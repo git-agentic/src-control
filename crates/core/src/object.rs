@@ -74,6 +74,10 @@ pub struct Snapshot {
     pub author: String,
     pub timestamp: i64,
     pub message: String,
+    /// Side registry of committed secrets, `name -> Secret object id`. Separate
+    /// from the file tree: secrets are env vars, not files, and are never
+    /// materialized by `checkout`. Encoded sorted by name for a canonical hash.
+    pub secrets: Vec<(String, ObjectId)>,
 }
 
 /// A DEK wrapped (encrypted) for one authorized recipient public key.
@@ -164,6 +168,13 @@ impl Object {
                 w.str(&s.author);
                 w.i64(s.timestamp);
                 w.str(&s.message);
+                let mut secrets = s.secrets.clone();
+                secrets.sort_by(|a, b| a.0.cmp(&b.0));
+                w.u32(secrets.len() as u32);
+                for (name, id) in &secrets {
+                    w.str(name);
+                    w.id(id);
+                }
             }
             Object::Secret(s) => {
                 w.tag(TAG_SECRET);
@@ -212,7 +223,14 @@ impl Object {
                 let author = r.str()?;
                 let timestamp = r.i64()?;
                 let message = r.str()?;
-                Object::Snapshot(Snapshot { root, parents, author, timestamp, message })
+                let ns = r.u32()?;
+                let mut secrets = Vec::with_capacity(ns as usize);
+                for _ in 0..ns {
+                    let name = r.str()?;
+                    let id = r.id()?;
+                    secrets.push((name, id));
+                }
+                Object::Snapshot(Snapshot { root, parents, author, timestamp, message, secrets })
             }
             TAG_SECRET => {
                 let name = r.str()?;
@@ -353,6 +371,7 @@ mod tests {
             author: "agent".into(),
             timestamp: 42,
             message: "init".into(),
+            secrets: vec![],
         });
         assert_eq!(snap, Object::decode(&snap.encode()).unwrap());
 
@@ -366,5 +385,33 @@ mod tests {
             }],
         });
         assert_eq!(sec, Object::decode(&sec.encode()).unwrap());
+    }
+
+    #[test]
+    fn snapshot_with_secrets_roundtrips_and_is_order_independent() {
+        let sid = Object::Secret(Secret {
+            name: "API_KEY".into(),
+            nonce: vec![1, 2, 3],
+            ciphertext: vec![9; 8],
+            wrapped_keys: vec![],
+        })
+        .id();
+        let root = Object::blob(b"r".to_vec()).id();
+        let base = |secrets: Vec<(String, ObjectId)>| {
+            Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "a".into(),
+                timestamp: 0,
+                message: "m".into(),
+                secrets,
+            })
+        };
+        let s1 = base(vec![("DB_URL".into(), sid), ("API_KEY".into(), sid)]);
+        let s2 = base(vec![("API_KEY".into(), sid), ("DB_URL".into(), sid)]);
+        // Canonical: registry order does not affect the id.
+        assert_eq!(s1.id(), s2.id());
+        // Decode yields the canonical (sorted) form; s2 is already sorted.
+        assert_eq!(s2, Object::decode(&s1.encode()).unwrap());
     }
 }

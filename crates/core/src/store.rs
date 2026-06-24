@@ -164,6 +164,13 @@ impl Store {
         }
     }
 
+    pub fn get_secret(&mut self, id: &ObjectId) -> Result<crate::object::Secret> {
+        match self.get(id)? {
+            Object::Secret(s) => Ok(s),
+            _ => Err(Error::WrongKind(*id, "secret")),
+        }
+    }
+
     // ---- eviction ----------------------------------------------------------
 
     /// Free enough resident blob budget for `needed` bytes, excluding `incoming`
