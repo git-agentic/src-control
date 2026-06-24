@@ -226,7 +226,7 @@ mod tests {
     fn revoke_removes_access() {
         let (sk_a, pk_a) = generate_keypair_with_rng(&mut rng(1));
         let (sk_b, pk_b) = generate_keypair_with_rng(&mut rng(2));
-        let secret = seal_with_rng("K", b"v", &[pk_a, pk_b], &mut rng(3));
+        let secret = seal_with_rng("K", b"v", &[pk_a, pk_b.clone()], &mut rng(3));
         let revoked = revoke(&secret, &pk_b.recipient_id());
         assert!(matches!(open(&revoked, &sk_b), Err(Error::NotARecipient)));
         assert_eq!(&open(&revoked, &sk_a).unwrap()[..], b"v");
