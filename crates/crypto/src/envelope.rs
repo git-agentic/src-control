@@ -62,6 +62,12 @@ pub fn open(secret: &Secret, identity: &SecretKey) -> Result<Zeroizing<Vec<u8>>>
         .find(|w| w.recipient_id == my_id.as_str())
         .ok_or(Error::NotARecipient)?;
 
+    // Guard against a malformed stored nonce: `XNonce::from_slice` panics on a
+    // length mismatch, and a committed `Secret` is attacker-influenced data.
+    if secret.nonce.len() != NONCE_LEN {
+        return Err(Error::Decrypt);
+    }
+
     let dek = unwrap_dek(&wk.wrapped_dek, identity)?;
     let cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).map_err(|_| Error::Decrypt)?;
     let plaintext = cipher
@@ -136,18 +142,25 @@ fn unwrap_dek(blob: &[u8], identity: &SecretKey) -> Result<Zeroizing<[u8; DEK_LE
     if blob.len() < EPK_LEN + NONCE_LEN {
         return Err(Error::Decrypt);
     }
-    let ephemeral_pub_bytes: [u8; 32] = blob[..EPK_LEN].try_into().unwrap();
+    let ephemeral_pub_bytes: [u8; 32] = blob[..EPK_LEN].try_into().expect("32-byte slice after length check");
     let wrap_nonce = &blob[EPK_LEN..EPK_LEN + NONCE_LEN];
     let wrapped = &blob[EPK_LEN + NONCE_LEN..];
 
+    // We intentionally do NOT do a low-order / contributory-point check on the
+    // ephemeral pubkey: authorization lives outside this crate, and an attacker
+    // who can craft this blob can already craft an entire `Secret`, so the check
+    // would buy nothing here.
     let ephemeral_pub = x25519_dalek::PublicKey::from(ephemeral_pub_bytes);
     let shared = identity.inner().diffie_hellman(&ephemeral_pub);
     let wrap_key = derive_wrap_key(shared.as_bytes(), &ephemeral_pub_bytes, &identity.public().to_bytes());
 
     let cipher = XChaCha20Poly1305::new_from_slice(wrap_key.as_slice()).map_err(|_| Error::Decrypt)?;
-    let dek_vec = cipher
-        .decrypt(XNonce::from_slice(wrap_nonce), wrapped)
-        .map_err(|_| Error::Decrypt)?;
+    // Wrap the decrypted DEK so the cleartext key is zeroized on drop.
+    let dek_vec = Zeroizing::new(
+        cipher
+            .decrypt(XNonce::from_slice(wrap_nonce), wrapped)
+            .map_err(|_| Error::Decrypt)?,
+    );
     let dek: [u8; DEK_LEN] = dek_vec.as_slice().try_into().map_err(|_| Error::Decrypt)?;
     Ok(Zeroizing::new(dek))
 }
@@ -197,6 +210,16 @@ mod tests {
         let (sk, pk) = generate_keypair_with_rng(&mut rng(1));
         let mut secret = seal_with_rng("K", b"v", &[pk], &mut rng(2));
         secret.ciphertext[0] ^= 0xFF;
+        assert!(matches!(open(&secret, &sk), Err(Error::Decrypt)));
+    }
+
+    #[test]
+    fn malformed_nonce_length_errors_instead_of_panicking() {
+        let (sk, pk) = generate_keypair_with_rng(&mut rng(1));
+        let mut secret = seal_with_rng("K", b"v", &[pk], &mut rng(2));
+        // Truncate the otherwise-valid stored nonce: `open` must reject it, not
+        // panic inside `XNonce::from_slice`.
+        secret.nonce.truncate(NONCE_LEN - 1);
         assert!(matches!(open(&secret, &sk), Err(Error::Decrypt)));
     }
 

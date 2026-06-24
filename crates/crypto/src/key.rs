@@ -1,7 +1,7 @@
 //! X25519 identities, recipient fingerprints, and their string encodings.
 
 use rand_core::{CryptoRng, OsRng, RngCore};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -63,9 +63,18 @@ impl SecretKey {
     /// Parse a `scl-sk-<hex>` string.
     pub fn from_key_string(s: &str) -> Result<Self> {
         let hexpart = s.trim().strip_prefix(SEC_PREFIX).ok_or(Error::BadKey)?;
-        let bytes = hex::decode(hexpart).map_err(|_| Error::BadKey)?;
-        let arr: [u8; 32] = bytes.try_into().map_err(|_| Error::BadKey)?;
-        Ok(SecretKey(x25519_dalek::StaticSecret::from(arr)))
+        // Decode into a zeroizing buffer: these are raw private-key bytes.
+        let bytes = Zeroizing::new(hex::decode(hexpart).map_err(|_| Error::BadKey)?);
+        if bytes.len() != 32 {
+            return Err(Error::BadKey);
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        // `StaticSecret::from` takes `arr` by value (it's `Copy`), so the source
+        // array survives the call — wipe it before returning.
+        let sk = x25519_dalek::StaticSecret::from(arr);
+        arr.zeroize();
+        Ok(SecretKey(sk))
     }
 
     pub(crate) fn inner(&self) -> &x25519_dalek::StaticSecret {

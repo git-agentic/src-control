@@ -25,7 +25,11 @@ impl FileKeyProvider {
 
 impl KeyProvider for FileKeyProvider {
     fn identity(&self) -> Result<SecretKey> {
-        let contents = std::fs::read_to_string(&self.path).map_err(|e| Error::KeyIo(e.to_string()))?;
+        // Wrap in `Zeroizing` so the raw `scl-sk-` material is wiped after parse
+        // rather than lingering in the read buffer.
+        let contents = zeroize::Zeroizing::new(
+            std::fs::read_to_string(&self.path).map_err(|e| Error::KeyIo(e.to_string()))?,
+        );
         SecretKey::from_key_string(&contents)
     }
 }
