@@ -292,6 +292,8 @@ fn default_identity_path() -> PathBuf {
 }
 
 /// Resolve the identity file: `--identity` > `SC_IDENTITY` > default.
+// Scaffolding wired up by `sc secret add`/`grant` (deferred — see spec Out of scope).
+#[allow(dead_code)]
 fn resolve_identity_path(flag: Option<PathBuf>) -> PathBuf {
     if let Some(p) = flag {
         return p;
@@ -306,13 +308,32 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
     let path = out.unwrap_or_else(default_identity_path);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // Defense-in-depth: tighten the identity dir to owner-only.
+        #[cfg(unix)]
+        if !parent.as_os_str().is_empty() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     let (sk, pk) = scl_crypto::generate_keypair();
-    std::fs::write(&path, sk.to_key_string())?;
+    // Create the key file 0600 *atomically* so the private key is never visible
+    // group/world-readable through the umask window between write and chmod.
+    // `create_new(true)` refuses to clobber an existing identity.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("identity already exists at {} (refusing to overwrite)", path.display()))?;
+        f.write_all(sk.to_key_string().as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, sk.to_key_string())?;
     }
     println!("wrote private key: {} (0600)", path.display());
     println!("public key:   {}", pk.to_key_string());
@@ -325,6 +346,8 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
 // ---- Task 8: .sc/recipients.toml loader ------------------------------------
 
 /// Parsed `.sc/recipients.toml`: `name -> scl-pk-<hex>`.
+// Scaffolding wired up by `sc secret add`/`grant` (deferred — see spec Out of scope).
+#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 struct RecipientsFile {
     #[serde(default)]
@@ -332,6 +355,8 @@ struct RecipientsFile {
 }
 
 /// Resolve recipient names to public keys from a recipients file.
+// Scaffolding wired up by `sc secret add`/`grant` (deferred — see spec Out of scope).
+#[allow(dead_code)]
 fn load_recipients(
     path: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, scl_crypto::PublicKey>> {
@@ -364,10 +389,24 @@ fn run_with_secret(
         .ok_or_else(|| anyhow::anyhow!("no secret named {name}"))?;
     let secret = repo.store().lock().unwrap().get_secret(&sid)?;
     let plaintext = scl_crypto::open(&secret, identity)?; // Err if unauthorized
+    // Inject the raw secret bytes verbatim. On unix the value can be non-UTF-8;
+    // pass it as an `OsStr` so a binary secret survives intact rather than being
+    // silently replaced by "".
+    #[cfg(unix)]
+    let cmd_env_val = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(&plaintext)
+    };
+    #[cfg(not(unix))]
+    let cmd_env_val =
+        std::str::from_utf8(&plaintext).map_err(|_| anyhow::anyhow!("secret is not valid UTF-8"))?;
+    // NOTE: `plaintext` is `Zeroizing` and is wiped when this fn returns. The
+    // child's stdout copy below is NOT zeroized; acceptable here because the
+    // demo only logs its `.len()`, never the value itself.
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("printf %s \"${name}\""))
-        .env(name, std::str::from_utf8(&plaintext).unwrap_or(""))
+        .env(name, cmd_env_val)
         .output()?;
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -423,6 +462,22 @@ fn run_secret_demo(args: SecretDemoArgs) -> Result<()> {
     assert_eq!(got.as_bytes(), secret_value, "alice's child must see the plaintext");
     println!("alice run -> child process read DB_URL = <{} bytes, matches> ✔", got.len());
 
+    // Materialize alice's worktree to disk (under session_root): the file tree
+    // is written, but the secret registry is NOT a file and must never appear.
+    // This also makes the zero-residue teardown below non-vacuous: there is real
+    // on-disk content to remove and re-verify.
+    let checkout_dir = session_root.join("alice-checkout");
+    repo.fork(snap, "alice-checkout")?.checkout(&checkout_dir)?;
+    assert!(
+        checkout_dir.join("README.md").exists(),
+        "checkout must materialize the file tree"
+    );
+    assert!(
+        !checkout_dir.join("DB_URL").exists(),
+        "the secret must NOT be written as a file by checkout"
+    );
+    println!("checkout wrote the file tree but no DB_URL secret file ✔");
+
     // 3) Grant mallory by re-wrapping the DEK (no value rotation).
     println!("\n--- grant mallory (re-wrap DEK) ---");
     let granted = scl_crypto::rewrap_for(&stored, &alice_sk, &mallory_pk)?;
@@ -434,7 +489,8 @@ fn run_secret_demo(args: SecretDemoArgs) -> Result<()> {
     assert_eq!(got2.as_bytes(), secret_value, "mallory should now decrypt");
     println!("mallory run after grant -> DB_URL decrypted ✔ (value not rotated)");
 
-    // 4) Teardown + zero-residue proof.
+    // 4) Teardown + zero-residue proof: remove the session dir (which now holds
+    // alice's real checkout from step 2) and verify nothing remains on disk.
     drop(setup);
     drop(repo);
     std::fs::remove_dir_all(&session_root).ok();
