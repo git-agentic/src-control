@@ -1,0 +1,20 @@
+//! `scl-crypto` — envelope encryption for committed secrets.
+//!
+//! This is the only crate that links the cryptographic stack. It depends on
+//! `scl-core` to construct and consume [`scl_core::Secret`] objects, but `core`
+//! never depends on it: all cryptography stays behind this boundary, mirroring
+//! the `gix`-in-`gitio` rule.
+//!
+//! A per-secret data-encryption key (DEK) encrypts the value with
+//! XChaCha20-Poly1305; the DEK is wrapped once per recipient via X25519 ECDH +
+//! HKDF. Authorization is "do you hold a recipient private key."
+
+pub mod envelope;
+pub mod error;
+pub mod key;
+pub mod provider;
+
+pub use envelope::{open, rewrap_for, revoke, seal};
+pub use error::{Error, Result};
+pub use key::{generate_keypair, PublicKey, RecipientId, SecretKey};
+pub use provider::{FileKeyProvider, KeyProvider};
