@@ -1,6 +1,6 @@
 # ADR-0009: Recipient-based key management and authorization
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-24
 - **Phase:** 2
 

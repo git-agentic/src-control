@@ -22,9 +22,9 @@ near-term value and builds on / interoperates with Git wherever that saves time:
   in RAM, run and checkout against each, and tear them down cleanly leaving zero
   local artifacts. Includes a bounded memory budget with eviction and optional
   spill so large repos don't exhaust the heap.
-- **Phase 2 — Native committed secrets.** Env vars / keys committed directly
-  into repo state, encrypted at rest and in transit, decrypted only inside an
-  authorized execution context through integrated key management.
+- **Phase 2 — Native committed secrets (built).** Env vars / keys committed
+  directly into repo state, encrypted at rest and in transit, decrypted only
+  inside an authorized execution context through integrated key management.
 
 Everything in Phase 1 is designed so Phase 2 drops in without re-architecting:
 secrets are just a special object kind in the same content-addressed store.
@@ -48,8 +48,8 @@ to reason about — which is exactly the property Phase 1 is meant to demonstrat
 
 ## System overview
 
-The codebase is a Cargo workspace of four crates with a strict dependency
-direction (`cli → {vfs, gitio} → core`):
+The codebase is a Cargo workspace of five crates with a strict dependency
+direction (`cli → {vfs, gitio, crypto} → core`):
 
 ```
 src-control/
@@ -57,14 +57,17 @@ src-control/
 │   ├── core/     content-addressed store, snapshot model, memory budget + eviction
 │   ├── vfs/      in-memory virtual worktree engine (fork / edit / checkout / teardown)
 │   ├── gitio/    Git interop boundary (import a Git repo's tree into the store via gix)
+│   ├── crypto/   envelope encryption for committed secrets (scl-crypto; depends on core)
 │   └── cli/      `sc` binary: import, fork agents, run, checkout, status, teardown
 └── ARCHITECTURE.md
 ```
 
-`core` knows nothing about Git or worktrees. `gitio` is the only crate that
-links `gix`, keeping the Git dependency quarantined behind one boundary. This
-matters because the long-term plan is to own the object format outright; Git is
-an import/export peer, not a foundation.
+`core` knows nothing about Git, worktrees, or cryptography. `gitio` is the only
+crate that links `gix`, keeping the Git dependency quarantined behind one
+boundary. `crypto` is the only crate that links the RustCrypto stack, keeping
+the cryptographic dependency quarantined behind another. This matters because the
+long-term plan is to own the object format outright; Git is an import/export
+peer, not a foundation.
 
 ## Content-addressed snapshot model
 
@@ -153,7 +156,7 @@ a single crate so the rest of the system stays Git-agnostic. Export (writing a
 snapshot back out as a Git commit) is the symmetric operation and is left as a
 post-MVP extension; import is what the agent wedge needs first.
 
-## Key management design (Phase 2 preview)
+## Key management design (Phase 2)
 
 Committed secrets use **envelope encryption**. Each secret object carries
 ciphertext encrypted under a fresh per-secret data-encryption key (DEK) using
@@ -161,6 +164,13 @@ XChaCha20-Poly1305 (AEAD, large random nonce, authenticated). The DEK is then
 *wrapped* (encrypted) once per authorized recipient public key (X25519). The
 secret object stores the ciphertext, the AEAD nonce, and the set of wrapped DEKs
 keyed by recipient key id.
+
+Secrets are referenced by a side registry on each snapshot (`name -> Secret id`,
+a `BTreeMap` so canonical encoding is insertion-order-independent), kept separate
+from the file tree so `checkout` never materializes them. An authorized context
+decrypts in memory and injects the value into a child process environment; `sc
+secret-demo` proves the authorize/deny/grant flow end-to-end with the same
+zero-residue teardown as Phase 1. See ADR-0010.
 
 The consequence is that a clone in an **unauthorized** context — one whose
 private key is not among the recipients — receives the secret object intact but
@@ -172,9 +182,6 @@ you hold a private key listed as a recipient," and granting/revoking access is
 re-wrapping the DEK for a changed recipient set — a cheap metadata operation that
 does not require rotating the secret itself. This is the same envelope model used
 by age and cloud KMS, chosen because it is well-understood and auditable.
-
-This is documented now because Phase 1's object store and clone path are built to
-carry `Secret` objects unmodified, so Phase 2 is additive rather than a rewrite.
 
 ## Phase 1 deliverable and proof
 

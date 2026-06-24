@@ -13,8 +13,8 @@ with Git where it saves time.
 MVP scope is two wedges:
 - **Phase 1 (done):** in-memory virtual worktrees for parallel agents, with a
   bounded memory budget + eviction, leaving zero residual files on disk.
-- **Phase 2 (designed, not built):** native committed secrets via envelope
-  encryption, decrypted only in an authorized execution context.
+- **Phase 2 (built):** native committed secrets via envelope encryption,
+  decrypted only in an authorized execution context.
 
 Full design is in `ARCHITECTURE.md`; the rationale behind each major decision is
 recorded as an ADR in `docs/adr/`. Keep them in sync when the design changes.
@@ -25,7 +25,7 @@ recorded as an ADR in `docs/adr/`. Keep them in sync when the design changes.
 - **Edition:** 2021, inherited via `[workspace.package]`.
 - **Key deps (pin latest stable; no LTS concept in Rust/crates):**
   `blake3`, `thiserror`, `hex`, `gix` (Git interop only), `clap`, `anyhow`.
-  Phase 2 will add RustCrypto AEAD (XChaCha20-Poly1305) + X25519.
+  Phase 2 added RustCrypto AEAD (XChaCha20-Poly1305) + X25519 in `crates/crypto`.
 - Bump deps with `cargo add`/`cargo update`; do not hand-edit version pins to
   guesses. `gix` must keep its **default features** (it needs the `sha1`
   hashing feature — disabling defaults breaks `gix-hash`).
@@ -36,12 +36,15 @@ recorded as an ADR in `docs/adr/`. Keep them in sync when the design changes.
 crates/core   → content-addressed store, object model, budget + eviction
 crates/vfs    → in-memory worktree engine (depends on core)
 crates/gitio  → Git import via gix (depends on core; ONLY crate that links gix)
-crates/cli    → `sc` binary (depends on vfs + gitio + core)
+crates/crypto → envelope encryption (depends on core; ONLY crate linking RustCrypto)
+crates/cli    → `sc` binary (depends on vfs + gitio + crypto + core)
 ```
 
-Strict dependency direction: `cli → {vfs, gitio} → core`. **`core` must never
-depend on Git or worktrees.** **`gix` must stay quarantined in `gitio`** — if you
-find yourself reaching for `gix` elsewhere, add a function to `gitio` instead.
+Strict dependency direction: `cli → {vfs, gitio, crypto} → core`. **`core` must
+never depend on Git, worktrees, or crypto.** **`gix` must stay quarantined in
+`gitio`** — if you find yourself reaching for `gix` elsewhere, add a function to
+`gitio` instead. **RustCrypto must stay quarantined in `crypto`** — if you find
+yourself reaching for it elsewhere, add a function to `crypto` instead.
 
 ## Core invariants (do not break)
 
@@ -80,17 +83,24 @@ cargo run --bin sc -- demo --agents 4        # parallel-agent demo
 cargo run --bin sc -- demo --agents 6 --budget-mb 4 --spill   # exercise eviction
 cargo run --bin sc -- import --repo <path>   # import a Git repo's HEAD
 bash demo/run_demo.sh                         # independent zero-residue proof
+cargo run --bin sc -- keygen                 # generate an X25519 identity
+cargo run --bin sc -- secret-demo            # committed-secrets authorize/deny/grant proof
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
 the project tree if desired.
 
-## When extending toward Phase 2
+## Phase 2 is built
 
-The object model already has a `Secret` kind (`crates/core/src/object.rs`) that
-flows through fork/checkout/clone untouched. Phase 2 should: add a `crypto`
-module (likely a new crate `scl-crypto`), implement envelope encryption (per-
-secret DEK under XChaCha20-Poly1305, DEK wrapped per recipient via X25519), wire
-`sc secret add` / decryption-on-checkout into the CLI, and demonstrate the
-unauthorized-clone-stays-ciphertext flow. Do not weaken the Phase 1 invariants
-to get there.
+`crates/crypto` (`scl-crypto`) exists and owns all cryptography: envelope
+encryption (per-secret DEK under XChaCha20-Poly1305, DEK wrapped per recipient
+via X25519 ECDH + HKDF-SHA256), keygen, and a `KeyProvider` abstraction for
+loading identities. `Snapshot` carries a `secrets: BTreeMap<String, ObjectId>`
+side registry (separate from the file tree) so secrets are env vars, not files
+— `checkout` never materializes them. An authorized context decrypts the value
+in memory and injects it into a child process environment via `run_with_secret`.
+
+The deferred bits (persistent store, standalone `sc secret add`/`sc run` across
+invocations, break-glass escrow key guidance) can be added without changing the
+Phase 1 or Phase 2 invariants. Do not weaken either set of invariants to get
+there.

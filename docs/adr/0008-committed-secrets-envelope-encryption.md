@@ -1,6 +1,6 @@
 # ADR-0008: Native committed secrets via envelope encryption
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-24
 - **Phase:** 2
 
