@@ -1,0 +1,9 @@
+[package]
+name = "scl-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scl-core = { path = "../core" }
+thiserror = "2.0.18"

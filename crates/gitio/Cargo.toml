@@ -1,0 +1,11 @@
+[package]
+name = "scl-gitio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scl-core = { path = "../core" }
+gix = "0.85.0"
+thiserror = "2.0.18"
+anyhow = "1.0.102"
