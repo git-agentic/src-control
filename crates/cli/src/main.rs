@@ -307,10 +307,13 @@ fn resolve_identity_path(flag: Option<PathBuf>) -> PathBuf {
 fn run_keygen(out: Option<PathBuf>) -> Result<()> {
     let path = out.unwrap_or_else(default_identity_path);
     if let Some(parent) = path.parent() {
+        // Only tighten a directory we create ourselves: chmod-ing a pre-existing
+        // parent (e.g. $HOME for `--out ~/identity`, or CWD for `--out ./key`)
+        // would retroactively narrow the user's own dir — a footgun.
+        let parent_preexisted = parent.as_os_str().is_empty() || parent.exists();
         std::fs::create_dir_all(parent)?;
-        // Defense-in-depth: tighten the identity dir to owner-only.
         #[cfg(unix)]
-        if !parent.as_os_str().is_empty() {
+        if !parent_preexisted {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
@@ -388,6 +391,16 @@ fn run_with_secret(
         .secret_id(name)
         .ok_or_else(|| anyhow::anyhow!("no secret named {name}"))?;
     let secret = repo.store().lock().unwrap().get_secret(&sid)?;
+    // Integrity: the registry pointer must name the same secret it points at, so
+    // a registry entry can't be silently relabeled to another (same-recipient)
+    // secret. The AEAD already binds `secret.name` as AAD; this checks the
+    // pointer too.
+    if secret.name != name {
+        return Err(anyhow::anyhow!(
+            "secret name mismatch: registry entry {name} points at a secret named {}",
+            secret.name
+        ));
+    }
     let plaintext = scl_crypto::open(&secret, identity)?; // Err if unauthorized
     // Inject the raw secret bytes verbatim. On unix the value can be non-UTF-8;
     // pass it as an `OsStr` so a binary secret survives intact rather than being
@@ -438,7 +451,7 @@ fn run_secret_demo(args: SecretDemoArgs) -> Result<()> {
         "init",
     )?;
     let mut setup = repo.fork(base, "setup")?;
-    setup.put_secret(scl_crypto::seal("DB_URL", secret_value, &[alice_pk.clone()]))?;
+    setup.put_secret(scl_crypto::seal("DB_URL", secret_value, std::slice::from_ref(&alice_pk)))?;
     let snap = setup.commit("setup", "commit DB_URL")?;
     println!("\ncommitted secret DB_URL (wrapped to alice) in snapshot {}", snap.short());
 
