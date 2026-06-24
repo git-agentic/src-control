@@ -28,6 +28,7 @@ pub fn import_head(store: &mut Store, repo_path: &Path) -> Result<ObjectId> {
         author: "git-import".into(),
         timestamp: 0,
         message: format!("import HEAD {}", commit.id().shorten_or_id()),
+        secrets: vec![],
     });
     store.put(snap).context("storing imported snapshot")
 }
