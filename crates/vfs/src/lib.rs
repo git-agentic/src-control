@@ -67,7 +67,7 @@ impl Repo {
             author: author.into(),
             timestamp: 0,
             message: message.into(),
-            secrets: vec![],
+            secrets: BTreeMap::new(),
         });
         Ok(self.store.lock().unwrap().put(snap)?)
     }
@@ -81,7 +81,7 @@ impl Repo {
             base_snapshot: snapshot,
             base_root: snap.root,
             overlay: BTreeMap::new(),
-            secrets: snap.secrets.into_iter().collect(),
+            secrets: snap.secrets,
             label: label.into(),
         })
     }
@@ -192,7 +192,8 @@ impl Worktree {
     }
 
     /// Store a sealed secret and register it by name (overwriting any prior
-    /// secret with the same name).
+    /// secret with the same name). Overwriting a name only updates the registry
+    /// pointer; the previous content-addressed Secret object remains in the store.
     pub fn put_secret(&mut self, secret: Secret) -> Result<ObjectId> {
         let name = secret.name.clone();
         let id = self.store.lock().unwrap().put(Object::Secret(secret))?;
@@ -285,7 +286,7 @@ impl Worktree {
             author: author.into(),
             timestamp: 0,
             message: message.into(),
-            secrets: self.secrets.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            secrets: self.secrets.clone(),
         });
         Ok(self.store.lock().unwrap().put(snap)?)
     }
@@ -490,7 +491,9 @@ mod tests {
         // The secret is NOT a file: absent from list() and from checkout.
         assert!(!wt2.list().unwrap().iter().any(|p| p.contains("DB_URL")));
         let dest = std::env::temp_dir().join(format!("scl-secret-co-{}", std::process::id()));
-        wt2.checkout(&dest).unwrap();
+        let n = wt2.checkout(&dest).unwrap();
+        // Checked-out file count equals the visible file set: secrets excluded.
+        assert_eq!(n, wt2.list().unwrap().len());
         assert!(!dest.join("DB_URL").exists());
         std::fs::remove_dir_all(&dest).unwrap();
         assert!(!dest.exists());

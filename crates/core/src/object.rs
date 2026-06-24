@@ -76,8 +76,9 @@ pub struct Snapshot {
     pub message: String,
     /// Side registry of committed secrets, `name -> Secret object id`. Separate
     /// from the file tree: secrets are env vars, not files, and are never
-    /// materialized by `checkout`. Encoded sorted by name for a canonical hash.
-    pub secrets: Vec<(String, ObjectId)>,
+    /// materialized by `checkout`. A `BTreeMap` iterates in sorted key order, so
+    /// the canonical encoding (and thus `id()`) is independent of insertion order.
+    pub secrets: std::collections::BTreeMap<String, ObjectId>,
 }
 
 /// A DEK wrapped (encrypted) for one authorized recipient public key.
@@ -168,10 +169,8 @@ impl Object {
                 w.str(&s.author);
                 w.i64(s.timestamp);
                 w.str(&s.message);
-                let mut secrets = s.secrets.clone();
-                secrets.sort_by(|a, b| a.0.cmp(&b.0));
-                w.u32(secrets.len() as u32);
-                for (name, id) in &secrets {
+                w.u32(s.secrets.len() as u32);
+                for (name, id) in &s.secrets {
                     w.str(name);
                     w.id(id);
                 }
@@ -224,11 +223,11 @@ impl Object {
                 let timestamp = r.i64()?;
                 let message = r.str()?;
                 let ns = r.u32()?;
-                let mut secrets = Vec::with_capacity(ns as usize);
+                let mut secrets = std::collections::BTreeMap::new();
                 for _ in 0..ns {
                     let name = r.str()?;
                     let id = r.id()?;
-                    secrets.push((name, id));
+                    secrets.insert(name, id);
                 }
                 Object::Snapshot(Snapshot { root, parents, author, timestamp, message, secrets })
             }
@@ -371,7 +370,7 @@ mod tests {
             author: "agent".into(),
             timestamp: 42,
             message: "init".into(),
-            secrets: vec![],
+            secrets: std::collections::BTreeMap::new(),
         });
         assert_eq!(snap, Object::decode(&snap.encode()).unwrap());
 
@@ -397,7 +396,7 @@ mod tests {
         })
         .id();
         let root = Object::blob(b"r".to_vec()).id();
-        let base = |secrets: Vec<(String, ObjectId)>| {
+        let base = |secrets: std::collections::BTreeMap<String, ObjectId>| {
             Object::Snapshot(Snapshot {
                 root,
                 parents: vec![],
@@ -407,11 +406,19 @@ mod tests {
                 secrets,
             })
         };
-        let s1 = base(vec![("DB_URL".into(), sid), ("API_KEY".into(), sid)]);
-        let s2 = base(vec![("API_KEY".into(), sid), ("DB_URL".into(), sid)]);
-        // Canonical: registry order does not affect the id.
+        // Two registries built from differently-ordered inputs.
+        let mut m1 = std::collections::BTreeMap::new();
+        m1.insert("DB_URL".to_string(), sid);
+        m1.insert("API_KEY".to_string(), sid);
+        let mut m2 = std::collections::BTreeMap::new();
+        m2.insert("API_KEY".to_string(), sid);
+        m2.insert("DB_URL".to_string(), sid);
+        let s1 = base(m1);
+        let s2 = base(m2);
+        // A BTreeMap is inherently ordered: insertion order affects neither
+        // equality nor the canonical id.
+        assert_eq!(s1, s2);
         assert_eq!(s1.id(), s2.id());
-        // Decode yields the canonical (sorted) form; s2 is already sorted.
-        assert_eq!(s2, Object::decode(&s1.encode()).unwrap());
+        assert_eq!(s1, Object::decode(&s1.encode()).unwrap());
     }
 }
