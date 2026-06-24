@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use scl_core::{
-    EntryKind, FileMode, Object, ObjectId, Snapshot, Store, StoreStats, Tree, TreeEntry,
+    EntryKind, FileMode, Object, ObjectId, Secret, Snapshot, Store, StoreStats, Tree, TreeEntry,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +67,7 @@ impl Repo {
             author: author.into(),
             timestamp: 0,
             message: message.into(),
+            secrets: vec![],
         });
         Ok(self.store.lock().unwrap().put(snap)?)
     }
@@ -74,12 +75,13 @@ impl Repo {
     /// Fork an in-memory worktree from a base snapshot. Cheap: allocates only an
     /// empty overlay; no file content is copied.
     pub fn fork(&self, snapshot: ObjectId, label: impl Into<String>) -> Result<Worktree> {
-        let base_root = self.store.lock().unwrap().get_snapshot(&snapshot)?.root;
+        let snap = self.store.lock().unwrap().get_snapshot(&snapshot)?;
         Ok(Worktree {
             store: self.store.clone(),
             base_snapshot: snapshot,
-            base_root,
+            base_root: snap.root,
             overlay: BTreeMap::new(),
+            secrets: snap.secrets.into_iter().collect(),
             label: label.into(),
         })
     }
@@ -146,6 +148,9 @@ pub struct Worktree {
     base_snapshot: ObjectId,
     base_root: ObjectId,
     overlay: BTreeMap<String, Overlay>,
+    /// Committed-secret registry inherited from the base snapshot, plus local
+    /// add/revoke edits. `name -> Secret object id`.
+    secrets: std::collections::BTreeMap<String, ObjectId>,
     label: String,
 }
 
@@ -184,6 +189,30 @@ impl Worktree {
     /// Tombstone a path in the overlay.
     pub fn remove(&mut self, path: &str) {
         self.overlay.insert(normalize(path), Overlay::Removed);
+    }
+
+    /// Store a sealed secret and register it by name (overwriting any prior
+    /// secret with the same name).
+    pub fn put_secret(&mut self, secret: Secret) -> Result<ObjectId> {
+        let name = secret.name.clone();
+        let id = self.store.lock().unwrap().put(Object::Secret(secret))?;
+        self.secrets.insert(name, id);
+        Ok(id)
+    }
+
+    /// Drop a secret from the registry.
+    pub fn remove_secret(&mut self, name: &str) {
+        self.secrets.remove(name);
+    }
+
+    /// The committed-secret registry as `(name, id)` pairs.
+    pub fn list_secrets(&self) -> Vec<(String, ObjectId)> {
+        self.secrets.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    /// The Secret object id registered under `name`, if any.
+    pub fn secret_id(&self, name: &str) -> Option<ObjectId> {
+        self.secrets.get(name).copied()
     }
 
     pub fn exists(&self, path: &str) -> bool {
@@ -256,6 +285,7 @@ impl Worktree {
             author: author.into(),
             timestamp: 0,
             message: message.into(),
+            secrets: self.secrets.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         });
         Ok(self.store.lock().unwrap().put(snap)?)
     }
@@ -435,5 +465,34 @@ mod tests {
         assert_ne!(new_snap, snap);
         let wt2 = r.fork(new_snap, "verifier").unwrap();
         assert_eq!(&wt2.read("README.md").unwrap()[..], b"v2");
+    }
+
+    #[test]
+    fn secrets_carry_through_fork_and_commit_but_never_check_out() {
+        use scl_core::{Secret, WrappedKey};
+        let r = repo();
+        let snap = seed(&r);
+        let mut wt = r.fork(snap, "setup").unwrap();
+        wt.put_secret(Secret {
+            name: "DB_URL".into(),
+            nonce: vec![0; 24],
+            ciphertext: vec![1, 2, 3, 4],
+            wrapped_keys: vec![WrappedKey { recipient_id: "rid".into(), wrapped_dek: vec![7; 80] }],
+        })
+        .unwrap();
+        let snap2 = wt.commit("setup", "add secret").unwrap();
+
+        // Registry survives a fresh fork.
+        let wt2 = r.fork(snap2, "consumer").unwrap();
+        assert_eq!(wt2.list_secrets().len(), 1);
+        assert!(wt2.secret_id("DB_URL").is_some());
+
+        // The secret is NOT a file: absent from list() and from checkout.
+        assert!(!wt2.list().unwrap().iter().any(|p| p.contains("DB_URL")));
+        let dest = std::env::temp_dir().join(format!("scl-secret-co-{}", std::process::id()));
+        wt2.checkout(&dest).unwrap();
+        assert!(!dest.join("DB_URL").exists());
+        std::fs::remove_dir_all(&dest).unwrap();
+        assert!(!dest.exists());
     }
 }
