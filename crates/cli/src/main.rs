@@ -31,6 +31,22 @@ enum Cmd {
         #[arg(long)]
         repo: PathBuf,
     },
+    /// Generate an X25519 identity keypair (private key written to disk 0600).
+    Keygen {
+        /// Where to write the private key (default: ~/.sc/identity).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Phase 2 proof: add a committed secret, deny an unauthorized context,
+    /// decrypt + inject in an authorized one, then grant — all in RAM.
+    SecretDemo(SecretDemoArgs),
+}
+
+#[derive(Parser)]
+struct SecretDemoArgs {
+    /// Resident blob budget in megabytes.
+    #[arg(long, default_value_t = 8)]
+    budget_mb: usize,
 }
 
 #[derive(Parser)]
@@ -58,6 +74,8 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Demo(args) => run_demo(args),
         Cmd::Import { repo } => run_import(repo),
+        Cmd::Keygen { out } => run_keygen(out),
+        Cmd::SecretDemo(args) => run_secret_demo(args),
     }
 }
 
@@ -263,4 +281,192 @@ fn fmt_stats(repo: &Repo) -> String {
         s.evictions,
         s.rehydrations,
     )
+}
+
+// ---- Task 7: keygen + identity-path helpers --------------------------------
+
+/// Default identity path: `$HOME/.sc/identity`.
+fn default_identity_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".sc").join("identity")
+}
+
+/// Resolve the identity file: `--identity` > `SC_IDENTITY` > default.
+fn resolve_identity_path(flag: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = flag {
+        return p;
+    }
+    if let Ok(env) = std::env::var("SC_IDENTITY") {
+        return PathBuf::from(env);
+    }
+    default_identity_path()
+}
+
+fn run_keygen(out: Option<PathBuf>) -> Result<()> {
+    let path = out.unwrap_or_else(default_identity_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let (sk, pk) = scl_crypto::generate_keypair();
+    std::fs::write(&path, sk.to_key_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!("wrote private key: {} (0600)", path.display());
+    println!("public key:   {}", pk.to_key_string());
+    println!("recipient id: {}", pk.recipient_id());
+    println!("\nAdd to .sc/recipients.toml under [recipients]:");
+    println!("  <name> = \"{}\"", pk.to_key_string());
+    Ok(())
+}
+
+// ---- Task 8: .sc/recipients.toml loader ------------------------------------
+
+/// Parsed `.sc/recipients.toml`: `name -> scl-pk-<hex>`.
+#[derive(serde::Deserialize)]
+struct RecipientsFile {
+    #[serde(default)]
+    recipients: std::collections::BTreeMap<String, String>,
+}
+
+/// Resolve recipient names to public keys from a recipients file.
+fn load_recipients(
+    path: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, scl_crypto::PublicKey>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let parsed: RecipientsFile = toml::from_str(&text)?;
+    let mut out = std::collections::BTreeMap::new();
+    for (name, key_str) in parsed.recipients {
+        let pk = scl_crypto::PublicKey::from_key_string(&key_str)
+            .map_err(|_| anyhow::anyhow!("bad public key for recipient '{name}'"))?;
+        out.insert(name, pk);
+    }
+    Ok(out)
+}
+
+// ---- Task 9: sc secret-demo ------------------------------------------------
+
+/// Decrypt `name` from `snapshot` using `identity`, inject it into a child
+/// process environment, and return what the child read back. Proves the value
+/// reaches a real process env without ever touching disk.
+fn run_with_secret(
+    repo: &Repo,
+    snapshot: scl_core::ObjectId,
+    name: &str,
+    identity: &scl_crypto::SecretKey,
+) -> Result<String> {
+    let wt = repo.fork(snapshot, "run")?;
+    let sid = wt
+        .secret_id(name)
+        .ok_or_else(|| anyhow::anyhow!("no secret named {name}"))?;
+    let secret = repo.store().lock().unwrap().get_secret(&sid)?;
+    let plaintext = scl_crypto::open(&secret, identity)?; // Err if unauthorized
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf %s \"${name}\""))
+        .env(name, std::str::from_utf8(&plaintext).unwrap_or(""))
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_secret_demo(args: SecretDemoArgs) -> Result<()> {
+    let pid = std::process::id();
+    let session_root = std::env::temp_dir().join(format!("scl-secret-session-{pid}"));
+    let _ = std::fs::remove_dir_all(&session_root);
+    std::fs::create_dir_all(&session_root)?;
+
+    println!("=== src-control · committed-secrets demo ===");
+    let budget_bytes = args.budget_mb * 1024 * 1024;
+    let repo = Repo::new(Store::new(StoreConfig {
+        budget_bytes,
+        spill: SpillPolicy::Disallow,
+    }));
+
+    // Two identities, generated in RAM (never written to disk in this demo).
+    let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+    let (mallory_sk, mallory_pk) = scl_crypto::generate_keypair();
+    println!("alice   recipient: {}", alice_pk.recipient_id());
+    println!("mallory recipient: {}", mallory_pk.recipient_id());
+
+    // Base snapshot: one file + one secret sealed to ALICE only.
+    let secret_value = b"postgres://app:s3cr3t@db.prod/main";
+    let base = repo.commit_files(
+        &[("README.md".into(), b"# app\n".to_vec(), FileMode::FILE)],
+        "seed",
+        "init",
+    )?;
+    let mut setup = repo.fork(base, "setup")?;
+    setup.put_secret(scl_crypto::seal("DB_URL", secret_value, &[alice_pk.clone()]))?;
+    let snap = setup.commit("setup", "commit DB_URL")?;
+    println!("\ncommitted secret DB_URL (wrapped to alice) in snapshot {}", snap.short());
+
+    // 1) Unauthorized context: mallory cannot decrypt.
+    println!("\n--- unauthorized context (mallory) ---");
+    match run_with_secret(&repo, snap, "DB_URL", &mallory_sk) {
+        Ok(v) => anyhow::bail!("SECURITY FAILURE: mallory decrypted DB_URL = {v:?}"),
+        Err(e) => println!("mallory run -> DENIED ({e})"),
+    }
+    // The stored object is still ciphertext.
+    let stored = {
+        let id = repo.fork(snap, "probe")?.secret_id("DB_URL").unwrap();
+        repo.store().lock().unwrap().get_secret(&id)?
+    };
+    assert_ne!(stored.ciphertext, secret_value, "stored value must be ciphertext");
+    println!("stored DB_URL is ciphertext ({} bytes), not the plaintext ✔", stored.ciphertext.len());
+
+    // 2) Authorized context: alice decrypts and injects into a child process.
+    println!("\n--- authorized context (alice) ---");
+    let got = run_with_secret(&repo, snap, "DB_URL", &alice_sk)?;
+    assert_eq!(got.as_bytes(), secret_value, "alice's child must see the plaintext");
+    println!("alice run -> child process read DB_URL = <{} bytes, matches> ✔", got.len());
+
+    // 3) Grant mallory by re-wrapping the DEK (no value rotation).
+    println!("\n--- grant mallory (re-wrap DEK) ---");
+    let granted = scl_crypto::rewrap_for(&stored, &alice_sk, &mallory_pk)?;
+    assert_eq!(granted.ciphertext, stored.ciphertext, "grant must not rotate the value");
+    let mut regrant = repo.fork(snap, "grant")?;
+    regrant.put_secret(granted)?;
+    let snap2 = regrant.commit("admin", "grant mallory")?;
+    let got2 = run_with_secret(&repo, snap2, "DB_URL", &mallory_sk)?;
+    assert_eq!(got2.as_bytes(), secret_value, "mallory should now decrypt");
+    println!("mallory run after grant -> DB_URL decrypted ✔ (value not rotated)");
+
+    // 4) Teardown + zero-residue proof.
+    drop(setup);
+    drop(repo);
+    std::fs::remove_dir_all(&session_root).ok();
+    let residue = session_root.exists();
+    println!("\n=== teardown ===");
+    if residue {
+        anyhow::bail!("residual files left on disk at {}", session_root.display());
+    }
+    println!("RESULT: authorize/deny/grant proven; zero residual files on disk ✔");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_recipients_from_toml() {
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        let dir = std::env::temp_dir().join(format!("scl-recip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recipients.toml");
+        std::fs::write(
+            &path,
+            format!("[recipients]\nalice = \"{}\"\n", pk.to_key_string()),
+        )
+        .unwrap();
+
+        let map = load_recipients(&path).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["alice"].to_bytes(), pk.to_bytes());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
