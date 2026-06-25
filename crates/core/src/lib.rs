@@ -14,4 +14,4 @@ pub use id::ObjectId;
 pub use object::{
     EntryKind, FileMode, Object, Secret, Snapshot, Tree, TreeEntry, WrappedKey,
 };
-pub use store::{SpillPolicy, Store, StoreConfig, StoreStats};
+pub use store::{Backend, SpillPolicy, Store, StoreConfig, StoreStats};

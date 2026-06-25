@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::id::ObjectId;
 use crate::object::Object;
 
-/// What to do when the blob budget is exhausted.
+/// What to do when the blob budget is exhausted (ephemeral mode only).
 #[derive(Clone, Debug)]
 pub enum SpillPolicy {
     /// Never spill: an over-budget insert returns `BudgetExceeded`.
@@ -23,18 +23,28 @@ pub enum SpillPolicy {
     SpillTo(PathBuf),
 }
 
+/// Where objects live. Ephemeral is the Phase 1 RAM-first store; Persistent
+/// write-throughs every object to a durable `.sc/objects/` directory.
+#[derive(Clone, Debug)]
+pub enum Backend {
+    /// RAM + optional ephemeral spill; the spill dir is removed on `Drop`.
+    Ephemeral(SpillPolicy),
+    /// RAM + write-through to this objects directory; never removed on `Drop`.
+    Persistent(PathBuf),
+}
+
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
     /// Maximum resident blob bytes. Trees/snapshots/secrets are not counted.
     pub budget_bytes: usize,
-    pub spill: SpillPolicy,
+    pub backend: Backend,
 }
 
 impl Default for StoreConfig {
     fn default() -> Self {
         StoreConfig {
             budget_bytes: 512 * 1024 * 1024,
-            spill: SpillPolicy::Disallow,
+            backend: Backend::Ephemeral(SpillPolicy::Disallow),
         }
     }
 }
@@ -87,6 +97,23 @@ impl Store {
         Store::new(StoreConfig { budget_bytes, ..Default::default() })
     }
 
+    /// Open (or create) a persistent store backed by `objects_dir`.
+    pub fn open_persistent(objects_dir: impl Into<PathBuf>, budget_bytes: usize) -> Result<Self> {
+        let dir = objects_dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Ok(Store::new(StoreConfig {
+            budget_bytes,
+            backend: Backend::Persistent(dir),
+        }))
+    }
+
+    fn persistent_dir(&self) -> Option<&PathBuf> {
+        match &self.cfg.backend {
+            Backend::Persistent(p) => Some(p),
+            Backend::Ephemeral(_) => None,
+        }
+    }
+
     pub fn stats(&self) -> StoreStats {
         StoreStats {
             resident_blob_bytes: self.resident_blob_bytes,
@@ -103,13 +130,16 @@ impl Store {
         self.clock
     }
 
-    /// Insert an object, returning its content address. Idempotent: inserting
-    /// content already present (resident or spilled) is a no-op that returns the
-    /// existing id.
+    /// Insert an object, returning its content address. Idempotent. In
+    /// persistent mode the object is durably written before returning.
     pub fn put(&mut self, obj: Object) -> Result<ObjectId> {
         let id = obj.id();
         if self.resident.contains_key(&id) || self.spilled.contains_key(&id) {
             return Ok(id);
+        }
+        // Persistent: write-through (idempotent) before admitting to RAM.
+        if self.persistent_dir().is_some() {
+            self.write_object_file(&id, &obj.encode())?;
         }
         let blob_size = obj.blob_size();
         if blob_size > 0 {
@@ -121,7 +151,7 @@ impl Store {
         Ok(id)
     }
 
-    /// Fetch an object, rehydrating from spill on a miss. Updates recency.
+    /// Fetch an object, rehydrating from the backend on a miss.
     pub fn get(&mut self, id: &ObjectId) -> Result<Object> {
         if let Some(r) = self.resident.get_mut(id) {
             r.last_used = {
@@ -130,9 +160,9 @@ impl Store {
             };
             return Ok(r.obj.clone());
         }
+        // Ephemeral spill rehydrate (blobs only).
         if let Some(&size) = self.spilled.get(id) {
             let obj = self.read_spill(id)?;
-            // Re-admit to RAM (may trigger further eviction of other blobs).
             self.ensure_capacity(size, id)?;
             self.spilled.remove(id);
             self.resident_blob_bytes += size;
@@ -141,11 +171,30 @@ impl Store {
             self.resident.insert(*id, Resident { obj: obj.clone(), blob_size: size, last_used: t });
             return Ok(obj);
         }
+        // Persistent backend: load any object kind from disk.
+        if self.persistent_dir().is_some() {
+            let obj = self.read_object_file(id)?;
+            let blob_size = obj.blob_size();
+            if blob_size > 0 {
+                self.ensure_capacity(blob_size, id)?;
+                self.resident_blob_bytes += blob_size;
+            }
+            self.rehydrations += 1;
+            let t = self.tick();
+            self.resident.insert(*id, Resident { obj: obj.clone(), blob_size, last_used: t });
+            return Ok(obj);
+        }
         Err(Error::NotFound(*id))
     }
 
     pub fn contains(&self, id: &ObjectId) -> bool {
-        self.resident.contains_key(id) || self.spilled.contains_key(id)
+        if self.resident.contains_key(id) || self.spilled.contains_key(id) {
+            return true;
+        }
+        if let Some(dir) = self.persistent_dir() {
+            return dir.join(id.to_hex()).exists();
+        }
+        false
     }
 
     // ---- typed convenience helpers -----------------------------------------
@@ -201,8 +250,8 @@ impl Store {
                 });
             };
 
-            match &self.cfg.spill {
-                SpillPolicy::Disallow => {
+            match &self.cfg.backend {
+                Backend::Ephemeral(SpillPolicy::Disallow) => {
                     let available = self.evictable_bytes(incoming);
                     return Err(Error::BudgetExceeded {
                         needed,
@@ -210,7 +259,8 @@ impl Store {
                         budget: self.cfg.budget_bytes,
                     });
                 }
-                SpillPolicy::SpillTo(_) => self.evict_to_spill(&victim)?,
+                Backend::Ephemeral(SpillPolicy::SpillTo(_)) => self.evict_to_spill(&victim)?,
+                Backend::Persistent(_) => self.drop_resident_blob(&victim),
             }
         }
     }
@@ -241,10 +291,42 @@ impl Store {
     // ---- spill backend ------------------------------------------------------
 
     fn spill_dir(&self) -> Option<&PathBuf> {
-        match &self.cfg.spill {
-            SpillPolicy::SpillTo(p) => Some(p),
-            SpillPolicy::Disallow => None,
+        match &self.cfg.backend {
+            Backend::Ephemeral(SpillPolicy::SpillTo(p)) => Some(p),
+            _ => None,
         }
+    }
+
+    /// Persistent eviction: drop the RAM copy; the durable file is authoritative.
+    fn drop_resident_blob(&mut self, id: &ObjectId) {
+        if let Some(r) = self.resident.remove(id) {
+            self.resident_blob_bytes -= r.blob_size;
+            self.evictions += 1;
+        }
+    }
+
+    /// Write `encode()` bytes to `objects/<hex>` idempotently (tmp + rename).
+    fn write_object_file(&mut self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
+        let dir = self.persistent_dir().expect("persistent backend").clone();
+        let final_path = dir.join(id.to_hex());
+        if final_path.exists() {
+            return Ok(());
+        }
+        let tmp = dir.join(format!("{}.tmp", id.to_hex()));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &final_path)?;
+        Ok(())
+    }
+
+    /// Read+verify+decode an object file. Hash mismatch => `Malformed`.
+    fn read_object_file(&self, id: &ObjectId) -> Result<Object> {
+        let dir = self.persistent_dir().ok_or(Error::NotFound(*id))?;
+        let path = dir.join(id.to_hex());
+        let bytes = std::fs::read(&path).map_err(|_| Error::NotFound(*id))?;
+        if ObjectId::of(&bytes) != *id {
+            return Err(Error::Malformed(format!("object {id} failed hash verification on read")));
+        }
+        Object::decode(&bytes)
     }
 
     fn ensure_spill_dir(&mut self) -> Result<()> {
@@ -315,7 +397,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("scl-spill-test-{}", std::process::id()));
         let mut s = Store::new(StoreConfig {
             budget_bytes: 150,
-            spill: SpillPolicy::SpillTo(dir.clone()),
+            backend: Backend::Ephemeral(SpillPolicy::SpillTo(dir.clone())),
         });
         let a = s.put(blob(100, 0xAA)).unwrap();
         // Touch nothing; insert b -> a is coldest and must spill.
@@ -331,5 +413,75 @@ mod tests {
         assert_eq!(s.stats().rehydrations, 1);
         drop(s);
         assert!(!dir.exists(), "spill dir must be removed on drop");
+    }
+
+    use crate::object::{Object, Snapshot, Tree};
+    use std::collections::BTreeMap;
+
+    fn temp_objects_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("scl-persist-{tag}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn persistent_put_then_reopen_reads_all_kinds() {
+        let dir = temp_objects_dir("reopen");
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob_id;
+        let snap_id;
+        {
+            let mut s = Store::open_persistent(&dir, 1024).unwrap();
+            blob_id = s.put(Object::blob(b"hello".to_vec())).unwrap();
+            let root = s.put(Object::Tree(Tree::new(vec![]))).unwrap();
+            snap_id = s
+                .put(Object::Snapshot(Snapshot {
+                    root,
+                    parents: vec![],
+                    author: "a".into(),
+                    timestamp: 0,
+                    message: "m".into(),
+                    secrets: BTreeMap::new(),
+                }))
+                .unwrap();
+        } // store dropped; nothing deleted
+        // Reopen on the same dir: resident cache is empty, must load from disk.
+        let mut s2 = Store::open_persistent(&dir, 1024).unwrap();
+        assert_eq!(&s2.get(&blob_id).unwrap().encode(), &Object::blob(b"hello".to_vec()).encode());
+        assert!(matches!(s2.get(&snap_id).unwrap(), Object::Snapshot(_)));
+        drop(s2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_corrupt_object_fails_hash_verify() {
+        let dir = temp_objects_dir("corrupt");
+        let _ = std::fs::remove_dir_all(&dir);
+        let id;
+        {
+            let mut s = Store::open_persistent(&dir, 1024).unwrap();
+            id = s.put(Object::blob(b"data".to_vec())).unwrap();
+        }
+        // Corrupt the file on disk.
+        std::fs::write(dir.join(id.to_hex()), b"tampered").unwrap();
+        let mut s2 = Store::open_persistent(&dir, 1024).unwrap();
+        assert!(matches!(s2.get(&id), Err(Error::Malformed(_))));
+        drop(s2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_eviction_drops_ram_but_reloads_from_disk() {
+        let dir = temp_objects_dir("evict");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Store::open_persistent(&dir, 150).unwrap();
+        let a = s.put(Object::blob(vec![0xAA; 100])).unwrap();
+        let _b = s.put(Object::blob(vec![0xBB; 100])).unwrap(); // forces a to evict from RAM
+        assert!(s.stats().evictions >= 1);
+        // a is gone from RAM but on disk; get reloads it.
+        match s.get(&a).unwrap() {
+            Object::Blob(b) => assert!(b.iter().all(|&x| x == 0xAA)),
+            _ => panic!("wrong kind"),
+        }
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
