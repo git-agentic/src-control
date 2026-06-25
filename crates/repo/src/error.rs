@@ -16,6 +16,10 @@ pub enum Error {
     BadRef(String),
     #[error("branch not found: {0}")]
     NoSuchBranch(String),
+    #[error("secret not found: {0}")]
+    NoSuchSecret(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("operation requires at least one commit (branch is unborn)")]
     Unborn,
     #[error(transparent)]

@@ -72,13 +72,13 @@ impl Repo {
     /// Grant `new` access to `name` by re-wrapping the DEK with `authorized`.
     pub fn secret_grant(&self, name: &str, authorized: &SecretKey, new: &PublicKey) -> Result<ObjectId> {
         let mut reg = self.registry()?;
-        let sid = *reg.get(name).ok_or_else(|| Error::BadRef(format!("no secret {name}")))?;
+        let sid = *reg.get(name).ok_or_else(|| Error::NoSuchSecret(name.to_string()))?;
         let secret = {
             let arc = self.store_arc();
             let obj = arc.lock().unwrap().get(&sid)?;
             match obj {
                 Object::Secret(s) => s,
-                _ => return Err(Error::BadRef(format!("{name} is not a secret"))),
+                _ => return Err(Error::NoSuchSecret(format!("{name} is not a secret"))),
             }
         };
         let regranted = scl_crypto::rewrap_for(&secret, authorized, new)?;
@@ -94,13 +94,13 @@ impl Repo {
     /// Revoke a recipient from `name` (metadata-only re-wrap).
     pub fn secret_revoke(&self, name: &str, recipient: &RecipientId) -> Result<ObjectId> {
         let mut reg = self.registry()?;
-        let sid = *reg.get(name).ok_or_else(|| Error::BadRef(format!("no secret {name}")))?;
+        let sid = *reg.get(name).ok_or_else(|| Error::NoSuchSecret(name.to_string()))?;
         let secret = {
             let arc = self.store_arc();
             let obj = arc.lock().unwrap().get(&sid)?;
             match obj {
                 Object::Secret(s) => s,
-                _ => return Err(Error::BadRef(format!("{name} is not a secret"))),
+                _ => return Err(Error::NoSuchSecret(format!("{name} is not a secret"))),
             }
         };
         let revoked = scl_crypto::revoke(&secret, recipient);
@@ -146,6 +146,12 @@ impl Repo {
             };
             match scl_crypto::open(&secret, identity) {
                 Ok(plaintext) => {
+                    // The decrypted bytes are copied into an `OsString` for the
+                    // child's environment. That `OsString` is NOT separately
+                    // zeroized (and the kernel copies the environment into the
+                    // child anyway), so this is a best-effort confidentiality
+                    // limit inherent to env-var injection — the plaintext lives
+                    // in this process's memory until `command` is dropped.
                     #[cfg(unix)]
                     let val = {
                         use std::os::unix::ffi::OsStrExt;
@@ -154,7 +160,7 @@ impl Repo {
                     #[cfg(not(unix))]
                     let val = OsString::from(
                         std::str::from_utf8(&plaintext)
-                            .map_err(|_| Error::BadRef(format!("secret {name} not UTF-8")))?,
+                            .map_err(|_| Error::InvalidArgument(format!("secret {name} not UTF-8")))?,
                     );
                     envs.push((name, val));
                 }
@@ -164,7 +170,8 @@ impl Repo {
                 Err(e) => return Err(e.into()),
             }
         }
-        let (exe, args) = cmd.split_first().ok_or_else(|| Error::BadRef("empty command".into()))?;
+        let (exe, args) =
+            cmd.split_first().ok_or_else(|| Error::InvalidArgument("empty command".into()))?;
         let mut command = Command::new(exe);
         command.args(args);
         for (k, v) in &envs {

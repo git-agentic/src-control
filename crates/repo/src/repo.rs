@@ -30,6 +30,10 @@ impl Repo {
     /// Create a new repo at `root` (errors if `.sc/` already exists).
     pub fn init(root: impl AsRef<Path>) -> Result<Repo> {
         let layout = Layout::at(root.as_ref());
+        // The exists-check then create_dir_all is a benign TOCTOU: under the
+        // single-writer assumption (one `sc` process per repo at a time) no
+        // concurrent creator can race between the two; a second `init` either
+        // sees `.sc` and errors here or loses the lock in `open_layout`.
         if layout.dot_sc.exists() {
             return Err(Error::RepoExists(layout.dot_sc.display().to_string()));
         }
@@ -51,6 +55,7 @@ impl Repo {
         Ok(Repo { layout, vfs: VfsRepo::new(store), _lock: lock })
     }
 
+    /// The resolved on-disk paths for this repo (root, `.sc/`, refs, etc.).
     pub fn layout(&self) -> &Layout {
         &self.layout
     }
@@ -159,7 +164,17 @@ impl Repo {
     }
 
     /// Switch HEAD to `name` and materialize its tip into the working tree.
+    ///
+    /// Refuses to switch when the working tree has uncommitted modifications or
+    /// deletions, because `materialize` would silently overwrite them. (New,
+    /// untracked files are left in place and so don't block the switch.)
     pub fn switch(&self, name: &str) -> Result<()> {
+        let dirty = self.status()?;
+        if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
+            return Err(Error::InvalidArgument(
+                "working tree has uncommitted changes; commit before switching".into(),
+            ));
+        }
         let target_tip = refs::read_branch_tip(&self.layout, name)?
             .ok_or_else(|| Error::NoSuchBranch(name.to_string()))?;
         let old_root = self.head_root()?;
@@ -247,6 +262,23 @@ mod tests {
         let branches = repo.branches().unwrap();
         assert!(branches.contains(&("main".to_string(), true)));
         assert!(branches.contains(&("feature".to_string(), false)));
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn switch_refuses_to_clobber_uncommitted_changes() {
+        let root = tmp_root("switch-dirty");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        // Uncommitted edit to a tracked file.
+        std::fs::write(root.join("a.txt"), b"local-edit").unwrap();
+        let err = repo.switch("feature").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        // The uncommitted edit must be preserved (switch did not materialize).
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"local-edit");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

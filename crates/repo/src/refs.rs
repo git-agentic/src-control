@@ -49,6 +49,11 @@ pub fn head_tip(layout: &Layout) -> Result<Option<ObjectId>> {
     read_branch_tip(layout, &current_branch(layout)?)
 }
 
+/// Write `bytes` to `path` via a temp file + rename so a reader never observes
+/// a half-written ref. Correctness relies on the single-writer repo lock
+/// ([`crate::lock::RepoLock`]): the fixed `.tmp` sibling means two concurrent
+/// writers to the same ref would clobber each other's temp file, so we assume
+/// at most one writer holds the lock at a time.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;

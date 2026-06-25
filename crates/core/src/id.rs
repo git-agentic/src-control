@@ -49,10 +49,16 @@ impl std::str::FromStr for ObjectId {
 
     /// Parse a 64-char hex string into an `ObjectId`.
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let bytes = hex::decode(s)
-            .map_err(|_| crate::error::Error::Malformed(format!("bad ObjectId hex: {s}")))?;
-        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-            crate::error::Error::Malformed(format!("ObjectId must be 64 hex chars, got {}", s.len()))
+        // Two distinct failures: the string isn't valid hex at all, vs. it is
+        // valid hex but decodes to the wrong number of bytes (not 32).
+        let bytes = hex::decode(s).map_err(|_| {
+            crate::error::Error::Malformed(format!("ObjectId is not valid hex: {s:?}"))
+        })?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            crate::error::Error::Malformed(format!(
+                "ObjectId must be 32 bytes (64 hex chars), got {} bytes",
+                v.len()
+            ))
         })?;
         Ok(ObjectId(arr))
     }
