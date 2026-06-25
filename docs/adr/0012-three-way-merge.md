@@ -30,12 +30,16 @@ Implement **three-way merge** keyed on a common ancestor found by walking
    re-committed. A clean merge writes a **merge snapshot** with two `parents`.
 
 `sc merge <branch>` performs the merge into the current branch. Secrets/encrypted
-entries (Phase 2/P6) merge by registry/policy entry, not by byte content.
+entries (Phase 2/P7) merge by registry/policy entry, not by byte content.
 
 ## Consequences
 
-- Branches become genuinely collaborative; `fetch` (P5) + `merge` is the standard
+- Branches become genuinely collaborative; `fetch` (P6) + `merge` is the standard
   loop.
+- **Destructive-operation safety:** `merge` refuses on a dirty working tree and
+  `merge --abort` is the explicit, reversible escape hatch — consistent with the
+  cross-cutting destructive-op approval-gate principle (no silent loss of
+  uncommitted work). See ROADMAP "Cross-cutting principles".
 - `Snapshot.parents` is already a `Vec`, so merge commits (two parents) need no
   format change.
 - Conflict representation in the working tree means a merge can leave the tree in

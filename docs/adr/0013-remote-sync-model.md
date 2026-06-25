@@ -2,13 +2,14 @@
 
 - **Status:** Proposed
 - **Date:** 2026-06-25
-- **Phase:** 5
+- **Phase:** 6
+- **Adapts:** git.agentic ADR-0006/0011 (pluggable ObjectStore backend trait)
 
 ## Context
 
 Phase 3 made repos durable on disk. The "in-memory clones" thesis pillar and real
 collaboration need a way to copy a repo and synchronize objects and refs between
-locations. This also sets up the headline P6 demo: an *unauthorized clone* that
+locations. This also sets up the headline P7 demo: an *unauthorized clone* that
 receives encrypted content it cannot read.
 
 ## Decision
@@ -29,10 +30,16 @@ implementation is a **local filesystem path** (copy between two `.sc/` repos):
   remote ref (no force this round).
 - A `Transport` trait abstracts "list refs", "has object?", "get/put object",
   "update ref" so SSH/HTTP transports can be added later without touching the
-  sync logic.
+  sync logic. This is the same backend seam GC (P8) needs; the underlying object
+  store grows `delete` and `list_prefix` (for negotiation/orphan-enumeration) plus
+  an async variant for network round-trips, with the local filesystem as the
+  default impl and remote/managed-Git backends behind adapters. **Storage-layer
+  concepts (object paths, vendor ref models) never leak into the CLI/SDK surface**
+  — callers deal in snapshots and ref names only. (Adapted from git.agentic
+  ADR-0006/0011.)
 
 **Confidentiality property:** transfer moves objects verbatim. Encrypted-path
-blobs (P6) and secret objects (Phase 2) travel as ciphertext; a clone whose holder
+blobs (P7) and secret objects (Phase 2) travel as ciphertext; a clone whose holder
 is not a recipient receives them intact but cannot decrypt — confidential by
 construction, no special-casing in the transport.
 
@@ -40,7 +47,7 @@ construction, no special-casing in the transport.
 
 - Completes a usable collaboration loop with P4 (fetch → merge).
 - Reachability-based negotiation avoids resending objects; it gets materially
-  faster once packfiles (P7) allow bulk transfer, but does not require them.
+  faster once packfiles (P8) allow bulk transfer, but does not require them.
 - Single-writer `.sc/lock` (Phase 3) must be respected on the receiving side
   during ref updates.
 - Push fast-forward-only avoids clobbering remote history this round; non-ff
@@ -54,5 +61,5 @@ construction, no special-casing in the transport.
   transports.
 - **Network transport (SSH/HTTP) first.** More moving parts (auth, framing) before
   the core sync logic is proven; deferred — local-path transport proves the model.
-- **Git's smart protocol / packfile negotiation now.** Premature before P7 defines
+- **Git's smart protocol / packfile negotiation now.** Premature before P8 defines
   our pack format; negotiation starts object-granular and upgrades later.

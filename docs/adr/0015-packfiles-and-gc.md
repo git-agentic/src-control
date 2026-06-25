@@ -2,15 +2,19 @@
 
 - **Status:** Proposed
 - **Date:** 2026-06-25
-- **Phase:** 7
+- **Phase:** 8
+- **Adapts:** git.agentic ADR-0006/0011 (backend trait `delete`/`list_prefix`),
+  and its on-disk object sharding + zstd compression
 
 ## Context
 
 Phase 3 stores every object as a loose file at `.sc/objects/<hex>`. This is simple
 and legible but does not scale: many small files waste inodes and slow directory
 walks, unreachable objects (from amended/abandoned work, rewrapped secrets, or
-superseded encrypted blobs) accumulate forever, and remote transfer (P5) is
-object-at-a-time. We need compaction and space reclamation.
+superseded encrypted blobs) accumulate forever, and remote transfer (P6) is
+object-at-a-time. We need compaction and space reclamation. The flat,
+uncompressed `.sc/objects/<hex>` layout also wastes space and strains a single
+directory as object counts grow.
 
 ## Decision
 
@@ -26,8 +30,14 @@ Add a **packfile format** and a **`sc gc`** command:
   older than a safety grace window (to avoid racing in-progress work). Reachability
   must include secret/protected-blob objects referenced by snapshot registries and
   policies, not just the file tree.
-- **Transfer integration** — P5's `Transport` can move a packfile in bulk instead
+- **Transfer integration** — P6's `Transport` can move a packfile in bulk instead
   of object-by-object once both ends understand the pack format.
+- **Loose-object storage refinements** (adapted from git.agentic): shard loose
+  objects into `objects/<first-2-hex>/<rest>` to keep directories small, and
+  **zstd-compress** object payloads on disk (the canonical bytes are decompressed
+  and BLAKE3-verified on read, so the content-address invariant is unchanged).
+  The store gains `delete` and `list_prefix` operations (the latter for orphan
+  enumeration during GC), matching the backend trait P6 introduces.
 
 ## Consequences
 

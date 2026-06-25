@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-06-25
-- **Phase:** 8
+- **Phase:** 9
 
 ## Context
 
@@ -30,7 +30,7 @@ per ADR-0007):
   protected content" mode is a documented option.)
 
 Import (ADR-0007) plus export gives round-trip interop; full bidirectional sync
-(treating Git as a remote via the P5 `Transport`) is a later extension.
+(treating Git as a remote via the P6 `Transport`) is a later extension.
 
 ## Consequences
 

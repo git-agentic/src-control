@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-06-25
-- **Phase:** 6
+- **Phase:** 7
 
 ## Context
 
@@ -10,7 +10,7 @@ The third thesis pillar is per-file permissions. We scope the first cut to
 **read confidentiality**: designate paths/subtrees as private so their content is
 readable only by authorized recipients. This generalizes the Phase 2 committed-
 secrets envelope from named env vars to arbitrary file content, and — combined
-with clone (P5) — yields the headline property: an unauthorized clone receives the
+with clone (P6) — yields the headline property: an unauthorized clone receives the
 protected files but only as ciphertext.
 
 A tension with the project's bedrock invariant (content addressing, "identical
