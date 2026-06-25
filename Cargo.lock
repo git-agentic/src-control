@@ -1898,6 +1898,7 @@ dependencies = [
  "scl-core",
  "scl-crypto",
  "scl-gitio",
+ "scl-repo",
  "scl-vfs",
  "serde",
  "toml",
