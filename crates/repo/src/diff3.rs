@@ -7,159 +7,88 @@
 //! conflict. Operates on `\n`-separated lines and preserves a trailing newline.
 
 /// Result of a three-way line merge.
+#[derive(Debug)]
 pub struct Merged {
     pub text: String,
     pub conflicted: bool,
 }
 
+/// Which side a hunk came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Ours,
+    Theirs,
+}
+
 /// Three-way merge of three text buffers.
+///
+/// Uses a unified chunk-list diff3: each side is diffed against `base` into
+/// maximal change hunks (replacements and pure insertions), the hunks from both
+/// sides are grouped into clusters whose base ranges interact, and each cluster
+/// is reconciled independently. Non-interacting edits both apply cleanly;
+/// overlapping or coincident edits that differ produce conflict markers.
 pub fn merge_lines(base: &str, ours: &str, theirs: &str) -> Merged {
-    let (b, _b_nl) = split_lines(base);
+    let (b, b_nl) = split_lines(base);
     let (o, o_nl) = split_lines(ours);
     let (t, t_nl) = split_lines(theirs);
 
     // Build hunks from two independent diffs (base→ours, base→theirs).
-    // Each hunk is a range of base indices and the corresponding replacement lines.
     let o_hunks = diff_hunks(&b, &o);
     let t_hunks = diff_hunks(&b, &t);
 
-    // Merge the two hunk lists by scanning base line by line.
+    // Combine all hunks into one list tagged by side, then form clusters from
+    // hunks whose base ranges interact (across sides).
+    let mut all: Vec<(Side, Hunk)> = Vec::new();
+    for h in o_hunks {
+        all.push((Side::Ours, h));
+    }
+    for h in t_hunks {
+        all.push((Side::Theirs, h));
+    }
+
+    let clusters = cluster_hunks(&all);
+
     let mut out: Vec<&str> = Vec::new();
     let mut conflicted = false;
+    let mut bi = 0usize; // next unconsumed base index
 
-    let mut bi = 0usize; // current base index
-    let mut oi = 0usize; // index into o_hunks
-    let mut ti = 0usize; // index into t_hunks
+    for cluster in &clusters {
+        // [lo, hi) is the base window spanned by this cluster's hunks.
+        let lo = cluster.iter().map(|&i| all[i].1.base_start).min().unwrap();
+        let hi = cluster.iter().map(|&i| all[i].1.base_end).max().unwrap();
 
-    while bi <= b.len() {
-        let o_hunk = o_hunks.get(oi);
-        let t_hunk = t_hunks.get(ti);
-
-        // Find the next hunk start.
-        let next_o = o_hunk.map(|h: &Hunk| h.base_start).unwrap_or(usize::MAX);
-        let next_t = t_hunk.map(|h: &Hunk| h.base_start).unwrap_or(usize::MAX);
-
-        let next_change = next_o.min(next_t);
-
-        // Emit unchanged base lines up to the next change.
-        let emit_until = next_change.min(b.len());
-        while bi < emit_until {
+        // Copy stable base lines preceding the cluster.
+        while bi < lo {
             out.push(b[bi]);
             bi += 1;
         }
 
-        if bi >= b.len() && next_change == usize::MAX {
-            break;
-        }
-        if next_change == usize::MAX {
-            break;
-        }
+        let base_region = &b[lo..hi];
+        let ours_text = apply_side(&b, lo, hi, &all, cluster, Side::Ours);
+        let theirs_text = apply_side(&b, lo, hi, &all, cluster, Side::Theirs);
 
-        // Both hunks start at the same base position → potential conflict.
-        if next_o == next_t {
-            let oh = o_hunk.unwrap();
-            let th = t_hunk.unwrap();
-
-            // Determine the base range covered by either hunk.
-            let base_end = oh.base_end.max(th.base_end);
-
-            // Collect all o_hunks and t_hunks that overlap [next_change, base_end).
-            let mut o_replacement: Vec<&str> = Vec::new();
-            let mut t_replacement: Vec<&str> = Vec::new();
-            let mut base_end_combined = base_end;
-
-            let mut oi2 = oi;
-            let mut ti2 = ti;
-
-            loop {
-                let more_o = o_hunks
-                    .get(oi2)
-                    .map(|h| h.base_start < base_end_combined)
-                    .unwrap_or(false);
-                let more_t = t_hunks
-                    .get(ti2)
-                    .map(|h| h.base_start < base_end_combined)
-                    .unwrap_or(false);
-                if !more_o && !more_t {
-                    break;
-                }
-                if more_o {
-                    let h = &o_hunks[oi2];
-                    // Fill gap with base lines.
-                    while o_replacement.len() < h.base_start.saturating_sub(bi) {
-                        let idx = bi + o_replacement.len();
-                        if idx < b.len() {
-                            o_replacement.push(b[idx]);
-                        }
-                    }
-                    o_replacement.extend_from_slice(&h.replacement);
-                    base_end_combined = base_end_combined.max(h.base_end);
-                    oi2 += 1;
-                }
-                if more_t {
-                    let h = &t_hunks[ti2];
-                    while t_replacement.len() < h.base_start.saturating_sub(bi) {
-                        let idx = bi + t_replacement.len();
-                        if idx < b.len() {
-                            t_replacement.push(b[idx]);
-                        }
-                    }
-                    t_replacement.extend_from_slice(&h.replacement);
-                    base_end_combined = base_end_combined.max(h.base_end);
-                    ti2 += 1;
-                }
-            }
-
-            // Fill remaining base lines (between last hunk end and base_end_combined).
-            let o_base_len = base_end_combined - bi;
-            let t_base_len = base_end_combined - bi;
-            while o_replacement.len() < o_base_len {
-                let idx = bi + o_replacement.len();
-                if idx < b.len() {
-                    o_replacement.push(b[idx]);
-                }
-            }
-            while t_replacement.len() < t_base_len {
-                let idx = bi + t_replacement.len();
-                if idx < b.len() {
-                    t_replacement.push(b[idx]);
-                }
-            }
-
-            let base_region = &b[bi..base_end_combined.min(b.len())];
-
-            if o_replacement == t_replacement {
-                out.extend_from_slice(&o_replacement);
-            } else if o_replacement == base_region {
-                out.extend_from_slice(&t_replacement);
-            } else if t_replacement == base_region {
-                out.extend_from_slice(&o_replacement);
-            } else {
-                conflicted = true;
-                out.push("<<<<<<< ours");
-                out.extend_from_slice(&o_replacement);
-                out.push("=======");
-                out.extend_from_slice(&t_replacement);
-                out.push(">>>>>>> theirs");
-            }
-
-            bi = base_end_combined;
-            oi = oi2;
-            ti = ti2;
-        } else if next_o < next_t {
-            // Only ours has a hunk here.
-            let oh = o_hunk.unwrap();
-            // Emit base lines between bi and oh.base_start (already done above).
-            out.extend_from_slice(&oh.replacement);
-            bi = oh.base_end;
-            oi += 1;
+        if ours_text == base_region {
+            out.extend_from_slice(&theirs_text);
+        } else if theirs_text == base_region {
+            out.extend_from_slice(&ours_text);
+        } else if ours_text == theirs_text {
+            out.extend_from_slice(&ours_text);
         } else {
-            // Only theirs has a hunk here.
-            let th = t_hunk.unwrap();
-            out.extend_from_slice(&th.replacement);
-            bi = th.base_end;
-            ti += 1;
+            conflicted = true;
+            out.push("<<<<<<< ours");
+            out.extend_from_slice(&ours_text);
+            out.push("=======");
+            out.extend_from_slice(&theirs_text);
+            out.push(">>>>>>> theirs");
         }
+
+        bi = hi;
+    }
+
+    // Copy any base lines after the last cluster.
+    while bi < b.len() {
+        out.push(b[bi]);
+        bi += 1;
     }
 
     let mut text = out.join("\n");
@@ -169,12 +98,115 @@ pub fn merge_lines(base: &str, ours: &str, theirs: &str) -> Merged {
     } else if !t.is_empty() {
         t_nl
     } else {
-        _b_nl
+        b_nl
     };
     if !text.is_empty() && trailing {
         text.push('\n');
     }
     Merged { text, conflicted }
+}
+
+/// Reconstruct `base[lo..hi]` with one side's hunks (from `cluster`) applied.
+/// A side with no hunk in the cluster contributes `base[lo..hi]` verbatim.
+fn apply_side<'a>(
+    b: &[&'a str],
+    lo: usize,
+    hi: usize,
+    all: &[(Side, Hunk<'a>)],
+    cluster: &[usize],
+    side: Side,
+) -> Vec<&'a str> {
+    // Collect this side's hunks in this cluster, sorted by base_start.
+    let mut hunks: Vec<&Hunk<'a>> = cluster
+        .iter()
+        .filter(|&&i| all[i].0 == side)
+        .map(|&i| &all[i].1)
+        .collect();
+    hunks.sort_by_key(|h| (h.base_start, h.base_end));
+
+    let mut out: Vec<&'a str> = Vec::new();
+    let mut cursor = lo;
+    for h in hunks {
+        // Copy untouched base lines up to this hunk's start.
+        while cursor < h.base_start {
+            out.push(b[cursor]);
+            cursor += 1;
+        }
+        out.extend_from_slice(&h.replacement);
+        cursor = cursor.max(h.base_end);
+    }
+    // Copy remaining untouched base lines to the window end.
+    while cursor < hi {
+        out.push(b[cursor]);
+        cursor += 1;
+    }
+    out
+}
+
+/// Group hunks into clusters by the connected components of the interaction
+/// relation. Returns a list of clusters, each a list of indices into `all`,
+/// ordered by the cluster's minimum base_start.
+fn cluster_hunks(all: &[(Side, Hunk)]) -> Vec<Vec<usize>> {
+    let n = all.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        // Path compression.
+        let mut c = x;
+        while parent[c] != r {
+            let next = parent[c];
+            parent[c] = r;
+            c = next;
+        }
+        r
+    }
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if all[i].0 != all[j].0 && interacts(&all[i].1, &all[j].1) {
+                let ri = find(&mut parent, i);
+                let rj = find(&mut parent, j);
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+
+    // Bucket indices by their representative, preserving discovery order.
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+
+    let mut clusters: Vec<Vec<usize>> = groups.into_values().collect();
+    // Order clusters by their earliest base position so the walk is left-to-right.
+    clusters.sort_by_key(|c| c.iter().map(|&i| all[i].1.base_start).min().unwrap());
+    clusters
+}
+
+/// Whether two hunks (assumed to be on different sides) interact and so belong
+/// in the same cluster. Replacements interact on half-open range overlap; pure
+/// insertions cluster with insertions at the same point and with any hunk whose
+/// closed base range `[start, end]` contains the insertion point.
+fn interacts(a: &Hunk, b: &Hunk) -> bool {
+    let a_ins = a.base_start == a.base_end;
+    let b_ins = b.base_start == b.base_end;
+    match (a_ins, b_ins) {
+        // Both pure insertions: cluster only if at the same point.
+        (true, true) => a.base_start == b.base_start,
+        // a is an insertion at point p; cluster if b's closed range contains p.
+        (true, false) => b.base_start <= a.base_start && a.base_start <= b.base_end,
+        // b is an insertion at point p; cluster if a's closed range contains p.
+        (false, true) => a.base_start <= b.base_start && b.base_start <= a.base_end,
+        // Two replacements: half-open range overlap.
+        (false, false) => a.base_start < b.base_end && b.base_start < a.base_end,
+    }
 }
 
 /// A changed region: base lines [base_start, base_end) are replaced by `replacement`.
@@ -319,5 +351,85 @@ mod tests {
         let m = merge_lines(base, ours, theirs);
         assert!(!m.conflicted);
         assert_eq!(m.text, "a\nB");
+    }
+
+    #[test]
+    fn overlapping_offset_hunks_conflict() {
+        // Bug #1: overlapping-but-offset hunks must conflict, not silently
+        // produce "a\nX\nY\nC\n".
+        let base = "a\nb\nc\n";
+        let ours = "a\nX\nY\n";
+        let theirs = "a\nb\nC\n";
+        let m = merge_lines(base, ours, theirs);
+        assert!(m.conflicted);
+        assert!(m.text.contains("<<<<<<< ours"));
+        assert_ne!(m.text, "a\nX\nY\nC\n");
+    }
+
+    #[test]
+    fn both_insert_into_empty_base_conflict() {
+        // Bug #2: pure insertions into an empty base must conflict with both
+        // adds present, not drop a side.
+        let base = "";
+        let ours = "a\n";
+        let theirs = "b\n";
+        let m = merge_lines(base, ours, theirs);
+        assert!(m.conflicted);
+        assert!(m.text.contains('a'));
+        assert!(m.text.contains('b'));
+        assert!(m.text.contains("<<<<<<< ours"));
+        assert!(m.text.contains(">>>>>>> theirs"));
+    }
+
+    #[test]
+    fn both_append_at_eof_conflict() {
+        // Bug #2: appends at EOF must conflict with both adds present.
+        let base = "a\n";
+        let ours = "a\nX\n";
+        let theirs = "a\nY\n";
+        let m = merge_lines(base, ours, theirs);
+        assert!(m.conflicted);
+        assert!(m.text.contains('X'));
+        assert!(m.text.contains('Y'));
+    }
+
+    #[test]
+    fn both_delete_same_lines_clean() {
+        let base = "a\nb\nc\n";
+        let ours = "a\nc\n";
+        let theirs = "a\nc\n";
+        let m = merge_lines(base, ours, theirs);
+        assert!(!m.conflicted);
+        assert_eq!(m.text, "a\nc\n");
+    }
+
+    #[test]
+    fn delete_modify_conflict() {
+        let base = "a\nb\nc\n";
+        let ours = "a\nc\n"; // deletes b
+        let theirs = "a\nB\nc\n"; // modifies b
+        let m = merge_lines(base, ours, theirs);
+        assert!(m.conflicted);
+    }
+
+    #[test]
+    fn both_insert_identical_clean() {
+        let base = "a\n";
+        let ours = "a\nZ\n";
+        let theirs = "a\nZ\n";
+        let m = merge_lines(base, ours, theirs);
+        assert!(!m.conflicted);
+        assert_eq!(m.text, "a\nZ\n");
+    }
+
+    #[test]
+    fn repeated_identical_lines_no_panic() {
+        let base = "x\nx\nx\n";
+        let ours = "x\nx\nx\nx\n";
+        let theirs = "x\nx\n";
+        let m = merge_lines(base, ours, theirs);
+        // Must not panic; just assert it returns a value.
+        let _ = m.conflicted;
+        let _ = m.text;
     }
 }

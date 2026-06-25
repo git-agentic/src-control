@@ -50,13 +50,31 @@ pub fn write(layout: &Layout, theirs: &ObjectId, conflicts: &[String]) -> Result
 
 /// Clear all merge state (after a successful merge commit or `--abort`).
 pub fn clear(layout: &Layout) -> Result<()> {
-    let _ = std::fs::remove_file(merge_head_path(layout));
-    let _ = std::fs::remove_file(merge_conflicts_path(layout));
+    remove_if_exists(&merge_head_path(layout))?;
+    remove_if_exists(&merge_conflicts_path(layout))?;
     Ok(())
 }
 
+/// Remove a file, treating "already absent" as success but propagating any
+/// other IO error rather than swallowing it.
+fn remove_if_exists(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    // Build the tmp path as "<file_name>.tmp" so we don't clobber a sibling
+    // that differs only by extension (e.g. MERGE_HEAD vs MERGE_HEAD.tmp, not
+    // turning "foo.bar" into "foo.tmp").
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::InvalidArgument(format!("path has no file name: {}", path.display())))?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = path.with_file_name(format!("{name}.tmp"));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
