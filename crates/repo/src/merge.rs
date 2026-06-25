@@ -9,8 +9,10 @@ use crate::diff3;
 use crate::error::{Error, Result};
 use crate::worktree::tree_file_entries;
 
-/// The lowest common ancestor of `a` and `b` over the parent DAG, or `None` if
-/// the two share no ancestor. Walks ancestors breadth-first from both tips.
+/// *A* lowest common ancestor of `a` and `b` over the parent DAG, or `None` if
+/// the two share no ancestor. Walks ancestors breadth-first from both tips. In a
+/// criss-cross history there can be multiple incomparable LCAs; the one returned
+/// is BFS-order-dependent and may differ if `a` and `b` are swapped.
 pub fn merge_base(store: &mut Store, a: ObjectId, b: ObjectId) -> Result<Option<ObjectId>> {
     let a_anc = ancestors(store, a)?;
     // BFS from b; first node also in a's ancestor set is a lowest common ancestor.
@@ -126,7 +128,13 @@ pub fn three_way(
 
         // Both sides changed differently.
         match (o, t) {
-            (Some((oid, omode)), Some((tid, _tmode))) => {
+            (Some((oid, omode)), Some((tid, tmode))) => {
+                // Mode resolves like Git: executable if either side is.
+                let mode = if omode == FileMode::EXEC || tmode == FileMode::EXEC {
+                    FileMode::EXEC
+                } else {
+                    FileMode::FILE
+                };
                 let ob = blob_bytes(store, oid)?;
                 let tb = blob_bytes(store, tid)?;
                 let bb = match b {
@@ -135,18 +143,21 @@ pub fn three_way(
                 };
                 match (std::str::from_utf8(&ob), std::str::from_utf8(&tb)) {
                     (Ok(os), Ok(ts)) => {
+                        // A non-UTF-8 base falls back to an empty base (rare
+                        // encoding-change case): yields a conservative conflict,
+                        // never corruption.
                         let base_text = std::str::from_utf8(&bb).unwrap_or("");
                         let m = diff3::merge_lines(base_text, os, ts);
                         if m.conflicted {
                             conflicts.push(path.clone());
                         }
-                        files.push((path, omode, m.text.into_bytes()));
+                        files.push((path, mode, m.text.into_bytes()));
                     }
                     _ => {
                         // binary conflict: keep ours, write theirs sidecar
                         conflicts.push(path.clone());
                         sidecars.push((format!("{path}.theirs"), tb));
-                        files.push((path, omode, ob));
+                        files.push((path, mode, ob));
                     }
                 }
             }
@@ -313,6 +324,110 @@ mod tests {
         assert_eq!(m.conflicts, vec!["f.txt"]);
         let f = &m.files.iter().find(|(p, _, _)| p == "f.txt").unwrap().2;
         assert!(String::from_utf8_lossy(f).contains("<<<<<<< ours"));
+    }
+
+    /// Like `commit_files` but takes raw bytes, so non-UTF-8 blobs can be built.
+    fn commit_bytes(
+        store_repo: &VfsRepo,
+        files: &[(&str, Vec<u8>)],
+        parents: Vec<ObjectId>,
+    ) -> ObjectId {
+        let fs: Vec<(String, Vec<u8>, FileMode)> = files
+            .iter()
+            .map(|(p, c)| (p.to_string(), c.clone(), FileMode::FILE))
+            .collect();
+        let root = store_repo.write_tree(&fs).unwrap();
+        let arc = store_repo.store();
+        let mut s = arc.lock().unwrap();
+        s.put(Object::Snapshot(scl_core::Snapshot {
+            root,
+            parents,
+            author: "t".into(),
+            timestamp: 0,
+            message: "c".into(),
+            secrets: BTreeMap::new(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn delete_modify_ours_deletes_theirs_modifies_conflict() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let base = commit_files(&repo, &[("f.txt", "a\nb\nc\n")], vec![]);
+        // ours deletes f.txt (absent from the file set)
+        let ours = commit_files(&repo, &[("keep.txt", "k\n")], vec![base]);
+        // theirs modifies f.txt
+        let theirs = commit_files(&repo, &[("f.txt", "a\nB\nc\n")], vec![base]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let m = three_way(&mut s, base, ours, theirs).unwrap();
+        assert_eq!(m.conflicts, vec!["f.txt"]);
+        // surviving (theirs') content is kept
+        let f = m.files.iter().find(|(p, _, _)| p == "f.txt").unwrap();
+        assert_eq!(f.2, b"a\nB\nc\n");
+    }
+
+    #[test]
+    fn delete_modify_ours_modifies_theirs_deletes_conflict() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let base = commit_files(&repo, &[("f.txt", "a\nb\nc\n")], vec![]);
+        // ours modifies f.txt
+        let ours = commit_files(&repo, &[("f.txt", "a\nB\nc\n")], vec![base]);
+        // theirs deletes f.txt
+        let theirs = commit_files(&repo, &[("keep.txt", "k\n")], vec![base]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let m = three_way(&mut s, base, ours, theirs).unwrap();
+        assert_eq!(m.conflicts, vec!["f.txt"]);
+        let f = m.files.iter().find(|(p, _, _)| p == "f.txt").unwrap();
+        assert_eq!(f.2, b"a\nB\nc\n");
+    }
+
+    #[test]
+    fn both_deleted_is_clean_and_absent() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let base = commit_files(&repo, &[("f.txt", "a\nb\nc\n"), ("keep.txt", "k\n")], vec![]);
+        // both sides delete f.txt
+        let ours = commit_files(&repo, &[("keep.txt", "k\n")], vec![base]);
+        let theirs = commit_files(&repo, &[("keep.txt", "k\n")], vec![base]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let m = three_way(&mut s, base, ours, theirs).unwrap();
+        assert!(m.conflicts.is_empty());
+        assert!(!m.files.iter().any(|(p, _, _)| p == "f.txt"));
+    }
+
+    #[test]
+    fn one_sided_delete_is_clean_and_absent() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let base = commit_files(&repo, &[("f.txt", "a\nb\nc\n"), ("keep.txt", "k\n")], vec![]);
+        // ours deletes f.txt; theirs leaves it unchanged
+        let ours = commit_files(&repo, &[("keep.txt", "k\n")], vec![base]);
+        let theirs = commit_files(&repo, &[("f.txt", "a\nb\nc\n"), ("keep.txt", "k\n")], vec![base]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let m = three_way(&mut s, base, ours, theirs).unwrap();
+        assert!(m.conflicts.is_empty());
+        assert!(!m.files.iter().any(|(p, _, _)| p == "f.txt"));
+    }
+
+    #[test]
+    fn binary_conflict_keeps_ours_and_writes_sidecar() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let base = commit_bytes(&repo, &[("b.bin", vec![0x00])], vec![]);
+        // two different non-UTF-8 byte sequences
+        let ours = commit_bytes(&repo, &[("b.bin", vec![0xff, 0x00])], vec![base]);
+        let theirs = commit_bytes(&repo, &[("b.bin", vec![0x00, 0xff])], vec![base]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let m = three_way(&mut s, base, ours, theirs).unwrap();
+        assert_eq!(m.conflicts, vec!["b.bin"]);
+        // sidecar with theirs' bytes
+        let sidecar = m.sidecars.iter().find(|(p, _)| p == "b.bin.theirs").unwrap();
+        assert_eq!(sidecar.1, vec![0x00, 0xff]);
+        // file kept with ours' bytes
+        let f = m.files.iter().find(|(p, _, _)| p == "b.bin").unwrap();
+        assert_eq!(f.2, vec![0xff, 0x00]);
     }
 
     #[test]
