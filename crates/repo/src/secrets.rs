@@ -53,7 +53,7 @@ impl Repo {
             }
             None => self.vfs_handle().write_tree(&[])?, // empty tree
         };
-        self.commit_snapshot(root, tip, registry, author, message)
+        self.commit_snapshot(root, tip.into_iter().collect(), registry, author, message)
     }
 
     /// Seal `value` to `recipients` and register it under `name`.
