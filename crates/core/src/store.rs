@@ -2,10 +2,18 @@
 //!
 //! Trees, snapshots, and secrets are small and always kept resident. Blob
 //! content is bounded by a configurable byte budget; when an insert would
-//! exceed it, the coldest reconstructible blobs are evicted (LRU). With spill
-//! enabled, evicted blobs are written to a content-addressed temp directory and
-//! rehydrated on demand; without it, the store fails loudly with
-//! [`Error::BudgetExceeded`] rather than thrashing.
+//! exceed it, the coldest reconstructible blobs are evicted (LRU). What happens
+//! to an evicted blob depends on the [`Backend`]:
+//!
+//! - **Ephemeral, no spill** ([`SpillPolicy::Disallow`]): an over-budget insert
+//!   fails loudly with [`Error::BudgetExceeded`] rather than thrashing.
+//! - **Ephemeral, spill** ([`SpillPolicy::SpillTo`]): evicted blobs are written
+//!   to a content-addressed temp directory and rehydrated on demand; that
+//!   directory is removed on `Drop`, so a session leaves zero residual files.
+//! - **Persistent** ([`Backend::Persistent`]): every object is written through
+//!   to a durable objects directory on `put`; eviction merely drops the RAM copy
+//!   (disk is authoritative) and a read-miss rehydrates from disk. The directory
+//!   is never removed on `Drop`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,6 +45,8 @@ pub enum Backend {
 pub struct StoreConfig {
     /// Maximum resident blob bytes. Trees/snapshots/secrets are not counted.
     pub budget_bytes: usize,
+    /// Where objects live and what eviction does: RAM-only/spill (ephemeral) or
+    /// durable write-through (persistent). See [`Backend`].
     pub backend: Backend,
 }
 
@@ -136,6 +146,14 @@ impl Store {
         let id = obj.id();
         if self.resident.contains_key(&id) || self.spilled.contains_key(&id) {
             return Ok(id);
+        }
+        // Persistent: an object already durable on disk (e.g. evicted from RAM)
+        // is a no-op. Re-admitting it here would double-count its bytes against
+        // the budget; instead leave it on disk and let `get` rehydrate on demand.
+        if let Some(dir) = self.persistent_dir() {
+            if dir.join(id.to_hex()).exists() {
+                return Ok(id);
+            }
         }
         // Persistent: write-through (idempotent) before admitting to RAM.
         if self.persistent_dir().is_some() {
@@ -312,17 +330,23 @@ impl Store {
         if final_path.exists() {
             return Ok(());
         }
-        let tmp = dir.join(format!("{}.tmp", id.to_hex()));
+        // Per-process tmp name so a concurrent writer can't clobber our staging
+        // file mid-write before the atomic rename.
+        let tmp = dir.join(format!("{}.{}.tmp", id.to_hex(), std::process::id()));
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &final_path)?;
         Ok(())
     }
 
-    /// Read+verify+decode an object file. Hash mismatch => `Malformed`.
+    /// Read+verify+decode an object file. A missing file is `NotFound`; other IO
+    /// errors propagate as `Io`. A hash mismatch is `Malformed`.
     fn read_object_file(&self, id: &ObjectId) -> Result<Object> {
         let dir = self.persistent_dir().ok_or(Error::NotFound(*id))?;
         let path = dir.join(id.to_hex());
-        let bytes = std::fs::read(&path).map_err(|_| Error::NotFound(*id))?;
+        let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Error::NotFound(*id),
+            _ => Error::Io(e),
+        })?;
         if ObjectId::of(&bytes) != *id {
             return Err(Error::Malformed(format!("object {id} failed hash verification on read")));
         }
@@ -351,8 +375,15 @@ impl Store {
 
     fn read_spill(&self, id: &ObjectId) -> Result<Object> {
         let path = self.spill_dir().ok_or(Error::NotFound(*id))?.join(id.to_hex());
+        // Spill files hold RAW blob bytes (not `encode()` output), so reconstruct
+        // the blob and verify its content address rather than hashing the bytes
+        // directly.
         let bytes = std::fs::read(path)?;
-        Ok(Object::blob(bytes))
+        let obj = Object::blob(bytes);
+        if obj.id() != *id {
+            return Err(Error::Malformed(format!("spill object {id} failed hash verification")));
+        }
+        Ok(obj)
     }
 }
 
@@ -481,6 +512,33 @@ mod tests {
             Object::Blob(b) => assert!(b.iter().all(|&x| x == 0xAA)),
             _ => panic!("wrong kind"),
         }
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_reput_of_evicted_object_does_not_double_count() {
+        let dir = temp_objects_dir("reput");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Store::open_persistent(&dir, 150).unwrap();
+        let a = s.put(Object::blob(vec![0xAA; 100])).unwrap();
+        let _b = s.put(Object::blob(vec![0xBB; 100])).unwrap(); // evicts a from RAM
+        // After eviction only b is resident.
+        assert_eq!(s.stats().resident_blob_bytes, 100);
+        // Re-putting a (already durable on disk) must not re-admit + double-count.
+        let a2 = s.put(Object::blob(vec![0xAA; 100])).unwrap();
+        assert_eq!(a, a2);
+        assert_eq!(
+            s.stats().resident_blob_bytes,
+            100,
+            "re-put of an on-disk object must not re-admit to RAM"
+        );
+        // a is still readable (rehydrated from disk); this evicts b in turn.
+        match s.get(&a).unwrap() {
+            Object::Blob(b) => assert!(b.iter().all(|&x| x == 0xAA)),
+            _ => panic!("wrong kind"),
+        }
+        assert_eq!(s.stats().resident_blob_bytes, 100);
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -11,7 +11,7 @@ pub enum Error {
 
     #[error(
         "memory budget exceeded: need {needed} more bytes but only {available} reclaimable \
-         under a {budget}-byte blob budget (enable spill to grow beyond RAM)"
+         under a {budget}-byte blob budget (raise the budget, or enable spill in ephemeral mode)"
     )]
     BudgetExceeded {
         needed: usize,
@@ -25,8 +25,8 @@ pub enum Error {
     #[error("malformed object: {0}")]
     Malformed(String),
 
-    #[error("spill backend io error: {0}")]
-    Spill(#[from] std::io::Error),
+    #[error("backend io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
