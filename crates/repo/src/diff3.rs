@@ -1,10 +1,12 @@
 //! Dependency-free line-level three-way merge (diff3-style).
 //!
-//! `merge_lines(base, ours, theirs)` aligns each side to `base` via an LCS of
-//! lines, then reconciles the regions between common anchors: a region changed
-//! on only one side is taken; identical changes are taken once; genuinely
-//! divergent regions emit `<<<<<<< / ======= / >>>>>>>` markers and flag a
-//! conflict. Operates on `\n`-separated lines and preserves a trailing newline.
+//! `merge_lines(base, ours, theirs)` independently diffs each side against
+//! `base` into maximal replacement hunks (via LCS), then groups interacting
+//! hunks from both sides into clusters whose base ranges overlap. Each cluster
+//! is reconciled: a region changed on one side only is taken; identical changes
+//! on both sides are taken once; genuinely divergent clusters emit
+//! `<<<<<<< / ======= / >>>>>>>` markers and flag a conflict. Operates on
+//! `\n`-separated lines and preserves a trailing newline.
 
 /// Result of a three-way line merge.
 #[derive(Debug)]
@@ -69,9 +71,8 @@ pub fn merge_lines(base: &str, ours: &str, theirs: &str) -> Merged {
 
         if ours_text == base_region {
             out.extend_from_slice(&theirs_text);
-        } else if theirs_text == base_region {
-            out.extend_from_slice(&ours_text);
-        } else if ours_text == theirs_text {
+        } else if theirs_text == base_region || ours_text == theirs_text {
+            // Only ours changed, or both sides changed identically — take ours.
             out.extend_from_slice(&ours_text);
         } else {
             conflicted = true;

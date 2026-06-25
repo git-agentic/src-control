@@ -22,7 +22,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0009](0009-key-management-and-authorization.md) | Recipient-based key management and authorization | Accepted | 2 |
 | [0010](0010-secret-registry-and-opaque-wrapped-dek.md) | Secrets as a snapshot-side registry with an opaque wrapped DEK | Accepted | 2 |
 | [0011](0011-persistent-store-and-working-tree.md) | Persistent loose-object store and git-like working tree | Accepted | 3 |
-| [0012](0012-three-way-merge.md) | Three-way merge with a snapshot common ancestor | Proposed | 4 |
+| [0012](0012-three-way-merge.md) | Three-way merge with a snapshot common ancestor | Accepted | 4 |
 | [0017](0017-secret-scanner.md) | Accidental-plaintext secret scanner at commit time | Proposed | 5 |
 | [0013](0013-remote-sync-model.md) | Remote sync via object + ref transfer over a pluggable transport | Proposed | 6 |
 | [0014](0014-per-file-permissions-encrypted-paths.md) | Per-file permissions as encrypted paths (convergent encryption) | Proposed | 7 |

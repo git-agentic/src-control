@@ -63,6 +63,16 @@ enum Cmd {
         #[command(subcommand)]
         op: SecretOp,
     },
+    /// Merge a branch into the current branch (or fast-forward).
+    Merge {
+        /// Branch to merge in.
+        branch: Option<String>,
+        /// Abandon an in-progress merge and restore the working tree.
+        #[arg(long)]
+        abort: bool,
+        #[arg(long, default_value = "you")]
+        author: String,
+    },
     /// Decrypt authorized secrets, inject them, and run a command.
     Run {
         /// Identity file (default ~/.sc/identity or $SC_IDENTITY).
@@ -146,6 +156,7 @@ fn main() -> Result<()> {
         Cmd::Log => run_log(),
         Cmd::Branch { name } => run_branch(&name),
         Cmd::Switch { name } => run_switch(&name),
+        Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &author),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
     }
@@ -604,9 +615,17 @@ fn run_commit(author: &str, message: &str) -> Result<()> {
 
 fn run_status() -> Result<()> {
     let repo = open_repo()?;
+    if repo.merge_in_progress() {
+        println!("merge in progress; resolve and `sc commit` (or `sc merge --abort`):");
+        for p in repo.merge_conflicts()? {
+            println!("  conflicted: {p}");
+        }
+    }
     let s = repo.status()?;
     if s.added.is_empty() && s.modified.is_empty() && s.deleted.is_empty() {
-        println!("clean (working tree matches HEAD)");
+        if !repo.merge_in_progress() {
+            println!("clean (working tree matches HEAD)");
+        }
         return Ok(());
     }
     for p in &s.added {
@@ -619,6 +638,34 @@ fn run_status() -> Result<()> {
         println!("D  {p}");
     }
     Ok(())
+}
+
+fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
+    let repo = open_repo()?;
+    if abort {
+        repo.merge_abort()?;
+        println!("merge aborted; working tree restored");
+        return Ok(());
+    }
+    let branch = branch.ok_or_else(|| anyhow::anyhow!("merge: provide a branch or --abort"))?;
+    match repo.merge(&branch, author) {
+        Ok(id) => {
+            println!("merged {branch}: {}", id.short());
+            Ok(())
+        }
+        Err(scl_repo::Error::MergeConflicts(n)) => {
+            println!("merge has {n} conflict(s); resolve these files then `sc commit`:");
+            for p in repo.merge_conflicts()? {
+                println!("  {p}");
+            }
+            Ok(()) // not an error exit; the user has work to do
+        }
+        Err(scl_repo::Error::UpToDate) => {
+            println!("already up to date");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn run_log() -> Result<()> {
