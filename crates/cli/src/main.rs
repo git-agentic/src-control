@@ -64,10 +64,17 @@ enum Cmd {
         op: SecretOp,
     },
     /// Merge a branch into the current branch (or fast-forward).
+    ///
+    /// On conflicts this command prints the conflicted files and exits 0 (not an
+    /// error) — the working tree is left with conflict markers and a merge in
+    /// progress. Check `sc status` (or scripts should check it) before chaining
+    /// further commands, since `sc merge x && sc commit` would otherwise commit
+    /// the markers.
     Merge {
         /// Branch to merge in.
         branch: Option<String>,
-        /// Abandon an in-progress merge and restore the working tree.
+        /// Abandon an in-progress merge and restore the working tree. When given,
+        /// the BRANCH argument is ignored.
         #[arg(long)]
         abort: bool,
         #[arg(long, default_value = "you")]
@@ -617,8 +624,13 @@ fn run_status() -> Result<()> {
     let repo = open_repo()?;
     if repo.merge_in_progress() {
         println!("merge in progress; resolve and `sc commit` (or `sc merge --abort`):");
-        for p in repo.merge_conflicts()? {
-            println!("  conflicted: {p}");
+        let conflicts = repo.merge_conflicts()?;
+        if conflicts.is_empty() {
+            println!("  (all conflicts resolved — ready to `sc commit`)");
+        } else {
+            for p in conflicts {
+                println!("  conflicted: {p}");
+            }
         }
     }
     let s = repo.status()?;

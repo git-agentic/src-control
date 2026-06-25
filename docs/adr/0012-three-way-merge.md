@@ -47,7 +47,7 @@ entries (Phase 2/P7) merge by registry/policy entry, not by byte content.
 - The merge-base walk must handle the multi-parent DAG correctly once merge
   commits exist; tests must cover criss-cross histories.
 
-**As built (P4):** line-level diff3 is hand-rolled (LCS-based, in `scl-repo::diff3`);
+**As built (P4):** line-level diff3 is hand-rolled (LCS-based, in `scl_repo::diff3`);
 the conflict workflow uses `.sc/MERGE_HEAD` + `.sc/MERGE_CONFLICTS` with a
 merge-aware `commit` that records both parents; fast-forward and
 already-up-to-date are short-circuits; binary conflicts keep ours and write a
