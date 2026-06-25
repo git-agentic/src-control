@@ -18,11 +18,21 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0005](0005-in-ram-vfs-over-fuse.md) | Pure in-RAM copy-on-write worktrees, not FUSE | Accepted | 1 |
 | [0006](0006-memory-budget-and-eviction.md) | Bounded blob budget with LRU eviction and optional spill | Accepted | 1 |
 | [0007](0007-git-interop-via-gix.md) | In-process Git interop via gix, quarantined in one crate | Accepted | 1 |
-| [0008](0008-committed-secrets-envelope-encryption.md) | Native committed secrets via envelope encryption | Proposed | 2 |
-| [0009](0009-key-management-and-authorization.md) | Recipient-based key management and authorization | Proposed | 2 |
+| [0008](0008-committed-secrets-envelope-encryption.md) | Native committed secrets via envelope encryption | Accepted | 2 |
+| [0009](0009-key-management-and-authorization.md) | Recipient-based key management and authorization | Accepted | 2 |
+| [0010](0010-secret-registry-and-opaque-wrapped-dek.md) | Secrets as a snapshot-side registry with an opaque wrapped DEK | Accepted | 2 |
+| [0011](0011-persistent-store-and-working-tree.md) | Persistent loose-object store and git-like working tree | Accepted | 3 |
+| [0012](0012-three-way-merge.md) | Three-way merge with a snapshot common ancestor | Proposed | 4 |
+| [0013](0013-remote-sync-model.md) | Remote sync via object + ref transfer over a pluggable transport | Proposed | 5 |
+| [0014](0014-per-file-permissions-encrypted-paths.md) | Per-file permissions as encrypted paths (convergent encryption) | Proposed | 6 |
+| [0015](0015-packfiles-and-gc.md) | Packfiles and reachability-based garbage collection | Proposed | 7 |
+| [0016](0016-git-export.md) | Git export for round-trip interop | Proposed | 8 |
+
+See [`ROADMAP.md`](../../ROADMAP.md) for how the Proposed ADRs (0012–0016)
+sequence into phases.
 
 ## Status legend
 
 - **Proposed** — under discussion, not yet built.
-- **Accepted** — decided and (for Phase 1) implemented.
+- **Accepted** — decided and implemented.
 - **Superseded by ADR-NNNN** — replaced; kept for history.
