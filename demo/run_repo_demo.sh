@@ -30,4 +30,8 @@ SC_IDENTITY="$WORK/id" "$SC" secret add DB_URL --to me --value "postgres://app"
 OUT="$(SC_IDENTITY="$WORK/id" "$SC" run -- sh -c 'printf %s "$DB_URL"')"
 [ "$OUT" = "postgres://app" ] || { echo "FAIL: secret did not survive/inject ($OUT)"; exit 1; }
 
+# Regression guard: `sc run` must release the repo lock on exit. If it leaks the
+# lock (e.g. process::exit skipping Drop), the next command fails with `Locked`.
+"$SC" status >/dev/null || { echo "FAIL: repo locked after run (lock leak)"; exit 1; }
+
 echo "RESULT: persistent repo survived across invocations; secret decrypted in a new process ✔"

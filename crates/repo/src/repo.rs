@@ -156,6 +156,7 @@ impl Repo {
 
     /// Create `name` pointing at the current tip (errors if unborn or exists).
     pub fn branch(&self, name: &str) -> Result<()> {
+        validate_branch_name(name)?;
         if self.layout.ref_path(name).exists() {
             return Err(Error::BadRef(format!("branch already exists: {name}")));
         }
@@ -169,6 +170,7 @@ impl Repo {
     /// deletions, because `materialize` would silently overwrite them. (New,
     /// untracked files are left in place and so don't block the switch.)
     pub fn switch(&self, name: &str) -> Result<()> {
+        validate_branch_name(name)?;
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
             return Err(Error::InvalidArgument(
@@ -197,6 +199,22 @@ impl Repo {
     }
 }
 
+/// Reject branch names that would escape or corrupt `refs/heads/`. A branch name
+/// becomes a single path component under `refs/heads/`, so names containing path
+/// separators, the special `.`/`..` components, or a leading dot are refused.
+fn validate_branch_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.contains('\\')
+    {
+        return Err(Error::BadRef(format!("invalid branch name: {name:?}")));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +224,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn rejects_unsafe_branch_names() {
+        // Direct checks on the validator.
+        for bad in ["", ".", "..", "a/b", "a\\b", ".hidden"] {
+            assert!(
+                matches!(validate_branch_name(bad), Err(Error::BadRef(_))),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        assert!(validate_branch_name("feature").is_ok());
+
+        // And via the public API, so a traversal name can't reach the ref path.
+        let root = tmp_root("badbranch");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        repo.commit("me", "base").unwrap();
+        assert!(matches!(repo.branch(".."), Err(Error::BadRef(_))));
+        assert!(matches!(repo.switch("a/b"), Err(Error::BadRef(_))));
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

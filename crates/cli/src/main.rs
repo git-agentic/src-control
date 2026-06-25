@@ -679,6 +679,10 @@ fn run_run(identity: Option<PathBuf>, cmd: Vec<String>) -> Result<()> {
     let repo = open_repo()?;
     let sk = load_identity(identity)?;
     let code = repo.run(&sk, &cmd)?;
+    // `process::exit` skips destructors, so the repo's RepoLock would never run
+    // its Drop and `.sc/lock` would leak — bricking the next `sc` command with a
+    // spurious `Locked` error. Drop the repo (releasing the lock) before exiting.
+    drop(repo);
     std::process::exit(code);
 }
 
