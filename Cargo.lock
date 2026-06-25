@@ -1940,6 +1940,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scl-repo"
+version = "0.1.0"
+dependencies = [
+ "scl-core",
+ "scl-crypto",
+ "scl-vfs",
+ "thiserror",
+]
+
+[[package]]
 name = "scl-vfs"
 version = "0.1.0"
 dependencies = [

@@ -43,3 +43,17 @@ impl fmt::Debug for ObjectId {
         write!(f, "ObjectId({})", self.short())
     }
 }
+
+impl std::str::FromStr for ObjectId {
+    type Err = crate::error::Error;
+
+    /// Parse a 64-char hex string into an `ObjectId`.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let bytes = hex::decode(s)
+            .map_err(|_| crate::error::Error::Malformed(format!("bad ObjectId hex: {s}")))?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            crate::error::Error::Malformed(format!("ObjectId must be 64 hex chars, got {}", s.len()))
+        })?;
+        Ok(ObjectId(arr))
+    }
+}

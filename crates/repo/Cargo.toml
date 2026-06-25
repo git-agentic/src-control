@@ -1,0 +1,11 @@
+[package]
+name = "scl-repo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scl-core = { path = "../core" }
+scl-vfs = { path = "../vfs" }
+scl-crypto = { path = "../crypto" }
+thiserror = "2.0.18"
