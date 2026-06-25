@@ -72,6 +72,21 @@ impl Repo {
         Ok(self.store.lock().unwrap().put(snap)?)
     }
 
+    /// Put each file's blob and build the directory trees, returning the root
+    /// tree id. Does not create a snapshot. Used by the persistent repo layer to
+    /// snapshot a working directory.
+    pub fn write_tree(&self, files: &[(String, Vec<u8>, FileMode)]) -> Result<ObjectId> {
+        let mut map: BTreeMap<String, (ObjectId, FileMode)> = BTreeMap::new();
+        {
+            let mut store = self.store.lock().unwrap();
+            for (path, bytes, mode) in files {
+                let id = store.put(Object::blob(bytes.clone()))?;
+                map.insert(normalize(path), (id, *mode));
+            }
+        }
+        self.build_tree(&map)
+    }
+
     /// Fork an in-memory worktree from a base snapshot. Cheap: allocates only an
     /// empty overlay; no file content is copied.
     pub fn fork(&self, snapshot: ObjectId, label: impl Into<String>) -> Result<Worktree> {
@@ -466,6 +481,34 @@ mod tests {
         assert_ne!(new_snap, snap);
         let wt2 = r.fork(new_snap, "verifier").unwrap();
         assert_eq!(&wt2.read("README.md").unwrap()[..], b"v2");
+    }
+
+    #[test]
+    fn write_tree_then_fork_reads_files() {
+        let r = repo();
+        let root = r
+            .write_tree(&[
+                ("a.txt".into(), b"A".to_vec(), FileMode::FILE),
+                ("dir/b.txt".into(), b"B".to_vec(), FileMode::FILE),
+            ])
+            .unwrap();
+        let snap = {
+            let store_arc = r.store();
+            let mut store = store_arc.lock().unwrap();
+            store
+                .put(Object::Snapshot(scl_core::Snapshot {
+                    root,
+                    parents: vec![],
+                    author: "t".into(),
+                    timestamp: 0,
+                    message: "m".into(),
+                    secrets: std::collections::BTreeMap::new(),
+                }))
+                .unwrap()
+        };
+        let wt = r.fork(snap, "v").unwrap();
+        assert_eq!(&wt.read("a.txt").unwrap()[..], b"A");
+        assert_eq!(&wt.read("dir/b.txt").unwrap()[..], b"B");
     }
 
     #[test]
