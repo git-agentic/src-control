@@ -22,6 +22,14 @@ pub enum Error {
     InvalidArgument(String),
     #[error("operation requires at least one commit (branch is unborn)")]
     Unborn,
+    #[error("a merge is already in progress (resolve and `sc commit`, or `sc merge --abort`)")]
+    MergeInProgress,
+    #[error("merge produced {0} conflict(s); resolve the marked files then `sc commit`")]
+    MergeConflicts(usize),
+    #[error("no common ancestor between the branches")]
+    NoCommonAncestor,
+    #[error("secret {0} changed differently on both branches; resolve with `sc secret` then retry")]
+    SecretMergeConflict(String),
     #[error(transparent)]
     Core(#[from] scl_core::Error),
     #[error(transparent)]
