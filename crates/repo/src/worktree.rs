@@ -54,6 +54,35 @@ fn file_mode(_path: &Path) -> FileMode {
     FileMode::FILE
 }
 
+/// Flatten a snapshot's root tree to `path -> (blob id, mode)`.
+pub fn tree_file_entries(
+    store: &mut Store,
+    root: ObjectId,
+) -> Result<BTreeMap<String, (ObjectId, FileMode)>> {
+    let mut out = BTreeMap::new();
+    walk_entries(store, root, String::new(), &mut out)?;
+    Ok(out)
+}
+
+fn walk_entries(
+    store: &mut Store,
+    tree_id: ObjectId,
+    prefix: String,
+    out: &mut BTreeMap<String, (ObjectId, FileMode)>,
+) -> Result<()> {
+    let tree: Tree = store.get_tree(&tree_id)?;
+    for e in tree.entries {
+        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        match e.kind {
+            EntryKind::Blob => {
+                out.insert(path, (e.id, e.mode));
+            }
+            EntryKind::Tree => walk_entries(store, e.id, path, out)?,
+        }
+    }
+    Ok(())
+}
+
 /// Flatten a snapshot's root tree to `path -> blob id`.
 pub fn tree_file_ids(store: &mut Store, root: ObjectId) -> Result<BTreeMap<String, ObjectId>> {
     let mut out = BTreeMap::new();

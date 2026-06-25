@@ -5,6 +5,7 @@ pub mod diff3;
 pub mod error;
 pub mod layout;
 pub mod lock;
+pub mod merge;
 pub mod merge_state;
 pub mod refs;
 pub mod repo;
