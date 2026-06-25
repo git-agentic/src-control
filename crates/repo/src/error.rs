@@ -22,12 +22,12 @@ pub enum Error {
     InvalidArgument(String),
     #[error("operation requires at least one commit (branch is unborn)")]
     Unborn,
-    // The four merge variants below are defined here now but only wired up by
-    // the merge command in a later task.
     #[error("a merge is already in progress (resolve and `sc commit`, or `sc merge --abort`)")]
     MergeInProgress,
     #[error("merge produced {0} conflict(s); resolve the marked files then `sc commit`")]
     MergeConflicts(usize),
+    #[error("already up to date")]
+    UpToDate,
     #[error("no common ancestor between the branches")]
     NoCommonAncestor,
     #[error("secret {0} changed differently on both branches; resolve with `sc secret` then retry")]

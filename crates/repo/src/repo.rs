@@ -183,7 +183,7 @@ impl Repo {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
             if crate::merge::is_ancestor(&mut store, theirs, ours)? {
-                return Err(Error::InvalidArgument("already up to date".into()));
+                return Err(Error::UpToDate);
             }
             if crate::merge::is_ancestor(&mut store, ours, theirs)? {
                 // fast-forward: advance ref + materialize, no merge commit
@@ -238,6 +238,10 @@ impl Repo {
             )?;
             Ok(id)
         } else {
+            // Conflict markers are already on disk; record MERGE_HEAD last. A
+            // crash in this window leaves marked files but no merge state — under
+            // the single-writer lock this is recoverable: re-running `merge`
+            // simply redoes the (idempotent) materialize + write.
             crate::merge_state::write(&self.layout, &theirs, &merge_result.conflicts)?;
             Err(Error::MergeConflicts(merge_result.conflicts.len()))
         }
@@ -249,16 +253,21 @@ impl Repo {
         if !crate::merge_state::in_progress(&self.layout) {
             return Err(Error::InvalidArgument("no merge in progress".into()));
         }
+        let theirs_id = crate::merge_state::read_merge_head(&self.layout)?
+            .expect("in_progress is true but MERGE_HEAD is absent");
         // Remove any .theirs sidecars recorded as conflicts.
         for path in crate::merge_state::read_conflicts(&self.layout)? {
             let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
         }
-        // Restore working tree to ours tip.
+        // Restore working tree to ours tip. Pass theirs' root as `old_root` so
+        // the deletion pass drops files the conflicted merge pulled in from
+        // theirs; materializing against ours==old would delete nothing.
         let ours_root = self.head_root()?;
         if let Some(root) = ours_root {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            worktree::materialize(&self.layout, &mut store, root, Some(root))?;
+            let theirs_root = store.get_snapshot(&theirs_id)?.root;
+            worktree::materialize(&self.layout, &mut store, root, Some(theirs_root))?;
         }
         crate::merge_state::clear(&self.layout)
     }
@@ -574,6 +583,57 @@ mod tests {
         std::fs::write(root.join("a.txt"), b"dirty-local").unwrap();
         let err = repo.merge("feature", "me").unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_abort_drops_theirs_only_files() {
+        let root = tmp_root("abort-theirs-only");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        // ours: modify f.txt on main
+        std::fs::write(root.join("f.txt"), b"a\nX\nc\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        // theirs: modify f.txt AND add new.txt on feature
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("f.txt"), b"a\nY\nc\n").unwrap();
+        std::fs::write(root.join("new.txt"), b"from-theirs").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+
+        let _ = repo.merge("feature", "me").unwrap_err();
+        assert!(root.join("new.txt").exists(), "merge pulled in theirs' new.txt");
+        repo.merge_abort().unwrap();
+        assert!(!repo.merge_in_progress());
+        // theirs-only file must be gone, f.txt restored to ours' content
+        assert!(!root.join("new.txt").exists(), "abort must drop theirs-only new.txt");
+        assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"a\nX\nc\n");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_and_switch_refuse_while_merge_in_progress() {
+        let root = tmp_root("guard-in-progress");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        std::fs::write(root.join("f.txt"), b"a\nX\nc\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("f.txt"), b"a\nY\nc\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+        // Trigger a conflict so a merge is in progress.
+        let _ = repo.merge("feature", "me").unwrap_err();
+        assert!(repo.merge_in_progress());
+        // Both `merge` and `switch` must refuse mid-merge.
+        assert!(matches!(repo.merge("feature", "me"), Err(Error::MergeInProgress)));
+        assert!(matches!(repo.switch("feature"), Err(Error::MergeInProgress)));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
