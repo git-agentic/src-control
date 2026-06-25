@@ -48,8 +48,8 @@ to reason about — which is exactly the property Phase 1 is meant to demonstrat
 
 ## System overview
 
-The codebase is a Cargo workspace of five crates with a strict dependency
-direction (`cli → {vfs, gitio, crypto} → core`):
+The codebase is a Cargo workspace of six crates with a strict dependency
+direction (`cli → repo → {vfs, gitio, crypto} → core`):
 
 ```
 src-control/
@@ -58,16 +58,19 @@ src-control/
 │   ├── vfs/      in-memory virtual worktree engine (fork / edit / checkout / teardown)
 │   ├── gitio/    Git interop boundary (import a Git repo's tree into the store via gix)
 │   ├── crypto/   envelope encryption for committed secrets (scl-crypto; depends on core)
-│   └── cli/      `sc` binary: import, fork agents, run, checkout, status, teardown
+│   ├── repo/     durable on-disk repo: .sc/ layout, refs, branches, working tree
+│   └── cli/      `sc` binary: import, fork agents, init/commit/status/log/branch/switch/secret/run
 └── ARCHITECTURE.md
 ```
 
 `core` knows nothing about Git, worktrees, or cryptography. `gitio` is the only
 crate that links `gix`, keeping the Git dependency quarantined behind one
 boundary. `crypto` is the only crate that links the RustCrypto stack, keeping
-the cryptographic dependency quarantined behind another. This matters because the
-long-term plan is to own the object format outright; Git is an import/export
-peer, not a foundation.
+the cryptographic dependency quarantined behind another. `repo` owns the
+`.sc/` on-disk layout and the `init`/`commit`/`switch`/`secret` orchestration;
+`cli` depends on `repo` and links `gitio` directly only for the `import`
+command. This matters because the long-term plan is to own the object format
+outright; Git is an import/export peer, not a foundation.
 
 ## Content-addressed snapshot model
 
@@ -182,6 +185,55 @@ you hold a private key listed as a recipient," and granting/revoking access is
 re-wrapping the DEK for a changed recipient set — a cheap metadata operation that
 does not require rotating the secret itself. This is the same envelope model used
 by age and cloud KMS, chosen because it is well-understood and auditable.
+
+## Persistence
+
+The third wedge adds a durable on-disk store so commits and committed secrets
+survive between `sc` invocations. See ADR-0011.
+
+### Persistent Store backend
+
+`core::Store` gains a `Backend::Persistent(PathBuf)` variant alongside the
+existing `Backend::Ephemeral`. In persistent mode every `put` writes the
+canonical `Object::encode()` bytes to `.sc/objects/<hex>` (idempotent
+tmp+rename) before returning, so disk is always at least as fresh as RAM. A
+read-miss loads the file, verifies `BLAKE3(bytes) == id`, and decodes; a
+tampered file returns `Error::Malformed`. Blob eviction drops only the RAM copy
+— the durable file remains authoritative — so the existing LRU eviction logic
+extends naturally.
+
+### `.sc/` layout and `scl-repo`
+
+The `scl-repo` crate owns everything `.sc/`-related:
+
+- `objects/` — loose content-addressed object files (one per `ObjectId`).
+- `refs/heads/<branch>` — one hex-id-per-line branch tip file, updated
+  atomically.
+- `HEAD` — symbolic ref (`ref: refs/heads/<branch>`), updated atomically.
+- `lock` — exclusive lock file; acquired on `Repo::open`/`init`, removed on
+  drop. Enforces the single-writer invariant.
+- `recipients.toml` — `[recipients]` table mapping a name to its
+  `scl-pk-<hex>` public key; read by `sc secret add/grant`.
+
+### Git-like working tree
+
+The directory beside `.sc/` is the working tree. `commit` reads every file
+(skipping `.sc/`), builds a content-addressed tree, and advances the current
+branch ref. `switch` materializes the target branch tip into the working tree,
+removing tracked files that are absent from the target, and refuses the
+operation if tracked files are modified or deleted (to prevent data loss). New,
+untracked files are left in place. `status` diffs the working tree against HEAD.
+
+### Mode-scoped disk invariant
+
+**Ephemeral mode** (Phase 1 agents, `sc demo`, `sc secret-demo`) keeps the
+zero-residue guarantee unchanged: nothing touches disk except `Worktree::checkout`
+and the optional spill backend, both of which are removed after the session.
+
+**Persistent mode** (`sc init` repos) writes to `.sc/` by design. `.sc/` is
+user-owned durable state — the same relationship Git has with `.git/`. The
+two modes are mutually exclusive: a session is either ephemeral or persistent,
+never a mix.
 
 ## Phase 1 deliverable and proof
 
