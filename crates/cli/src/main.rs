@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use scl_core::{FileMode, SpillPolicy, Store, StoreConfig};
+use scl_core::{Backend, FileMode, SpillPolicy, Store, StoreConfig};
+use scl_crypto::KeyProvider;
 use scl_vfs::Repo;
 
 #[derive(Parser)]
@@ -40,6 +41,65 @@ enum Cmd {
     /// Phase 2 proof: add a committed secret, deny an unauthorized context,
     /// decrypt + inject in an authorized one, then grant — all in RAM.
     SecretDemo(SecretDemoArgs),
+    /// Create a new persistent repo (.sc/) in the current directory.
+    Init,
+    /// Snapshot the working tree as a commit on the current branch.
+    Commit {
+        #[arg(short, long)]
+        message: String,
+        #[arg(long, default_value = "you")]
+        author: String,
+    },
+    /// Show working-tree changes against HEAD.
+    Status,
+    /// Show commit history from HEAD.
+    Log,
+    /// Create a new branch at the current tip.
+    Branch { name: String },
+    /// Switch HEAD to a branch and materialize it.
+    Switch { name: String },
+    /// Committed-secret operations.
+    Secret {
+        #[command(subcommand)]
+        op: SecretOp,
+    },
+    /// Decrypt authorized secrets, inject them, and run a command.
+    Run {
+        /// Identity file (default ~/.sc/identity or $SC_IDENTITY).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Command and args after `--`.
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretOp {
+    /// Seal a value (read from --value or stdin) to named recipients.
+    Add {
+        name: String,
+        #[arg(long, value_delimiter = ',')]
+        to: Vec<String>,
+        #[arg(long)]
+        value: String,
+    },
+    /// Grant a recipient access by re-wrapping (requires your identity).
+    Grant {
+        name: String,
+        #[arg(long, value_delimiter = ',')]
+        to: Vec<String>,
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Revoke a recipient (by recipient id).
+    Revoke {
+        name: String,
+        #[arg(long)]
+        recipient_id: String,
+    },
+    /// List committed secrets.
+    List,
 }
 
 #[derive(Parser)]
@@ -76,6 +136,14 @@ fn main() -> Result<()> {
         Cmd::Import { repo } => run_import(repo),
         Cmd::Keygen { out } => run_keygen(out),
         Cmd::SecretDemo(args) => run_secret_demo(args),
+        Cmd::Init => run_init(),
+        Cmd::Commit { message, author } => run_commit(&author, &message),
+        Cmd::Status => run_status(),
+        Cmd::Log => run_log(),
+        Cmd::Branch { name } => run_branch(&name),
+        Cmd::Switch { name } => run_switch(&name),
+        Cmd::Secret { op } => run_secret(op),
+        Cmd::Run { identity, cmd } => run_run(identity, cmd),
     }
 }
 
@@ -104,10 +172,10 @@ fn run_demo(args: DemoArgs) -> Result<()> {
     std::fs::create_dir_all(&session_root)?;
 
     let budget_bytes = args.budget_mb * 1024 * 1024;
-    let spill = if args.spill {
-        SpillPolicy::SpillTo(session_root.join("spill"))
+    let backend = if args.spill {
+        Backend::Ephemeral(SpillPolicy::SpillTo(session_root.join("spill")))
     } else {
-        SpillPolicy::Disallow
+        Backend::Ephemeral(SpillPolicy::Disallow)
     };
 
     println!("=== src-control · in-memory agent worktree demo ===");
@@ -118,7 +186,7 @@ fn run_demo(args: DemoArgs) -> Result<()> {
     println!("session dir: {}", session_root.display());
     println!();
 
-    let repo = Repo::new(Store::new(StoreConfig { budget_bytes, spill }));
+    let repo = Repo::new(Store::new(StoreConfig { budget_bytes, backend }));
 
     // ---- base snapshot: import a Git repo, or synthesize one in memory. ----
     let base = match &args.repo {
@@ -283,7 +351,7 @@ fn fmt_stats(repo: &Repo) -> String {
     )
 }
 
-// ---- Task 7: keygen + identity-path helpers --------------------------------
+// ---- identity-path helpers --------------------------------
 
 /// Default identity path: `$HOME/.sc/identity`.
 fn default_identity_path() -> PathBuf {
@@ -292,8 +360,6 @@ fn default_identity_path() -> PathBuf {
 }
 
 /// Resolve the identity file: `--identity` > `SC_IDENTITY` > default.
-// Scaffolding wired up by `sc secret add`/`grant` (deferred — see spec Out of scope).
-#[allow(dead_code)]
 fn resolve_identity_path(flag: Option<PathBuf>) -> PathBuf {
     if let Some(p) = flag {
         return p;
@@ -346,11 +412,9 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-// ---- Task 8: .sc/recipients.toml loader ------------------------------------
+// ---- .sc/recipients.toml loader ------------------------------------
 
 /// Parsed `.sc/recipients.toml`: `name -> scl-pk-<hex>`.
-// Scaffolding wired up by `sc secret add`/`grant` (deferred — see spec Out of scope).
-#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 struct RecipientsFile {
     #[serde(default)]
@@ -358,8 +422,6 @@ struct RecipientsFile {
 }
 
 /// Resolve recipient names to public keys from a recipients file.
-// Scaffolding wired up by `sc secret add`/`grant` (deferred — see spec Out of scope).
-#[allow(dead_code)]
 fn load_recipients(
     path: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, scl_crypto::PublicKey>> {
@@ -375,7 +437,7 @@ fn load_recipients(
     Ok(out)
 }
 
-// ---- Task 9: sc secret-demo ------------------------------------------------
+// ---- sc secret-demo ------------------------------------------------
 
 /// Decrypt `name` from `snapshot` using `identity`, inject it into a child
 /// process environment, and return what the child read back. Proves the value
@@ -434,7 +496,7 @@ fn run_secret_demo(args: SecretDemoArgs) -> Result<()> {
     let budget_bytes = args.budget_mb * 1024 * 1024;
     let repo = Repo::new(Store::new(StoreConfig {
         budget_bytes,
-        spill: SpillPolicy::Disallow,
+        backend: Backend::Ephemeral(SpillPolicy::Disallow),
     }));
 
     // Two identities, generated in RAM (never written to disk in this demo).
@@ -514,6 +576,121 @@ fn run_secret_demo(args: SecretDemoArgs) -> Result<()> {
     }
     println!("RESULT: authorize/deny/grant proven; zero residual files on disk ✔");
     Ok(())
+}
+
+// ---- Persistent repo subcommand handlers -----------------------------------
+
+fn open_repo() -> Result<scl_repo::Repo> {
+    let cwd = std::env::current_dir()?;
+    scl_repo::Repo::open(cwd).map_err(Into::into)
+}
+
+fn run_init() -> Result<()> {
+    let repo = scl_repo::Repo::init(std::env::current_dir()?)?;
+    println!("initialized empty src-control repo at {}", repo.layout().dot_sc.display());
+    Ok(())
+}
+
+fn run_commit(author: &str, message: &str) -> Result<()> {
+    let repo = open_repo()?;
+    let id = repo.commit(author, message)?;
+    println!("committed {}", id.short());
+    Ok(())
+}
+
+fn run_status() -> Result<()> {
+    let repo = open_repo()?;
+    let s = repo.status()?;
+    if s.added.is_empty() && s.modified.is_empty() && s.deleted.is_empty() {
+        println!("clean (working tree matches HEAD)");
+        return Ok(());
+    }
+    for p in &s.added {
+        println!("A  {p}");
+    }
+    for p in &s.modified {
+        println!("M  {p}");
+    }
+    for p in &s.deleted {
+        println!("D  {p}");
+    }
+    Ok(())
+}
+
+fn run_log() -> Result<()> {
+    let repo = open_repo()?;
+    for (id, snap) in repo.log()? {
+        println!("{} {} — {}", id.short(), snap.author, snap.message);
+    }
+    Ok(())
+}
+
+fn run_branch(name: &str) -> Result<()> {
+    open_repo()?.branch(name)?;
+    println!("created branch {name}");
+    Ok(())
+}
+
+fn run_switch(name: &str) -> Result<()> {
+    open_repo()?.switch(name)?;
+    println!("switched to branch {name}");
+    Ok(())
+}
+
+fn run_secret(op: SecretOp) -> Result<()> {
+    let repo = open_repo()?;
+    let recipients_path = repo.layout().root.join(".sc").join("recipients.toml");
+    match op {
+        SecretOp::Add { name, to, value } => {
+            let dir = load_recipients(&recipients_path)?;
+            let pks = resolve_names(&dir, &to)?;
+            repo.secret_add(&name, value.as_bytes(), &pks)?;
+            println!("added secret {name} for {} recipient(s)", to.len());
+        }
+        SecretOp::Grant { name, to, identity } => {
+            let dir = load_recipients(&recipients_path)?;
+            let pks = resolve_names(&dir, &to)?;
+            let sk = load_identity(identity)?;
+            for pk in &pks {
+                repo.secret_grant(&name, &sk, pk)?;
+            }
+            println!("granted {name} to {} recipient(s)", to.len());
+        }
+        SecretOp::Revoke { name, recipient_id } => {
+            let rid = scl_crypto::RecipientId::from_hex(&recipient_id)
+                .map_err(|_| anyhow::anyhow!("bad recipient id"))?;
+            repo.secret_revoke(&name, &rid)?;
+            println!("revoked {recipient_id} from {name}");
+        }
+        SecretOp::List => {
+            for info in repo.secret_list()? {
+                println!("{}  ({} recipient(s))", info.name, info.recipients);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_run(identity: Option<PathBuf>, cmd: Vec<String>) -> Result<()> {
+    let repo = open_repo()?;
+    let sk = load_identity(identity)?;
+    let code = repo.run(&sk, &cmd)?;
+    std::process::exit(code);
+}
+
+fn load_identity(flag: Option<PathBuf>) -> Result<scl_crypto::SecretKey> {
+    let path = resolve_identity_path(flag);
+    scl_crypto::FileKeyProvider::new(path).identity().map_err(Into::into)
+}
+
+fn resolve_names(
+    dir: &std::collections::BTreeMap<String, scl_crypto::PublicKey>,
+    names: &[String],
+) -> Result<Vec<scl_crypto::PublicKey>> {
+    names
+        .iter()
+        .map(|n| dir.get(n).cloned().ok_or_else(|| anyhow::anyhow!("unknown recipient: {n}")))
+        .collect()
 }
 
 #[cfg(test)]

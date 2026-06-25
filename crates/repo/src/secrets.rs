@@ -200,7 +200,7 @@ mod tests {
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         {
             let repo = Repo::init(&root).unwrap();
-            repo.secret_add("DB_URL", b"postgres://secret", &[alice_pk.clone()]).unwrap();
+            repo.secret_add("DB_URL", b"postgres://secret", std::slice::from_ref(&alice_pk)).unwrap();
         } // dropped: store + lock released, secret only on disk now
         let repo2 = Repo::open(&root).unwrap();
         let list = repo2.secret_list().unwrap();

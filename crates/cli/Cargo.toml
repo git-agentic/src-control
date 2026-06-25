@@ -13,6 +13,7 @@ scl-core = { path = "../core" }
 scl-vfs = { path = "../vfs" }
 scl-gitio = { path = "../gitio" }
 scl-crypto = { path = "../crypto" }
+scl-repo = { path = "../repo" }
 clap = { version = "4.6.1", features = ["derive"] }
 anyhow = "1.0.102"
 toml = "0.8"

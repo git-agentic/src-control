@@ -18,6 +18,20 @@ impl RecipientId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Parse a 32 hex-char recipient id (16 bytes). Returns `Error::BadKey` on
+    /// bad input.
+    pub fn from_hex(s: &str) -> Result<Self> {
+        let s = s.trim();
+        if s.len() != ID_LEN * 2 {
+            return Err(Error::BadKey);
+        }
+        // Validate it's all hex chars.
+        if s.bytes().any(|b| !b.is_ascii_hexdigit()) {
+            return Err(Error::BadKey);
+        }
+        Ok(RecipientId(s.to_lowercase()))
+    }
 }
 
 impl std::fmt::Display for RecipientId {
