@@ -81,10 +81,14 @@ enum SecretOp {
         name: String,
         #[arg(long, value_delimiter = ',')]
         to: Vec<String>,
+        /// The secret value. WARNING: passed on the command line, so it is
+        /// visible in process args (e.g. `ps`) and shell history. Reading the
+        /// value from stdin instead is a planned follow-up.
         #[arg(long)]
         value: String,
     },
-    /// Grant a recipient access by re-wrapping (requires your identity).
+    /// Grant a recipient access by re-wrapping (requires your identity). Each
+    /// granted recipient produces one commit (N recipients -> N commits).
     Grant {
         name: String,
         #[arg(long, value_delimiter = ',')]
@@ -639,7 +643,7 @@ fn run_switch(name: &str) -> Result<()> {
 
 fn run_secret(op: SecretOp) -> Result<()> {
     let repo = open_repo()?;
-    let recipients_path = repo.layout().root.join(".sc").join("recipients.toml");
+    let recipients_path = repo.layout().dot_sc.join("recipients.toml");
     match op {
         SecretOp::Add { name, to, value } => {
             let dir = load_recipients(&recipients_path)?;

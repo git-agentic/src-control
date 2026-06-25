@@ -20,7 +20,7 @@ impl RecipientId {
     }
 
     /// Parse a 32 hex-char recipient id (16 bytes). Returns `Error::BadKey` on
-    /// bad input.
+    /// bad input. Accepts upper- or lower-case hex and normalizes to lowercase.
     pub fn from_hex(s: &str) -> Result<Self> {
         let s = s.trim();
         if s.len() != ID_LEN * 2 {
