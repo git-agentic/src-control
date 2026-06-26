@@ -1,11 +1,15 @@
 //! Secret detection: high-precision token patterns + a Shannon-entropy
 //! heuristic. Byte-oriented and UTF-8-lossy — never panics on binary input.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 use regex::RegexSet;
+use scl_core::ObjectId;
 
+use crate::error::{Error, Result};
 use crate::scanner_patterns::PATTERNS;
 
 /// What kind of detection fired.
@@ -88,6 +92,94 @@ fn shannon_entropy(s: &str) -> f64 {
         h -= p * p.log2();
     }
     h
+}
+
+/// Hash-scoped allowlist: exact blob `ObjectId`s exempt from scanning.
+#[derive(Default)]
+pub struct Allowlist {
+    ids: HashSet<ObjectId>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct AllowlistFile {
+    #[serde(default)]
+    allow: Vec<AllowEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct AllowEntry {
+    blob: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    note: Option<String>,
+}
+
+impl Allowlist {
+    /// Load from `.sc/scanner-allowlist.toml`. Missing file => empty allowlist.
+    pub fn load(path: &Path) -> Result<Allowlist> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Allowlist::default()),
+            Err(e) => return Err(e.into()),
+        };
+        let parsed: AllowlistFile =
+            toml::from_str(&text).map_err(|e| Error::BadRef(format!("bad scanner-allowlist.toml: {e}")))?;
+        let mut ids = HashSet::new();
+        for entry in parsed.allow {
+            let id = ObjectId::from_str(entry.blob.trim())
+                .map_err(|_| Error::BadRef(format!("bad blob id in allowlist: {}", entry.blob)))?;
+            ids.insert(id);
+        }
+        Ok(Allowlist { ids })
+    }
+
+    pub fn is_allowed(&self, id: &ObjectId) -> bool {
+        self.ids.contains(id)
+    }
+}
+
+/// One scan finding tied to a working-tree path and the offending blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub path: String,
+    pub rule: String,
+    pub blob_id: ObjectId,
+    pub line: usize,
+}
+
+/// The result of scanning a working tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    pub findings: Vec<Finding>,
+}
+
+impl ScanReport {
+    pub fn is_empty(&self) -> bool {
+        self.findings.is_empty()
+    }
+}
+
+impl std::fmt::Display for ScanReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for fd in &self.findings {
+            writeln!(f, "{}:{}  {}  blob {}", fd.path, fd.line, fd.rule, fd.blob_id.to_hex())?;
+        }
+        if !self.findings.is_empty() {
+            writeln!(
+                f,
+                "secret(s) detected; remove them, commit via `sc secret`, or allowlist the blob hash(es) in .sc/scanner-allowlist.toml"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Convert a `HitKind` into the report's rule string.
+pub(crate) fn rule_label(kind: &HitKind) -> String {
+    match kind {
+        HitKind::Pattern(name) => format!("pattern:{name}"),
+        HitKind::Entropy => "entropy".to_string(),
+    }
 }
 
 #[cfg(test)]

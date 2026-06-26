@@ -77,10 +77,46 @@ impl Repo {
         }
     }
 
+    /// Scan a set of working-tree files for plaintext secrets, skipping any blob
+    /// whose content hash is in `.sc/scanner-allowlist.toml`.
+    pub fn scan_files(
+        &self,
+        files: &[(String, Vec<u8>, scl_core::FileMode)],
+    ) -> Result<crate::scanner::ScanReport> {
+        let allow =
+            crate::scanner::Allowlist::load(&self.layout.dot_sc.join("scanner-allowlist.toml"))?;
+        let mut findings = Vec::new();
+        for (path, bytes, _mode) in files {
+            let id = Object::blob(bytes.clone()).id();
+            if allow.is_allowed(&id) {
+                continue;
+            }
+            for hit in crate::scanner::scan(path, bytes) {
+                findings.push(crate::scanner::Finding {
+                    path: path.clone(),
+                    rule: crate::scanner::rule_label(&hit.rule),
+                    blob_id: id,
+                    line: hit.line,
+                });
+            }
+        }
+        Ok(crate::scanner::ScanReport { findings })
+    }
+
+    /// Scan the current working tree for plaintext secrets (read-only).
+    pub fn scan_worktree(&self) -> Result<crate::scanner::ScanReport> {
+        let files = worktree::read_worktree(&self.layout)?;
+        self.scan_files(&files)
+    }
+
     /// Snapshot the working tree into a new commit on the current branch. When a
     /// merge is in progress, records both parents and clears the merge state.
     pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
         let files = worktree::read_worktree(&self.layout)?;
+        let report = self.scan_files(&files)?;
+        if !report.is_empty() {
+            return Err(Error::SecretDetected(report));
+        }
         let root = self.vfs.write_tree(&files)?;
         let tip = self.head_tip()?;
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
@@ -611,6 +647,53 @@ mod tests {
         // theirs-only file must be gone, f.txt restored to ours' content
         assert!(!root.join("new.txt").exists(), "abort must drop theirs-only new.txt");
         assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"a\nX\nc\n");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commit_rejects_a_plaintext_secret_and_writes_nothing() {
+        let root = tmp_root("scan-reject");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("clean.txt"), b"hello").unwrap();
+        std::fs::write(root.join("creds.txt"), b"aws = AKIAIOSFODNN7EXAMPLE\n").unwrap();
+        let err = repo.commit("me", "leak").unwrap_err();
+        assert!(matches!(err, Error::SecretDetected(_)), "got {err:?}");
+        // Nothing committed: the branch is still unborn.
+        assert_eq!(repo.head_tip().unwrap(), None);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn allowlisted_blob_hash_lets_commit_through() {
+        let root = tmp_root("scan-allow");
+        let repo = Repo::init(&root).unwrap();
+        let secret = b"aws = AKIAIOSFODNN7EXAMPLE\n";
+        std::fs::write(root.join("creds.txt"), secret).unwrap();
+        // Compute the blob hash the scanner will object to.
+        let id = scl_core::Object::blob(secret.to_vec()).id();
+        std::fs::create_dir_all(&repo.layout().dot_sc).unwrap();
+        std::fs::write(
+            repo.layout().dot_sc.join("scanner-allowlist.toml"),
+            format!("[[allow]]\nblob = \"{}\"\nnote = \"test fixture\"\n", id.to_hex()),
+        )
+        .unwrap();
+        // Now the commit succeeds.
+        let cid = repo.commit("me", "allowed").unwrap();
+        assert!(repo.head_tip().unwrap() == Some(cid));
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clean_tree_commits_normally() {
+        let root = tmp_root("scan-clean");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"just some text\n").unwrap();
+        assert!(repo.commit("me", "ok").is_ok());
+        let rep = repo.scan_worktree().unwrap();
+        assert!(rep.is_empty());
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

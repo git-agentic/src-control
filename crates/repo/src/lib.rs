@@ -16,5 +16,6 @@ pub mod worktree;
 
 pub use error::{Error, Result};
 pub use repo::{Repo, Status};
+pub use scanner::ScanReport;
 pub use secrets::SecretInfo;
 pub use worktree::Diff;

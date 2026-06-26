@@ -28,6 +28,8 @@ pub enum Error {
     MergeConflicts(usize),
     #[error("already up to date")]
     UpToDate,
+    #[error("{0}")]
+    SecretDetected(crate::scanner::ScanReport),
     #[error("no common ancestor between the branches")]
     NoCommonAncestor,
     #[error("secret {0} changed differently on both branches; resolve with `sc secret` then retry")]
