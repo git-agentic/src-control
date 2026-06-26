@@ -480,12 +480,14 @@ impl Repo {
         if let Some((_, remote_tip)) =
             transport.list_refs()?.into_iter().find(|(b, _)| *b == branch)
         {
-            if remote_tip != local_tip {
-                let store_arc = self.vfs.store();
-                let mut store = store_arc.lock().unwrap();
-                if !crate::merge::is_ancestor(&mut store, remote_tip, local_tip)? {
-                    return Err(Error::NonFastForward);
-                }
+            if remote_tip == local_tip {
+                // Already up to date: skip all remote I/O (no transfer, no ref write).
+                return Ok(local_tip);
+            }
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            if !crate::merge::is_ancestor(&mut store, remote_tip, local_tip)? {
+                return Err(Error::NonFastForward);
             }
         }
 
@@ -974,6 +976,9 @@ mod tests {
         // A's main now points at B's tip and A has the objects.
         let arepo = Repo::open(&a).unwrap();
         assert_eq!(arepo.head_tip().unwrap(), Some(b_tip));
+
+        // An immediate re-push is a no-op (already up to date) and still succeeds.
+        assert_eq!(brepo.push("origin").unwrap(), b_tip);
 
         // A diverges; B's next push is non-ff.
         std::fs::write(a.join("f.txt"), b"base\nB-change\nA-diverge\n").unwrap();
