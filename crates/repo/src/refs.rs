@@ -56,8 +56,14 @@ pub fn read_remote_tip(layout: &Layout, remote: &str, branch: &str) -> Result<Op
     }
 }
 
-/// Set `refs/remotes/<remote>/<branch>` to `id` (atomic).
+/// Set `refs/remotes/<remote>/<branch>` to `id` (atomic). Defense-in-depth:
+/// both components are traversal-guarded here too, so even a hand-edited
+/// `.sc/config` remote (which bypasses `remote_add`'s validation) can't escape
+/// `.sc/refs/remotes/` on the write side.
 pub fn write_remote_tip(layout: &Layout, remote: &str, branch: &str, id: &ObjectId) -> Result<()> {
+    if is_unsafe_ref_component(remote) || is_unsafe_ref_component(branch) {
+        return Err(Error::BadRef(format!("invalid remote-tracking ref: {remote}/{branch}")));
+    }
     let dir = layout.refs_remotes_dir().join(remote);
     std::fs::create_dir_all(&dir)?;
     atomic_write(&dir.join(branch), format!("{}\n", id.to_hex()).as_bytes())
@@ -82,10 +88,17 @@ pub fn resolve_tip(layout: &Layout, name: &str) -> Result<Option<ObjectId>> {
 }
 
 /// Whether a `<remote>/<branch>` path component could escape or corrupt
-/// `refs/remotes/`: empty, dot-prefixed, backslash-bearing, or containing a
-/// `..` path component. (A single-component `remote` splits to just itself.)
+/// `refs/remotes/`: empty, dot-prefixed, backslash-bearing, or containing an
+/// empty or `..` sub-component. The empty sub-component check rejects an
+/// absolute component (leading `/`, e.g. `"/etc/passwd"`), a trailing `/`, and
+/// `//` — all of which would otherwise let `Path::join` discard the
+/// `.sc/refs/remotes/` prefix. (A single-component `remote` splits to just
+/// itself; a legit nested branch like `feature/x` still passes.)
 fn is_unsafe_ref_component(s: &str) -> bool {
-    s.is_empty() || s.starts_with('.') || s.contains('\\') || s.split('/').any(|c| c == "..")
+    s.is_empty()
+        || s.starts_with('.')
+        || s.contains('\\')
+        || s.split('/').any(|c| c.is_empty() || c == "..")
 }
 
 /// The tip of the branch HEAD names (or None if unborn).
@@ -143,11 +156,34 @@ mod tests {
             Err(Error::BadRef(_))
         ));
         assert!(matches!(resolve_tip(&layout, "origin/../x"), Err(Error::BadRef(_))));
+        // Absolute branch component (leading `/`) and an empty `//` sub-component
+        // — these slip past a `..`-only check but `Path::join` would discard the
+        // prefix, so they must be rejected.
+        assert!(matches!(
+            resolve_tip(&layout, "origin//etc/passwd"),
+            Err(Error::BadRef(_))
+        ));
+        assert!(matches!(resolve_tip(&layout, "origin/a//b"), Err(Error::BadRef(_))));
         // A legitimate nested branch under a remote resolves (None = absent ref).
         assert_eq!(resolve_tip(&layout, "origin/feature/x").unwrap(), None);
         // A plain local branch still resolves to its tip.
         assert_eq!(resolve_tip(&layout, "main").unwrap(), Some(id));
 
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn write_remote_tip_rejects_traversal_in_either_component() {
+        let layout = tmp_layout("write-remote");
+        let id = ObjectId::of(b"snap");
+        // A hostile remote name (bypassing remote_add) is rejected on write.
+        assert!(matches!(
+            write_remote_tip(&layout, "../../x", "main", &id),
+            Err(Error::BadRef(_))
+        ));
+        // A normal write still succeeds and round-trips.
+        write_remote_tip(&layout, "origin", "main", &id).unwrap();
+        assert_eq!(read_remote_tip(&layout, "origin", "main").unwrap(), Some(id));
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
