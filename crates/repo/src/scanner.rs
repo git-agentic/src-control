@@ -1,6 +1,7 @@
 //! Secret detection: high-precision token patterns + a Shannon-entropy
 //! heuristic. Byte-oriented and UTF-8-lossy — never panics on binary input.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use regex::RegexSet;
@@ -41,7 +42,7 @@ pub fn scan(_name: &str, bytes: &[u8]) -> Vec<Hit> {
     let mut hits = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let lineno = i + 1;
-        for idx in set.matches(line).into_iter() {
+        for idx in set.matches(line) {
             hits.push(Hit { rule: HitKind::Pattern(PATTERNS[idx].name), line: lineno });
         }
         if has_high_entropy_run(line) {
@@ -56,7 +57,7 @@ pub fn scan(_name: &str, bytes: &[u8]) -> Vec<Hit> {
 fn has_high_entropy_run(line: &str) -> bool {
     let is_tok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '-' | '_' | '=');
     let mut run = String::new();
-    let check = |run: &str| run.chars().count() >= B64_MIN_RUN && shannon_entropy(run) > ENTROPY_THRESHOLD;
+    let check = |s: &str| s.len() >= B64_MIN_RUN && shannon_entropy(s) > ENTROPY_THRESHOLD;
     for c in line.chars() {
         if is_tok(c) {
             run.push(c);
@@ -77,7 +78,7 @@ fn shannon_entropy(s: &str) -> f64 {
     if n == 0.0 {
         return 0.0;
     }
-    let mut counts = std::collections::HashMap::new();
+    let mut counts = HashMap::new();
     for c in &chars {
         *counts.entry(*c).or_insert(0usize) += 1;
     }
@@ -130,6 +131,36 @@ mod tests {
     #[test]
     fn line_numbers_are_one_based() {
         let body = b"clean line\nkey = AKIAIOSFODNN7EXAMPLE\n";
+        let hits = scan("f", body);
+        assert!(hits.iter().any(|h| h.line == 2 && h.rule == HitKind::Pattern("aws_access_key")));
+    }
+
+    #[test]
+    fn empty_input_has_no_hits_and_no_panic() {
+        assert!(scan("f", b"").is_empty());
+    }
+
+    #[test]
+    fn run_one_below_min_does_not_flag_entropy() {
+        // 19 chars: one below B64_MIN_RUN.
+        let nineteen = "Zm9vYmFyMTIzNDU2Nzg";
+        assert_eq!(nineteen.len(), 19);
+        let hits = scan("f", format!("x = {nineteen}\n").as_bytes());
+        assert!(!rules(&hits).contains(&&HitKind::Entropy));
+    }
+
+    #[test]
+    fn long_low_entropy_run_does_not_flag_entropy() {
+        // 20 chars (length passes) but entropy 0 (all identical).
+        let run = "AAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(run.len(), 20);
+        let hits = scan("f", format!("x = {run}\n").as_bytes());
+        assert!(!rules(&hits).contains(&&HitKind::Entropy));
+    }
+
+    #[test]
+    fn pattern_on_last_line_without_trailing_newline() {
+        let body = b"clean line\nkey = AKIAIOSFODNN7EXAMPLE";
         let hits = scan("f", body);
         assert!(hits.iter().any(|h| h.line == 2 && h.rule == HitKind::Pattern("aws_access_key")));
     }
