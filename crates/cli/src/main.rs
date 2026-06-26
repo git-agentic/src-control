@@ -80,6 +80,8 @@ enum Cmd {
         #[arg(long, default_value = "you")]
         author: String,
     },
+    /// Scan the working tree for plaintext secrets without committing.
+    Scan,
     /// Decrypt authorized secrets, inject them, and run a command.
     Run {
         /// Identity file (default ~/.sc/identity or $SC_IDENTITY).
@@ -163,6 +165,7 @@ fn main() -> Result<()> {
         Cmd::Log => run_log(),
         Cmd::Branch { name } => run_branch(&name),
         Cmd::Switch { name } => run_switch(&name),
+        Cmd::Scan => run_scan(),
         Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &author),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
@@ -615,9 +618,34 @@ fn run_init() -> Result<()> {
 
 fn run_commit(author: &str, message: &str) -> Result<()> {
     let repo = open_repo()?;
-    let id = repo.commit(author, message)?;
-    println!("committed {}", id.short());
-    Ok(())
+    match repo.commit(author, message) {
+        Ok(id) => {
+            println!("committed {}", id.short());
+            Ok(())
+        }
+        Err(scl_repo::Error::SecretDetected(report)) => {
+            // Drop the repo (releases .sc/lock) before process::exit, which
+            // skips destructors and would otherwise leave a stale lock file.
+            drop(repo);
+            eprint!("{report}");
+            std::process::exit(1);
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn run_scan() -> Result<()> {
+    let repo = open_repo()?;
+    let report = repo.scan_worktree()?;
+    if report.is_empty() {
+        println!("scan clean (no secrets detected)");
+        return Ok(());
+    }
+    // Drop the repo (releases .sc/lock) before process::exit, which skips
+    // destructors and would otherwise leave a stale lock file.
+    drop(repo);
+    print!("{report}");
+    std::process::exit(1);
 }
 
 fn run_status() -> Result<()> {

@@ -1,6 +1,6 @@
 # ADR-0017: Accidental-plaintext secret scanner at commit time
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Phase:** 5
 - **Adapts:** [git.agentic ADR-0013](https://github.com/git-agentic/git.agentic)
@@ -63,6 +63,13 @@ Add a **pattern + Shannon-entropy scanner** that runs at commit time and
 - The exemption rule couples the scanner to object kinds (Blob vs Secret vs
   encrypted) — it must be updated when P7 adds encrypted-path objects so those are
   exempted too.
+
+**As built (P5):** the scanner runs in `scl-repo` on every working-tree file at
+commit time (`Repo::commit` → `scan_files` before `write_tree`); `sc scan`
+previews and exits non-zero on findings; detection is a compile-time `RegexSet`
++ a Shannon-entropy pass (base64 runs ≥ 20 chars, > 4.5 bits/char); the allowlist
+is hash-scoped in `.sc/scanner-allowlist.toml`. Encrypted-path bypass is a P7
+interaction (not built here).
 
 ## Alternatives considered
 
