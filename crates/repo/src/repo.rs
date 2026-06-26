@@ -387,8 +387,11 @@ impl Repo {
         &self.vfs
     }
 
-    /// Add a named remote to `.sc/config`.
+    /// Add a named remote to `.sc/config`. The name becomes a path component
+    /// under `refs/remotes/`, so it is validated like a branch name to keep a
+    /// hostile name (e.g. `../heads`) from escaping into `refs/heads/`.
     pub fn remote_add(&self, name: &str, url: &str) -> Result<()> {
+        validate_branch_name(name)?;
         let mut cfg = RemoteConfig::load(&self.layout)?;
         cfg.add(name, url)?;
         cfg.save(&self.layout)
@@ -415,26 +418,12 @@ impl Repo {
 
         let dst_repo = Repo::init(dst.as_ref())?;
 
-        // Transfer every object reachable from the remote's branch tips. The
-        // reachability walk only decodes snapshots + trees (small); each blob is
-        // fetched exactly once, here in the transfer loop — there is no
-        // large-object double-read.
+        // Transfer every object reachable from the remote's branch tips.
         let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
         {
-            let mut tsrc = reachable::TransportSource { transport: &transport };
-            let ids = reachable::reachable_objects(&mut tsrc, &tips)?;
             let store_arc = dst_repo.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            for id in ids {
-                if store.contains(&id) {
-                    continue;
-                }
-                let bytes = transport.get_object(&id)?;
-                let got = store.put(Object::decode(&bytes)?)?;
-                if got != id {
-                    return Err(Error::CorruptObject(id));
-                }
-            }
+            transfer_objects(&transport, &mut store, &tips)?;
         }
 
         // Copy branches + HEAD, and seed origin/* remote-tracking refs so
@@ -467,26 +456,39 @@ impl Repo {
 
         let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
         {
-            let mut tsrc = reachable::TransportSource { transport: &transport };
-            let ids = reachable::reachable_objects(&mut tsrc, &tips)?;
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            for id in ids {
-                if store.contains(&id) {
-                    continue;
-                }
-                let bytes = transport.get_object(&id)?;
-                let got = store.put(Object::decode(&bytes)?)?;
-                if got != id {
-                    return Err(Error::CorruptObject(id));
-                }
-            }
+            transfer_objects(&transport, &mut store, &tips)?;
         }
         for (branch, tip) in &remote_refs {
             refs::write_remote_tip(&self.layout, remote, branch, tip)?;
         }
         Ok(remote_refs)
     }
+}
+
+/// Pull every object reachable from `tips` out of `transport` and into `store`,
+/// skipping ids already present. The reachability walk only decodes snapshots +
+/// trees (small); each blob is fetched exactly once here — there is no
+/// large-object double-read. Callers hold the store lock across this call, so it
+/// must not acquire any other lock. Shared by `clone_to` and `fetch`.
+fn transfer_objects(
+    transport: &impl Transport,
+    store: &mut Store,
+    tips: &[ObjectId],
+) -> Result<()> {
+    let mut tsrc = reachable::TransportSource { transport };
+    for id in reachable::reachable_objects(&mut tsrc, tips)? {
+        if store.contains(&id) {
+            continue;
+        }
+        let bytes = transport.get_object(&id)?;
+        let got = store.put(Object::decode(&bytes)?)?;
+        if got != id {
+            return Err(Error::CorruptObject(id));
+        }
+    }
+    Ok(())
 }
 
 /// Reject branch names that would escape or corrupt `refs/heads/`. A branch name

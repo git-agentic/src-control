@@ -64,10 +64,22 @@ pub fn write_remote_tip(layout: &Layout, remote: &str, branch: &str, id: &Object
 }
 
 /// Resolve a merge source name to a tip. A name containing `/` is treated as a
-/// remote-tracking ref `<remote>/<branch>`; otherwise a local branch.
+/// remote-tracking ref `<remote>/<branch>`; otherwise a local branch. The split
+/// is left-greedy: `"origin/feature/x"` means remote `origin`, branch
+/// `feature/x` (a nested branch is legitimate). The branch component is guarded
+/// against path traversal before it reaches `remote_ref_path`.
 pub fn resolve_tip(layout: &Layout, name: &str) -> Result<Option<ObjectId>> {
     match name.split_once('/') {
-        Some((remote, branch)) => read_remote_tip(layout, remote, branch),
+        Some((remote, branch)) => {
+            if branch.is_empty()
+                || branch.starts_with('.')
+                || branch.contains('\\')
+                || branch.split('/').any(|c| c == "..")
+            {
+                return Err(Error::BadRef(format!("invalid remote-tracking ref: {name:?}")));
+            }
+            read_remote_tip(layout, remote, branch)
+        }
         None => read_branch_tip(layout, name),
     }
 }
