@@ -1944,10 +1944,13 @@ dependencies = [
 name = "scl-repo"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "scl-core",
  "scl-crypto",
  "scl-vfs",
+ "serde",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
