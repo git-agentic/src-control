@@ -842,9 +842,9 @@ fn run_remote(op: RemoteOp) -> Result<()> {
 
 fn run_fetch(remote: &str) -> Result<()> {
     let repo = open_repo()?;
-    let updated = repo.fetch(remote)?;
-    println!("fetched {remote}: {} branch(es)", updated.len());
-    for (branch, tip) in updated {
+    let remote_refs = repo.fetch(remote)?;
+    println!("fetched {remote}: {} remote branch(es)", remote_refs.len());
+    for (branch, tip) in remote_refs {
         println!("  {remote}/{branch} -> {}", tip.short());
     }
     Ok(())

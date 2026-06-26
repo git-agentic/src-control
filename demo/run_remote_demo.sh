@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# End-to-end proof: clone a repo, sync changes both directions, and confirm an
-# unauthorized clone receives a committed secret as ciphertext it cannot read.
+# End-to-end proof: clone a repo, then sync changes both directions between two
+# local repos — fetch+merge a change made on the origin into the clone, and push
+# a change made on the clone back to the origin (fast-forward).
 set -euo pipefail
 cargo build --bin sc >/dev/null 2>&1
 SC="$(pwd)/target/debug/sc"
