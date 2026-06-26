@@ -214,7 +214,7 @@ impl Repo {
             ));
         }
         let ours = self.head_tip()?.ok_or(Error::Unborn)?;
-        let theirs = refs::read_branch_tip(&self.layout, branch)?
+        let theirs = refs::resolve_tip(&self.layout, branch)?
             .ok_or_else(|| Error::NoSuchBranch(branch.to_string()))?;
 
         // Ancestor short-circuits.
@@ -455,6 +455,37 @@ impl Repo {
             worktree::materialize(&dst_repo.layout, &mut store, root, None)?;
         }
         Ok(dst_repo)
+    }
+
+    /// Fetch objects + branch tips from `remote` into remote-tracking refs
+    /// (`refs/remotes/<remote>/<branch>`). Local branches are left untouched.
+    pub fn fetch(&self, remote: &str) -> Result<Vec<(String, ObjectId)>> {
+        let cfg = RemoteConfig::load(&self.layout)?;
+        let url = cfg.url(remote).ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
+        let transport = LocalTransport::open(url)?;
+        let remote_refs = transport.list_refs()?;
+
+        let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
+        {
+            let mut tsrc = reachable::TransportSource { transport: &transport };
+            let ids = reachable::reachable_objects(&mut tsrc, &tips)?;
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            for id in ids {
+                if store.contains(&id) {
+                    continue;
+                }
+                let bytes = transport.get_object(&id)?;
+                let got = store.put(Object::decode(&bytes)?)?;
+                if got != id {
+                    return Err(Error::CorruptObject(id));
+                }
+            }
+        }
+        for (branch, tip) in &remote_refs {
+            refs::write_remote_tip(&self.layout, remote, branch, tip)?;
+        }
+        Ok(remote_refs)
     }
 }
 
@@ -840,6 +871,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(code_denied, 0, "non-recipient sees no DB_URL (ciphertext stays sealed)");
+
+        drop(brepo);
+        std::fs::remove_dir_all(&a).unwrap();
+        std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn fetch_updates_remote_tracking_then_merge_integrates() {
+        let a = tmp_root("fetch-src");
+        {
+            let repo = Repo::init(&a).unwrap();
+            std::fs::write(a.join("f.txt"), b"base\n").unwrap();
+            repo.commit("me", "base").unwrap();
+        }
+        let b = tmp_root("fetch-dst");
+        let _ = std::fs::remove_dir_all(&b);
+        let brepo = Repo::clone_to(&a, &b).unwrap();
+
+        // New commit on A.
+        let a_tip = {
+            let arepo = Repo::open(&a).unwrap();
+            std::fs::write(a.join("f.txt"), b"base\nA-change\n").unwrap();
+            arepo.commit("me", "A change").unwrap()
+        };
+
+        // B fetches: remote-tracking ref advances, local branch does not.
+        let updated = brepo.fetch("origin").unwrap();
+        assert!(updated.iter().any(|(br, id)| br == "main" && *id == a_tip));
+        assert_eq!(
+            crate::refs::read_remote_tip(&brepo.layout, "origin", "main").unwrap(),
+            Some(a_tip)
+        );
+
+        // Merge the fetched ref (fast-forward) and verify the file updated.
+        brepo.merge("origin/main", "me").unwrap();
+        assert_eq!(std::fs::read(b.join("f.txt")).unwrap(), b"base\nA-change\n");
 
         drop(brepo);
         std::fs::remove_dir_all(&a).unwrap();

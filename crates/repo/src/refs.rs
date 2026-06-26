@@ -63,6 +63,15 @@ pub fn write_remote_tip(layout: &Layout, remote: &str, branch: &str, id: &Object
     atomic_write(&dir.join(branch), format!("{}\n", id.to_hex()).as_bytes())
 }
 
+/// Resolve a merge source name to a tip. A name containing `/` is treated as a
+/// remote-tracking ref `<remote>/<branch>`; otherwise a local branch.
+pub fn resolve_tip(layout: &Layout, name: &str) -> Result<Option<ObjectId>> {
+    match name.split_once('/') {
+        Some((remote, branch)) => read_remote_tip(layout, remote, branch),
+        None => read_branch_tip(layout, name),
+    }
+}
+
 /// The tip of the branch HEAD names (or None if unborn).
 pub fn head_tip(layout: &Layout) -> Result<Option<ObjectId>> {
     read_branch_tip(layout, &current_branch(layout)?)
