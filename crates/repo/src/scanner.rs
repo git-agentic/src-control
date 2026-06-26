@@ -167,7 +167,7 @@ impl std::fmt::Display for ScanReport {
             writeln!(f, "{}:{}  {}  blob {}", fd.path, fd.line, fd.rule, fd.blob_id.to_hex())?;
         }
         if !self.findings.is_empty() {
-            write!(
+            writeln!(
                 f,
                 "secret(s) detected; remove them, commit via `sc secret`, or allowlist the blob hash(es) in .sc/scanner-allowlist.toml"
             )?;
