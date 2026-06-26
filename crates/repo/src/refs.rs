@@ -69,12 +69,12 @@ pub fn head_tip(layout: &Layout) -> Result<Option<ObjectId>> {
 }
 
 /// Write `bytes` to `path` via a temp file + rename so a reader never observes
-/// a half-written ref. Correctness relies on the single-writer repo lock
-/// ([`crate::lock::RepoLock`]): the fixed `.tmp` sibling means two concurrent
-/// writers to the same ref would clobber each other's temp file, so we assume
-/// at most one writer holds the lock at a time.
+/// a half-written ref. The temp sibling is per-process (`<name>.<pid>.tmp`) so
+/// writers in different processes never clobber each other's temp file; the
+/// rename itself is atomic. The single-writer repo lock
+/// ([`crate::lock::RepoLock`]) still serializes the final ref content.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())

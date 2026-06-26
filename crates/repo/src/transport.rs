@@ -16,6 +16,7 @@ pub trait Transport {
     fn list_refs(&self) -> Result<Vec<(String, ObjectId)>>;
     /// The branch the remote HEAD names.
     fn head_branch(&self) -> Result<String>;
+    /// True if the remote already holds an object with this id.
     fn has_object(&self, id: &ObjectId) -> Result<bool>;
     /// Raw canonical `encode()` bytes of an object.
     fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>>;
@@ -45,16 +46,19 @@ impl Transport for LocalTransport {
     fn list_refs(&self) -> Result<Vec<(String, ObjectId)>> {
         let mut out = Vec::new();
         let dir = self.layout.refs_heads_dir();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries {
-                let e = e?;
-                if e.file_type()?.is_file() {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    let text = std::fs::read_to_string(e.path())?;
-                    let id = ObjectId::from_str(text.trim())
-                        .map_err(|_| Error::BadRef(format!("remote ref {name} has bad id")))?;
-                    out.push((name, id));
-                }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for e in entries {
+            let e = e?;
+            if e.file_type()?.is_file() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let text = std::fs::read_to_string(e.path())?;
+                let id = ObjectId::from_str(text.trim())
+                    .map_err(|_| Error::BadRef(format!("remote ref {name} has bad id")))?;
+                out.push((name, id));
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));

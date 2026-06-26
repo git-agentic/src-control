@@ -22,7 +22,7 @@ impl ObjectSource for Store {
 
 /// An `ObjectSource` backed by a remote `Transport`.
 pub struct TransportSource<'a> {
-    pub transport: &'a dyn Transport,
+    pub(crate) transport: &'a dyn Transport,
 }
 
 impl ObjectSource for TransportSource<'_> {
@@ -65,20 +65,30 @@ pub fn reachable_objects(src: &mut impl ObjectSource, tips: &[ObjectId]) -> Resu
     Ok(seen)
 }
 
-fn walk_tree(src: &mut impl ObjectSource, tree_id: ObjectId, seen: &mut BTreeSet<ObjectId>) -> Result<()> {
-    if !seen.insert(tree_id) {
-        return Ok(());
+/// Walk `root` and every subtree it reaches, recording trees and blobs in
+/// `seen`. Uses an explicit stack rather than recursion so a deeply-nested
+/// (possibly hostile) remote tree can't overflow the call stack.
+fn walk_tree(src: &mut impl ObjectSource, root: ObjectId, seen: &mut BTreeSet<ObjectId>) -> Result<()> {
+    let mut stack: Vec<ObjectId> = Vec::new();
+    if seen.insert(root) {
+        stack.push(root);
     }
-    let tree = match src.get(&tree_id)? {
-        Object::Tree(t) => t,
-        _ => return Err(Error::BadRef(format!("expected tree {tree_id}"))),
-    };
-    for e in tree.entries {
-        match e.kind {
-            EntryKind::Blob => {
-                seen.insert(e.id);
+    while let Some(tree_id) = stack.pop() {
+        let tree = match src.get(&tree_id)? {
+            Object::Tree(t) => t,
+            _ => return Err(Error::BadRef(format!("expected tree {tree_id}"))),
+        };
+        for e in tree.entries {
+            match e.kind {
+                EntryKind::Blob => {
+                    seen.insert(e.id);
+                }
+                EntryKind::Tree => {
+                    if seen.insert(e.id) {
+                        stack.push(e.id);
+                    }
+                }
             }
-            EntryKind::Tree => walk_tree(src, e.id, seen)?,
         }
     }
     Ok(())
