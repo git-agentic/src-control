@@ -95,7 +95,7 @@ fn shannon_entropy(s: &str) -> f64 {
 }
 
 /// Hash-scoped allowlist: exact blob `ObjectId`s exempt from scanning.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Allowlist {
     ids: HashSet<ObjectId>,
 }
@@ -109,6 +109,8 @@ struct AllowlistFile {
 #[derive(serde::Deserialize)]
 struct AllowEntry {
     blob: String,
+    /// Human annotation explaining why a blob is allowlisted; intentionally
+    /// ignored by the runtime (read by people, not by the scanner).
     #[allow(dead_code)]
     #[serde(default)]
     note: Option<String>,
@@ -122,12 +124,12 @@ impl Allowlist {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Allowlist::default()),
             Err(e) => return Err(e.into()),
         };
-        let parsed: AllowlistFile =
-            toml::from_str(&text).map_err(|e| Error::BadRef(format!("bad scanner-allowlist.toml: {e}")))?;
+        let parsed: AllowlistFile = toml::from_str(&text)
+            .map_err(|e| Error::BadConfig(format!("bad scanner-allowlist.toml: {e}")))?;
         let mut ids = HashSet::new();
         for entry in parsed.allow {
             let id = ObjectId::from_str(entry.blob.trim())
-                .map_err(|_| Error::BadRef(format!("bad blob id in allowlist: {}", entry.blob)))?;
+                .map_err(|_| Error::BadConfig(format!("bad blob id in allowlist: {}", entry.blob)))?;
             ids.insert(id);
         }
         Ok(Allowlist { ids })
@@ -165,7 +167,7 @@ impl std::fmt::Display for ScanReport {
             writeln!(f, "{}:{}  {}  blob {}", fd.path, fd.line, fd.rule, fd.blob_id.to_hex())?;
         }
         if !self.findings.is_empty() {
-            writeln!(
+            write!(
                 f,
                 "secret(s) detected; remove them, commit via `sc secret`, or allowlist the blob hash(es) in .sc/scanner-allowlist.toml"
             )?;
@@ -255,5 +257,17 @@ mod tests {
         let body = b"clean line\nkey = AKIAIOSFODNN7EXAMPLE";
         let hits = scan("f", body);
         assert!(hits.iter().any(|h| h.line == 2 && h.rule == HitKind::Pattern("aws_access_key")));
+    }
+
+    #[test]
+    fn malformed_allowlist_toml_errors_not_panics() {
+        let dir = std::env::temp_dir()
+            .join(format!("scl-allowlist-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scanner-allowlist.toml");
+        std::fs::write(&path, b"not valid toml [[[").unwrap();
+        let err = Allowlist::load(&path).unwrap_err();
+        assert!(matches!(err, Error::BadConfig(_)), "got {err:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -14,6 +14,8 @@ pub enum Error {
     CorruptObject(ObjectId),
     #[error("malformed ref: {0}")]
     BadRef(String),
+    #[error("bad config: {0}")]
+    BadConfig(String),
     #[error("branch not found: {0}")]
     NoSuchBranch(String),
     #[error("secret not found: {0}")]
