@@ -402,7 +402,11 @@ impl Repo {
 
     /// Clone the repo at `src` into a fresh repo at `dst`. Transfers all objects
     /// reachable from src's branches via `LocalTransport`, copies refs + HEAD,
-    /// records `origin = src`, and materializes HEAD into the dst working tree.
+    /// seeds `origin/*` remote-tracking refs, records `origin = src`, and
+    /// materializes HEAD into the dst working tree.
+    ///
+    /// On `Err`, `dst` may be left with a partially-initialized `.sc/`; the
+    /// caller should remove it before retrying.
     pub fn clone_to(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<Repo> {
         let src = src.as_ref();
         let transport = LocalTransport::open(src)?;
@@ -411,7 +415,10 @@ impl Repo {
 
         let dst_repo = Repo::init(dst.as_ref())?;
 
-        // Transfer every object reachable from the remote's branch tips.
+        // Transfer every object reachable from the remote's branch tips. The
+        // reachability walk only decodes snapshots + trees (small); each blob is
+        // fetched exactly once, here in the transfer loop — there is no
+        // large-object double-read.
         let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
         {
             let mut tsrc = reachable::TransportSource { transport: &transport };
@@ -430,14 +437,16 @@ impl Repo {
             }
         }
 
-        // Copy branches and HEAD.
+        // Copy branches + HEAD, and seed origin/* remote-tracking refs so
+        // `merge origin/<branch>` resolves immediately and `fetch` has a baseline.
         for (branch, tip) in &remote_refs {
             refs::write_branch_tip(&dst_repo.layout, branch, tip)?;
+            refs::write_remote_tip(&dst_repo.layout, "origin", branch, tip)?;
         }
         refs::write_head(&dst_repo.layout, &head_branch)?;
 
         // Record origin.
-        dst_repo.remote_add("origin", &src.to_string_lossy())?;
+        dst_repo.remote_add("origin", &src.display().to_string())?;
 
         // Materialize HEAD into the working tree.
         if let Some(root) = dst_repo.head_root()? {
@@ -786,7 +795,12 @@ mod tests {
         // origin recorded
         assert_eq!(
             cloned.remotes().unwrap(),
-            vec![("origin".to_string(), a.to_string_lossy().into_owned())]
+            vec![("origin".to_string(), a.display().to_string())]
+        );
+        // origin/* remote-tracking refs seeded so merge/fetch resolve immediately
+        assert_eq!(
+            crate::refs::read_remote_tip(cloned.layout(), "origin", "main").unwrap(),
+            cloned.head_tip().unwrap()
         );
         drop(cloned);
         std::fs::remove_dir_all(&a).unwrap();

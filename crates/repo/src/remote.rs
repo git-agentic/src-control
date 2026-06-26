@@ -35,6 +35,7 @@ impl RemoteConfig {
         Ok(())
     }
 
+    /// Register a new remote; errors `RemoteExists` if `name` is already set.
     pub fn add(&mut self, name: &str, url: &str) -> Result<()> {
         if self.remote.contains_key(name) {
             return Err(Error::RemoteExists(name.to_string()));
@@ -43,10 +44,12 @@ impl RemoteConfig {
         Ok(())
     }
 
+    /// The URL configured for `name`, or None if there is no such remote.
     pub fn url(&self, name: &str) -> Option<&str> {
         self.remote.get(name).map(|r| r.url.as_str())
     }
 
+    /// The configured remote names, sorted (the backing map is ordered).
     pub fn names(&self) -> Vec<String> {
         self.remote.keys().cloned().collect()
     }
