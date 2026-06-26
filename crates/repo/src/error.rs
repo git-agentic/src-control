@@ -32,6 +32,12 @@ pub enum Error {
     UpToDate,
     #[error("{0}")]
     SecretDetected(crate::scanner::ScanReport),
+    #[error("non-fast-forward: the remote has commits you don't have; fetch + merge first")]
+    NonFastForward,
+    #[error("no such remote: {0}")]
+    NoSuchRemote(String),
+    #[error("remote already exists: {0}")]
+    RemoteExists(String),
     #[error("no common ancestor between the branches")]
     NoCommonAncestor,
     #[error("secret {0} changed differently on both branches; resolve with `sc secret` then retry")]

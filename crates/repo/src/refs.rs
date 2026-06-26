@@ -44,6 +44,25 @@ pub fn write_branch_tip(layout: &Layout, branch: &str, id: &ObjectId) -> Result<
     atomic_write(&layout.ref_path(branch), format!("{}\n", id.to_hex()).as_bytes())
 }
 
+/// The tip recorded for `refs/remotes/<remote>/<branch>`, or None if absent.
+pub fn read_remote_tip(layout: &Layout, remote: &str, branch: &str) -> Result<Option<ObjectId>> {
+    let path = layout.remote_ref_path(remote, branch);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => ObjectId::from_str(text.trim())
+            .map(Some)
+            .map_err(|_| Error::BadRef(format!("remote ref {remote}/{branch} has bad id"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Set `refs/remotes/<remote>/<branch>` to `id` (atomic).
+pub fn write_remote_tip(layout: &Layout, remote: &str, branch: &str, id: &ObjectId) -> Result<()> {
+    let dir = layout.refs_remotes_dir().join(remote);
+    std::fs::create_dir_all(&dir)?;
+    atomic_write(&dir.join(branch), format!("{}\n", id.to_hex()).as_bytes())
+}
+
 /// The tip of the branch HEAD names (or None if unborn).
 pub fn head_tip(layout: &Layout) -> Result<Option<ObjectId>> {
     read_branch_tip(layout, &current_branch(layout)?)

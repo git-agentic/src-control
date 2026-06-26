@@ -9,9 +9,11 @@ pub mod layout;
 pub mod lock;
 pub mod merge;
 pub mod merge_state;
+pub mod reachable;
 pub mod refs;
 pub mod repo;
 pub mod secrets;
+pub mod transport;
 pub mod worktree;
 
 pub use error::{Error, Result};

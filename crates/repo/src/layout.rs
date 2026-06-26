@@ -51,4 +51,17 @@ impl Layout {
     pub fn ref_path(&self, branch: &str) -> PathBuf {
         self.refs_heads_dir().join(branch)
     }
+
+    /// `.sc/refs/remotes` — remote-tracking refs, one dir per remote.
+    pub fn refs_remotes_dir(&self) -> PathBuf {
+        self.dot_sc.join("refs").join("remotes")
+    }
+    /// `.sc/refs/remotes/<remote>/<branch>` — a remote-tracking ref file.
+    pub fn remote_ref_path(&self, remote: &str, branch: &str) -> PathBuf {
+        self.refs_remotes_dir().join(remote).join(branch)
+    }
+    /// `.sc/config` — remotes and other repo config.
+    pub fn config_path(&self) -> PathBuf {
+        self.dot_sc.join("config")
+    }
 }
