@@ -66,22 +66,26 @@ pub fn write_remote_tip(layout: &Layout, remote: &str, branch: &str, id: &Object
 /// Resolve a merge source name to a tip. A name containing `/` is treated as a
 /// remote-tracking ref `<remote>/<branch>`; otherwise a local branch. The split
 /// is left-greedy: `"origin/feature/x"` means remote `origin`, branch
-/// `feature/x` (a nested branch is legitimate). The branch component is guarded
-/// against path traversal before it reaches `remote_ref_path`.
+/// `feature/x` (a nested branch is legitimate). Both the remote and branch
+/// components are guarded against path traversal before they reach
+/// `remote_ref_path`, so neither can escape `.sc/refs/remotes/`.
 pub fn resolve_tip(layout: &Layout, name: &str) -> Result<Option<ObjectId>> {
     match name.split_once('/') {
         Some((remote, branch)) => {
-            if branch.is_empty()
-                || branch.starts_with('.')
-                || branch.contains('\\')
-                || branch.split('/').any(|c| c == "..")
-            {
+            if is_unsafe_ref_component(remote) || is_unsafe_ref_component(branch) {
                 return Err(Error::BadRef(format!("invalid remote-tracking ref: {name:?}")));
             }
             read_remote_tip(layout, remote, branch)
         }
         None => read_branch_tip(layout, name),
     }
+}
+
+/// Whether a `<remote>/<branch>` path component could escape or corrupt
+/// `refs/remotes/`: empty, dot-prefixed, backslash-bearing, or containing a
+/// `..` path component. (A single-component `remote` splits to just itself.)
+fn is_unsafe_ref_component(s: &str) -> bool {
+    s.is_empty() || s.starts_with('.') || s.contains('\\') || s.split('/').any(|c| c == "..")
 }
 
 /// The tip of the branch HEAD names (or None if unborn).
@@ -123,6 +127,27 @@ mod tests {
         let id = ObjectId::of(b"snap");
         write_branch_tip(&layout, "main", &id).unwrap();
         assert_eq!(head_tip(&layout).unwrap(), Some(id));
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn resolve_tip_rejects_traversal_in_either_component() {
+        let layout = tmp_layout("resolve");
+        write_head(&layout, "main").unwrap();
+        let id = ObjectId::of(b"snap");
+        write_branch_tip(&layout, "main", &id).unwrap();
+
+        // Traversal in the remote component or the branch component is rejected.
+        assert!(matches!(
+            resolve_tip(&layout, "../evil/main"),
+            Err(Error::BadRef(_))
+        ));
+        assert!(matches!(resolve_tip(&layout, "origin/../x"), Err(Error::BadRef(_))));
+        // A legitimate nested branch under a remote resolves (None = absent ref).
+        assert_eq!(resolve_tip(&layout, "origin/feature/x").unwrap(), None);
+        // A plain local branch still resolves to its tip.
+        assert_eq!(resolve_tip(&layout, "main").unwrap(), Some(id));
+
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
