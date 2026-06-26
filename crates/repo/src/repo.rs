@@ -465,6 +465,45 @@ impl Repo {
         }
         Ok(remote_refs)
     }
+
+    /// Push the current branch to `remote`, fast-forward-only. Creates the remote
+    /// branch if absent. Errors `NonFastForward` if the remote has commits not
+    /// reachable from the local tip.
+    pub fn push(&self, remote: &str) -> Result<ObjectId> {
+        let cfg = RemoteConfig::load(&self.layout)?;
+        let url = cfg.url(remote).ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
+        let transport = LocalTransport::open(url)?;
+        let branch = refs::current_branch(&self.layout)?;
+        let local_tip = self.head_tip()?.ok_or(Error::Unborn)?;
+
+        // Fast-forward check against the remote's current tip for this branch.
+        if let Some((_, remote_tip)) =
+            transport.list_refs()?.into_iter().find(|(b, _)| *b == branch)
+        {
+            if remote_tip != local_tip {
+                let store_arc = self.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                if !crate::merge::is_ancestor(&mut store, remote_tip, local_tip)? {
+                    return Err(Error::NonFastForward);
+                }
+            }
+        }
+
+        // Transfer objects the remote lacks, then advance the remote ref.
+        {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let ids = reachable::reachable_objects(&mut *store, &[local_tip])?;
+            for id in ids {
+                if !transport.has_object(&id)? {
+                    let bytes = store.get(&id)?.encode();
+                    transport.put_object(&id, &bytes)?;
+                }
+            }
+        }
+        transport.update_ref(&branch, &local_tip)?;
+        Ok(local_tip)
+    }
 }
 
 /// Pull every object reachable from `tips` out of `transport` and into `store`,
@@ -911,6 +950,64 @@ mod tests {
         assert_eq!(std::fs::read(b.join("f.txt")).unwrap(), b"base\nA-change\n");
 
         drop(brepo);
+        std::fs::remove_dir_all(&a).unwrap();
+        std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn push_fast_forward_advances_remote_and_rejects_non_ff() {
+        let a = tmp_root("push-remote");
+        {
+            let repo = Repo::init(&a).unwrap();
+            std::fs::write(a.join("f.txt"), b"base\n").unwrap();
+            repo.commit("me", "base").unwrap();
+        }
+        let b = tmp_root("push-local");
+        let _ = std::fs::remove_dir_all(&b);
+        let brepo = Repo::clone_to(&a, &b).unwrap();
+
+        // B commits and pushes (fast-forward).
+        std::fs::write(b.join("f.txt"), b"base\nB-change\n").unwrap();
+        let b_tip = brepo.commit("me", "B change").unwrap();
+        let pushed = brepo.push("origin").unwrap();
+        assert_eq!(pushed, b_tip);
+        // A's main now points at B's tip and A has the objects.
+        let arepo = Repo::open(&a).unwrap();
+        assert_eq!(arepo.head_tip().unwrap(), Some(b_tip));
+
+        // A diverges; B's next push is non-ff.
+        std::fs::write(a.join("f.txt"), b"base\nB-change\nA-diverge\n").unwrap();
+        arepo.commit("me", "A diverge").unwrap();
+        std::fs::write(b.join("f.txt"), b"base\nB-change\nB-again\n").unwrap();
+        brepo.commit("me", "B again").unwrap();
+        assert!(matches!(brepo.push("origin"), Err(Error::NonFastForward)));
+
+        drop(brepo);
+        drop(arepo);
+        std::fs::remove_dir_all(&a).unwrap();
+        std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn push_creates_a_new_remote_branch() {
+        let a = tmp_root("push-newbr-remote");
+        {
+            let repo = Repo::init(&a).unwrap();
+            std::fs::write(a.join("f.txt"), b"x\n").unwrap();
+            repo.commit("me", "base").unwrap();
+        }
+        let b = tmp_root("push-newbr-local");
+        let _ = std::fs::remove_dir_all(&b);
+        let brepo = Repo::clone_to(&a, &b).unwrap();
+        brepo.branch("feature").unwrap();
+        brepo.switch("feature").unwrap();
+        std::fs::write(b.join("g.txt"), b"feat\n").unwrap();
+        let tip = brepo.commit("me", "feature").unwrap();
+        brepo.push("origin").unwrap();
+        let arepo = Repo::open(&a).unwrap();
+        assert_eq!(crate::refs::read_branch_tip(arepo.layout(), "feature").unwrap(), Some(tip));
+        drop(brepo);
+        drop(arepo);
         std::fs::remove_dir_all(&a).unwrap();
         std::fs::remove_dir_all(&b).unwrap();
     }
