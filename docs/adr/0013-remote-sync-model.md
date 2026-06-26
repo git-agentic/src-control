@@ -1,6 +1,6 @@
 # ADR-0013: Remote sync via object + ref transfer over a pluggable transport
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Phase:** 6
 - **Adapts:** git.agentic ADR-0006/0011 (pluggable ObjectStore backend trait)
@@ -52,6 +52,14 @@ construction, no special-casing in the transport.
   during ref updates.
 - Push fast-forward-only avoids clobbering remote history this round; non-ff
   push / force is deferred.
+
+**As built (P6):** `.sc/config` holds named remotes (`clone` seeds `origin`); a
+sync `Transport` trait with a `LocalTransport` (local-path) impl; an
+`ObjectSource` reachability walk drives object-at-a-time transfer; `fetch` writes
+`refs/remotes/<remote>/<branch>` and `sc merge <remote>/<branch>` integrates via
+the P4 three-way merge; `push` is current-branch fast-forward-only and creates an
+absent remote branch. Network transports, packfile bulk transfer, and `pull`
+remain follow-ons.
 
 ## Alternatives considered
 

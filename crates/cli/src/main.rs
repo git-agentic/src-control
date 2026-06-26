@@ -91,6 +91,31 @@ enum Cmd {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Clone a local repo into a new directory.
+    Clone { src: PathBuf, dst: PathBuf },
+    /// Manage remotes.
+    Remote {
+        #[command(subcommand)]
+        op: RemoteOp,
+    },
+    /// Fetch objects + branch tips from a remote into remote-tracking refs.
+    Fetch {
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
+    /// Push the current branch to a remote (fast-forward-only).
+    Push {
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteOp {
+    /// Add a named remote.
+    Add { name: String, url: String },
+    /// List configured remotes.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -169,6 +194,10 @@ fn main() -> Result<()> {
         Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &author),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
+        Cmd::Clone { src, dst } => run_clone(src, dst),
+        Cmd::Remote { op } => run_remote(op),
+        Cmd::Fetch { remote } => run_fetch(&remote),
+        Cmd::Push { remote } => run_push(&remote),
     }
 }
 
@@ -786,6 +815,46 @@ fn resolve_names(
         .iter()
         .map(|n| dir.get(n).cloned().ok_or_else(|| anyhow::anyhow!("unknown recipient: {n}")))
         .collect()
+}
+
+fn run_clone(src: PathBuf, dst: PathBuf) -> Result<()> {
+    let repo = scl_repo::Repo::clone_to(&src, &dst)?;
+    let n = repo.branches()?.len();
+    println!("cloned {} into {} ({} branch(es))", src.display(), dst.display(), n);
+    Ok(())
+}
+
+fn run_remote(op: RemoteOp) -> Result<()> {
+    let repo = open_repo()?;
+    match op {
+        RemoteOp::Add { name, url } => {
+            repo.remote_add(&name, &url)?;
+            println!("added remote {name} -> {url}");
+        }
+        RemoteOp::List => {
+            for (name, url) in repo.remotes()? {
+                println!("{name}\t{url}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_fetch(remote: &str) -> Result<()> {
+    let repo = open_repo()?;
+    let updated = repo.fetch(remote)?;
+    println!("fetched {remote}: {} branch(es)", updated.len());
+    for (branch, tip) in updated {
+        println!("  {remote}/{branch} -> {}", tip.short());
+    }
+    Ok(())
+}
+
+fn run_push(remote: &str) -> Result<()> {
+    let repo = open_repo()?;
+    let tip = repo.push(remote)?;
+    println!("pushed to {remote}: {}", tip.short());
+    Ok(())
 }
 
 #[cfg(test)]
