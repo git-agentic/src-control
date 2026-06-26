@@ -9,7 +9,10 @@ use scl_vfs::Repo as VfsRepo;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::lock::RepoLock;
+use crate::reachable;
 use crate::refs;
+use crate::remote::RemoteConfig;
+use crate::transport::{LocalTransport, Transport};
 use crate::worktree::{self, Diff};
 
 const DEFAULT_BRANCH: &str = "main";
@@ -383,6 +386,67 @@ impl Repo {
     pub(crate) fn vfs_handle(&self) -> &VfsRepo {
         &self.vfs
     }
+
+    /// Add a named remote to `.sc/config`.
+    pub fn remote_add(&self, name: &str, url: &str) -> Result<()> {
+        let mut cfg = RemoteConfig::load(&self.layout)?;
+        cfg.add(name, url)?;
+        cfg.save(&self.layout)
+    }
+
+    /// List configured remotes as `(name, url)`.
+    pub fn remotes(&self) -> Result<Vec<(String, String)>> {
+        let cfg = RemoteConfig::load(&self.layout)?;
+        Ok(cfg.remote.into_iter().map(|(n, r)| (n, r.url)).collect())
+    }
+
+    /// Clone the repo at `src` into a fresh repo at `dst`. Transfers all objects
+    /// reachable from src's branches via `LocalTransport`, copies refs + HEAD,
+    /// records `origin = src`, and materializes HEAD into the dst working tree.
+    pub fn clone_to(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<Repo> {
+        let src = src.as_ref();
+        let transport = LocalTransport::open(src)?;
+        let remote_refs = transport.list_refs()?;
+        let head_branch = transport.head_branch()?;
+
+        let dst_repo = Repo::init(dst.as_ref())?;
+
+        // Transfer every object reachable from the remote's branch tips.
+        let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
+        {
+            let mut tsrc = reachable::TransportSource { transport: &transport };
+            let ids = reachable::reachable_objects(&mut tsrc, &tips)?;
+            let store_arc = dst_repo.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            for id in ids {
+                if store.contains(&id) {
+                    continue;
+                }
+                let bytes = transport.get_object(&id)?;
+                let got = store.put(Object::decode(&bytes)?)?;
+                if got != id {
+                    return Err(Error::CorruptObject(id));
+                }
+            }
+        }
+
+        // Copy branches and HEAD.
+        for (branch, tip) in &remote_refs {
+            refs::write_branch_tip(&dst_repo.layout, branch, tip)?;
+        }
+        refs::write_head(&dst_repo.layout, &head_branch)?;
+
+        // Record origin.
+        dst_repo.remote_add("origin", &src.to_string_lossy())?;
+
+        // Materialize HEAD into the working tree.
+        if let Some(root) = dst_repo.head_root()? {
+            let store_arc = dst_repo.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            worktree::materialize(&dst_repo.layout, &mut store, root, None)?;
+        }
+        Ok(dst_repo)
+    }
 }
 
 /// Reject branch names that would escape or corrupt `refs/heads/`. A branch name
@@ -696,6 +760,76 @@ mod tests {
         assert!(rep.is_empty());
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clone_copies_objects_refs_head_and_worktree() {
+        let a = tmp_root("clone-src");
+        {
+            let repo = Repo::init(&a).unwrap();
+            std::fs::write(a.join("README.md"), b"hello from A\n").unwrap();
+            repo.commit("me", "first").unwrap();
+            repo.branch("feature").unwrap();
+        }
+        let b = tmp_root("clone-dst");
+        let _ = std::fs::remove_dir_all(&b); // clone_to inits it
+        let cloned = Repo::clone_to(&a, &b).unwrap();
+        // HEAD + branches copied
+        assert!(cloned.head_tip().unwrap().is_some());
+        let branches: Vec<String> =
+            cloned.branches().unwrap().into_iter().map(|(n, _)| n).collect();
+        assert!(
+            branches.contains(&"main".to_string()) && branches.contains(&"feature".to_string())
+        );
+        // working tree materialized
+        assert_eq!(std::fs::read(b.join("README.md")).unwrap(), b"hello from A\n");
+        // origin recorded
+        assert_eq!(
+            cloned.remotes().unwrap(),
+            vec![("origin".to_string(), a.to_string_lossy().into_owned())]
+        );
+        drop(cloned);
+        std::fs::remove_dir_all(&a).unwrap();
+        std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn clone_preserves_committed_secret_decryptable_only_with_key() {
+        let a = tmp_root("clone-secret-src");
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mallory_sk, _mallory_pk) = scl_crypto::generate_keypair();
+        {
+            let repo = Repo::init(&a).unwrap();
+            std::fs::write(a.join("f.txt"), b"x\n").unwrap();
+            repo.commit("me", "base").unwrap();
+            repo.secret_add("DB_URL", b"postgres://secret", &[alice_pk]).unwrap();
+        }
+        let b = tmp_root("clone-secret-dst");
+        let _ = std::fs::remove_dir_all(&b);
+        let brepo = Repo::clone_to(&a, &b).unwrap();
+
+        // The secret travelled: it's in the cloned registry...
+        let list = brepo.secret_list().unwrap();
+        assert!(list.iter().any(|s| s.name == "DB_URL"));
+        // ...as ciphertext only an authorized key can read.
+        let code_ok = brepo
+            .run(
+                &alice_sk,
+                &["sh".into(), "-c".into(), "test \"$DB_URL\" = postgres://secret".into()],
+            )
+            .unwrap();
+        assert_eq!(code_ok, 0, "alice's key decrypts the cloned secret");
+        let code_denied = brepo
+            .run(
+                &mallory_sk,
+                &["sh".into(), "-c".into(), "test -z \"$DB_URL\"".into()],
+            )
+            .unwrap();
+        assert_eq!(code_denied, 0, "non-recipient sees no DB_URL (ciphertext stays sealed)");
+
+        drop(brepo);
+        std::fs::remove_dir_all(&a).unwrap();
+        std::fs::remove_dir_all(&b).unwrap();
     }
 
     #[test]

@@ -11,12 +11,14 @@ pub mod merge;
 pub mod merge_state;
 pub mod reachable;
 pub mod refs;
+pub mod remote;
 pub mod repo;
 pub mod secrets;
 pub mod transport;
 pub mod worktree;
 
 pub use error::{Error, Result};
+pub use remote::RemoteConfig;
 pub use repo::{Repo, Status};
 pub use scanner::ScanReport;
 pub use secrets::SecretInfo;
