@@ -130,12 +130,36 @@ impl Transport for LocalTransport {
         Ok(pack)
     }
 
+    /// Receive a pack: verify every record (BLAKE3) and write each object into the store.
+    /// Returns the ids of every object written. Ref updates are the caller's responsibility.
+    ///
+    /// # Verification
+    ///
+    /// `parse_pack` BLAKE3-verifies every record in the pack **before** any object is written.
+    /// A corrupt or tampered pack is therefore rejected in full, with no objects written, and
+    /// returns `Err`.
+    ///
+    /// # Non-transactional writes
+    ///
+    /// After the upfront verification passes, objects are written one-by-one. These writes are
+    /// **not** atomic: if a later `store.put` fails (e.g. disk full), earlier objects are already
+    /// durably stored and the call returns `Err`. This cannot corrupt the store — every written
+    /// object is valid and uniquely identified by its own BLAKE3 hash — but a partially-applied
+    /// pack is observable (`has_object` may return `true` for some ids and `false` for others).
+    ///
+    /// # Caller contract on `Err`
+    ///
+    /// Treat any `Err` return as "the pack was not fully applied". Do **not** update refs on
+    /// failure. Any partially-written objects are unreferenced and will be reclaimed by `sc gc`.
+    /// Retrying is safe because content-addressed `put` is idempotent.
     fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>> {
         let mut store = self.store.borrow_mut();
         let mut ids = Vec::new();
         // parse_pack verifies every record's hash before we write anything.
         for (id, obj) in scl_core::pack::parse_pack(pack)? {
             let got = store.put(obj)?;
+            // Defense in depth: parse_pack already verified each record's hash; this guards
+            // against a future change that weakens that.
             if got != id {
                 return Err(Error::CorruptObject(id));
             }
