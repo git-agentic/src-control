@@ -80,6 +80,13 @@ struct Resident {
     last_used: u64,
 }
 
+/// Where a packed object lives: which pack file and its record offset.
+#[derive(Clone)]
+struct PackLoc {
+    pack_path: PathBuf,
+    offset: u64,
+}
+
 /// The object store. Cheap to share base content across many worktrees because
 /// blob bytes live behind `Arc`.
 pub struct Store {
@@ -87,6 +94,8 @@ pub struct Store {
     resident: HashMap<ObjectId, Resident>,
     /// Blobs evicted to spill, with their byte size for budget re-admission.
     spilled: HashMap<ObjectId, usize>,
+    /// id -> pack location, union over all loaded packs (persistent only).
+    pack_index: HashMap<ObjectId, PackLoc>,
     clock: u64,
     resident_blob_bytes: usize,
     spill_dir_ready: bool,
@@ -100,6 +109,7 @@ impl Store {
             cfg,
             resident: HashMap::new(),
             spilled: HashMap::new(),
+            pack_index: HashMap::new(),
             clock: 0,
             resident_blob_bytes: 0,
             spill_dir_ready: false,
@@ -116,10 +126,12 @@ impl Store {
     pub fn open_persistent(objects_dir: impl Into<PathBuf>, budget_bytes: usize) -> Result<Self> {
         let dir = objects_dir.into();
         std::fs::create_dir_all(&dir)?;
-        Ok(Store::new(StoreConfig {
+        let mut store = Store::new(StoreConfig {
             budget_bytes,
             backend: Backend::Persistent(dir),
-        }))
+        });
+        store.reload_packs()?;
+        Ok(store)
     }
 
     fn persistent_dir(&self) -> Option<&PathBuf> {
@@ -193,9 +205,12 @@ impl Store {
             self.resident.insert(*id, Resident { obj: obj.clone(), blob_size: size, last_used: t });
             return Ok(obj);
         }
-        // Persistent backend: load any object kind from disk.
+        // Persistent backend: load any object kind from disk (loose, else pack).
         if self.persistent_dir().is_some() {
-            let obj = self.read_object_file(id)?;
+            let obj = match self.existing_loose_path(id) {
+                Some(_) => self.read_object_file(id)?,
+                None => self.read_pack_object(id)?,
+            };
             let blob_size = obj.blob_size();
             if blob_size > 0 {
                 self.ensure_capacity(blob_size, id)?;
@@ -213,7 +228,7 @@ impl Store {
         if self.resident.contains_key(id) || self.spilled.contains_key(id) {
             return true;
         }
-        self.existing_loose_path(id).is_some()
+        self.existing_loose_path(id).is_some() || self.pack_index.contains_key(id)
     }
 
     // ---- typed convenience helpers -----------------------------------------
@@ -471,6 +486,107 @@ impl Store {
         Ok(())
     }
 
+    /// `objects/pack` directory, or `None` in ephemeral mode.
+    fn pack_dir(&self) -> Option<PathBuf> {
+        Some(self.persistent_dir()?.join("pack"))
+    }
+
+    /// Rescan `objects/pack/*.idx`, rebuilding the in-memory id->location map.
+    pub fn reload_packs(&mut self) -> Result<()> {
+        self.pack_index.clear();
+        let Some(pack_dir) = self.pack_dir() else { return Ok(()) };
+        let entries = match std::fs::read_dir(&pack_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        for e in entries {
+            let e = e?;
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("idx") {
+                continue;
+            }
+            let pack_path = path.with_extension("pack");
+            if !pack_path.exists() {
+                continue; // orphan idx; ignore
+            }
+            let idx_bytes = std::fs::read(&path)?;
+            for ie in crate::pack::parse_index(&idx_bytes)? {
+                self.pack_index
+                    .entry(ie.id)
+                    .or_insert(PackLoc { pack_path: pack_path.clone(), offset: ie.offset });
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `true` if `id` is present in a loaded pack index.
+    pub fn is_packed(&self, id: &ObjectId) -> bool {
+        self.pack_index.contains_key(id)
+    }
+
+    /// Hashes (file stems) of currently-loaded packs.
+    pub fn pack_hashes(&self) -> Vec<String> {
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for loc in self.pack_index.values() {
+            if let Some(stem) = loc.pack_path.file_stem().and_then(|s| s.to_str()) {
+                set.insert(stem.to_string());
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Read a packed object: seek to its record and decompress+verify+decode.
+    fn read_pack_object(&self, id: &ObjectId) -> Result<Object> {
+        let loc = self.pack_index.get(id).ok_or(Error::NotFound(*id))?;
+        // Read just the record: 4-byte length prefix then the compressed payload.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&loc.pack_path)?;
+        f.seek(SeekFrom::Start(loc.offset))?;
+        let mut len_buf = [0u8; 4];
+        f.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        f.read_exact(&mut payload)?;
+        // Reuse the pure reader by framing the record as a 1-record slice.
+        let mut framed = Vec::with_capacity(4 + len);
+        framed.extend_from_slice(&len_buf);
+        framed.extend_from_slice(&payload);
+        crate::pack::read_object_at(&framed, 0, id)
+    }
+
+    /// Read every named object's canonical bytes, write a `<hash>.pack`/`.idx`
+    /// under `objects/pack/`, refresh the index, and return the pack hash.
+    pub fn write_pack(&mut self, ids: &[ObjectId]) -> Result<String> {
+        let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::with_capacity(ids.len());
+        for id in ids {
+            objects.push((*id, self.get(id)?.encode()));
+        }
+        let (pack_bytes, idx_bytes) = crate::pack::build_pack(&objects)?;
+        let hash = hex::encode(blake3::hash(&pack_bytes).as_bytes());
+        let pack_dir = self.pack_dir().expect("persistent backend");
+        std::fs::create_dir_all(&pack_dir)?;
+        write_atomic(&pack_dir.join(format!("{hash}.pack")), &pack_bytes)?;
+        write_atomic(&pack_dir.join(format!("{hash}.idx")), &idx_bytes)?;
+        self.reload_packs()?;
+        Ok(hash)
+    }
+
+    /// Remove a pack's `.pack` + `.idx` and forget its index entries.
+    pub fn delete_pack(&mut self, hash: &str) -> Result<()> {
+        if let Some(pack_dir) = self.pack_dir() {
+            for ext in ["pack", "idx"] {
+                let p = pack_dir.join(format!("{hash}.{ext}"));
+                match std::fs::remove_file(&p) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::Io(e)),
+                }
+            }
+        }
+        self.reload_packs()
+    }
+
     fn read_spill(&self, id: &ObjectId) -> Result<Object> {
         let path = self.spill_dir().ok_or(Error::NotFound(*id))?.join(id.to_hex());
         // Spill files hold RAW blob bytes (not `encode()` output), so reconstruct
@@ -494,6 +610,14 @@ impl Drop for Store {
             }
         }
     }
+}
+
+/// Atomic write via a per-process tmp sibling + rename.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -649,6 +773,44 @@ mod tests {
         let mut s = Store::open_persistent(&dir, 1 << 20).unwrap();
         assert!(s.contains(&id));
         assert_eq!(s.get(&id).unwrap().encode(), obj.encode());
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_pack_then_read_after_loose_deleted() {
+        let dir = temp_objects_dir("pack");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Store::open_persistent(&dir, 1 << 20).unwrap();
+        let a = s.put(Object::blob(b"packed-a".to_vec())).unwrap();
+        let b = s.put(Object::blob(b"packed-b".to_vec())).unwrap();
+        let hash = s.write_pack(&[a, b]).unwrap();
+        assert!(s.pack_hashes().contains(&hash));
+        assert!(s.is_packed(&a) && s.is_packed(&b));
+        // Delete the loose copies; the object must still be readable from the pack.
+        s.delete(&a).unwrap();
+        s.delete(&b).unwrap();
+        assert!(s.list_loose().unwrap().is_empty());
+        // Reopen so RAM cache is cold: read must come from the pack.
+        let mut s2 = Store::open_persistent(&dir, 1 << 20).unwrap();
+        assert_eq!(s2.get(&a).unwrap().encode(), Object::blob(b"packed-a".to_vec()).encode());
+        assert!(s2.contains(&b));
+        drop((s, s2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn delete_pack_forgets_its_objects() {
+        let dir = temp_objects_dir("delpack");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Store::open_persistent(&dir, 1 << 20).unwrap();
+        let a = s.put(Object::blob(b"x".to_vec())).unwrap();
+        let hash = s.write_pack(&[a]).unwrap();
+        s.delete(&a).unwrap(); // drop loose copy; only the pack has it now
+        assert!(s.contains(&a));
+        s.delete_pack(&hash).unwrap();
+        assert!(!s.is_packed(&a));
+        assert!(!s.contains(&a));
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
     }
