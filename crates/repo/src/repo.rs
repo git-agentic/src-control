@@ -18,6 +18,10 @@ use crate::worktree::{self, Diff};
 const DEFAULT_BRANCH: &str = "main";
 const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
 
+/// A working-tree file headed for encryption at commit time:
+/// `(path, plaintext bytes, file mode, recipient pubkeys)`.
+type ProtectedFile = (String, Vec<u8>, scl_core::FileMode, Vec<[u8; 32]>);
+
 /// Working-tree status against HEAD.
 pub type Status = Diff;
 
@@ -135,28 +139,33 @@ impl Repo {
             }
         };
 
-        // Partition by protected prefix: protected files are encrypted, not scanned.
-        let (protected, plain): (Vec<_>, Vec<_>) = files
-            .into_iter()
-            .partition(|(path, _, _)| crate::protect::matching_prefix(&protection, path).is_some());
+        // Single pass: split protected files (capturing each rule's recipients, so
+        // the encryption loop needn't look the prefix up again) from plaintext.
+        let mut plain: Vec<(String, Vec<u8>, scl_core::FileMode)> = Vec::new();
+        let mut protected: Vec<ProtectedFile> = Vec::new();
+        for (path, bytes, mode) in files {
+            match crate::protect::matching_prefix(&protection, &path) {
+                Some(rule) => protected.push((path, bytes, mode, rule.recipients.clone())),
+                None => plain.push((path, bytes, mode)),
+            }
+        }
 
-        // Scan only plaintext files.
+        // Scan only plaintext files (protected files are encrypted on purpose).
         let report = self.scan_files(&plain)?;
         if !report.is_empty() {
             return Err(Error::SecretDetected(report));
         }
 
-        // Encrypt protected files; accumulate fresh wrapped DEKs.
+        // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
         let mut all: Vec<(String, Vec<u8>, scl_core::FileMode, u8)> =
             plain.into_iter().map(|(p, b, m)| (p, b, m, 0u8)).collect();
         let mut fresh_wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
-        for (path, bytes, mode) in protected {
-            let rule = crate::protect::matching_prefix(&protection, &path)
-                .expect("file was partitioned into the protected set");
+        for (path, bytes, mode, recipients) in protected {
             let (blob_bytes, dek) = scl_crypto::encrypt_path(&bytes);
+            // Build the blob object once for its id; `write_tree_with_perms` does
+            // the (idempotent) store insert below — no second explicit `put`.
             let blob_id = Object::blob(blob_bytes.clone()).id();
-            let wks: Vec<WrappedKey> = rule
-                .recipients
+            let wks: Vec<WrappedKey> = recipients
                 .iter()
                 .map(|pk| scl_crypto::wrap_dek_for(&dek, &scl_crypto::PublicKey::from_bytes(*pk)))
                 .collect();
@@ -166,9 +175,26 @@ impl Repo {
 
         let root = self.vfs.write_tree_with_perms(&all)?;
 
-        // Rebuild policy.wrapped from only this commit's protected blobs.
-        // Convergent encryption reproduces the same blob id for unchanged content,
-        // so fresh wraps already cover every protected file — nothing stale is kept.
+        // Rebuild policy.wrapped from only this commit's protected blobs, dropping
+        // any stale entries. Crucially, reuse the prior wrap bytes for an unchanged
+        // (blob_id, recipient_id): convergent encryption keeps blob ids stable, but
+        // `wrap_dek_for` randomizes its ephemeral key — re-wrapping every commit
+        // would change the `protection` encoding (and thus the snapshot id) for
+        // identical content, breaking "same content -> stable history". Carrying the
+        // prior wrap forward keeps it stable; only a newly-added recipient (or a new
+        // blob) gets a fresh wrap, and a revoked recipient is already absent here.
+        let prior = std::mem::take(&mut protection.wrapped);
+        for (blob_id, wks) in fresh_wrapped.iter_mut() {
+            if let Some(prior_wks) = prior.get(blob_id) {
+                for wk in wks.iter_mut() {
+                    if let Some(existing) =
+                        prior_wks.iter().find(|p| p.recipient_id == wk.recipient_id)
+                    {
+                        *wk = existing.clone();
+                    }
+                }
+            }
+        }
         protection.wrapped = fresh_wrapped;
 
         let mut parents: Vec<ObjectId> = tip.into_iter().collect();
@@ -1113,6 +1139,34 @@ mod tests {
         } else {
             panic!("expected Blob object");
         }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_protected_file_keeps_stable_wrapped_dek_across_commits() {
+        // Regression: `wrap_dek_for` randomizes its ephemeral key, so naively
+        // re-wrapping every commit would change `protection.wrapped` (and the
+        // snapshot encoding) even when the protected content is identical. The
+        // prior wrap must be carried forward for an unchanged (blob, recipient).
+        let root = tmp_root("p7-stable-wrap");
+        let repo = Repo::init(&root).unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        repo.test_set_protected_prefix("secret/", &[pk]).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        std::fs::write(root.join("plain.txt"), b"v1").unwrap();
+        let c1 = repo.commit("me", "add").unwrap();
+        let w1 = repo.snapshot(&c1).unwrap().protection.wrapped;
+
+        // Change only the unrelated plaintext file; the protected file is untouched.
+        std::fs::write(root.join("plain.txt"), b"v2").unwrap();
+        let c2 = repo.commit("me", "touch plain").unwrap();
+        let w2 = repo.snapshot(&c2).unwrap().protection.wrapped;
+
+        assert_ne!(c1, c2, "the two commits are distinct");
+        // Same blob id (convergent) AND byte-identical wrapped DEKs (carried forward).
+        assert_eq!(w1, w2, "wrapped DEKs must be stable for unchanged protected content");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -101,7 +101,7 @@ impl Repo {
                 map.insert(normalize(path), (id, *mode, *perms));
             }
         }
-        self.build_subtree_perms(&map, "")
+        self.build_subtree_inner(&map, "")
     }
 
     /// Fork an in-memory worktree from a base snapshot. Cheap: allocates only an
@@ -120,62 +120,24 @@ impl Repo {
     }
 
     /// Recursively build directory trees bottom-up from a flat path->(blob, mode)
-    /// map, inserting each tree object, and return the root tree id.
+    /// map, inserting each tree object, and return the root tree id. All entries
+    /// get `perms = 0`; protected (encrypted) entries go through
+    /// `write_tree_with_perms` instead.
     fn build_tree(&self, files: &BTreeMap<String, (ObjectId, FileMode)>) -> Result<ObjectId> {
-        self.build_subtree(files, "")
+        let with_perms: BTreeMap<String, (ObjectId, FileMode, u8)> =
+            files.iter().map(|(p, (id, mode))| (p.clone(), (*id, *mode, 0u8))).collect();
+        self.build_subtree_inner(&with_perms, "")
     }
 
-    fn build_subtree(
-        &self,
-        files: &BTreeMap<String, (ObjectId, FileMode)>,
-        prefix: &str,
-    ) -> Result<ObjectId> {
-        // Partition entries directly under `prefix` into files vs subdirectories.
-        let mut entries: Vec<TreeEntry> = Vec::new();
-        let mut subdirs: BTreeMap<String, ()> = BTreeMap::new();
-
-        for (path, (id, mode)) in files {
-            let Some(rest) = strip_prefix_dir(path, prefix) else { continue };
-            match rest.split_once('/') {
-                None => entries.push(TreeEntry {
-                    name: rest.to_string(),
-                    kind: EntryKind::Blob,
-                    id: *id,
-                    mode: *mode,
-                    perms: 0,
-                }),
-                Some((dir, _)) => {
-                    subdirs.insert(dir.to_string(), ());
-                }
-            }
-        }
-        for dir in subdirs.keys() {
-            let child_prefix = if prefix.is_empty() {
-                format!("{dir}/")
-            } else {
-                format!("{prefix}{dir}/")
-            };
-            let sub_id = self.build_subtree(files, &child_prefix)?;
-            entries.push(TreeEntry {
-                name: dir.clone(),
-                kind: EntryKind::Tree,
-                id: sub_id,
-                mode: FileMode(0o755),
-                perms: 0,
-            });
-        }
-        let tree = Object::Tree(Tree::new(entries));
-        Ok(self.store.lock().unwrap().put(tree)?)
-    }
-
-    /// Like `build_subtree` but reads the `perms` byte per entry from the map,
-    /// enabling the `PROTECTED` bit (and others) on individual blob entries.
-    /// Subtree (directory) entries always use `perms: 0`.
-    fn build_subtree_perms(
+    /// The single tree builder: reads each blob entry's `perms` byte from the map
+    /// (e.g. `scl_core::PROTECTED` for encrypted blobs); subtree (directory)
+    /// entries always use `perms: 0`.
+    fn build_subtree_inner(
         &self,
         files: &BTreeMap<String, (ObjectId, FileMode, u8)>,
         prefix: &str,
     ) -> Result<ObjectId> {
+        // Partition entries directly under `prefix` into files vs subdirectories.
         let mut entries: Vec<TreeEntry> = Vec::new();
         let mut subdirs: BTreeMap<String, ()> = BTreeMap::new();
 
@@ -200,7 +162,7 @@ impl Repo {
             } else {
                 format!("{prefix}{dir}/")
             };
-            let sub_id = self.build_subtree_perms(files, &child_prefix)?;
+            let sub_id = self.build_subtree_inner(files, &child_prefix)?;
             entries.push(TreeEntry {
                 name: dir.clone(),
                 kind: EntryKind::Tree,
