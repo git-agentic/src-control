@@ -148,6 +148,12 @@ enum Cmd {
         #[arg(long)]
         recipient_id: String,
     },
+    /// Garbage-collect: pack reachable objects, prune unreachable ones.
+    Gc {
+        /// Prune unreachable loose objects older than this (e.g. 24h, 7d).
+        #[arg(long, default_value = "24h")]
+        prune_expire: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,6 +247,7 @@ fn main() -> Result<()> {
         Cmd::Protect { prefix, to, list } => run_protect(prefix, to, list),
         Cmd::Grant { prefix, to, identity } => run_grant(prefix, to, identity),
         Cmd::Revoke { prefix, recipient_id } => run_revoke(prefix, recipient_id),
+        Cmd::Gc { prune_expire } => run_gc(&prune_expire),
     }
 }
 
@@ -956,9 +963,46 @@ fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
     Ok(())
 }
 
+/// Parse a duration like `24h`, `30m`, `45s`, `7d` into a `std::time::Duration`.
+/// Bare-number (no suffix) is rejected to avoid ambiguity.
+fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1u64),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('d') => (&s[..s.len() - 1], 86400),
+        _ => anyhow::bail!("duration needs a unit suffix s/m/h/d, got {s:?}"),
+    };
+    let n: u64 = num.parse().map_err(|_| anyhow::anyhow!("bad duration number: {s:?}"))?;
+    Ok(std::time::Duration::from_secs(n * mult))
+}
+
+fn run_gc(prune_expire: &str) -> Result<()> {
+    let grace = parse_duration(prune_expire)?;
+    let repo = scl_repo::Repo::open(".")?;
+    let stats = repo.gc(grace)?;
+    println!(
+        "gc: packed {} object(s), pruned {} loose, kept {} recent, removed {} old pack(s)",
+        stats.packed, stats.loose_pruned, stats.loose_kept, stats.packs_removed
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_suffixed_durations() {
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(24 * 3600));
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+        assert_eq!(parse_duration("45s").unwrap(), Duration::from_secs(45));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(7 * 86400));
+        assert!(parse_duration("nope").is_err());
+    }
 
     #[test]
     fn loads_recipients_from_toml() {
