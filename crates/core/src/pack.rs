@@ -42,7 +42,11 @@ pub fn build_pack(objects: &[(ObjectId, Vec<u8>)]) -> Result<(Vec<u8>, Vec<u8>)>
     for (id, canonical) in objects {
         let compressed = zstd::encode_all(std::io::Cursor::new(canonical), COMPRESSION_LEVEL)
             .map_err(Error::Io)?;
-        let offset = pack.len() as u64;
+        // Each record: [id:32][compressed_len:4][compressed_data:N].
+        // The index offset points to `compressed_len` so that `read_object_at`
+        // (which reads the length at `offset`) requires no format-aware changes.
+        pack.extend_from_slice(id.as_bytes());
+        let offset = pack.len() as u64; // position of compressed_len
         pack.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         pack.extend_from_slice(&compressed);
         entries.push(IndexEntry { id: *id, offset, length: compressed.len() as u64 });
@@ -139,6 +143,15 @@ pub fn parse_pack(pack: &[u8]) -> Result<Vec<(ObjectId, Object)>> {
     let mut out = Vec::new();
     let mut pos = 8usize;
     while pos < pack.len() {
+        // Record layout: [id:32][compressed_len:4][compressed_data:N].
+        if pos + 32 > pack.len() {
+            return Err(Error::PackCorrupt("truncated record id".into()));
+        }
+        let mut id_bytes = [0u8; 32];
+        id_bytes.copy_from_slice(&pack[pos..pos + 32]);
+        let expected_id = ObjectId::from_bytes(id_bytes);
+        pos += 32;
+
         if pos + 4 > pack.len() {
             return Err(Error::PackCorrupt("truncated record length".into()));
         }
@@ -150,9 +163,14 @@ pub fn parse_pack(pack: &[u8]) -> Result<Vec<(ObjectId, Object)>> {
         }
         let canonical = zstd::decode_all(std::io::Cursor::new(&pack[start..end]))
             .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-        let id = ObjectId::of(&canonical);
+        let actual_id = ObjectId::of(&canonical);
+        if actual_id != expected_id {
+            return Err(Error::PackCorrupt(format!(
+                "hash mismatch: expected {expected_id}, got {actual_id}"
+            )));
+        }
         let obj = Object::decode(&canonical)?;
-        out.push((id, obj));
+        out.push((actual_id, obj));
         pos = end;
     }
     Ok(out)

@@ -25,6 +25,14 @@ pub trait Transport {
     fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()>;
     /// Set `refs/heads/<branch>` on the remote to `id`.
     fn update_ref(&self, branch: &str, id: &ObjectId) -> Result<()>;
+
+    /// Build a pack of every object reachable from `wants` but not already
+    /// implied by `haves` (the receiver's closure). Returns `.pack` bytes.
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>>;
+
+    /// Receive a pack: verify every record (BLAKE3) and write each object into
+    /// the store. Returns the contained ids. Refs are the caller's job.
+    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>>;
 }
 
 /// Transport over a remote `.sc/` directory on the local filesystem.
@@ -99,6 +107,41 @@ impl Transport for LocalTransport {
     fn update_ref(&self, branch: &str, id: &ObjectId) -> Result<()> {
         let _lock = RepoLock::acquire(&self.layout)?;
         crate::refs::write_branch_tip(&self.layout, branch, id)
+    }
+
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>> {
+        use std::collections::BTreeSet;
+        let mut store = self.store.borrow_mut();
+        // Reachable-from-wants minus reachable-from-haves, computed on this
+        // (the remote) store. `haves` the remote doesn't have are skipped.
+        let want_set = crate::reachable::reachable_objects(&mut *store, wants)?;
+        let mut have_set: BTreeSet<ObjectId> = BTreeSet::new();
+        for h in haves {
+            if store.contains(h) {
+                have_set.extend(crate::reachable::reachable_objects(&mut *store, &[*h])?);
+            }
+        }
+        let send: Vec<(ObjectId, Vec<u8>)> = want_set
+            .into_iter()
+            .filter(|id| !have_set.contains(id))
+            .map(|id| Ok((id, store.get(&id)?.encode())))
+            .collect::<Result<Vec<_>>>()?;
+        let (pack, _idx) = scl_core::pack::build_pack(&send)?;
+        Ok(pack)
+    }
+
+    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>> {
+        let mut store = self.store.borrow_mut();
+        let mut ids = Vec::new();
+        // parse_pack verifies every record's hash before we write anything.
+        for (id, obj) in scl_core::pack::parse_pack(pack)? {
+            let got = store.put(obj)?;
+            if got != id {
+                return Err(Error::CorruptObject(id));
+            }
+            ids.push(id);
+        }
+        Ok(ids)
     }
 }
 
@@ -175,5 +218,48 @@ mod tests {
         assert!(t.has_object(&id).unwrap());
         assert_eq!(t.get_object(&id).unwrap(), Object::blob(b"remote-packed".to_vec()).encode());
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn get_pack_excludes_haves_and_put_pack_verifies() {
+        let pid = std::process::id();
+        let src_root =
+            std::env::temp_dir().join(format!("scl-xport-bulk-{pid}"));
+        let dst_root =
+            std::env::temp_dir().join(format!("scl-xport-bulkdst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(&src_root).unwrap();
+        std::fs::create_dir_all(&dst_root).unwrap();
+
+        // Seed two reachable commits on the remote via a real repo.
+        let remote_repo = crate::repo::Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("a.txt"), b"one").unwrap();
+        let c1 = remote_repo.commit("t", "c1").unwrap();
+        std::fs::write(src_root.join("a.txt"), b"two").unwrap();
+        let c2 = remote_repo.commit("t", "c2").unwrap();
+
+        let t = LocalTransport::open(&src_root).unwrap();
+        // Want c2, already have c1: the pack must omit c1's objects but include c2.
+        let pack = t.get_pack(&[c2], &[c1]).unwrap();
+        let ids: Vec<_> = scl_core::pack::parse_pack(&pack).unwrap().into_iter().map(|(id, _)| id).collect();
+        assert!(ids.contains(&c2));
+        assert!(!ids.contains(&c1));
+
+        // put_pack into a fresh empty remote writes + returns the ids.
+        let _ = crate::repo::Repo::init(&dst_root).unwrap();
+        let t2 = LocalTransport::open(&dst_root).unwrap();
+        let written = t2.put_pack(&pack).unwrap();
+        assert!(written.contains(&c2));
+        assert!(t2.has_object(&c2).unwrap());
+
+        // A tampered pack is rejected.
+        let mut bad = pack.clone();
+        let n = bad.len() - 1;
+        bad[n] ^= 0xFF;
+        assert!(t2.put_pack(&bad).is_err());
+
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
     }
 }
