@@ -233,6 +233,7 @@ mod tests {
                 timestamp: 0,
                 message: msg.into(),
                 secrets: BTreeMap::new(),
+                protection: Default::default(),
             }))
             .unwrap()
     }
@@ -293,6 +294,7 @@ mod tests {
             timestamp: 0,
             message: "c".into(),
             secrets: BTreeMap::new(),
+            protection: Default::default(),
         }))
         .unwrap()
     }
@@ -346,6 +348,7 @@ mod tests {
             timestamp: 0,
             message: "c".into(),
             secrets: BTreeMap::new(),
+            protection: Default::default(),
         }))
         .unwrap()
     }

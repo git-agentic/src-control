@@ -128,6 +128,7 @@ mod tests {
                     timestamp: 0,
                     message: "c".into(),
                     secrets,
+                    protection: Default::default(),
                 }))
                 .unwrap();
             (snap_id, blob_id, secret_id)

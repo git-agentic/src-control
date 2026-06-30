@@ -45,15 +45,15 @@ impl Repo {
         message: &str,
     ) -> Result<ObjectId> {
         let tip = self.head_tip()?;
-        let root = match tip {
+        let (root, protection) = match tip {
             Some(t) => {
                 let arc = self.store_arc();
-                let r = arc.lock().unwrap().get_snapshot(&t)?.root;
-                r
+                let snap = arc.lock().unwrap().get_snapshot(&t)?;
+                (snap.root, snap.protection)
             }
-            None => self.vfs_handle().write_tree(&[])?, // empty tree
+            None => (self.vfs_handle().write_tree(&[])?, scl_core::Protection::default()),
         };
-        self.commit_snapshot(root, tip.into_iter().collect(), registry, author, message)
+        self.commit_snapshot(root, tip.into_iter().collect(), registry, protection, author, message)
     }
 
     /// Seal `value` to `recipients` and register it under `name`.

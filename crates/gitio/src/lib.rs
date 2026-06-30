@@ -29,6 +29,7 @@ pub fn import_head(store: &mut Store, repo_path: &Path) -> Result<ObjectId> {
         timestamp: 0,
         message: format!("import HEAD {}", commit.id().shorten_or_id()),
         secrets: std::collections::BTreeMap::new(),
+        protection: Default::default(),
     });
     store.put(snap).context("storing imported snapshot")
 }

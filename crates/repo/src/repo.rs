@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use scl_core::{Object, ObjectId, Snapshot, Store};
+use scl_core::{Object, ObjectId, Protection, Snapshot, Store};
 use scl_vfs::Repo as VfsRepo;
 
 use crate::error::{Error, Result};
@@ -126,11 +126,21 @@ impl Repo {
 
         let secrets = self.merged_secrets_for_commit(tip, merge_head)?;
 
+        // Carry forward the tip's protection policy unchanged (Task 4 will apply encryption).
+        let protection = match tip {
+            Some(t) => {
+                let store_arc = self.vfs.store();
+                let p = store_arc.lock().unwrap().get_snapshot(&t)?.protection;
+                p
+            }
+            None => Protection::default(),
+        };
+
         let mut parents: Vec<ObjectId> = tip.into_iter().collect();
         if let Some(theirs) = merge_head {
             parents.push(theirs);
         }
-        let id = self.commit_snapshot(root, parents, secrets, author, message)?;
+        let id = self.commit_snapshot(root, parents, secrets, protection, author, message)?;
         crate::merge_state::clear(&self.layout)?;
         Ok(id)
     }
@@ -164,6 +174,7 @@ impl Repo {
         root: ObjectId,
         parents: Vec<ObjectId>,
         secrets: BTreeMap<String, ObjectId>,
+        protection: Protection,
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
@@ -174,6 +185,7 @@ impl Repo {
             timestamp: 0,
             message: message.to_string(),
             secrets,
+            protection,
         });
         let store_arc = self.vfs.store();
         let id = store_arc.lock().unwrap().put(snap)?;
@@ -267,11 +279,17 @@ impl Repo {
         }
 
         if merge_result.conflicts.is_empty() {
-            // Clean merge: two-parent snapshot now.
+            // Clean merge: two-parent snapshot now. Carry ours' protection forward.
+            let ours_protection = {
+                let store_arc = self.vfs.store();
+                let p = store_arc.lock().unwrap().get_snapshot(&ours)?.protection;
+                p
+            };
             let id = self.commit_snapshot(
                 merged_root,
                 vec![ours, theirs],
                 merge_result.secrets,
+                ours_protection,
                 author,
                 &format!("merge {branch}"),
             )?;

@@ -239,6 +239,7 @@ mod tests {
                 timestamp: 0,
                 message: "m".into(),
                 secrets: BTreeMap::new(),
+                protection: Default::default(),
             }))
             .unwrap();
         let snap_root = store.get_snapshot(&snap).unwrap().root;

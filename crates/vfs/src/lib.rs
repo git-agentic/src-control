@@ -11,7 +11,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use scl_core::{
-    EntryKind, FileMode, Object, ObjectId, Secret, Snapshot, Store, StoreStats, Tree, TreeEntry,
+    EntryKind, FileMode, Object, ObjectId, Protection, Secret, Snapshot, Store, StoreStats, Tree,
+    TreeEntry,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +69,7 @@ impl Repo {
             timestamp: 0,
             message: message.into(),
             secrets: BTreeMap::new(),
+            protection: Protection::default(),
         });
         Ok(self.store.lock().unwrap().put(snap)?)
     }
@@ -97,6 +99,7 @@ impl Repo {
             base_root: snap.root,
             overlay: BTreeMap::new(),
             secrets: snap.secrets,
+            protection: snap.protection,
             label: label.into(),
         })
     }
@@ -166,6 +169,8 @@ pub struct Worktree {
     /// Committed-secret registry inherited from the base snapshot, plus local
     /// add/revoke edits. `name -> Secret object id`.
     secrets: std::collections::BTreeMap<String, ObjectId>,
+    /// Encrypted-path policy carried from the base snapshot (P7).
+    protection: Protection,
     label: String,
 }
 
@@ -302,6 +307,7 @@ impl Worktree {
             timestamp: 0,
             message: message.into(),
             secrets: self.secrets.clone(),
+            protection: self.protection.clone(),
         });
         Ok(self.store.lock().unwrap().put(snap)?)
     }
@@ -503,6 +509,7 @@ mod tests {
                     timestamp: 0,
                     message: "m".into(),
                     secrets: std::collections::BTreeMap::new(),
+                    protection: Default::default(),
                 }))
                 .unwrap()
         };
