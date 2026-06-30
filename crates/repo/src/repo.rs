@@ -889,16 +889,20 @@ impl Repo {
             }
         }
 
-        // Transfer objects the remote lacks, then advance the remote ref.
+        // Build one pack of the objects the remote lacks, send it in bulk, then
+        // advance the remote ref.
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            let ids = reachable::reachable_objects(&mut *store, &[local_tip])?;
-            for id in ids {
+            let mut send: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+            for id in reachable::reachable_objects(&mut *store, &[local_tip])? {
                 if !transport.has_object(&id)? {
-                    let bytes = store.get(&id)?.encode();
-                    transport.put_object(&id, &bytes)?;
+                    send.push((id, store.get(&id)?.encode()));
                 }
+            }
+            if !send.is_empty() {
+                let (pack, _idx) = scl_core::pack::build_pack(&send)?;
+                transport.put_pack(&pack)?;
             }
         }
         transport.update_ref(&branch, &local_tip)?;
@@ -906,23 +910,22 @@ impl Repo {
     }
 }
 
-/// Pull every object reachable from `tips` out of `transport` and into `store`,
-/// skipping ids already present. The reachability walk only decodes snapshots +
-/// trees (small); each blob is fetched exactly once here — there is no
-/// large-object double-read. Callers hold the store lock across this call, so it
-/// must not acquire any other lock. Shared by `clone_to` and `fetch`.
+/// Pull every object reachable from `tips` out of `transport` and into `store`.
+/// Sends the ids the local store already holds as `haves` so the remote can
+/// omit them from the pack; `parse_pack` verifies each record. Callers hold the
+/// store lock across this call, so it must not acquire any other lock. Shared by
+/// `clone_to` and `fetch`.
 fn transfer_objects(
     transport: &impl Transport,
     store: &mut Store,
     tips: &[ObjectId],
 ) -> Result<()> {
-    let mut tsrc = reachable::TransportSource { transport };
-    for id in reachable::reachable_objects(&mut tsrc, tips)? {
-        if store.contains(&id) {
-            continue;
-        }
-        let bytes = transport.get_object(&id)?;
-        let got = store.put(Object::decode(&bytes)?)?;
+    // Tell the remote what we already have so it omits those objects.
+    let haves: Vec<ObjectId> = tips.iter().copied().filter(|id| store.contains(id)).collect();
+    let pack = transport.get_pack(tips, &haves)?;
+    // parse_pack verifies every record; write each object into the local store.
+    for (id, obj) in scl_core::pack::parse_pack(&pack)? {
+        let got = store.put(obj)?;
         if got != id {
             return Err(Error::CorruptObject(id));
         }
@@ -1904,6 +1907,30 @@ mod tests {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn push_then_clone_via_pack_roundtrips_history() {
+        let origin = std::env::temp_dir().join(format!("scl-bulk-origin-{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("scl-bulk-work-{}", std::process::id()));
+        let clone = std::env::temp_dir().join(format!("scl-bulk-clone-{}", std::process::id()));
+        for p in [&origin, &work, &clone] { let _ = std::fs::remove_dir_all(p); }
+
+        // origin is an empty remote; work pushes two commits to it.
+        Repo::init(&origin).unwrap();
+        let w = Repo::init(&work).unwrap();
+        w.remote_add("origin", &origin.display().to_string()).unwrap();
+        std::fs::write(work.join("a.txt"), b"one").unwrap();
+        w.commit("t", "c1").unwrap();
+        std::fs::write(work.join("a.txt"), b"two").unwrap();
+        let tip = w.commit("t", "c2").unwrap();
+        w.push("origin").unwrap();
+
+        // Clone the origin elsewhere; HEAD tip + its objects must be present.
+        let c = Repo::clone_to(&origin, &clone).unwrap();
+        assert_eq!(c.head_tip().unwrap(), Some(tip));
+
+        for p in [&origin, &work, &clone] { std::fs::remove_dir_all(p).unwrap(); }
     }
 
     #[test]
