@@ -22,6 +22,11 @@ use crate::error::{Error, Result};
 use crate::id::ObjectId;
 use crate::object::Object;
 
+/// zstd level for on-disk object payloads. 3 is the zstd default: fast, solid
+/// ratio. The level is a storage detail — it never affects the content address,
+/// which is BLAKE3 of the *decompressed* canonical bytes.
+const COMPRESSION_LEVEL: i32 = 3;
+
 /// What to do when the blob budget is exhausted (ephemeral mode only).
 #[derive(Clone, Debug)]
 pub enum SpillPolicy {
@@ -150,10 +155,9 @@ impl Store {
         // Persistent: an object already durable on disk (e.g. evicted from RAM)
         // is a no-op. Re-admitting it here would double-count its bytes against
         // the budget; instead leave it on disk and let `get` rehydrate on demand.
-        if let Some(dir) = self.persistent_dir() {
-            if dir.join(id.to_hex()).exists() {
-                return Ok(id);
-            }
+        if self.persistent_dir().is_some() && self.existing_loose_path(&id).is_some() {
+            // Already durable on disk (e.g. evicted from RAM); don't re-admit.
+            return Ok(id);
         }
         // Persistent: write-through (idempotent) before admitting to RAM.
         if self.persistent_dir().is_some() {
@@ -209,10 +213,7 @@ impl Store {
         if self.resident.contains_key(id) || self.spilled.contains_key(id) {
             return true;
         }
-        if let Some(dir) = self.persistent_dir() {
-            return dir.join(id.to_hex()).exists();
-        }
-        false
+        self.existing_loose_path(id).is_some()
     }
 
     // ---- typed convenience helpers -----------------------------------------
@@ -323,34 +324,131 @@ impl Store {
         }
     }
 
-    /// Write `encode()` bytes to `objects/<hex>` idempotently (tmp + rename).
-    fn write_object_file(&mut self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
-        let dir = self.persistent_dir().expect("persistent backend").clone();
-        let final_path = dir.join(id.to_hex());
-        if final_path.exists() {
-            return Ok(());
+    /// The sharded loose path `objects/<aa>/<rest>` for `id`, or `None` in
+    /// ephemeral mode (which has no persistent objects dir).
+    fn loose_path(&self, id: &ObjectId) -> Option<PathBuf> {
+        let dir = self.persistent_dir()?;
+        let hex = id.to_hex();
+        Some(dir.join(&hex[..2]).join(&hex[2..]))
+    }
+
+    /// The legacy flat path `objects/<hex>` (pre-P8 repos), or `None` in ephemeral.
+    fn flat_path(&self, id: &ObjectId) -> Option<PathBuf> {
+        Some(self.persistent_dir()?.join(id.to_hex()))
+    }
+
+    /// The on-disk loose file for `id` if one exists (sharded preferred, then the
+    /// legacy flat location), or `None`.
+    fn existing_loose_path(&self, id: &ObjectId) -> Option<PathBuf> {
+        if let Some(p) = self.loose_path(id) {
+            if p.exists() {
+                return Some(p);
+            }
         }
-        // Per-process tmp name so a concurrent writer can't clobber our staging
-        // file mid-write before the atomic rename.
-        let tmp = dir.join(format!("{}.{}.tmp", id.to_hex(), std::process::id()));
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &final_path)?;
+        if let Some(p) = self.flat_path(id) {
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Remove a loose object file (sharded or legacy flat) **and** drop any RAM /
+    /// spill-map copy, so the object is truly gone unless a pack still holds it (in
+    /// which case `get` rehydrates from the pack on demand). Without the RAM drop,
+    /// `contains`/`get` would keep serving a pruned object from cache within a
+    /// process. Absent on disk is success. Never removes packed objects — pack
+    /// removal is `delete_pack`'s job.
+    pub fn delete(&mut self, id: &ObjectId) -> Result<()> {
+        if let Some(p) = self.existing_loose_path(id) {
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+        if let Some(r) = self.resident.remove(id) {
+            self.resident_blob_bytes -= r.blob_size;
+        }
+        self.spilled.remove(id);
         Ok(())
     }
 
-    /// Read+verify+decode an object file. A missing file is `NotFound`; other IO
-    /// errors propagate as `Io`. A hash mismatch is `Malformed`.
+    /// mtime of `id`'s loose file (sharded or flat), or `None` if not loose.
+    pub fn loose_mtime(&self, id: &ObjectId) -> Result<Option<std::time::SystemTime>> {
+        match self.existing_loose_path(id) {
+            Some(p) => Ok(Some(std::fs::metadata(&p)?.modified()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every loose object id under the persistent objects dir: sharded
+    /// `<aa>/<rest>` plus legacy flat `<hex>`. Skips `pack/`, tmp files, and any
+    /// name that isn't a 64-char hex id. Empty in ephemeral mode.
+    pub fn list_loose(&self) -> Result<Vec<ObjectId>> {
+        let mut out = Vec::new();
+        let Some(dir) = self.persistent_dir() else { return Ok(out) };
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        for e in entries {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let ft = e.file_type()?;
+            if ft.is_dir() {
+                // A 2-hex shard directory; its children are the id's remaining hex.
+                if name.len() != 2 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    continue; // e.g. "pack"
+                }
+                for c in std::fs::read_dir(e.path())? {
+                    let c = c?;
+                    let rest = c.file_name().to_string_lossy().into_owned();
+                    if let Ok(id) = format!("{name}{rest}").parse::<ObjectId>() {
+                        out.push(id);
+                    }
+                }
+            } else if let Ok(id) = name.parse::<ObjectId>() {
+                out.push(id); // legacy flat file
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write `zstd(encode())` to the sharded `objects/<aa>/<rest>` idempotently
+    /// (tmp + rename). Creates the shard directory.
+    fn write_object_file(&mut self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
+        let path = self.loose_path(id).expect("persistent backend");
+        if path.exists() {
+            return Ok(());
+        }
+        let shard = path.parent().expect("sharded path has a parent");
+        std::fs::create_dir_all(shard)?;
+        let compressed = zstd::encode_all(std::io::Cursor::new(bytes), COMPRESSION_LEVEL)
+            .map_err(Error::Io)?;
+        // Per-process tmp name so a concurrent writer can't clobber our staging file.
+        let tmp = shard.join(format!("{}.{}.tmp", id.to_hex(), std::process::id()));
+        std::fs::write(&tmp, &compressed)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Read + verify + decode a loose object. Tries the sharded path then the
+    /// legacy flat path; tries zstd-decompress then falls back to treating the
+    /// bytes as a raw (pre-P8 uncompressed) canonical encoding. Either way the
+    /// final canonical bytes are BLAKE3-verified against `id`.
     fn read_object_file(&self, id: &ObjectId) -> Result<Object> {
-        let dir = self.persistent_dir().ok_or(Error::NotFound(*id))?;
-        let path = dir.join(id.to_hex());
-        let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => Error::NotFound(*id),
-            _ => Error::Io(e),
-        })?;
-        if ObjectId::of(&bytes) != *id {
+        let path = self.existing_loose_path(id).ok_or(Error::NotFound(*id))?;
+        let raw = std::fs::read(&path)?;
+        let canonical = match zstd::decode_all(std::io::Cursor::new(&raw)) {
+            Ok(d) => d,
+            Err(_) => raw, // legacy uncompressed loose file
+        };
+        if ObjectId::of(&canonical) != *id {
             return Err(Error::Malformed(format!("object {id} failed hash verification on read")));
         }
-        Object::decode(&bytes)
+        Object::decode(&canonical)
     }
 
     fn ensure_spill_dir(&mut self) -> Result<()> {
@@ -493,7 +591,8 @@ mod tests {
             id = s.put(Object::blob(b"data".to_vec())).unwrap();
         }
         // Corrupt the file on disk.
-        std::fs::write(dir.join(id.to_hex()), b"tampered").unwrap();
+        let hex = id.to_hex();
+        std::fs::write(dir.join(&hex[..2]).join(&hex[2..]), b"tampered").unwrap();
         let mut s2 = Store::open_persistent(&dir, 1024).unwrap();
         assert!(matches!(s2.get(&id), Err(Error::Malformed(_))));
         drop(s2);
@@ -513,6 +612,43 @@ mod tests {
             Object::Blob(b) => assert!(b.iter().all(|&x| x == 0xAA)),
             _ => panic!("wrong kind"),
         }
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_writes_sharded_compressed_and_reads_back() {
+        let dir = temp_objects_dir("shard");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Store::open_persistent(&dir, 1 << 20).unwrap();
+        let id = s.put(Object::blob(b"hello sharded world".to_vec())).unwrap();
+        // File lives at objects/<aa>/<rest>, NOT objects/<hex>.
+        let hex = id.to_hex();
+        let sharded = dir.join(&hex[..2]).join(&hex[2..]);
+        assert!(sharded.exists(), "expected sharded path {sharded:?}");
+        assert!(!dir.join(&hex).exists(), "must not write flat path");
+        // Payload is compressed, not the raw canonical bytes.
+        let on_disk = std::fs::read(&sharded).unwrap();
+        assert_ne!(on_disk, Object::blob(b"hello sharded world".to_vec()).encode());
+        // Reopen (empty RAM cache) and read back through decompress+verify.
+        let mut s2 = Store::open_persistent(&dir, 1 << 20).unwrap();
+        assert_eq!(s2.get(&id).unwrap().encode(), Object::blob(b"hello sharded world".to_vec()).encode());
+        drop((s, s2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reads_legacy_flat_uncompressed_object() {
+        let dir = temp_objects_dir("legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Simulate a pre-P8 repo: raw canonical bytes at flat objects/<hex>.
+        let obj = Object::blob(b"legacy".to_vec());
+        let id = obj.id();
+        std::fs::write(dir.join(id.to_hex()), obj.encode()).unwrap();
+        let mut s = Store::open_persistent(&dir, 1 << 20).unwrap();
+        assert!(s.contains(&id));
+        assert_eq!(s.get(&id).unwrap().encode(), obj.encode());
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
     }
