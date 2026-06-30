@@ -101,6 +101,66 @@ fn is_unsafe_ref_component(s: &str) -> bool {
         || s.split('/').any(|c| c.is_empty() || c == "..")
 }
 
+/// `(branch, tip)` for every `refs/heads/*`. Skips temp files and unreadable
+/// names; a malformed ref body is an error.
+pub fn list_heads(layout: &Layout) -> Result<Vec<(String, ObjectId)>> {
+    let mut out = Vec::new();
+    let dir = layout.refs_heads_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for e in entries {
+        let e = e?;
+        if !e.file_type()?.is_file() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.contains(".tmp") {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path())?;
+        let id = ObjectId::from_str(text.trim())
+            .map_err(|_| Error::BadRef(format!("head {name} has bad id")))?;
+        out.push((name, id));
+    }
+    Ok(out)
+}
+
+/// `(remote, branch, tip)` for every `refs/remotes/<remote>/<branch>`.
+pub fn list_remote_tips(layout: &Layout) -> Result<Vec<(String, String, ObjectId)>> {
+    let mut out = Vec::new();
+    let root = layout.refs_remotes_dir();
+    let remotes = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for r in remotes {
+        let r = r?;
+        if !r.file_type()?.is_dir() {
+            continue;
+        }
+        let remote = r.file_name().to_string_lossy().into_owned();
+        for b in std::fs::read_dir(r.path())? {
+            let b = b?;
+            if !b.file_type()?.is_file() {
+                continue;
+            }
+            let branch = b.file_name().to_string_lossy().into_owned();
+            if branch.contains(".tmp") {
+                continue;
+            }
+            let text = std::fs::read_to_string(b.path())?;
+            let id = ObjectId::from_str(text.trim())
+                .map_err(|_| Error::BadRef(format!("remote ref {remote}/{branch} has bad id")))?;
+            out.push((remote.clone(), branch, id));
+        }
+    }
+    Ok(out)
+}
+
 /// The tip of the branch HEAD names (or None if unborn).
 pub fn head_tip(layout: &Layout) -> Result<Option<ObjectId>> {
     read_branch_tip(layout, &current_branch(layout)?)
@@ -184,6 +244,26 @@ mod tests {
         // A normal write still succeeds and round-trips.
         write_remote_tip(&layout, "origin", "main", &id).unwrap();
         assert_eq!(read_remote_tip(&layout, "origin", "main").unwrap(), Some(id));
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn lists_all_heads_and_remote_tips() {
+        let layout = tmp_layout("listall");
+        write_head(&layout, "main").unwrap();
+        let a = ObjectId::of(b"a");
+        let b = ObjectId::of(b"b");
+        let c = ObjectId::of(b"c");
+        write_branch_tip(&layout, "main", &a).unwrap();
+        write_branch_tip(&layout, "feature", &b).unwrap();
+        write_remote_tip(&layout, "origin", "main", &c).unwrap();
+
+        let mut heads = list_heads(&layout).unwrap();
+        heads.sort();
+        assert_eq!(heads, vec![("feature".to_string(), b), ("main".to_string(), a)]);
+
+        let remotes = list_remote_tips(&layout).unwrap();
+        assert_eq!(remotes, vec![("origin".to_string(), "main".to_string(), c)]);
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
