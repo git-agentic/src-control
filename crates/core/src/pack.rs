@@ -73,7 +73,11 @@ pub fn parse_index(idx: &[u8]) -> Result<Vec<IndexEntry>> {
     }
     let count = u64::from_le_bytes(idx[8..16].try_into().unwrap()) as usize;
     const ROW: usize = 32 + 8 + 8;
-    if idx.len() != 16 + count * ROW {
+    let expected = count
+        .checked_mul(ROW)
+        .and_then(|n| n.checked_add(16))
+        .ok_or_else(|| Error::BadPackIndex("entry count overflow".into()))?;
+    if idx.len() != expected {
         return Err(Error::BadPackIndex("length does not match count".into()));
     }
     let mut out = Vec::with_capacity(count);
@@ -197,6 +201,17 @@ mod tests {
     #[test]
     fn bad_index_magic_rejected() {
         let err = parse_index(b"XXXXnot an index").unwrap_err();
+        assert!(matches!(err, crate::error::Error::BadPackIndex(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_index_rejects_overflowing_count() {
+        // Magic b"SCIX", version 1 LE, count = 2^58 LE — count * 48 wraps on usize.
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(b"SCIX");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0x0400_0000_0000_0000u64.to_le_bytes());
+        let err = parse_index(&bytes).unwrap_err();
         assert!(matches!(err, crate::error::Error::BadPackIndex(_)), "got {err:?}");
     }
 }
