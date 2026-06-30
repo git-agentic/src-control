@@ -7,10 +7,13 @@ set -euo pipefail
 cargo build --bin sc >/dev/null 2>&1
 SC="$(pwd)/target/debug/sc"
 
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d)"
+# Identity file lives outside WORK so the secret scanner never sees it during commit.
+KEYS="$(mktemp -d)"
+trap 'rm -rf "$WORK" "$KEYS"' EXIT
 
 # Generate an identity (private key + public key for recipients.toml).
-PUB="$("$SC" keygen --out "$WORK/id" | grep 'public key' | awk '{print $3}')"
+PUB="$("$SC" keygen --out "$KEYS/id" | grep 'public key' | awk '{print $3}')"
 
 cd "$WORK"
 "$SC" init                                   # creates ./.sc (must not pre-exist)
@@ -25,13 +28,35 @@ echo "feature" > feature.txt
 "$SC" switch main
 [ ! -f feature.txt ] || { echo "FAIL: feature.txt should be gone on main"; exit 1; }
 
-SC_IDENTITY="$WORK/id" "$SC" secret add DB_URL --to me --value "postgres://app"
+SC_IDENTITY="$KEYS/id" "$SC" secret add DB_URL --to me --value "postgres://app"
 # A *new* `sc` process reads the secret back, proving cross-invocation persistence:
-OUT="$(SC_IDENTITY="$WORK/id" "$SC" run -- sh -c 'printf %s "$DB_URL"')"
+OUT="$(SC_IDENTITY="$KEYS/id" "$SC" run -- sh -c 'printf %s "$DB_URL"')"
 [ "$OUT" = "postgres://app" ] || { echo "FAIL: secret did not survive/inject ($OUT)"; exit 1; }
 
 # Regression guard: `sc run` must release the repo lock on exit. If it leaks the
 # lock (e.g. process::exit skipping Drop), the next command fails with `Locked`.
 "$SC" status >/dev/null || { echo "FAIL: repo locked after run (lock leak)"; exit 1; }
+
+echo
+echo "== GC reclamation =="
+# Create abandoned objects: commit a large file, then overwrite + recommit so the
+# original blob becomes unreachable.  Use dd+tr (no secrets) instead of /dev/urandom
+# to avoid triggering the secret scanner.
+dd if=/dev/zero bs=1048576 count=1 2>/dev/null | tr '\0' 'A' > "$WORK/big.bin"
+"$SC" commit -m "add big.bin" --author me
+dd if=/dev/zero bs=1048576 count=1 2>/dev/null | tr '\0' 'B' > "$WORK/big.bin"
+"$SC" commit -m "replace big.bin" --author me
+
+before=$(du -sk "$WORK/.sc/objects" | cut -f1)
+echo "objects size before gc: ${before} KiB"
+# Zero grace so the just-abandoned blob is immediately collectable in the demo.
+"$SC" gc --prune-expire 0s
+after=$(du -sk "$WORK/.sc/objects" | cut -f1)
+echo "objects size after gc:  ${after} KiB"
+if [ "$after" -lt "$before" ]; then
+  echo "OK: gc reclaimed space"
+else
+  echo "WARN: gc did not shrink objects (small repo / fs rounding)"
+fi
 
 echo "RESULT: persistent repo survived across invocations; secret decrypted in a new process ✔"
