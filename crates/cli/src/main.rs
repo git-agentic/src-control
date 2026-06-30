@@ -980,18 +980,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_identity_opt_missing_is_none_existing_loads() {
+    fn resolve_identity_opt_covers_missing_valid_and_corrupt() {
         let dir = std::env::temp_dir().join(format!("scl-ident-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+
+        // Absent file → None (keyless holders still switch; protected files skip).
         let missing = dir.join("nope");
         assert!(resolve_identity_opt(Some(missing)).unwrap().is_none());
 
+        // Present + valid → Some, round-trips to the same key.
         let (sk, _pk) = scl_crypto::generate_keypair();
         let key_path = dir.join("identity");
         std::fs::write(&key_path, sk.to_key_string()).unwrap();
         let loaded = resolve_identity_opt(Some(key_path)).unwrap();
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().to_key_string(), sk.to_key_string());
+
+        // Present + corrupt → Err. This is the safety property the soft loader
+        // exists for: a malformed key must NOT be silently treated as keyless
+        // (which would skip protected files for a user who actually holds a key).
+        let corrupt = dir.join("corrupt");
+        std::fs::write(&corrupt, b"not a real scl-sk- key").unwrap();
+        assert!(resolve_identity_opt(Some(corrupt)).is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
