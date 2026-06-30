@@ -20,6 +20,10 @@ pub enum Error {
     NoSuchBranch(String),
     #[error("secret not found: {0}")]
     NoSuchSecret(String),
+    #[error("no protected prefix matches: {0}")]
+    NotProtected(String),
+    #[error("identity is not authorized for protected prefix: {0}")]
+    NotAuthorized(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("operation requires at least one commit (branch is unborn)")]

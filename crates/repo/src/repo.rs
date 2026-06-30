@@ -580,6 +580,159 @@ impl Repo {
         Ok(skipped)
     }
 
+    /// Record (or replace) a protected-path rule for `prefix`, encrypting any
+    /// matching working-tree files for `recipients`.
+    ///
+    /// The rule is persisted as a policy-only snapshot first (so the subsequent
+    /// commit reads it from the tip), then a normal `commit` runs: matching
+    /// working-tree files are convergently encrypted and wrapped for each
+    /// recipient. If nothing matches yet, the rule is still recorded for future
+    /// commits. The `identity` arg is reserved for future re-encrypt symmetry
+    /// (e.g. re-protecting already-committed plaintext) and is unused today.
+    /// Returns the id of the resulting commit.
+    pub fn protect(
+        &self,
+        prefix: &str,
+        recipients: &[scl_crypto::PublicKey],
+        _identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<ObjectId> {
+        use scl_core::ProtectPrefix;
+        // Load the tip's protection, add/replace the rule, and persist it as a
+        // policy-only commit (same root) so `commit` below sees the new prefix.
+        let (root, parents, secrets, mut protection) = match self.head_tip()? {
+            Some(t) => {
+                let snap = self.snapshot(&t)?;
+                (snap.root, vec![t], snap.secrets, snap.protection)
+            }
+            None => {
+                let root = self.vfs.write_tree(&[])?;
+                (root, vec![], BTreeMap::new(), Protection::default())
+            }
+        };
+        protection.prefixes.retain(|p| p.prefix != prefix);
+        protection.prefixes.push(ProtectPrefix {
+            prefix: prefix.to_string(),
+            recipients: recipients.iter().map(|p| p.to_bytes()).collect(),
+        });
+        self.commit_snapshot(root, parents, secrets, protection, "system", &format!("protect {prefix}"))?;
+        // Now encrypt matching working-tree files under the freshly-recorded rule.
+        self.commit("system", &format!("encrypt under {prefix}"))
+    }
+
+    /// Collect the PROTECTED blob ids in the tip tree whose path is governed by
+    /// the rule `prefix` (longest-prefix wins, mirroring `matching_prefix`).
+    fn protected_blob_ids_under(&self, root: ObjectId, protection: &Protection, prefix: &str) -> Result<Vec<ObjectId>> {
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let entries = worktree::tree_file_entries_with_perms(&mut store, root)?;
+        Ok(entries
+            .into_iter()
+            .filter(|(path, (_id, _mode, perms))| {
+                perms & scl_core::PROTECTED != 0
+                    && crate::protect::matching_prefix(protection, path)
+                        .is_some_and(|r| r.prefix == prefix)
+            })
+            .map(|(_path, (id, _, _))| id)
+            .collect())
+    }
+
+    /// Grant `new` read access to the files protected under `prefix` — a
+    /// policy-only operation that does NOT touch any blob or tree id.
+    ///
+    /// For each protected blob under `prefix`, the DEK is recovered with the
+    /// `authorized` identity (which must currently be a recipient, else
+    /// `NotAuthorized`) and re-wrapped for `new` (deduped by recipient id). The
+    /// `new` recipient is also added to the prefix rule. The resulting snapshot
+    /// reuses the tip's exact root tree. Errors `NotProtected` if no such prefix.
+    pub fn grant(
+        &self,
+        prefix: &str,
+        authorized: &scl_crypto::SecretKey,
+        new: &scl_crypto::PublicKey,
+    ) -> Result<ObjectId> {
+        let tip = self.head_tip()?.ok_or(Error::Unborn)?;
+        let snap = self.snapshot(&tip)?;
+        let (root, secrets, mut protection) = (snap.root, snap.secrets, snap.protection);
+
+        let rule_idx = protection
+            .prefixes
+            .iter()
+            .position(|p| p.prefix == prefix)
+            .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
+
+        let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
+        let new_id = new.recipient_id().to_string();
+        for blob_id in protected_ids {
+            let Some(wks) = protection.wrapped.get(&blob_id) else { continue };
+            if wks.iter().any(|w| w.recipient_id == new_id) {
+                continue; // `new` already a recipient for this blob
+            }
+            // Recover the DEK via any wrap the authorized identity can unwrap.
+            let dek = wks
+                .iter()
+                .find_map(|w| scl_crypto::unwrap_dek_with(w, authorized).ok())
+                .ok_or_else(|| Error::NotAuthorized(prefix.to_string()))?;
+            let new_wk = scl_crypto::wrap_dek_for(&dek, new);
+            protection.wrapped.get_mut(&blob_id).expect("present above").push(new_wk);
+        }
+
+        let new_bytes = new.to_bytes();
+        if !protection.prefixes[rule_idx].recipients.contains(&new_bytes) {
+            protection.prefixes[rule_idx].recipients.push(new_bytes);
+        }
+        self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("grant {prefix}"))
+    }
+
+    /// Revoke `recipient_id` from `prefix`: drop its wrapped DEK from every
+    /// protected blob under the prefix and remove its public key from the rule's
+    /// recipients. Policy-only (root tree unchanged). Errors `NotProtected` if no
+    /// such prefix. Does not rotate content (a prior holder kept any plaintext
+    /// already checked out — see the secrets-revoke rationale in ADR-0008).
+    pub fn revoke(&self, prefix: &str, recipient_id: &scl_crypto::RecipientId) -> Result<ObjectId> {
+        let tip = self.head_tip()?.ok_or(Error::Unborn)?;
+        let snap = self.snapshot(&tip)?;
+        let (root, secrets, mut protection) = (snap.root, snap.secrets, snap.protection);
+
+        let rule_idx = protection
+            .prefixes
+            .iter()
+            .position(|p| p.prefix == prefix)
+            .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
+
+        let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
+        let rid = recipient_id.as_str();
+        for blob_id in protected_ids {
+            if let Some(wks) = protection.wrapped.get_mut(&blob_id) {
+                wks.retain(|w| w.recipient_id != rid);
+            }
+        }
+        protection.prefixes[rule_idx]
+            .recipients
+            .retain(|pk| scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != rid);
+        self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("revoke from {prefix}"))
+    }
+
+    /// List the tip's protected prefixes, each with its recipients' fingerprints
+    /// (for display). Empty if unborn or no prefixes are protected.
+    pub fn protected_prefixes(&self) -> Result<Vec<(String, Vec<scl_crypto::RecipientId>)>> {
+        let protection = match self.head_tip()? {
+            Some(t) => self.snapshot(&t)?.protection,
+            None => Protection::default(),
+        };
+        Ok(protection
+            .prefixes
+            .into_iter()
+            .map(|p| {
+                let rids = p
+                    .recipients
+                    .iter()
+                    .map(|pk| scl_crypto::PublicKey::from_bytes(*pk).recipient_id())
+                    .collect();
+                (p.prefix, rids)
+            })
+            .collect())
+    }
+
     /// Expose the underlying VFS repo handle (needed by secrets.rs methods).
     pub(crate) fn vfs_handle(&self) -> &VfsRepo {
         &self.vfs
@@ -1283,6 +1436,135 @@ mod tests {
         assert_ne!(c1, c2, "the two commits are distinct");
         // Same blob id (convergent) AND byte-identical wrapped DEKs (carried forward).
         assert_eq!(w1, w2, "wrapped DEKs must be stable for unchanged protected content");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn protect_records_prefix_and_encrypts_matching_file() {
+        let root = tmp_root("p7-protect");
+        let repo = Repo::init(&root).unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        // Commit unrelated history first so `protect` runs against an existing
+        // tip (exercises the `Some(tip)` branch, not just the unborn case).
+        std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+        repo.commit("me", "base").unwrap();
+        // Write a matching file first, then protect: it must be encrypted + wrapped.
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        let cid = repo.protect("secret/", &[pk], None).unwrap();
+        let snap = repo.snapshot(&cid).unwrap();
+        // The prefix is recorded.
+        assert!(snap.protection.prefixes.iter().any(|p| p.prefix == "secret/"));
+        // Exactly one wrapped protected blob, and it is ciphertext.
+        assert_eq!(snap.protection.wrapped.len(), 1, "one protected blob");
+        let blob_id = *snap.protection.wrapped.keys().next().unwrap();
+        let obj = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            s.get(&blob_id).unwrap()
+        };
+        match obj {
+            scl_core::Object::Blob(b) => assert_ne!(&b[..], b"hunter2", "blob must be ciphertext"),
+            _ => panic!("expected Blob"),
+        }
+        // The tree entry is PROTECTED.
+        let entries = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap()
+        };
+        let (_id, _m, perms) = entries.get("secret/db.txt").copied().unwrap();
+        assert_ne!(perms & scl_core::PROTECTED, 0, "db.txt must be PROTECTED");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grant_adds_recipient_without_changing_file_objects() {
+        let root = tmp_root("p7-grant");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        let c1 = repo.commit("me", "add").unwrap();
+        let root1 = repo.snapshot(&c1).unwrap().root;
+        let c2 = repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        let snap2 = repo.snapshot(&c2).unwrap();
+        assert_eq!(snap2.root, root1, "grant must not change the file tree");
+        // bob now has a wrapped DEK for the protected blob.
+        let any = snap2.protection.wrapped.values().next().unwrap();
+        assert_eq!(any.len(), 2, "alice + bob");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grant_on_unprotected_prefix_errors_not_protected() {
+        let root = tmp_root("p7-grant-noprefix");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, _alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        repo.commit("me", "base").unwrap();
+        let err = repo.grant("nope/", &alice_sk, &bob_pk).unwrap_err();
+        assert!(matches!(err, Error::NotProtected(_)), "got {err:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grant_with_non_recipient_identity_errors_not_authorized() {
+        let root = tmp_root("p7-grant-unauth");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mallory_sk, _mallory_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        // mallory is not a recipient → cannot recover the DEK to grant.
+        let err = repo.grant("secret/", &mallory_sk, &bob_pk).unwrap_err();
+        assert!(matches!(err, Error::NotAuthorized(_)), "got {err:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn revoke_removes_wrapped_entries_and_prefix_membership() {
+        let root = tmp_root("p7-revoke");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        let c1 = repo.commit("me", "add").unwrap();
+        let root1 = repo.snapshot(&c1).unwrap().root;
+        // Grant bob, then revoke him.
+        let c2 = repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        assert_eq!(repo.snapshot(&c2).unwrap().protection.wrapped.values().next().unwrap().len(), 2);
+        let bob_id = bob_pk.recipient_id();
+        let c3 = repo.revoke("secret/", &bob_id).unwrap();
+        let snap3 = repo.snapshot(&c3).unwrap();
+        // Root tree unchanged (policy-only).
+        assert_eq!(snap3.root, root1, "revoke must not change the file tree");
+        // bob's wrap is gone; only alice remains.
+        let wks = snap3.protection.wrapped.values().next().unwrap();
+        assert_eq!(wks.len(), 1, "only alice remains");
+        assert!(!wks.iter().any(|w| w.recipient_id == bob_id.as_str()));
+        // bob is no longer in the prefix rule's recipients.
+        let rule = snap3.protection.prefixes.iter().find(|p| p.prefix == "secret/").unwrap();
+        assert!(!rule.recipients.iter().any(|pk| {
+            scl_crypto::PublicKey::from_bytes(*pk).recipient_id() == bob_id
+        }));
+        // protected_prefixes reflects the surviving recipient.
+        let listed = repo.protected_prefixes().unwrap();
+        let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
+        assert_eq!(recips, &vec![alice_pk.recipient_id()]);
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
