@@ -25,6 +25,12 @@ pub enum Error {
     #[error("malformed object: {0}")]
     Malformed(String),
 
+    #[error("corrupt packfile: {0}")]
+    PackCorrupt(String),
+
+    #[error("bad pack index: {0}")]
+    BadPackIndex(String),
+
     #[error("backend io error: {0}")]
     Io(#[from] std::io::Error),
 }

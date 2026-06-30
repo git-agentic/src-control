@@ -7,6 +7,7 @@
 pub mod error;
 pub mod id;
 pub mod object;
+pub mod pack;
 pub mod store;
 
 pub use error::{Error, Result};
