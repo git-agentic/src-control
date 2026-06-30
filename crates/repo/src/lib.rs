@@ -9,6 +9,7 @@ pub mod layout;
 pub mod lock;
 pub mod merge;
 pub mod merge_state;
+pub mod protect;
 pub mod reachable;
 pub mod refs;
 pub mod remote;

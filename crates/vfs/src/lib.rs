@@ -89,6 +89,21 @@ impl Repo {
         self.build_tree(&map)
     }
 
+    /// Like `write_tree`, but each file carries an explicit `perms` byte (e.g.
+    /// `scl_core::PROTECTED` for encrypted blobs). Used by the persistent repo
+    /// layer to commit working trees that include encrypted protected paths (P7).
+    pub fn write_tree_with_perms(&self, files: &[(String, Vec<u8>, FileMode, u8)]) -> Result<ObjectId> {
+        let mut map: BTreeMap<String, (ObjectId, FileMode, u8)> = BTreeMap::new();
+        {
+            let mut store = self.store.lock().unwrap();
+            for (path, bytes, mode, perms) in files {
+                let id = store.put(Object::blob(bytes.clone()))?;
+                map.insert(normalize(path), (id, *mode, *perms));
+            }
+        }
+        self.build_subtree_perms(&map, "")
+    }
+
     /// Fork an in-memory worktree from a base snapshot. Cheap: allocates only an
     /// empty overlay; no file content is copied.
     pub fn fork(&self, snapshot: ObjectId, label: impl Into<String>) -> Result<Worktree> {
@@ -141,6 +156,51 @@ impl Repo {
                 format!("{prefix}{dir}/")
             };
             let sub_id = self.build_subtree(files, &child_prefix)?;
+            entries.push(TreeEntry {
+                name: dir.clone(),
+                kind: EntryKind::Tree,
+                id: sub_id,
+                mode: FileMode(0o755),
+                perms: 0,
+            });
+        }
+        let tree = Object::Tree(Tree::new(entries));
+        Ok(self.store.lock().unwrap().put(tree)?)
+    }
+
+    /// Like `build_subtree` but reads the `perms` byte per entry from the map,
+    /// enabling the `PROTECTED` bit (and others) on individual blob entries.
+    /// Subtree (directory) entries always use `perms: 0`.
+    fn build_subtree_perms(
+        &self,
+        files: &BTreeMap<String, (ObjectId, FileMode, u8)>,
+        prefix: &str,
+    ) -> Result<ObjectId> {
+        let mut entries: Vec<TreeEntry> = Vec::new();
+        let mut subdirs: BTreeMap<String, ()> = BTreeMap::new();
+
+        for (path, (id, mode, perms)) in files {
+            let Some(rest) = strip_prefix_dir(path, prefix) else { continue };
+            match rest.split_once('/') {
+                None => entries.push(TreeEntry {
+                    name: rest.to_string(),
+                    kind: EntryKind::Blob,
+                    id: *id,
+                    mode: *mode,
+                    perms: *perms,
+                }),
+                Some((dir, _)) => {
+                    subdirs.insert(dir.to_string(), ());
+                }
+            }
+        }
+        for dir in subdirs.keys() {
+            let child_prefix = if prefix.is_empty() {
+                format!("{dir}/")
+            } else {
+                format!("{prefix}{dir}/")
+            };
+            let sub_id = self.build_subtree_perms(files, &child_prefix)?;
             entries.push(TreeEntry {
                 name: dir.clone(),
                 kind: EntryKind::Tree,

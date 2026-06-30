@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use scl_core::{Object, ObjectId, Protection, Snapshot, Store};
+use scl_core::{Object, ObjectId, Protection, Snapshot, Store, WrappedKey};
 use scl_vfs::Repo as VfsRepo;
 
 use crate::error::{Error, Result};
@@ -114,27 +114,62 @@ impl Repo {
 
     /// Snapshot the working tree into a new commit on the current branch. When a
     /// merge is in progress, records both parents and clears the merge state.
+    /// Files under a protected prefix are convergently encrypted (scanner-exempt);
+    /// only plaintext files are scanned.
     pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
         let files = worktree::read_worktree(&self.layout)?;
-        let report = self.scan_files(&files)?;
-        if !report.is_empty() {
-            return Err(Error::SecretDetected(report));
-        }
-        let root = self.vfs.write_tree(&files)?;
         let tip = self.head_tip()?;
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
 
-        let secrets = self.merged_secrets_for_commit(tip, merge_head)?;
-
-        // Carry forward the tip's protection policy unchanged (Task 4 will apply encryption).
-        let protection = match tip {
-            Some(t) => {
-                let store_arc = self.vfs.store();
-                let p = store_arc.lock().unwrap().get_snapshot(&t)?.protection;
-                p
+        // Read the tip snapshot exactly once; extract both protection and secrets.
+        let (mut protection, secrets) = match (tip, merge_head) {
+            (None, _) => (Protection::default(), BTreeMap::new()),
+            (Some(t), None) => {
+                let snap = self.snapshot(&t)?;
+                (snap.protection, snap.secrets)
             }
-            None => Protection::default(),
+            (Some(t), Some(_)) => {
+                let prot = self.snapshot(&t)?.protection;
+                let secs = self.merged_secrets_for_commit(tip, merge_head)?;
+                (prot, secs)
+            }
         };
+
+        // Partition by protected prefix: protected files are encrypted, not scanned.
+        let (protected, plain): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|(path, _, _)| crate::protect::matching_prefix(&protection, path).is_some());
+
+        // Scan only plaintext files.
+        let report = self.scan_files(&plain)?;
+        if !report.is_empty() {
+            return Err(Error::SecretDetected(report));
+        }
+
+        // Encrypt protected files; accumulate fresh wrapped DEKs.
+        let mut all: Vec<(String, Vec<u8>, scl_core::FileMode, u8)> =
+            plain.into_iter().map(|(p, b, m)| (p, b, m, 0u8)).collect();
+        let mut fresh_wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
+        for (path, bytes, mode) in protected {
+            let rule = crate::protect::matching_prefix(&protection, &path)
+                .expect("file was partitioned into the protected set");
+            let (blob_bytes, dek) = scl_crypto::encrypt_path(&bytes);
+            let blob_id = Object::blob(blob_bytes.clone()).id();
+            let wks: Vec<WrappedKey> = rule
+                .recipients
+                .iter()
+                .map(|pk| scl_crypto::wrap_dek_for(&dek, &scl_crypto::PublicKey::from_bytes(*pk)))
+                .collect();
+            fresh_wrapped.insert(blob_id, wks);
+            all.push((path, blob_bytes, mode, scl_core::PROTECTED));
+        }
+
+        let root = self.vfs.write_tree_with_perms(&all)?;
+
+        // Rebuild policy.wrapped from only this commit's protected blobs.
+        // Convergent encryption reproduces the same blob id for unchanged content,
+        // so fresh wraps already cover every protected file — nothing stale is kept.
+        protection.wrapped = fresh_wrapped;
 
         let mut parents: Vec<ObjectId> = tip.into_iter().collect();
         if let Some(theirs) = merge_head {
@@ -143,6 +178,14 @@ impl Repo {
         let id = self.commit_snapshot(root, parents, secrets, protection, author, message)?;
         crate::merge_state::clear(&self.layout)?;
         Ok(id)
+    }
+
+    /// Decode the snapshot at `id` from the store. Small utility reused across
+    /// commit, grant/revoke (Task 6), and tests.
+    pub(crate) fn snapshot(&self, id: &ObjectId) -> Result<Snapshot> {
+        let store_arc = self.vfs.store();
+        let snap = store_arc.lock().unwrap().get_snapshot(id)?;
+        Ok(snap)
     }
 
     /// Secrets to record on a commit: during a merge, the conflict-free merged
@@ -564,6 +607,36 @@ fn validate_branch_name(name: &str) -> Result<()> {
         return Err(Error::BadRef(format!("invalid branch name: {name:?}")));
     }
     Ok(())
+}
+
+/// Test seam: commit a snapshot that adds or replaces a protected prefix rule in
+/// the current tip's protection policy. Used by tests that need a prefix rule
+/// in place before calling `commit`; Task 6 provides the real `protect` API.
+#[cfg(test)]
+impl Repo {
+    pub(crate) fn test_set_protected_prefix(
+        &self,
+        prefix: &str,
+        recipients: &[scl_crypto::PublicKey],
+    ) -> Result<ObjectId> {
+        use scl_core::{ProtectPrefix, Protection};
+        let (root, parents, secrets, mut protection) = match self.head_tip()? {
+            Some(t) => {
+                let snap = self.snapshot(&t)?;
+                (snap.root, vec![t], snap.secrets, snap.protection)
+            }
+            None => {
+                let root = self.vfs.write_tree(&[])?;
+                (root, vec![], BTreeMap::new(), Protection::default())
+            }
+        };
+        protection.prefixes.retain(|p| p.prefix != prefix);
+        protection.prefixes.push(ProtectPrefix {
+            prefix: prefix.to_string(),
+            recipients: recipients.iter().map(|pk| pk.to_bytes()).collect(),
+        });
+        self.commit_snapshot(root, parents, secrets, protection, "system", "set protected prefix")
+    }
 }
 
 #[cfg(test)]
@@ -1009,6 +1082,39 @@ mod tests {
         drop(arepo);
         std::fs::remove_dir_all(&a).unwrap();
         std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn commit_encrypts_files_under_a_protected_prefix() {
+        let root = tmp_root("p7-commit");
+        let repo = Repo::init(&root).unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        // Seed a protected prefix via the test seam (Task 6 provides the real `protect`).
+        repo.test_set_protected_prefix("secret/", &[pk]).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        let cid = repo.commit("me", "add secret").unwrap();
+        // The policy must have exactly one wrapped-DEK entry.
+        let snap = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            s.get_snapshot(&cid).unwrap()
+        };
+        assert_eq!(snap.protection.wrapped.len(), 1, "one protected blob");
+        // The stored blob bytes must be ciphertext (not the plaintext).
+        let blob_id = *snap.protection.wrapped.keys().next().unwrap();
+        let obj = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            s.get(&blob_id).unwrap()
+        };
+        if let scl_core::Object::Blob(b) = obj {
+            assert_ne!(&b[..], b"hunter2", "blob must be ciphertext, not plaintext");
+        } else {
+            panic!("expected Blob object");
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
