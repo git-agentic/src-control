@@ -206,11 +206,12 @@ mod tests {
 
     #[test]
     fn parse_index_rejects_overflowing_count() {
-        // Magic b"SCIX", version 1 LE, count = 2^58 LE — count * 48 wraps on usize.
+        // Magic b"SCIX", version 1 LE, count = 2^60 — count * 48 wraps to 0 on u64,
+        // so unchecked arithmetic would pass the length check then panic.
         let mut bytes = Vec::with_capacity(16);
         bytes.extend_from_slice(b"SCIX");
         bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&0x0400_0000_0000_0000u64.to_le_bytes());
+        bytes.extend_from_slice(&0x1000_0000_0000_0000u64.to_le_bytes());
         let err = parse_index(&bytes).unwrap_err();
         assert!(matches!(err, crate::error::Error::BadPackIndex(_)), "got {err:?}");
     }
