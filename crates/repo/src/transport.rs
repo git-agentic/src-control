@@ -2,9 +2,10 @@
 //! `.sc/` directory on the same filesystem; the trait is the seam for future
 //! SSH/HTTP transports.
 
+use std::cell::RefCell;
 use std::str::FromStr;
 
-use scl_core::ObjectId;
+use scl_core::{Object, ObjectId, Store};
 
 use crate::error::{Error, Result};
 use crate::layout::Layout;
@@ -29,6 +30,10 @@ pub trait Transport {
 /// Transport over a remote `.sc/` directory on the local filesystem.
 pub struct LocalTransport {
     layout: Layout,
+    /// A store opened on the remote objects dir, so reads resolve loose
+    /// (sharded or flat), compressed, and packed objects uniformly. Lazily
+    /// mutated for its RAM cache; interior-mutable because the trait reads `&self`.
+    store: RefCell<Store>,
 }
 
 impl LocalTransport {
@@ -38,7 +43,8 @@ impl LocalTransport {
         if !layout.dot_sc.is_dir() {
             return Err(Error::NotARepo);
         }
-        Ok(LocalTransport { layout })
+        let store = Store::open_persistent(layout.objects_dir(), 1 << 20)?;
+        Ok(LocalTransport { layout, store: RefCell::new(store) })
     }
 }
 
@@ -70,33 +76,21 @@ impl Transport for LocalTransport {
     }
 
     fn has_object(&self, id: &ObjectId) -> Result<bool> {
-        Ok(self.layout.objects_dir().join(id.to_hex()).exists())
+        Ok(self.store.borrow().contains(id))
     }
 
     fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        let path = self.layout.objects_dir().join(id.to_hex());
-        std::fs::read(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Error::Core(scl_core::Error::NotFound(*id))
-            } else {
-                e.into()
-            }
-        })
+        Ok(self.store.borrow_mut().get(id)?.encode())
     }
 
     fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
         if ObjectId::of(bytes) != *id {
             return Err(Error::CorruptObject(*id));
         }
-        let dir = self.layout.objects_dir();
-        std::fs::create_dir_all(&dir)?;
-        let final_path = dir.join(id.to_hex());
-        if final_path.exists() {
-            return Ok(());
+        let got = self.store.borrow_mut().put(Object::decode(bytes)?)?;
+        if got != *id {
+            return Err(Error::CorruptObject(*id));
         }
-        let tmp = dir.join(format!("{}.{}.tmp", id.to_hex(), std::process::id()));
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &final_path)?;
         Ok(())
     }
 
@@ -141,6 +135,23 @@ mod tests {
         assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), id)]);
         assert_eq!(t.head_branch().unwrap(), "main");
 
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn transport_reads_packed_remote_object() {
+        let layout = tmp_remote("packed");
+        // Write an object into the remote store, pack it, drop the loose copy.
+        let id;
+        {
+            let mut s = scl_core::Store::open_persistent(layout.objects_dir(), 1 << 20).unwrap();
+            id = s.put(Object::blob(b"remote-packed".to_vec())).unwrap();
+            let _h = s.write_pack(&[id]).unwrap();
+            s.delete(&id).unwrap();
+        }
+        let t = LocalTransport::open(&layout.root).unwrap();
+        assert!(t.has_object(&id).unwrap());
+        assert_eq!(t.get_object(&id).unwrap(), Object::blob(b"remote-packed".to_vec()).encode());
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 }
