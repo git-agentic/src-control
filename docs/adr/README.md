@@ -25,13 +25,13 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0012](0012-three-way-merge.md) | Three-way merge with a snapshot common ancestor | Accepted | 4 |
 | [0017](0017-secret-scanner.md) | Accidental-plaintext secret scanner at commit time | Accepted | 5 |
 | [0013](0013-remote-sync-model.md) | Remote sync via object + ref transfer over a pluggable transport | Accepted | 6 |
-| [0014](0014-per-file-permissions-encrypted-paths.md) | Per-file permissions as encrypted paths (convergent encryption) | Proposed | 7 |
+| [0014](0014-per-file-permissions-encrypted-paths.md) | Per-file permissions as encrypted paths (convergent encryption) | Accepted | 7 |
 | [0015](0015-packfiles-and-gc.md) | Packfiles and reachability-based garbage collection | Proposed | 8 |
 | [0016](0016-git-export.md) | Git export for round-trip interop | Proposed | 9 |
 
-See [`ROADMAP.md`](../../ROADMAP.md) for how the Proposed ADRs (0013–0016)
+See [`ROADMAP.md`](../../ROADMAP.md) for how the Proposed ADRs (0015–0016)
 sequence into phases (note: ADR numbers are assigned in creation order, so 0017 —
-the secret scanner — sequences as phase P5, ahead of 0013–0016).
+the secret scanner — sequences as phase P5, ahead of 0015–0016).
 
 ## Status legend
 

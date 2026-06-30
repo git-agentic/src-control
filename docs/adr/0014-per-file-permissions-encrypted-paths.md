@@ -1,6 +1,6 @@
 # ADR-0014: Per-file permissions as encrypted paths (convergent encryption)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Phase:** 7
 
@@ -74,3 +74,49 @@ makes the same plaintext encrypt to different ciphertext every commit — new
 - **Policy-only (no encryption), tool-enforced read refusal.** Doesn't protect
   content in an unauthorized clone — the whole point — so rejected for the read-
   confidentiality goal.
+
+## As built (P7)
+
+The decision shipped as designed; the concrete shape settled as follows.
+
+- **Split envelope.** An encrypted file is a normal, content-addressed `Blob`
+  whose bytes are `nonce(24)‖ciphertext`; its `TreeEntry.perms` carries the
+  `PROTECTED` bit (`0b0000_0001`). The per-recipient *wrapped DEKs* live entirely
+  on the policy side — `Snapshot.protection.wrapped: BTreeMap<ObjectId,
+  Vec<WrappedKey>>`, keyed by the ciphertext blob's id — never inside the blob.
+  This keeps the encrypted blob a deterministic function of the plaintext (stable
+  id, dedup) while the necessarily-random per-recipient wraps churn off to the
+  side without affecting any object id.
+- **Convergent API in `scl-crypto`.** `encrypt_path(plaintext) -> (nonce‖ct,
+  Zeroizing<DEK>)` derives `DEK = HKDF-SHA256(BLAKE3(plaintext), info=
+  "scl-path-dek-v1")` and `nonce = HKDF(... "scl-path-nonce-v1")[..24]`, AEAD
+  AAD `b"scl-path-v1"`; `decrypt_path(blob, dek)` is the AEAD-verified inverse.
+  DEK wrapping reuses Phase 2's X25519→HKDF→AEAD via public `wrap_dek_for` /
+  `unwrap_dek_with`. Recipient pubkeys are reconstructed in `repo` through
+  `PublicKey::from_bytes`.
+- **Persisted prefix rules + commit-time auto-encryption.** `protection.prefixes`
+  is a list of `ProtectPrefix { prefix, recipients: Vec<[u8;32]> }` (recipient
+  *pubkeys*, not ids, so commit can re-wrap freshly minted DEKs without an
+  identity). `commit` partitions working files by `matching_prefix` (longest
+  prefix wins), encrypts matching files, marks their entries `PROTECTED`, and
+  populates `policy.wrapped`. **Protected paths bypass the P5 secret scanner** —
+  scanning only the plaintext partition — so a deliberately secret-looking file
+  under a protected prefix is encrypted rather than rejected.
+- **Skip-on-unauthorized checkout, with carry-forward.** `materialize` takes an
+  optional identity; for a `PROTECTED` entry it unwraps the matching `WrappedKey`
+  and `decrypt_path`s, writing plaintext only on success. With no identity or no
+  matching key it **skips** the file (removing any stale on-disk copy) and reports
+  the path. Crucially, `commit` carries forward the wrapped DEKs (and ciphertext
+  ids) for protected files a non-recipient committer never decrypted, so a commit
+  by someone lacking the key cannot silently drop protected content.
+- **Policy-only grant/revoke.** `grant` recovers each affected DEK with an
+  authorized identity and re-wraps it for the new recipient (deduped by recipient
+  id), `revoke` drops a recipient's wraps and prefix membership; both commit a
+  snapshot reusing the tip's exact root tree — **no blob or tree id changes**.
+- **CLI.** `sc protect <prefix> --to <names>` / `sc protect --list`,
+  `sc grant <prefix> --to <names> [--identity]`, `sc revoke <prefix>
+  --recipient-id <id>`. `sc switch [--identity]` resolves the identity softly
+  (`--identity`/`SC_IDENTITY`/`~/.sc/identity`): a missing key is not an error —
+  protected files are simply skipped and listed. `demo/run_protect_demo.sh`
+  proves the headline end-to-end (commit→clone→keyless skip→keyed decrypt) with a
+  positive control guaranteeing the ciphertext assertion is non-vacuous.

@@ -56,8 +56,16 @@ enum Cmd {
     Log,
     /// Create a new branch at the current tip.
     Branch { name: String },
-    /// Switch HEAD to a branch and materialize it.
-    Switch { name: String },
+    /// Switch HEAD to a branch and materialize it. Protected files decrypt when
+    /// the resolved identity is a recipient, and are skipped otherwise.
+    Switch {
+        name: String,
+        /// Identity file for decrypting protected files (default
+        /// `--identity`/`SC_IDENTITY`/`~/.sc/identity`). Missing file → protected
+        /// files are simply skipped.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
     /// Committed-secret operations.
     Secret {
         #[command(subcommand)]
@@ -107,6 +115,38 @@ enum Cmd {
     Push {
         #[arg(default_value = "origin")]
         remote: String,
+    },
+    /// Protect a path prefix: files under it are convergently encrypted for the
+    /// named recipients on commit. With `--list` (or no prefix), list the rules.
+    Protect {
+        /// Path prefix to protect (e.g. `secret/`). Omit to list.
+        prefix: Option<String>,
+        /// Recipient names (from `.sc/recipients.toml`).
+        #[arg(long, value_delimiter = ',')]
+        to: Vec<String>,
+        /// List protected prefixes instead of adding one.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Grant a recipient read access to an already-protected prefix (policy-only;
+    /// no file objects change). Requires your identity to re-wrap the DEK.
+    Grant {
+        /// The protected path prefix.
+        prefix: String,
+        /// Recipient names to grant (from `.sc/recipients.toml`).
+        #[arg(long, value_delimiter = ',')]
+        to: Vec<String>,
+        /// Your identity file (must currently be a recipient of the prefix).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Revoke a recipient's access to a protected prefix (by recipient id).
+    Revoke {
+        /// The protected path prefix.
+        prefix: String,
+        /// Recipient id to revoke.
+        #[arg(long)]
+        recipient_id: String,
     },
 }
 
@@ -189,7 +229,7 @@ fn main() -> Result<()> {
         Cmd::Status => run_status(),
         Cmd::Log => run_log(),
         Cmd::Branch { name } => run_branch(&name),
-        Cmd::Switch { name } => run_switch(&name),
+        Cmd::Switch { name, identity } => run_switch(&name, identity),
         Cmd::Scan => run_scan(),
         Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &author),
         Cmd::Secret { op } => run_secret(op),
@@ -198,6 +238,9 @@ fn main() -> Result<()> {
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
         Cmd::Push { remote } => run_push(&remote),
+        Cmd::Protect { prefix, to, list } => run_protect(prefix, to, list),
+        Cmd::Grant { prefix, to, identity } => run_grant(prefix, to, identity),
+        Cmd::Revoke { prefix, recipient_id } => run_revoke(prefix, recipient_id),
     }
 }
 
@@ -754,8 +797,9 @@ fn run_branch(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_switch(name: &str) -> Result<()> {
-    let skipped = open_repo()?.switch(name)?;
+fn run_switch(name: &str, identity: Option<PathBuf>) -> Result<()> {
+    let sk = resolve_identity_opt(identity)?;
+    let skipped = open_repo()?.switch_with_identity(name, sk.as_ref())?;
     println!("switched to branch {name}");
     for path in &skipped {
         eprintln!("skipped (no key): {path}");
@@ -813,6 +857,18 @@ fn load_identity(flag: Option<PathBuf>) -> Result<scl_crypto::SecretKey> {
     scl_crypto::FileKeyProvider::new(path).identity().map_err(Into::into)
 }
 
+/// Soft identity resolution for checkout/switch: a holder with no key must still
+/// be able to switch (protected files are skipped). Returns `Ok(None)` when the
+/// resolved path doesn't exist, `Ok(Some(..))` when it loads, and propagates the
+/// error when a present file fails to parse.
+fn resolve_identity_opt(flag: Option<PathBuf>) -> Result<Option<scl_crypto::SecretKey>> {
+    let path = resolve_identity_path(flag);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(scl_crypto::FileKeyProvider::new(path).identity()?))
+}
+
 fn resolve_names(
     dir: &std::collections::BTreeMap<String, scl_crypto::PublicKey>,
     names: &[String],
@@ -863,6 +919,43 @@ fn run_push(remote: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool) -> Result<()> {
+    let repo = open_repo()?;
+    if list || prefix.is_none() {
+        for (p, recips) in repo.protected_prefixes()? {
+            println!("{p}  ({} recipient(s))", recips.len());
+        }
+        return Ok(());
+    }
+    let prefix = prefix.unwrap();
+    let dir = load_recipients(&repo.layout().dot_sc.join("recipients.toml"))?;
+    let pks = resolve_names(&dir, &to)?;
+    let id = repo.protect(&prefix, &pks, None)?;
+    println!("protected {prefix} for {} recipient(s): {}", to.len(), id.short());
+    Ok(())
+}
+
+fn run_grant(prefix: String, to: Vec<String>, identity: Option<PathBuf>) -> Result<()> {
+    let repo = open_repo()?;
+    let dir = load_recipients(&repo.layout().dot_sc.join("recipients.toml"))?;
+    let pks = resolve_names(&dir, &to)?;
+    let sk = load_identity(identity)?;
+    for pk in &pks {
+        repo.grant(&prefix, &sk, pk)?;
+    }
+    println!("granted {prefix} to {} recipient(s)", to.len());
+    Ok(())
+}
+
+fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
+    let repo = open_repo()?;
+    let rid = scl_crypto::RecipientId::from_hex(&recipient_id)
+        .map_err(|_| anyhow::anyhow!("bad recipient id"))?;
+    repo.revoke(&prefix, &rid)?;
+    println!("revoked {recipient_id} from {prefix}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,6 +975,23 @@ mod tests {
         let map = load_recipients(&path).unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map["alice"].to_bytes(), pk.to_bytes());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_identity_opt_missing_is_none_existing_loads() {
+        let dir = std::env::temp_dir().join(format!("scl-ident-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("nope");
+        assert!(resolve_identity_opt(Some(missing)).unwrap().is_none());
+
+        let (sk, _pk) = scl_crypto::generate_keypair();
+        let key_path = dir.join("identity");
+        std::fs::write(&key_path, sk.to_key_string()).unwrap();
+        let loaded = resolve_identity_opt(Some(key_path)).unwrap();
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().to_key_string(), sk.to_key_string());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
