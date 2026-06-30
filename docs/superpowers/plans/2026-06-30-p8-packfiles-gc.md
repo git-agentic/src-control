@@ -282,12 +282,27 @@ with:
         self.existing_loose_path(id).is_some()
 ```
 
-- [ ] **Step 5: Run the new test + the full core suite**
+- [ ] **Step 5: Fix the existing corrupt-object test to corrupt the sharded path**
+
+The existing `persistent_corrupt_object_fails_hash_verify` test (in `store.rs` tests) tampers with the **flat** path `dir.join(id.to_hex())`. After this task `put` writes the **sharded** path and `existing_loose_path` checks sharded first — so the flat tamper would be a stray file the read never sees, the real object would read back clean, and the test's `Malformed` assertion would silently fail. Update the corruption line:
+
+Replace:
+```rust
+        std::fs::write(dir.join(id.to_hex()), b"tampered").unwrap();
+```
+with:
+```rust
+        let hex = id.to_hex();
+        std::fs::write(dir.join(&hex[..2]).join(&hex[2..]), b"tampered").unwrap();
+```
+(This now also exercises the zstd-decode-fails → raw-fallback → hash-mismatch branch, so it's a strictly stronger test.)
+
+- [ ] **Step 6: Run the new test + the full core suite**
 
 Run: `cargo test -p scl-core`
-Expected: PASS — including the existing `persistent_*` tests (they reopen and read back, which now goes through the sharded/compressed path) and the new sharded test.
+Expected: PASS — including the existing `persistent_*` tests (they reopen and read back through the sharded/compressed path), the updated corrupt test, and the new sharded test.
 
-- [ ] **Step 6: Write + run the legacy-flat back-compat test**
+- [ ] **Step 7: Write + run the legacy-flat back-compat test**
 
 ```rust
 #[test]
@@ -309,7 +324,7 @@ fn reads_legacy_flat_uncompressed_object() {
 Run: `cargo test -p scl-core reads_legacy_flat_uncompressed_object`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add crates/core/Cargo.toml Cargo.lock crates/core/src/store.rs
@@ -1844,4 +1859,5 @@ git commit -m "docs: accept ADR-0015 and record P8 packfiles/gc as built"
 
 - **Spec coverage:** packfile format → Task 2/3; pack-aware reads → Task 3; `sc gc` reachability+prune+grace → Task 5/9; full safe root set → Task 4/5; sharding+zstd+read-both → Task 1; `delete`/`list_loose` → Task 1; bulk-pack transfer (get_pack/put_pack + push/fetch/clone) → Task 7/8; transport read-path fix → Task 6; demo reclamation → Task 10; ADR/docs sync → Task 11. No spec section is unmapped.
 - **Type consistency:** `write_pack -> String` (hash), `pack_hashes -> Vec<String>`, `delete_pack(&str)`, `GcStats{packed,loose_pruned,loose_kept,packs_removed}`, `gc::run(layout,store,Duration)`, `Repo::gc(Duration)`, `get_pack(wants,haves)`/`put_pack(pack)` are used identically everywhere they appear.
-- **Open verification for the implementer:** Task 5 assumes `Repo` holds its store as a field named `vfs` (`scl_vfs::Repo`) — the `vfs()` accessor and `self.vfs.store()` calls match the existing `repo.rs` usage at lines ~802/843/870. Confirm the field name when adding `vfs()`; if it differs, adjust the accessor only.
+- **Stale flat-path audit (done):** `rg 'objects_dir\(\)\.join|to_hex\(\)' crates/` found exactly these object-path sites — all accounted for: Store `put`/`contains`/`write_object_file`/`read_object_file` (rewritten in Task 1); the ephemeral `spill_dir` paths (intentionally left flat+raw — gc/packs are persistent-only); `transport.rs` reads/writes (rewritten in Task 6); `refs.rs` (a ref file, not an object); and the `persistent_corrupt_object_fails_hash_verify` test (fixed in Task 1 Step 5). No third site needs touching.
+- **Open verification for the implementer:** confirmed `Repo` holds its store as field `vfs: VfsRepo` (alias of `scl_vfs::Repo`) with `_lock: RepoLock` held for the repo's lifetime — so the `vfs()` accessor and the "don't re-acquire the lock in `Repo::gc`" instruction are both grounded in the real struct.
