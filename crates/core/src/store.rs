@@ -471,6 +471,7 @@ mod tests {
                     timestamp: 0,
                     message: "m".into(),
                     secrets: BTreeMap::new(),
+                    protection: Default::default(),
                 }))
                 .unwrap();
         } // store dropped; nothing deleted

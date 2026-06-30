@@ -15,6 +15,26 @@ const TAG_TREE: u8 = 1;
 const TAG_SNAPSHOT: u8 = 2;
 const TAG_SECRET: u8 = 3;
 
+/// Perms-byte bit: this blob entry holds a `nonce‖ciphertext` envelope (an
+/// encrypted file), not plaintext. Set on protected-path entries (P7).
+pub const PROTECTED: u8 = 0b0000_0001;
+
+/// A protected path prefix and the recipient public keys its files are
+/// encrypted for (used at commit time to wrap new files' DEKs).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProtectPrefix {
+    pub prefix: String,
+    pub recipients: Vec<[u8; 32]>,
+}
+
+/// Per-snapshot encrypted-path policy: which prefixes are protected (+ for whom),
+/// and the per-recipient wrapped DEKs keyed by the ciphertext blob's id.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct Protection {
+    pub prefixes: Vec<ProtectPrefix>,
+    pub wrapped: std::collections::BTreeMap<ObjectId, Vec<WrappedKey>>,
+}
+
 /// Whether a tree entry points at file content or a subtree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EntryKind {
@@ -79,6 +99,10 @@ pub struct Snapshot {
     /// materialized by `checkout`. A `BTreeMap` iterates in sorted key order, so
     /// the canonical encoding (and thus `id()`) is independent of insertion order.
     pub secrets: std::collections::BTreeMap<String, ObjectId>,
+    /// Encrypted-path policy (P7): protected prefixes + per-ciphertext wrapped
+    /// DEKs. Canonical encoding (sorted prefixes + ordered map) keeps the id
+    /// order-independent.
+    pub protection: Protection,
 }
 
 /// A DEK wrapped (encrypted) for one authorized recipient public key.
@@ -174,6 +198,26 @@ impl Object {
                     w.str(name);
                     w.id(id);
                 }
+                // protection: prefixes (sorted by prefix) then wrapped map.
+                let mut prefixes = s.protection.prefixes.clone();
+                prefixes.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+                w.u32(prefixes.len() as u32);
+                for p in &prefixes {
+                    w.str(&p.prefix);
+                    w.u32(p.recipients.len() as u32);
+                    for r in &p.recipients {
+                        w.raw(r); // 32 bytes
+                    }
+                }
+                w.u32(s.protection.wrapped.len() as u32);
+                for (id, wks) in &s.protection.wrapped {
+                    w.id(id);
+                    w.u32(wks.len() as u32);
+                    for k in wks {
+                        w.str(&k.recipient_id);
+                        w.bytes(&k.wrapped_dek);
+                    }
+                }
             }
             Object::Secret(s) => {
                 w.tag(TAG_SECRET);
@@ -229,7 +273,34 @@ impl Object {
                     let id = r.id()?;
                     secrets.insert(name, id);
                 }
-                Object::Snapshot(Snapshot { root, parents, author, timestamp, message, secrets })
+                let np2 = r.u32()?;
+                let mut prefixes = Vec::with_capacity(np2 as usize);
+                for _ in 0..np2 {
+                    let prefix = r.str()?;
+                    let nr = r.u32()?;
+                    let mut recipients = Vec::with_capacity(nr as usize);
+                    for _ in 0..nr {
+                        let mut rk = [0u8; 32];
+                        rk.copy_from_slice(r.take(32)?);
+                        recipients.push(rk);
+                    }
+                    prefixes.push(ProtectPrefix { prefix, recipients });
+                }
+                let nw = r.u32()?;
+                let mut wrapped = std::collections::BTreeMap::new();
+                for _ in 0..nw {
+                    let id = r.id()?;
+                    let nk = r.u32()?;
+                    let mut wks = Vec::with_capacity(nk as usize);
+                    for _ in 0..nk {
+                        let recipient_id = r.str()?;
+                        let wrapped_dek = r.bytes()?;
+                        wks.push(WrappedKey { recipient_id, wrapped_dek });
+                    }
+                    wrapped.insert(id, wks);
+                }
+                let protection = Protection { prefixes, wrapped };
+                Object::Snapshot(Snapshot { root, parents, author, timestamp, message, secrets, protection })
             }
             TAG_SECRET => {
                 let name = r.str()?;
@@ -371,6 +442,7 @@ mod tests {
             timestamp: 42,
             message: "init".into(),
             secrets: std::collections::BTreeMap::new(),
+            protection: Protection::default(),
         });
         assert_eq!(snap, Object::decode(&snap.encode()).unwrap());
 
@@ -404,6 +476,7 @@ mod tests {
                 timestamp: 0,
                 message: "m".into(),
                 secrets,
+                protection: Protection::default(),
             })
         };
         // Two registries built from differently-ordered inputs.
@@ -420,5 +493,22 @@ mod tests {
         assert_eq!(s1, s2);
         assert_eq!(s1.id(), s2.id());
         assert_eq!(s1, Object::decode(&s1.encode()).unwrap());
+    }
+
+    #[test]
+    fn snapshot_with_protection_roundtrips_canonically() {
+        let root = Object::blob(b"r".to_vec()).id();
+        let cid = Object::blob(b"ct".to_vec()).id();
+        let mut wrapped = std::collections::BTreeMap::new();
+        wrapped.insert(cid, vec![WrappedKey { recipient_id: "rid".into(), wrapped_dek: vec![7; 80] }]);
+        let prot = Protection {
+            prefixes: vec![ProtectPrefix { prefix: "secrets/".into(), recipients: vec![[9u8; 32]] }],
+            wrapped,
+        };
+        let snap = Object::Snapshot(Snapshot {
+            root, parents: vec![], author: "a".into(), timestamp: 0, message: "m".into(),
+            secrets: std::collections::BTreeMap::new(), protection: prot,
+        });
+        assert_eq!(snap, Object::decode(&snap.encode()).unwrap());
     }
 }
