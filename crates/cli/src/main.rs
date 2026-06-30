@@ -712,8 +712,11 @@ fn run_status() -> Result<()> {
 fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
     let repo = open_repo()?;
     if abort {
-        repo.merge_abort()?;
+        let skipped = repo.merge_abort()?;
         println!("merge aborted; working tree restored");
+        for path in &skipped {
+            eprintln!("skipped (no key): {path}");
+        }
         return Ok(());
     }
     let branch = branch.ok_or_else(|| anyhow::anyhow!("merge: provide a branch or --abort"))?;

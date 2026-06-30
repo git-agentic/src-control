@@ -265,10 +265,16 @@ impl Repo {
 
     /// Working-tree status against HEAD, plus merge-in-progress info.
     pub fn status(&self) -> Result<Status> {
-        let head_root = self.head_root()?;
+        let (head_root, protection) = match self.head_tip()? {
+            Some(tip) => {
+                let snap = self.snapshot(&tip)?;
+                (Some(snap.root), snap.protection)
+            }
+            None => (None, Protection::default()),
+        };
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
-        worktree::diff_worktree(&self.layout, &mut store, head_root)
+        worktree::diff_worktree(&self.layout, &mut store, head_root, &protection)
     }
 
     /// Conflicted paths if a merge is in progress (empty otherwise).
@@ -393,7 +399,12 @@ impl Repo {
 
     /// Abandon an in-progress merge: restore the working tree to the current tip
     /// and clear merge state. Errors if no merge is in progress.
-    pub fn merge_abort(&self) -> Result<()> {
+    ///
+    /// Returns the protected paths that could not be restored. No identity is
+    /// available at abort time, so protected files are skipped (left absent)
+    /// rather than decrypted — that's expected; re-supply an identity via a
+    /// `switch_with_identity` back to the branch to materialize them.
+    pub fn merge_abort(&self) -> Result<Vec<String>> {
         if !crate::merge_state::in_progress(&self.layout) {
             return Err(Error::InvalidArgument("no merge in progress".into()));
         }
@@ -406,6 +417,7 @@ impl Repo {
         // Restore working tree to ours tip. Pass theirs' root as `old_root` so
         // the deletion pass drops files the conflicted merge pulled in from
         // theirs; materializing against ours==old would delete nothing.
+        let mut skipped = Vec::new();
         let ours_tip = self.head_tip()?;
         if let Some(ours_id) = ours_tip {
             let store_arc = self.vfs.store();
@@ -415,7 +427,7 @@ impl Repo {
             let ours_protection = ours_snap.protection;
             let theirs_root = store.get_snapshot(&theirs_id)?.root;
             // No identity at abort time: protected files in ours are skipped (not decrypted).
-            worktree::materialize(
+            skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
                 ours_root,
@@ -424,7 +436,8 @@ impl Repo {
                 None,
             )?;
         }
-        crate::merge_state::clear(&self.layout)
+        crate::merge_state::clear(&self.layout)?;
+        Ok(skipped)
     }
 
     /// Snapshots from the current tip back through parents (newest first).
@@ -470,10 +483,11 @@ impl Repo {
     ///
     /// Refuses to switch when the working tree has uncommitted modifications or
     /// deletions, because `materialize` would silently overwrite them. (New,
-    /// untracked files are left in place and so don't block the switch.)
-    /// PROTECTED files in the current HEAD are excluded from the dirty check —
-    /// plaintext on disk legitimately differs from the stored ciphertext and is
-    /// not a user modification.
+    /// untracked files are left in place and so don't block the switch.) The
+    /// dirty check is protection-aware (see `status`/`diff_worktree`): a
+    /// decrypted protected file that matches HEAD is clean and a skipped/absent
+    /// protected file is clean, but a genuine edit to a protected file blocks
+    /// the switch like any other uncommitted change.
     ///
     /// Returns the list of protected paths skipped (not decrypted) because no
     /// identity was provided. Use `switch_with_identity` to supply one.
@@ -493,33 +507,11 @@ impl Repo {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
-        // Dirty check: exclude PROTECTED paths in the current HEAD — plaintext
-        // on disk differs from stored ciphertext but is not a user modification.
-        let protected_in_head: std::collections::HashSet<String> =
-            match self.head_tip()? {
-                Some(tip) => {
-                    let snap = self.snapshot(&tip)?;
-                    if snap.protection.wrapped.is_empty() {
-                        Default::default()
-                    } else {
-                        let store_arc = self.vfs.store();
-                        let mut store = store_arc.lock().unwrap();
-                        worktree::tree_file_entries_with_perms(&mut store, snap.root)?
-                            .into_iter()
-                            .filter(|(_, (_, _, p))| p & scl_core::PROTECTED != 0)
-                            .map(|(path, _)| path)
-                            .collect()
-                    }
-                }
-                None => Default::default(),
-            };
+        // The protection-aware dirty check (status) already treats unchanged
+        // decrypted protected files and skipped/absent protected files as clean,
+        // so a reported modification/deletion is a genuine uncommitted change.
         let dirty = self.status()?;
-        let has_unprotected_changes = dirty
-            .modified
-            .iter()
-            .any(|p| !protected_in_head.contains(p))
-            || dirty.deleted.iter().any(|p| !protected_in_head.contains(p));
-        if has_unprotected_changes {
+        if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
             return Err(Error::InvalidArgument(
                 "working tree has uncommitted changes; commit before switching".into(),
             ));
@@ -1321,6 +1313,91 @@ mod tests {
             "unauthorized switch must not write the protected file"
         );
 
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn status_clean_for_decrypted_protected_file() {
+        // A decrypted protected file on disk must read as CLEAN: status compares
+        // the convergent re-encryption of the disk bytes to the stored ciphertext.
+        let root = tmp_root("p7-status-clean");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        // The working file is plaintext while HEAD holds ciphertext, yet status
+        // must report no changes (no spurious modified/deleted/added).
+        let s = repo.status().unwrap();
+        assert!(s.modified.is_empty(), "decrypted protected file must not show as modified: {s:?}");
+        assert!(s.deleted.is_empty(), "protected file present on disk must not show as deleted: {s:?}");
+        assert!(s.added.is_empty(), "{s:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn switch_refuses_genuine_edit_to_protected_file() {
+        // A real edit to a decrypted protected file must BLOCK the switch (no
+        // silent data loss) and the edit must be preserved.
+        let root = tmp_root("p7-switch-edit");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        repo.branch("other").unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        // Genuinely edit the protected file (still plaintext on disk).
+        std::fs::write(root.join("secret/db.txt"), b"edited-secret").unwrap();
+        // status must report it modified (convergent re-encryption differs).
+        assert!(repo.status().unwrap().modified.contains(&"secret/db.txt".to_string()));
+        // switch must refuse and preserve the edit.
+        let err = repo.switch("other").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        assert_eq!(
+            std::fs::read(root.join("secret/db.txt")).unwrap(),
+            b"edited-secret",
+            "the uncommitted edit to the protected file must be preserved"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn switching_to_protected_branch_removes_stale_plaintext_for_non_recipient() {
+        // A path that is plaintext on branch A and protected on branch B must be
+        // ABSENT (not the stale A plaintext) after a non-recipient switches A->B.
+        let root = tmp_root("p7-stale-plaintext");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mallory_sk, _mallory_pk) = scl_crypto::generate_keypair();
+
+        // Branch A (main): data/x.txt as plaintext.
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(root.join("data/x.txt"), b"plaintext-A").unwrap();
+        repo.commit("me", "plaintext on A").unwrap();
+
+        // Branch B: same path, but data/ is protected -> committed as ciphertext.
+        repo.branch("b").unwrap();
+        repo.switch("b").unwrap();
+        repo.test_set_protected_prefix("data/", &[alice_pk]).unwrap();
+        repo.commit("me", "encrypt on B").unwrap();
+
+        // Back on A: the working file is plaintext again.
+        repo.switch("main").unwrap();
+        assert_eq!(std::fs::read(root.join("data/x.txt")).unwrap(), b"plaintext-A");
+
+        // Switch A->B as mallory (non-recipient): the file is skipped AND the
+        // stale plaintext must be removed (confidentiality).
+        let skipped = repo.switch_with_identity("b", Some(&mallory_sk)).unwrap();
+        assert!(skipped.contains(&"data/x.txt".to_string()), "mallory must skip the protected file");
+        assert!(
+            !root.join("data/x.txt").exists(),
+            "stale A plaintext must be removed when the path becomes protected for a non-recipient"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

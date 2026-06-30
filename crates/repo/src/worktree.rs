@@ -148,29 +148,57 @@ pub struct Diff {
 }
 
 /// Diff the working tree against `head_root` (None => unborn: all files added).
+///
+/// Protection-aware: a HEAD entry flagged `PROTECTED` stores ciphertext, while
+/// the working copy (when present) is decrypted plaintext, so a naive plaintext
+/// id comparison would always report it modified. Instead, for a PROTECTED HEAD
+/// path:
+/// - absent on disk => CLEAN (the expected state for an unauthorized/skipped
+///   checkout — not a user deletion);
+/// - present on disk => re-encrypt the disk bytes convergently (`encrypt_path`
+///   is a pure, keyless function) and compare the resulting ciphertext blob id
+///   to the stored one: equal => CLEAN, different => MODIFIED (a genuine edit).
+///
+/// Non-protected paths use the usual plaintext-blob-id comparison.
 pub fn diff_worktree(
     layout: &Layout,
     store: &mut Store,
     head_root: Option<ObjectId>,
+    // Per-entry `PROTECTED` perms (read from the HEAD tree) are the authoritative
+    // signal; the policy is taken explicitly so callers thread it consistently and
+    // a future richer diff (e.g. prefix-aware reporting) needs no signature change.
+    _protection: &Protection,
 ) -> Result<Diff> {
-    let wt: BTreeMap<String, ObjectId> = read_worktree(layout)?
-        .into_iter()
-        .map(|(p, b, _)| (p, Object::blob(b).id()))
-        .collect();
+    let wt: BTreeMap<String, Vec<u8>> =
+        read_worktree(layout)?.into_iter().map(|(p, b, _)| (p, b)).collect();
     let head = match head_root {
-        Some(root) => tree_file_ids(store, root)?,
+        Some(root) => tree_file_entries_with_perms(store, root)?,
         None => BTreeMap::new(),
     };
     let mut diff = Diff::default();
-    for (p, id) in &wt {
+    for (p, bytes) in &wt {
         match head.get(p) {
             None => diff.added.push(p.clone()),
-            Some(hid) if hid != id => diff.modified.push(p.clone()),
-            _ => {}
+            Some((hid, _mode, perms)) => {
+                let disk_id = if perms & PROTECTED != 0 {
+                    // Convergent re-encryption yields the same id as the commit did.
+                    Object::blob(scl_crypto::encrypt_path(bytes).0).id()
+                } else {
+                    Object::blob(bytes.clone()).id()
+                };
+                if &disk_id != hid {
+                    diff.modified.push(p.clone());
+                }
+            }
         }
     }
-    for p in head.keys() {
+    for (p, (_hid, _mode, perms)) in &head {
         if !wt.contains_key(p) {
+            // A PROTECTED HEAD path absent on disk is the expected state for an
+            // unauthorized/skipped checkout — clean, not a user deletion.
+            if perms & PROTECTED != 0 {
+                continue;
+            }
             diff.deleted.push(p.clone());
         }
     }
@@ -246,7 +274,11 @@ pub fn materialize(
                     // `pt` (Zeroizing<Vec<u8>>) is dropped and zeroed here.
                 }
                 None => {
-                    // No identity or no matching key: skip without writing.
+                    // No identity or no matching key: skip without writing. Remove
+                    // any pre-existing on-disk file at this path so stale plaintext
+                    // can't linger when a path becomes protected across a switch for
+                    // a non-recipient (confidentiality).
+                    let _ = std::fs::remove_file(&full);
                     skipped.push(path.clone());
                 }
             }
