@@ -177,12 +177,15 @@ impl Repo {
         // from the working tree. `commit` cannot distinguish "absent because the
         // committer isn't a recipient (skipped at checkout)" from "the committer
         // deleted it" — an absent protected path reads as clean either way (see
-        // Task 5 `status`). We therefore NEVER silently drop protected content on
-        // commit: a still-protected path that is missing from disk is carried
-        // forward verbatim from the tip (its exact ciphertext blob and wrapped
-        // DEKs). This closes the hole where a non-recipient's unrelated commit
-        // would otherwise destroy ciphertext they cannot even read. (Explicit
-        // deletion of a protected file is a future operation, out of scope.)
+        // Task 5 `status`). We therefore never silently drop protected content
+        // on a non-merge commit: a still-protected path that is missing from
+        // disk is carried forward verbatim from the tip (its exact ciphertext
+        // blob and wrapped DEKs). This closes the hole where a non-recipient's
+        // unrelated commit would otherwise destroy ciphertext they cannot even
+        // read. (Explicit deletion of a protected file is a future operation,
+        // out of scope.) Scope: this scans only `tip` (ours), so it covers
+        // non-merge commits. Merge commits do not yet carry forward theirs-side
+        // protected content; merge-of-protected is a separate follow-on.
         if let Some(tip_id) = tip {
             let on_disk: std::collections::BTreeSet<String> =
                 all.iter().map(|(p, _, _, _)| p.clone()).collect();
@@ -661,17 +664,23 @@ impl Repo {
             .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
 
         let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
+        let authorized_id = authorized.public().recipient_id().to_string();
         let new_id = new.recipient_id().to_string();
         for blob_id in protected_ids {
             let Some(wks) = protection.wrapped.get(&blob_id) else { continue };
             if wks.iter().any(|w| w.recipient_id == new_id) {
                 continue; // `new` already a recipient for this blob
             }
-            // Recover the DEK via any wrap the authorized identity can unwrap.
-            let dek = wks
+            // Locate the wrap addressed to `authorized` by recipient id (mirrors
+            // the Phase-2 `secrets.rs`/`open` lookup). A missing wrap means the
+            // caller isn't a recipient → NotAuthorized; a present-but-corrupt
+            // wrap must surface as a hard crypto error via `?`, not be misread as
+            // an authorization failure. The DEK stays `Zeroizing`.
+            let wk = wks
                 .iter()
-                .find_map(|w| scl_crypto::unwrap_dek_with(w, authorized).ok())
+                .find(|w| w.recipient_id == authorized_id)
                 .ok_or_else(|| Error::NotAuthorized(prefix.to_string()))?;
+            let dek = scl_crypto::unwrap_dek_with(wk, authorized)?;
             let new_wk = scl_crypto::wrap_dek_for(&dek, new);
             protection.wrapped.get_mut(&blob_id).expect("present above").push(new_wk);
         }
@@ -1529,6 +1538,39 @@ mod tests {
         // mallory is not a recipient → cannot recover the DEK to grant.
         let err = repo.grant("secret/", &mallory_sk, &bob_pk).unwrap_err();
         assert!(matches!(err, Error::NotAuthorized(_)), "got {err:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn grant_surfaces_tampered_wrap_as_crypto_error_not_unauthorized() {
+        // A wrap addressed to the authorized identity that fails to decrypt
+        // (tampered) must surface as a hard crypto error, not be misclassified
+        // as NotAuthorized.
+        let root = tmp_root("p7-grant-tamper");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        let c1 = repo.commit("me", "add").unwrap();
+        let snap = repo.snapshot(&c1).unwrap();
+
+        // Tamper alice's wrap bytes (recipient id intact) and commit it forward.
+        let mut protection = snap.protection;
+        for wks in protection.wrapped.values_mut() {
+            for w in wks.iter_mut() {
+                let n = w.wrapped_dek.len();
+                w.wrapped_dek[n - 1] ^= 0xFF;
+            }
+        }
+        repo.commit_snapshot(snap.root, vec![c1], snap.secrets, protection, "test", "tamper")
+            .unwrap();
+
+        let err = repo.grant("secret/", &alice_sk, &bob_pk).unwrap_err();
+        assert!(matches!(err, Error::Crypto(_)), "tamper must be a crypto error, got {err:?}");
+        assert!(!matches!(err, Error::NotAuthorized(_)));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
