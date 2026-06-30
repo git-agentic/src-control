@@ -43,7 +43,9 @@ impl LocalTransport {
         if !layout.dot_sc.is_dir() {
             return Err(Error::NotARepo);
         }
-        let store = Store::open_persistent(layout.objects_dir(), 1 << 20)?;
+        // Match the repo's store budget so a single large object never fails to resolve
+        // (a blob bigger than the whole budget would BudgetExceed).
+        let store = Store::open_persistent(layout.objects_dir(), crate::repo::DEFAULT_BUDGET)?;
         Ok(LocalTransport { layout, store: RefCell::new(store) })
     }
 }
@@ -135,6 +137,26 @@ mod tests {
         assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), id)]);
         assert_eq!(t.head_branch().unwrap(), "main");
 
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn transport_reads_object_larger_than_one_mib() {
+        // A blob > 1 MiB would BudgetExceed under the old 1 MiB budget.
+        let layout = tmp_remote("large");
+        let big_bytes: Vec<u8> = vec![0xAB; (1 << 20) + 4096];
+        let blob = Object::blob(big_bytes);
+        let id = blob.id();
+        let expected = blob.encode();
+        {
+            let mut s =
+                scl_core::Store::open_persistent(layout.objects_dir(), crate::repo::DEFAULT_BUDGET)
+                    .unwrap();
+            s.put(Object::blob(vec![0xAB; (1 << 20) + 4096])).unwrap();
+        }
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let got = t.get_object(&id).expect("large object must transfer without BudgetExceeded");
+        assert_eq!(got, expected);
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 

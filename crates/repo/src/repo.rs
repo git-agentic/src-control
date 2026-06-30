@@ -16,7 +16,7 @@ use crate::transport::{LocalTransport, Transport};
 use crate::worktree::{self, Diff};
 
 const DEFAULT_BRANCH: &str = "main";
-const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
+pub(crate) const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
 
 /// A working-tree file headed for encryption at commit time:
 /// `(path, plaintext bytes, file mode, recipient pubkeys)`.
