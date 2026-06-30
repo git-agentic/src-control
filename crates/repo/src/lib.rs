@@ -5,6 +5,7 @@ pub mod diff3;
 pub mod scanner;
 pub mod scanner_patterns;
 pub mod error;
+pub mod gc;
 pub mod layout;
 pub mod lock;
 pub mod merge;
@@ -19,6 +20,7 @@ pub mod transport;
 pub mod worktree;
 
 pub use error::{Error, Result};
+pub use gc::GcStats;
 pub use remote::RemoteConfig;
 pub use repo::{Repo, Status};
 pub use scanner::ScanReport;

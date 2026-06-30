@@ -765,6 +765,21 @@ impl Repo {
         &self.vfs
     }
 
+    /// The underlying VFS handle (objects live behind its `Store`). Test/gc use.
+    pub fn vfs(&self) -> &VfsRepo {
+        &self.vfs
+    }
+
+    /// Garbage-collect this repo: pack the reachable set and prune unreachable
+    /// loose objects older than `grace`. Persistent repos only. The open `Repo`
+    /// already holds the single-writer lock, so the whole pass is serialized
+    /// against other writers.
+    pub fn gc(&self, grace: std::time::Duration) -> Result<crate::gc::GcStats> {
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        crate::gc::run(&self.layout, &mut store, grace)
+    }
+
     /// Add a named remote to `.sc/config`. The name becomes a path component
     /// under `refs/remotes/`, so it is validated like a branch name to keep a
     /// hostile name (e.g. `../heads`) from escaping into `refs/heads/`.
