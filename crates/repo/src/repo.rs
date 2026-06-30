@@ -173,6 +173,46 @@ impl Repo {
             all.push((path, blob_bytes, mode, scl_core::PROTECTED));
         }
 
+        // Safe-by-default: carry forward still-protected files that are absent
+        // from the working tree. `commit` cannot distinguish "absent because the
+        // committer isn't a recipient (skipped at checkout)" from "the committer
+        // deleted it" — an absent protected path reads as clean either way (see
+        // Task 5 `status`). We therefore NEVER silently drop protected content on
+        // commit: a still-protected path that is missing from disk is carried
+        // forward verbatim from the tip (its exact ciphertext blob and wrapped
+        // DEKs). This closes the hole where a non-recipient's unrelated commit
+        // would otherwise destroy ciphertext they cannot even read. (Explicit
+        // deletion of a protected file is a future operation, out of scope.)
+        if let Some(tip_id) = tip {
+            let on_disk: std::collections::BTreeSet<String> =
+                all.iter().map(|(p, _, _, _)| p.clone()).collect();
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let tip_root = store.get_snapshot(&tip_id)?.root;
+            let entries = worktree::tree_file_entries_with_perms(&mut store, tip_root)?;
+            for (path, (blob_id, mode, perms)) in entries {
+                if perms & scl_core::PROTECTED == 0
+                    || crate::protect::matching_prefix(&protection, &path).is_none()
+                    || on_disk.contains(&path)
+                {
+                    continue;
+                }
+                let bytes = match store.get(&blob_id)? {
+                    Object::Blob(b) => b.to_vec(),
+                    _ => continue,
+                };
+                all.push((path, bytes, mode, scl_core::PROTECTED));
+                // Preserve this blob's wraps. Carried-forward blobs are absent
+                // from `fresh_wrapped` (they never hit the on-disk encrypt loop),
+                // so the prior-wrap reuse below won't cover them — add them here.
+                // `or_insert_with` so an on-disk file already sharing this blob id
+                // keeps its freshly-wrapped DEKs.
+                if let Some(prior_wks) = protection.wrapped.get(&blob_id) {
+                    fresh_wrapped.entry(blob_id).or_insert_with(|| prior_wks.clone());
+                }
+            }
+        }
+
         let root = self.vfs.write_tree_with_perms(&all)?;
 
         // Rebuild policy.wrapped from only this commit's protected blobs, dropping
@@ -1243,6 +1283,68 @@ mod tests {
         assert_ne!(c1, c2, "the two commits are distinct");
         // Same blob id (convergent) AND byte-identical wrapped DEKs (carried forward).
         assert_eq!(w1, w2, "wrapped DEKs must be stable for unchanged protected content");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commit_carries_forward_absent_protected_files_for_non_recipient() {
+        // Regression: a non-recipient checks out (protected file skipped/absent),
+        // then commits something unrelated. The absent protected file and its
+        // wrapped DEKs must SURVIVE — a non-recipient must not silently destroy
+        // ciphertext they cannot read.
+        let root = tmp_root("p7-carry-forward");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mallory_sk, _mallory_pk) = scl_crypto::generate_keypair();
+
+        // Seed the prefix on a commit, branch "other" BEFORE the protected file
+        // exists so switching there (then back as mallory) leaves it absent.
+        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        repo.branch("other").unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        let c1 = repo.commit("me", "add secret").unwrap();
+
+        // Capture c1's protected blob id + alice's wrap count.
+        let snap1 = repo.snapshot(&c1).unwrap();
+        let blob1 = {
+            let entries = {
+                let a = repo.vfs_handle().store();
+                let mut s = a.lock().unwrap();
+                worktree::tree_file_entries_with_perms(&mut s, snap1.root).unwrap()
+            };
+            let (id, _mode, perms) = entries.get("secret/db.txt").copied().unwrap();
+            assert_ne!(perms & scl_core::PROTECTED, 0, "db.txt must be PROTECTED in c1");
+            id
+        };
+        assert_eq!(snap1.protection.wrapped.get(&blob1).map(|w| w.len()), Some(1));
+
+        // As mallory: switch away (deletes db.txt) then back (skipped, absent).
+        repo.switch_with_identity("other", Some(&mallory_sk)).unwrap();
+        let skipped = repo.switch_with_identity("main", Some(&mallory_sk)).unwrap();
+        assert!(skipped.contains(&"secret/db.txt".to_string()));
+        assert!(!root.join("secret/db.txt").exists(), "protected file absent for mallory");
+
+        // Mallory commits an UNRELATED file.
+        std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+        let c2 = repo.commit("mallory", "unrelated").unwrap();
+
+        // The protected ciphertext + its wrap survived mallory's commit.
+        let snap2 = repo.snapshot(&c2).unwrap();
+        assert_eq!(
+            snap2.protection.wrapped.get(&blob1).map(|w| w.len()),
+            Some(1),
+            "alice's wrapped DEK must survive a non-recipient commit"
+        );
+        let entries2 = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
+        };
+        let (id2, _m, perms2) = entries2.get("secret/db.txt").copied().expect("db.txt still in tree");
+        assert_ne!(perms2 & scl_core::PROTECTED, 0, "db.txt must still be PROTECTED");
+        assert_eq!(id2, blob1, "same ciphertext blob carried forward unchanged");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
