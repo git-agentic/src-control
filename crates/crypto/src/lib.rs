@@ -14,7 +14,7 @@ pub mod error;
 pub mod key;
 pub mod provider;
 
-pub use envelope::{open, rewrap_for, revoke, seal};
+pub use envelope::{decrypt_path, encrypt_path, open, rewrap_for, revoke, seal, unwrap_dek_with, wrap_dek_for};
 pub use error::{Error, Result};
 pub use key::{generate_keypair, PublicKey, RecipientId, SecretKey};
 pub use provider::{FileKeyProvider, KeyProvider};

@@ -114,6 +114,58 @@ pub fn revoke(secret: &Secret, recipient: &RecipientId) -> Secret {
     out
 }
 
+// ---- convergent path encryption (P7) --------------------------------------
+
+const PATH_AAD: &[u8] = b"scl-path-v1";
+
+/// Convergent file encryption: the data key and nonce are derived from the
+/// plaintext, so identical plaintext yields identical `nonce‖ciphertext` bytes
+/// (stable content-addressed id, perfect dedup). Returns the blob bytes and the
+/// DEK (to be wrapped per recipient and stored in the snapshot policy).
+pub fn encrypt_path(plaintext: &[u8]) -> (Vec<u8>, Zeroizing<[u8; DEK_LEN]>) {
+    let ikm = blake3::hash(plaintext);
+    let hk = Hkdf::<Sha256>::new(None, ikm.as_bytes());
+    let mut dek = Zeroizing::new([0u8; DEK_LEN]);
+    hk.expand(b"scl-path-dek-v1", dek.as_mut_slice()).expect("32-byte okm");
+    let mut nonce = [0u8; NONCE_LEN];
+    hk.expand(b"scl-path-nonce-v1", &mut nonce).expect("24-byte okm");
+
+    let cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).expect("32-byte DEK");
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad: PATH_AAD })
+        .expect("aead encrypt is infallible for valid inputs");
+
+    let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ciphertext);
+    (blob, dek)
+}
+
+/// Decrypt a `nonce‖ciphertext` blob with its DEK (AEAD-verified).
+pub fn decrypt_path(blob: &[u8], dek: &[u8; DEK_LEN]) -> Result<Zeroizing<Vec<u8>>> {
+    if blob.len() < NONCE_LEN {
+        return Err(Error::Decrypt);
+    }
+    let (nonce, ct) = blob.split_at(NONCE_LEN);
+    let cipher = XChaCha20Poly1305::new_from_slice(dek).map_err(|_| Error::Decrypt)?;
+    let pt = cipher
+        .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: PATH_AAD })
+        .map_err(|_| Error::Decrypt)?;
+    Ok(Zeroizing::new(pt))
+}
+
+/// Wrap a DEK for `recipient` (X25519→HKDF→AEAD); the wrap uses a random
+/// ephemeral key, so the wrapped bytes vary — but they live in the snapshot
+/// policy, NOT in the content-addressed blob, so dedup is unaffected.
+pub fn wrap_dek_for(dek: &[u8; DEK_LEN], recipient: &PublicKey) -> WrappedKey {
+    wrap_dek(dek.as_slice(), recipient, &mut OsRng)
+}
+
+/// Unwrap a DEK from a `WrappedKey` with `identity` (errors if not the recipient).
+pub fn unwrap_dek_with(wrapped: &WrappedKey, identity: &SecretKey) -> Result<Zeroizing<[u8; DEK_LEN]>> {
+    unwrap_dek(&wrapped.wrapped_dek, identity)
+}
+
 // ---- internals -------------------------------------------------------------
 
 fn wrap_dek<R: RngCore + CryptoRng>(dek: &[u8], recipient: &PublicKey, rng: &mut R) -> WrappedKey {
@@ -253,5 +305,42 @@ mod tests {
         let revoked = revoke(&secret, &pk_b.recipient_id());
         assert!(matches!(open(&revoked, &sk_b), Err(Error::NotARecipient)));
         assert_eq!(&open(&revoked, &sk_a).unwrap()[..], b"v");
+    }
+
+    #[test]
+    fn encrypt_path_is_convergent_and_roundtrips() {
+        let pt = b"the database password is hunter2";
+        let (blob1, dek1) = encrypt_path(pt);
+        let (blob2, _dek2) = encrypt_path(pt);
+        assert_eq!(blob1, blob2, "same plaintext -> identical bytes (convergent)");
+        let out = decrypt_path(&blob1, &dek1).unwrap();
+        assert_eq!(&out[..], pt);
+        let (blob3, _) = encrypt_path(b"different");
+        assert_ne!(blob1, blob3);
+    }
+
+    #[test]
+    fn decrypt_path_rejects_tamper_and_wrong_key() {
+        let (mut blob, dek) = encrypt_path(b"secret");
+        let n = blob.len();
+        blob[n - 1] ^= 0xFF;
+        assert!(decrypt_path(&blob, &dek).is_err());
+        let (good, _) = encrypt_path(b"secret");
+        let wrong = [0u8; 32];
+        assert!(decrypt_path(&good, &wrong).is_err());
+    }
+
+    #[test]
+    fn wrap_unwrap_dek_roundtrip() {
+        use crate::key::generate_keypair_with_rng;
+        use rand_chacha::ChaCha20Rng;
+        use rand_core::SeedableRng;
+        let (sk, pk) = generate_keypair_with_rng(&mut ChaCha20Rng::seed_from_u64(1));
+        let (_blob, dek) = encrypt_path(b"x");
+        let wk = wrap_dek_for(&dek, &pk);
+        let got = unwrap_dek_with(&wk, &sk).unwrap();
+        assert_eq!(got.as_slice(), dek.as_slice());
+        let (other_sk, _) = generate_keypair_with_rng(&mut ChaCha20Rng::seed_from_u64(2));
+        assert!(unwrap_dek_with(&wk, &other_sk).is_err());
     }
 }

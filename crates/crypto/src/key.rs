@@ -97,6 +97,13 @@ impl SecretKey {
 }
 
 impl PublicKey {
+    /// Construct a `PublicKey` from its raw 32-byte representation. Used to
+    /// reconstruct recipient keys from the 32-byte values stored in the
+    /// snapshot's `Protection` policy (P7).
+    pub fn from_bytes(b: [u8; 32]) -> PublicKey {
+        PublicKey(x25519_dalek::PublicKey::from(b))
+    }
+
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
     }
@@ -173,5 +180,12 @@ mod tests {
     fn bad_key_string_is_rejected() {
         assert!(matches!(PublicKey::from_key_string("nope"), Err(Error::BadKey)));
         assert!(matches!(SecretKey::from_key_string("scl-sk-zz"), Err(Error::BadKey)));
+    }
+
+    #[test]
+    fn from_bytes_roundtrip() {
+        let (_sk, pk) = generate_keypair_with_rng(&mut seeded());
+        let back = PublicKey::from_bytes(pk.to_bytes());
+        assert_eq!(pk.to_bytes(), back.to_bytes());
     }
 }
