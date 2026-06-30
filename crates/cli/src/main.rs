@@ -752,8 +752,11 @@ fn run_branch(name: &str) -> Result<()> {
 }
 
 fn run_switch(name: &str) -> Result<()> {
-    open_repo()?.switch(name)?;
+    let skipped = open_repo()?.switch(name)?;
     println!("switched to branch {name}");
+    for path in &skipped {
+        eprintln!("skipped (no key): {path}");
+    }
     Ok(())
 }
 

@@ -307,9 +307,18 @@ impl Repo {
             }
             if crate::merge::is_ancestor(&mut store, ours, theirs)? {
                 // fast-forward: advance ref + materialize, no merge commit
-                let theirs_root = store.get_snapshot(&theirs)?.root;
+                let theirs_snap = store.get_snapshot(&theirs)?;
+                let theirs_root = theirs_snap.root;
+                let theirs_protection = theirs_snap.protection;
                 let ours_root = store.get_snapshot(&ours)?.root;
-                worktree::materialize(&self.layout, &mut store, theirs_root, Some(ours_root))?;
+                worktree::materialize(
+                    &self.layout,
+                    &mut store,
+                    theirs_root,
+                    Some(ours_root),
+                    &theirs_protection,
+                    None,
+                )?;
                 drop(store);
                 let branch_name = refs::current_branch(&self.layout)?;
                 refs::write_branch_tip(&self.layout, &branch_name, &theirs)?;
@@ -334,10 +343,19 @@ impl Repo {
         let merged_root = self.vfs.write_tree(&write_set)?;
 
         // Materialize merged tree into the working dir, then write sidecars.
+        // The merged tree has no PROTECTED entries (merge writes plaintext blobs),
+        // so no identity is needed and no files will be skipped.
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            worktree::materialize(&self.layout, &mut store, merged_root, Some(ours_root))?;
+            worktree::materialize(
+                &self.layout,
+                &mut store,
+                merged_root,
+                Some(ours_root),
+                &scl_core::Protection::default(),
+                None,
+            )?;
         }
         for (rel, bytes) in &merge_result.sidecars {
             let full = self.layout.root.join(rel);
@@ -388,12 +406,23 @@ impl Repo {
         // Restore working tree to ours tip. Pass theirs' root as `old_root` so
         // the deletion pass drops files the conflicted merge pulled in from
         // theirs; materializing against ours==old would delete nothing.
-        let ours_root = self.head_root()?;
-        if let Some(root) = ours_root {
+        let ours_tip = self.head_tip()?;
+        if let Some(ours_id) = ours_tip {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
+            let ours_snap = store.get_snapshot(&ours_id)?;
+            let ours_root = ours_snap.root;
+            let ours_protection = ours_snap.protection;
             let theirs_root = store.get_snapshot(&theirs_id)?.root;
-            worktree::materialize(&self.layout, &mut store, root, Some(theirs_root))?;
+            // No identity at abort time: protected files in ours are skipped (not decrypted).
+            worktree::materialize(
+                &self.layout,
+                &mut store,
+                ours_root,
+                Some(theirs_root),
+                &ours_protection,
+                None,
+            )?;
         }
         crate::merge_state::clear(&self.layout)
     }
@@ -442,13 +471,55 @@ impl Repo {
     /// Refuses to switch when the working tree has uncommitted modifications or
     /// deletions, because `materialize` would silently overwrite them. (New,
     /// untracked files are left in place and so don't block the switch.)
-    pub fn switch(&self, name: &str) -> Result<()> {
+    /// PROTECTED files in the current HEAD are excluded from the dirty check —
+    /// plaintext on disk legitimately differs from the stored ciphertext and is
+    /// not a user modification.
+    ///
+    /// Returns the list of protected paths skipped (not decrypted) because no
+    /// identity was provided. Use `switch_with_identity` to supply one.
+    pub fn switch(&self, name: &str) -> Result<Vec<String>> {
+        self.switch_with_identity(name, None)
+    }
+
+    /// Like [`switch`][Repo::switch] but decrypts `PROTECTED` files using
+    /// `identity` when possible. Returns the list of protected paths that were
+    /// skipped because the identity could not unwrap their DEK.
+    pub fn switch_with_identity(
+        &self,
+        name: &str,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<Vec<String>> {
         validate_branch_name(name)?;
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
+        // Dirty check: exclude PROTECTED paths in the current HEAD — plaintext
+        // on disk differs from stored ciphertext but is not a user modification.
+        let protected_in_head: std::collections::HashSet<String> =
+            match self.head_tip()? {
+                Some(tip) => {
+                    let snap = self.snapshot(&tip)?;
+                    if snap.protection.wrapped.is_empty() {
+                        Default::default()
+                    } else {
+                        let store_arc = self.vfs.store();
+                        let mut store = store_arc.lock().unwrap();
+                        worktree::tree_file_entries_with_perms(&mut store, snap.root)?
+                            .into_iter()
+                            .filter(|(_, (_, _, p))| p & scl_core::PROTECTED != 0)
+                            .map(|(path, _)| path)
+                            .collect()
+                    }
+                }
+                None => Default::default(),
+            };
         let dirty = self.status()?;
-        if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
+        let has_unprotected_changes = dirty
+            .modified
+            .iter()
+            .any(|p| !protected_in_head.contains(p))
+            || dirty.deleted.iter().any(|p| !protected_in_head.contains(p));
+        if has_unprotected_changes {
             return Err(Error::InvalidArgument(
                 "working tree has uncommitted changes; commit before switching".into(),
             ));
@@ -456,17 +527,25 @@ impl Repo {
         let target_tip = refs::read_branch_tip(&self.layout, name)?
             .ok_or_else(|| Error::NoSuchBranch(name.to_string()))?;
         let old_root = self.head_root()?;
-        let target_root = {
+        let (target_root, target_protection) = {
             let store_arc = self.vfs.store();
-            let r = store_arc.lock().unwrap().get_snapshot(&target_tip)?.root;
-            r
+            let snap = store_arc.lock().unwrap().get_snapshot(&target_tip)?;
+            (snap.root, snap.protection)
         };
-        {
+        let skipped = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            worktree::materialize(&self.layout, &mut store, target_root, old_root)?;
-        }
-        refs::write_head(&self.layout, name)
+            worktree::materialize(
+                &self.layout,
+                &mut store,
+                target_root,
+                old_root,
+                &target_protection,
+                identity,
+            )?
+        };
+        refs::write_head(&self.layout, name)?;
+        Ok(skipped)
     }
 
     /// Expose the underlying VFS repo handle (needed by secrets.rs methods).
@@ -524,11 +603,16 @@ impl Repo {
         // Record origin.
         dst_repo.remote_add("origin", &src.display().to_string())?;
 
-        // Materialize HEAD into the working tree.
-        if let Some(root) = dst_repo.head_root()? {
+        // Materialize HEAD into the working tree. No identity is available at
+        // clone time, so PROTECTED files are skipped (ciphertext stays in objects
+        // but plaintext is not written to disk — correct for unauthorized clones).
+        if let Some(head_tip) = dst_repo.head_tip()? {
             let store_arc = dst_repo.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            worktree::materialize(&dst_repo.layout, &mut store, root, None)?;
+            let head_snap = store.get_snapshot(&head_tip)?;
+            let head_root = head_snap.root;
+            let head_protection = head_snap.protection;
+            worktree::materialize(&dst_repo.layout, &mut store, head_root, None, &head_protection, None)?;
         }
         Ok(dst_repo)
     }
@@ -1193,6 +1277,52 @@ mod tests {
         drop(arepo);
         std::fs::remove_dir_all(&a).unwrap();
         std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn authorized_checkout_decrypts_unauthorized_skips() {
+        // Setup: init repo, generate alice + mallory key pairs.
+        let root = tmp_root("p7-checkout");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mallory_sk, _mallory_pk) = scl_crypto::generate_keypair();
+
+        // Seed the protection prefix via the test seam (Task 6 will provide
+        // the real `protect` API). Branch "other" at this policy-only commit so
+        // it has no protected files — switching to it will delete secret/db.txt
+        // from the working tree and switching back as mallory will skip writing it.
+        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        repo.branch("other").unwrap();
+
+        // Add the protected file and commit on "main": it is encrypted for alice.
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+
+        // Switch away (deletes working-tree secret/db.txt) then back as alice → decrypts.
+        repo.switch_with_identity("other", Some(&alice_sk)).unwrap();
+        assert!(!root.join("secret/db.txt").exists(), "switch to other must clear the protected file");
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("secret/db.txt")).unwrap(),
+            b"hunter2",
+            "alice's key must decrypt the protected file on switch back to main"
+        );
+
+        // Switch away again (clears file), then back as mallory → skipped (file absent).
+        repo.switch_with_identity("other", Some(&mallory_sk)).unwrap();
+        let skipped = repo.switch_with_identity("main", Some(&mallory_sk)).unwrap();
+        assert!(
+            skipped.contains(&"secret/db.txt".to_string()),
+            "mallory's switch must report secret/db.txt as skipped"
+        );
+        assert!(
+            !root.join("secret/db.txt").exists(),
+            "unauthorized switch must not write the protected file"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

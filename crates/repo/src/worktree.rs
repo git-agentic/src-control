@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use scl_core::{EntryKind, FileMode, Object, ObjectId, Store, Tree};
+use scl_core::{EntryKind, FileMode, Object, ObjectId, Protection, Store, Tree, PROTECTED};
 
 use crate::error::Result;
 use crate::layout::Layout;
@@ -78,6 +78,36 @@ fn walk_entries(
                 out.insert(path, (e.id, e.mode));
             }
             EntryKind::Tree => walk_entries(store, e.id, path, out)?,
+        }
+    }
+    Ok(())
+}
+
+/// Flatten a snapshot's root tree to `path -> (blob id, mode, perms)`.
+/// The `perms` byte carries per-entry flags such as [`scl_core::PROTECTED`].
+pub fn tree_file_entries_with_perms(
+    store: &mut Store,
+    root: ObjectId,
+) -> Result<BTreeMap<String, (ObjectId, FileMode, u8)>> {
+    let mut out = BTreeMap::new();
+    walk_entries_with_perms(store, root, String::new(), &mut out)?;
+    Ok(out)
+}
+
+fn walk_entries_with_perms(
+    store: &mut Store,
+    tree_id: ObjectId,
+    prefix: String,
+    out: &mut BTreeMap<String, (ObjectId, FileMode, u8)>,
+) -> Result<()> {
+    let tree: Tree = store.get_tree(&tree_id)?;
+    for e in tree.entries {
+        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        match e.kind {
+            EntryKind::Blob => {
+                out.insert(path, (e.id, e.mode, e.perms));
+            }
+            EntryKind::Tree => walk_entries_with_perms(store, e.id, path, out)?,
         }
     }
     Ok(())
@@ -161,15 +191,23 @@ fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
     Ok(root.join(rel))
 }
 
-/// Materialize a snapshot's file tree into the working dir, deleting working
-/// files that are tracked by `old_root` but absent from the target.
+/// Materialize a snapshot's file tree into the working dir.
+///
+/// For `PROTECTED` entries, decrypts with `identity` if it can unwrap the
+/// blob's DEK from `protection.wrapped`; otherwise **skips** the file (neither
+/// writes nor deletes it) and records its path in the returned `skipped` list.
+/// Non-protected entries are written verbatim. Working files tracked by
+/// `old_root` but absent from the target tree are deleted regardless of
+/// protection status.
 pub fn materialize(
     layout: &Layout,
     store: &mut Store,
     target_root: ObjectId,
     old_root: Option<ObjectId>,
-) -> Result<()> {
-    let target = tree_file_ids(store, target_root)?;
+    protection: &Protection,
+    identity: Option<&scl_crypto::SecretKey>,
+) -> Result<Vec<String>> {
+    let target = tree_file_entries_with_perms(store, target_root)?;
     if let Some(old) = old_root {
         for p in tree_file_ids(store, old)?.keys() {
             if !target.contains_key(p) {
@@ -178,18 +216,48 @@ pub fn materialize(
             }
         }
     }
-    for (path, blob_id) in &target {
+    let mut skipped = Vec::new();
+    for (path, (blob_id, _mode, perms)) in &target {
         let full = safe_join(&layout.root, path)?;
         let bytes = match store.get(blob_id)? {
             Object::Blob(b) => b,
             _ => continue,
         };
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent)?;
+        if perms & PROTECTED != 0 {
+            // Protected: try to decrypt with the provided identity.
+            let decrypted: Option<_> = (|| {
+                let sk = identity?;
+                let wks = protection.wrapped.get(blob_id)?;
+                for wk in wks {
+                    if let Ok(dek) = scl_crypto::unwrap_dek_with(wk, sk) {
+                        if let Ok(pt) = scl_crypto::decrypt_path(&bytes, &dek) {
+                            return Some(pt);
+                        }
+                    }
+                }
+                None
+            })();
+            match decrypted {
+                Some(pt) => {
+                    if let Some(parent) = full.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&full, &pt[..])?;
+                    // `pt` (Zeroizing<Vec<u8>>) is dropped and zeroed here.
+                }
+                None => {
+                    // No identity or no matching key: skip without writing.
+                    skipped.push(path.clone());
+                }
+            }
+        } else {
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&full, &bytes[..])?;
         }
-        std::fs::write(&full, &bytes[..])?;
     }
-    Ok(())
+    Ok(skipped)
 }
 
 #[cfg(test)]
@@ -223,7 +291,8 @@ mod tests {
             }])))
             .unwrap();
 
-        let err = materialize(&layout, &mut store, evil_tree, None).unwrap_err();
+        let err = materialize(&layout, &mut store, evil_tree, None, &Default::default(), None)
+            .unwrap_err();
         assert!(matches!(err, crate::error::Error::BadRef(_)), "got {err:?}");
         // Nothing was written outside the repo root: the sibling "<root>.." path
         // would be the repo's parent dir; assert no stray "pwned" file landed there.
@@ -243,7 +312,7 @@ mod tests {
             }))
             .unwrap();
         let snap_root = store.get_snapshot(&snap).unwrap().root;
-        assert!(materialize(&layout, &mut store, snap_root, None).is_err());
+        assert!(materialize(&layout, &mut store, snap_root, None, &Default::default(), None).is_err());
 
         drop(store);
         std::fs::remove_dir_all(&layout.root).unwrap();
