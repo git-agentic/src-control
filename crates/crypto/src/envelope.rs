@@ -123,8 +123,10 @@ const PATH_AAD: &[u8] = b"scl-path-v1";
 /// (stable content-addressed id, perfect dedup). Returns the blob bytes and the
 /// DEK (to be wrapped per recipient and stored in the snapshot policy).
 pub fn encrypt_path(plaintext: &[u8]) -> (Vec<u8>, Zeroizing<[u8; DEK_LEN]>) {
-    let ikm = blake3::hash(plaintext);
-    let hk = Hkdf::<Sha256>::new(None, ikm.as_bytes());
+    let hash = blake3::hash(plaintext);
+    let mut ikm = Zeroizing::new([0u8; 32]);
+    ikm.copy_from_slice(hash.as_bytes());
+    let hk = Hkdf::<Sha256>::new(None, ikm.as_slice());
     let mut dek = Zeroizing::new([0u8; DEK_LEN]);
     hk.expand(b"scl-path-dek-v1", dek.as_mut_slice()).expect("32-byte okm");
     let mut nonce = [0u8; NONCE_LEN];

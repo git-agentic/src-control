@@ -205,7 +205,11 @@ impl Object {
                 for p in &prefixes {
                     w.str(&p.prefix);
                     w.u32(p.recipients.len() as u32);
-                    for r in &p.recipients {
+                    // Sort recipients so the same logical policy hashes
+                    // identically regardless of the order they were added in.
+                    let mut sorted = p.recipients.clone();
+                    sorted.sort_unstable();
+                    for r in &sorted {
                         w.raw(r); // 32 bytes
                     }
                 }
@@ -273,26 +277,26 @@ impl Object {
                     let id = r.id()?;
                     secrets.insert(name, id);
                 }
-                let np2 = r.u32()?;
-                let mut prefixes = Vec::with_capacity(np2 as usize);
-                for _ in 0..np2 {
+                let n_prefixes = r.count()?;
+                let mut prefixes = Vec::with_capacity(n_prefixes);
+                for _ in 0..n_prefixes {
                     let prefix = r.str()?;
-                    let nr = r.u32()?;
-                    let mut recipients = Vec::with_capacity(nr as usize);
-                    for _ in 0..nr {
+                    let n_recipients = r.count()?;
+                    let mut recipients = Vec::with_capacity(n_recipients);
+                    for _ in 0..n_recipients {
                         let mut rk = [0u8; 32];
                         rk.copy_from_slice(r.take(32)?);
                         recipients.push(rk);
                     }
                     prefixes.push(ProtectPrefix { prefix, recipients });
                 }
-                let nw = r.u32()?;
+                let n_wrapped = r.count()?;
                 let mut wrapped = std::collections::BTreeMap::new();
-                for _ in 0..nw {
+                for _ in 0..n_wrapped {
                     let id = r.id()?;
-                    let nk = r.u32()?;
-                    let mut wks = Vec::with_capacity(nk as usize);
-                    for _ in 0..nk {
+                    let n_keys = r.count()?;
+                    let mut wks = Vec::with_capacity(n_keys);
+                    for _ in 0..n_keys {
                         let recipient_id = r.str()?;
                         let wrapped_dek = r.bytes()?;
                         wks.push(WrappedKey { recipient_id, wrapped_dek });
@@ -377,6 +381,21 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    /// Bytes not yet consumed.
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+    /// Read a `u32` element count and reject it if it exceeds the bytes left in
+    /// the reader. Every element consumes at least one byte, so a count larger
+    /// than the remaining bytes is fabricated — rejecting it before allocating
+    /// prevents a multi-GB `Vec::with_capacity` from a malicious snapshot.
+    fn count(&mut self) -> Result<usize> {
+        let n = self.u32()? as usize;
+        if n > self.remaining() {
+            return Err(Error::Malformed("element count exceeds remaining bytes".into()));
+        }
+        Ok(n)
     }
     fn i64(&mut self) -> Result<i64> {
         let b = self.take(8)?;
@@ -510,5 +529,28 @@ mod tests {
             secrets: std::collections::BTreeMap::new(), protection: prot,
         });
         assert_eq!(snap, Object::decode(&snap.encode()).unwrap());
+    }
+
+    #[test]
+    fn protection_recipients_order_independent_id() {
+        let root = Object::blob(b"r".to_vec()).id();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let snap = |recipients: Vec<[u8; 32]>| {
+            Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "a".into(),
+                timestamp: 0,
+                message: "m".into(),
+                secrets: std::collections::BTreeMap::new(),
+                protection: Protection {
+                    prefixes: vec![ProtectPrefix { prefix: "secrets/".into(), recipients }],
+                    wrapped: std::collections::BTreeMap::new(),
+                },
+            })
+        };
+        // Same recipient set, opposite order -> identical canonical id.
+        assert_eq!(snap(vec![a, b]).id(), snap(vec![b, a]).id());
     }
 }
