@@ -975,12 +975,13 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
         _ => anyhow::bail!("duration needs a unit suffix s/m/h/d, got {s:?}"),
     };
     let n: u64 = num.parse().map_err(|_| anyhow::anyhow!("bad duration number: {s:?}"))?;
-    Ok(std::time::Duration::from_secs(n * mult))
+    let secs = n.checked_mul(mult).ok_or_else(|| anyhow::anyhow!("duration too large: {s:?}"))?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 fn run_gc(prune_expire: &str) -> Result<()> {
     let grace = parse_duration(prune_expire)?;
-    let repo = scl_repo::Repo::open(".")?;
+    let repo = open_repo()?;
     let stats = repo.gc(grace)?;
     println!(
         "gc: packed {} object(s), pruned {} loose, kept {} recent, removed {} old pack(s)",
@@ -992,7 +993,6 @@ fn run_gc(prune_expire: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::parse_duration;
     use std::time::Duration;
 
     #[test]
@@ -1002,6 +1002,7 @@ mod tests {
         assert_eq!(parse_duration("45s").unwrap(), Duration::from_secs(45));
         assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(7 * 86400));
         assert!(parse_duration("nope").is_err());
+        assert!(parse_duration("7").is_err());
     }
 
     #[test]
