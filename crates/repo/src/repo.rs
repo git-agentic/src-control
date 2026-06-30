@@ -381,6 +381,23 @@ impl Repo {
             let mut store = store_arc.lock().unwrap();
             let base = crate::merge::merge_base(&mut store, ours, theirs)?
                 .ok_or(Error::NoCommonAncestor)?;
+
+            // Fail closed on protected content. `three_way` flattens trees without
+            // the `perms` byte and would push raw ciphertext into the working tree
+            // as an ordinary unprotected blob, destroying the encrypted files (even
+            // the legitimate recipient could no longer decrypt the merge commit).
+            // Properly threading perms + wrapped DEKs through the merge is a
+            // deliberate backlog follow-on; until then we refuse rather than corrupt.
+            // This is a pure read + early return: nothing is written to the working
+            // tree or refs before the guard fires.
+            for snap_id in [base, ours, theirs] {
+                let root = store.get_snapshot(&snap_id)?.root;
+                let entries = worktree::tree_file_entries_with_perms(&mut store, root)?;
+                if entries.values().any(|(_, _, perms)| perms & scl_core::PROTECTED != 0) {
+                    return Err(Error::MergeProtected(branch.to_string()));
+                }
+            }
+
             let m = crate::merge::three_way(&mut store, base, ours, theirs)?;
             let ours_root = store.get_snapshot(&ours)?.root;
             (m, ours_root)
@@ -392,8 +409,9 @@ impl Repo {
         let merged_root = self.vfs.write_tree(&write_set)?;
 
         // Materialize merged tree into the working dir, then write sidecars.
-        // The merged tree has no PROTECTED entries (merge writes plaintext blobs),
-        // so no identity is needed and no files will be skipped.
+        // Protected merges are refused by the guard above, so this path only ever
+        // sees unprotected blobs: the merged tree legitimately has no PROTECTED
+        // entries, so no identity is needed and no files will be skipped.
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
@@ -1189,6 +1207,51 @@ mod tests {
         // theirs-only file must be gone, f.txt restored to ours' content
         assert!(!root.join("new.txt").exists(), "abort must drop theirs-only new.txt");
         assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"a\nX\nc\n");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_refuses_when_protected_paths_present() {
+        // A real three-way merge cannot yet thread perms + wrapped DEKs through
+        // `three_way`; doing so would strip protection and write ciphertext to the
+        // working tree. The merge must fail closed and leave the repo untouched.
+        let root = tmp_root("p7-merge-protected");
+        let repo = Repo::init(&root).unwrap();
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.test_set_protected_prefix("secret/", &[pk]).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        std::fs::write(root.join("shared.txt"), b"base\n").unwrap();
+        let base = repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // Divergent change on each branch from the common base (a real three-way).
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        let ours = repo.commit("me", "ours adds a.txt").unwrap();
+        repo.switch_with_identity("feature", Some(&sk)).unwrap();
+        std::fs::write(root.join("b.txt"), b"b\n").unwrap();
+        repo.commit("me", "theirs adds b.txt").unwrap();
+        // Back on main, authorized, so the protected file is decrypted on disk.
+        repo.switch_with_identity("main", Some(&sk)).unwrap();
+        assert_eq!(std::fs::read(root.join("secret/db.txt")).unwrap(), b"hunter2");
+
+        // The merge must refuse, naming the branch.
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeProtected(_)), "got {err:?}");
+
+        // Working tree untouched: still decrypted plaintext, no raw ciphertext.
+        assert_eq!(
+            std::fs::read(root.join("secret/db.txt")).unwrap(),
+            b"hunter2",
+            "protected file must be unchanged (no ciphertext written) when merge refused",
+        );
+        // theirs-only file was never pulled in; no merge state recorded.
+        assert!(!root.join("b.txt").exists(), "nothing from theirs written");
+        assert!(!repo.merge_in_progress(), "no MERGE_HEAD recorded");
+        // HEAD unmoved: no merge commit was created.
+        assert_eq!(repo.head_tip().unwrap(), Some(ours), "HEAD must not advance");
+        let _ = base;
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

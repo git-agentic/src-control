@@ -32,6 +32,8 @@ pub enum Error {
     MergeInProgress,
     #[error("merge produced {0} conflict(s); resolve the marked files then `sc commit`")]
     MergeConflicts(usize),
+    #[error("merge of protected paths is not yet supported (would corrupt encrypted files): {0}")]
+    MergeProtected(String),
     #[error("already up to date")]
     UpToDate,
     #[error("{0}")]
