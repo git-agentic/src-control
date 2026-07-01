@@ -154,6 +154,18 @@ enum Cmd {
         #[arg(long, default_value = "24h")]
         prune_expire: String,
     },
+    /// Export the current branch's history into a Git repository.
+    Export {
+        /// Target Git repo path (created bare if absent).
+        #[arg(long)]
+        to: PathBuf,
+        /// Ref to update (default: refs/heads/<current-branch>).
+        #[arg(long)]
+        r#ref: Option<String>,
+        /// Allow exporting protected ciphertext and dropping secrets.
+        #[arg(long)]
+        include_encrypted: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -248,6 +260,7 @@ fn main() -> Result<()> {
         Cmd::Grant { prefix, to, identity } => run_grant(prefix, to, identity),
         Cmd::Revoke { prefix, recipient_id } => run_revoke(prefix, recipient_id),
         Cmd::Gc { prune_expire } => run_gc(&prune_expire),
+        Cmd::Export { to, r#ref, include_encrypted } => run_export(to, r#ref, include_encrypted),
     }
 }
 
@@ -960,6 +973,35 @@ fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("bad recipient id"))?;
     repo.revoke(&prefix, &rid)?;
     println!("revoked {recipient_id} from {prefix}");
+    Ok(())
+}
+
+fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) -> Result<()> {
+    let repo = open_repo()?;
+    let branch = scl_repo::refs::current_branch(repo.layout())?;
+    let tip = repo
+        .head_tip()?
+        .ok_or_else(|| anyhow::anyhow!("branch is unborn — nothing to export"))?;
+    let ref_name = ref_name.unwrap_or_else(|| format!("refs/heads/{branch}"));
+
+    let store_arc = repo.vfs().store();
+    let mut store = store_arc.lock().unwrap();
+    let opts = scl_gitio::ExportOptions { to: &to, ref_name: &ref_name, include_encrypted };
+    let report = scl_gitio::export_branch(&mut store, tip, &opts)?;
+
+    println!(
+        "exported {} commit(s) to {} at {} ({})",
+        report.commits_written,
+        to.display(),
+        ref_name,
+        &report.git_commit[..12.min(report.git_commit.len())]
+    );
+    if report.protected_blobs_as_ciphertext > 0 || report.secrets_dropped > 0 {
+        println!(
+            "  warning: {} protected file(s) exported as ciphertext; {} secret(s) dropped (Git cannot enforce confidentiality)",
+            report.protected_blobs_as_ciphertext, report.secrets_dropped
+        );
+    }
     Ok(())
 }
 
