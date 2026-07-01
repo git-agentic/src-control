@@ -27,17 +27,37 @@ across every phase.
   with a git-like working tree and `init`/`commit`/`status`/`log`/`branch`/
   `switch`/`secret`/`run`. Commits and secrets survive across `sc` invocations.
   (ADR-0011.)
+- **Phase 4 — Merge & conflict resolution.** `sc merge <branch>` performs
+  snapshot-DAG three-way merge, fast-forwards when possible, writes conflict
+  markers/sidecars when needed, and records two-parent merge snapshots after
+  resolution. (ADR-0012.)
+- **Phase 5 — Secret scanner.** Commit-time pattern + entropy scanning
+  hard-rejects accidental plaintext secrets, with `sc scan` preview and a
+  hash-scoped allowlist. (ADR-0017.)
+- **Phase 6 — Remotes.** Local-path `clone`/`fetch`/`push` transfer objects and
+  refs, maintain remote-tracking refs, and integrate fetched work through merge.
+  (ADR-0013.)
+- **Phase 7 — Per-file permissions.** Protected path prefixes encrypt matching
+  file content for recipients; unauthorized clones receive ciphertext but skip
+  plaintext checkout, while authorized checkout decrypts. (ADR-0014.)
+- **Phase 8 — Packfiles + GC.** Sharded/zstd loose objects, pack-aware reads,
+  reachability repack/prune, and bulk-pack remote transfer are implemented.
+  (ADR-0015.)
+- **Phase 9 — Git export / interop.** `sc export --to <git-repo>` writes the
+  current branch's full history as Git commits, keeps `gix` quarantined in
+  `gitio`, and fails closed on encrypted content unless `--include-encrypted` is
+  explicit. (ADR-0016.)
 
-## Planned phases (usability-first ordering)
+## Completed phases (usability-first ordering)
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
 | **P4 — Merge & conflict resolution** | Combine work from two branches | `sc merge <branch>` creates a merge snapshot; clean merges auto-resolve, conflicts are detected and reported | [0012](docs/adr/0012-three-way-merge.md) |
-| **P5 — Secret scanner (accidental-plaintext guard)** | Stop plaintext secrets being committed | a `put`-time pattern + entropy scan **hard-rejects** plaintext secrets (`SecretDetected`), with a hash-scoped allowlist; complements the Phase 2 *deliberate, encrypted* secrets | [0017](docs/adr/0017-secret-scanner.md) |
+| **P5 — Secret scanner (accidental-plaintext guard)** | Stop plaintext secrets being committed | pattern + entropy scan hard-rejects plaintext secrets, with `sc scan` and a hash-scoped allowlist | [0017](docs/adr/0017-secret-scanner.md) |
 | **P6 — Remotes: clone / push / fetch** | Sync a repo between locations | `sc clone <src> <dst>`, `sc push`, `sc fetch` transfer objects + refs; `fetch` then `merge` integrates remote work | [0013](docs/adr/0013-remote-sync-model.md) |
-| **P7 — Per-file permissions (encrypted paths)** | Read-confidentiality for designated paths | `sc protect <path> --to …`; an **unauthorized clone receives ciphertext it cannot read**; an authorized checkout decrypts transparently | [0014](docs/adr/0014-per-file-permissions-encrypted-paths.md) |
-| **P8 — Packfiles + GC** | Scale storage; reclaim space | `sc gc` packs reachable objects into a packfile and drops unreachable ones; pack transfer accelerates P6 | [0015](docs/adr/0015-packfiles-and-gc.md) |
-| **P9 — Git export / interop** | Round-trip with Git | `sc export --to <git-repo>` writes snapshots as Git commits; `git log` shows them | [0016](docs/adr/0016-git-export.md) |
+| **P7 — Per-file permissions (encrypted paths)** | Read-confidentiality for designated paths | `sc protect <path> --to …`; an unauthorized clone receives ciphertext it cannot decrypt; authorized checkout decrypts transparently | [0014](docs/adr/0014-per-file-permissions-encrypted-paths.md) |
+| **P8 — Packfiles + GC** | Scale storage; reclaim space | `sc gc` packs reachable objects and prunes unreachable loose objects; clone/fetch/push use bulk-pack transfer | [0015](docs/adr/0015-packfiles-and-gc.md) |
+| **P9 — Git export / interop** | Round-trip with Git | `sc export --to <git-repo>` writes current-branch history as Git commits; `git log` reads it back | [0016](docs/adr/0016-git-export.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -81,9 +101,9 @@ Phase 3 (persistence) ─┬─> P4 Merge
 scl-crypto (Phase 2) ──> P5 Secret scanner, P7 Encrypted paths
 ```
 
-All planned phases build on the Phase 3 persistent store. P5 and P7 additionally
-build on the Phase 2 cryptography. Otherwise the phases are loosely coupled and
-could be reordered if priorities change.
+All completed phases build on the Phase 3 persistent store. P5 and P7
+additionally build on the Phase 2 cryptography. Otherwise the phases are loosely
+coupled; the order above records the path taken to get to the P9 milestone.
 
 ## Cross-cutting principles (adapted from git.agentic)
 

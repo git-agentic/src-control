@@ -6,10 +6,10 @@
 
 ## Context
 
-`gitio` currently imports a Git repository's HEAD into our store (ADR-0007) but
-cannot write back. The thesis is to interoperate with Git, not replace it; teams
-need to push src-control history into a Git repo for coexistence, migration, and
-existing tooling (`git log`, hosting, CI).
+`gitio` originally imported a Git repository's HEAD into our store (ADR-0007)
+but had no write-back path. The thesis is to interoperate with Git, not replace
+it; teams need to push src-control history into a Git repo for coexistence,
+migration, and existing tooling (`git log`, hosting, CI).
 
 ## Decision
 
@@ -29,8 +29,8 @@ per ADR-0007):
   history contains protected paths or registry secrets the command refuses unless
   `--include-encrypted` is passed. With `--include-encrypted`, protected files
   export as their **ciphertext blobs** (nothing plaintext leaks); registry secrets
-  are **silently dropped** rather than materialized as sidecar files, because Git
-  has no equivalent of our secrets registry.
+  are **dropped and reported** rather than materialized as sidecar files, because
+  Git has no equivalent of our secrets registry.
 - **Target ref is overwritten** (mirror semantics). If the `--to` path does not
   exist it is created with `git init --bare`; `HEAD` is pointed at the exported ref
   on a newly-created repo. Pre-existing repos have their ref force-updated but
@@ -53,6 +53,25 @@ Import (ADR-0007) plus export gives round-trip interop; full bidirectional sync
   and is neither flagged nor refused by `--include-encrypted`. This is the same
   forward-looking model as git-crypt; a reader must not treat export refusal as a
   blanket "no plaintext anywhere in history" guarantee.
+
+## As built (P9)
+
+The implementation shipped with the stricter export policy captured above:
+
+- `scl-gitio` owns the full Git-write path in `export.rs` and exports only
+  project-native types (`ExportOptions`, `ExportReport`, `export_branch`) so no
+  `gix` type leaks into `cli` or `repo`.
+- Export walks the snapshot DAG from the current branch tip, writes parents
+  before children, emits canonical Git tree order, synthesizes deterministic
+  author/committer signatures, and force-updates the requested ref.
+- Absent targets are initialized as bare Git repos and have `HEAD` pointed at the
+  exported ref; existing Git repos keep their existing `HEAD`.
+- `sc export --to <path> [--ref <name>] [--include-encrypted]` resolves the
+  current branch tip in `cli`, calls `gitio::export_branch`, and reports commit
+  count plus any protected ciphertext / dropped-secret counts.
+- Tests cover canonical tree ordering against `git`, multi-commit history,
+  idempotent re-export, import→export→re-import round-trip, fail-closed encrypted
+  content, and `--include-encrypted` behavior.
 
 ## Alternatives considered
 
