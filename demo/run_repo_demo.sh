@@ -38,10 +38,13 @@ OUT="$(SC_IDENTITY="$KEYS/id" "$SC" run -- sh -c 'printf %s "$DB_URL"')"
 "$SC" status >/dev/null || { echo "FAIL: repo locked after run (lock leak)"; exit 1; }
 
 echo
-echo "== GC reclamation =="
-# Create abandoned objects: commit a large file, then overwrite + recommit so the
-# original blob becomes unreachable.  Use dd+tr (no secrets) instead of /dev/urandom
-# to avoid triggering the secret scanner.
+echo "== GC compaction =="
+# Committing several times produces many small loose objects in .sc/objects/.
+# sc gc consolidates all reachable objects into a single compressed packfile and
+# removes the redundant loose files, reclaiming space.  (Pruning additionally
+# reclaims objects that are truly unreachable — from amended or abandoned work —
+# but this demo shows the compaction path.)
+# Use dd+tr (no secrets) instead of /dev/urandom to avoid triggering the secret scanner.
 dd if=/dev/zero bs=1048576 count=1 2>/dev/null | tr '\0' 'A' > "$WORK/big.bin"
 "$SC" commit -m "add big.bin" --author me
 dd if=/dev/zero bs=1048576 count=1 2>/dev/null | tr '\0' 'B' > "$WORK/big.bin"
@@ -49,12 +52,12 @@ dd if=/dev/zero bs=1048576 count=1 2>/dev/null | tr '\0' 'B' > "$WORK/big.bin"
 
 before=$(du -sk "$WORK/.sc/objects" | cut -f1)
 echo "objects size before gc: ${before} KiB"
-# Zero grace so the just-abandoned blob is immediately collectable in the demo.
+# Zero grace period so any unreachable objects are immediately eligible for pruning.
 "$SC" gc --prune-expire 0s
 after=$(du -sk "$WORK/.sc/objects" | cut -f1)
 echo "objects size after gc:  ${after} KiB"
 if [ "$after" -lt "$before" ]; then
-  echo "OK: gc reclaimed space"
+  echo "OK: gc compacted loose objects and reclaimed space"
 else
   echo "WARN: gc did not shrink objects (small repo / fs rounding)"
 fi
