@@ -300,10 +300,16 @@ fn scan_encrypted(store: &mut Store, tip: ObjectId) -> anyhow::Result<(Vec<Strin
 }
 
 /// Record PROTECTED entry paths under `prefix`, recursing into subtrees. Uses an
-/// explicit stack so deep trees can't overflow.
+/// explicit stack so deep trees can't overflow. Deduplicates subtree object ids
+/// via `seen` so shared subtrees (identical content at multiple paths in a
+/// content-addressed store) are visited exactly once.
 fn scan_tree(store: &mut Store, root: ObjectId, prefix: String, out: &mut Vec<String>) -> anyhow::Result<()> {
+    let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
     let mut stack = vec![(root, prefix)];
     while let Some((id, pre)) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
         let tree = store.get_tree(&id)?;
         for e in &tree.entries {
             let path = if pre.is_empty() { e.name.clone() } else { format!("{pre}/{}", e.name) };
@@ -578,7 +584,7 @@ mod tests {
         let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false };
         let err = export_branch(&mut store, snap, &opts).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("secret.txt") || msg.contains("DB_URL"), "error must name the content: {msg}");
+        assert!(msg.contains("secret.txt") && msg.contains("DB_URL"), "error must name both the protected path and the secret: {msg}");
         assert!(!dir.exists(), "no git repo should be created on refusal");
     }
 
@@ -598,6 +604,50 @@ mod tests {
         assert!(listing.contains("secret.txt"));
         assert!(!listing.contains("DB_URL"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scan_dedups_shared_subtree() {
+        // Build a snapshot whose root tree references the SAME subtree object
+        // under two different names ("a" and "b"). The subtree contains one
+        // PROTECTED file ("key"). scan_tree must visit the shared object only
+        // once (dedup guard) yet still detect the protected content and cause
+        // export_branch to refuse without --include-encrypted.
+        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot, PROTECTED};
+        use std::collections::BTreeMap;
+
+        let mut store = Store::new(StoreConfig::default());
+
+        // Protected blob inside the shared subtree.
+        let ct = store.put(Object::blob(b"ciphertext".to_vec())).unwrap();
+        // The shared subtree — built once, referenced twice.
+        let shared_sub = store.put(Object::Tree(Tree::new(vec![
+            TreeEntry { name: "key".into(), kind: EntryKind::Blob, id: ct, mode: FileMode::FILE, perms: PROTECTED },
+        ]))).unwrap();
+        // Root tree: entries "a" and "b" both point at shared_sub.
+        let root = store.put(Object::Tree(Tree::new(vec![
+            TreeEntry { name: "a".into(), kind: EntryKind::Tree, id: shared_sub, mode: FileMode::FILE, perms: 0 },
+            TreeEntry { name: "b".into(), kind: EntryKind::Tree, id: shared_sub, mode: FileMode::FILE, perms: 0 },
+        ]))).unwrap();
+        let snap = store.put(Object::Snapshot(Snapshot {
+            root,
+            parents: vec![],
+            author: "t".into(),
+            timestamp: 1,
+            message: "shared".into(),
+            secrets: BTreeMap::new(),
+            protection: Default::default(),
+        })).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("scl-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false };
+        let err = export_branch(&mut store, snap, &opts).unwrap_err();
+        let msg = format!("{err:#}");
+        // The scan must have found the protected content and refused.
+        assert!(msg.contains("key"), "error must name the protected path: {msg}");
+        // No git repo should have been created.
+        assert!(!dir.exists(), "no git repo should be created on refusal");
     }
 
     #[test]
