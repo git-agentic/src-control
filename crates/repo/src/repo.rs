@@ -790,6 +790,14 @@ impl Repo {
         cfg.save(&self.layout)
     }
 
+    /// Add a named Git-backed remote to `.sc/config`.
+    pub fn remote_add_git(&self, name: &str, url: &str) -> Result<()> {
+        validate_branch_name(name)?;
+        let mut cfg = RemoteConfig::load(&self.layout)?;
+        cfg.add_kind(name, url, crate::remote::RemoteKind::Git)?;
+        cfg.save(&self.layout)
+    }
+
     /// List configured remotes as `(name, url)`.
     pub fn remotes(&self) -> Result<Vec<(String, String)>> {
         let cfg = RemoteConfig::load(&self.layout)?;

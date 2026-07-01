@@ -21,7 +21,7 @@ pub mod worktree;
 
 pub use error::{Error, Result};
 pub use gc::GcStats;
-pub use remote::RemoteConfig;
+pub use remote::{RemoteConfig, RemoteKind};
 pub use repo::{Repo, Status};
 pub use scanner::ScanReport;
 pub use secrets::SecretInfo;

@@ -171,7 +171,13 @@ enum Cmd {
 #[derive(Subcommand)]
 enum RemoteOp {
     /// Add a named remote.
-    Add { name: String, url: String },
+    Add {
+        name: String,
+        url: String,
+        /// Treat the remote URL as a Git repository (translated via gitio).
+        #[arg(long)]
+        git: bool,
+    },
     /// List configured remotes.
     List,
 }
@@ -909,13 +915,23 @@ fn run_clone(src: PathBuf, dst: PathBuf) -> Result<()> {
 fn run_remote(op: RemoteOp) -> Result<()> {
     let repo = open_repo()?;
     match op {
-        RemoteOp::Add { name, url } => {
-            repo.remote_add(&name, &url)?;
-            println!("added remote {name} -> {url}");
+        RemoteOp::Add { name, url, git } => {
+            if git {
+                repo.remote_add_git(&name, &url)?;
+                println!("added git remote {name} -> {url}");
+            } else {
+                repo.remote_add(&name, &url)?;
+                println!("added remote {name} -> {url}");
+            }
         }
         RemoteOp::List => {
+            let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
             for (name, url) in repo.remotes()? {
-                println!("{name}\t{url}");
+                let kind = match cfg.kind(&name) {
+                    Some(scl_repo::RemoteKind::Git) => "git",
+                    _ => "sc",
+                };
+                println!("{name}\t{url}\t[{kind}]");
             }
         }
     }
