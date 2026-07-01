@@ -270,6 +270,10 @@ pub struct ExportOptions<'a> {
     /// registry secrets are dropped; when false the export fails closed if any
     /// encrypted content is present in history.
     pub include_encrypted: bool,
+    /// sc-snapshot-id → git-oid-hex for commits already present on the target
+    /// (learned from the marks map). Snapshots found here reuse their existing
+    /// git commit and are not rewritten. Empty for a plain `sc export`.
+    pub known_git_commits: &'a std::collections::HashMap<ObjectId, String>,
 }
 
 /// Summary of an export. `git_commit` is a hex string so `cli` needs no `gix`.
@@ -290,6 +294,9 @@ pub struct ExportReport {
     /// no Git-native equivalent and cannot be exported safely). Deduped by name
     /// across all snapshots.
     pub secrets_dropped: usize,
+    /// Commits written *this call* as `(git_oid_hex, sc_id)`, for the caller to
+    /// persist into the marks map. Excludes reused (already-known) commits.
+    pub new_marks: Vec<(String, ObjectId)>,
 }
 
 /// Read-only pre-flight scan of the DAG rooted at `tip`: collect the paths of
@@ -366,6 +373,14 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
     let target = GitTarget::open_or_init_bare(opts.to)?;
 
     let mut commit_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
+    // Seed with commits already on the target (marks map): these are reused, not
+    // rewritten. A bad hex here is a corrupt marks file — surface it.
+    for (sc_id, git_hex) in opts.known_git_commits {
+        let g = gix::ObjectId::from_hex(git_hex.as_bytes())
+            .with_context(|| format!("bad git oid in marks for {sc_id}"))?;
+        commit_memo.insert(*sc_id, g);
+    }
+    let mut new_marks: Vec<(String, ObjectId)> = Vec::new();
     let mut tree_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
     let mut blob_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
     let mut protected = 0usize;
@@ -384,6 +399,7 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
                 snap.parents.iter().map(|p| commit_memo[p]).collect();
             let cid = map_commit(&target, &snap, tree_oid, &parent_oids)?;
             commit_memo.insert(sid, cid);
+            new_marks.push((cid.to_hex().to_string(), sid));
         } else {
             stack.push((sid, true));
             let snap = store.get_snapshot(&sid)?;
@@ -409,7 +425,21 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
         commits_written: commit_memo.len(),
         protected_blobs_as_ciphertext: protected,
         secrets_dropped,
+        new_marks,
     })
+}
+
+/// The current git-oid-hex that `ref_name` points at in the git repo at `path`,
+/// or `None` if the ref (or repo) is absent. Used by the push fast-forward gate.
+pub fn read_ref(path: &Path, ref_name: &str) -> Result<Option<String>> {
+    let repo = match gix::open(path) {
+        Ok(r) => r,
+        Err(_) => return Ok(None), // absent/uninitialized target => no ref
+    };
+    match repo.find_reference(ref_name) {
+        Ok(mut r) => Ok(Some(r.peel_to_id().context("peeling ref")?.detach().to_hex().to_string())),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -521,7 +551,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("scl-hist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false };
+        let empty = std::collections::HashMap::new();
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
         let report = export_branch(&mut store, c3, &opts).unwrap();
         assert_eq!(report.commits_written, 3);
 
@@ -543,7 +574,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("scl-idem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false };
+        let empty = std::collections::HashMap::new();
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
         let a = export_branch(&mut store, c, &opts).unwrap();
         let b2 = export_branch(&mut store, c, &opts).unwrap();
         assert_eq!(a.git_commit, b2.git_commit);
@@ -568,7 +600,8 @@ mod tests {
 
         let dst = std::env::temp_dir().join(format!("scl-rt-dst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
-        let opts = ExportOptions { to: &dst, ref_name: "refs/heads/main", include_encrypted: false };
+        let empty = std::collections::HashMap::new();
+        let opts = ExportOptions { to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
         export_branch(&mut store, snap, &opts).unwrap();
 
         // Re-import our export; the tree must reconstruct the same files.
@@ -602,7 +635,8 @@ mod tests {
         let snap = encrypted_snapshot(&mut store);
         let dir = std::env::temp_dir().join(format!("scl-refuse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false };
+        let empty = std::collections::HashMap::new();
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
         let err = export_branch(&mut store, snap, &opts).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("secret.txt") && msg.contains("DB_URL"), "error must name both the protected path and the secret: {msg}");
@@ -615,7 +649,8 @@ mod tests {
         let snap = encrypted_snapshot(&mut store);
         let dir = std::env::temp_dir().join(format!("scl-allow-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: true };
+        let empty = std::collections::HashMap::new();
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: true, known_git_commits: &empty };
         let report = export_branch(&mut store, snap, &opts).unwrap();
         assert_eq!(report.protected_blobs_as_ciphertext, 1);
         assert_eq!(report.secrets_dropped, 1);
@@ -662,7 +697,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("scl-dedup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false };
+        let empty = std::collections::HashMap::new();
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
         let err = export_branch(&mut store, snap, &opts).unwrap_err();
         let msg = format!("{err:#}");
         // The scan must have found the protected content and refused.
@@ -687,5 +723,52 @@ mod tests {
         let out = git(&dir, &["--git-dir", dir.to_str().unwrap(), "log", "--format=%s", "-1"]);
         assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "init");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_reuses_known_marks_and_reports_new_ones() {
+        use crate::{import_history, ImportReport};
+        use scl_core::StoreConfig;
+        use std::collections::HashMap;
+
+        // Build a 2-commit sc history by importing from a throwaway git repo.
+        let gsrc = std::env::temp_dir().join(format!("scl-exp-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gsrc);
+        std::fs::create_dir_all(&gsrc).unwrap();
+        git(&gsrc, &["init", "-q", "-b", "main"]);
+        std::fs::write(gsrc.join("a"), b"1").unwrap();
+        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "c1"]);
+        std::fs::write(gsrc.join("a"), b"2").unwrap();
+        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "c2"]);
+
+        let mut store = Store::new(StoreConfig::default());
+        let ImportReport { tip, .. } = import_history(&mut store, &gsrc, "main", &HashMap::new()).unwrap();
+
+        // First export: empty known-map => all commits written and reported.
+        let dst = std::env::temp_dir().join(format!("scl-exp-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+        let empty: HashMap<ObjectId, String> = HashMap::new();
+        let opts = ExportOptions {
+            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty,
+        };
+        let rep1 = export_branch(&mut store, tip, &opts).unwrap();
+        assert_eq!(rep1.new_marks.len(), 2);
+
+        // read_ref sees the tip we just wrote.
+        let tip_git = read_ref(&dst, "refs/heads/main").unwrap();
+        assert_eq!(tip_git.as_deref(), Some(rep1.git_commit.as_str()));
+
+        // Second export with ALL commits known: nothing new written.
+        let known: HashMap<ObjectId, String> =
+            rep1.new_marks.iter().map(|(g, s)| (*s, g.clone())).collect();
+        let opts2 = ExportOptions {
+            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &known,
+        };
+        let rep2 = export_branch(&mut store, tip, &opts2).unwrap();
+        assert!(rep2.new_marks.is_empty());
+        assert_eq!(rep2.git_commit, rep1.git_commit); // same tip oid
+
+        std::fs::remove_dir_all(&gsrc).unwrap();
+        std::fs::remove_dir_all(&dst).unwrap();
     }
 }

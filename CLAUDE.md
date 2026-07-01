@@ -113,6 +113,10 @@ cargo run --bin sc -- gc --prune-expire 7d    # custom grace window
 cargo run --bin sc -- export --to <git-repo>  # write current branch history to Git
 cargo run --bin sc -- export --to <git-repo> --include-encrypted  # allow protected ciphertext
 bash demo/run_repo_demo.sh                   # end-to-end persistent repo proof
+cargo run --bin sc -- remote add <name> <git-path> --git   # register a git-backed remote
+cargo run --bin sc -- fetch <git-remote>                    # import git history -> remote-tracking ref
+cargo run --bin sc -- push <git-remote> [--include-encrypted]  # export sc history -> git ref (ff-only)
+bash demo/run_git_remote_demo.sh                            # git-as-a-remote round-trip proof
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -144,5 +148,26 @@ protected files export as ciphertext and secrets are dropped), overwrites the
 target ref (mirror semantics), auto-inits a bare repo if the path is absent, and
 is idempotent via deterministic signature synthesis.
 
-Remaining follow-ons: merge, break-glass escrow key guidance, and git-as-a-remote
-bidirectional sync.
+**Phase 10 is built.** A local Git repo is now a first-class remote. `sc remote
+add <name> <git-path> --git` registers it; `sc fetch <git-remote>` imports the
+full Git history deterministically and writes a `refs/remotes/<name>/<branch>`
+tracking ref + a persisted `git_oid ↔ sc_id` marks map
+(`.sc/git-remotes/<name>/marks`); `sc push <git-remote> [--include-encrypted]`
+synthesizes/reuses Git commits for the current branch and fast-forward-updates
+the Git ref, reusing P9's export machinery and confidentiality gate verbatim
+(refuse on protected content unless `--include-encrypted`). Identity across the
+two DAGs is carried by the marks map, not by a fatter object model — the
+content-addressing invariant is unchanged. The git-remote path dispatches above
+the P6 `Transport` trait rather than implementing it (a Git remote has a
+different id space and encoding than sc's `Transport` assumes). Scope is local
+`.git` paths on disk only; network Git is deferred. One accepted MVP
+limitation: fetching from Git repo A and pushing a Git-origin commit to a
+*different* Git repo B re-synthesizes with dropped committer/timezone/gpgsig
+and a different Git oid than A had — same-remote fetch/push stays clean. A side
+effect of this phase: `sc merge <ref>` now also fast-forwards into a freshly
+initialized (unborn) branch by adopting the incoming snapshot wholesale,
+needed because the demo's second repo merges a git-fetched branch into a repo
+with no local commits yet. See ADR-0018.
+
+Remaining follow-ons: break-glass escrow key guidance and network transport for
+remotes (including network Git).

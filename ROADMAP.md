@@ -47,6 +47,13 @@ across every phase.
   current branch's full history as Git commits, keeps `gix` quarantined in
   `gitio`, and fails closed on encrypted content unless `--include-encrypted` is
   explicit. (ADR-0016.)
+- **Phase 10 — Git as a remote (bidirectional sync).** A local Git repo becomes
+  a first-class remote: `sc remote add <name> <git-path> --git`,
+  `sc fetch <git-remote>`, and `sc push <git-remote> [--include-encrypted]`
+  close the `fetch` → `merge` → `push` loop against Git, via a persisted
+  git-oid ↔ sc-id marks map rather than a fatter object model, reusing P9's
+  confidentiality gate and P6's fast-forward-only push semantics. Scoped to
+  local Git repos on disk; network Git is a later transport swap. (ADR-0018.)
 
 ## Completed phases (usability-first ordering)
 
@@ -58,6 +65,7 @@ across every phase.
 | **P7 — Per-file permissions (encrypted paths)** | Read-confidentiality for designated paths | `sc protect <path> --to …`; an unauthorized clone receives ciphertext it cannot decrypt; authorized checkout decrypts transparently | [0014](docs/adr/0014-per-file-permissions-encrypted-paths.md) |
 | **P8 — Packfiles + GC** | Scale storage; reclaim space | `sc gc` packs reachable objects and prunes unreachable loose objects; clone/fetch/push use bulk-pack transfer | [0015](docs/adr/0015-packfiles-and-gc.md) |
 | **P9 — Git export / interop** | Round-trip with Git | `sc export --to <git-repo>` writes current-branch history as Git commits; `git log` reads it back | [0016](docs/adr/0016-git-export.md) |
+| **P10 — Git as a remote** | Bidirectional sync with Git | `sc remote add <name> <git-path> --git`; `sc push hub` writes commits `git log` can read; a second sc repo `sc fetch hub` + `sc merge hub/main` gets the content back | [0018](docs/adr/0018-git-as-a-remote.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -88,6 +96,10 @@ remaining differentiators.
   feature-bearing phases.
 - **P9 (Git export)** is independent interop; it lands last because it serves
   migration/coexistence rather than core capability.
+- **P10 (Git as a remote)** follows P9 directly: it reuses P9's deterministic
+  export path (now marks-aware) and P9's confidentiality gate, and closes the
+  interop loop P9 left one-way. It also reuses P6's remote/fetch/merge/push
+  machinery, so it could not land before either P6 or P9.
 
 ## Dependencies
 
@@ -97,13 +109,13 @@ Phase 3 (persistence) ─┬─> P4 Merge
                        ├─> P6 Remotes ──> (fetch feeds P4 merge)
                        ├─> P7 Encrypted paths ── needs P6 clone for the headline demo
                        ├─> P8 Packfiles + GC ── benefits P6 transfer
-                       └─> P9 Git export
+                       └─> P9 Git export ──> P10 Git as a remote (needs P6 remotes + P9 export)
 scl-crypto (Phase 2) ──> P5 Secret scanner, P7 Encrypted paths
 ```
 
 All completed phases build on the Phase 3 persistent store. P5 and P7
 additionally build on the Phase 2 cryptography. Otherwise the phases are loosely
-coupled; the order above records the path taken to get to the P9 milestone.
+coupled; the order above records the path taken to get to the P10 milestone.
 
 ## Cross-cutting principles (adapted from git.agentic)
 
@@ -122,12 +134,15 @@ These apply across phases rather than to one:
   accidental plaintext secrets are rejected at `put` time (P5). The two are
   complementary, not alternatives.
 
-## Deferred beyond P9
+## Deferred beyond P10
 
 Tracked but out of scope for this roadmap horizon:
 
 - **Network transport for remotes** (P6 starts with a local-filesystem transport;
-  SSH/HTTP transports come later).
+  SSH/HTTP transports come later). This now also covers P10's git-backed
+  remotes: P10 proves the marks-map bijection against local `.git` paths only —
+  network Git (GitHub over https/ssh) is a later transport swap onto the same
+  translation core.
 - **Secret/permission lifecycle**: value rotation, break-glass / escrow recipient
   keys, and bulk re-wrap ergonomics.
 - **Sub-tree / partial sharing** and sparse checkouts.

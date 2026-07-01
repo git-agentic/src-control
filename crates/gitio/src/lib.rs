@@ -7,7 +7,10 @@
 //! of the system Git-agnostic.
 
 mod export;
-pub use export::{export_branch, ExportOptions, ExportReport};
+pub use export::{export_branch, read_ref, ExportOptions, ExportReport};
+
+mod import;
+pub use import::{import_history, ImportReport};
 
 use std::path::Path;
 
@@ -37,7 +40,7 @@ pub fn import_head(store: &mut Store, repo_path: &Path) -> Result<ObjectId> {
     store.put(snap).context("storing imported snapshot")
 }
 
-fn import_tree(store: &mut Store, repo: &gix::Repository, tree: &gix::Tree) -> Result<ObjectId> {
+pub(crate) fn import_tree(store: &mut Store, repo: &gix::Repository, tree: &gix::Tree) -> Result<ObjectId> {
     let mut entries: Vec<TreeEntry> = Vec::new();
 
     for entry in tree.iter() {
