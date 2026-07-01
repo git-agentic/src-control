@@ -6,6 +6,8 @@
 //! id that worktrees can fork from. Keeping Git behind one crate keeps the rest
 //! of the system Git-agnostic.
 
+mod export;
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
