@@ -108,6 +108,8 @@ cargo run --bin sc -- secret grant <name> --to <recipient> --identity <key>
 cargo run --bin sc -- secret revoke <name> --recipient-id <id>
 cargo run --bin sc -- secret list
 cargo run --bin sc -- run -- <cmd> [args…]   # inject decrypted secrets + run command
+cargo run --bin sc -- gc                      # pack reachable objects + prune unreachable
+cargo run --bin sc -- gc --prune-expire 7d    # custom grace window
 bash demo/run_repo_demo.sh                   # end-to-end persistent repo proof
 ```
 
@@ -126,5 +128,10 @@ in memory and injects it into a child process environment via `run_with_secret`.
 
 The persistent store and standalone `sc secret add`/`sc run` across invocations
 are now built (persistent-store branch). Do not weaken Phase 1 or Phase 2
-invariants when extending further. Remaining follow-ons: merge, packfiles/gc,
-remotes, and break-glass escrow key guidance.
+invariants when extending further.
+
+**Phase 8 is built.** Packfiles (`objects/pack/<hash>.pack` + `.idx`),
+sharded/zstd loose objects (`objects/<aa>/<rest>`), `sc gc` (reachability repack
++ grace-window prune), and bulk-pack transfer (push/clone/fetch move one pack
+instead of object-at-a-time) are all shipped. Remaining follow-ons: merge and
+break-glass escrow key guidance.

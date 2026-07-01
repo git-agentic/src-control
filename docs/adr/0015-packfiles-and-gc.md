@@ -1,6 +1,6 @@
 # ADR-0015: Packfiles and reachability-based garbage collection
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Phase:** 8
 - **Adapts:** git.agentic ADR-0006/0011 (backend trait `delete`/`list_prefix`),
@@ -60,3 +60,24 @@ Add a **packfile format** and a **`sc gc`** command:
   still inconsistent with the "own the format" thesis.
 - **Aggressive immediate GC (no grace window).** Simpler but risks deleting
   objects for work that is staged but not yet ref-pointed; rejected for safety.
+
+## Implementation notes (locked in during build)
+
+Two clarifications were settled during Phase 8 implementation:
+
+1. **Safe GC root set expanded.** The decision text says "all refs (branch tips +
+   HEAD)" — the build added `refs/remotes/*` (all remote-tracking refs) and
+   `MERGE_HEAD` (when a merge is in progress) to the root set. Branch tips + HEAD
+   alone was insufficient; remote-tracking refs and in-progress merge heads must
+   also be kept.
+
+2. **Grace window applies to loose objects only.** Packed unreachable objects are
+   dropped immediately on repack — they survived at least one prior GC cycle so
+   the grace period has already passed. Only loose objects are guarded by the
+   mtime-based grace window (default 24 h, configurable via
+   `sc gc --prune-expire <dur>`). GC never drops a reachable object; deletions
+   happen only after the new pack is durably written.
+
+Additionally, each pack record stores a 32-byte id prefix before the compressed
+payload — a lightweight tamper-verification handle that `parse_pack` can check
+without a separate index lookup.

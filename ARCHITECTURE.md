@@ -242,3 +242,32 @@ parallel, has each agent independently edit and checkout files, runs the bounded
 budget under load, then tears everything down. A filesystem snapshot taken before
 and after the run is diffed to prove **zero residual files** remain on disk once
 the session ends. That diff is the headline evidence for the agent wedge.
+
+## Phase 8 — packfiles, GC, and bulk-pack transfer (built)
+
+Phase 8 adds three tightly coupled capabilities to the persistent store:
+
+- **Sharded + zstd loose objects.** Loose objects moved from `objects/<hex>` to
+  `objects/<aa>/<rest>` (first two hex chars as a shard prefix) and their payloads
+  are zstd-compressed on disk. The canonical bytes are decompressed and
+  BLAKE3-verified on every read, so the content-addressing invariant is unchanged.
+  Legacy flat/uncompressed objects are still read (read-both, write-new).
+- **Packfile format.** `objects/pack/<hash>.pack` + `.idx` bundle many objects
+  into a single file. Each pack record is `[id:32][compressed_len:4][zstd(canonical)]`;
+  the `.idx` maps `ObjectId → (offset, length)`. The store gains a pack-aware read
+  path: loose objects are checked first, then pack indexes. Writing is always loose;
+  packing is a batch GC operation.
+- **`sc gc`.** Computes the reachable object set by walking from all refs (branch
+  tips, HEAD, all `refs/remotes/*` remote-tracking refs, and `MERGE_HEAD` when a
+  merge is in progress) through snapshots → trees → blobs/secrets/protected objects.
+  Reachable objects are written into a new packfile; unreachable loose objects older
+  than the grace window (default 24 h, `--prune-expire <dur>`) are deleted. Packed
+  unreachable objects are dropped immediately (they survived a prior GC cycle).
+  Deletions happen only after the new pack is durably written. GC is persistent-only
+  and runs under the single-writer repo lock.
+- **Bulk-pack transfer.** `push` builds a single pack of objects the remote lacks
+  and ships it via `put_pack`; `clone`/`fetch` use `get_pack(wants, haves)`. The
+  transport read path resolves packed, sharded, and compressed objects from the
+  remote store. This replaces the prior object-at-a-time transfer.
+
+Remaining follow-ons: merge and break-glass escrow key guidance.
