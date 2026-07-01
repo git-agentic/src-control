@@ -256,6 +256,79 @@ fn map_commit(
     target.write_commit(tree_oid, parent_oids, &sig, &snap.message)
 }
 
+/// Options controlling an export.
+pub struct ExportOptions<'a> {
+    /// Target Git repo path (existing repo, or created bare if absent).
+    pub to: &'a Path,
+    /// Ref to update, e.g. "refs/heads/main".
+    pub ref_name: &'a str,
+    /// Allow exporting protected ciphertext + dropping secrets.
+    pub include_encrypted: bool,
+}
+
+/// Summary of an export. `git_commit` is a hex string so `cli` needs no `gix`.
+pub struct ExportReport {
+    pub git_commit: String,
+    pub commits_written: usize,
+    pub protected_blobs_as_ciphertext: usize,
+    pub secrets_dropped: usize,
+}
+
+/// Export the snapshot DAG rooted at `tip` into the Git repo named by `opts`,
+/// updating `opts.ref_name` to the exported commit. Re-export is idempotent.
+///
+/// (Encrypted-content policy is layered on in a later step; this base version
+/// exports everything.)
+pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> anyhow::Result<ExportReport> {
+    let target = GitTarget::open_or_init_bare(opts.to)?;
+
+    let mut commit_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
+    let mut tree_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
+    let mut blob_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
+    let mut protected = 0usize;
+
+    // Post-order DAG walk: a commit is written only after all its parents have
+    // Git oids. Explicit stack (no recursion) so deep history can't overflow.
+    let mut stack: Vec<(ObjectId, bool)> = vec![(tip, false)];
+    while let Some((sid, ready)) = stack.pop() {
+        if commit_memo.contains_key(&sid) {
+            continue;
+        }
+        if ready {
+            let snap = store.get_snapshot(&sid)?;
+            let tree_oid = map_tree(store, &target, snap.root, &mut tree_memo, &mut blob_memo, &mut protected)?;
+            let parent_oids: Vec<gix::ObjectId> =
+                snap.parents.iter().map(|p| commit_memo[p]).collect();
+            let cid = map_commit(&target, &snap, tree_oid, &parent_oids)?;
+            commit_memo.insert(sid, cid);
+        } else {
+            stack.push((sid, true));
+            let snap = store.get_snapshot(&sid)?;
+            for p in &snap.parents {
+                if !commit_memo.contains_key(p) {
+                    stack.push((*p, false));
+                }
+            }
+        }
+    }
+
+    let tip_git = commit_memo[&tip];
+    target.set_ref_force(opts.ref_name, tip_git)?;
+    // If we created the repo, point HEAD at the exported ref so `git log` and
+    // `import_head` (which resolve HEAD) see the history. Never touch HEAD on a
+    // pre-existing repo.
+    if target.created {
+        target.set_head(opts.ref_name)?;
+    }
+
+    Ok(ExportReport {
+        git_commit: tip_git.to_hex().to_string(),
+        commits_written: commit_memo.len(),
+        protected_blobs_as_ciphertext: protected,
+        secrets_dropped: 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +418,85 @@ mod tests {
         assert_eq!((a.name.as_str(), a.email.as_str(), a.time_secs), ("Ada", "ada@x", 42));
         let b = synth_sig("bare-name", 7);
         assert_eq!((b.name.as_str(), b.email.as_str(), b.time_secs), ("bare-name", "", 7));
+    }
+
+    #[test]
+    fn exports_multi_commit_history_with_parents() {
+        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot};
+        use std::collections::BTreeMap;
+        let mut store = Store::new(StoreConfig::default());
+        let mk = |store: &mut Store, content: &[u8], parents: Vec<scl_core::ObjectId>, msg: &str| {
+            let b = store.put(Object::blob(content.to_vec())).unwrap();
+            let root = store.put(Object::Tree(Tree::new(vec![
+                TreeEntry { name: "a.txt".into(), kind: EntryKind::Blob, id: b, mode: FileMode::FILE, perms: 0 },
+            ]))).unwrap();
+            store.put(Object::Snapshot(Snapshot { root, parents, author: "t".into(), timestamp: 1, message: msg.into(), secrets: BTreeMap::new(), protection: Default::default() })).unwrap()
+        };
+        let c1 = mk(&mut store, b"one", vec![], "c1");
+        let c2 = mk(&mut store, b"two", vec![c1], "c2");
+        let c3 = mk(&mut store, b"three", vec![c2], "c3");
+
+        let dir = std::env::temp_dir().join(format!("scl-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false };
+        let report = export_branch(&mut store, c3, &opts).unwrap();
+        assert_eq!(report.commits_written, 3);
+
+        let out = std::process::Command::new("git")
+            .args(["--git-dir", dir.to_str().unwrap(), "log", "--format=%s", "main"]).output().unwrap();
+        let log = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(log.split_whitespace().collect::<Vec<_>>(), vec!["c3", "c2", "c1"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn re_export_is_idempotent() {
+        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot};
+        use std::collections::BTreeMap;
+        let mut store = Store::new(StoreConfig::default());
+        let b = store.put(Object::blob(b"x".to_vec())).unwrap();
+        let root = store.put(Object::Tree(Tree::new(vec![TreeEntry { name: "a".into(), kind: EntryKind::Blob, id: b, mode: FileMode::FILE, perms: 0 }]))).unwrap();
+        let c = store.put(Object::Snapshot(Snapshot { root, parents: vec![], author: "t".into(), timestamp: 5, message: "m".into(), secrets: BTreeMap::new(), protection: Default::default() })).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("scl-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false };
+        let a = export_branch(&mut store, c, &opts).unwrap();
+        let b2 = export_branch(&mut store, c, &opts).unwrap();
+        assert_eq!(a.git_commit, b2.git_commit);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn git_import_export_reimport_roundtrip() {
+        use scl_core::{Store, StoreConfig};
+        let src = std::env::temp_dir().join(format!("scl-rt-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("top.txt"), b"top").unwrap();
+        std::fs::write(src.join("sub/inner.txt"), b"inner").unwrap();
+        let g = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&src)
+            .env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@e")
+            .env("GIT_COMMITTER_NAME","t").env("GIT_COMMITTER_EMAIL","t@e").output().unwrap();
+        g(&["init","-q"]); g(&["add","."]); g(&["commit","-q","-m","init"]);
+
+        let mut store = Store::new(StoreConfig::default());
+        let snap = crate::import_head(&mut store, &src).unwrap();
+
+        let dst = std::env::temp_dir().join(format!("scl-rt-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+        let opts = ExportOptions { to: &dst, ref_name: "refs/heads/main", include_encrypted: false };
+        export_branch(&mut store, snap, &opts).unwrap();
+
+        // Re-import our export; the tree must reconstruct the same files.
+        let mut store2 = Store::new(StoreConfig::default());
+        let snap2 = crate::import_head(&mut store2, &dst).unwrap();
+        let root = store2.get_snapshot(&snap2).unwrap().root;
+        let t = store2.get_tree(&root).unwrap();
+        assert!(t.get("top.txt").is_some() && t.get("sub").is_some());
+
+        std::fs::remove_dir_all(&src).unwrap();
+        std::fs::remove_dir_all(&dst).unwrap();
     }
 
     #[test]

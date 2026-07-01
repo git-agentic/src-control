@@ -7,6 +7,7 @@
 //! of the system Git-agnostic.
 
 mod export;
+pub use export::{export_branch, ExportOptions, ExportReport};
 
 use std::path::Path;
 
