@@ -271,3 +271,59 @@ Phase 8 adds three tightly coupled capabilities to the persistent store:
   remote store. This replaces the prior object-at-a-time transfer.
 
 Remaining follow-ons: merge and break-glass escrow key guidance.
+
+## Phase 9 — Git export (built)
+
+`sc export --to <git-repo> [--ref <name>] [--include-encrypted]` is the symmetric
+peer of the Phase 1 Git import: it maps src-control objects to Git objects and
+writes them into a target Git repository via `gix`, keeping all Git logic
+quarantined in `gitio`.
+
+### Object mapping
+
+| src-control | Git |
+|---|---|
+| `Blob` | Git blob |
+| `Tree` | Git tree (entries sorted in Git's byte order) |
+| `Snapshot` | Git commit (root tree + parents + author/message) |
+
+The full history of the current branch is walked and written. Identical content
+maps to identical Git objects, so re-export is **idempotent**.
+
+### Deterministic signature synthesis
+
+`Snapshot` author strings are parsed as `Name <email>` (with fallback to name-only
++ empty email). The committer is set equal to the author. The timezone is always
+`+0000`. This makes the Git commit hash stable across re-exports of the same
+src-control history.
+
+### Encrypted-content policy (fail-closed)
+
+Export **refuses** if the history contains protected paths or registry secrets
+unless `--include-encrypted` is passed:
+
+- **Protected files** export as their **ciphertext blobs** — nothing plaintext
+  escapes into the Git repo.
+- **Registry secrets** are **dropped** — Git has no secrets-registry equivalent,
+  so there is no safe representation; silently omitting them is the least-surprise
+  behaviour.
+
+### Target ref and HEAD
+
+The target ref is **overwritten** (mirror semantics). If `--to` does not exist,
+it is created with `git init --bare`. On a newly-created repo, `HEAD` is pointed
+at the exported ref so tools that resolve `HEAD` (including `git log`) work
+without additional configuration. Pre-existing repos have their ref force-updated;
+`HEAD` is not touched.
+
+### Lossy points
+
+Git trees cannot carry the following src-control metadata; it is dropped on export:
+
+- The **secrets registry** (`BTreeMap<String, ObjectId>` on each snapshot).
+- The **protection policy** (wrapped DEKs for encrypted paths).
+- The **per-entry `perms` byte** on tree entries.
+
+These are the documented lossy points (see ADR-0016). A future bidirectional-sync
+transport would need a sidecar or extended-attribute convention to preserve them,
+which is out of scope for the initial export.

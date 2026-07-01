@@ -1,6 +1,6 @@
 # ADR-0016: Git export for round-trip interop
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-25
 - **Phase:** 9
 
@@ -20,14 +20,21 @@ per ADR-0007):
 - **Blob → Git blob**, **Tree → Git tree** (translating our sorted, mode-bearing
   entries to Git's tree format), **Snapshot → Git commit** (root tree + parents +
   author/message; our `i64` timestamp maps to Git's commit time).
-- Export walks from selected refs and writes the equivalent Git object graph, then
-  updates a Git ref to the exported commit. Re-export is idempotent: identical
-  history maps to identical Git objects.
-- **Secrets and encrypted-path objects** have no native Git representation. The
-  initial policy is to **export them as their ciphertext blobs** (so nothing
-  plaintext leaks) under a reserved path, and to **warn** that confidentiality
-  semantics are not enforced by Git on the far side. (A stricter "refuse to export
-  protected content" mode is a documented option.)
+- Export walks the current branch's full history and writes the equivalent Git
+  object graph, then updates a Git ref to the exported commit. Re-export is
+  idempotent: identical history maps to identical Git objects via deterministic
+  signature synthesis (parse `Name <email>` else name-only + empty email;
+  committer = author; timezone +0000).
+- **Encrypted-path objects (protected files):** export is **fail-closed** — if the
+  history contains protected paths or registry secrets the command refuses unless
+  `--include-encrypted` is passed. With `--include-encrypted`, protected files
+  export as their **ciphertext blobs** (nothing plaintext leaks); registry secrets
+  are **silently dropped** rather than materialized as sidecar files, because Git
+  has no equivalent of our secrets registry.
+- **Target ref is overwritten** (mirror semantics). If the `--to` path does not
+  exist it is created with `git init --bare`; `HEAD` is pointed at the exported ref
+  on a newly-created repo. Pre-existing repos have their ref force-updated but
+  HEAD is left alone.
 
 Import (ADR-0007) plus export gives round-trip interop; full bidirectional sync
 (treating Git as a remote via the P6 `Transport`) is a later extension.

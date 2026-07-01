@@ -10,7 +10,8 @@ SC="$(pwd)/target/debug/sc"
 WORK="$(mktemp -d)"
 # Identity file lives outside WORK so the secret scanner never sees it during commit.
 KEYS="$(mktemp -d)"
-trap 'rm -rf "$WORK" "$KEYS"' EXIT
+MIRROR_BASE="$(mktemp -d)"
+trap 'rm -rf "$WORK" "$KEYS" "$MIRROR_BASE"' EXIT
 
 # Generate an identity (private key + public key for recipients.toml).
 PUB="$("$SC" keygen --out "$KEYS/id" | grep 'public key' | awk '{print $3}')"
@@ -61,5 +62,15 @@ if [ "$after" -lt "$before" ]; then
 else
   echo "WARN: gc did not shrink objects (small repo / fs rounding)"
 fi
+
+echo
+echo "== Git export =="
+# This repo carries a committed secret (DB_URL).  Export is fail-closed by
+# default; --include-encrypted allows it: protected files export as ciphertext
+# and registry secrets are silently dropped (no plaintext leaks into Git).
+MIRROR="$MIRROR_BASE/mirror.git"
+"$SC" export --to "$MIRROR" --include-encrypted
+echo "git sees the exported history:"
+git --git-dir "$MIRROR" log --oneline | sed 's/^/  /'
 
 echo "RESULT: persistent repo survived across invocations; secret decrypted in a new process ✔"

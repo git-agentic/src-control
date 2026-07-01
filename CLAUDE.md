@@ -110,6 +110,8 @@ cargo run --bin sc -- secret list
 cargo run --bin sc -- run -- <cmd> [args…]   # inject decrypted secrets + run command
 cargo run --bin sc -- gc                      # pack reachable objects + prune unreachable
 cargo run --bin sc -- gc --prune-expire 7d    # custom grace window
+cargo run --bin sc -- export --to <git-repo>  # write current branch history to Git
+cargo run --bin sc -- export --to <git-repo> --include-encrypted  # allow protected ciphertext
 bash demo/run_repo_demo.sh                   # end-to-end persistent repo proof
 ```
 
@@ -133,5 +135,14 @@ invariants when extending further.
 **Phase 8 is built.** Packfiles (`objects/pack/<hash>.pack` + `.idx`),
 sharded/zstd loose objects (`objects/<aa>/<rest>`), `sc gc` (reachability repack
 + grace-window prune), and bulk-pack transfer (push/clone/fetch move one pack
-instead of object-at-a-time) are all shipped. Remaining follow-ons: merge and
-break-glass escrow key guidance.
+instead of object-at-a-time) are all shipped.
+
+**Phase 9 is built.** `sc export --to <git-repo>` maps the current branch's full
+history to Git objects (blob/tree/commit), keeps `gix` quarantined in `gitio`,
+fails closed on encrypted content (refuse unless `--include-encrypted`; then
+protected files export as ciphertext and secrets are dropped), overwrites the
+target ref (mirror semantics), auto-inits a bare repo if the path is absent, and
+is idempotent via deterministic signature synthesis.
+
+Remaining follow-ons: merge, break-glass escrow key guidance, and git-as-a-remote
+bidirectional sync.
