@@ -7,7 +7,7 @@
 //! of the system Git-agnostic.
 
 mod export;
-pub use export::{export_branch, ExportOptions, ExportReport};
+pub use export::{export_branch, read_ref, ExportOptions, ExportReport};
 
 mod import;
 pub use import::{import_history, ImportReport};

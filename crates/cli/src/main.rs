@@ -1002,7 +1002,8 @@ fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) ->
 
     let store_arc = repo.vfs().store();
     let mut store = store_arc.lock().unwrap();
-    let opts = scl_gitio::ExportOptions { to: &to, ref_name: &ref_name, include_encrypted };
+    let known: std::collections::HashMap<scl_core::ObjectId, String> = std::collections::HashMap::new();
+    let opts = scl_gitio::ExportOptions { to: &to, ref_name: &ref_name, include_encrypted, known_git_commits: &known };
     let report = scl_gitio::export_branch(&mut store, tip, &opts)?;
 
     println!(
