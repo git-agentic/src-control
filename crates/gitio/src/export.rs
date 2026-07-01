@@ -267,6 +267,7 @@ pub struct ExportOptions<'a> {
 }
 
 /// Summary of an export. `git_commit` is a hex string so `cli` needs no `gix`.
+#[derive(Debug)]
 pub struct ExportReport {
     pub git_commit: String,
     pub commits_written: usize,
@@ -274,12 +275,67 @@ pub struct ExportReport {
     pub secrets_dropped: usize,
 }
 
+/// Read-only pre-flight scan of the DAG rooted at `tip`: collect the paths of
+/// PROTECTED tree entries and the names of registry secrets, without writing
+/// anything. Used to fail closed before any Git repo is created.
+fn scan_encrypted(store: &mut Store, tip: ObjectId) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let mut protected_paths = Vec::new();
+    let mut secret_names = Vec::new();
+    let mut seen_snaps: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    let mut snaps = vec![tip];
+    while let Some(sid) = snaps.pop() {
+        if !seen_snaps.insert(sid) {
+            continue;
+        }
+        let snap = store.get_snapshot(&sid)?;
+        for name in snap.secrets.keys() {
+            secret_names.push(name.clone());
+        }
+        scan_tree(store, snap.root, String::new(), &mut protected_paths)?;
+        for p in &snap.parents {
+            snaps.push(*p);
+        }
+    }
+    Ok((protected_paths, secret_names))
+}
+
+/// Record PROTECTED entry paths under `prefix`, recursing into subtrees. Uses an
+/// explicit stack so deep trees can't overflow.
+fn scan_tree(store: &mut Store, root: ObjectId, prefix: String, out: &mut Vec<String>) -> anyhow::Result<()> {
+    let mut stack = vec![(root, prefix)];
+    while let Some((id, pre)) = stack.pop() {
+        let tree = store.get_tree(&id)?;
+        for e in &tree.entries {
+            let path = if pre.is_empty() { e.name.clone() } else { format!("{pre}/{}", e.name) };
+            if e.perms & PROTECTED != 0 {
+                out.push(path.clone());
+            }
+            if let EntryKind::Tree = e.kind {
+                stack.push((e.id, path));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Export the snapshot DAG rooted at `tip` into the Git repo named by `opts`,
 /// updating `opts.ref_name` to the exported commit. Re-export is idempotent.
 ///
-/// (Encrypted-content policy is layered on in a later step; this base version
-/// exports everything.)
+/// Fails closed if any snapshot contains protected blobs or registry secrets
+/// and `opts.include_encrypted` is false — no Git repo is created and no
+/// object is written on refusal. With the flag, protected blobs export as
+/// ciphertext and secrets are dropped (counted in the report).
 pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> anyhow::Result<ExportReport> {
+    // Fail closed BEFORE creating or writing anything.
+    let (protected_paths, secret_names) = scan_encrypted(store, tip)?;
+    if !opts.include_encrypted && (!protected_paths.is_empty() || !secret_names.is_empty()) {
+        anyhow::bail!(
+            "refusing to export encrypted content without --include-encrypted:\n  protected paths: {:?}\n  secrets: {:?}",
+            protected_paths, secret_names
+        );
+    }
+    let secrets_dropped = secret_names.len();
+
     let target = GitTarget::open_or_init_bare(opts.to)?;
 
     let mut commit_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
@@ -325,7 +381,7 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
         git_commit: tip_git.to_hex().to_string(),
         commits_written: commit_memo.len(),
         protected_blobs_as_ciphertext: protected,
-        secrets_dropped: 0,
+        secrets_dropped,
     })
 }
 
@@ -497,6 +553,51 @@ mod tests {
 
         std::fs::remove_dir_all(&src).unwrap();
         std::fs::remove_dir_all(&dst).unwrap();
+    }
+
+    // Helper: a snapshot with one PROTECTED entry and one registry secret.
+    fn encrypted_snapshot(store: &mut scl_core::Store) -> scl_core::ObjectId {
+        use scl_core::{Object, Tree, TreeEntry, EntryKind, FileMode, Snapshot, Secret, PROTECTED};
+        use std::collections::BTreeMap;
+        let ct = store.put(Object::blob(b"ciphertext-bytes".to_vec())).unwrap();
+        let root = store.put(Object::Tree(Tree::new(vec![
+            TreeEntry { name: "secret.txt".into(), kind: EntryKind::Blob, id: ct, mode: FileMode::FILE, perms: PROTECTED },
+        ]))).unwrap();
+        let sid = store.put(Object::Secret(Secret { name: "DB_URL".into(), nonce: vec![0;24], ciphertext: vec![1,2,3], wrapped_keys: vec![] })).unwrap();
+        let mut secrets = BTreeMap::new();
+        secrets.insert("DB_URL".to_string(), sid);
+        store.put(Object::Snapshot(Snapshot { root, parents: vec![], author: "t".into(), timestamp: 1, message: "enc".into(), secrets, protection: Default::default() })).unwrap()
+    }
+
+    #[test]
+    fn refuses_encrypted_without_flag() {
+        let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
+        let snap = encrypted_snapshot(&mut store);
+        let dir = std::env::temp_dir().join(format!("scl-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false };
+        let err = export_branch(&mut store, snap, &opts).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("secret.txt") || msg.contains("DB_URL"), "error must name the content: {msg}");
+        assert!(!dir.exists(), "no git repo should be created on refusal");
+    }
+
+    #[test]
+    fn exports_encrypted_with_flag_drops_secrets() {
+        let mut store = scl_core::Store::new(scl_core::StoreConfig::default());
+        let snap = encrypted_snapshot(&mut store);
+        let dir = std::env::temp_dir().join(format!("scl-allow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: true };
+        let report = export_branch(&mut store, snap, &opts).unwrap();
+        assert_eq!(report.protected_blobs_as_ciphertext, 1);
+        assert_eq!(report.secrets_dropped, 1);
+        // The protected file exists in git as its ciphertext; no secret file exists.
+        let out = std::process::Command::new("git").args(["--git-dir", dir.to_str().unwrap(), "ls-tree", "main"]).output().unwrap();
+        let listing = String::from_utf8(out.stdout).unwrap();
+        assert!(listing.contains("secret.txt"));
+        assert!(!listing.contains("DB_URL"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
