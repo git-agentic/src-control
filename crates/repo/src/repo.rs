@@ -816,7 +816,8 @@ impl Repo {
         {
             let store_arc = dst_repo.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            transfer_objects(&transport, &mut store, &tips)?;
+            // Fresh clone dst has no local refs yet → no haves → full transfer.
+            transfer_objects(&transport, &mut store, &tips, &[])?;
         }
 
         // Copy branches + HEAD, and seed origin/* remote-tracking refs so
@@ -856,7 +857,9 @@ impl Repo {
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            transfer_objects(&transport, &mut store, &tips)?;
+            // Derive haves from local refs before the mutable borrow for transfer.
+            let haves = local_have_tips(&self.layout, &store)?;
+            transfer_objects(&transport, &mut store, &tips, &haves)?;
         }
         for (branch, tip) in &remote_refs {
             refs::write_remote_tip(&self.layout, remote, branch, tip)?;
@@ -910,8 +913,28 @@ impl Repo {
     }
 }
 
+/// The tips we already hold locally: every local branch and remote-tracking ref
+/// target that is present in the store. Passed as `haves` so a fetch pulls only
+/// the delta the remote has beyond what we already have. Safe to advertise
+/// because refs advance only after a fully-successful transfer, so every ref
+/// target's closure is complete in the store.
+fn local_have_tips(layout: &Layout, store: &Store) -> Result<Vec<ObjectId>> {
+    let mut out = Vec::new();
+    for (_, id) in refs::list_heads(layout)? {
+        if store.contains(&id) {
+            out.push(id);
+        }
+    }
+    for (_, _, id) in refs::list_remote_tips(layout)? {
+        if store.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
 /// Pull every object reachable from `tips` out of `transport` and into `store`.
-/// Sends the ids the local store already holds as `haves` so the remote can
+/// `haves` tells the remote which objects the local store already has so it can
 /// omit them from the pack; `parse_pack` verifies each record. Callers hold the
 /// store lock across this call, so it must not acquire any other lock. Shared by
 /// `clone_to` and `fetch`.
@@ -919,10 +942,9 @@ fn transfer_objects(
     transport: &impl Transport,
     store: &mut Store,
     tips: &[ObjectId],
+    haves: &[ObjectId],
 ) -> Result<()> {
-    // Tell the remote what we already have so it omits those objects.
-    let haves: Vec<ObjectId> = tips.iter().copied().filter(|id| store.contains(id)).collect();
-    let pack = transport.get_pack(tips, &haves)?;
+    let pack = transport.get_pack(tips, haves)?;
     // parse_pack verifies every record; write each object into the local store.
     for (id, obj) in scl_core::pack::parse_pack(&pack)? {
         let got = store.put(obj)?;
@@ -1954,5 +1976,80 @@ mod tests {
         assert!(matches!(repo.switch("feature"), Err(Error::MergeInProgress)));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Regression: after a clone, an incremental fetch must send only the new
+    /// delta — not the full history. Under the old bug, `transfer_objects`
+    /// derived `haves` from the remote's tips (the objects being fetched), so
+    /// on a clone→advance→fetch cycle the intersection would be empty and the
+    /// remote would re-send the entire reachable closure. The fix derives haves
+    /// from the local repo's refs, which are closure-complete by construction.
+    ///
+    /// This test proves the property directly against `LocalTransport::get_pack`:
+    /// with correct local haves the pack for the new tip MUST exclude objects
+    /// that were already present in the clone.
+    #[test]
+    fn fetch_transfers_only_delta_not_full_history() {
+        let remote_root = tmp_root("delta-remote");
+        let local_root = tmp_root("delta-local");
+        let _ = std::fs::remove_dir_all(&local_root); // clone_to inits it
+
+        // ── step 1: remote gets c1 with a distinctive large blob ─────────────
+        let big_blob_bytes: Vec<u8> = vec![0xCDu8; 4096];
+        let big_blob_id = scl_core::Object::blob(big_blob_bytes.clone()).id();
+        {
+            let remote = Repo::init(&remote_root).unwrap();
+            std::fs::write(remote_root.join("large.bin"), &big_blob_bytes).unwrap();
+            remote.commit("me", "c1 large").unwrap();
+        }
+
+        // ── step 2: clone the remote to local (local holds c1 and its objects) ─
+        let local = Repo::clone_to(&remote_root, &local_root).unwrap();
+        let c1 = local.head_tip().unwrap().expect("clone should have a HEAD tip");
+
+        // ── step 3: remote advances with a small new file (c2) ──────────────
+        let c2 = {
+            let remote = Repo::open(&remote_root).unwrap();
+            std::fs::write(remote_root.join("small.txt"), b"delta").unwrap();
+            remote.commit("me", "c2 small").unwrap()
+        };
+
+        // ── step 4: verify correct haves and delta pack ───────────────────────
+        // Open local store and compute local_have_tips (the fix path).
+        let store_arc = local.vfs.store();
+        let store = store_arc.lock().unwrap();
+
+        let haves = local_have_tips(&local.layout, &store).unwrap();
+        assert!(haves.contains(&c1), "local haves must include c1 ({c1})");
+
+        // Build the delta pack: remote only sends what local doesn't have.
+        let transport = LocalTransport::open(&remote_root).unwrap();
+        let pack = transport.get_pack(&[c2], &haves).unwrap();
+        let entries: Vec<scl_core::ObjectId> = scl_core::pack::parse_pack(&pack)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        // The pack MUST include the new tip snapshot.
+        assert!(
+            entries.contains(&c2),
+            "delta pack must contain c2; got {entries:?}"
+        );
+        // The pack MUST NOT contain c1 (local already has it).
+        assert!(
+            !entries.contains(&c1),
+            "delta pack must not re-send c1 that local already holds"
+        );
+        // The pack MUST NOT contain the large distinctive blob (part of c1's closure).
+        assert!(
+            !entries.contains(&big_blob_id),
+            "delta pack must not re-send the large blob that was in c1"
+        );
+
+        drop(store);
+        drop(local);
+        std::fs::remove_dir_all(&remote_root).unwrap();
+        std::fs::remove_dir_all(&local_root).unwrap();
     }
 }

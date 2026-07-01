@@ -51,7 +51,7 @@ pub fn build_pack(objects: &[(ObjectId, Vec<u8>)]) -> Result<(Vec<u8>, Vec<u8>)>
         pack.extend_from_slice(&compressed);
         entries.push(IndexEntry { id: *id, offset, length: compressed.len() as u64 });
     }
-    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries.sort_by_key(|e| e.id);
 
     let mut idx = Vec::new();
     idx.extend_from_slice(IDX_MAGIC);
@@ -92,7 +92,7 @@ pub fn parse_index(idx: &[u8]) -> Result<Vec<IndexEntry>> {
         id_bytes.copy_from_slice(&idx[base..base + 32]);
         let id = ObjectId::from_bytes(id_bytes);
         if let Some(p) = prev {
-            if !(p < id) {
+            if p >= id {
                 return Err(Error::BadPackIndex("entries not strictly ascending".into()));
             }
         }
