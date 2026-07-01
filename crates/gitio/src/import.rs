@@ -50,6 +50,13 @@ pub fn import_history(
     // sc id for every git commit we resolve this call (seed with `known`).
     let mut mapped: HashMap<gix::ObjectId, ObjectId> = HashMap::new();
     for (hex, sc) in known {
+        if !store.contains(sc) {
+            // Stale mark: the snapshot was pruned (e.g. remote rewind + gc). Skip it so
+            // this commit is re-imported deterministically (import is a pure function of
+            // the git commit → same sc id) and re-rooted, rather than trusting a dangling
+            // id. Keeps marks a recoverable cache, never corrupting (ADR-0018).
+            continue;
+        }
         if let Ok(oid) = gix::ObjectId::from_hex(hex.as_bytes()) {
             mapped.insert(oid, *sc);
         }
@@ -199,6 +206,76 @@ mod tests {
         let r2 = import_history(&mut store, &dir, "main", &known).unwrap();
         assert_eq!(r2.tip, r1.tip);
         assert!(r2.new_marks.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stale_mark_is_skipped_so_pruned_parent_is_reimported() {
+        // Real scenario: fetch A,B → gc prunes B after a remote rewind → remote
+        // re-advances to C (child of B) → re-fetch with a stale mark for B. The
+        // stale mark must be skipped so B (and thus C's parent) re-imports instead
+        // of dangling. Under the pre-fix code C's parent sB is missing.
+        let dir = tmp("stale");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("f"), b"a").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "A"]);
+        std::fs::write(dir.join("f"), b"b").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "B"]);
+
+        let mut store = Store::new(StoreConfig::default());
+        let r1 = import_history(&mut store, &dir, "main", &HashMap::new()).unwrap();
+        // Recover marks for A and B by message.
+        let mut ga_hex = None;
+        let mut gb_hex = None;
+        let sb = r1.tip; // tip is B
+        for (hex, sc) in &r1.new_marks {
+            let snap = store.get_snapshot(sc).unwrap();
+            match snap.message.as_str() {
+                "A" => ga_hex = Some(hex.clone()),
+                "B" => gb_hex = Some(hex.clone()),
+                _ => {}
+            }
+        }
+        let ga_hex = ga_hex.expect("A mark");
+        let gb_hex = gb_hex.expect("B mark");
+        let sa = {
+            // sc id for A = the recorded mark for A.
+            r1.new_marks.iter().find(|(h, _)| *h == ga_hex).unwrap().1
+        };
+
+        // Simulate rewind + gc: B's snapshot is now unreachable and pruned.
+        store.delete(&sb).unwrap();
+        assert!(!store.contains(&sb), "sB must be absent after delete");
+
+        // Remote re-advances: add C (child of B).
+        std::fs::write(dir.join("f"), b"c").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "C"]);
+
+        // Re-fetch carrying the stale marks (gA:sA, gB:sB — sB is gone).
+        let mut known = HashMap::new();
+        known.insert(ga_hex, sa);
+        known.insert(gb_hex, sb);
+        let r2 = import_history(&mut store, &dir, "main", &known).unwrap();
+
+        // The entire ancestry of the new tip must be resident in the store.
+        let mut stack = vec![r2.tip];
+        let mut saw_b = false;
+        while let Some(id) = stack.pop() {
+            assert!(store.contains(&id), "ancestor {id:?} must exist in store");
+            let snap = store.get_snapshot(&id).unwrap();
+            if snap.message == "B" {
+                saw_b = true;
+            }
+            for p in snap.parents {
+                stack.push(p);
+            }
+        }
+        // B was re-created with its same deterministic id.
+        assert!(store.contains(&sb), "sB must be re-imported (deterministic id)");
+        assert!(saw_b, "B must appear in the re-rooted ancestry");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
