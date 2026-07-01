@@ -332,7 +332,12 @@ impl Repo {
 
     /// Merge `branch` into the current branch. Fast-forwards when possible;
     /// auto-commits a two-parent snapshot on a clean merge; on conflicts writes
-    /// markers + merge state and returns `MergeConflicts`.
+    /// markers + merge state and returns `MergeConflicts`. If the current
+    /// branch is unborn (no commits yet), adopts `theirs` wholesale — the same
+    /// fast-forward-from-empty behavior Git uses when merging into an unborn
+    /// branch — so `sc init` followed directly by `sc fetch` + `sc merge`
+    /// (e.g. from a freshly imported git remote) works without an intervening
+    /// local commit.
     pub fn merge(&self, branch: &str, author: &str) -> Result<ObjectId> {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
@@ -343,9 +348,31 @@ impl Repo {
                 "working tree has uncommitted changes; commit before merging".into(),
             ));
         }
-        let ours = self.head_tip()?.ok_or(Error::Unborn)?;
         let theirs = refs::resolve_tip(&self.layout, branch)?
             .ok_or_else(|| Error::NoSuchBranch(branch.to_string()))?;
+        let ours = match self.head_tip()? {
+            Some(ours) => ours,
+            None => {
+                // Unborn local branch: adopt theirs wholesale (fast-forward from empty).
+                let store_arc = self.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                let theirs_snap = store.get_snapshot(&theirs)?;
+                let theirs_root = theirs_snap.root;
+                let theirs_protection = theirs_snap.protection;
+                worktree::materialize(
+                    &self.layout,
+                    &mut store,
+                    theirs_root,
+                    None,
+                    &theirs_protection,
+                    None,
+                )?;
+                drop(store);
+                let branch_name = refs::current_branch(&self.layout)?;
+                refs::write_branch_tip(&self.layout, &branch_name, &theirs)?;
+                return Ok(theirs);
+            }
+        };
 
         // Ancestor short-circuits.
         {
@@ -1458,6 +1485,35 @@ mod tests {
         assert_eq!(std::fs::read(b.join("f.txt")).unwrap(), b"base\nA-change\n");
 
         drop(brepo);
+        std::fs::remove_dir_all(&a).unwrap();
+        std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn merge_into_unborn_branch_adopts_theirs_wholesale() {
+        // A freshly `init`ed repo has an unborn local branch (no commits yet).
+        // Merging a branch into it (e.g. after fetching remote history) must
+        // adopt that branch's tip directly rather than erroring `Unborn`.
+        let a = tmp_root("unborn-merge-src");
+        {
+            let repo = Repo::init(&a).unwrap();
+            std::fs::write(a.join("f.txt"), b"from-theirs\n").unwrap();
+            repo.commit("me", "base").unwrap();
+        }
+        let b = tmp_root("unborn-merge-dst");
+        let _ = std::fs::remove_dir_all(&b);
+        std::fs::create_dir_all(&b).unwrap();
+        let unborn = Repo::init(&b).unwrap();
+        unborn.remote_add("origin", a.to_str().unwrap()).unwrap();
+        let fetched = unborn.fetch("origin").unwrap();
+        assert!(fetched.iter().any(|(br, _)| br == "main"));
+        assert_eq!(unborn.head_tip().unwrap(), None, "local branch is still unborn before merge");
+
+        let merged = unborn.merge("origin/main", "me").unwrap();
+        assert_eq!(std::fs::read(b.join("f.txt")).unwrap(), b"from-theirs\n");
+        assert_eq!(unborn.head_tip().unwrap(), Some(merged));
+
+        drop(unborn);
         std::fs::remove_dir_all(&a).unwrap();
         std::fs::remove_dir_all(&b).unwrap();
     }

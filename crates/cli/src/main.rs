@@ -938,13 +938,63 @@ fn run_remote(op: RemoteOp) -> Result<()> {
     Ok(())
 }
 
+/// Fetch from `remote`, dispatching on its configured kind: a `git`-kind
+/// remote gets a full-history import into a remote-tracking ref (see
+/// `run_fetch_git`); an `sc`-kind remote (or unconfigured, defaulting to `sc`)
+/// uses the existing object-transport fetch.
 fn run_fetch(remote: &str) -> Result<()> {
     let repo = open_repo()?;
-    let remote_refs = repo.fetch(remote)?;
-    println!("fetched {remote}: {} remote branch(es)", remote_refs.len());
-    for (branch, tip) in remote_refs {
-        println!("  {remote}/{branch} -> {}", tip.short());
+    let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
+    match cfg.kind(remote) {
+        Some(scl_repo::RemoteKind::Git) => run_fetch_git(&repo, remote),
+        _ => {
+            let remote_refs = repo.fetch(remote)?;
+            println!("fetched {remote}: {} remote branch(es)", remote_refs.len());
+            for (branch, tip) in remote_refs {
+                println!("  {remote}/{branch} -> {}", tip.short());
+            }
+            Ok(())
+        }
     }
+}
+
+/// Fetch a git-backed remote: import full history for the current branch into
+/// `refs/remotes/<remote>/<branch>`, maintaining the marks map.
+///
+/// Atomicity order: import (object writes) happens first, then new marks are
+/// appended, and the remote-tracking ref is written last. The ref is the
+/// reachability root for gc, so a crash between marks and ref leaves only
+/// gc-collectible orphans rather than a ref pointing at missing objects.
+fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
+    use std::collections::HashMap;
+    let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
+    let url = cfg.url(remote).ok_or_else(|| anyhow::anyhow!("no such remote: {remote}"))?.to_string();
+    let branch = scl_repo::refs::current_branch(repo.layout())?;
+
+    // Known marks: git-oid-hex -> sc-id.
+    let marks = scl_repo::MarksStore::open(repo.layout(), remote)?;
+    let mut known: HashMap<String, scl_core::ObjectId> = HashMap::new();
+    for (g, s) in marks.load()? {
+        let id = s.parse().map_err(|_| anyhow::anyhow!("bad sc id in marks: {s}"))?;
+        known.insert(g, id);
+    }
+
+    let report = {
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        scl_gitio::import_history(&mut store, std::path::Path::new(&url), &branch, &known)?
+    };
+
+    // Persist new marks first, then the reachability root (the tracking ref) last.
+    let new: Vec<(String, String)> =
+        report.new_marks.iter().map(|(g, s)| (g.clone(), s.to_hex().to_string())).collect();
+    marks.append(&new)?;
+    scl_repo::refs::write_remote_tip(repo.layout(), remote, &branch, &report.tip)?;
+
+    println!(
+        "fetched {remote} (git): {}/{branch} -> {} ({} new commit(s))",
+        remote, report.tip.short(), report.new_marks.len()
+    );
     Ok(())
 }
 
