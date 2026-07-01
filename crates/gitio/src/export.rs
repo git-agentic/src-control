@@ -5,9 +5,11 @@
 //! `GitTreeEntry`/`GitMode`/`GitSig` value types, so the rest of export (and the
 //! whole rest of the workspace) stays Git-agnostic.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use scl_core::{EntryKind, FileMode, Object, ObjectId, Snapshot, Store, PROTECTED};
 
 /// A Git repository we write objects and refs into.
 pub(crate) struct GitTarget {
@@ -171,6 +173,89 @@ impl GitTarget {
     }
 }
 
+/// Deterministic Git signature from our freeform author + i64 timestamp. If
+/// `author` looks like `Name <email>`, split it; otherwise name=author, empty
+/// email. Timezone is fixed at +0000 so re-export is byte-identical.
+fn synth_sig(author: &str, timestamp: i64) -> GitSig {
+    if let Some((name, rest)) = author.split_once('<') {
+        if let Some(email) = rest.strip_suffix('>') {
+            return GitSig { name: name.trim().to_string(), email: email.trim().to_string(), time_secs: timestamp };
+        }
+    }
+    GitSig { name: author.to_string(), email: String::new(), time_secs: timestamp }
+}
+
+/// Write our blob to Git once (memoized by our ObjectId).
+fn map_blob(
+    store: &mut Store,
+    target: &GitTarget,
+    id: ObjectId,
+    blob_memo: &mut HashMap<ObjectId, gix::ObjectId>,
+) -> anyhow::Result<gix::ObjectId> {
+    if let Some(&g) = blob_memo.get(&id) {
+        return Ok(g);
+    }
+    let bytes = match store.get(&id)? {
+        Object::Blob(b) => b,
+        other => anyhow::bail!("expected blob for {id}, got {}", other.kind_name()),
+    };
+    let g = target.write_blob(&bytes)?;
+    blob_memo.insert(id, g);
+    Ok(g)
+}
+
+/// Recursively translate our tree to a Git tree (memoized). Increments
+/// `protected_count` for every entry carrying the PROTECTED perms bit (the blob
+/// is exported as-is — it is already ciphertext).
+fn map_tree(
+    store: &mut Store,
+    target: &GitTarget,
+    id: ObjectId,
+    tree_memo: &mut HashMap<ObjectId, gix::ObjectId>,
+    blob_memo: &mut HashMap<ObjectId, gix::ObjectId>,
+    protected_count: &mut usize,
+) -> anyhow::Result<gix::ObjectId> {
+    if let Some(&g) = tree_memo.get(&id) {
+        return Ok(g);
+    }
+    let tree = store.get_tree(&id)?;
+    let mut git_entries = Vec::with_capacity(tree.entries.len());
+    for e in &tree.entries {
+        if e.perms & PROTECTED != 0 {
+            *protected_count += 1;
+        }
+        let (mode, oid) = match e.kind {
+            EntryKind::Tree => (
+                GitMode::Tree,
+                map_tree(store, target, e.id, tree_memo, blob_memo, protected_count)?,
+            ),
+            EntryKind::Blob => {
+                let mode = match e.mode {
+                    m if m == FileMode::EXEC => GitMode::Exec,
+                    FileMode(0o120000) => GitMode::Link,
+                    _ => GitMode::File,
+                };
+                (mode, map_blob(store, target, e.id, blob_memo)?)
+            }
+        };
+        git_entries.push(GitTreeEntry { name: e.name.clone(), mode, oid });
+    }
+    let g = target.write_tree(git_entries)?;
+    tree_memo.insert(id, g);
+    Ok(g)
+}
+
+/// Write a Git commit for `snap` given its already-mapped tree + parent oids.
+fn map_commit(
+    target: &GitTarget,
+    snap: &Snapshot,
+    tree_oid: gix::ObjectId,
+    parent_oids: &[gix::ObjectId],
+) -> anyhow::Result<gix::ObjectId> {
+    let sig = synth_sig(&snap.author, snap.timestamp);
+    target.write_commit(tree_oid, parent_oids, &sig, &snap.message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +305,46 @@ mod tests {
 
         assert_eq!(root.to_hex().to_string(), git_reference_tree_oid());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn single_snapshot_exports_files_and_modes() {
+        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode};
+        use std::collections::{BTreeMap, HashMap};
+        let mut store = Store::new(StoreConfig::default());
+        let blob = store.put(Object::blob(b"fn main(){}".to_vec())).unwrap();
+        let exec = store.put(Object::blob(b"#!/bin/sh\n".to_vec())).unwrap();
+        let root = store.put(Object::Tree(Tree::new(vec![
+            TreeEntry { name: "main.rs".into(), kind: EntryKind::Blob, id: blob, mode: FileMode::FILE, perms: 0 },
+            TreeEntry { name: "run.sh".into(), kind: EntryKind::Blob, id: exec, mode: FileMode::EXEC, perms: 0 },
+        ]))).unwrap();
+        let snap = scl_core::Snapshot { root, parents: vec![], author: "Ada <ada@x>".into(), timestamp: 1_700_000_000, message: "c1".into(), secrets: BTreeMap::new(), protection: Default::default() };
+
+        let dir = std::env::temp_dir().join(format!("scl-map1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = GitTarget::open_or_init_bare(&dir).unwrap();
+        let mut tree_memo = HashMap::new();
+        let mut blob_memo = HashMap::new();
+        let mut protected = 0usize;
+        let tree_oid = map_tree(&mut store, &target, root, &mut tree_memo, &mut blob_memo, &mut protected).unwrap();
+        let cid = map_commit(&target, &snap, tree_oid, &[]).unwrap();
+        target.set_ref_force("refs/heads/main", cid).unwrap();
+
+        // git sees both files with correct modes (100644, 100755).
+        let out = std::process::Command::new("git")
+            .args(["--git-dir", dir.to_str().unwrap(), "ls-tree", "main"]).output().unwrap();
+        let listing = String::from_utf8(out.stdout).unwrap();
+        assert!(listing.contains("100644 blob") && listing.contains("main.rs"), "{listing}");
+        assert!(listing.contains("100755 blob") && listing.contains("run.sh"), "{listing}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn synth_sig_parses_name_email_and_falls_back() {
+        let a = synth_sig("Ada <ada@x>", 42);
+        assert_eq!((a.name.as_str(), a.email.as_str(), a.time_secs), ("Ada", "ada@x", 42));
+        let b = synth_sig("bare-name", 7);
+        assert_eq!((b.name.as_str(), b.email.as_str(), b.time_secs), ("bare-name", "", 7));
     }
 
     #[test]
