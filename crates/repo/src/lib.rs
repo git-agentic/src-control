@@ -6,6 +6,7 @@ pub mod scanner;
 pub mod scanner_patterns;
 pub mod error;
 pub mod gc;
+pub mod git_marks;
 pub mod layout;
 pub mod lock;
 pub mod merge;
@@ -21,6 +22,7 @@ pub mod worktree;
 
 pub use error::{Error, Result};
 pub use gc::GcStats;
+pub use git_marks::MarksStore;
 pub use remote::{RemoteConfig, RemoteKind};
 pub use repo::{Repo, Status};
 pub use scanner::ScanReport;
