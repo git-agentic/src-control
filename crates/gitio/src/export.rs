@@ -124,7 +124,7 @@ impl GitTarget {
             }
             k
         }
-        entries.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+        entries.sort_by_key(sort_key);
 
         let mut tree = gix::objs::Tree::empty();
         for e in entries {
@@ -178,6 +178,9 @@ impl GitTarget {
 /// email. Timezone is fixed at +0000 so re-export is byte-identical.
 fn synth_sig(author: &str, timestamp: i64) -> GitSig {
     if let Some((name, rest)) = author.split_once('<') {
+        // Edge case: `Name <email> trailing` (text after `>`) fails strip_suffix
+        // and falls through to name-only with empty email — acceptable for
+        // freeform author strings.
         if let Some(email) = rest.strip_suffix('>') {
             return GitSig { name: name.trim().to_string(), email: email.trim().to_string(), time_secs: timestamp };
         }
@@ -258,29 +261,47 @@ fn map_commit(
 
 /// Options controlling an export.
 pub struct ExportOptions<'a> {
-    /// Target Git repo path (existing repo, or created bare if absent).
+    /// Target Git repo path; an existing bare repo is opened, otherwise one is
+    /// created with `git init --bare`.
     pub to: &'a Path,
-    /// Ref to update, e.g. "refs/heads/main".
+    /// Fully-qualified Git ref to update, e.g. `"refs/heads/main"`.
     pub ref_name: &'a str,
-    /// Allow exporting protected ciphertext + dropping secrets.
+    /// When true, protected files are exported as their ciphertext blobs and
+    /// registry secrets are dropped; when false the export fails closed if any
+    /// encrypted content is present in history.
     pub include_encrypted: bool,
 }
 
 /// Summary of an export. `git_commit` is a hex string so `cli` needs no `gix`.
 #[derive(Debug)]
 pub struct ExportReport {
+    /// Hex Git commit id of the exported tip (the commit `ref_name` now points
+    /// at).
     pub git_commit: String,
+    /// Total number of commits in the exported history DAG (the full walk from
+    /// tip to roots). Because Git deduplicates by content hash, a re-export into
+    /// a populated repo still reports the full count — not only newly-written
+    /// objects.
     pub commits_written: usize,
+    /// Number of tree entries that carried the PROTECTED bit and were written as
+    /// ciphertext blobs (only non-zero when `include_encrypted` is true).
     pub protected_blobs_as_ciphertext: usize,
+    /// Number of unique registry secret names dropped from history (secrets have
+    /// no Git-native equivalent and cannot be exported safely). Deduped by name
+    /// across all snapshots.
     pub secrets_dropped: usize,
 }
 
 /// Read-only pre-flight scan of the DAG rooted at `tip`: collect the paths of
 /// PROTECTED tree entries and the names of registry secrets, without writing
 /// anything. Used to fail closed before any Git repo is created.
+///
+/// Secret names are deduped across snapshots (the same name in N commits counts
+/// once) so `secrets_dropped` in the report reflects unique names, not
+/// per-snapshot occurrences.
 fn scan_encrypted(store: &mut Store, tip: ObjectId) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let mut protected_paths = Vec::new();
-    let mut secret_names = Vec::new();
+    let mut secret_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut seen_snaps: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
     let mut snaps = vec![tip];
     while let Some(sid) = snaps.pop() {
@@ -289,14 +310,14 @@ fn scan_encrypted(store: &mut Store, tip: ObjectId) -> anyhow::Result<(Vec<Strin
         }
         let snap = store.get_snapshot(&sid)?;
         for name in snap.secrets.keys() {
-            secret_names.push(name.clone());
+            secret_names.insert(name.clone());
         }
         scan_tree(store, snap.root, String::new(), &mut protected_paths)?;
         for p in &snap.parents {
             snaps.push(*p);
         }
     }
-    Ok((protected_paths, secret_names))
+    Ok((protected_paths, secret_names.into_iter().collect()))
 }
 
 /// Record PROTECTED entry paths under `prefix`, recursing into subtrees. Uses an

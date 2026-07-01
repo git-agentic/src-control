@@ -327,3 +327,9 @@ Git trees cannot carry the following src-control metadata; it is dropped on expo
 These are the documented lossy points (see ADR-0016). A future bidirectional-sync
 transport would need a sidecar or extended-attribute convention to preserve them,
 which is out of scope for the initial export.
+
+Note: the fail-closed scan keys on the per-entry `PROTECTED` bit, so content
+committed as plaintext *before* a path was protected remains plaintext in history
+and is neither flagged nor refused by `--include-encrypted`. This is the same
+forward-looking model as git-crypt; export refusal is not a blanket guarantee of
+"no plaintext anywhere in history".

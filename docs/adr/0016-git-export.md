@@ -48,6 +48,11 @@ Import (ADR-0007) plus export gives round-trip interop; full bidirectional sync
   blobs/trees/commits; the lossy points are our extra metadata (secrets registry,
   protection policy, per-entry `perms`) which Git trees cannot carry and which the
   export must handle explicitly rather than silently drop.
+- The fail-closed scan keys on the per-entry `PROTECTED` bit, so content that was
+  committed as plaintext *before* a path was protected remains plaintext in history
+  and is neither flagged nor refused by `--include-encrypted`. This is the same
+  forward-looking model as git-crypt; a reader must not treat export refusal as a
+  blanket "no plaintext anywhere in history" guarantee.
 
 ## Alternatives considered
 

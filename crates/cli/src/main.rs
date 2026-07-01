@@ -997,7 +997,7 @@ fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) ->
         &report.git_commit[..12.min(report.git_commit.len())]
     );
     if report.protected_blobs_as_ciphertext > 0 || report.secrets_dropped > 0 {
-        println!(
+        eprintln!(
             "  warning: {} protected file(s) exported as ciphertext; {} secret(s) dropped (Git cannot enforce confidentiality)",
             report.protected_blobs_as_ciphertext, report.secrets_dropped
         );
