@@ -115,6 +115,9 @@ enum Cmd {
     Push {
         #[arg(default_value = "origin")]
         remote: String,
+        /// For git remotes: allow pushing protected ciphertext and dropping secrets.
+        #[arg(long)]
+        include_encrypted: bool,
     },
     /// Protect a path prefix: files under it are convergently encrypted for the
     /// named recipients on commit. With `--list` (or no prefix), list the rules.
@@ -261,7 +264,7 @@ fn main() -> Result<()> {
         Cmd::Clone { src, dst } => run_clone(src, dst),
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
-        Cmd::Push { remote } => run_push(&remote),
+        Cmd::Push { remote, include_encrypted } => run_push(&remote, include_encrypted),
         Cmd::Protect { prefix, to, list } => run_protect(prefix, to, list),
         Cmd::Grant { prefix, to, identity } => run_grant(prefix, to, identity),
         Cmd::Revoke { prefix, recipient_id } => run_revoke(prefix, recipient_id),
@@ -998,10 +1001,96 @@ fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_push(remote: &str) -> Result<()> {
+fn run_push(remote: &str, include_encrypted: bool) -> Result<()> {
     let repo = open_repo()?;
-    let tip = repo.push(remote)?;
-    println!("pushed to {remote}: {}", tip.short());
+    let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
+    match cfg.kind(remote) {
+        Some(scl_repo::RemoteKind::Git) => run_push_git(&repo, remote, include_encrypted),
+        _ => {
+            let tip = repo.push(remote)?;
+            println!("pushed to {remote}: {}", tip.short());
+            Ok(())
+        }
+    }
+}
+
+/// Push the current branch to a git-backed remote, fast-forward-only. The
+/// snapshot↔commit marks map carries identity so already-pushed commits are
+/// reused, not rewritten.
+///
+/// Atomicity order: `export_branch` writes the git objects and advances the git
+/// ref, then new marks are appended. A crash between export and `marks.append`
+/// leaves git advanced but sc marks missing, so the next push sees a remote
+/// commit it can't map and refuses "fetch first" — a safe refuse, not corruption.
+fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) -> Result<()> {
+    use std::collections::HashMap;
+    let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
+    let url = cfg.url(remote).ok_or_else(|| anyhow::anyhow!("no such remote: {remote}"))?.to_string();
+    let branch = scl_repo::refs::current_branch(repo.layout())?;
+    let ref_name = format!("refs/heads/{branch}");
+    let local_tip = repo.head_tip()?.ok_or_else(|| anyhow::anyhow!("branch is unborn — nothing to push"))?;
+
+    // Load marks both directions.
+    let marks = scl_repo::MarksStore::open(repo.layout(), remote)?;
+    let pairs = marks.load()?;
+    let mut git_to_sc: HashMap<String, scl_core::ObjectId> = HashMap::new();
+    let mut known_sc_to_git: HashMap<scl_core::ObjectId, String> = HashMap::new();
+    for (g, s) in &pairs {
+        let id: scl_core::ObjectId = s.parse().map_err(|_| anyhow::anyhow!("bad sc id in marks: {s}"))?;
+        git_to_sc.insert(g.clone(), id);
+        known_sc_to_git.insert(id, g.clone());
+    }
+
+    // Fast-forward gate against the remote git ref.
+    if let Some(remote_git_hex) = scl_gitio::read_ref(std::path::Path::new(&url), &ref_name)? {
+        match git_to_sc.get(&remote_git_hex) {
+            Some(&remote_sc) if remote_sc == local_tip => {
+                println!("push {remote} (git): already up to date");
+                return Ok(());
+            }
+            Some(&remote_sc) => {
+                let store_arc = repo.vfs().store();
+                let mut store = store_arc.lock().unwrap();
+                if !scl_repo::merge::is_ancestor(&mut store, remote_sc, local_tip)? {
+                    anyhow::bail!("non-fast-forward: remote {remote}/{branch} has commits not in local history");
+                }
+            }
+            None => {
+                anyhow::bail!(
+                    "non-fast-forward: remote {remote}/{branch} points at a commit sc has never seen ({}); fetch first",
+                    &remote_git_hex[..12.min(remote_git_hex.len())]
+                );
+            }
+        }
+    }
+
+    // Export (reusing known commits), then persist newly-written marks.
+    let report = {
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let opts = scl_gitio::ExportOptions {
+            to: std::path::Path::new(&url),
+            ref_name: &ref_name,
+            include_encrypted,
+            known_git_commits: &known_sc_to_git,
+        };
+        scl_gitio::export_branch(&mut store, local_tip, &opts)?
+    };
+    let new: Vec<(String, String)> =
+        report.new_marks.iter().map(|(g, s)| (g.clone(), s.to_hex().to_string())).collect();
+    marks.append(&new)?;
+
+    println!(
+        "pushed {} commit(s) to {remote} (git) at {ref_name}: {}",
+        report.new_marks.len(),
+        &report.git_commit[..12.min(report.git_commit.len())]
+    );
+    if report.protected_blobs_as_ciphertext > 0 || report.secrets_dropped > 0 {
+        eprintln!(
+            "  warning: {} protected file(s) pushed as ciphertext; {} secret(s) dropped (Git cannot enforce confidentiality)",
+            report.protected_blobs_as_ciphertext, report.secrets_dropped
+        );
+    }
     Ok(())
 }
 
