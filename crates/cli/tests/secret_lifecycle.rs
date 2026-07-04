@@ -49,3 +49,36 @@ fn secret_rotate_new_value_changes_what_run_injects() {
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::remove_dir_all(&keys).unwrap();
 }
+
+#[test]
+fn escrow_set_and_show_roundtrip() {
+    let root = tmp("escrow-cfg");
+    let keys = tmp("escrow-cfg-keys");
+    let (_e_id, escrow_pk) = keygen(&keys, "escrow");
+
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(sc(&repo, &["init"]).status.success());
+    std::fs::write(repo.join(".sc/recipients.toml"), "[recipients]\n").unwrap();
+
+    // show with none set
+    let none = sc(&repo, &["escrow", "show"]);
+    assert!(none.status.success());
+    assert!(String::from_utf8_lossy(&none.stdout).to_lowercase().contains("no escrow"));
+
+    // set by raw pubkey, then show it back + the non-guarantee note
+    assert!(sc(&repo, &["escrow", "set", &escrow_pk]).status.success());
+    let shown = sc(&repo, &["escrow", "show"]);
+    let out = String::from_utf8_lossy(&shown.stdout);
+    assert!(out.contains(&escrow_pk), "escrow show prints the key");
+    assert!(out.to_lowercase().contains("policy") || out.to_lowercase().contains("not enforce"),
+        "escrow show states the non-guarantee");
+
+    // recipients section preserved after the rewrite
+    let cfg = std::fs::read_to_string(repo.join(".sc/recipients.toml")).unwrap();
+    assert!(cfg.contains("[recipients]"));
+    assert!(cfg.contains("[escrow]"));
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}

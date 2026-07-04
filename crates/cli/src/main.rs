@@ -169,6 +169,19 @@ enum Cmd {
         #[arg(long)]
         include_encrypted: bool,
     },
+    /// Manage the break-glass escrow recipient (auto-included at seal/protect).
+    Escrow {
+        #[command(subcommand)]
+        op: EscrowOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum EscrowOp {
+    /// Set the escrow key (a `scl-pk-…` pubkey, or a name from [recipients]).
+    Set { key_or_name: String },
+    /// Show the configured escrow key (and its recovery non-guarantee).
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -286,6 +299,7 @@ fn main() -> Result<()> {
         Cmd::Revoke { prefix, recipient_id } => run_revoke(prefix, recipient_id),
         Cmd::Gc { prune_expire } => run_gc(&prune_expire),
         Cmd::Export { to, r#ref, include_encrypted } => run_export(to, r#ref, include_encrypted),
+        Cmd::Escrow { op } => run_escrow(op),
     }
 }
 
@@ -556,11 +570,20 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
 
 // ---- .sc/recipients.toml loader ------------------------------------
 
-/// Parsed `.sc/recipients.toml`: `name -> scl-pk-<hex>`.
-#[derive(serde::Deserialize)]
+/// Parsed `.sc/recipients.toml`: `[recipients] name -> scl-pk-<hex>`, plus an
+/// optional `[escrow]` break-glass key auto-included at seal/protect time.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
 struct RecipientsFile {
     #[serde(default)]
     recipients: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    escrow: Option<EscrowEntry>,
+}
+
+/// A single break-glass escrow recipient entry: `[escrow] key = "scl-pk-…"`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EscrowEntry {
+    key: String,
 }
 
 /// Resolve recipient names to public keys from a recipients file.
@@ -577,6 +600,24 @@ fn load_recipients(
         out.insert(name, pk);
     }
     Ok(out)
+}
+
+/// The configured escrow public key, if any. Missing file or missing `[escrow]`
+/// section → `None`.
+fn load_escrow(path: &std::path::Path) -> Result<Option<scl_crypto::PublicKey>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let parsed: RecipientsFile = toml::from_str(&text)?;
+    match parsed.escrow {
+        Some(e) => Ok(Some(
+            scl_crypto::PublicKey::from_key_string(&e.key)
+                .map_err(|_| anyhow::anyhow!("bad escrow public key"))?,
+        )),
+        None => Ok(None),
+    }
 }
 
 // ---- sc secret-demo ------------------------------------------------
@@ -904,6 +945,49 @@ fn run_secret(op: SecretOp) -> Result<()> {
                        ciphertext stays in history and anyone holding the old DEK keeps it — \
                        rotate the underlying credential too");
         }
+    }
+    Ok(())
+}
+
+/// `sc escrow set/show`: configure (or display) the break-glass escrow
+/// recipient in `.sc/recipients.toml`. Config only — auto-including the
+/// escrow key at seal/protect time is a separate concern.
+fn run_escrow(op: EscrowOp) -> Result<()> {
+    let repo = open_repo()?;
+    let path = repo.layout().dot_sc.join("recipients.toml");
+    match op {
+        EscrowOp::Set { key_or_name } => {
+            // Accept a raw pubkey, else resolve a [recipients] name.
+            let pk = match scl_crypto::PublicKey::from_key_string(&key_or_name) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    let dir = load_recipients(&path)?;
+                    dir.get(&key_or_name).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("'{key_or_name}' is not a public key or a known recipient")
+                    })?
+                }
+            };
+            // Round-trip the file so [recipients] is preserved.
+            let mut file: RecipientsFile = match std::fs::read_to_string(&path) {
+                Ok(t) => toml::from_str(&t)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => RecipientsFile::default(),
+                Err(e) => return Err(e.into()),
+            };
+            file.escrow = Some(EscrowEntry { key: pk.to_key_string() });
+            std::fs::write(&path, toml::to_string(&file)?)?;
+            println!("escrow set to {}", pk.recipient_id());
+        }
+        EscrowOp::Show => match load_escrow(&path)? {
+            Some(pk) => {
+                println!("escrow key: {}", pk.to_key_string());
+                println!("recipient id: {}", pk.recipient_id());
+                println!(
+                    "note: escrow is a recovery *policy* convenience, not enforcement — a \
+                     committer using the raw API can seal without it."
+                );
+            }
+            None => println!("no escrow key set"),
+        },
     }
     Ok(())
 }
