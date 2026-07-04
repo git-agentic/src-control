@@ -82,3 +82,39 @@ fn escrow_set_and_show_roundtrip() {
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::remove_dir_all(&keys).unwrap();
 }
+
+#[test]
+fn escrow_is_auto_included_on_add_and_recoverable() {
+    let root = tmp("escrow-auto");
+    let keys = tmp("escrow-auto-keys");
+    let (_a_id, alice_pk) = keygen(&keys, "alice");
+    let (escrow_id, escrow_pk) = keygen(&keys, "escrow");
+
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(sc(&repo, &["init"]).status.success());
+    std::fs::write(repo.join(".sc/recipients.toml"), format!("[recipients]\nalice = \"{alice_pk}\"\n")).unwrap();
+    assert!(sc(&repo, &["escrow", "set", &escrow_pk]).status.success());
+
+    // add a secret only to alice; escrow must be auto-included → 2 recipients.
+    assert!(sc(&repo, &["secret", "add", "DB_URL", "--to", "alice", "--value", "topsecret"]).status.success());
+    let list = sc(&repo, &["secret", "list"]);
+    let out = String::from_utf8_lossy(&list.stdout);
+    assert!(out.contains("DB_URL") && out.contains("2 recipient"), "escrow auto-included: {out}");
+
+    // the escrow identity can recover the value.
+    let code = sc(&repo, &["run", "--identity", escrow_id.to_str().unwrap(),
+        "--", "sh", "-c", "test \"$DB_URL\" = topsecret"]).status.code().unwrap();
+    assert_eq!(code, 0, "escrow identity recovers the secret");
+
+    // rotating (default recipients) keeps escrow (still 2, still recoverable).
+    assert!(sc(&repo, &["secret", "rotate", "DB_URL", "--value", "rotated"]).status.success());
+    let list2 = sc(&repo, &["secret", "list"]);
+    assert!(String::from_utf8_lossy(&list2.stdout).contains("2 recipient"), "escrow retained on rotate");
+    let code2 = sc(&repo, &["run", "--identity", escrow_id.to_str().unwrap(),
+        "--", "sh", "-c", "test \"$DB_URL\" = rotated"]).status.code().unwrap();
+    assert_eq!(code2, 0, "escrow recovers the rotated value");
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}

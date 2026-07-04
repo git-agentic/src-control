@@ -899,9 +899,10 @@ fn run_secret(op: SecretOp) -> Result<()> {
     match op {
         SecretOp::Add { name, to, value } => {
             let dir = load_recipients(&recipients_path)?;
-            let pks = resolve_names(&dir, &to)?;
+            let mut pks = resolve_names(&dir, &to)?;
+            pks = append_escrow(pks, load_escrow(&recipients_path)?);
             repo.secret_add(&name, value.as_bytes(), &pks)?;
-            println!("added secret {name} for {} recipient(s)", to.len());
+            println!("added secret {name} for {} recipient(s)", pks.len());
         }
         SecretOp::Grant { name, to, identity } => {
             let dir = load_recipients(&recipients_path)?;
@@ -926,14 +927,20 @@ fn run_secret(op: SecretOp) -> Result<()> {
         }
         SecretOp::Rotate { name, value, to, identity } => {
             let dir = load_recipients(&recipients_path)?;
+            let escrow = load_escrow(&recipients_path)?;
             // Recipient set: explicit --to, else the secret's current recipients.
             let pks = if to.is_empty() {
                 let ids = repo.secret_recipients(&name)?;
-                let pool: Vec<scl_crypto::PublicKey> = dir.values().cloned().collect();
+                // Pool = named recipients + escrow, so an escrow-only id resolves.
+                let mut pool: Vec<scl_crypto::PublicKey> = dir.values().cloned().collect();
+                if let Some(e) = escrow.clone() {
+                    pool.push(e);
+                }
                 resolve_ids_to_pubkeys(&ids, &pool)?
             } else {
                 resolve_names(&dir, &to)?
             };
+            let pks = append_escrow(pks, escrow);
             let new_value = value.as_deref().map(|s| s.as_bytes());
             let identity = match &value {
                 Some(_) => None, // sealing a new value needs no decryption
@@ -1018,6 +1025,20 @@ fn resolve_identity_opt(flag: Option<PathBuf>) -> Result<Option<scl_crypto::Secr
         return Ok(None);
     }
     Ok(Some(scl_crypto::FileKeyProvider::new(path).identity()?))
+}
+
+/// Append `escrow` to `pks` unless a key with the same bytes is already present
+/// (so passing escrow explicitly is harmless).
+fn append_escrow(
+    mut pks: Vec<scl_crypto::PublicKey>,
+    escrow: Option<scl_crypto::PublicKey>,
+) -> Vec<scl_crypto::PublicKey> {
+    if let Some(e) = escrow {
+        if !pks.iter().any(|p| p.to_bytes() == e.to_bytes()) {
+            pks.push(e);
+        }
+    }
+    pks
 }
 
 fn resolve_names(
@@ -1250,9 +1271,10 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool) -> Result<()
     }
     let prefix = prefix.unwrap();
     let dir = load_recipients(&repo.layout().dot_sc.join("recipients.toml"))?;
-    let pks = resolve_names(&dir, &to)?;
+    let mut pks = resolve_names(&dir, &to)?;
+    pks = append_escrow(pks, load_escrow(&repo.layout().dot_sc.join("recipients.toml"))?);
     let id = repo.protect(&prefix, &pks, None)?;
-    println!("protected {prefix} for {} recipient(s): {}", to.len(), id.short());
+    println!("protected {prefix} for {} recipient(s): {}", pks.len(), id.short());
     Ok(())
 }
 
