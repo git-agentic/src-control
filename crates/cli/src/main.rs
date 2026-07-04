@@ -215,6 +215,22 @@ enum SecretOp {
     },
     /// List committed secrets.
     List,
+    /// Rotate a secret's value under a fresh DEK (the cryptographic cutover that
+    /// revoke does not perform). With --value, seal a new value (no identity
+    /// needed); without, recover the current value with --identity and re-seal it.
+    /// Recipients default to the secret's current set; --to overrides.
+    Rotate {
+        name: String,
+        /// New value. Omit to keep the current value (requires --identity).
+        #[arg(long)]
+        value: Option<String>,
+        /// Recipient names (default: the secret's current recipients).
+        #[arg(long, value_delimiter = ',')]
+        to: Vec<String>,
+        /// Your identity (required when --value is omitted, to recover the value).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
 }
 
 #[derive(Parser)]
@@ -860,11 +876,33 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("bad recipient id"))?;
             repo.secret_revoke(&name, &rid)?;
             println!("revoked {recipient_id} from {name}");
+            eprintln!("note: revoke is metadata-only; run `sc secret rotate {name}` for a cryptographic cutover");
         }
         SecretOp::List => {
             for info in repo.secret_list()? {
                 println!("{}  ({} recipient(s))", info.name, info.recipients);
             }
+        }
+        SecretOp::Rotate { name, value, to, identity } => {
+            let dir = load_recipients(&recipients_path)?;
+            // Recipient set: explicit --to, else the secret's current recipients.
+            let pks = if to.is_empty() {
+                let ids = repo.secret_recipients(&name)?;
+                let pool: Vec<scl_crypto::PublicKey> = dir.values().cloned().collect();
+                resolve_ids_to_pubkeys(&ids, &pool)?
+            } else {
+                resolve_names(&dir, &to)?
+            };
+            let new_value = value.as_deref().map(|s| s.as_bytes());
+            let identity = match &value {
+                Some(_) => None, // sealing a new value needs no decryption
+                None => Some(load_identity(identity)?),
+            };
+            repo.secret_rotate(&name, new_value, &pks, identity.as_ref())?;
+            println!("rotated secret {name} for {} recipient(s)", pks.len());
+            eprintln!("note: rotation cuts off future reads via the current registry; the old \
+                       ciphertext stays in history and anyone holding the old DEK keeps it — \
+                       rotate the underlying credential too");
         }
     }
     Ok(())
@@ -906,6 +944,30 @@ fn resolve_names(
         .iter()
         .map(|n| dir.get(n).cloned().ok_or_else(|| anyhow::anyhow!("unknown recipient: {n}")))
         .collect()
+}
+
+/// Map current recipient ids back to public keys drawn from `pool`. Errors,
+/// listing the unresolved ids, when a current recipient has no key in `pool`
+/// (e.g. missing from `.sc/recipients.toml`) — we cannot re-wrap a key we lack.
+fn resolve_ids_to_pubkeys(
+    ids: &[scl_crypto::RecipientId],
+    pool: &[scl_crypto::PublicKey],
+) -> Result<Vec<scl_crypto::PublicKey>> {
+    let mut out = Vec::with_capacity(ids.len());
+    let mut unresolved = Vec::new();
+    for id in ids {
+        match pool.iter().find(|pk| pk.recipient_id().as_str() == id.as_str()) {
+            Some(pk) => out.push(pk.clone()),
+            None => unresolved.push(id.as_str().to_string()),
+        }
+    }
+    if !unresolved.is_empty() {
+        anyhow::bail!(
+            "cannot rotate: no public key in .sc/recipients.toml for current recipient(s): {}",
+            unresolved.join(", ")
+        );
+    }
+    Ok(out)
 }
 
 fn run_clone(src: PathBuf, dst: PathBuf) -> Result<()> {
