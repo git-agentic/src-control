@@ -54,6 +54,17 @@ across every phase.
   git-oid ↔ sc-id marks map rather than a fatter object model, reusing P9's
   confidentiality gate and P6's fast-forward-only push semantics. Scoped to
   local Git repos on disk; network Git is a later transport swap. (ADR-0018.)
+- **Phase 11 — Secret/permission lifecycle (rotation + escrow).** `sc secret
+  rotate <name> [--value <new>] [--to <names>] [--identity <key>]` re-seals a
+  secret's value under a fresh DEK, composed entirely from existing
+  `seal`/`open` primitives (no crypto changes) — closing the true-revocation
+  gap ADR-0008/0009 deferred. `sc escrow set/show` configures a single
+  break-glass recipient key in `.sc/recipients.toml [escrow]`, auto-appended
+  (deduped, forward-only) whenever a secret is sealed or a path is protected.
+  `revoke` stays metadata-only, now with a hint pointing at `rotate`. Rotation
+  is secrets-only — convergent encryption makes protected-path DEK rotation
+  security-meaningless (ADR-0014) — and rotation is a future-reads cutover,
+  not erasure: old ciphertext remains reachable from history. (ADR-0019.)
 
 ## Completed phases (usability-first ordering)
 
@@ -66,6 +77,7 @@ across every phase.
 | **P8 — Packfiles + GC** | Scale storage; reclaim space | `sc gc` packs reachable objects and prunes unreachable loose objects; clone/fetch/push use bulk-pack transfer | [0015](docs/adr/0015-packfiles-and-gc.md) |
 | **P9 — Git export / interop** | Round-trip with Git | `sc export --to <git-repo>` writes current-branch history as Git commits; `git log` reads it back | [0016](docs/adr/0016-git-export.md) |
 | **P10 — Git as a remote** | Bidirectional sync with Git | `sc remote add <name> <git-path> --git`; `sc push hub` writes commits `git log` can read; a second sc repo `sc fetch hub` + `sc merge hub/main` gets the content back | [0018](docs/adr/0018-git-as-a-remote.md) |
+| **P11 — Secret/permission lifecycle** | Cryptographic cutover + break-glass recovery for secrets | `sc secret rotate <name> --value <new>` re-seals under a fresh DEK; `sc escrow set <key>` auto-includes a recovery recipient at `secret add`/`rotate`/`protect` | [0019](docs/adr/0019-secret-lifecycle.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -100,6 +112,11 @@ remaining differentiators.
   export path (now marks-aware) and P9's confidentiality gate, and closes the
   interop loop P9 left one-way. It also reuses P6's remote/fetch/merge/push
   machinery, so it could not land before either P6 or P9.
+- **P11 (Secret/permission lifecycle)** follows Phase 2/P7 directly: rotation
+  and escrow are pure compositions of the existing `scl-crypto` primitives and
+  the Phase 3 commit/registry machinery, with no dependency on P4–P10. It
+  slots last chronologically because it hardens already-shipped pillars
+  (Phase 2 secrets, P7 paths) rather than adding a new capability axis.
 
 ## Dependencies
 
@@ -115,7 +132,7 @@ scl-crypto (Phase 2) ──> P5 Secret scanner, P7 Encrypted paths
 
 All completed phases build on the Phase 3 persistent store. P5 and P7
 additionally build on the Phase 2 cryptography. Otherwise the phases are loosely
-coupled; the order above records the path taken to get to the P10 milestone.
+coupled; the order above records the path taken to get to the P11 milestone.
 
 ## Cross-cutting principles (adapted from git.agentic)
 
@@ -134,7 +151,7 @@ These apply across phases rather than to one:
   accidental plaintext secrets are rejected at `put` time (P5). The two are
   complementary, not alternatives.
 
-## Deferred beyond P10
+## Deferred beyond P11
 
 Tracked but out of scope for this roadmap horizon:
 
@@ -143,8 +160,11 @@ Tracked but out of scope for this roadmap horizon:
   remotes: P10 proves the marks-map bijection against local `.git` paths only —
   network Git (GitHub over https/ssh) is a later transport swap onto the same
   translation core.
-- **Secret/permission lifecycle**: value rotation, break-glass / escrow recipient
-  keys, and bulk re-wrap ergonomics.
+- **Bulk re-wrap** of all secrets and protected prefixes on an org-wide
+  recipient/escrow change (P11 ships per-secret/per-path retrofit only —
+  rotation and re-wrap apply one at a time).
+- **Multiple escrow keys** / escrow key rotation (P11 ships a single
+  break-glass key in `.sc/recipients.toml [escrow]`).
 - **Sub-tree / partial sharing** and sparse checkouts.
 - **Merge ergonomics**: rebase, cherry-pick, and richer conflict resolution UX
   beyond P4's detection/representation.

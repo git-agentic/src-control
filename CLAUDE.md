@@ -117,6 +117,11 @@ cargo run --bin sc -- remote add <name> <git-path> --git   # register a git-back
 cargo run --bin sc -- fetch <git-remote>                    # import git history -> remote-tracking ref
 cargo run --bin sc -- push <git-remote> [--include-encrypted]  # export sc history -> git ref (ff-only)
 bash demo/run_git_remote_demo.sh                            # git-as-a-remote round-trip proof
+cargo run --bin sc -- secret rotate <name> --value <new>       # re-seal under a fresh DEK
+cargo run --bin sc -- secret rotate <name> --identity <key>    # same value, fresh DEK
+cargo run --bin sc -- escrow set <pubkey-or-name>              # break-glass recovery key
+cargo run --bin sc -- escrow show
+bash demo/run_lifecycle_demo.sh                                # rotation + escrow proof
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -169,5 +174,27 @@ initialized (unborn) branch by adopting the incoming snapshot wholesale,
 needed because the demo's second repo merges a git-fetched branch into a repo
 with no local commits yet. See ADR-0018.
 
-Remaining follow-ons: break-glass escrow key guidance and network transport for
-remotes (including network Git).
+**Phase 11 is built.** `sc secret rotate <name> [--value <new>] [--to <names>]
+[--identity <key>]` re-seals a secret's value under a fresh DEK, composed
+entirely from existing `seal`/`open` primitives (`crates/crypto` is
+unchanged). With `--value`, seals the new plaintext directly; without it,
+recovers the current value via `--identity` and re-seals it. Recipients
+default to the secret's current set (resolved by reverse `recipient_id`
+lookup against `.sc/recipients.toml`) or `--to`. This is secrets-only —
+per-file protected paths use convergent encryption, where DEK "rotation" is
+either dedup-breaking or security-meaningless, so path lifecycle stays on
+recipient re-wrap (`grant`/`revoke`). `sc secret revoke` remains
+metadata-only (unchanged behavior), now printing a hint to run `rotate` for
+an actual cryptographic cutover. `sc escrow set <pubkey-or-name>` / `sc escrow
+show` configure a single break-glass recipient key in `.sc/recipients.toml
+[escrow]`, auto-appended (deduped) whenever `secret add`, `secret rotate`, or
+`protect` seals/wraps — forward-only (existing secrets/paths gain escrow only
+when next rotated/re-wrapped) and policy, not enforcement (nothing stops a
+caller from bypassing the CLI and omitting it). **Rotation ≠ erasure:**
+content-addressed history means the old ciphertext object remains reachable
+and decryptable by anyone who kept the old DEK; rotation cuts off *future*
+reads through the current registry, and real security requires rotating the
+underlying external credential too. See ADR-0019.
+
+Remaining follow-ons: network transport for remotes (including network Git),
+plus P11's own noted sub-follow-ons — bulk re-wrap and multiple escrow keys.

@@ -29,6 +29,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0015](0015-packfiles-and-gc.md) | Packfiles and reachability-based garbage collection | Accepted | 8 |
 | [0016](0016-git-export.md) | Git export for round-trip interop | Accepted | 9 |
 | [0018](0018-git-as-a-remote.md) | Git as a remote (bidirectional sync) | Accepted | 10 |
+| [0019](0019-secret-lifecycle.md) | Secret/permission lifecycle (rotation + escrow) | Accepted | 11 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
