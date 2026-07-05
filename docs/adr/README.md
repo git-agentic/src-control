@@ -31,6 +31,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0018](0018-git-as-a-remote.md) | Git as a remote (bidirectional sync) | Accepted | 10 |
 | [0019](0019-secret-lifecycle.md) | Secret/permission lifecycle (rotation + escrow) | Accepted | 11 |
 | [0020](0020-six-crate-workspace.md) | Six-crate workspace with a strict dependency direction | Accepted | foundation |
+| [0021](0021-durability-and-concurrency-hardening.md) | Durability and concurrency hardening for `.sc/` | Accepted | hardening |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
