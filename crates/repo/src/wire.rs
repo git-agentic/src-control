@@ -313,11 +313,13 @@ pub fn err_from_wire(code: u8, msg: String) -> Error {
 
 // --- response body builders/decoders (one symmetric pair per verb shape) ---
 
+/// Response body for Hello: the server's protocol version.
 pub fn u32_body(v: u32) -> Vec<u8> {
     let mut b = Vec::new();
     put_u32(&mut b, v);
     b
 }
+/// Decode a Hello response body.
 pub fn decode_u32_body(b: &[u8]) -> Result<u32> {
     let mut c = Cur::new(b);
     let v = c.u32()?;
@@ -325,11 +327,13 @@ pub fn decode_u32_body(b: &[u8]) -> Result<u32> {
     Ok(v)
 }
 
+/// Response body for HeadBranch: the current branch name.
 pub fn str_body(s: &str) -> Vec<u8> {
     let mut b = Vec::new();
     put_str(&mut b, s);
     b
 }
+/// Decode a HeadBranch response body.
 pub fn decode_str_body(b: &[u8]) -> Result<String> {
     let mut c = Cur::new(b);
     let s = c.str()?;
@@ -337,9 +341,11 @@ pub fn decode_str_body(b: &[u8]) -> Result<String> {
     Ok(s)
 }
 
+/// Response body for HasObject: whether the object is stored.
 pub fn bool_body(v: bool) -> Vec<u8> {
     vec![v as u8]
 }
+/// Decode a HasObject response body.
 pub fn decode_bool_body(b: &[u8]) -> Result<bool> {
     let mut c = Cur::new(b);
     let v = c.u8()?;
@@ -351,11 +357,13 @@ pub fn decode_bool_body(b: &[u8]) -> Result<bool> {
     }
 }
 
+/// Response body for PutPack: the object IDs written to the repo.
 pub fn ids_body(ids: &[ObjectId]) -> Vec<u8> {
     let mut b = Vec::new();
     put_ids(&mut b, ids);
     b
 }
+/// Decode a PutPack response body.
 pub fn decode_ids_body(b: &[u8]) -> Result<Vec<ObjectId>> {
     let mut c = Cur::new(b);
     let ids = c.ids()?;
@@ -363,6 +371,7 @@ pub fn decode_ids_body(b: &[u8]) -> Result<Vec<ObjectId>> {
     Ok(ids)
 }
 
+/// Response body for ListRefs: the remote's (branch, tip) pairs.
 pub fn refs_body(refs: &[(String, ObjectId)]) -> Vec<u8> {
     let mut b = Vec::new();
     put_u32(&mut b, refs.len() as u32);
@@ -372,6 +381,7 @@ pub fn refs_body(refs: &[(String, ObjectId)]) -> Vec<u8> {
     }
     b
 }
+/// Decode a ListRefs response body.
 pub fn decode_refs_body(b: &[u8]) -> Result<Vec<(String, ObjectId)>> {
     let mut c = Cur::new(b);
     let n = c.u32()? as usize;
