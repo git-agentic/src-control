@@ -859,7 +859,11 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
             for p in repo.merge_conflicts()? {
                 println!("  {p}");
             }
-            Ok(()) // not an error exit; the user has work to do
+            // Exit 1 so `sc merge x && sc commit` can't commit conflict markers.
+            // Drop the repo first (releases .sc/lock) — process::exit skips
+            // destructors and would otherwise leave a stale lock file.
+            drop(repo);
+            std::process::exit(1);
         }
         Err(scl_repo::Error::UpToDate) => {
             println!("already up to date");
