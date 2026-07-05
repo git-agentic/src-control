@@ -135,6 +135,10 @@ cargo run --bin sc -- remote add <name> <git-path> --git   # register a git-back
 cargo run --bin sc -- fetch <git-remote>                    # import git history -> remote-tracking ref
 cargo run --bin sc -- push <git-remote> [--include-encrypted]  # export sc history -> git ref (ff-only)
 bash demo/run_git_remote_demo.sh                            # git-as-a-remote round-trip proof
+cargo run --bin sc -- remote add <name> ssh://[user@]host[:port]/path   # ssh-native remote
+cargo run --bin sc -- clone ssh://host/path <dst>   # clone over ssh (spawns `ssh … sc serve --stdio`)
+cargo run --bin sc -- serve --stdio <path>          # wire-protocol server (invoked via ssh; not interactive)
+bash demo/run_ssh_remote_demo.sh                    # ssh transport round-trip proof (SC_SSH shim, no sshd)
 cargo run --bin sc -- secret rotate <name> --value <new>       # re-seal under a fresh DEK
 cargo run --bin sc -- secret rotate <name> --identity <key>    # same value, fresh DEK
 cargo run --bin sc -- escrow set <pubkey-or-name>              # break-glass recovery key
@@ -214,5 +218,15 @@ and decryptable by anyone who kept the old DEK; rotation cuts off *future*
 reads through the current registry, and real security requires rotating the
 underlying external credential too. See ADR-0019.
 
-Remaining follow-ons: network transport for remotes (including network Git),
-plus P11's own noted sub-follow-ons — bulk re-wrap and multiple escrow keys.
+**Phase 12 is built.** sc-native network transport over SSH: a framed stdio
+wire protocol mirrors the 8 `Transport` verbs (version handshake, typed
+`NonFastForward`/`NotARepo` errors); `sc serve --stdio` dispatches onto the
+existing `LocalTransport` (CAS, pack verification reused verbatim); the
+client spawns the user's `ssh` for `ssh://` URLs, overridable via `SC_SSH`
+(GIT_SSH pattern) — tests and `demo/run_ssh_remote_demo.sh` drive the full
+ssh:// code path through a shim with no sshd. Zero new dependencies. Accepted
+limitations: 4 GiB frame cap, repo paths with spaces unsupported over real
+ssh, `sc` must be on the server's PATH. See ADR-0022.
+
+Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
+frames, bulk re-wrap, and multiple escrow keys.

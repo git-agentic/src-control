@@ -284,8 +284,10 @@ Phase 8 adds three tightly coupled capabilities to the persistent store:
   transport read path resolves packed, sharded, and compressed objects from the
   remote store. This replaces the prior object-at-a-time transfer.
 
-Remaining follow-ons: network transport for remotes (merge shipped as Phase 4;
-break-glass escrow shipped as Phase 11).
+Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
+frames, bulk re-wrap, and multiple escrow keys (merge shipped as Phase 4;
+break-glass escrow shipped as Phase 11; ssh-native network transport shipped
+as Phase 12).
 
 ## Phase 9 — Git export (built)
 
@@ -400,3 +402,17 @@ rotated/re-wrapped) and policy, not enforcement.
 object reachable, and anyone who kept the old DEK can still decrypt it.
 Rotation cuts off *future* reads through the current registry; real security
 requires rotating the underlying external credential too. See ADR-0019.
+
+## Phase 12 — Network transport over SSH (built)
+
+`sc clone / fetch / push` work against `ssh://[user@]host[:port]/path`
+remotes. The wire protocol mirrors the 8 `Transport` verbs over length-
+prefixed frames with a version handshake; the server (`sc serve --stdio`) is
+a dispatch loop around `LocalTransport`, so CAS ref updates and pack
+verification apply verbatim server-side. The client spawns the user's `ssh`
+(overridable via `SC_SSH`, Git's `GIT_SSH` pattern — the demo and tests drive
+the full ssh:// path through a local shim, no sshd needed). Typed errors
+(`NonFastForward`, `NotARepo`) survive the wire; an interrupted push leaves
+at worst unreachable objects, never a torn ref. Confidentiality is unchanged
+by construction: objects travel as canonical bytes, ciphertext stays
+ciphertext. See ADR-0022.
