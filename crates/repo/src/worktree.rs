@@ -304,8 +304,13 @@ pub fn materialize(
                     // No identity or no matching key: skip without writing. Remove
                     // any pre-existing on-disk file at this path so stale plaintext
                     // can't linger when a path becomes protected across a switch for
-                    // a non-recipient (confidentiality).
-                    let _ = std::fs::remove_file(&full);
+                    // a non-recipient (confidentiality). A failed removal must
+                    // surface — swallowing it leaves plaintext on disk.
+                    match std::fs::remove_file(&full) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                     skipped.push(path.clone());
                 }
             }
@@ -355,6 +360,53 @@ mod tests {
         assert_eq!(paths, vec![".scignore", "src/main.rs", "tracked.log"]);
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stale_plaintext_removal_is_an_error_not_silent() {
+        use std::os::unix::fs::PermissionsExt;
+        // When a non-recipient materializes a tree with a PROTECTED path, any
+        // stale on-disk plaintext at that path must be removed. If removal
+        // fails, plaintext would silently linger — a confidentiality leak — so
+        // materialize must surface the failure, not swallow it.
+        let (layout, mut store) = tmp_objects("stale-ro");
+        std::fs::create_dir_all(layout.root.join("vault")).unwrap();
+        std::fs::write(layout.root.join("vault/secret.txt"), b"plaintext").unwrap();
+
+        let blob = store.put(Object::blob(b"ciphertext".to_vec())).unwrap();
+        let inner = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "secret.txt".into(),
+                kind: EntryKind::Blob,
+                id: blob,
+                mode: FileMode::FILE,
+                perms: PROTECTED,
+            }])))
+            .unwrap();
+        let root_tree = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "vault".into(),
+                kind: EntryKind::Tree,
+                id: inner,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+
+        // Read-only parent dir: unlink of vault/secret.txt now fails.
+        let vault = layout.root.join("vault");
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = materialize(&layout, &mut store, root_tree, None, &Default::default(), None);
+
+        // Restore perms before asserting so cleanup always works.
+        std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "swallowing a failed stale-plaintext removal leaks plaintext");
+        assert!(vault.join("secret.txt").exists());
+
+        drop(store);
+        std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
     #[test]
