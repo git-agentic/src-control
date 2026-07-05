@@ -768,6 +768,18 @@ impl Repo {
             .position(|p| p.prefix == prefix)
             .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
 
+        // Refuse to empty the rule's recipient set: subsequent commits under the
+        // prefix would seal new content for nobody (the empty-recipient footgun).
+        let survives = protection.prefixes[rule_idx].recipients.iter().any(|pk| {
+            scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != recipient_id.as_str()
+        });
+        if !survives {
+            return Err(Error::InvalidArgument(format!(
+                "revoking the last recipient would leave {prefix} readable by nobody; \
+                 grant another recipient first"
+            )));
+        }
+
         let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
         let rid = recipient_id.as_str();
         for blob_id in protected_ids {
