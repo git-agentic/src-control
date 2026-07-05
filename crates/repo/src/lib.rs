@@ -3,6 +3,7 @@
 
 pub mod diff3;
 pub mod scanner;
+pub mod textdiff;
 pub mod scanner_patterns;
 pub mod error;
 pub mod gc;

@@ -47,13 +47,25 @@ enum Cmd {
     Commit {
         #[arg(short, long)]
         message: String,
-        #[arg(long, default_value = "you")]
-        author: String,
+        /// Author recorded on the snapshot (default: $SC_AUTHOR, then the OS
+        /// username).
+        #[arg(long)]
+        author: Option<String>,
     },
     /// Show working-tree changes against HEAD.
-    Status,
+    Status {
+        /// Emit machine-readable JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show line-level working-tree changes against HEAD (unified diff).
+    Diff,
     /// Show commit history from HEAD.
-    Log,
+    Log {
+        /// Emit machine-readable JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a new branch at the current tip.
     Branch { name: String },
     /// Switch HEAD to a branch and materialize it. Protected files decrypt when
@@ -73,11 +85,10 @@ enum Cmd {
     },
     /// Merge a branch into the current branch (or fast-forward).
     ///
-    /// On conflicts this command prints the conflicted files and exits 0 (not an
-    /// error) — the working tree is left with conflict markers and a merge in
-    /// progress. Check `sc status` (or scripts should check it) before chaining
-    /// further commands, since `sc merge x && sc commit` would otherwise commit
-    /// the markers.
+    /// On conflicts this command prints the conflicted files and exits 1 — the
+    /// working tree is left with conflict markers and a merge in progress, so
+    /// `sc merge x && sc commit` cannot commit the markers. Resolve, then
+    /// `sc commit` (or `sc merge --abort`).
     Merge {
         /// Branch to merge in.
         branch: Option<String>,
@@ -85,8 +96,10 @@ enum Cmd {
         /// the BRANCH argument is ignored.
         #[arg(long)]
         abort: bool,
-        #[arg(long, default_value = "you")]
-        author: String,
+        /// Author recorded on the merge snapshot (default: $SC_AUTHOR, then the
+        /// OS username).
+        #[arg(long)]
+        author: Option<String>,
     },
     /// Scan the working tree for plaintext secrets without committing.
     Scan,
@@ -227,7 +240,11 @@ enum SecretOp {
         recipient_id: String,
     },
     /// List committed secrets.
-    List,
+    List {
+        /// Emit machine-readable JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
     /// Rotate a secret's value under a fresh DEK (the cryptographic cutover that
     /// revoke does not perform). With --value, seal a new value (no identity
     /// needed); without, recover the current value with --identity and re-seal it.
@@ -288,13 +305,14 @@ fn main() -> Result<()> {
         Cmd::Keygen { out } => run_keygen(out),
         Cmd::SecretDemo(args) => run_secret_demo(args),
         Cmd::Init => run_init(),
-        Cmd::Commit { message, author } => run_commit(&author, &message),
-        Cmd::Status => run_status(),
-        Cmd::Log => run_log(),
+        Cmd::Commit { message, author } => run_commit(&resolve_author(author), &message),
+        Cmd::Status { json } => run_status(json),
+        Cmd::Diff => run_diff(),
+        Cmd::Log { json } => run_log(json),
         Cmd::Branch { name } => run_branch(&name),
         Cmd::Switch { name, identity } => run_switch(&name, identity),
         Cmd::Scan => run_scan(),
-        Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &author),
+        Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &resolve_author(author)),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
         Cmd::Clone { src, dst } => run_clone(src, dst),
@@ -813,8 +831,22 @@ fn run_scan() -> Result<()> {
     std::process::exit(1);
 }
 
-fn run_status() -> Result<()> {
+fn run_status(json: bool) -> Result<()> {
     let repo = open_repo()?;
+    if json {
+        let s = repo.status()?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "added": s.added,
+                "modified": s.modified,
+                "deleted": s.deleted,
+                "merge_in_progress": repo.merge_in_progress(),
+                "conflicts": repo.merge_conflicts()?,
+            })
+        );
+        return Ok(());
+    }
     if repo.merge_in_progress() {
         println!("merge in progress; resolve and `sc commit` (or `sc merge --abort`):");
         let conflicts = repo.merge_conflicts()?;
@@ -880,12 +912,71 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
     }
 }
 
-fn run_log() -> Result<()> {
+fn run_log(json: bool) -> Result<()> {
     let repo = open_repo()?;
-    for (id, snap) in repo.log()? {
-        println!("{} {} — {}", id.short(), snap.author, snap.message);
+    let entries = repo.log()?;
+    if json {
+        let arr: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(id, snap)| {
+                serde_json::json!({
+                    "id": id.to_hex(),
+                    "author": snap.author,
+                    "timestamp": snap.timestamp,
+                    "message": snap.message,
+                    "parents": snap.parents.iter().map(|p| p.to_hex()).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(arr));
+        return Ok(());
+    }
+    for (id, snap) in entries {
+        let merge = if snap.parents.len() > 1 { " (merge)" } else { "" };
+        println!(
+            "{} {} {} — {}{}",
+            id.short(),
+            fmt_utc(snap.timestamp),
+            snap.author,
+            snap.message,
+            merge
+        );
     }
     Ok(())
+}
+
+/// Show line-level working-tree changes against HEAD.
+fn run_diff() -> Result<()> {
+    let repo = open_repo()?;
+    print!("{}", repo.diff_unified()?);
+    Ok(())
+}
+
+/// Resolve the commit/merge author: explicit `--author`, then `$SC_AUTHOR`,
+/// then the OS username, then the historical `"you"` placeholder.
+fn resolve_author(flag: Option<String>) -> String {
+    flag.or_else(|| std::env::var("SC_AUTHOR").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| std::env::var("USER").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| std::env::var("USERNAME").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "you".to_string())
+}
+
+/// Unix seconds → `YYYY-MM-DD HH:MM` UTC, no chrono dependency (civil-from-days
+/// per Howard Hinnant's algorithm).
+fn fmt_utc(ts: i64) -> String {
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, secs / 3600, (secs % 3600) / 60)
 }
 
 fn run_branch(name: &str) -> Result<()> {
@@ -935,9 +1026,18 @@ fn run_secret(op: SecretOp) -> Result<()> {
             println!("revoked {recipient_id} from {name}");
             eprintln!("note: revoke is metadata-only; run `sc secret rotate {name}` for a cryptographic cutover");
         }
-        SecretOp::List => {
-            for info in repo.secret_list()? {
-                println!("{}  ({} recipient(s))", info.name, info.recipients);
+        SecretOp::List { json } => {
+            let infos = repo.secret_list()?;
+            if json {
+                let arr: Vec<serde_json::Value> = infos
+                    .iter()
+                    .map(|i| serde_json::json!({"name": i.name, "recipients": i.recipients}))
+                    .collect();
+                println!("{}", serde_json::Value::Array(arr));
+            } else {
+                for info in infos {
+                    println!("{}  ({} recipient(s))", info.name, info.recipients);
+                }
             }
         }
         SecretOp::Rotate { name, value, value_stdin, to, identity } => {

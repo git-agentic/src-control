@@ -308,7 +308,7 @@ impl Repo {
             root,
             parents,
             author: author.to_string(),
-            timestamp: 0,
+            timestamp: unix_now(),
             message: message.to_string(),
             secrets,
             protection,
@@ -332,6 +332,71 @@ impl Repo {
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         worktree::diff_worktree(&self.layout, &mut store, head_root, &protection)
+    }
+
+    /// Line-level unified diff of the working tree against HEAD (`sc diff`).
+    ///
+    /// Text files get standard `---`/`+++`/`@@` hunks; a file with a NUL byte
+    /// on either side is reported as binary. `PROTECTED` HEAD entries follow
+    /// the same rules as [`Repo::status`]: absent-on-disk is clean (skipped
+    /// checkout, not a deletion), an on-disk edit is detected by convergent
+    /// re-encryption — but the content is never shown (it would be ciphertext
+    /// vs plaintext noise at best, a leak at worst).
+    pub fn diff_unified(&self) -> Result<String> {
+        use scl_core::PROTECTED;
+        let head_root = self.head_tip()?.map(|t| self.snapshot(&t)).transpose()?.map(|s| s.root);
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let head = match head_root {
+            Some(root) => worktree::tree_file_entries_with_perms(&mut store, root)?,
+            None => BTreeMap::new(),
+        };
+        let tracked: std::collections::BTreeSet<String> = head.keys().cloned().collect();
+        let wt: BTreeMap<String, Vec<u8>> = worktree::read_worktree(&self.layout, &tracked)?
+            .into_iter()
+            .map(|(p, b, _)| (p, b))
+            .collect();
+
+        let mut paths: std::collections::BTreeSet<&String> = wt.keys().collect();
+        paths.extend(head.keys());
+
+        let mut out = String::new();
+        for path in paths {
+            let disk = wt.get(path);
+            match head.get(path) {
+                None => {
+                    // Added file.
+                    let bytes = disk.expect("path came from one of the two maps");
+                    push_file_diff(&mut out, path, &[], bytes);
+                }
+                Some((blob_id, _mode, perms)) if *perms & PROTECTED != 0 => {
+                    // Never show protected content; report the change status only.
+                    if let Some(bytes) = disk {
+                        let disk_id = Object::blob(scl_crypto::encrypt_path(bytes).0).id();
+                        if disk_id != *blob_id {
+                            out.push_str(&format!(
+                                "protected file changed: {path} (content not shown)\n"
+                            ));
+                        }
+                    }
+                }
+                Some((blob_id, _mode, _perms)) => {
+                    let old = match store.get(blob_id)? {
+                        Object::Blob(b) => b,
+                        _ => continue,
+                    };
+                    match disk {
+                        None => push_file_diff(&mut out, path, &old, &[]),
+                        Some(bytes) => {
+                            if Object::blob(bytes.clone()).id() != *blob_id {
+                                push_file_diff(&mut out, path, &old, bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Conflicted paths if a merge is in progress (empty otherwise).
@@ -979,6 +1044,28 @@ impl Repo {
         transport.update_ref(&branch, &local_tip, expected_old.as_ref())?;
         Ok(local_tip)
     }
+}
+
+/// Current unix time in seconds, for snapshot timestamps. Snapshot ids
+/// legitimately depend on commit time (as in Git); nothing in the system
+/// requires two separate commits of identical content to share an id.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Append one file's diff to `out`: unified hunks for text, a one-line notice
+/// for binary content (NUL byte on either side).
+fn push_file_diff(out: &mut String, path: &str, old: &[u8], new: &[u8]) {
+    if old.contains(&0) || new.contains(&0) {
+        out.push_str(&format!("Binary files a/{path} and b/{path} differ\n"));
+        return;
+    }
+    let old_s = String::from_utf8_lossy(old);
+    let new_s = String::from_utf8_lossy(new);
+    out.push_str(&crate::textdiff::unified(path, &old_s, &new_s));
 }
 
 /// The tips we already hold locally: every local branch and remote-tracking ref
