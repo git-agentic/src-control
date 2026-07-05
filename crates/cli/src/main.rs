@@ -112,8 +112,17 @@ enum Cmd {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Clone a local repo into a new directory.
-    Clone { src: PathBuf, dst: PathBuf },
+    /// Clone a repo (local path or `ssh://` URL) into a new directory.
+    Clone { src: String, dst: PathBuf },
+    /// Serve a repo over stdin/stdout to a remote `sc` client (invoked by
+    /// `ssh` for ssh:// remotes; not intended for interactive use).
+    Serve {
+        /// Speak the wire protocol on stdin/stdout (required; the only mode).
+        #[arg(long)]
+        stdio: bool,
+        /// Repo root to serve (the directory containing `.sc/`).
+        path: PathBuf,
+    },
     /// Manage remotes.
     Remote {
         #[command(subcommand)]
@@ -316,6 +325,7 @@ fn main() -> Result<()> {
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
         Cmd::Clone { src, dst } => run_clone(src, dst),
+        Cmd::Serve { stdio, path } => run_serve(stdio, path),
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
         Cmd::Push { remote, include_encrypted } => run_push(&remote, include_encrypted),
@@ -1211,10 +1221,22 @@ fn resolve_ids_to_pubkeys(
     Ok(out)
 }
 
-fn run_clone(src: PathBuf, dst: PathBuf) -> Result<()> {
-    let repo = scl_repo::Repo::clone_to(&src, &dst)?;
+fn run_clone(src: String, dst: PathBuf) -> Result<()> {
+    let repo = scl_repo::Repo::clone_url(&src, &dst)?;
     let n = repo.branches()?.len();
-    println!("cloned {} into {} ({} branch(es))", src.display(), dst.display(), n);
+    println!("cloned {} into {} ({} branch(es))", src, dst.display(), n);
+    Ok(())
+}
+
+/// Serve a repo over the wire protocol on stdin/stdout. Invoked as the
+/// remote-side command by `ssh` for `ssh://` remotes.
+fn run_serve(stdio: bool, path: PathBuf) -> Result<()> {
+    if !stdio {
+        anyhow::bail!("sc serve requires --stdio (the only supported mode)");
+    }
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    scl_repo::wire::serve(&path, &mut stdin, &mut stdout)?;
     Ok(())
 }
 
@@ -1226,6 +1248,9 @@ fn run_remote(op: RemoteOp) -> Result<()> {
                 repo.remote_add_git(&name, &url)?;
                 println!("added git remote {name} -> {url}");
             } else {
+                if url.starts_with("ssh://") {
+                    scl_repo::SshUrl::parse(&url)?; // fail fast on malformed URLs
+                }
                 repo.remote_add(&name, &url)?;
                 println!("added remote {name} -> {url}");
             }
