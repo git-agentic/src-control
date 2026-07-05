@@ -183,6 +183,13 @@ impl Transport for StdioTransport {
 /// The path is the repo root *on the server* and keeps its leading `/`.
 /// Known limitation: paths containing spaces are unsupported over real ssh
 /// (the remote shell splits the command) — see ADR-0022.
+///
+/// A host or user starting with `-` is rejected at parse time: `ssh_command`
+/// places them as bare argv positionals (`user@host`), and `ssh` itself
+/// parses a leading `-` as an option flag — the Git CVE-2017-1000117 class of
+/// argv injection (flag smuggling). The trailing `--` in `ssh_command` only
+/// protects the remote command, not the host/user positional, so this must
+/// be caught here before anything spawns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SshUrl {
     pub user: Option<String>,
@@ -217,6 +224,18 @@ impl SshUrl {
         };
         if host.is_empty() {
             return Err(Error::InvalidArgument(format!("ssh url has empty host: {url}")));
+        }
+        if host.starts_with('-') {
+            return Err(Error::InvalidArgument(format!(
+                "ssh url host looks like an option flag: {url}"
+            )));
+        }
+        if let Some(u) = &user {
+            if u.starts_with('-') {
+                return Err(Error::InvalidArgument(format!(
+                    "ssh url host looks like an option flag: {url}"
+                )));
+            }
         }
         Ok(SshUrl { user, host: host.to_string(), port, path: path.to_string() })
     }
@@ -425,16 +444,26 @@ mod tests {
     #[test]
     fn ssh_url_rejects_malformed_forms() {
         for bad in [
-            "/plain/path",              // not ssh
-            "ssh://host",               // no path
-            "ssh:///path",              // empty host
-            "ssh://host:notaport/path", // bad port
+            "/plain/path",                     // not ssh
+            "ssh://host",                      // no path
+            "ssh:///path",                     // empty host
+            "ssh://host:notaport/path",        // bad port
+            "ssh://-oProxyCommand=evil/path",  // host looks like an option flag
+            "ssh://-user@host/path",           // user looks like an option flag
         ] {
             assert!(
                 matches!(SshUrl::parse(bad), Err(Error::InvalidArgument(_))),
                 "should reject {bad}"
             );
         }
+    }
+
+    #[test]
+    fn ssh_url_allows_hosts_with_internal_dashes() {
+        let u = SshUrl::parse("ssh://my-host/path").unwrap();
+        assert_eq!(u.host, "my-host");
+        assert_eq!(u.user, None);
+        assert_eq!(u.path, "/path");
     }
 
     #[test]
