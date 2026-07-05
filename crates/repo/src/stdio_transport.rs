@@ -178,6 +178,78 @@ impl Transport for StdioTransport {
     }
 }
 
+/// A parsed `ssh://[user@]host[:port]/abs/path` remote URL.
+///
+/// The path is the repo root *on the server* and keeps its leading `/`.
+/// Known limitation: paths containing spaces are unsupported over real ssh
+/// (the remote shell splits the command) — see ADR-0022.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SshUrl {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: Option<u16>,
+    pub path: String,
+}
+
+impl SshUrl {
+    /// Parse an `ssh://` URL; anything malformed is `InvalidArgument` with a
+    /// message naming the URL, so `remote add` can fail fast.
+    pub fn parse(url: &str) -> Result<SshUrl> {
+        let rest = url
+            .strip_prefix("ssh://")
+            .ok_or_else(|| Error::InvalidArgument(format!("not an ssh:// url: {url}")))?;
+        let slash = rest
+            .find('/')
+            .ok_or_else(|| Error::InvalidArgument(format!("ssh url has no repo path: {url}")))?;
+        let (authority, path) = rest.split_at(slash);
+        let (user, hostport) = match authority.split_once('@') {
+            Some((u, h)) => (Some(u.to_string()), h),
+            None => (None, authority),
+        };
+        let (host, port) = match hostport.split_once(':') {
+            Some((h, p)) => {
+                let port = p.parse::<u16>().map_err(|_| {
+                    Error::InvalidArgument(format!("bad port in ssh url: {url}"))
+                })?;
+                (h, Some(port))
+            }
+            None => (hostport, None),
+        };
+        if host.is_empty() {
+            return Err(Error::InvalidArgument(format!("ssh url has empty host: {url}")));
+        }
+        Ok(SshUrl { user, host: host.to_string(), port, path: path.to_string() })
+    }
+}
+
+/// The command that reaches `sc serve --stdio` on the far side: the user's
+/// `ssh` binary (or `$SC_SSH`, Git's `GIT_SSH` pattern — tests and the demo
+/// point it at a shim so the whole ssh:// path runs without an sshd).
+pub(crate) fn ssh_command(url: &SshUrl) -> Command {
+    let program = std::env::var("SC_SSH").unwrap_or_else(|_| "ssh".to_string());
+    let mut cmd = Command::new(program);
+    if let Some(port) = url.port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    match &url.user {
+        Some(user) => cmd.arg(format!("{user}@{}", url.host)),
+        None => cmd.arg(&url.host),
+    };
+    cmd.arg("--").arg("sc").arg("serve").arg("--stdio").arg(&url.path);
+    cmd
+}
+
+/// Open the right [`Transport`] for a remote URL: `ssh://` spawns the wire
+/// client; anything else is a local `.sc/` path.
+pub fn open_transport(url: &str) -> Result<Box<dyn Transport>> {
+    if url.starts_with("ssh://") {
+        let parsed = SshUrl::parse(url)?;
+        Ok(Box::new(StdioTransport::spawn(ssh_command(&parsed))?))
+    } else {
+        Ok(Box::new(crate::transport::LocalTransport::open(url)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +405,61 @@ mod tests {
             Error::ConnectionLost(msg) => assert!(msg.contains("definitely-not-a-program")),
             other => panic!("expected ConnectionLost, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ssh_url_parses_all_forms() {
+        let u = SshUrl::parse("ssh://alice@host.example:2222/srv/repo").unwrap();
+        assert_eq!(u.user.as_deref(), Some("alice"));
+        assert_eq!(u.host, "host.example");
+        assert_eq!(u.port, Some(2222));
+        assert_eq!(u.path, "/srv/repo");
+
+        let u = SshUrl::parse("ssh://host/repo").unwrap();
+        assert_eq!(u.user, None);
+        assert_eq!(u.port, None);
+        assert_eq!(u.host, "host");
+        assert_eq!(u.path, "/repo");
+    }
+
+    #[test]
+    fn ssh_url_rejects_malformed_forms() {
+        for bad in [
+            "/plain/path",              // not ssh
+            "ssh://host",               // no path
+            "ssh:///path",              // empty host
+            "ssh://host:notaport/path", // bad port
+        ] {
+            assert!(
+                matches!(SshUrl::parse(bad), Err(Error::InvalidArgument(_))),
+                "should reject {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_command_builds_the_expected_argv() {
+        let u = SshUrl::parse("ssh://alice@host:2222/srv/repo").unwrap();
+        let cmd = ssh_command(&u);
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["-p", "2222", "alice@host", "--", "sc", "serve", "--stdio", "/srv/repo"]);
+
+        let u = SshUrl::parse("ssh://host/repo").unwrap();
+        let cmd = ssh_command(&u);
+        let args: Vec<String> =
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["host", "--", "sc", "serve", "--stdio", "/repo"]);
+    }
+
+    #[test]
+    fn open_transport_dispatches_local_paths_to_local_transport() {
+        let root = tmp_repo("factory");
+        // A plain path must open (LocalTransport) and answer verbs.
+        let t = open_transport(root.to_str().unwrap()).unwrap();
+        assert_eq!(t.head_branch().unwrap(), "main");
+        // A malformed ssh URL fails fast in parsing, before spawning anything.
+        assert!(matches!(open_transport("ssh://nopath"), Err(Error::InvalidArgument(_))));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

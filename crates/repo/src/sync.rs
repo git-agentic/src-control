@@ -14,7 +14,8 @@ use crate::worktree;
 use crate::repo::validate_branch_name;
 use crate::remote::RemoteConfig;
 use crate::repo::Repo;
-use crate::transport::{LocalTransport, Transport};
+use crate::stdio_transport::open_transport;
+use crate::transport::Transport;
 
 impl Repo {
     /// Add a named remote to `.sc/config`. The name becomes a path component
@@ -41,16 +42,21 @@ impl Repo {
         Ok(cfg.remote.into_iter().map(|(n, r)| (n, r.url)).collect())
     }
 
-    /// Clone the repo at `src` into a fresh repo at `dst`. Transfers all objects
-    /// reachable from src's branches via `LocalTransport`, copies refs + HEAD,
-    /// seeds `origin/*` remote-tracking refs, records `origin = src`, and
-    /// materializes HEAD into the dst working tree.
+    /// Clone the repo at local path `src` into a fresh repo at `dst`.
+    /// Path-flavored convenience over [`Repo::clone_url`].
+    pub fn clone_to(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<Repo> {
+        Self::clone_url(&src.as_ref().display().to_string(), dst)
+    }
+
+    /// Clone the repo at `src_url` (local path or `ssh://…`) into a fresh repo
+    /// at `dst`. Transfers all objects reachable from src's branches, copies
+    /// refs + HEAD, seeds `origin/*` remote-tracking refs, records
+    /// `origin = src_url`, and materializes HEAD into the dst working tree.
     ///
     /// On `Err`, `dst` may be left with a partially-initialized `.sc/`; the
     /// caller should remove it before retrying.
-    pub fn clone_to(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<Repo> {
-        let src = src.as_ref();
-        let transport = LocalTransport::open(src)?;
+    pub fn clone_url(src_url: &str, dst: impl AsRef<Path>) -> Result<Repo> {
+        let transport = open_transport(src_url)?;
         let remote_refs = transport.list_refs()?;
         let head_branch = transport.head_branch()?;
 
@@ -62,7 +68,7 @@ impl Repo {
             let store_arc = dst_repo.vfs.store();
             let mut store = store_arc.lock().unwrap();
             // Fresh clone dst has no local refs yet → no haves → full transfer.
-            transfer_objects(&transport, &mut store, &tips, &[])?;
+            transfer_objects(transport.as_ref(), &mut store, &tips, &[])?;
         }
 
         // Copy branches + HEAD, and seed origin/* remote-tracking refs so
@@ -74,7 +80,7 @@ impl Repo {
         refs::write_head(&dst_repo.layout, &head_branch)?;
 
         // Record origin.
-        dst_repo.remote_add("origin", &src.display().to_string())?;
+        dst_repo.remote_add("origin", src_url)?;
 
         // Materialize HEAD into the working tree. No identity is available at
         // clone time, so PROTECTED files are skipped (ciphertext stays in objects
@@ -95,7 +101,7 @@ impl Repo {
     pub fn fetch(&self, remote: &str) -> Result<Vec<(String, ObjectId)>> {
         let cfg = RemoteConfig::load(&self.layout)?;
         let url = cfg.url(remote).ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
-        let transport = LocalTransport::open(url)?;
+        let transport = open_transport(url)?;
         let remote_refs = transport.list_refs()?;
 
         let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
@@ -104,7 +110,7 @@ impl Repo {
             let mut store = store_arc.lock().unwrap();
             // Derive haves from local refs before the mutable borrow for transfer.
             let haves = local_have_tips(&self.layout, &store)?;
-            transfer_objects(&transport, &mut store, &tips, &haves)?;
+            transfer_objects(transport.as_ref(), &mut store, &tips, &haves)?;
         }
         for (branch, tip) in &remote_refs {
             refs::write_remote_tip(&self.layout, remote, branch, tip)?;
@@ -118,7 +124,7 @@ impl Repo {
     pub fn push(&self, remote: &str) -> Result<ObjectId> {
         let cfg = RemoteConfig::load(&self.layout)?;
         let url = cfg.url(remote).ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
-        let transport = LocalTransport::open(url)?;
+        let transport = open_transport(url)?;
         let branch = refs::current_branch(&self.layout)?;
         let local_tip = self.head_tip()?.ok_or(Error::Unborn)?;
 
@@ -190,7 +196,7 @@ pub(crate) fn local_have_tips(layout: &Layout, store: &Store) -> Result<Vec<Obje
 /// store lock across this call, so it must not acquire any other lock. Shared by
 /// `clone_to` and `fetch`.
 fn transfer_objects(
-    transport: &impl Transport,
+    transport: &dyn Transport,
     store: &mut Store,
     tips: &[ObjectId],
     haves: &[ObjectId],
@@ -204,4 +210,35 @@ fn transfer_objects(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::repo::Repo;
+
+    #[test]
+    fn clone_url_with_plain_path_matches_clone_to() {
+        let pid = std::process::id();
+        let src = std::env::temp_dir().join(format!("scl-cloneurl-src-{pid}"));
+        let dst = std::env::temp_dir().join(format!("scl-cloneurl-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+        std::fs::create_dir_all(&src).unwrap();
+
+        let repo = Repo::init(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"one").unwrap();
+        let tip = repo.commit("t", "c1").unwrap();
+
+        let cloned = Repo::clone_url(src.to_str().unwrap(), &dst).unwrap();
+        assert_eq!(cloned.head_tip().unwrap(), Some(tip));
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"one");
+        // origin records the URL string verbatim.
+        assert_eq!(
+            cloned.remotes().unwrap(),
+            vec![("origin".to_string(), src.to_str().unwrap().to_string())]
+        );
+
+        std::fs::remove_dir_all(&src).unwrap();
+        std::fs::remove_dir_all(&dst).unwrap();
+    }
 }

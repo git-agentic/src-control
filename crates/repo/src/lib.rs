@@ -33,5 +33,5 @@ pub use remote::{RemoteConfig, RemoteKind};
 pub use repo::{Repo, Status};
 pub use scanner::ScanReport;
 pub use secrets::SecretInfo;
-pub use stdio_transport::StdioTransport;
+pub use stdio_transport::{open_transport, SshUrl, StdioTransport};
 pub use worktree::Diff;
