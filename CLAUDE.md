@@ -103,6 +103,15 @@ cargo run --bin sc -- status                 # diff working tree vs HEAD
 cargo run --bin sc -- log                    # show commit history
 cargo run --bin sc -- branch <name>          # create a new branch at current tip
 cargo run --bin sc -- switch <name>          # switch branch + materialize working tree
+cargo run --bin sc -- merge <ref>            # three-way merge (ff when possible)
+cargo run --bin sc -- scan                   # preview the commit-time secret scan
+cargo run --bin sc -- clone <src> <dst>      # copy a repo (objects + refs)
+cargo run --bin sc -- protect <prefix> --to <recipient>   # encrypt matching paths (P7)
+cargo run --bin sc -- grant <prefix> --to <recipient> --identity <key>   # path-protection grant
+cargo run --bin sc -- revoke <prefix> --recipient-id <id>                # path-protection revoke
+                                             # NB: top-level grant/revoke act on protected
+                                             # path prefixes; `secret grant/revoke` act on
+                                             # named secrets — two different surfaces
 cargo run --bin sc -- secret add <name> --to <recipient> --value <val>
 cargo run --bin sc -- secret grant <name> --to <recipient> --identity <key>
 cargo run --bin sc -- secret revoke <name> --recipient-id <id>

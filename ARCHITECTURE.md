@@ -59,7 +59,9 @@ src-control/
 │   ├── gitio/    Git interop boundary (import a Git repo's tree into the store via gix)
 │   ├── crypto/   envelope encryption for committed secrets (scl-crypto; depends on core)
 │   ├── repo/     durable on-disk repo: .sc/ layout, refs, branches, working tree
-│   └── cli/      `sc` binary: import, fork agents, init/commit/status/log/branch/switch/secret/run
+│   └── cli/      `sc` binary: the full command surface — demo/import, init/commit/status/log,
+│                 branch/switch/merge, secret/run/scan, protect/grant/revoke, clone/remote/
+│                 fetch/push, gc, export, escrow
 └── ARCHITECTURE.md
 ```
 
@@ -156,8 +158,9 @@ database, and inserts equivalent `Blob`/`Tree`/`Snapshot` objects into our store
 returning the root `Snapshot` id. Agents then fork in-memory worktrees off that
 snapshot. No subprocess, no dependency on an installed `git`, and the boundary is
 a single crate so the rest of the system stays Git-agnostic. Export (writing a
-snapshot back out as a Git commit) is the symmetric operation and is left as a
-post-MVP extension; import is what the agent wedge needs first.
+snapshot back out as a Git commit) is the symmetric operation, built in Phase 9;
+Phase 10 composes the two into bidirectional sync with a Git repo as a
+first-class remote. Both keep `gix` quarantined in `gitio`.
 
 ## Key management design (Phase 2)
 
@@ -270,7 +273,8 @@ Phase 8 adds three tightly coupled capabilities to the persistent store:
   transport read path resolves packed, sharded, and compressed objects from the
   remote store. This replaces the prior object-at-a-time transfer.
 
-Remaining follow-ons: merge and break-glass escrow key guidance.
+Remaining follow-ons: network transport for remotes (merge shipped as Phase 4;
+break-glass escrow shipped as Phase 11).
 
 ## Phase 9 — Git export (built)
 
@@ -324,12 +328,64 @@ Git trees cannot carry the following src-control metadata; it is dropped on expo
 - The **protection policy** (wrapped DEKs for encrypted paths).
 - The **per-entry `perms` byte** on tree entries.
 
-These are the documented lossy points (see ADR-0016). A future bidirectional-sync
-transport would need a sidecar or extended-attribute convention to preserve them,
-which is out of scope for the initial export.
+These are the documented lossy points (see ADR-0016). Phase 10's bidirectional
+sync inherits them: the Git side of a git-backed remote never carries the
+secrets registry, protection policy, or perms byte — a sidecar or
+extended-attribute convention to preserve them remains out of scope.
 
 Note: the fail-closed scan keys on the per-entry `PROTECTED` bit, so content
 committed as plaintext *before* a path was protected remains plaintext in history
 and is neither flagged nor refused by `--include-encrypted`. This is the same
 forward-looking model as git-crypt; export refusal is not a blanket guarantee of
 "no plaintext anywhere in history".
+
+## Phase 10 — Git as a remote (built)
+
+A local Git repository is a first-class remote. `sc remote add <name>
+<git-path> --git` registers it; `sc fetch <git-remote>` imports the full Git
+history deterministically and writes a `refs/remotes/<name>/<branch>`
+remote-tracking ref; `sc push <git-remote> [--include-encrypted]`
+synthesizes (or reuses) Git commits for the current branch and
+fast-forward-updates the Git ref, reusing Phase 9's export machinery and
+confidentiality gate verbatim.
+
+Identity across the two DAGs is carried by a persisted `git_oid ↔ sc_id`
+**marks map** (`.sc/git-remotes/<name>/marks`), not by a fatter object model —
+the content-addressing invariant is unchanged. The git-remote path dispatches
+in `cli` *above* the Phase 6 `Transport` trait rather than implementing it: a
+Git remote has a different id space and encoding than `Transport` assumes, and
+routing through `cli` keeps `repo` free of any `gitio` dependency.
+
+Scope is local `.git` paths on disk; network Git is a later transport swap
+onto the same translation core. One accepted MVP limitation: fetching from Git
+repo A and pushing a Git-origin commit to a *different* Git repo B
+re-synthesizes with dropped committer/timezone/gpgsig and a different Git oid
+than A had — same-remote fetch/push stays clean. See ADR-0018.
+
+## Phase 11 — secret/permission lifecycle: rotation + escrow (built)
+
+`sc secret rotate <name> [--value <new>] [--to <names>] [--identity <key>]`
+re-seals a secret's value under a **fresh DEK**, composed entirely from the
+existing `seal`/`open` primitives (`crates/crypto` is unchanged). With
+`--value`, the new plaintext is sealed directly; without it, the current value
+is recovered via `--identity` and re-sealed. Recipients default to the
+secret's current set (reverse `recipient_id` lookup against
+`.sc/recipients.toml`), overridable with `--to`.
+
+Rotation is **secrets-only**: protected paths use convergent encryption
+(`DEK = HKDF(BLAKE3(plaintext))`), so a recipient who checked the file out can
+re-derive the key — "rotating" a path's DEK is either dedup-breaking or
+security-meaningless. Path lifecycle stays on recipient re-wrap
+(`grant`/`revoke`). `sc secret revoke` remains metadata-only and now hints to
+run `rotate` for the actual cryptographic cutover.
+
+`sc escrow set <pubkey-or-name>` / `sc escrow show` configure a single
+break-glass recipient key (`[escrow]` in `.sc/recipients.toml`) that is
+auto-appended (deduped) whenever `secret add`, `secret rotate`, or `protect`
+seals or wraps — forward-only (existing secrets/paths gain escrow when next
+rotated/re-wrapped) and policy, not enforcement.
+
+**Rotation ≠ erasure:** content-addressed history keeps the old ciphertext
+object reachable, and anyone who kept the old DEK can still decrypt it.
+Rotation cuts off *future* reads through the current registry; real security
+requires rotating the underlying external credential too. See ADR-0019.
