@@ -659,6 +659,7 @@ impl Repo {
         _identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<ObjectId> {
         use scl_core::ProtectPrefix;
+        crate::secrets::require_recipients(recipients)?;
         // Load the tip's protection, add/replace the rule, and persist it as a
         // policy-only commit (same root) so `commit` below sees the new prefix.
         let (root, parents, secrets, mut protection) = match self.head_tip()? {
