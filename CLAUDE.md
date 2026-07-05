@@ -102,8 +102,11 @@ cargo run --bin sc -- commit -m "msg"        # snapshot working tree as a commit
                                              # honors .scignore at the repo root (gitignore
                                              # subset; hides untracked matches only — tracked
                                              # paths are never ignored)
-cargo run --bin sc -- status                 # diff working tree vs HEAD
-cargo run --bin sc -- log                    # show commit history
+cargo run --bin sc -- status                 # working-tree changes vs HEAD (--json for scripts)
+cargo run --bin sc -- diff                   # line-level unified diff vs HEAD
+cargo run --bin sc -- log                    # history: id, date, author, message, (merge) marker
+                                             # (--json for scripts; also on secret list)
+                                             # commit/merge author: --author > $SC_AUTHOR > OS user
 cargo run --bin sc -- branch <name>          # create a new branch at current tip
 cargo run --bin sc -- switch <name>          # switch branch + materialize working tree
 cargo run --bin sc -- merge <ref>            # three-way merge (ff when possible; exits 1 on conflicts)
