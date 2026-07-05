@@ -110,6 +110,15 @@ impl Repo {
             }
         };
         let revoked = scl_crypto::revoke(&secret, recipient);
+        // Same footgun as sealing to an empty set: a secret with zero wrapped
+        // keys is permanently unreadable. Rotate (choosing new recipients) is
+        // the operation that changes who can read; revoke can't empty the set.
+        if revoked.wrapped_keys.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "revoking the last recipient would leave {name} readable by nobody; \
+                 use `secret rotate --to <names>` to change the recipient set instead"
+            )));
+        }
         let new_id = {
             let arc = self.store_arc();
             let i = arc.lock().unwrap().put(Object::Secret(revoked))?;
@@ -309,6 +318,42 @@ mod tests {
         assert!(
             matches!(repo.protect("secret/", &[], None), Err(Error::InvalidArgument(_))),
             "protect must reject an empty recipient set"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn revoking_the_last_recipient_is_an_error() {
+        // Dropping the last wrapped key would leave a value sealed to nobody —
+        // the same unreadable-value footgun as sealing to an empty set.
+        let root = tmp_root("lastrevoke");
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+
+        // Secret surface: two recipients — revoking one is fine, the last is not.
+        repo.secret_add("K", b"v", &[alice_pk.clone(), bob_pk.clone()]).unwrap();
+        repo.secret_revoke("K", &bob_pk.recipient_id()).unwrap();
+        assert!(
+            matches!(
+                repo.secret_revoke("K", &alice_pk.recipient_id()),
+                Err(Error::InvalidArgument(_))
+            ),
+            "revoking the last secret recipient must fail"
+        );
+        // The secret is still readable metadata-wise (registry unchanged).
+        assert_eq!(repo.secret_list().unwrap()[0].recipients, 1);
+
+        // Path-protection surface: same rule.
+        repo.protect("vault/", std::slice::from_ref(&alice_pk), None).unwrap();
+        assert!(
+            matches!(
+                repo.revoke("vault/", &alice_pk.recipient_id()),
+                Err(Error::InvalidArgument(_))
+            ),
+            "revoking the last path recipient must fail"
         );
 
         drop(repo);
