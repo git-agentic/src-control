@@ -1981,6 +1981,7 @@ dependencies = [
 name = "scl-repo"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "regex",
  "scl-core",
  "scl-crypto",

@@ -12,3 +12,4 @@ thiserror = "2.0.18"
 regex = "1"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+libc = "0.2.186"

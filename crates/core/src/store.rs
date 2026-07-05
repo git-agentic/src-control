@@ -442,10 +442,7 @@ impl Store {
         std::fs::create_dir_all(shard)?;
         let compressed = zstd::encode_all(std::io::Cursor::new(bytes), COMPRESSION_LEVEL)
             .map_err(Error::Io)?;
-        // Per-process tmp name so a concurrent writer can't clobber our staging file.
-        let tmp = shard.join(format!("{}.{}.tmp", id.to_hex(), std::process::id()));
-        std::fs::write(&tmp, &compressed)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::fsutil::atomic_write_durable(&path, &compressed)?;
         Ok(())
     }
 
@@ -612,12 +609,9 @@ impl Drop for Store {
     }
 }
 
-/// Atomic write via a per-process tmp sibling + rename.
+/// Durable atomic write (fsync file, rename, fsync dir) — see [`crate::fsutil`].
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(crate::fsutil::atomic_write_durable(path, bytes)?)
 }
 
 #[cfg(test)]

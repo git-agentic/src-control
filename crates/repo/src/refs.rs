@@ -172,10 +172,7 @@ pub fn head_tip(layout: &Layout) -> Result<Option<ObjectId>> {
 /// rename itself is atomic. The single-writer repo lock
 /// ([`crate::lock::RepoLock`]) still serializes the final ref content.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(scl_core::fsutil::atomic_write_durable(path, bytes)?)
 }
 
 #[cfg(test)]

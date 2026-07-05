@@ -23,8 +23,16 @@ pub trait Transport {
     fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>>;
     /// Write raw `encode()` bytes; verifies `ObjectId::of(bytes) == id`.
     fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()>;
-    /// Set `refs/heads/<branch>` on the remote to `id`.
-    fn update_ref(&self, branch: &str, id: &ObjectId) -> Result<()>;
+    /// Set `refs/heads/<branch>` on the remote to `id` — compare-and-swap.
+    ///
+    /// `expected_old` is the tip the caller based its fast-forward check on
+    /// (`None` = the branch must not exist yet). The implementation must
+    /// revalidate under the remote's own lock and refuse with
+    /// [`Error::NonFastForward`] when the ref moved in between, so two racing
+    /// pushers cannot silently clobber each other's commits. Setting the ref
+    /// to the value it already has succeeds regardless of `expected_old`.
+    fn update_ref(&self, branch: &str, id: &ObjectId, expected_old: Option<&ObjectId>)
+        -> Result<()>;
 
     /// Build a pack of every object reachable from `wants` but not already
     /// implied by `haves` (the receiver's closure). Returns `.pack` bytes.
@@ -104,8 +112,22 @@ impl Transport for LocalTransport {
         Ok(())
     }
 
-    fn update_ref(&self, branch: &str, id: &ObjectId) -> Result<()> {
+    fn update_ref(
+        &self,
+        branch: &str,
+        id: &ObjectId,
+        expected_old: Option<&ObjectId>,
+    ) -> Result<()> {
         let _lock = RepoLock::acquire(&self.layout)?;
+        // Revalidate inside the lock: the caller's fast-forward check ran
+        // unlocked, so the ref may have moved since (two concurrent pushes).
+        let current = crate::refs::read_branch_tip(&self.layout, branch)?;
+        if current.as_ref() == Some(id) {
+            return Ok(()); // already there — idempotent
+        }
+        if current.as_ref() != expected_old {
+            return Err(Error::NonFastForward);
+        }
         crate::refs::write_branch_tip(&self.layout, branch, id)
     }
 
@@ -200,9 +222,40 @@ mod tests {
         // corrupt put is rejected
         assert!(matches!(t.put_object(&id, b"not the bytes"), Err(Error::CorruptObject(_))));
 
-        t.update_ref("main", &id).unwrap();
+        t.update_ref("main", &id, None).unwrap();
         assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), id)]);
         assert_eq!(t.head_branch().unwrap(), "main");
+
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn update_ref_is_compare_and_swap() {
+        // Two pushers can both pass the fast-forward check against the same old
+        // tip; the ref write itself must revalidate under the remote lock so
+        // the second writer fails instead of silently clobbering the first.
+        let layout = tmp_remote("cas");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let c1 = Object::blob(b"c1".to_vec()).id();
+        let c2 = Object::blob(b"c2".to_vec()).id();
+        let c3 = Object::blob(b"c3".to_vec()).id();
+
+        // Create: expected None means "branch must not exist".
+        t.update_ref("main", &c1, None).unwrap();
+        // Creating again with expected None must fail (it exists now).
+        assert!(matches!(t.update_ref("main", &c2, None), Err(Error::NonFastForward)));
+
+        // Advance with the right expected old tip.
+        t.update_ref("main", &c2, Some(&c1)).unwrap();
+
+        // A raced writer still expecting c1 must fail, not clobber c2.
+        assert!(matches!(t.update_ref("main", &c3, Some(&c1)), Err(Error::NonFastForward)));
+        assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), c2)]);
+
+        // Re-pushing the value already at the tip is fine (idempotent), even
+        // with a stale expectation — the ref ends up exactly where asked.
+        t.update_ref("main", &c2, Some(&c1)).unwrap();
+        t.update_ref("main", &c2, Some(&c2)).unwrap();
 
         std::fs::remove_dir_all(&layout.root).unwrap();
     }

@@ -238,6 +238,17 @@ user-owned durable state — the same relationship Git has with `.git/`. The
 two modes are mutually exclusive: a session is either ephemeral or persistent,
 never a mix.
 
+### Durability & concurrency (hardened)
+
+Every ref, loose-object, and pack write goes through one durable atomic-write
+helper (`scl_core::fsutil`): write a per-process temp sibling, fsync it,
+rename, fsync the parent directory — Git's crash-durability discipline.
+Remote ref updates are compare-and-swap: `Transport::update_ref` revalidates
+the expected old tip under the remote's own lock, so two racing pushes cannot
+silently clobber each other. The single-writer lock file records the holder's
+PID and is broken automatically when that process is provably dead, so a
+SIGKILLed `sc` doesn't brick the repo. See ADR-0021.
+
 ## Phase 1 deliverable and proof
 
 The Phase 1 demo imports a sample repo, forks several agent worktrees in

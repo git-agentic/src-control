@@ -940,9 +940,15 @@ impl Repo {
         let local_tip = self.head_tip()?.ok_or(Error::Unborn)?;
 
         // Fast-forward check against the remote's current tip for this branch.
-        if let Some((_, remote_tip)) =
-            transport.list_refs()?.into_iter().find(|(b, _)| *b == branch)
-        {
+        // The tip we checked against is remembered and passed to `update_ref`,
+        // which revalidates it under the remote's lock (compare-and-swap) — so
+        // a push racing us fails there instead of being silently clobbered.
+        let expected_old = transport
+            .list_refs()?
+            .into_iter()
+            .find(|(b, _)| *b == branch)
+            .map(|(_, tip)| tip);
+        if let Some(remote_tip) = expected_old {
             if remote_tip == local_tip {
                 // Already up to date: skip all remote I/O (no transfer, no ref write).
                 return Ok(local_tip);
@@ -970,7 +976,7 @@ impl Repo {
                 transport.put_pack(&pack)?;
             }
         }
-        transport.update_ref(&branch, &local_tip)?;
+        transport.update_ref(&branch, &local_tip, expected_old.as_ref())?;
         Ok(local_tip)
     }
 }
