@@ -395,6 +395,87 @@ pub fn decode_refs_body(b: &[u8]) -> Result<Vec<(String, ObjectId)>> {
     Ok(out)
 }
 
+use crate::transport::{LocalTransport, Transport};
+
+/// Serve the repo at `root` to one wire-protocol peer until `Bye`/EOF.
+///
+/// This is the whole server: every verb dispatches onto [`LocalTransport`],
+/// so CAS ref updates, pack verification, and hash-verified reads behave
+/// exactly as for a local remote. Verb failures are *replies*; only protocol
+/// violations end the session.
+pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> Result<()> {
+    // Handshake: HELLO must come first, and versions must match, before any
+    // repo access happens.
+    let first = match read_frame_opt(r)? {
+        Some(f) => f,
+        None => return Ok(()), // peer connected and immediately hung up
+    };
+    match Request::decode(&first) {
+        Ok(Request::Hello { version }) if version == PROTOCOL_VERSION => {}
+        Ok(Request::Hello { version }) => {
+            write_err(
+                w,
+                EC_PROTOCOL,
+                &format!("unsupported protocol version {version} (server speaks {PROTOCOL_VERSION})"),
+            )?;
+            return Ok(());
+        }
+        Ok(_) | Err(_) => {
+            write_err(w, EC_PROTOCOL, "expected HELLO as the first request")?;
+            return Ok(());
+        }
+    }
+    let transport = match LocalTransport::open(root) {
+        Ok(t) => {
+            write_ok(w, &u32_body(PROTOCOL_VERSION))?;
+            t
+        }
+        Err(e) => {
+            let (code, msg) = err_to_wire(&e);
+            write_err(w, code, &msg)?;
+            return Ok(());
+        }
+    };
+
+    loop {
+        let frame = match read_frame_opt(r)? {
+            Some(f) => f,
+            None => return Ok(()), // peer hung up between requests
+        };
+        let req = match Request::decode(&frame) {
+            Ok(req) => req,
+            Err(e) => {
+                let (code, msg) = err_to_wire(&e);
+                write_err(w, code, &msg)?;
+                return Ok(());
+            }
+        };
+        let result: Result<Vec<u8>> = match req {
+            Request::Bye => return Ok(()),
+            Request::Hello { .. } => Err(Error::Protocol("unexpected HELLO mid-session".into())),
+            Request::ListRefs => transport.list_refs().map(|refs| refs_body(&refs)),
+            Request::HeadBranch => transport.head_branch().map(|s| str_body(&s)),
+            Request::HasObject(id) => transport.has_object(&id).map(bool_body),
+            Request::GetObject(id) => transport.get_object(&id),
+            Request::PutObject { id, bytes } => {
+                transport.put_object(&id, &bytes).map(|()| Vec::new())
+            }
+            Request::UpdateRef { branch, id, expected_old } => {
+                transport.update_ref(&branch, &id, expected_old.as_ref()).map(|()| Vec::new())
+            }
+            Request::GetPack { wants, haves } => transport.get_pack(&wants, &haves),
+            Request::PutPack(pack) => transport.put_pack(&pack).map(|ids| ids_body(&ids)),
+        };
+        match result {
+            Ok(body) => write_ok(w, &body)?,
+            Err(e) => {
+                let (code, msg) = err_to_wire(&e);
+                write_err(w, code, &msg)?;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +483,32 @@ mod tests {
 
     fn some_id(seed: u8) -> ObjectId {
         ObjectId::from_bytes([seed; 32])
+    }
+
+    /// Encode a request sequence into one input byte stream, run `serve`
+    /// against it (Cursor in, Vec out), return the response frames.
+    fn run_session(root: &std::path::Path, reqs: &[Request]) -> Vec<Result<Vec<u8>>> {
+        let mut input = Vec::new();
+        for r in reqs {
+            write_frame(&mut input, &r.encode()).unwrap();
+        }
+        let mut reader = std::io::Cursor::new(input);
+        let mut output = Vec::new();
+        serve(root, &mut reader, &mut output).unwrap();
+        let mut out = Vec::new();
+        let mut r = std::io::Cursor::new(output);
+        while let Some(frame) = read_frame_opt(&mut r).unwrap() {
+            out.push(parse_response(frame));
+        }
+        out
+    }
+
+    fn tmp_repo(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("scl-wire-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::repo::Repo::init(&root).unwrap();
+        root
     }
 
     #[test]
@@ -502,5 +609,84 @@ mod tests {
         assert_eq!(decode_refs_body(&refs_body(&refs)).unwrap(), refs);
         // Truncated bodies are protocol errors, not panics.
         assert!(matches!(decode_refs_body(&[0, 0, 0, 5]), Err(crate::error::Error::Protocol(_))));
+    }
+
+    #[test]
+    fn serve_answers_hello_then_verbs_until_bye() {
+        let root = tmp_repo("serve");
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        let tip = crate::repo::Repo::open(&root).unwrap().commit("t", "c1").unwrap();
+
+        let responses = run_session(
+            &root,
+            &[
+                Request::Hello { version: PROTOCOL_VERSION },
+                Request::ListRefs,
+                Request::HeadBranch,
+                Request::HasObject(tip),
+                Request::Bye,
+            ],
+        );
+        assert_eq!(responses.len(), 4); // Bye gets no response
+        assert_eq!(decode_u32_body(responses[0].as_ref().unwrap()).unwrap(), PROTOCOL_VERSION);
+        let refs = decode_refs_body(responses[1].as_ref().unwrap()).unwrap();
+        assert_eq!(refs, vec![("main".to_string(), tip)]);
+        assert_eq!(decode_str_body(responses[2].as_ref().unwrap()).unwrap(), "main");
+        assert!(decode_bool_body(responses[3].as_ref().unwrap()).unwrap());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_rejects_wrong_version_and_missing_hello() {
+        let root = tmp_repo("vers");
+        let bad_version = run_session(&root, &[Request::Hello { version: 999 }]);
+        assert!(matches!(bad_version[0], Err(Error::Protocol(_))));
+
+        let no_hello = run_session(&root, &[Request::ListRefs]);
+        assert!(matches!(no_hello[0], Err(Error::Protocol(_))));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_reports_not_a_repo_as_typed_error() {
+        let root = std::env::temp_dir().join(format!("scl-wire-norepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap(); // a dir, but no .sc inside
+
+        let responses = run_session(&root, &[Request::Hello { version: PROTOCOL_VERSION }]);
+        assert!(matches!(responses[0], Err(Error::NotARepo)));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_ends_cleanly_on_eof_without_bye() {
+        let root = tmp_repo("eof");
+        // No Bye at the end: input just runs out. serve must return Ok.
+        let responses =
+            run_session(&root, &[Request::Hello { version: PROTOCOL_VERSION }, Request::ListRefs]);
+        assert_eq!(responses.len(), 2);
+        assert!(responses[1].is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_verb_errors_are_replies_not_session_teardown() {
+        let root = tmp_repo("verberr");
+        let missing = some_id(0xEE);
+        let responses = run_session(
+            &root,
+            &[
+                Request::Hello { version: PROTOCOL_VERSION },
+                Request::GetObject(missing), // NotFound on the server
+                Request::HeadBranch,         // session must still be alive
+                Request::Bye,
+            ],
+        );
+        assert!(responses[1].is_err());
+        assert_eq!(decode_str_body(responses[2].as_ref().unwrap()).unwrap(), "main");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
