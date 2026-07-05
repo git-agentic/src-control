@@ -22,6 +22,7 @@ pub mod repo;
 pub mod secrets;
 pub mod sync;
 pub mod transport;
+pub mod wire;
 pub mod worktree;
 
 pub use error::{Error, Result};

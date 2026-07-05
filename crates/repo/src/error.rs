@@ -46,6 +46,12 @@ pub enum Error {
     RemoteExists(String),
     #[error("no common ancestor between the branches")]
     NoCommonAncestor,
+    #[error("wire protocol error: {0}")]
+    Protocol(String),
+    #[error("connection to remote lost: {0}")]
+    ConnectionLost(String),
+    #[error("remote error: {0}")]
+    Remote(String),
     #[error("secret {0} changed differently on both branches; resolve with `sc secret` then retry")]
     SecretMergeConflict(String),
     #[error(transparent)]
