@@ -181,10 +181,12 @@ impl Transport for StdioTransport {
 /// A parsed `ssh://[user@]host[:port]/abs/path` remote URL.
 ///
 /// The path is the repo root *on the server* and keeps its leading `/`.
-/// Known limitations: paths containing spaces are unsupported over real ssh
-/// (the remote shell splits the command) — see ADR-0022; IPv6 host literals
-/// (`ssh://[::1]:22/…`) and usernames containing `@` are not understood by
-/// this parser (both fail or misparse into a host ssh will reject).
+/// Known limitations: the repo path must be shell-inert — spaces and shell
+/// metacharacters are rejected at parse time, because the remote args are
+/// concatenated into the far host's login shell (see ADR-0022 and the command-
+/// injection guard in `parse`); IPv6 host literals (`ssh://[::1]:22/…`) and
+/// usernames containing `@` are not understood by this parser (both fail or
+/// misparse into a host ssh will reject).
 ///
 /// A host or user starting with `-` is rejected at parse time: `ssh_command`
 /// places them as bare argv positionals (`user@host`), and `ssh` itself
@@ -239,8 +241,38 @@ impl SshUrl {
                 )));
             }
         }
+        // `ssh host -- sc serve --stdio <path>` concatenates the remote args and
+        // hands them to the far host's *login shell*, so a metacharacter in the
+        // path (`;`, `|`, `$(…)`, a space, …) executes on the remote — command
+        // injection, the class Git closes by shell-quoting the repo path. We fail
+        // closed instead: reject any path that isn't shell-inert. This also
+        // enforces the previously-documented "spaces unsupported" limitation.
+        if let Some(bad) = path.chars().find(|c| !is_shell_safe_path_char(*c)) {
+            return Err(Error::InvalidArgument(format!(
+                "ssh url path has a shell-unsafe character {bad:?}: {url}"
+            )));
+        }
+        // Belt-and-suspenders: host/user reach ssh as argv, not a shell, but
+        // whitespace or control bytes there are never a legitimate hostname and
+        // only invite confusion — reject them too.
+        if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(Error::InvalidArgument(format!("ssh url host is malformed: {url}")));
+        }
+        if let Some(u) = &user {
+            if u.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(Error::InvalidArgument(format!("ssh url user is malformed: {url}")));
+            }
+        }
         Ok(SshUrl { user, host: host.to_string(), port, path: path.to_string() })
     }
+}
+
+/// Characters allowed in an ssh URL repo path. A conservative allow-list of
+/// bytes that carry no meaning to a POSIX shell, so the path survives the
+/// remote shell verbatim. Everything else (whitespace and every shell
+/// metacharacter) is rejected at parse time.
+fn is_shell_safe_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "/._-+@:~=,%".contains(c)
 }
 
 /// The command that reaches `sc serve --stdio` on the far side: the user's
@@ -452,11 +484,29 @@ mod tests {
             "ssh://host:notaport/path",        // bad port
             "ssh://-oProxyCommand=evil/path",  // host looks like an option flag
             "ssh://-user@host/path",           // user looks like an option flag
+            "ssh://host/repo;rm -rf ~",        // command injection into remote shell
+            "ssh://host/repo$(touch pwned)",   // command substitution
+            "ssh://host/repo`id`",             // backtick substitution
+            "ssh://host/repo|curl evil",       // pipe to remote command
+            "ssh://host/with space/repo",      // whitespace splits the remote command
+            "ssh://host/repo&background",      // background operator
         ] {
             assert!(
                 matches!(SshUrl::parse(bad), Err(Error::InvalidArgument(_))),
                 "should reject {bad}"
             );
+        }
+    }
+
+    #[test]
+    fn ssh_url_allows_realistic_repo_paths() {
+        // The path allow-list must not reject ordinary repo paths.
+        for good in [
+            "ssh://host/srv/git/my-repo.sc",
+            "ssh://host/~user/repos/proj_1",
+            "ssh://host/a/b-c/d.e/f+g@h",
+        ] {
+            assert!(SshUrl::parse(good).is_ok(), "should accept {good}");
         }
     }
 

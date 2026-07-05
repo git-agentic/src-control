@@ -51,8 +51,15 @@ unreachable objects (pack lands before the ref CAS), never a torn ref.
   (packs) are single-round-trip, and composite opcodes can be added behind
   the version handshake if latency ever matters.
 - Accepted limitations: frames cap at 4 GiB (packs are in-memory anyway);
-  repo paths with spaces break over real ssh (remote shell splitting — same
-  class of issue Git has); `sc` must be installed on the server.
+  `sc` must be installed on the server.
+- Security: because `ssh host -- sc serve --stdio <path>` concatenates the
+  remote args into the far host's login shell, `SshUrl::parse` rejects at
+  parse time (a) hosts/usernames starting with `-` (argv flag smuggling, the
+  Git CVE-2017-1000117 class) and (b) repo paths carrying any non-shell-inert
+  character (command injection). The path allow-list is conservative
+  (alphanumeric plus `/._-+@:~=,%`), which also means repo paths with spaces
+  or shell metacharacters are unsupported over ssh — fail-closed rather than
+  shell-quoted, since we control both ends of the URL space.
 - Interaction inherited from P7 (not new to this phase): three-way merges of
   history containing protected paths are refused fail-closed, so the demo
   proves merge-recovery before protecting a path; fast-forwards are
