@@ -99,11 +99,14 @@ cargo run --bin sc -- secret-demo            # committed-secrets authorize/deny/
 # Persistent repo commands (sc init creates .sc/ in the working directory):
 cargo run --bin sc -- init                   # initialize a new persistent repo
 cargo run --bin sc -- commit -m "msg"        # snapshot working tree as a commit
+                                             # honors .scignore at the repo root (gitignore
+                                             # subset; hides untracked matches only — tracked
+                                             # paths are never ignored)
 cargo run --bin sc -- status                 # diff working tree vs HEAD
 cargo run --bin sc -- log                    # show commit history
 cargo run --bin sc -- branch <name>          # create a new branch at current tip
 cargo run --bin sc -- switch <name>          # switch branch + materialize working tree
-cargo run --bin sc -- merge <ref>            # three-way merge (ff when possible)
+cargo run --bin sc -- merge <ref>            # three-way merge (ff when possible; exits 1 on conflicts)
 cargo run --bin sc -- scan                   # preview the commit-time secret scan
 cargo run --bin sc -- clone <src> <dst>      # copy a repo (objects + refs)
 cargo run --bin sc -- protect <prefix> --to <recipient>   # encrypt matching paths (P7)
@@ -113,6 +116,9 @@ cargo run --bin sc -- revoke <prefix> --recipient-id <id>                # path-
                                              # path prefixes; `secret grant/revoke` act on
                                              # named secrets — two different surfaces
 cargo run --bin sc -- secret add <name> --to <recipient> --value <val>
+                                             # omit --value to read the secret from stdin
+                                             # (keeps it out of `ps` and shell history);
+                                             # `secret rotate --value-stdin` likewise
 cargo run --bin sc -- secret grant <name> --to <recipient> --identity <key>
 cargo run --bin sc -- secret revoke <name> --recipient-id <id>
 cargo run --bin sc -- secret list

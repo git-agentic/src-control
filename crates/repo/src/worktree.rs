@@ -1,17 +1,27 @@
 //! Reading the on-disk working tree and diffing it against a snapshot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use scl_core::{EntryKind, FileMode, Object, ObjectId, Protection, Store, Tree, PROTECTED};
 
 use crate::error::Result;
+use crate::ignore::Ignore;
 use crate::layout::Layout;
 
 /// Read all working-tree files (skipping `.sc/`) as `(relpath, bytes, mode)`.
-pub fn read_worktree(layout: &Layout) -> Result<Vec<(String, Vec<u8>, FileMode)>> {
+///
+/// Honors `.scignore` at the repo root, with git's model: an ignore rule hides
+/// only **untracked** paths. `tracked` is the set of paths in HEAD — a tracked
+/// path is always read even if a rule matches it, so adding a pattern can never
+/// silently drop already-committed content from the next snapshot.
+pub fn read_worktree(
+    layout: &Layout,
+    tracked: &BTreeSet<String>,
+) -> Result<Vec<(String, Vec<u8>, FileMode)>> {
+    let ignore = Ignore::load(&layout.root)?;
     let mut out = Vec::new();
-    walk_disk(&layout.root, &layout.root, &layout.dot_sc, &mut out)?;
+    walk_disk(&layout.root, &layout.root, &layout.dot_sc, &ignore, tracked, &mut out)?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
@@ -20,6 +30,8 @@ fn walk_disk(
     base: &Path,
     dir: &Path,
     skip: &Path,
+    ignore: &Ignore,
+    tracked: &BTreeSet<String>,
     out: &mut Vec<(String, Vec<u8>, FileMode)>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -29,16 +41,30 @@ fn walk_disk(
             continue;
         }
         let ft = entry.file_type()?;
+        let rel = path.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
         if ft.is_dir() {
-            walk_disk(base, &path, skip, out)?;
+            // Prune an ignored directory wholesale — unless a tracked path
+            // lives under it, in which case we must descend to keep it.
+            if ignore.matches(&rel) && !tracked_under(tracked, &rel) {
+                continue;
+            }
+            walk_disk(base, &path, skip, ignore, tracked, out)?;
         } else if ft.is_file() {
-            let rel = path.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
+            if ignore.matches(&rel) && !tracked.contains(&rel) {
+                continue;
+            }
             let bytes = std::fs::read(&path)?;
             let mode = file_mode(&path);
             out.push((rel, bytes, mode));
         }
     }
     Ok(())
+}
+
+/// Is any tracked path inside directory `dir` (repo-relative, no trailing `/`)?
+fn tracked_under(tracked: &BTreeSet<String>, dir: &str) -> bool {
+    let prefix = format!("{dir}/");
+    tracked.range(prefix.clone()..).next().is_some_and(|p| p.starts_with(&prefix))
 }
 
 #[cfg(unix)]
@@ -169,12 +195,13 @@ pub fn diff_worktree(
     // a future richer diff (e.g. prefix-aware reporting) needs no signature change.
     _protection: &Protection,
 ) -> Result<Diff> {
-    let wt: BTreeMap<String, Vec<u8>> =
-        read_worktree(layout)?.into_iter().map(|(p, b, _)| (p, b)).collect();
     let head = match head_root {
         Some(root) => tree_file_entries_with_perms(store, root)?,
         None => BTreeMap::new(),
     };
+    let tracked: BTreeSet<String> = head.keys().cloned().collect();
+    let wt: BTreeMap<String, Vec<u8>> =
+        read_worktree(layout, &tracked)?.into_iter().map(|(p, b, _)| (p, b)).collect();
     let mut diff = Diff::default();
     for (p, bytes) in &wt {
         match head.get(p) {
@@ -305,6 +332,29 @@ mod tests {
         std::fs::create_dir_all(layout.objects_dir()).unwrap();
         let store = Store::open_persistent(layout.objects_dir(), 1 << 20).unwrap();
         (layout, store)
+    }
+
+    #[test]
+    fn read_worktree_respects_scignore_but_keeps_tracked() {
+        let root =
+            std::env::temp_dir().join(format!("scl-repo-wt-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let layout = Layout::at(&root);
+        std::fs::write(root.join(".scignore"), "target\n*.log\n").unwrap();
+        std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(root.join("target/debug/app"), b"\x7fELF").unwrap();
+        std::fs::write(root.join("foo.log"), b"noise").unwrap();
+        std::fs::write(root.join("tracked.log"), b"kept").unwrap();
+
+        let tracked: std::collections::BTreeSet<String> =
+            std::iter::once("tracked.log".to_string()).collect();
+        let files = read_worktree(&layout, &tracked).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert_eq!(paths, vec![".scignore", "src/main.rs", "tracked.log"]);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

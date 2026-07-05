@@ -206,10 +206,10 @@ enum SecretOp {
         #[arg(long, value_delimiter = ',')]
         to: Vec<String>,
         /// The secret value. WARNING: passed on the command line, so it is
-        /// visible in process args (e.g. `ps`) and shell history. Reading the
-        /// value from stdin instead is a planned follow-up.
+        /// visible in process args (e.g. `ps`) and shell history. Omit it to
+        /// read the value from stdin instead (trailing newline trimmed).
         #[arg(long)]
-        value: String,
+        value: Option<String>,
     },
     /// Grant a recipient access by re-wrapping (requires your identity). Each
     /// granted recipient produces one commit (N recipients -> N commits).
@@ -235,12 +235,19 @@ enum SecretOp {
     Rotate {
         name: String,
         /// New value. Omit to keep the current value (requires --identity).
+        /// WARNING: visible in process args and shell history — prefer
+        /// --value-stdin for a new value.
         #[arg(long)]
         value: Option<String>,
+        /// Read the new value from stdin (trailing newline trimmed), keeping
+        /// it out of process args and shell history.
+        #[arg(long, conflicts_with = "value")]
+        value_stdin: bool,
         /// Recipient names (default: the secret's current recipients).
         #[arg(long, value_delimiter = ',')]
         to: Vec<String>,
-        /// Your identity (required when --value is omitted, to recover the value).
+        /// Your identity (required when no new value is given, to recover the
+        /// current value).
         #[arg(long)]
         identity: Option<PathBuf>,
     },
@@ -859,7 +866,11 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
             for p in repo.merge_conflicts()? {
                 println!("  {p}");
             }
-            Ok(()) // not an error exit; the user has work to do
+            // Exit 1 so `sc merge x && sc commit` can't commit conflict markers.
+            // Drop the repo first (releases .sc/lock) — process::exit skips
+            // destructors and would otherwise leave a stale lock file.
+            drop(repo);
+            std::process::exit(1);
         }
         Err(scl_repo::Error::UpToDate) => {
             println!("already up to date");
@@ -898,6 +909,10 @@ fn run_secret(op: SecretOp) -> Result<()> {
     let recipients_path = repo.layout().dot_sc.join("recipients.toml");
     match op {
         SecretOp::Add { name, to, value } => {
+            let value = match value {
+                Some(v) => v,
+                None => read_value_from_stdin()?,
+            };
             let dir = load_recipients(&recipients_path)?;
             let mut pks = resolve_names(&dir, &to)?;
             pks = append_escrow(pks, load_escrow(&recipients_path)?);
@@ -925,7 +940,12 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 println!("{}  ({} recipient(s))", info.name, info.recipients);
             }
         }
-        SecretOp::Rotate { name, value, to, identity } => {
+        SecretOp::Rotate { name, value, value_stdin, to, identity } => {
+            let value = match (value, value_stdin) {
+                (v @ Some(_), _) => v,
+                (None, true) => Some(read_value_from_stdin()?),
+                (None, false) => None,
+            };
             let dir = load_recipients(&recipients_path)?;
             let escrow = load_escrow(&recipients_path)?;
             // Recipient set: explicit --to, else the secret's current recipients.
@@ -1013,6 +1033,22 @@ fn run_run(identity: Option<PathBuf>, cmd: Vec<String>) -> Result<()> {
 fn load_identity(flag: Option<PathBuf>) -> Result<scl_crypto::SecretKey> {
     let path = resolve_identity_path(flag);
     scl_crypto::FileKeyProvider::new(path).identity().map_err(Into::into)
+}
+
+/// Read a secret value from stdin (for `secret add` without `--value` and
+/// `secret rotate --value-stdin`), so the value never appears in process args
+/// or shell history. One trailing newline is trimmed; an empty value is an
+/// error (an accidental `< /dev/null` should not seal an empty secret).
+fn read_value_from_stdin() -> Result<String> {
+    use std::io::Read;
+    eprintln!("reading secret value from stdin…");
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    let value = buf.strip_suffix('\n').map(|s| s.strip_suffix('\r').unwrap_or(s)).unwrap_or(&buf);
+    if value.is_empty() {
+        anyhow::bail!("empty secret value on stdin; pass --value or pipe a non-empty value");
+    }
+    Ok(value.to_string())
 }
 
 /// Soft identity resolution for checkout/switch: a holder with no key must still

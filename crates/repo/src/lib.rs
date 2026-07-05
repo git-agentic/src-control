@@ -6,6 +6,7 @@ pub mod scanner;
 pub mod scanner_patterns;
 pub mod error;
 pub mod gc;
+pub mod ignore;
 pub mod git_marks;
 pub mod layout;
 pub mod lock;

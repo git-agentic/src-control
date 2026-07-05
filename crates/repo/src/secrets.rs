@@ -63,6 +63,7 @@ impl Repo {
 
     /// Seal `value` to `recipients` and register it under `name`.
     pub fn secret_add(&self, name: &str, value: &[u8], recipients: &[PublicKey]) -> Result<ObjectId> {
+        require_recipients(recipients)?;
         let secret = scl_crypto::seal(name, value, recipients);
         let id = {
             let arc = self.store_arc();
@@ -132,6 +133,7 @@ impl Repo {
         recipients: &[PublicKey],
         identity: Option<&SecretKey>,
     ) -> Result<ObjectId> {
+        require_recipients(recipients)?;
         let mut reg = self.registry()?;
         let sid = *reg.get(name).ok_or_else(|| Error::NoSuchSecret(name.to_string()))?;
 
@@ -256,6 +258,20 @@ impl Repo {
     }
 }
 
+/// Refuse an empty recipient set on every seal/wrap path (`secret_add`,
+/// `secret_rotate`, `protect`): sealing to nobody silently mints a value that
+/// can never be decrypted — always a caller mistake, never intent.
+pub(crate) fn require_recipients(recipients: &[PublicKey]) -> Result<()> {
+    if recipients.is_empty() {
+        return Err(Error::InvalidArgument(
+            "recipient set is empty; sealing to zero recipients would make the value \
+             permanently unreadable"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +282,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn sealing_to_zero_recipients_is_an_error() {
+        // An empty recipient set would silently mint a value nobody can ever
+        // decrypt. Guard every seal/wrap path: add, rotate, and protect.
+        let root = tmp_root("norecip");
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+
+        assert!(
+            matches!(repo.secret_add("K", b"v", &[]), Err(Error::InvalidArgument(_))),
+            "secret_add must reject an empty recipient set"
+        );
+
+        repo.secret_add("K", b"v", std::slice::from_ref(&alice_pk)).unwrap();
+        assert!(
+            matches!(
+                repo.secret_rotate("K", Some(b"v2"), &[], Some(&alice_sk)),
+                Err(Error::InvalidArgument(_))
+            ),
+            "secret_rotate must reject an empty recipient set"
+        );
+
+        assert!(
+            matches!(repo.protect("secret/", &[], None), Err(Error::InvalidArgument(_))),
+            "protect must reject an empty recipient set"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
