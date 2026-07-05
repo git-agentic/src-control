@@ -5,6 +5,7 @@
 //! that bounds resident blob memory with LRU eviction and optional spill.
 
 pub mod error;
+pub mod fsutil;
 pub mod id;
 pub mod object;
 pub mod pack;
