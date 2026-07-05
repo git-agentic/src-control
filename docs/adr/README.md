@@ -14,7 +14,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0001](0001-use-rust.md) | Implement in Rust | Accepted | foundation |
 | [0002](0002-content-addressed-blake3.md) | Content-addressed objects keyed by BLAKE3 | Accepted | foundation |
 | [0003](0003-snapshot-and-tag-model.md) | Snapshot-and-tag model over a Git-style staging model | Accepted | foundation |
-| [0004](0004-crate-layout-and-dependency-rule.md) | Four-crate workspace with a strict dependency direction | Accepted | foundation |
+| [0004](0004-crate-layout-and-dependency-rule.md) | Four-crate workspace with a strict dependency direction | Superseded by 0020 | foundation |
 | [0005](0005-in-ram-vfs-over-fuse.md) | Pure in-RAM copy-on-write worktrees, not FUSE | Accepted | 1 |
 | [0006](0006-memory-budget-and-eviction.md) | Bounded blob budget with LRU eviction and optional spill | Accepted | 1 |
 | [0007](0007-git-interop-via-gix.md) | In-process Git interop via gix, quarantined in one crate | Accepted | 1 |
@@ -30,6 +30,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0016](0016-git-export.md) | Git export for round-trip interop | Accepted | 9 |
 | [0018](0018-git-as-a-remote.md) | Git as a remote (bidirectional sync) | Accepted | 10 |
 | [0019](0019-secret-lifecycle.md) | Secret/permission lifecycle (rotation + escrow) | Accepted | 11 |
+| [0020](0020-six-crate-workspace.md) | Six-crate workspace with a strict dependency direction | Accepted | foundation |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

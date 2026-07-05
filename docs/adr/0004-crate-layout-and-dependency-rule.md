@@ -1,6 +1,6 @@
 # ADR-0004: Four-crate workspace with a strict dependency direction
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0020](0020-six-crate-workspace.md)
 - **Date:** 2026-06-24
 - **Phase:** Foundation
 
