@@ -112,8 +112,22 @@ impl Repo {
 
     /// Scan the current working tree for plaintext secrets (read-only).
     pub fn scan_worktree(&self) -> Result<crate::scanner::ScanReport> {
-        let files = worktree::read_worktree(&self.layout)?;
+        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         self.scan_files(&files)
+    }
+
+    /// Paths tracked by HEAD (empty when the branch is unborn). `.scignore`
+    /// rules never hide these — same model as git.
+    fn tracked_paths(&self) -> Result<std::collections::BTreeSet<String>> {
+        match self.head_tip()? {
+            None => Ok(Default::default()),
+            Some(tip) => {
+                let root = self.snapshot(&tip)?.root;
+                let store_arc = self.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                Ok(worktree::tree_file_ids(&mut store, root)?.into_keys().collect())
+            }
+        }
     }
 
     /// Snapshot the working tree into a new commit on the current branch. When a
@@ -121,7 +135,7 @@ impl Repo {
     /// Files under a protected prefix are convergently encrypted (scanner-exempt);
     /// only plaintext files are scanned.
     pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
-        let files = worktree::read_worktree(&self.layout)?;
+        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         let tip = self.head_tip()?;
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
 
@@ -1045,6 +1059,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn scignore_hides_untracked_from_status_and_commit_but_not_tracked() {
+        let root = tmp_root("scignore");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join(".scignore"), "junk\n").unwrap();
+        std::fs::create_dir_all(root.join("junk")).unwrap();
+        std::fs::write(root.join("junk/big.bin"), b"x").unwrap();
+        std::fs::write(root.join("real.txt"), b"content").unwrap();
+
+        // status: the ignored path is invisible; the real file and .scignore show.
+        let st = repo.status().unwrap();
+        assert_eq!(st.added, vec![".scignore".to_string(), "real.txt".to_string()]);
+
+        // commit: the snapshot tree must not contain the ignored path.
+        let id = repo.commit("t", "c1").unwrap();
+        let store_arc = repo.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let snap_root = store.get_snapshot(&id).unwrap().root;
+        let entries = worktree::tree_file_ids(&mut store, snap_root).unwrap();
+        drop(store);
+        assert!(entries.contains_key("real.txt"));
+        assert!(!entries.keys().any(|p| p.starts_with("junk/")), "ignored path committed");
+
+        // A tracked file stays tracked even when a later rule matches it.
+        std::fs::write(root.join(".scignore"), "junk\nreal.txt\n").unwrap();
+        std::fs::write(root.join("real.txt"), b"changed").unwrap();
+        let st = repo.status().unwrap();
+        assert!(
+            st.modified.contains(&"real.txt".to_string()),
+            "tracked file must not be ignored: {:?}",
+            st
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
