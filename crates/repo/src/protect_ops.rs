@@ -1,0 +1,184 @@
+//! Per-file permission (protected-path) operations on [`Repo`]: `protect`,
+//! `grant`, `revoke`, and the prefix listing. Split from `repo.rs` for
+//! cohesion — same `impl Repo` extension pattern as `secrets.rs`.
+
+use scl_core::{ObjectId, Protection};
+
+use crate::error::{Error, Result};
+use crate::repo::Repo;
+use crate::worktree;
+use std::collections::BTreeMap;
+
+impl Repo {
+    /// Record (or replace) a protected-path rule for `prefix`, encrypting any
+    /// matching working-tree files for `recipients`.
+    ///
+    /// The rule is persisted as a policy-only snapshot first (so the subsequent
+    /// commit reads it from the tip), then a normal `commit` runs: matching
+    /// working-tree files are convergently encrypted and wrapped for each
+    /// recipient. If nothing matches yet, the rule is still recorded for future
+    /// commits. The `identity` arg is reserved for future re-encrypt symmetry
+    /// (e.g. re-protecting already-committed plaintext) and is unused today.
+    /// Returns the id of the resulting commit.
+    pub fn protect(
+        &self,
+        prefix: &str,
+        recipients: &[scl_crypto::PublicKey],
+        _identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<ObjectId> {
+        use scl_core::ProtectPrefix;
+        crate::secrets::require_recipients(recipients)?;
+        // Load the tip's protection, add/replace the rule, and persist it as a
+        // policy-only commit (same root) so `commit` below sees the new prefix.
+        let (root, parents, secrets, mut protection) = match self.head_tip()? {
+            Some(t) => {
+                let snap = self.snapshot(&t)?;
+                (snap.root, vec![t], snap.secrets, snap.protection)
+            }
+            None => {
+                let root = self.vfs.write_tree(&[])?;
+                (root, vec![], BTreeMap::new(), Protection::default())
+            }
+        };
+        protection.prefixes.retain(|p| p.prefix != prefix);
+        protection.prefixes.push(ProtectPrefix {
+            prefix: prefix.to_string(),
+            recipients: recipients.iter().map(|p| p.to_bytes()).collect(),
+        });
+        self.commit_snapshot(root, parents, secrets, protection, "system", &format!("protect {prefix}"))?;
+        // Now encrypt matching working-tree files under the freshly-recorded rule.
+        self.commit("system", &format!("encrypt under {prefix}"))
+    }
+
+    /// Collect the PROTECTED blob ids in the tip tree whose path is governed by
+    /// the rule `prefix` (longest-prefix wins, mirroring `matching_prefix`).
+    fn protected_blob_ids_under(&self, root: ObjectId, protection: &Protection, prefix: &str) -> Result<Vec<ObjectId>> {
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let entries = worktree::tree_file_entries_with_perms(&mut store, root)?;
+        Ok(entries
+            .into_iter()
+            .filter(|(path, (_id, _mode, perms))| {
+                perms & scl_core::PROTECTED != 0
+                    && crate::protect::matching_prefix(protection, path)
+                        .is_some_and(|r| r.prefix == prefix)
+            })
+            .map(|(_path, (id, _, _))| id)
+            .collect())
+    }
+
+    /// Grant `new` read access to the files protected under `prefix` — a
+    /// policy-only operation that does NOT touch any blob or tree id.
+    ///
+    /// For each protected blob under `prefix`, the DEK is recovered with the
+    /// `authorized` identity (which must currently be a recipient, else
+    /// `NotAuthorized`) and re-wrapped for `new` (deduped by recipient id). The
+    /// `new` recipient is also added to the prefix rule. The resulting snapshot
+    /// reuses the tip's exact root tree. Errors `NotProtected` if no such prefix.
+    pub fn grant(
+        &self,
+        prefix: &str,
+        authorized: &scl_crypto::SecretKey,
+        new: &scl_crypto::PublicKey,
+    ) -> Result<ObjectId> {
+        let tip = self.head_tip()?.ok_or(Error::Unborn)?;
+        let snap = self.snapshot(&tip)?;
+        let (root, secrets, mut protection) = (snap.root, snap.secrets, snap.protection);
+
+        let rule_idx = protection
+            .prefixes
+            .iter()
+            .position(|p| p.prefix == prefix)
+            .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
+
+        let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
+        let authorized_id = authorized.public().recipient_id().to_string();
+        let new_id = new.recipient_id().to_string();
+        for blob_id in protected_ids {
+            let Some(wks) = protection.wrapped.get(&blob_id) else { continue };
+            if wks.iter().any(|w| w.recipient_id == new_id) {
+                continue; // `new` already a recipient for this blob
+            }
+            // Locate the wrap addressed to `authorized` by recipient id (mirrors
+            // the Phase-2 `secrets.rs`/`open` lookup). A missing wrap means the
+            // caller isn't a recipient → NotAuthorized; a present-but-corrupt
+            // wrap must surface as a hard crypto error via `?`, not be misread as
+            // an authorization failure. The DEK stays `Zeroizing`.
+            let wk = wks
+                .iter()
+                .find(|w| w.recipient_id == authorized_id)
+                .ok_or_else(|| Error::NotAuthorized(prefix.to_string()))?;
+            let dek = scl_crypto::unwrap_dek_with(wk, authorized)?;
+            let new_wk = scl_crypto::wrap_dek_for(&dek, new);
+            protection.wrapped.get_mut(&blob_id).expect("present above").push(new_wk);
+        }
+
+        let new_bytes = new.to_bytes();
+        if !protection.prefixes[rule_idx].recipients.contains(&new_bytes) {
+            protection.prefixes[rule_idx].recipients.push(new_bytes);
+        }
+        self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("grant {prefix}"))
+    }
+
+    /// Revoke `recipient_id` from `prefix`: drop its wrapped DEK from every
+    /// protected blob under the prefix and remove its public key from the rule's
+    /// recipients. Policy-only (root tree unchanged). Errors `NotProtected` if no
+    /// such prefix. Does not rotate content (a prior holder kept any plaintext
+    /// already checked out — see the secrets-revoke rationale in ADR-0008).
+    pub fn revoke(&self, prefix: &str, recipient_id: &scl_crypto::RecipientId) -> Result<ObjectId> {
+        let tip = self.head_tip()?.ok_or(Error::Unborn)?;
+        let snap = self.snapshot(&tip)?;
+        let (root, secrets, mut protection) = (snap.root, snap.secrets, snap.protection);
+
+        let rule_idx = protection
+            .prefixes
+            .iter()
+            .position(|p| p.prefix == prefix)
+            .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
+
+        // Refuse to empty the rule's recipient set: subsequent commits under the
+        // prefix would seal new content for nobody (the empty-recipient footgun).
+        let survives = protection.prefixes[rule_idx].recipients.iter().any(|pk| {
+            scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != recipient_id.as_str()
+        });
+        if !survives {
+            return Err(Error::InvalidArgument(format!(
+                "revoking the last recipient would leave {prefix} readable by nobody; \
+                 grant another recipient first"
+            )));
+        }
+
+        let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
+        let rid = recipient_id.as_str();
+        for blob_id in protected_ids {
+            if let Some(wks) = protection.wrapped.get_mut(&blob_id) {
+                wks.retain(|w| w.recipient_id != rid);
+            }
+        }
+        protection.prefixes[rule_idx]
+            .recipients
+            .retain(|pk| scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != rid);
+        self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("revoke from {prefix}"))
+    }
+
+    /// List the tip's protected prefixes, each with its recipients' fingerprints
+    /// (for display). Empty if unborn or no prefixes are protected.
+    pub fn protected_prefixes(&self) -> Result<Vec<(String, Vec<scl_crypto::RecipientId>)>> {
+        let protection = match self.head_tip()? {
+            Some(t) => self.snapshot(&t)?.protection,
+            None => Protection::default(),
+        };
+        Ok(protection
+            .prefixes
+            .into_iter()
+            .map(|p| {
+                let rids = p
+                    .recipients
+                    .iter()
+                    .map(|pk| scl_crypto::PublicKey::from_bytes(*pk).recipient_id())
+                    .collect();
+                (p.prefix, rids)
+            })
+            .collect())
+    }
+}
