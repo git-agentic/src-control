@@ -181,8 +181,10 @@ impl Transport for StdioTransport {
 /// A parsed `ssh://[user@]host[:port]/abs/path` remote URL.
 ///
 /// The path is the repo root *on the server* and keeps its leading `/`.
-/// Known limitation: paths containing spaces are unsupported over real ssh
-/// (the remote shell splits the command) — see ADR-0022.
+/// Known limitations: paths containing spaces are unsupported over real ssh
+/// (the remote shell splits the command) — see ADR-0022; IPv6 host literals
+/// (`ssh://[::1]:22/…`) and usernames containing `@` are not understood by
+/// this parser (both fail or misparse into a host ssh will reject).
 ///
 /// A host or user starting with `-` is rejected at parse time: `ssh_command`
 /// places them as bare argv positionals (`user@host`), and `ssh` itself
