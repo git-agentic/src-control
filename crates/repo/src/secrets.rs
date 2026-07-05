@@ -20,9 +20,14 @@ pub struct SecretInfo {
 }
 
 impl Repo {
+    /// The Arc-wrapped object store (raw object access for tests/CLI).
+    pub fn store(&self) -> Arc<Mutex<Store>> {
+        self.vfs_handle().store()
+    }
+
     /// Return the Arc-wrapped store (avoids borrow-of-temporary issues).
     fn store_arc(&self) -> Arc<Mutex<Store>> {
-        self.vfs_handle().store()
+        self.store()
     }
 
     /// The current tip's secret registry (empty if unborn).
@@ -111,6 +116,75 @@ impl Repo {
         };
         reg.insert(name.to_string(), new_id);
         self.commit_registry(reg, "secret", &format!("revoke from {name}"))
+    }
+
+    /// Rotate a secret's value under a **fresh DEK**, re-sealing for `recipients`.
+    /// With `new_value = Some(..)`, that plaintext is sealed (no identity needed).
+    /// With `new_value = None`, the current value is recovered with `identity`
+    /// (which must be a current recipient) and re-sealed unchanged. Either way the
+    /// stored ciphertext changes, so a party holding the *old* DEK cannot read the
+    /// new object. NOTE: the old object stays reachable from history — rotation
+    /// cuts off future registry reads, it does not erase the old ciphertext.
+    pub fn secret_rotate(
+        &self,
+        name: &str,
+        new_value: Option<&[u8]>,
+        recipients: &[PublicKey],
+        identity: Option<&SecretKey>,
+    ) -> Result<ObjectId> {
+        let mut reg = self.registry()?;
+        let sid = *reg.get(name).ok_or_else(|| Error::NoSuchSecret(name.to_string()))?;
+
+        // Resolve the plaintext to seal: the supplied new value, or the current
+        // value recovered with an authorized identity.
+        let recovered;
+        let plaintext: &[u8] = match new_value {
+            Some(v) => v,
+            None => {
+                let id = identity.ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "rotate requires --value or an authorizing --identity".into(),
+                    )
+                })?;
+                let secret = {
+                    let arc = self.store_arc();
+                    let obj = arc.lock().unwrap().get(&sid)?;
+                    match obj {
+                        Object::Secret(s) => s,
+                        _ => return Err(Error::NoSuchSecret(format!("{name} is not a secret"))),
+                    }
+                };
+                recovered = scl_crypto::open(&secret, id)?;
+                &recovered[..]
+            }
+        };
+
+        let sealed = scl_crypto::seal(name, plaintext, recipients);
+        let new_id = {
+            let arc = self.store_arc();
+            let i = arc.lock().unwrap().put(Object::Secret(sealed))?;
+            i
+        };
+        reg.insert(name.to_string(), new_id);
+        self.commit_registry(reg, "secret", &format!("rotate {name}"))
+    }
+
+    /// The current recipient ids for `name` (so callers can resolve the existing
+    /// recipient set back to public keys). Errors if `name` is not a secret.
+    pub fn secret_recipients(&self, name: &str) -> Result<Vec<RecipientId>> {
+        let reg = self.registry()?;
+        let sid = *reg.get(name).ok_or_else(|| Error::NoSuchSecret(name.to_string()))?;
+        let arc = self.store_arc();
+        let obj = arc.lock().unwrap().get(&sid)?;
+        match obj {
+            Object::Secret(s) => Ok(s
+                .wrapped_keys
+                .iter()
+                .map(|w| RecipientId::from_hex(&w.recipient_id))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| Error::InvalidArgument("corrupt recipient id in secret".into()))?),
+            _ => Err(Error::NoSuchSecret(format!("{name} is not a secret"))),
+        }
     }
 
     /// List secrets at HEAD with recipient counts.
@@ -211,6 +285,112 @@ mod tests {
             .unwrap();
         assert_eq!(code, 0, "child saw the decrypted DB_URL");
         drop(repo2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rotate_new_value_reseals_and_recipients_read_it() {
+        let root = tmp_root("rot-newval");
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        let s0 = repo.secret_add("DB_URL", b"v0", std::slice::from_ref(&alice_pk)).unwrap();
+        let reg0 = repo.registry().unwrap();
+        let id0 = reg0["DB_URL"];
+
+        repo.secret_rotate("DB_URL", Some(b"v1"), std::slice::from_ref(&alice_pk), None).unwrap();
+        let reg1 = repo.registry().unwrap();
+        let id1 = reg1["DB_URL"];
+        assert_ne!(id0, id1, "rotation must repoint the registry to a new object");
+
+        let obj0 = repo.store().lock().unwrap().get(&id0).unwrap();
+        let obj1 = repo.store().lock().unwrap().get(&id1).unwrap();
+        let (sec0, sec1) = match (obj0, obj1) {
+            (scl_core::Object::Secret(a), scl_core::Object::Secret(b)) => (a, b),
+            _ => panic!("expected secrets"),
+        };
+        assert_ne!(sec0.ciphertext, sec1.ciphertext, "value was re-sealed under a fresh DEK");
+        assert_eq!(&*scl_crypto::open(&sec1, &alice_sk).unwrap(), b"v1");
+        let _ = s0;
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rotate_same_value_needs_identity_and_gets_fresh_ciphertext() {
+        let root = tmp_root("rot-sameval");
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        repo.secret_add("DB_URL", b"keepme", std::slice::from_ref(&alice_pk)).unwrap();
+        let id0 = repo.registry().unwrap()["DB_URL"];
+
+        // No value, no identity → error.
+        assert!(repo.secret_rotate("DB_URL", None, std::slice::from_ref(&alice_pk), None).is_err());
+
+        repo.secret_rotate("DB_URL", None, std::slice::from_ref(&alice_pk), Some(&alice_sk)).unwrap();
+        let id1 = repo.registry().unwrap()["DB_URL"];
+        let obj0 = repo.store().lock().unwrap().get(&id0).unwrap();
+        let obj1 = repo.store().lock().unwrap().get(&id1).unwrap();
+        let (sec0, sec1) = match (obj0, obj1) {
+            (scl_core::Object::Secret(a), scl_core::Object::Secret(b)) => (a, b),
+            _ => panic!("expected secrets"),
+        };
+        assert_ne!(sec0.ciphertext, sec1.ciphertext, "same value, fresh DEK → different ciphertext");
+        assert_eq!(&*scl_crypto::open(&sec1, &alice_sk).unwrap(), b"keepme");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn revoke_is_metadata_only_rotate_is_the_cutover() {
+        // The headline property: revoke drops the wrapped key but NOT the value;
+        // rotate re-seals so the ciphertext itself changes.
+        let root = tmp_root("cutover");
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        repo.secret_add("DB_URL", b"V", &[alice_pk.clone(), bob_pk.clone()]).unwrap();
+        let id0 = repo.registry().unwrap()["DB_URL"];
+        let sec0 = match repo.store().lock().unwrap().get(&id0).unwrap() {
+            scl_core::Object::Secret(s) => s, _ => panic!(),
+        };
+        assert_eq!(&*scl_crypto::open(&sec0, &bob_sk).unwrap(), b"V", "bob could read pre-revoke");
+
+        // Revoke Bob: metadata-only. Bob loses his wrapped key, but the value is unchanged.
+        repo.secret_revoke("DB_URL", &bob_pk.recipient_id()).unwrap();
+        let id1 = repo.registry().unwrap()["DB_URL"];
+        let sec1 = match repo.store().lock().unwrap().get(&id1).unwrap() {
+            scl_core::Object::Secret(s) => s, _ => panic!(),
+        };
+        assert_eq!(sec1.ciphertext, sec0.ciphertext, "revoke did NOT rotate the value");
+        assert!(scl_crypto::open(&sec1, &bob_sk).is_err(), "bob's wrapped key was dropped");
+
+        // Rotate (same value, alice authorizes): the ciphertext is now fresh.
+        repo.secret_rotate("DB_URL", None, std::slice::from_ref(&alice_pk), Some(&alice_sk)).unwrap();
+        let id2 = repo.registry().unwrap()["DB_URL"];
+        let sec2 = match repo.store().lock().unwrap().get(&id2).unwrap() {
+            scl_core::Object::Secret(s) => s, _ => panic!(),
+        };
+        assert_ne!(sec2.ciphertext, sec1.ciphertext, "rotate re-sealed under a fresh DEK");
+        assert_eq!(&*scl_crypto::open(&sec2, &alice_sk).unwrap(), b"V", "alice still reads new object");
+        assert!(scl_crypto::open(&sec2, &bob_sk).is_err(), "bob is not a recipient of the rotated object");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn secret_recipients_lists_current_ids() {
+        let root = tmp_root("recips");
+        let (_a_sk, a_pk) = scl_crypto::generate_keypair();
+        let (_b_sk, b_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        repo.secret_add("K", b"v", &[a_pk.clone(), b_pk.clone()]).unwrap();
+        let mut got = repo.secret_recipients("K").unwrap();
+        got.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        let mut want = vec![a_pk.recipient_id(), b_pk.recipient_id()];
+        want.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        assert_eq!(got, want);
+        assert!(repo.secret_recipients("nope").is_err());
+        drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

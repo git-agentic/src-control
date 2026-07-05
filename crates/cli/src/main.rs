@@ -169,6 +169,19 @@ enum Cmd {
         #[arg(long)]
         include_encrypted: bool,
     },
+    /// Manage the break-glass escrow recipient (auto-included at seal/protect).
+    Escrow {
+        #[command(subcommand)]
+        op: EscrowOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum EscrowOp {
+    /// Set the escrow key (a `scl-pk-…` pubkey, or a name from [recipients]).
+    Set { key_or_name: String },
+    /// Show the configured escrow key (and its recovery non-guarantee).
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -215,6 +228,22 @@ enum SecretOp {
     },
     /// List committed secrets.
     List,
+    /// Rotate a secret's value under a fresh DEK (the cryptographic cutover that
+    /// revoke does not perform). With --value, seal a new value (no identity
+    /// needed); without, recover the current value with --identity and re-seal it.
+    /// Recipients default to the secret's current set; --to overrides.
+    Rotate {
+        name: String,
+        /// New value. Omit to keep the current value (requires --identity).
+        #[arg(long)]
+        value: Option<String>,
+        /// Recipient names (default: the secret's current recipients).
+        #[arg(long, value_delimiter = ',')]
+        to: Vec<String>,
+        /// Your identity (required when --value is omitted, to recover the value).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
 }
 
 #[derive(Parser)]
@@ -270,6 +299,7 @@ fn main() -> Result<()> {
         Cmd::Revoke { prefix, recipient_id } => run_revoke(prefix, recipient_id),
         Cmd::Gc { prune_expire } => run_gc(&prune_expire),
         Cmd::Export { to, r#ref, include_encrypted } => run_export(to, r#ref, include_encrypted),
+        Cmd::Escrow { op } => run_escrow(op),
     }
 }
 
@@ -540,11 +570,20 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
 
 // ---- .sc/recipients.toml loader ------------------------------------
 
-/// Parsed `.sc/recipients.toml`: `name -> scl-pk-<hex>`.
-#[derive(serde::Deserialize)]
+/// Parsed `.sc/recipients.toml`: `[recipients] name -> scl-pk-<hex>`, plus an
+/// optional `[escrow]` break-glass key auto-included at seal/protect time.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
 struct RecipientsFile {
     #[serde(default)]
     recipients: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    escrow: Option<EscrowEntry>,
+}
+
+/// A single break-glass escrow recipient entry: `[escrow] key = "scl-pk-…"`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EscrowEntry {
+    key: String,
 }
 
 /// Resolve recipient names to public keys from a recipients file.
@@ -561,6 +600,24 @@ fn load_recipients(
         out.insert(name, pk);
     }
     Ok(out)
+}
+
+/// The configured escrow public key, if any. Missing file or missing `[escrow]`
+/// section → `None`.
+fn load_escrow(path: &std::path::Path) -> Result<Option<scl_crypto::PublicKey>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let parsed: RecipientsFile = toml::from_str(&text)?;
+    match parsed.escrow {
+        Some(e) => Ok(Some(
+            scl_crypto::PublicKey::from_key_string(&e.key)
+                .map_err(|_| anyhow::anyhow!("bad escrow public key"))?,
+        )),
+        None => Ok(None),
+    }
 }
 
 // ---- sc secret-demo ------------------------------------------------
@@ -842,9 +899,10 @@ fn run_secret(op: SecretOp) -> Result<()> {
     match op {
         SecretOp::Add { name, to, value } => {
             let dir = load_recipients(&recipients_path)?;
-            let pks = resolve_names(&dir, &to)?;
+            let mut pks = resolve_names(&dir, &to)?;
+            pks = append_escrow(pks, load_escrow(&recipients_path)?);
             repo.secret_add(&name, value.as_bytes(), &pks)?;
-            println!("added secret {name} for {} recipient(s)", to.len());
+            println!("added secret {name} for {} recipient(s)", pks.len());
         }
         SecretOp::Grant { name, to, identity } => {
             let dir = load_recipients(&recipients_path)?;
@@ -860,12 +918,83 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("bad recipient id"))?;
             repo.secret_revoke(&name, &rid)?;
             println!("revoked {recipient_id} from {name}");
+            eprintln!("note: revoke is metadata-only; run `sc secret rotate {name}` for a cryptographic cutover");
         }
         SecretOp::List => {
             for info in repo.secret_list()? {
                 println!("{}  ({} recipient(s))", info.name, info.recipients);
             }
         }
+        SecretOp::Rotate { name, value, to, identity } => {
+            let dir = load_recipients(&recipients_path)?;
+            let escrow = load_escrow(&recipients_path)?;
+            // Recipient set: explicit --to, else the secret's current recipients.
+            let pks = if to.is_empty() {
+                let ids = repo.secret_recipients(&name)?;
+                // Pool = named recipients + escrow, so an escrow-only id resolves.
+                let mut pool: Vec<scl_crypto::PublicKey> = dir.values().cloned().collect();
+                if let Some(e) = escrow.clone() {
+                    pool.push(e);
+                }
+                resolve_ids_to_pubkeys(&ids, &pool)?
+            } else {
+                resolve_names(&dir, &to)?
+            };
+            let pks = append_escrow(pks, escrow);
+            let new_value = value.as_deref().map(|s| s.as_bytes());
+            let identity = match &value {
+                Some(_) => None, // sealing a new value needs no decryption
+                None => Some(load_identity(identity)?),
+            };
+            repo.secret_rotate(&name, new_value, &pks, identity.as_ref())?;
+            println!("rotated secret {name} for {} recipient(s)", pks.len());
+            eprintln!("note: rotation cuts off future reads via the current registry; the old \
+                       ciphertext stays in history and anyone holding the old DEK keeps it — \
+                       rotate the underlying credential too");
+        }
+    }
+    Ok(())
+}
+
+/// `sc escrow set/show`: configure (or display) the break-glass escrow
+/// recipient in `.sc/recipients.toml`. Config only — auto-including the
+/// escrow key at seal/protect time is a separate concern.
+fn run_escrow(op: EscrowOp) -> Result<()> {
+    let repo = open_repo()?;
+    let path = repo.layout().dot_sc.join("recipients.toml");
+    match op {
+        EscrowOp::Set { key_or_name } => {
+            // Accept a raw pubkey, else resolve a [recipients] name.
+            let pk = match scl_crypto::PublicKey::from_key_string(&key_or_name) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    let dir = load_recipients(&path)?;
+                    dir.get(&key_or_name).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("'{key_or_name}' is not a public key or a known recipient")
+                    })?
+                }
+            };
+            // Round-trip the file so [recipients] is preserved.
+            let mut file: RecipientsFile = match std::fs::read_to_string(&path) {
+                Ok(t) => toml::from_str(&t)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => RecipientsFile::default(),
+                Err(e) => return Err(e.into()),
+            };
+            file.escrow = Some(EscrowEntry { key: pk.to_key_string() });
+            std::fs::write(&path, toml::to_string(&file)?)?;
+            println!("escrow set to {}", pk.recipient_id());
+        }
+        EscrowOp::Show => match load_escrow(&path)? {
+            Some(pk) => {
+                println!("escrow key: {}", pk.to_key_string());
+                println!("recipient id: {}", pk.recipient_id());
+                println!(
+                    "note: escrow is a recovery *policy* convenience, not enforcement — a \
+                     committer using the raw API can seal without it."
+                );
+            }
+            None => println!("no escrow key set"),
+        },
     }
     Ok(())
 }
@@ -898,6 +1027,20 @@ fn resolve_identity_opt(flag: Option<PathBuf>) -> Result<Option<scl_crypto::Secr
     Ok(Some(scl_crypto::FileKeyProvider::new(path).identity()?))
 }
 
+/// Append `escrow` to `pks` unless a key with the same bytes is already present
+/// (so passing escrow explicitly is harmless).
+fn append_escrow(
+    mut pks: Vec<scl_crypto::PublicKey>,
+    escrow: Option<scl_crypto::PublicKey>,
+) -> Vec<scl_crypto::PublicKey> {
+    if let Some(e) = escrow {
+        if !pks.iter().any(|p| p.to_bytes() == e.to_bytes()) {
+            pks.push(e);
+        }
+    }
+    pks
+}
+
 fn resolve_names(
     dir: &std::collections::BTreeMap<String, scl_crypto::PublicKey>,
     names: &[String],
@@ -906,6 +1049,30 @@ fn resolve_names(
         .iter()
         .map(|n| dir.get(n).cloned().ok_or_else(|| anyhow::anyhow!("unknown recipient: {n}")))
         .collect()
+}
+
+/// Map current recipient ids back to public keys drawn from `pool`. Errors,
+/// listing the unresolved ids, when a current recipient has no key in `pool`
+/// (e.g. missing from `.sc/recipients.toml`) — we cannot re-wrap a key we lack.
+fn resolve_ids_to_pubkeys(
+    ids: &[scl_crypto::RecipientId],
+    pool: &[scl_crypto::PublicKey],
+) -> Result<Vec<scl_crypto::PublicKey>> {
+    let mut out = Vec::with_capacity(ids.len());
+    let mut unresolved = Vec::new();
+    for id in ids {
+        match pool.iter().find(|pk| pk.recipient_id().as_str() == id.as_str()) {
+            Some(pk) => out.push(pk.clone()),
+            None => unresolved.push(id.as_str().to_string()),
+        }
+    }
+    if !unresolved.is_empty() {
+        anyhow::bail!(
+            "cannot rotate: no public key in .sc/recipients.toml for current recipient(s): {}",
+            unresolved.join(", ")
+        );
+    }
+    Ok(out)
 }
 
 fn run_clone(src: PathBuf, dst: PathBuf) -> Result<()> {
@@ -1104,9 +1271,10 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool) -> Result<()
     }
     let prefix = prefix.unwrap();
     let dir = load_recipients(&repo.layout().dot_sc.join("recipients.toml"))?;
-    let pks = resolve_names(&dir, &to)?;
+    let mut pks = resolve_names(&dir, &to)?;
+    pks = append_escrow(pks, load_escrow(&repo.layout().dot_sc.join("recipients.toml"))?);
     let id = repo.protect(&prefix, &pks, None)?;
-    println!("protected {prefix} for {} recipient(s): {}", to.len(), id.short());
+    println!("protected {prefix} for {} recipient(s): {}", pks.len(), id.short());
     Ok(())
 }
 
