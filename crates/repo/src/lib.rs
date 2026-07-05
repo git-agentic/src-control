@@ -3,6 +3,7 @@
 
 pub mod diff3;
 pub mod scanner;
+pub mod textdiff;
 pub mod scanner_patterns;
 pub mod error;
 pub mod gc;
@@ -13,11 +14,13 @@ pub mod lock;
 pub mod merge;
 pub mod merge_state;
 pub mod protect;
+pub mod protect_ops;
 pub mod reachable;
 pub mod refs;
 pub mod remote;
 pub mod repo;
 pub mod secrets;
+pub mod sync;
 pub mod transport;
 pub mod worktree;
 

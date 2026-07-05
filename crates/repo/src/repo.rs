@@ -9,10 +9,7 @@ use scl_vfs::Repo as VfsRepo;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::lock::RepoLock;
-use crate::reachable;
 use crate::refs;
-use crate::remote::RemoteConfig;
-use crate::transport::{LocalTransport, Transport};
 use crate::worktree::{self, Diff};
 
 const DEFAULT_BRANCH: &str = "main";
@@ -28,8 +25,8 @@ pub type Status = Diff;
 /// A handle to an open persistent repo. Holds the single-writer lock for its
 /// lifetime.
 pub struct Repo {
-    layout: Layout,
-    vfs: VfsRepo,
+    pub(crate) layout: Layout,
+    pub(crate) vfs: VfsRepo,
     _lock: RepoLock,
 }
 
@@ -308,7 +305,7 @@ impl Repo {
             root,
             parents,
             author: author.to_string(),
-            timestamp: 0,
+            timestamp: unix_now(),
             message: message.to_string(),
             secrets,
             protection,
@@ -332,6 +329,71 @@ impl Repo {
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         worktree::diff_worktree(&self.layout, &mut store, head_root, &protection)
+    }
+
+    /// Line-level unified diff of the working tree against HEAD (`sc diff`).
+    ///
+    /// Text files get standard `---`/`+++`/`@@` hunks; a file with a NUL byte
+    /// on either side is reported as binary. `PROTECTED` HEAD entries follow
+    /// the same rules as [`Repo::status`]: absent-on-disk is clean (skipped
+    /// checkout, not a deletion), an on-disk edit is detected by convergent
+    /// re-encryption — but the content is never shown (it would be ciphertext
+    /// vs plaintext noise at best, a leak at worst).
+    pub fn diff_unified(&self) -> Result<String> {
+        use scl_core::PROTECTED;
+        let head_root = self.head_tip()?.map(|t| self.snapshot(&t)).transpose()?.map(|s| s.root);
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let head = match head_root {
+            Some(root) => worktree::tree_file_entries_with_perms(&mut store, root)?,
+            None => BTreeMap::new(),
+        };
+        let tracked: std::collections::BTreeSet<String> = head.keys().cloned().collect();
+        let wt: BTreeMap<String, Vec<u8>> = worktree::read_worktree(&self.layout, &tracked)?
+            .into_iter()
+            .map(|(p, b, _)| (p, b))
+            .collect();
+
+        let mut paths: std::collections::BTreeSet<&String> = wt.keys().collect();
+        paths.extend(head.keys());
+
+        let mut out = String::new();
+        for path in paths {
+            let disk = wt.get(path);
+            match head.get(path) {
+                None => {
+                    // Added file.
+                    let bytes = disk.expect("path came from one of the two maps");
+                    push_file_diff(&mut out, path, &[], bytes);
+                }
+                Some((blob_id, _mode, perms)) if *perms & PROTECTED != 0 => {
+                    // Never show protected content; report the change status only.
+                    if let Some(bytes) = disk {
+                        let disk_id = Object::blob(scl_crypto::encrypt_path(bytes).0).id();
+                        if disk_id != *blob_id {
+                            out.push_str(&format!(
+                                "protected file changed: {path} (content not shown)\n"
+                            ));
+                        }
+                    }
+                }
+                Some((blob_id, _mode, _perms)) => {
+                    let old = match store.get(blob_id)? {
+                        Object::Blob(b) => b,
+                        _ => continue,
+                    };
+                    match disk {
+                        None => push_file_diff(&mut out, path, &old, &[]),
+                        Some(bytes) => {
+                            if Object::blob(bytes.clone()).id() != *blob_id {
+                                push_file_diff(&mut out, path, &old, bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Conflicted paths if a merge is in progress (empty otherwise).
@@ -642,177 +704,6 @@ impl Repo {
         Ok(skipped)
     }
 
-    /// Record (or replace) a protected-path rule for `prefix`, encrypting any
-    /// matching working-tree files for `recipients`.
-    ///
-    /// The rule is persisted as a policy-only snapshot first (so the subsequent
-    /// commit reads it from the tip), then a normal `commit` runs: matching
-    /// working-tree files are convergently encrypted and wrapped for each
-    /// recipient. If nothing matches yet, the rule is still recorded for future
-    /// commits. The `identity` arg is reserved for future re-encrypt symmetry
-    /// (e.g. re-protecting already-committed plaintext) and is unused today.
-    /// Returns the id of the resulting commit.
-    pub fn protect(
-        &self,
-        prefix: &str,
-        recipients: &[scl_crypto::PublicKey],
-        _identity: Option<&scl_crypto::SecretKey>,
-    ) -> Result<ObjectId> {
-        use scl_core::ProtectPrefix;
-        crate::secrets::require_recipients(recipients)?;
-        // Load the tip's protection, add/replace the rule, and persist it as a
-        // policy-only commit (same root) so `commit` below sees the new prefix.
-        let (root, parents, secrets, mut protection) = match self.head_tip()? {
-            Some(t) => {
-                let snap = self.snapshot(&t)?;
-                (snap.root, vec![t], snap.secrets, snap.protection)
-            }
-            None => {
-                let root = self.vfs.write_tree(&[])?;
-                (root, vec![], BTreeMap::new(), Protection::default())
-            }
-        };
-        protection.prefixes.retain(|p| p.prefix != prefix);
-        protection.prefixes.push(ProtectPrefix {
-            prefix: prefix.to_string(),
-            recipients: recipients.iter().map(|p| p.to_bytes()).collect(),
-        });
-        self.commit_snapshot(root, parents, secrets, protection, "system", &format!("protect {prefix}"))?;
-        // Now encrypt matching working-tree files under the freshly-recorded rule.
-        self.commit("system", &format!("encrypt under {prefix}"))
-    }
-
-    /// Collect the PROTECTED blob ids in the tip tree whose path is governed by
-    /// the rule `prefix` (longest-prefix wins, mirroring `matching_prefix`).
-    fn protected_blob_ids_under(&self, root: ObjectId, protection: &Protection, prefix: &str) -> Result<Vec<ObjectId>> {
-        let store_arc = self.vfs.store();
-        let mut store = store_arc.lock().unwrap();
-        let entries = worktree::tree_file_entries_with_perms(&mut store, root)?;
-        Ok(entries
-            .into_iter()
-            .filter(|(path, (_id, _mode, perms))| {
-                perms & scl_core::PROTECTED != 0
-                    && crate::protect::matching_prefix(protection, path)
-                        .is_some_and(|r| r.prefix == prefix)
-            })
-            .map(|(_path, (id, _, _))| id)
-            .collect())
-    }
-
-    /// Grant `new` read access to the files protected under `prefix` — a
-    /// policy-only operation that does NOT touch any blob or tree id.
-    ///
-    /// For each protected blob under `prefix`, the DEK is recovered with the
-    /// `authorized` identity (which must currently be a recipient, else
-    /// `NotAuthorized`) and re-wrapped for `new` (deduped by recipient id). The
-    /// `new` recipient is also added to the prefix rule. The resulting snapshot
-    /// reuses the tip's exact root tree. Errors `NotProtected` if no such prefix.
-    pub fn grant(
-        &self,
-        prefix: &str,
-        authorized: &scl_crypto::SecretKey,
-        new: &scl_crypto::PublicKey,
-    ) -> Result<ObjectId> {
-        let tip = self.head_tip()?.ok_or(Error::Unborn)?;
-        let snap = self.snapshot(&tip)?;
-        let (root, secrets, mut protection) = (snap.root, snap.secrets, snap.protection);
-
-        let rule_idx = protection
-            .prefixes
-            .iter()
-            .position(|p| p.prefix == prefix)
-            .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
-
-        let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
-        let authorized_id = authorized.public().recipient_id().to_string();
-        let new_id = new.recipient_id().to_string();
-        for blob_id in protected_ids {
-            let Some(wks) = protection.wrapped.get(&blob_id) else { continue };
-            if wks.iter().any(|w| w.recipient_id == new_id) {
-                continue; // `new` already a recipient for this blob
-            }
-            // Locate the wrap addressed to `authorized` by recipient id (mirrors
-            // the Phase-2 `secrets.rs`/`open` lookup). A missing wrap means the
-            // caller isn't a recipient → NotAuthorized; a present-but-corrupt
-            // wrap must surface as a hard crypto error via `?`, not be misread as
-            // an authorization failure. The DEK stays `Zeroizing`.
-            let wk = wks
-                .iter()
-                .find(|w| w.recipient_id == authorized_id)
-                .ok_or_else(|| Error::NotAuthorized(prefix.to_string()))?;
-            let dek = scl_crypto::unwrap_dek_with(wk, authorized)?;
-            let new_wk = scl_crypto::wrap_dek_for(&dek, new);
-            protection.wrapped.get_mut(&blob_id).expect("present above").push(new_wk);
-        }
-
-        let new_bytes = new.to_bytes();
-        if !protection.prefixes[rule_idx].recipients.contains(&new_bytes) {
-            protection.prefixes[rule_idx].recipients.push(new_bytes);
-        }
-        self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("grant {prefix}"))
-    }
-
-    /// Revoke `recipient_id` from `prefix`: drop its wrapped DEK from every
-    /// protected blob under the prefix and remove its public key from the rule's
-    /// recipients. Policy-only (root tree unchanged). Errors `NotProtected` if no
-    /// such prefix. Does not rotate content (a prior holder kept any plaintext
-    /// already checked out — see the secrets-revoke rationale in ADR-0008).
-    pub fn revoke(&self, prefix: &str, recipient_id: &scl_crypto::RecipientId) -> Result<ObjectId> {
-        let tip = self.head_tip()?.ok_or(Error::Unborn)?;
-        let snap = self.snapshot(&tip)?;
-        let (root, secrets, mut protection) = (snap.root, snap.secrets, snap.protection);
-
-        let rule_idx = protection
-            .prefixes
-            .iter()
-            .position(|p| p.prefix == prefix)
-            .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
-
-        // Refuse to empty the rule's recipient set: subsequent commits under the
-        // prefix would seal new content for nobody (the empty-recipient footgun).
-        let survives = protection.prefixes[rule_idx].recipients.iter().any(|pk| {
-            scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != recipient_id.as_str()
-        });
-        if !survives {
-            return Err(Error::InvalidArgument(format!(
-                "revoking the last recipient would leave {prefix} readable by nobody; \
-                 grant another recipient first"
-            )));
-        }
-
-        let protected_ids = self.protected_blob_ids_under(root, &protection, prefix)?;
-        let rid = recipient_id.as_str();
-        for blob_id in protected_ids {
-            if let Some(wks) = protection.wrapped.get_mut(&blob_id) {
-                wks.retain(|w| w.recipient_id != rid);
-            }
-        }
-        protection.prefixes[rule_idx]
-            .recipients
-            .retain(|pk| scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != rid);
-        self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("revoke from {prefix}"))
-    }
-
-    /// List the tip's protected prefixes, each with its recipients' fingerprints
-    /// (for display). Empty if unborn or no prefixes are protected.
-    pub fn protected_prefixes(&self) -> Result<Vec<(String, Vec<scl_crypto::RecipientId>)>> {
-        let protection = match self.head_tip()? {
-            Some(t) => self.snapshot(&t)?.protection,
-            None => Protection::default(),
-        };
-        Ok(protection
-            .prefixes
-            .into_iter()
-            .map(|p| {
-                let rids = p
-                    .recipients
-                    .iter()
-                    .map(|pk| scl_crypto::PublicKey::from_bytes(*pk).recipient_id())
-                    .collect();
-                (p.prefix, rids)
-            })
-            .collect())
-    }
 
     /// Expose the underlying VFS repo handle (needed by secrets.rs methods).
     pub(crate) fn vfs_handle(&self) -> &VfsRepo {
@@ -834,199 +725,35 @@ impl Repo {
         crate::gc::run(&self.layout, &mut store, grace)
     }
 
-    /// Add a named remote to `.sc/config`. The name becomes a path component
-    /// under `refs/remotes/`, so it is validated like a branch name to keep a
-    /// hostile name (e.g. `../heads`) from escaping into `refs/heads/`.
-    pub fn remote_add(&self, name: &str, url: &str) -> Result<()> {
-        validate_branch_name(name)?;
-        let mut cfg = RemoteConfig::load(&self.layout)?;
-        cfg.add(name, url)?;
-        cfg.save(&self.layout)
-    }
-
-    /// Add a named Git-backed remote to `.sc/config`.
-    pub fn remote_add_git(&self, name: &str, url: &str) -> Result<()> {
-        validate_branch_name(name)?;
-        let mut cfg = RemoteConfig::load(&self.layout)?;
-        cfg.add_kind(name, url, crate::remote::RemoteKind::Git)?;
-        cfg.save(&self.layout)
-    }
-
-    /// List configured remotes as `(name, url)`.
-    pub fn remotes(&self) -> Result<Vec<(String, String)>> {
-        let cfg = RemoteConfig::load(&self.layout)?;
-        Ok(cfg.remote.into_iter().map(|(n, r)| (n, r.url)).collect())
-    }
-
-    /// Clone the repo at `src` into a fresh repo at `dst`. Transfers all objects
-    /// reachable from src's branches via `LocalTransport`, copies refs + HEAD,
-    /// seeds `origin/*` remote-tracking refs, records `origin = src`, and
-    /// materializes HEAD into the dst working tree.
-    ///
-    /// On `Err`, `dst` may be left with a partially-initialized `.sc/`; the
-    /// caller should remove it before retrying.
-    pub fn clone_to(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<Repo> {
-        let src = src.as_ref();
-        let transport = LocalTransport::open(src)?;
-        let remote_refs = transport.list_refs()?;
-        let head_branch = transport.head_branch()?;
-
-        let dst_repo = Repo::init(dst.as_ref())?;
-
-        // Transfer every object reachable from the remote's branch tips.
-        let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
-        {
-            let store_arc = dst_repo.vfs.store();
-            let mut store = store_arc.lock().unwrap();
-            // Fresh clone dst has no local refs yet → no haves → full transfer.
-            transfer_objects(&transport, &mut store, &tips, &[])?;
-        }
-
-        // Copy branches + HEAD, and seed origin/* remote-tracking refs so
-        // `merge origin/<branch>` resolves immediately and `fetch` has a baseline.
-        for (branch, tip) in &remote_refs {
-            refs::write_branch_tip(&dst_repo.layout, branch, tip)?;
-            refs::write_remote_tip(&dst_repo.layout, "origin", branch, tip)?;
-        }
-        refs::write_head(&dst_repo.layout, &head_branch)?;
-
-        // Record origin.
-        dst_repo.remote_add("origin", &src.display().to_string())?;
-
-        // Materialize HEAD into the working tree. No identity is available at
-        // clone time, so PROTECTED files are skipped (ciphertext stays in objects
-        // but plaintext is not written to disk — correct for unauthorized clones).
-        if let Some(head_tip) = dst_repo.head_tip()? {
-            let store_arc = dst_repo.vfs.store();
-            let mut store = store_arc.lock().unwrap();
-            let head_snap = store.get_snapshot(&head_tip)?;
-            let head_root = head_snap.root;
-            let head_protection = head_snap.protection;
-            worktree::materialize(&dst_repo.layout, &mut store, head_root, None, &head_protection, None)?;
-        }
-        Ok(dst_repo)
-    }
-
-    /// Fetch objects + branch tips from `remote` into remote-tracking refs
-    /// (`refs/remotes/<remote>/<branch>`). Local branches are left untouched.
-    pub fn fetch(&self, remote: &str) -> Result<Vec<(String, ObjectId)>> {
-        let cfg = RemoteConfig::load(&self.layout)?;
-        let url = cfg.url(remote).ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
-        let transport = LocalTransport::open(url)?;
-        let remote_refs = transport.list_refs()?;
-
-        let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
-        {
-            let store_arc = self.vfs.store();
-            let mut store = store_arc.lock().unwrap();
-            // Derive haves from local refs before the mutable borrow for transfer.
-            let haves = local_have_tips(&self.layout, &store)?;
-            transfer_objects(&transport, &mut store, &tips, &haves)?;
-        }
-        for (branch, tip) in &remote_refs {
-            refs::write_remote_tip(&self.layout, remote, branch, tip)?;
-        }
-        Ok(remote_refs)
-    }
-
-    /// Push the current branch to `remote`, fast-forward-only. Creates the remote
-    /// branch if absent. Errors `NonFastForward` if the remote has commits not
-    /// reachable from the local tip.
-    pub fn push(&self, remote: &str) -> Result<ObjectId> {
-        let cfg = RemoteConfig::load(&self.layout)?;
-        let url = cfg.url(remote).ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
-        let transport = LocalTransport::open(url)?;
-        let branch = refs::current_branch(&self.layout)?;
-        let local_tip = self.head_tip()?.ok_or(Error::Unborn)?;
-
-        // Fast-forward check against the remote's current tip for this branch.
-        // The tip we checked against is remembered and passed to `update_ref`,
-        // which revalidates it under the remote's lock (compare-and-swap) — so
-        // a push racing us fails there instead of being silently clobbered.
-        let expected_old = transport
-            .list_refs()?
-            .into_iter()
-            .find(|(b, _)| *b == branch)
-            .map(|(_, tip)| tip);
-        if let Some(remote_tip) = expected_old {
-            if remote_tip == local_tip {
-                // Already up to date: skip all remote I/O (no transfer, no ref write).
-                return Ok(local_tip);
-            }
-            let store_arc = self.vfs.store();
-            let mut store = store_arc.lock().unwrap();
-            if !crate::merge::is_ancestor(&mut store, remote_tip, local_tip)? {
-                return Err(Error::NonFastForward);
-            }
-        }
-
-        // Build one pack of the objects the remote lacks, send it in bulk, then
-        // advance the remote ref.
-        {
-            let store_arc = self.vfs.store();
-            let mut store = store_arc.lock().unwrap();
-            let mut send: Vec<(ObjectId, Vec<u8>)> = Vec::new();
-            for id in reachable::reachable_objects(&mut *store, &[local_tip])? {
-                if !transport.has_object(&id)? {
-                    send.push((id, store.get(&id)?.encode()));
-                }
-            }
-            if !send.is_empty() {
-                let (pack, _idx) = scl_core::pack::build_pack(&send)?;
-                transport.put_pack(&pack)?;
-            }
-        }
-        transport.update_ref(&branch, &local_tip, expected_old.as_ref())?;
-        Ok(local_tip)
-    }
 }
 
-/// The tips we already hold locally: every local branch and remote-tracking ref
-/// target that is present in the store. Passed as `haves` so a fetch pulls only
-/// the delta the remote has beyond what we already have. Safe to advertise
-/// because refs advance only after a fully-successful transfer, so every ref
-/// target's closure is complete in the store.
-fn local_have_tips(layout: &Layout, store: &Store) -> Result<Vec<ObjectId>> {
-    let mut out = Vec::new();
-    for (_, id) in refs::list_heads(layout)? {
-        if store.contains(&id) {
-            out.push(id);
-        }
-    }
-    for (_, _, id) in refs::list_remote_tips(layout)? {
-        if store.contains(&id) {
-            out.push(id);
-        }
-    }
-    Ok(out)
+/// Current unix time in seconds, for snapshot timestamps. Snapshot ids
+/// legitimately depend on commit time (as in Git); nothing in the system
+/// requires two separate commits of identical content to share an id.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
-/// Pull every object reachable from `tips` out of `transport` and into `store`.
-/// `haves` tells the remote which objects the local store already has so it can
-/// omit them from the pack; `parse_pack` verifies each record. Callers hold the
-/// store lock across this call, so it must not acquire any other lock. Shared by
-/// `clone_to` and `fetch`.
-fn transfer_objects(
-    transport: &impl Transport,
-    store: &mut Store,
-    tips: &[ObjectId],
-    haves: &[ObjectId],
-) -> Result<()> {
-    let pack = transport.get_pack(tips, haves)?;
-    // parse_pack verifies every record; write each object into the local store.
-    for (id, obj) in scl_core::pack::parse_pack(&pack)? {
-        let got = store.put(obj)?;
-        if got != id {
-            return Err(Error::CorruptObject(id));
-        }
+/// Append one file's diff to `out`: unified hunks for text, a one-line notice
+/// for binary content (NUL byte on either side).
+fn push_file_diff(out: &mut String, path: &str, old: &[u8], new: &[u8]) {
+    if old.contains(&0) || new.contains(&0) {
+        out.push_str(&format!("Binary files a/{path} and b/{path} differ\n"));
+        return;
     }
-    Ok(())
+    let old_s = String::from_utf8_lossy(old);
+    let new_s = String::from_utf8_lossy(new);
+    out.push_str(&crate::textdiff::unified(path, &old_s, &new_s));
 }
+
 
 /// Reject branch names that would escape or corrupt `refs/heads/`. A branch name
 /// becomes a single path component under `refs/heads/`, so names containing path
 /// separators, the special `.`/`..` components, or a leading dot are refused.
-fn validate_branch_name(name: &str) -> Result<()> {
+pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
         || name == ".."
@@ -2153,11 +1880,12 @@ mod tests {
         let store_arc = local.vfs.store();
         let store = store_arc.lock().unwrap();
 
-        let haves = local_have_tips(&local.layout, &store).unwrap();
+        let haves = crate::sync::local_have_tips(&local.layout, &store).unwrap();
         assert!(haves.contains(&c1), "local haves must include c1 ({c1})");
 
         // Build the delta pack: remote only sends what local doesn't have.
-        let transport = LocalTransport::open(&remote_root).unwrap();
+        use crate::transport::Transport as _;
+        let transport = crate::transport::LocalTransport::open(&remote_root).unwrap();
         let pack = transport.get_pack(&[c2], &haves).unwrap();
         let entries: Vec<scl_core::ObjectId> = scl_core::pack::parse_pack(&pack)
             .unwrap()
