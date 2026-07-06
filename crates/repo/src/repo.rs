@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use scl_core::{Object, ObjectId, Protection, Snapshot, Store};
+use scl_core::{Object, ObjectId, Protection, Snapshot, Store, WrappedKey};
 use scl_vfs::Repo as VfsRepo;
 
 use crate::error::{Error, Result};
@@ -471,6 +471,22 @@ impl Repo {
     /// (e.g. from a freshly imported git remote) works without an intervening
     /// local commit.
     pub fn merge(&self, branch: &str, author: &str) -> Result<ObjectId> {
+        self.merge_with_identity(branch, author, None)
+    }
+
+    /// Like [`merge`][Repo::merge] but threads `identity` through the
+    /// real-three-way path so protected paths that diverged in *content* on
+    /// both sides can be decrypted, diff3'd, and re-encrypted (P15). Clean
+    /// ciphertext-id fast paths (ADR: [`crate::merge::three_way_files`]) still
+    /// need no identity at all. A conflicted merge that touches a protected
+    /// path is refused for now (`Task 6 removes this`) — see the comment at
+    /// the guard below.
+    pub fn merge_with_identity(
+        &self,
+        branch: &str,
+        author: &str,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<ObjectId> {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -552,50 +568,113 @@ impl Repo {
         }
 
         // Real three-way merge.
-        let (merge_result, ours_root) = {
+        let (merge_result, ours_root, ours_protection, theirs_protection) = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
             let base = crate::merge::merge_base(&mut store, ours, theirs)?
                 .ok_or(Error::NoCommonAncestor)?;
 
-            // Fail closed on protected content. `three_way` flattens trees without
-            // the `perms` byte and would push raw ciphertext into the working tree
-            // as an ordinary unprotected blob, destroying the encrypted files (even
-            // the legitimate recipient could no longer decrypt the merge commit).
-            // Properly threading perms + wrapped DEKs through the merge is a
-            // deliberate backlog follow-on; until then we refuse rather than corrupt.
-            // This is a pure read + early return: nothing is written to the working
-            // tree or refs before the guard fires.
-            for snap_id in [base, ours, theirs] {
-                let root = store.get_snapshot(&snap_id)?.root;
-                let entries = worktree::tree_file_entries_with_perms(&mut store, root)?;
-                if entries.values().any(|(_, _, perms)| perms & scl_core::PROTECTED != 0) {
-                    return Err(Error::MergeProtected(branch.to_string()));
-                }
-            }
-
-            let m = crate::merge::three_way(&mut store, base, ours, theirs, None)?;
+            let m = crate::merge::three_way(&mut store, base, ours, theirs, identity)?;
             let ours_root = store.get_snapshot(&ours)?.root;
-            (m, ours_root)
+            let ours_protection = store.get_snapshot(&ours)?.protection;
+            let theirs_protection = store.get_snapshot(&theirs)?.protection;
+            (m, ours_root, ours_protection, theirs_protection)
         };
 
-        // Build the merged tree from the resolved file set. The protected
-        // guard above makes `needs_encrypt` outputs unreachable here: with no
-        // PROTECTED entry on any side, every merged file is plain.
-        let write_set: Vec<(String, Vec<u8>, scl_core::FileMode)> = merge_result
-            .files
+        // Task 6 removes this. Clean protected merges are handled below, but a
+        // CONFLICTED merge that touches a protected (needs_encrypt) path isn't
+        // yet — resolving a protected conflict safely (markers in plaintext,
+        // re-encrypt on commit) is the next change's scope. Refuse before any
+        // write (working tree, refs, or merge state) so a re-run after that
+        // change ships just works. All-plain conflicts are unaffected: they
+        // fall through to the existing marker-file path below.
+        if merge_result
+            .conflicts
             .iter()
-            .map(|f| {
-                debug_assert!(!f.needs_encrypt, "protected guard fired above");
-                (f.path.clone(), f.bytes.clone(), f.mode)
-            })
-            .collect();
-        let merged_root = self.vfs.write_tree(&write_set)?;
+            .filter_map(|p| merge_result.files.iter().find(|f| &f.path == p))
+            .any(|f| f.needs_encrypt)
+        {
+            return Err(Error::InvalidArgument(
+                "protected conflict resolution lands in the next change; rerun after it ships"
+                    .into(),
+            ));
+        }
+
+        // Union protection rules across both sides: governs which recipients a
+        // needs_encrypt output (or a carried-plain file whose path is still
+        // ruled on the other side) is encrypted for, and becomes the merged
+        // snapshot's policy so future commits under either side's rules stay
+        // protected. `union_prot` exists only to drive `matching_prefix`
+        // lookups below — its `wrapped` map is irrelevant here.
+        let union_prefixes =
+            crate::protect::union_prefixes(&ours_protection.prefixes, &theirs_protection.prefixes);
+        let union_prot = scl_core::Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
+
+        // Split the resolved file set: carried ciphertext (needs_encrypt:
+        // false, PROTECTED) stays byte-for-byte as-is; needs_encrypt outputs
+        // (content-merged protected plaintext) get encrypted; a carried PLAIN
+        // file (perms 0) whose path still matches a union rule is ALSO routed
+        // through encryption — one side unprotecting a path the other side
+        // still rules must not let plaintext land in the merged snapshot
+        // (bit<->rule invariant, Task 4 review I2).
+        let mut carried: Vec<(String, Vec<u8>, scl_core::FileMode, u8)> = Vec::new();
+        let mut to_encrypt: Vec<(String, Vec<u8>, scl_core::FileMode, Vec<[u8; 32]>)> = Vec::new();
+        for f in &merge_result.files {
+            if f.needs_encrypt {
+                let recipients = crate::protect::matching_prefix(&union_prot, &f.path)
+                    .map(|r| r.recipients.clone())
+                    .ok_or_else(|| Error::NotProtected(f.path.clone()))?;
+                to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, recipients));
+            } else if f.perms & scl_core::PROTECTED == 0 {
+                match crate::protect::matching_prefix(&union_prot, &f.path) {
+                    Some(rule) => {
+                        to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, rule.recipients.clone()))
+                    }
+                    None => carried.push((f.path.clone(), f.bytes.clone(), f.mode, 0)),
+                }
+            } else {
+                // Carried ciphertext: bytes are already the surviving blob's
+                // raw ciphertext (fast path), never decrypted, perms verbatim.
+                carried.push((f.path.clone(), f.bytes.clone(), f.mode, f.perms));
+            }
+        }
+
+        let (encrypted, fresh_wrapped) = crate::protect::encrypt_protected(to_encrypt);
+        carried.extend(encrypted);
+        let all = carried;
+
+        let merged_root = self.vfs.write_tree_with_perms(&all)?;
+
+        // Merged wrap map: union the carried wraps (from `wrapped_carry`, for
+        // ciphertext that survived unchanged/one-sided) with the freshly
+        // encrypted entries' wraps, then reuse ours' prior wrap bytes for any
+        // (blob, recipient) that's unchanged — same stability discipline as
+        // `snapshot_files`' commit-time rebuild, so a convergent re-merge in
+        // an independent repo produces byte-identical wraps.
+        let mut wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = merge_result.wrapped_carry.clone();
+        for (id, wks) in fresh_wrapped {
+            let entry = wrapped.entry(id).or_default();
+            *entry = crate::protect::union_wraps(entry, &wks);
+        }
+        crate::protect::reuse_prior_wraps(&mut wrapped, &ours_protection.wrapped);
+        // Prune to blobs actually reachable in the merged tree (commit's
+        // rebuild discipline — a path that lost its rule mid-merge and no
+        // longer resolves to that blob must not leave a stale wrap entry).
+        {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let reachable: std::collections::BTreeSet<ObjectId> =
+                worktree::tree_file_entries_with_perms(&mut store, merged_root)?
+                    .values()
+                    .map(|(id, _, _)| *id)
+                    .collect();
+            wrapped.retain(|id, _| reachable.contains(id));
+        }
+        let merged_protection = scl_core::Protection { prefixes: union_prefixes, wrapped };
 
         // Materialize merged tree into the working dir, then write sidecars.
-        // Protected merges are refused by the guard above, so this path only ever
-        // sees unprotected blobs: the merged tree legitimately has no PROTECTED
-        // entries, so no identity is needed and no files will be skipped.
+        // Protection-aware: a merged PROTECTED entry decrypts for `identity`
+        // when possible, else is skipped (never writes ciphertext to disk).
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
@@ -604,8 +683,8 @@ impl Repo {
                 &mut store,
                 merged_root,
                 Some(ours_root),
-                &scl_core::Protection::default(),
-                None,
+                &merged_protection,
+                identity,
             )?;
         }
         for (rel, bytes) in &merge_result.sidecars {
@@ -617,17 +696,13 @@ impl Repo {
         }
 
         if merge_result.conflicts.is_empty() {
-            // Clean merge: two-parent snapshot now. Carry ours' protection forward.
-            let ours_protection = {
-                let store_arc = self.vfs.store();
-                let p = store_arc.lock().unwrap().get_snapshot(&ours)?.protection;
-                p
-            };
+            // Clean merge: two-parent snapshot now, carrying the merged
+            // (union rules + union/fresh wraps) protection policy forward.
             let id = self.commit_snapshot(
                 merged_root,
                 vec![ours, theirs],
                 merge_result.secrets,
-                ours_protection,
+                merged_protection,
                 author,
                 &format!("merge {branch}"),
             )?;
@@ -1304,49 +1379,372 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // ---- P15 Task 5: `Repo::merge_with_identity` — clean protected merges ----
+
     #[test]
-    fn merge_refuses_when_protected_paths_present() {
-        // A real three-way merge cannot yet thread perms + wrapped DEKs through
-        // `three_way`; doing so would strip protection and write ciphertext to the
-        // working tree. The merge must fail closed and leave the repo untouched.
-        let root = tmp_root("p7-merge-protected");
+    fn non_recipient_merges_disjoint_protected_branches() {
+        // alice protects secret/ and commits secret/a.txt; main edits
+        // secret/a.txt, feature (from the same base) adds secret/b.txt — both
+        // resolve by the ciphertext-id fast path (one side unchanged/one-sided
+        // add), so a merge with NO identity at all must still succeed: nothing
+        // is ever decrypted. Alice can still read both files afterward.
+        let root = tmp_root("p15-merge-disjoint-protected");
         let repo = Repo::init(&root).unwrap();
-        let (sk, pk) = scl_crypto::generate_keypair();
-        repo.test_set_protected_prefix("secret/", &[pk]).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
-        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
-        std::fs::write(root.join("shared.txt"), b"base\n").unwrap();
-        let base = repo.commit("me", "base").unwrap();
-        repo.branch("feature").unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"a1").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("b2").unwrap();
 
-        // Divergent change on each branch from the common base (a real three-way).
-        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
-        let ours = repo.commit("me", "ours adds a.txt").unwrap();
-        repo.switch_with_identity("feature", Some(&sk)).unwrap();
-        std::fs::write(root.join("b.txt"), b"b\n").unwrap();
-        repo.commit("me", "theirs adds b.txt").unwrap();
-        // Back on main, authorized, so the protected file is decrypted on disk.
-        repo.switch_with_identity("main", Some(&sk)).unwrap();
-        assert_eq!(std::fs::read(root.join("secret/db.txt")).unwrap(), b"hunter2");
+        // main (ours): edit secret/a.txt.
+        std::fs::write(root.join("secret/a.txt"), b"a2").unwrap();
+        let ours = repo.commit("me", "main edits a.txt").unwrap();
 
-        // The merge must refuse, naming the branch.
-        let err = repo.merge("feature", "me").unwrap_err();
-        assert!(matches!(err, Error::MergeProtected(_)), "got {err:?}");
+        // b2 (theirs): add secret/b.txt.
+        repo.switch_with_identity("b2", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/b.txt"), b"b1").unwrap();
+        repo.commit("me", "b2 adds b.txt").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
-        // Working tree untouched: still decrypted plaintext, no raw ciphertext.
-        assert_eq!(
-            std::fs::read(root.join("secret/db.txt")).unwrap(),
-            b"hunter2",
-            "protected file must be unchanged (no ciphertext written) when merge refused",
-        );
-        // theirs-only file was never pulled in; no merge state recorded.
-        assert!(!root.join("b.txt").exists(), "nothing from theirs written");
-        assert!(!repo.merge_in_progress(), "no MERGE_HEAD recorded");
-        // HEAD unmoved: no merge commit was created.
-        assert_eq!(repo.head_tip().unwrap(), Some(ours), "HEAD must not advance");
-        let _ = base;
+        // Merge with NO identity: must succeed (no content divergence to decrypt).
+        let id = repo.merge("b2", "me").unwrap();
+        assert!(!repo.merge_in_progress());
+        let _ = ours;
+
+        let snap = repo.snapshot(&id).unwrap();
+        let (a_id, a_perms, b_id, b_perms) = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap();
+            let (aid, _, aperms) = entries["secret/a.txt"];
+            let (bid, _, bperms) = entries["secret/b.txt"];
+            (aid, aperms, bid, bperms)
+        };
+        assert_ne!(a_perms & scl_core::PROTECTED, 0);
+        assert_ne!(b_perms & scl_core::PROTECTED, 0);
+        {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            if let Object::Blob(b) = s.get(&a_id).unwrap() {
+                assert_ne!(&b[..], b"a2", "a.txt blob must be ciphertext");
+            } else {
+                panic!("expected Blob");
+            }
+            if let Object::Blob(b) = s.get(&b_id).unwrap() {
+                assert_ne!(&b[..], b"b1", "b.txt blob must be ciphertext");
+            } else {
+                panic!("expected Blob");
+            }
+        }
+
+        // Alice, with her identity, can decrypt both merged files.
+        let skipped = repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        assert!(skipped.is_empty(), "alice must decrypt both: {skipped:?}");
+        assert_eq!(std::fs::read(root.join("secret/a.txt")).unwrap(), b"a2");
+        assert_eq!(std::fs::read(root.join("secret/b.txt")).unwrap(), b"b1");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn content_divergent_merge_without_identity_refuses_cleanly() {
+        // Both branches edit secret/a.txt's content: a genuine content merge,
+        // which needs an identity to decrypt and diff3 the plaintexts. Without
+        // one, the merge must refuse, and leave refs/working tree/merge state
+        // completely untouched.
+        let root = tmp_root("p15-merge-refuse-no-identity");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"v1").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"v2").unwrap();
+        let ours = repo.commit("me", "main edits").unwrap();
+        // Switch WITH identity so the protected file stays materialized on
+        // disk across the branch hop (a keyless switch would skip/remove it,
+        // which is not what this test is about).
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"v3").unwrap();
+        repo.commit("me", "feature edits").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "secret/a.txt"), "got {err:?}");
+
+        // Refs untouched.
+        assert_eq!(repo.head_tip().unwrap(), Some(ours));
+        // No merge state recorded.
+        assert!(!repo.merge_in_progress());
+        // Working tree untouched: main's own edit ("v2", written directly by
+        // `std::fs::write` — commit never rewrites the working copy) is intact.
+        assert_eq!(std::fs::read(root.join("secret/a.txt")).unwrap(), b"v2");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn content_merge_with_identity_reencrypts_for_all_recipients() {
+        // secret/ protected to BOTH alice and bob; colliding-but-mergeable
+        // edits (non-overlapping lines). `merge_with_identity(alice)` must
+        // produce a clean two-parent snapshot whose re-encrypted blob decrypts
+        // for BOTH recipients, not just the one who ran the merge.
+        let root = tmp_root("p15-merge-content-both-recipients");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk, bob_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"L1\nl2\nl3\n").unwrap();
+        repo.commit("me", "main edits line 1").unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nL3\n").unwrap();
+        repo.commit("me", "feature edits line 3").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        let id = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents.len(), 2, "clean merge is a two-parent snapshot");
+
+        let (blob_id, bytes) = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap();
+            let (id, _, perms) = entries["secret/a.txt"];
+            assert_ne!(perms & scl_core::PROTECTED, 0);
+            let bytes = match s.get(&id).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("expected Blob"),
+            };
+            (id, bytes)
+        };
+        let prot = &snap.protection;
+        let alice_pt =
+            crate::protect::decrypt_with(&bytes, &blob_id, &[prot], &alice_sk, "secret/a.txt").unwrap();
+        let bob_pt =
+            crate::protect::decrypt_with(&bytes, &blob_id, &[prot], &bob_sk, "secret/a.txt").unwrap();
+        assert_eq!(&alice_pt[..], b"L1\nl2\nL3\n");
+        assert_eq!(&bob_pt[..], b"L1\nl2\nL3\n");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rules_union_survives_merge_and_governs_future_commits() {
+        // feature adds a protect rule for keys/ (+ a protected file) that main
+        // never had. After merging feature into main, the merged snapshot's
+        // rule set must include keys/ — and a brand-new plaintext file
+        // committed under keys/ afterward must land PROTECTED (otherwise a
+        // merge would be a silent way to leak future content under a rule the
+        // merging side never explicitly adopted).
+        let root = tmp_root("p15-merge-rules-union");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main: unrelated addition (keeps the merge a genuine 3-way, not a ff).
+        std::fs::write(root.join("main-only.txt"), b"o").unwrap();
+        repo.commit("me", "main adds main-only.txt").unwrap();
+
+        // feature: adds the keys/ rule + a protected file under it.
+        repo.switch("feature").unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/a.txt"), b"secret-key").unwrap();
+        repo.protect("keys/", &[alice_pk], None).unwrap();
+        repo.switch("main").unwrap();
+
+        let id = repo.merge("feature", "me").unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        assert!(
+            snap.protection.prefixes.iter().any(|p| p.prefix == "keys/"),
+            "merged policy must carry forward feature's keys/ rule"
+        );
+
+        // A NEW plaintext file committed under keys/ must land PROTECTED.
+        std::fs::write(root.join("keys/b.txt"), b"another-secret").unwrap();
+        let id2 = repo.commit("me", "add keys/b.txt").unwrap();
+        let snap2 = repo.snapshot(&id2).unwrap();
+        let (b_id, b_perms) = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap();
+            let (id, _, perms) = entries["keys/b.txt"];
+            (id, perms)
+        };
+        assert_ne!(b_perms & scl_core::PROTECTED, 0, "new file under keys/ must be protected");
+        // And alice can decrypt it — the rule's recipient was carried too.
+        let bytes = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            match s.get(&b_id).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("expected Blob"),
+            }
+        };
+        let pt = crate::protect::decrypt_with(&bytes, &b_id, &[&snap2.protection], &alice_sk, "keys/b.txt")
+            .unwrap();
+        assert_eq!(&pt[..], b"another-secret");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn carried_plain_file_under_a_union_rule_lands_protected() {
+        // Task 4 review I2 resolution: ours carries a PLAIN winner (perms 0,
+        // needs_encrypt false — the ciphertext-id fast path never even looks
+        // at the file's content) whose path matches a rule that ONLY theirs
+        // knows about. The bit<->rule invariant must still hold in the merged
+        // snapshot: this file must land PROTECTED, not plaintext, even though
+        // no `needs_encrypt` output was ever produced for it.
+        let root = tmp_root("p15-merge-carried-plain-under-rule");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main (ours): a plain file under keys/ — no rule exists yet.
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/a.txt"), b"plain-for-now").unwrap();
+        repo.commit("me", "main adds plain keys/a.txt").unwrap();
+
+        // feature (theirs): records the keys/ rule with NO matching file
+        // present — `protect` still persists the rule for future commits.
+        repo.switch("feature").unwrap();
+        repo.protect("keys/", &[alice_pk], None).unwrap();
+        repo.switch("main").unwrap();
+
+        // ours' keys/a.txt is unchanged from base on ours' side (tk == bk:
+        // theirs never touched it, base never had it either) -> the plain
+        // fast-path winner, verbatim ciphertext-id logic transferred from the
+        // ordinary all-plain arm. No identity needed for the fast path itself.
+        let id = repo.merge("feature", "me").unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+
+        let (blob_id, perms) = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap();
+            let (id, _, perms) = entries["keys/a.txt"];
+            (id, perms)
+        };
+        assert_ne!(
+            perms & scl_core::PROTECTED,
+            0,
+            "carried-plain file under a union rule must be re-encrypted at merge time"
+        );
+        let bytes = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            match s.get(&blob_id).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("expected Blob"),
+            }
+        };
+        assert_ne!(&bytes[..], b"plain-for-now", "must not be the plaintext blob");
+        let pt = crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "keys/a.txt")
+            .unwrap();
+        assert_eq!(&pt[..], b"plain-for-now");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merged_plaintext_never_lands_in_cas() {
+        // After a content merge, every PROTECTED entry's stored blob bytes
+        // must differ from the known plaintext (only ciphertext ever reaches
+        // the CAS) — and decrypting with the right DEK must recover it.
+        let root = tmp_root("p15-merge-no-plaintext-leak");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"L1\nl2\nl3\n").unwrap();
+        repo.commit("me", "main edits line 1").unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nL3\n").unwrap();
+        repo.commit("me", "feature edits line 3").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        let id = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        let expected_plain = b"L1\nl2\nL3\n";
+
+        let store_arc = repo.vfs_handle().store();
+        let mut s = store_arc.lock().unwrap();
+        let entries = worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap();
+        for (path, (blob_id, _mode, perms)) in &entries {
+            if perms & scl_core::PROTECTED == 0 {
+                continue;
+            }
+            let bytes = match s.get(blob_id).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("expected Blob"),
+            };
+            assert_ne!(&bytes[..], &expected_plain[..], "{path}: plaintext leaked into the CAS");
+            let pt = crate::protect::decrypt_with(&bytes, blob_id, &[&snap.protection], &alice_sk, path)
+                .unwrap();
+            assert_eq!(&pt[..], expected_plain, "{path}: decrypts back to the merged plaintext");
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn convergent_merge_ids_are_stable_across_repos() {
+        // Two independent repos build the identical protected divergence
+        // (same base plaintext, same edits on both sides) and content-merge
+        // with their own (distinct) recipient identity. Convergent encryption
+        // means the merged plaintext is identical, so the resulting ciphertext
+        // blob id must be IDENTICAL across the two repos — merge output is
+        // deterministic content addressing, not per-repo randomness.
+        fn build(tag: &str) -> (Repo, std::path::PathBuf, ObjectId, ObjectId) {
+            let root = tmp_root(tag);
+            let repo = Repo::init(&root).unwrap();
+            let (sk, pk) = scl_crypto::generate_keypair();
+            repo.protect("secret/", &[pk], None).unwrap();
+            std::fs::create_dir_all(root.join("secret")).unwrap();
+            std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+            repo.commit("me", "base").unwrap();
+            repo.branch("feature").unwrap();
+
+            std::fs::write(root.join("secret/a.txt"), b"L1\nl2\nl3\n").unwrap();
+            repo.commit("me", "main edits line 1").unwrap();
+            repo.switch_with_identity("feature", Some(&sk)).unwrap();
+            std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nL3\n").unwrap();
+            repo.commit("me", "feature edits line 3").unwrap();
+            repo.switch_with_identity("main", Some(&sk)).unwrap();
+
+            let id = repo.merge_with_identity("feature", "me", Some(&sk)).unwrap();
+            let snap = repo.snapshot(&id).unwrap();
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap();
+            let (blob_id, _, _) = entries["secret/a.txt"];
+            drop(s);
+            (repo, root, id, blob_id)
+        }
+
+        let (repo1, root1, _id1, blob1) = build("p15-merge-convergent-a");
+        let (repo2, root2, _id2, blob2) = build("p15-merge-convergent-b");
+        assert_eq!(blob1, blob2, "identical merged plaintext must converge to the same blob id");
+        drop(repo1);
+        drop(repo2);
+        std::fs::remove_dir_all(&root1).unwrap();
+        std::fs::remove_dir_all(&root2).unwrap();
     }
 
     #[test]

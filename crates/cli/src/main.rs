@@ -100,6 +100,10 @@ enum Cmd {
         /// OS username).
         #[arg(long)]
         author: Option<String>,
+        /// Identity key to decrypt protected paths that diverged in content on
+        /// both sides (ciphertext-id fast paths need no identity at all).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
     /// Replay one commit from another branch onto the current branch.
     ///
@@ -376,7 +380,9 @@ fn main() -> Result<()> {
         Cmd::Branch { name } => run_branch(&name),
         Cmd::Switch { name, identity } => run_switch(&name, identity),
         Cmd::Scan => run_scan(),
-        Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &resolve_author(author)),
+        Cmd::Merge { branch, abort, author, identity } => {
+            run_merge(branch, abort, &resolve_author(author), identity)
+        }
         Cmd::CherryPick { refname, author } => run_cherry_pick(&refname, &resolve_author(author)),
         Cmd::Rebase { target, author } => run_rebase(&target, &resolve_author(author)),
         Cmd::Secret { op } => run_secret(op),
@@ -955,7 +961,7 @@ fn run_status(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
+fn run_merge(branch: Option<String>, abort: bool, author: &str, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
     if abort {
         let skipped = repo.merge_abort()?;
@@ -966,7 +972,8 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
         return Ok(());
     }
     let branch = branch.ok_or_else(|| anyhow::anyhow!("merge: provide a branch or --abort"))?;
-    match repo.merge(&branch, author) {
+    let sk = resolve_identity_opt(identity)?;
+    match repo.merge_with_identity(&branch, author, sk.as_ref()) {
         Ok(id) => {
             println!("merged {branch}: {}", id.short());
             Ok(())

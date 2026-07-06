@@ -106,6 +106,13 @@ pub struct Merge {
     pub conflicts: Vec<String>,
     /// Merged secret registry.
     pub secrets: BTreeMap<String, ObjectId>,
+    /// Wrapped DEKs for every surviving carried ciphertext blob (see
+    /// [`FileMerge::wrapped_carry`]) — threaded up from `three_way_files` so
+    /// `Repo::merge_with_identity` (P15) can union it with freshly-encrypted
+    /// wraps without a second file-tree walk. Extending `Merge` rather than
+    /// having callers reach into `FileMerge` directly keeps `three_way`'s
+    /// signature the single seam repo.rs depends on.
+    pub wrapped_carry: BTreeMap<ObjectId, Vec<WrappedKey>>,
 }
 
 /// Three-way merge of the file trees and secret registries of `ours`/`theirs`
@@ -138,6 +145,7 @@ pub fn three_way(
         sidecars: fm.sidecars,
         conflicts: fm.conflicts,
         secrets,
+        wrapped_carry: fm.wrapped_carry,
     })
 }
 
