@@ -212,11 +212,15 @@ impl Repo {
         Ok(out)
     }
 
-    /// Decrypt all secrets the `identity` can read, inject into the environment,
-    /// and run `cmd`. Secrets the identity cannot read are skipped with a
-    /// stderr warning; a corrupt/tampered secret is a hard error. Returns the
-    /// child's exit code.
-    pub fn run(&self, identity: &SecretKey, cmd: &[String]) -> Result<i32> {
+    /// Decrypt every registered secret with `identity` into `(name, value)`
+    /// env pairs. `strict: true` errors on the first secret the identity
+    /// cannot open (workspace preflight — fail before any agent runs);
+    /// `strict: false` warns and skips (`sc run` behavior).
+    pub(crate) fn secret_env(
+        &self,
+        identity: &SecretKey,
+        strict: bool,
+    ) -> Result<Vec<(String, OsString)>> {
         let reg = self.registry()?;
         let mut envs: Vec<(String, OsString)> = Vec::new();
         for (name, id) in reg {
@@ -249,12 +253,26 @@ impl Repo {
                     );
                     envs.push((name, val));
                 }
+                Err(scl_crypto::Error::NotARecipient) if strict => {
+                    return Err(Error::InvalidArgument(format!(
+                        "identity is not a recipient of secret {name}"
+                    )));
+                }
                 Err(scl_crypto::Error::NotARecipient) => {
                     eprintln!("warning: not authorized for secret {name}; skipping");
                 }
                 Err(e) => return Err(e.into()),
             }
         }
+        Ok(envs)
+    }
+
+    /// Decrypt all secrets the `identity` can read, inject into the environment,
+    /// and run `cmd`. Secrets the identity cannot read are skipped with a
+    /// stderr warning; a corrupt/tampered secret is a hard error. Returns the
+    /// child's exit code.
+    pub fn run(&self, identity: &SecretKey, cmd: &[String]) -> Result<i32> {
+        let envs = self.secret_env(identity, false)?;
         let (exe, args) =
             cmd.split_first().ok_or_else(|| Error::InvalidArgument("empty command".into()))?;
         let mut command = Command::new(exe);
@@ -498,6 +516,41 @@ mod tests {
             .run(&mallory_sk, &["sh".into(), "-c".into(), "test -z \"$DB_URL\"".into()])
             .unwrap();
         assert_eq!(code, 0, "DB_URL was not injected for unauthorized identity");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn secret_env_strict_rejects_non_recipient() {
+        let root = tmp_root("env-strict");
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mallory_sk, _mallory_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        repo.secret_add("DB_URL", b"v", &[alice_pk]).unwrap();
+
+        let err = repo.secret_env(&mallory_sk, true).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+
+        // lenient mode skips instead of erroring.
+        let envs = repo.secret_env(&mallory_sk, false).unwrap();
+        assert!(envs.is_empty());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn secret_env_decrypts_for_recipient() {
+        let root = tmp_root("env-ok");
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        repo.secret_add("DB_URL", b"v", &[alice_pk]).unwrap();
+
+        let envs = repo.secret_env(&alice_sk, true).unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].0, "DB_URL");
+        assert_eq!(envs[0].1, std::ffi::OsString::from("v"));
+
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
