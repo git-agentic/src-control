@@ -772,7 +772,7 @@ impl Repo {
 /// Current unix time in seconds, for snapshot timestamps. Snapshot ids
 /// legitimately depend on commit time (as in Git); nothing in the system
 /// requires two separate commits of identical content to share an id.
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

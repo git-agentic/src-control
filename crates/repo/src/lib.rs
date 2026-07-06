@@ -13,6 +13,7 @@ pub mod layout;
 pub mod lock;
 pub mod merge;
 pub mod merge_state;
+pub mod oplog;
 pub mod protect;
 pub mod protect_ops;
 pub mod reachable;
