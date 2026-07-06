@@ -7,6 +7,7 @@ use scl_core::{FileMode, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::merge;
+use crate::refs;
 use crate::repo::Repo;
 use crate::worktree;
 
@@ -79,6 +80,124 @@ pub(crate) fn replay_commit(repo: &Repo, commit_id: ObjectId, onto_root: ObjectI
         Ok(ReplayOutcome::Empty)
     } else {
         Ok(ReplayOutcome::Clean { root })
+    }
+}
+
+/// Outcome of [`Repo::cherry_pick`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickResult {
+    /// The replayed commit was applied as a new single-parent snapshot.
+    Picked(ObjectId),
+    /// Change already present on the current branch — nothing committed.
+    AlreadyApplied,
+}
+
+impl Repo {
+    /// Replay `refname`'s tip commit onto the current branch (cherry-pick).
+    ///
+    /// Preflight mirrors `Repo::merge`'s, in the same order, so the two
+    /// commands fail identically for identical reasons: merge-in-progress and
+    /// pick-in-progress guards, an unborn current branch (`Error::Unborn`),
+    /// resolving `refname` (`Error::NoSuchBranch`), then the dirty-working-tree
+    /// check. A clean replay advances the current branch with a single-parent
+    /// snapshot (`parents: [ours_tip]`) whose message is the picked commit's
+    /// first message line plus a `(cherry-picked from <short>)` suffix, and
+    /// materializes the new tree. A conflicting replay writes conflict markers
+    /// + sidecars over the working tree and records pick state
+    /// (`PICK_HEAD`/`PICK_CONFLICTS`) — no ref moves, no oplog entry, so the
+    /// current branch tip is unchanged until the conflicts are resolved and
+    /// committed. An empty replay (the change is already present) is a no-op.
+    pub fn cherry_pick(&self, refname: &str, author: &str) -> Result<PickResult> {
+        if crate::merge_state::in_progress(&self.layout) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
+        }
+        let ours_tip = self.head_tip()?.ok_or(Error::Unborn)?;
+        let picked_tip = refs::resolve_tip(&self.layout, refname)?
+            .ok_or_else(|| Error::NoSuchBranch(refname.to_string()))?;
+        let dirty = self.status()?;
+        if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
+            return Err(Error::InvalidArgument(
+                "working tree has uncommitted changes; commit before cherry-picking".into(),
+            ));
+        }
+
+        let head = refs::current_branch(&self.layout)?;
+        let before = refs::read_branch_tip(&self.layout, &head)?;
+        let ours_snap = self.snapshot(&ours_tip)?;
+        let ours_root = ours_snap.root;
+        let picked_snap = self.snapshot(&picked_tip)?;
+
+        match replay_commit(self, picked_tip, ours_root)? {
+            ReplayOutcome::Empty => Ok(PickResult::AlreadyApplied),
+            ReplayOutcome::Clean { root } => {
+                let msg_first_line = picked_snap.message.lines().next().unwrap_or("");
+                let message = format!("{msg_first_line} (cherry-picked from {})", picked_tip.short());
+                let id = self.build_snapshot(
+                    root,
+                    vec![ours_tip],
+                    ours_snap.secrets.clone(),
+                    ours_snap.protection.clone(),
+                    author,
+                    &message,
+                )?;
+                refs::write_branch_tip(&self.layout, &head, &id)?;
+                {
+                    let store_arc = self.vfs().store();
+                    let mut store = store_arc.lock().unwrap();
+                    worktree::materialize(
+                        &self.layout,
+                        &mut store,
+                        root,
+                        Some(ours_root),
+                        &ours_snap.protection,
+                        None,
+                    )?;
+                }
+                crate::oplog::record(
+                    &self.layout,
+                    &format!("cherry-pick {refname}"),
+                    &head,
+                    &head,
+                    &[(head.clone(), before, Some(id))],
+                )?;
+                Ok(PickResult::Picked(id))
+            }
+            ReplayOutcome::Conflicts { files, sidecars, paths } => {
+                // Same conflict-materialize pattern as `Repo::merge` (repo.rs
+                // ~595-625): build the marker tree, materialize it over ours,
+                // then write sidecars. `replay_commit`'s protected guard has
+                // already refused any replay touching PROTECTED content, so
+                // `Protection::default()` here is sound for the same reason
+                // it is in `merge`'s conflict path.
+                let write_set: Vec<(String, Vec<u8>, FileMode)> =
+                    files.iter().map(|(p, m, b)| (p.clone(), b.clone(), *m)).collect();
+                let marker_root = self.vfs().write_tree(&write_set)?;
+                {
+                    let store_arc = self.vfs().store();
+                    let mut store = store_arc.lock().unwrap();
+                    worktree::materialize(
+                        &self.layout,
+                        &mut store,
+                        marker_root,
+                        Some(ours_root),
+                        &scl_core::Protection::default(),
+                        None,
+                    )?;
+                }
+                for (rel, bytes) in &sidecars {
+                    let full = self.layout.root.join(rel);
+                    if let Some(parent) = full.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(full, bytes)?;
+                }
+                crate::pick_state::write(&self.layout, &picked_tip, &paths)?;
+                Err(Error::PickConflicts(paths.len()))
+            }
+        }
     }
 }
 
@@ -287,5 +406,168 @@ mod tests {
         drop(prepo);
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&proot).ok();
+    }
+
+    #[test]
+    fn cherry_pick_clean_advances_branch_and_materializes() {
+        let root = tmp_root("cp-clean");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("shared.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work-1").unwrap();
+
+        repo.switch("work-1").unwrap();
+        std::fs::write(root.join("x.txt"), b"x\n").unwrap();
+        let picked = repo.commit("me", "add x").unwrap();
+        repo.switch("main").unwrap();
+        let old_main_tip = repo.head_tip().unwrap().unwrap();
+
+        let outcome = repo.cherry_pick("work-1", "me").unwrap();
+        let id = match outcome {
+            PickResult::Picked(id) => id,
+            other => panic!("expected Picked, got {other:?}"),
+        };
+        assert_eq!(repo.head_tip().unwrap(), Some(id));
+
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![old_main_tip]);
+        assert!(
+            snap.message.ends_with(&format!("(cherry-picked from {})", picked.short())),
+            "got message: {}",
+            snap.message
+        );
+        assert_eq!(std::fs::read_to_string(root.join("x.txt")).unwrap(), "x\n");
+
+        let ops = repo.oplog().unwrap();
+        assert_eq!(ops.last().unwrap().desc, "cherry-pick work-1");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cherry_pick_conflicting_writes_markers_and_state_moves_no_refs() {
+        let root = tmp_root("cp-conflict");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work-1").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"a\nB\nc\n").unwrap();
+        let main_tip = repo.commit("me", "main edits x").unwrap();
+
+        repo.switch("work-1").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nZ\nc\n").unwrap();
+        let picked = repo.commit("me", "work edits x").unwrap();
+        repo.switch("main").unwrap();
+        assert_eq!(repo.head_tip().unwrap(), Some(main_tip));
+
+        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "main tip must not move");
+        assert_eq!(repo.pick_head().unwrap(), Some(picked));
+        let on_disk = std::fs::read_to_string(root.join("x.txt")).unwrap();
+        assert!(on_disk.contains("<<<<<<<"), "got: {on_disk}");
+
+        // Resolve + commit: single-parent commit, pick state cleared.
+        std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
+        let resolved = repo.commit("me", "resolve conflict").unwrap();
+        let resolved_snap = repo.snapshot(&resolved).unwrap();
+        assert_eq!(resolved_snap.parents, vec![main_tip]);
+        assert!(!repo.pick_in_progress());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cherry_pick_already_applied_is_a_noop() {
+        let root = tmp_root("cp-empty");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work-1").unwrap();
+
+        repo.switch("work-1").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\n").unwrap();
+        repo.commit("me", "work edits x").unwrap();
+        repo.switch("main").unwrap();
+
+        let merged = repo.merge("work-1", "me").unwrap();
+        assert_eq!(repo.head_tip().unwrap(), Some(merged));
+        let ops_before = repo.oplog().unwrap().len();
+
+        let outcome = repo.cherry_pick("work-1", "me").unwrap();
+        assert!(matches!(outcome, PickResult::AlreadyApplied), "got {outcome:?}");
+        assert_eq!(repo.head_tip().unwrap(), Some(merged), "tip must not move");
+        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no new oplog record");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cherry_pick_preflight_guards() {
+        let root = tmp_root("cp-guards");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work-1").unwrap();
+        repo.switch("work-1").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\n").unwrap();
+        repo.commit("me", "work edits x").unwrap();
+        repo.switch("main").unwrap();
+
+        // Dirty working tree.
+        std::fs::write(root.join("x.txt"), b"dirty\n").unwrap();
+        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        std::fs::write(root.join("x.txt"), b"a\n").unwrap();
+
+        // Merge in progress.
+        let ours_tip = repo.head_tip().unwrap().unwrap();
+        crate::merge_state::write(&repo.layout, &ours_tip, &[]).unwrap();
+        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
+        crate::merge_state::clear(&repo.layout).unwrap();
+
+        // Pick in progress.
+        crate::pick_state::write(&repo.layout, &ours_tip, &[]).unwrap();
+        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        assert!(matches!(err, Error::PickInProgress), "got {err:?}");
+        crate::pick_state::clear(&repo.layout).unwrap();
+
+        // Unknown ref.
+        let err = repo.cherry_pick("no-such-branch", "me").unwrap_err();
+        assert!(matches!(err, Error::NoSuchBranch(_)), "got {err:?}");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// From the Task 6 review: cherry-pick must also refuse during an
+    /// in-progress merge, as a standalone mutual-exclusion check distinct
+    /// from `cherry_pick_preflight_guards`'s combined guard sweep.
+    #[test]
+    fn cherry_pick_during_merge_is_refused() {
+        let root = tmp_root("cp-merge-mutex");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work-1").unwrap();
+        repo.switch("work-1").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\n").unwrap();
+        repo.commit("me", "work edits x").unwrap();
+        repo.switch("main").unwrap();
+
+        let ours_tip = repo.head_tip().unwrap().unwrap();
+        crate::merge_state::write(&repo.layout, &ours_tip, &[]).unwrap();
+        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
+        assert_eq!(repo.head_tip().unwrap(), Some(ours_tip), "tip must not move");
+
+        crate::merge_state::clear(&repo.layout).unwrap();
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

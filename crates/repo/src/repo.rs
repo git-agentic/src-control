@@ -478,6 +478,11 @@ impl Repo {
         crate::pick_state::read_pick_head(&self.layout)
     }
 
+    /// Conflicted paths if a cherry-pick is in progress (empty otherwise).
+    pub fn pick_conflicts(&self) -> Result<Vec<String>> {
+        crate::pick_state::read_conflicts(&self.layout)
+    }
+
     /// Merge `branch` into the current branch. Fast-forwards when possible;
     /// auto-commits a two-parent snapshot on a clean merge; on conflicts writes
     /// markers + merge state and returns `MergeConflicts`. If the current

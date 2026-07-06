@@ -101,6 +101,18 @@ enum Cmd {
         #[arg(long)]
         author: Option<String>,
     },
+    /// Replay one commit from another branch onto the current branch.
+    ///
+    /// On conflicts this behaves like `sc merge`: markers + a pick in
+    /// progress are left on disk (exit 1), resolve then `sc commit`.
+    CherryPick {
+        /// Branch or remote-tracking ref whose tip commit to pick.
+        #[arg(value_name = "ref")]
+        refname: String,
+        /// Commit author (default $SC_AUTHOR, then the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
     /// Scan the working tree for plaintext secrets without committing.
     Scan,
     /// Decrypt authorized secrets, inject them, and run a command.
@@ -353,6 +365,7 @@ fn main() -> Result<()> {
         Cmd::Switch { name, identity } => run_switch(&name, identity),
         Cmd::Scan => run_scan(),
         Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &resolve_author(author)),
+        Cmd::CherryPick { refname, author } => run_cherry_pick(&refname, &resolve_author(author)),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
         Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
@@ -959,6 +972,32 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
         Err(scl_repo::Error::UpToDate) => {
             println!("already up to date");
             Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn run_cherry_pick(refname: &str, author: &str) -> Result<()> {
+    let repo = open_repo()?;
+    match repo.cherry_pick(refname, author) {
+        Ok(scl_repo::PickResult::Picked(id)) => {
+            println!("picked {}", id.short());
+            Ok(())
+        }
+        Ok(scl_repo::PickResult::AlreadyApplied) => {
+            println!("already applied — nothing to do");
+            Ok(())
+        }
+        Err(scl_repo::Error::PickConflicts(n)) => {
+            println!("cherry-pick has {n} conflict(s); resolve these files then `sc commit`:");
+            for p in repo.pick_conflicts()? {
+                println!("  {p}");
+            }
+            // Exit 1 so `sc cherry-pick x && sc commit` can't commit conflict markers.
+            // Drop the repo first (releases .sc/lock) — process::exit skips
+            // destructors and would otherwise leave a stale lock file.
+            drop(repo);
+            std::process::exit(1);
         }
         Err(e) => Err(e.into()),
     }

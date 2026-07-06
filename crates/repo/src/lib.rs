@@ -35,6 +35,7 @@ pub use gc::GcStats;
 pub use git_marks::MarksStore;
 pub use oplog::{OpRecord, UndoOutcome};
 pub use remote::{RemoteConfig, RemoteKind};
+pub use replay::PickResult;
 pub use repo::{Repo, Status};
 pub use scanner::ScanReport;
 pub use secrets::SecretInfo;
