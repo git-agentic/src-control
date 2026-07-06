@@ -112,6 +112,33 @@ enum Cmd {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Fork N agent workspaces from HEAD, run a command in each, and harvest
+    /// changed workspaces to `<name>-<i>` branches.
+    Work {
+        /// Number of workspaces to fork.
+        #[arg(long, default_value_t = 2)]
+        agents: usize,
+        /// Branch/label base name (branches are `<name>-1..N`).
+        #[arg(long, default_value = "work")]
+        name: String,
+        /// Memory budget for the session's shared object cache, in MiB.
+        #[arg(long)]
+        budget_mb: Option<usize>,
+        /// Decrypt registered secrets and inject them into each agent's env.
+        #[arg(long)]
+        with_secrets: bool,
+        /// Identity file (protected-path checkout and --with-secrets;
+        /// default ~/.sc/identity or $SC_IDENTITY).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Commit author for harvested branches (default $SC_AUTHOR, then the
+        /// OS username).
+        #[arg(long)]
+        author: Option<String>,
+        /// Agent command and args after `--`.
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// Clone a repo (local path or `ssh://` URL) into a new directory.
     Clone { src: String, dst: PathBuf },
     /// Serve a repo over stdin/stdout to a remote `sc` client (invoked by
@@ -324,6 +351,9 @@ fn main() -> Result<()> {
         Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &resolve_author(author)),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
+        Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
+            run_work(agents, name, budget_mb, with_secrets, identity, author, cmd)
+        }
         Cmd::Clone { src, dst } => run_clone(src, dst),
         Cmd::Serve { stdio, path } => run_serve(stdio, path),
         Cmd::Remote { op } => run_remote(op),
@@ -1138,6 +1168,78 @@ fn run_run(identity: Option<PathBuf>, cmd: Vec<String>) -> Result<()> {
     // spurious `Locked` error. Drop the repo (releasing the lock) before exiting.
     drop(repo);
     std::process::exit(code);
+}
+
+/// `sc work`: one-command agent-workspace session. Prints a per-workspace
+/// summary; exits non-zero if any agent failed or any harvest was rejected.
+fn run_work(
+    agents: usize,
+    name: String,
+    budget_mb: Option<usize>,
+    with_secrets: bool,
+    identity: Option<PathBuf>,
+    author: Option<String>,
+    cmd: Vec<String>,
+) -> Result<()> {
+    let repo = match budget_mb {
+        Some(mb) => scl_repo::Repo::open_with_budget(std::env::current_dir()?, mb * 1024 * 1024)?,
+        None => open_repo()?,
+    };
+    // --with-secrets needs a loadable identity (hard error); otherwise the
+    // identity is optional and only decrypts protected paths at checkout.
+    let sk = if with_secrets {
+        Some(load_identity(identity)?)
+    } else {
+        resolve_identity_opt(identity)?
+    };
+    let outcomes = repo.work(scl_repo::WorkOptions {
+        agents,
+        base_name: name,
+        cmd,
+        author: resolve_author(author),
+        message: None,
+        identity: sk,
+        with_secrets,
+        session_root: None,
+    })?;
+
+    let mut failed = false;
+    println!("workspace        agent   result");
+    for o in &outcomes {
+        let agent = match o.agent_exit {
+            Some(0) => "ok".to_string(),
+            Some(code) => {
+                failed = true;
+                format!("exit {code}")
+            }
+            None => {
+                failed = true;
+                "spawn failed".to_string()
+            }
+        };
+        let result = match &o.harvest {
+            Ok(scl_repo::HarvestResult::Committed(id)) => {
+                format!("branch {} @ {}", o.label, id.short())
+            }
+            Ok(scl_repo::HarvestResult::Unchanged) => "unchanged".to_string(),
+            Ok(scl_repo::HarvestResult::Rejected(report)) => {
+                failed = true;
+                format!("REJECTED by secret scanner ({} finding(s))", report.findings.len())
+            }
+            Err(e) => {
+                failed = true;
+                format!("harvest error: {e}")
+            }
+        };
+        println!("{:<16} {:<7} {result}", o.label, agent);
+    }
+    if !failed {
+        println!("\nintegrate with: sc merge <branch>");
+    }
+    // Drop before exit so the RepoLock's Drop runs (process::exit skips
+    // destructors — same reasoning as run_run).
+    drop(repo);
+    std::process::exit(if failed { 1 } else { 0 });
 }
 
 fn load_identity(flag: Option<PathBuf>) -> Result<scl_crypto::SecretKey> {

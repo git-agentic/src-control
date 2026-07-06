@@ -44,18 +44,26 @@ impl Repo {
         std::fs::create_dir_all(layout.objects_dir())?;
         std::fs::create_dir_all(layout.refs_heads_dir())?;
         refs::write_head(&layout, DEFAULT_BRANCH)?;
-        Self::open_layout(layout)
+        Self::open_layout(layout, DEFAULT_BUDGET)
     }
 
     /// Open an existing repo by discovering `.sc/` at or above `start`.
     pub fn open(start: impl AsRef<Path>) -> Result<Repo> {
         let layout = Layout::discover(start)?;
-        Self::open_layout(layout)
+        Self::open_layout(layout, DEFAULT_BUDGET)
     }
 
-    fn open_layout(layout: Layout) -> Result<Repo> {
+    /// Open an existing repo with an explicit memory budget for the shared
+    /// object cache (bytes). `open` uses `DEFAULT_BUDGET`; workspace sessions
+    /// (`sc work --budget-mb`) size the cache to the fleet they fork.
+    pub fn open_with_budget(start: impl AsRef<Path>, budget_bytes: usize) -> Result<Repo> {
+        let layout = Layout::discover(start)?;
+        Self::open_layout(layout, budget_bytes)
+    }
+
+    fn open_layout(layout: Layout, budget_bytes: usize) -> Result<Repo> {
         let lock = RepoLock::acquire(&layout)?;
-        let store = Store::open_persistent(layout.objects_dir(), DEFAULT_BUDGET)?;
+        let store = Store::open_persistent(layout.objects_dir(), budget_bytes)?;
         Ok(Repo { layout, vfs: VfsRepo::new(store), _lock: lock })
     }
 
@@ -127,15 +135,20 @@ impl Repo {
         }
     }
 
-    /// Snapshot the working tree into a new commit on the current branch. When a
-    /// merge is in progress, records both parents and clears the merge state.
-    /// Files under a protected prefix are convergently encrypted (scanner-exempt);
-    /// only plaintext files are scanned.
-    pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
-        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
-        let tip = self.head_tip()?;
-        let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
-
+    /// The commit pipeline minus ref movement: split protected/plaintext files,
+    /// scan the plaintext (Err(SecretDetected) on a hit), convergently encrypt
+    /// protected files, carry forward absent still-protected content from
+    /// `tip`, and persist the resulting snapshot with `tip` (+ `merge_head`)
+    /// as parents. Used by `commit` (HEAD tip) and by workspace harvest (P13,
+    /// arbitrary base tip, no merge head). Advances no refs.
+    pub(crate) fn snapshot_files(
+        &self,
+        files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
+        tip: Option<ObjectId>,
+        merge_head: Option<ObjectId>,
+        author: &str,
+        message: &str,
+    ) -> Result<ObjectId> {
         // Read the tip snapshot exactly once; extract both protection and secrets.
         let (mut protection, secrets) = match (tip, merge_head) {
             (None, _) => (Protection::default(), BTreeMap::new()),
@@ -255,7 +268,20 @@ impl Repo {
         if let Some(theirs) = merge_head {
             parents.push(theirs);
         }
-        let id = self.commit_snapshot(root, parents, secrets, protection, author, message)?;
+        self.build_snapshot(root, parents, secrets, protection, author, message)
+    }
+
+    /// Snapshot the working tree into a new commit on the current branch. When a
+    /// merge is in progress, records both parents and clears the merge state.
+    /// Files under a protected prefix are convergently encrypted (scanner-exempt);
+    /// only plaintext files are scanned.
+    pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
+        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
+        let tip = self.head_tip()?;
+        let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
+        let id = self.snapshot_files(files, tip, merge_head, author, message)?;
+        let branch = refs::current_branch(&self.layout)?;
+        refs::write_branch_tip(&self.layout, &branch, &id)?;
         crate::merge_state::clear(&self.layout)?;
         Ok(id)
     }
@@ -291,8 +317,10 @@ impl Repo {
         }
     }
 
-    /// Build + persist a snapshot and advance the current branch ref.
-    pub(crate) fn commit_snapshot(
+    /// Persist a snapshot object (no ref movement). The workspace harvest
+    /// (P13) commits to non-HEAD branches, so snapshot construction must not
+    /// be welded to "advance the current branch".
+    pub(crate) fn build_snapshot(
         &self,
         root: ObjectId,
         parents: Vec<ObjectId>,
@@ -312,6 +340,20 @@ impl Repo {
         });
         let store_arc = self.vfs.store();
         let id = store_arc.lock().unwrap().put(snap)?;
+        Ok(id)
+    }
+
+    /// Build + persist a snapshot and advance the current branch ref.
+    pub(crate) fn commit_snapshot(
+        &self,
+        root: ObjectId,
+        parents: Vec<ObjectId>,
+        secrets: BTreeMap<String, ObjectId>,
+        protection: Protection,
+        author: &str,
+        message: &str,
+    ) -> Result<ObjectId> {
+        let id = self.build_snapshot(root, parents, secrets, protection, author, message)?;
         let branch = refs::current_branch(&self.layout)?;
         refs::write_branch_tip(&self.layout, &branch, &id)?;
         Ok(id)
@@ -1350,6 +1392,21 @@ mod tests {
         drop(arepo);
         std::fs::remove_dir_all(&a).unwrap();
         std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn open_with_budget_bounds_the_store() {
+        let dir = std::env::temp_dir().join(format!("sc-test-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            Repo::init(&dir).unwrap();
+        } // drop → release lock
+        let repo = Repo::open_with_budget(&dir, 4 * 1024 * 1024).unwrap();
+        assert_eq!(repo.vfs().stats().budget_bytes, 4 * 1024 * 1024);
+        drop(repo);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
     }
 
     #[test]

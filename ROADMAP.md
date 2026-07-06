@@ -65,6 +65,23 @@ across every phase.
   is secrets-only — convergent encryption makes protected-path DEK rotation
   security-meaningless (ADR-0014) — and rotation is a future-reads cutover,
   not erasure: old ciphertext remains reachable from history. (ADR-0019.)
+- **Phase 12 — Network transport over SSH.** A framed stdio wire protocol
+  mirrors the 8 `Transport` verbs; `sc serve --stdio` dispatches onto the
+  existing `LocalTransport` (CAS, pack verification reused verbatim); the
+  client spawns the user's `ssh` for `ssh://` remotes, overridable via
+  `SC_SSH` (GIT_SSH pattern) so tests and `demo/run_ssh_remote_demo.sh`
+  drive the full ssh:// code path with no sshd. Zero new dependencies.
+  Accepted limitations: 4 GiB frame cap, no repo paths with spaces over
+  real ssh, `sc` must be on the server's PATH. (ADR-0022.)
+- **Phase 13 — Agent workspaces (`sc work`).** Fused the two halves of the
+  project: fork N in-RAM copy-on-write workspaces from a persistent repo's
+  HEAD (the repo's budget-bounded store is the backing tier — eviction is
+  safe, no spill backend), materialize each to an ephemeral temp checkout,
+  run real agent processes concurrently, and harvest changed workspaces to
+  `work-<i>` branches through the commit path (so `.scignore` and the P5
+  scanner gate apply). `--with-secrets` injects decrypted secrets into each
+  agent's environment via the `sc run` path — one command exercising all
+  three thesis pillars. Zero residue outside `.sc/`. (ADR-0023.)
 
 ## Completed phases (usability-first ordering)
 
@@ -78,6 +95,8 @@ across every phase.
 | **P9 — Git export / interop** | Round-trip with Git | `sc export --to <git-repo>` writes current-branch history as Git commits; `git log` reads it back | [0016](docs/adr/0016-git-export.md) |
 | **P10 — Git as a remote** | Bidirectional sync with Git | `sc remote add <name> <git-path> --git`; `sc push hub` writes commits `git log` can read; a second sc repo `sc fetch hub` + `sc merge hub/main` gets the content back | [0018](docs/adr/0018-git-as-a-remote.md) |
 | **P11 — Secret/permission lifecycle** | Cryptographic cutover + break-glass recovery for secrets | `sc secret rotate <name> --value <new>` re-seals under a fresh DEK; `sc escrow set <key>` auto-includes a recovery recipient at `secret add`/`rotate`/`protect` | [0019](docs/adr/0019-secret-lifecycle.md) |
+| **P12 — SSH-native network transport** | Sync between machines | `sc clone ssh://host/path`, `sc fetch`/`push` over the wire via `sc serve --stdio`; `demo/run_ssh_remote_demo.sh` proves the round trip with no sshd | [0022](docs/adr/0022-ssh-native-transport.md) |
+| **P13 — Agent workspaces** | Parallel agents on a real repo | `sc work --agents 3 -- <cmd>` forks 3 in-RAM workspaces, runs the command in each, harvests to `work-1..3` branches; `sc merge` integrates; zero residue outside `.sc/` | [0023](docs/adr/0023-agent-workspaces.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -117,6 +136,12 @@ remaining differentiators.
   the Phase 3 commit/registry machinery, with no dependency on P4–P10. It
   slots last chronologically because it hardens already-shipped pillars
   (Phase 2 secrets, P7 paths) rather than adding a new capability axis.
+- **P12 (SSH transport)** turns src-control from local-only into a real DVCS;
+  it slots after P10 because it generalizes the same Transport seam.
+- **P13 (agent workspaces)** closes the original thesis loop: the Phase 1
+  in-memory-clone engine finally serves the persistent repos every phase
+  since Phase 3 built. It needs nothing beyond Phase 1 + Phase 3 machinery,
+  but lands after the transports so harvested branches can travel.
 
 ## Dependencies
 
@@ -127,12 +152,17 @@ Phase 3 (persistence) ─┬─> P4 Merge
                        ├─> P7 Encrypted paths ── needs P6 clone for the headline demo
                        ├─> P8 Packfiles + GC ── benefits P6 transfer
                        └─> P9 Git export ──> P10 Git as a remote (needs P6 remotes + P9 export)
+Phase 6 transport trait ──> P12 SSH-native transport (ADR-0022)
+Phase 1 vfs + Phase 3 store ──> P13 Agent workspaces (integrates via P4 merge;
+                                composes with P5 scanner, P7 paths, Phase 2 secrets)
 scl-crypto (Phase 2) ──> P5 Secret scanner, P7 Encrypted paths
 ```
 
 All completed phases build on the Phase 3 persistent store. P5 and P7
-additionally build on the Phase 2 cryptography. Otherwise the phases are loosely
-coupled; the order above records the path taken to get to the P11 milestone.
+additionally build on the Phase 2 cryptography. P12 builds on P6's Transport
+trait. P13 builds on Phase 1 vfs and Phase 3 store, with composition into P4
+merge and optional P5/P7 gates. Otherwise the phases are loosely coupled; the
+order above records the path taken to get to the current milestone.
 
 ## Cross-cutting principles (adapted from git.agentic)
 
@@ -151,15 +181,18 @@ These apply across phases rather than to one:
   accidental plaintext secrets are rejected at `put` time (P5). The two are
   complementary, not alternatives.
 
-## Deferred beyond P11
+## Deferred
 
 Tracked but out of scope for this roadmap horizon:
 
-- **Network transport for remotes** (P6 starts with a local-filesystem transport;
-  SSH/HTTP transports come later). This now also covers P10's git-backed
-  remotes: P10 proves the marks-map bijection against local `.git` paths only —
-  network Git (GitHub over https/ssh) is a later transport swap onto the same
-  translation core.
+- **HTTP transport** and **network Git remotes** (GitHub over https/ssh).
+  P12 shipped the sc-native SSH transport; P10's git-backed remotes still
+  reach local `.git` paths only — network Git is a transport swap onto the
+  same marks-map translation core.
+- **Streaming (>4 GiB) wire frames** (P12 caps a frame at 4 GiB).
+- **Interactive/daemon workspace sessions** (`sc ws fork` … `sc ws harvest`
+  across invocations) and **auto-merge of clean workspace results** — both
+  explicitly out of P13's one-command session scope.
 - **Bulk re-wrap** of all secrets and protected prefixes on an org-wide
   recipient/escrow change (P11 ships per-secret/per-path retrofit only —
   rotation and re-wrap apply one at a time).
