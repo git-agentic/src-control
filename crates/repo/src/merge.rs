@@ -290,10 +290,20 @@ pub(crate) fn three_way_files(
         if let Some(w) = winner {
             if let Some((id, mode, perms)) = w {
                 if perms & PROTECTED != 0 {
+                    // Unioning wraps across ours/theirs/base means a wrap
+                    // revoked on only ONE side is resurrected for an unchanged
+                    // blob — consistent with P11's revoke-is-metadata-only
+                    // stance (ADR-0019): the old DEK was never secret from a
+                    // past recipient anyway; a cryptographic cutover requires
+                    // `secret rotate` / re-wrap, not a merge.
                     let wraps = known_wraps(&prots, &id);
                     if !wraps.is_empty() {
                         wrapped_carry.insert(id, wraps);
                     }
+                    // An empty union (no input protection knows this blob)
+                    // gets no wrapped_carry entry, not an error: the input was
+                    // already undecryptable on every side — the merge
+                    // preserves that state, it never worsens it.
                 }
                 files.push(MergedFile {
                     path,
@@ -324,11 +334,14 @@ pub(crate) fn three_way_files(
                 // the rule was removed on both — the output stays plain.)
                 let perms = (oe.2 | te.2) & PROTECTED;
                 let needs_encrypt = perms != 0;
+                // Decrypted inputs stay in `Zeroizing` until the final output
+                // copy; `bb` never leaves it — the base plaintext is only read
+                // for diff3 and is wiped when it drops.
                 let ob = plain_input(store, oe, &prots, identity, &path)?;
                 let tb = plain_input(store, te, &prots, identity, &path)?;
                 let bb = match b {
                     Some(be) => plain_input(store, be, &prots, identity, &path)?,
-                    None => Vec::new(),
+                    None => scl_crypto::Zeroizing::new(Vec::new()),
                 };
                 match (std::str::from_utf8(&ob), std::str::from_utf8(&tb)) {
                     (Ok(os), Ok(ts)) => {
@@ -350,8 +363,14 @@ pub(crate) fn three_way_files(
                         // binary conflict: keep ours, write theirs sidecar —
                         // both in plaintext, so the user can resolve.
                         conflicts.push(path.clone());
-                        sidecars.push((format!("{path}.theirs"), tb));
-                        files.push(MergedFile { path, mode, bytes: ob, perms, needs_encrypt });
+                        sidecars.push((format!("{path}.theirs"), tb.to_vec()));
+                        files.push(MergedFile {
+                            path,
+                            mode,
+                            bytes: ob.to_vec(),
+                            perms,
+                            needs_encrypt,
+                        });
                     }
                 }
             }
@@ -365,7 +384,7 @@ pub(crate) fn three_way_files(
                 files.push(MergedFile {
                     path,
                     mode: oe.1,
-                    bytes,
+                    bytes: bytes.to_vec(),
                     perms,
                     needs_encrypt: perms != 0,
                 });
@@ -398,19 +417,24 @@ fn known_wraps(prots: &[&Protection], id: &ObjectId) -> Vec<WrappedKey> {
 /// entry, decrypt via the wraps known to `prots` — which requires `identity`
 /// ([`Error::ProtectedMergeNeedsIdentity`] when absent, `NotAuthorized` when
 /// present but no wrap unwraps for it).
+///
+/// Returned in `Zeroizing` so decrypted plaintext is wiped on drop (same
+/// convention as `worktree::materialize`, worktree.rs ~301): callers copy out
+/// only at the final output step, and an input that never reaches the output
+/// (notably the base side) is zeroed without ever leaving the wrapper.
 fn plain_input(
     store: &mut Store,
     entry: (ObjectId, FileMode, u8),
     prots: &[&Protection],
     identity: Option<&scl_crypto::SecretKey>,
     path: &str,
-) -> Result<Vec<u8>> {
+) -> Result<scl_crypto::Zeroizing<Vec<u8>>> {
     let bytes = blob_bytes(store, entry.0)?;
     if entry.2 & PROTECTED == 0 {
-        return Ok(bytes);
+        return Ok(scl_crypto::Zeroizing::new(bytes));
     }
     let sk = identity.ok_or_else(|| Error::ProtectedMergeNeedsIdentity(path.to_string()))?;
-    Ok(protect::decrypt_with(&bytes, &entry.0, prots, sk, path)?.to_vec())
+    Ok(protect::decrypt_with(&bytes, &entry.0, prots, sk, path)?)
 }
 
 /// Three-way merge of two secret registries against base. A name changed
@@ -856,6 +880,179 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::NotAuthorized(_)), "got {err:?}");
+    }
+
+    // ---- pinning tests for the decided resolution-rule edges (review) ----
+
+    #[test]
+    fn one_sided_protect_resolves_keyless() {
+        // Decided edge #1: fast-path keys are (blob id, PROTECTED bit). ours
+        // left x.txt untouched (equal to base in id AND bit); theirs added the
+        // rule and re-encrypted. This is a one-sided change: resolved with NO
+        // identity, carrying theirs' ciphertext + PROTECTED + wraps.
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (bp, op) = (Protection::default(), Protection::default());
+        let mut tp = Protection::default();
+        let ct = enc_file(&mut tp, &alice_pk, b"hello\n");
+        let base = tree_with_perms(&repo, &[("x.txt", b"hello\n".to_vec(), 0)]);
+        let ours = tree_with_perms(&repo, &[("x.txt", b"hello\n".to_vec(), 0)]);
+        let theirs = tree_with_perms(&repo, &[("x.txt", ct.clone(), PROTECTED)]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let fm =
+            three_way_files(&mut s, Some((base, &bp)), (ours, &op), (theirs, &tp), None).unwrap();
+        assert!(fm.conflicts.is_empty());
+        let f = fm.files.iter().find(|f| f.path == "x.txt").unwrap();
+        assert_eq!(f.bytes, ct, "theirs' ciphertext carried verbatim");
+        assert!(f.perms & PROTECTED != 0);
+        assert!(!f.needs_encrypt);
+        assert!(fm.wrapped_carry.contains_key(&Object::blob(ct).id()));
+    }
+
+    #[test]
+    fn delete_vs_modify_plain_survivor_needs_no_identity() {
+        // Decided edge #2: identity is demanded lazily, per protected input
+        // actually read. Base was protected, ours removed the rule and
+        // modified (plain survivor), theirs deleted: the survivor is plain,
+        // base is never consulted for delete-vs-modify — no identity needed.
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let mut bp = Protection::default();
+        let (op, tp) = (Protection::default(), Protection::default());
+        let cb = enc_file(&mut bp, &alice_pk, b"secret\n");
+        let base = tree_with_perms(&repo, &[("f.txt", cb, PROTECTED), ("keep.txt", b"k\n".to_vec(), 0)]);
+        let ours = tree_with_perms(&repo, &[("f.txt", b"public\n".to_vec(), 0), ("keep.txt", b"k\n".to_vec(), 0)]);
+        let theirs = tree_with_perms(&repo, &[("keep.txt", b"k\n".to_vec(), 0)]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let fm =
+            three_way_files(&mut s, Some((base, &bp)), (ours, &op), (theirs, &tp), None).unwrap();
+        assert_eq!(fm.conflicts, vec!["f.txt"], "delete-vs-modify still conflicts");
+        let f = fm.files.iter().find(|f| f.path == "f.txt").unwrap();
+        assert_eq!(f.bytes, b"public\n", "plain survivor kept as-is");
+        assert_eq!(f.perms, 0);
+        assert!(!f.needs_encrypt);
+    }
+
+    #[test]
+    fn protected_base_plain_divergent_sides_decrypts_base_outputs_plain() {
+        // Decided edge #3: rule removed on both sides (historically), sides
+        // diverged in plaintext. The protected BASE must be decrypted so
+        // diff3 has the true ancestor (identity required), but the output is
+        // plain — both sides chose plain, so perms 0 / needs_encrypt false.
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let mut bp = Protection::default();
+        let (op, tp) = (Protection::default(), Protection::default());
+        let cb = enc_file(&mut bp, &alice_pk, b"l1\nl2\nl3\n");
+        let base = tree_with_perms(&repo, &[("f.txt", cb, PROTECTED)]);
+        let ours = tree_with_perms(&repo, &[("f.txt", b"L1\nl2\nl3\n".to_vec(), 0)]);
+        let theirs = tree_with_perms(&repo, &[("f.txt", b"l1\nl2\nL3\n".to_vec(), 0)]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        // Without an identity the base can't be decrypted for the ancestor.
+        let err = three_way_files(&mut s, Some((base, &bp)), (ours, &op), (theirs, &tp), None)
+            .unwrap_err();
+        assert!(matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "f.txt"), "got {err:?}");
+        // With one, the merge is clean against the true ancestor and PLAIN.
+        let fm = three_way_files(
+            &mut s,
+            Some((base, &bp)),
+            (ours, &op),
+            (theirs, &tp),
+            Some(&alice_sk),
+        )
+        .unwrap();
+        assert!(fm.conflicts.is_empty());
+        let f = fm.files.iter().find(|f| f.path == "f.txt").unwrap();
+        assert_eq!(f.bytes, b"L1\nl2\nL3\n");
+        assert_eq!(f.perms, 0, "both sides removed the rule — output stays plain");
+        assert!(!f.needs_encrypt);
+    }
+
+    #[test]
+    fn delete_vs_modify_protected_survivor_decrypts_with_identity() {
+        // Decided edge #4: a PROTECTED survivor of delete-vs-modify is
+        // decrypted (identity-gated) so the conflicted file is resolvable in
+        // plaintext, flagged needs_encrypt.
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let mut bp = Protection::default();
+        let mut op = Protection::default();
+        let tp = Protection::default();
+        let cb = enc_file(&mut bp, &alice_pk, b"v1\n");
+        let co = enc_file(&mut op, &alice_pk, b"v2\n");
+        let base = tree_with_perms(&repo, &[("secret/f", cb, PROTECTED), ("keep.txt", b"k\n".to_vec(), 0)]);
+        let ours = tree_with_perms(&repo, &[("secret/f", co, PROTECTED), ("keep.txt", b"k\n".to_vec(), 0)]);
+        let theirs = tree_with_perms(&repo, &[("keep.txt", b"k\n".to_vec(), 0)]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        // Keyless: the protected survivor can't be decrypted.
+        let err = three_way_files(&mut s, Some((base, &bp)), (ours, &op), (theirs, &tp), None)
+            .unwrap_err();
+        assert!(matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "secret/f"), "got {err:?}");
+        // With identity: conflict marked, survivor in plaintext, needs_encrypt.
+        let fm = three_way_files(
+            &mut s,
+            Some((base, &bp)),
+            (ours, &op),
+            (theirs, &tp),
+            Some(&alice_sk),
+        )
+        .unwrap();
+        assert_eq!(fm.conflicts, vec!["secret/f"]);
+        let f = fm.files.iter().find(|f| f.path == "secret/f").unwrap();
+        assert_eq!(f.bytes, b"v2\n", "surviving (modified) plaintext kept");
+        assert!(f.perms & PROTECTED != 0);
+        assert!(f.needs_encrypt);
+    }
+
+    #[test]
+    fn wrapped_carry_unions_wraps_from_both_sides() {
+        // Decided edge #5: an unchanged protected blob whose sides know
+        // different recipient sets (theirs granted bob one-sidedly) carries
+        // the UNION of the wraps.
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        let mut bp = Protection::default();
+        let mut op = Protection::default();
+        let mut tp = Protection::default();
+        let ct = enc_file(&mut bp, &alice_pk, b"s\n");
+        let _ = enc_file(&mut op, &alice_pk, b"s\n"); // convergent: same blob id
+        let _ = enc_file(&mut tp, &alice_pk, b"s\n");
+        let _ = enc_file(&mut tp, &bob_pk, b"s\n"); // theirs also granted bob
+        let root = tree_with_perms(&repo, &[("secret/f", ct.clone(), PROTECTED)]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let fm =
+            three_way_files(&mut s, Some((root, &bp)), (root, &op), (root, &tp), None).unwrap();
+        assert!(fm.conflicts.is_empty());
+        let wraps = &fm.wrapped_carry[&Object::blob(ct).id()];
+        assert_eq!(wraps.len(), 2, "alice's wrap deduped, bob's grant unioned in");
+        let alice_id = alice_pk.recipient_id().to_string();
+        let bob_id = bob_pk.recipient_id().to_string();
+        assert!(wraps.iter().any(|w| w.recipient_id == alice_id));
+        assert!(wraps.iter().any(|w| w.recipient_id == bob_id));
+    }
+
+    #[test]
+    fn perms_divergence_requires_identity_when_keyless() {
+        // Companion to perms_divergence_resolves_protected: the same
+        // PROTECTED-bit divergence with identity None must refuse, not
+        // silently pick a side.
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let op = Protection::default();
+        let mut tp = Protection::default();
+        let ct = enc_file(&mut tp, &alice_pk, b"hello\n");
+        let ours = tree_with_perms(&repo, &[("x.txt", b"bye\n".to_vec(), 0)]);
+        let theirs = tree_with_perms(&repo, &[("x.txt", ct, PROTECTED)]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let err = three_way_files(&mut s, None, (ours, &op), (theirs, &tp), None).unwrap_err();
+        assert!(matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "x.txt"), "got {err:?}");
     }
 
     #[test]
