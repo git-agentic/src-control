@@ -469,8 +469,8 @@ ADR-0024.
 
 ## Phase 15 — protected merge & replay (built)
 
-Every merge/rebase/cherry-pick fails closed → **lifted in P15 (ADR-0025)** on
-protected content. The key observation is that P7's path encryption is
+Every merge/rebase/cherry-pick used to fail closed on protected content —
+**lifted in P15 (ADR-0025)**. The key observation is that P7's path encryption is
 **convergent** (equal plaintext ⇒ equal ciphertext blob id), so most
 three-way cases resolve on ciphertext ids alone: unchanged, one-side-changed,
 and clean-delete protected paths merge with no identity at all, carrying
