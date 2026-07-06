@@ -20,6 +20,7 @@ pub mod protect_ops;
 pub mod reachable;
 pub mod refs;
 pub mod remote;
+pub mod replay;
 pub mod repo;
 pub mod secrets;
 pub mod stdio_transport;
