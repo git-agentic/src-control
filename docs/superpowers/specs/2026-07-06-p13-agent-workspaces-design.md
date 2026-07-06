@@ -119,9 +119,11 @@ Session flow:
   composition: a `sc work` session is a bounded ephemeral session *hosted
   by* a persistent repo, with the persistent store as the only durable
   surface.
-- **Budget still fails loudly.** No spill backend in this path; over-budget
-  inserts surface `BudgetExceeded` with a hint to raise `--budget-mb`. Never
-  silently drop.
+- **Budget bounds resident bytes; nothing is ever silently dropped.** In
+  persistent mode eviction is safe (the store on disk is the reconstruction
+  source), so an over-budget session evicts LRU blobs and keeps working. The
+  loud-failure case remains: a single blob that cannot fit even after
+  evicting everything surfaces `BudgetExceeded` (hint: raise `--budget-mb`).
 - **Blobs stay `Arc<[u8]>`-shared.** Forking N workspaces must not copy blob
   bytes; one store read serves all N.
 - **No silent destruction.** Failed agents keep their branch; scanner
@@ -158,7 +160,9 @@ In `repo::workspace` tests (plus one CLI-level integration test):
   simulated harvest error.
 - secrets injection: agent script echoes the env var to a file → harvested
   content proves injection (using a scanner-allowlisted marker value).
-- budget: tiny `--budget-mb` over a large repo → loud `BudgetExceeded`.
+- budget: a session under a budget smaller than the repo's total blob bytes
+  (but larger than its largest blob) succeeds via eviction; a budget smaller
+  than a single blob fails loudly with `BudgetExceeded`.
 
 Demo `demo/run_work_demo.sh`: init repo → base commit → `sc work --agents 3
 -- <script editing different files>` → show three branches → `sc merge` them
