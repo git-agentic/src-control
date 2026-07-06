@@ -113,6 +113,18 @@ enum Cmd {
         #[arg(long)]
         author: Option<String>,
     },
+    /// Replay the current branch's commits onto another branch's tip.
+    ///
+    /// Any conflict aborts the whole rebase (exit 1): refs and the working
+    /// tree are left untouched, unlike `sc merge`/`sc cherry-pick`'s marker
+    /// files. Resolve via `sc merge` or per-commit `sc cherry-pick` instead.
+    Rebase {
+        /// Branch or remote-tracking ref to rebase onto.
+        target: String,
+        /// Commit author (default $SC_AUTHOR, then the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
     /// Scan the working tree for plaintext secrets without committing.
     Scan,
     /// Decrypt authorized secrets, inject them, and run a command.
@@ -366,6 +378,7 @@ fn main() -> Result<()> {
         Cmd::Scan => run_scan(),
         Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &resolve_author(author)),
         Cmd::CherryPick { refname, author } => run_cherry_pick(&refname, &resolve_author(author)),
+        Cmd::Rebase { target, author } => run_rebase(&target, &resolve_author(author)),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
         Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
@@ -998,6 +1011,25 @@ fn run_cherry_pick(refname: &str, author: &str) -> Result<()> {
             // destructors and would otherwise leave a stale lock file.
             drop(repo);
             std::process::exit(1);
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn run_rebase(target: &str, author: &str) -> Result<()> {
+    let repo = open_repo()?;
+    match repo.rebase(target, author) {
+        Ok(scl_repo::RebaseResult::AlreadyUpToDate) => {
+            println!("already up to date");
+            Ok(())
+        }
+        Ok(scl_repo::RebaseResult::FastForwarded(id)) => {
+            println!("fast-forwarded to {}", id.short());
+            Ok(())
+        }
+        Ok(scl_repo::RebaseResult::Rebased { new_tip, replayed, skipped }) => {
+            println!("rebased: {replayed} replayed, {skipped} skipped, tip {}", new_tip.short());
+            Ok(())
         }
         Err(e) => Err(e.into()),
     }

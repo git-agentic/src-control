@@ -210,6 +210,167 @@ impl Repo {
             }
         }
     }
+
+    /// Replay the current branch's commits onto `target`'s tip (rebase).
+    ///
+    /// Preflight mirrors `cherry_pick`'s exactly (merge/pick-in-progress
+    /// guards, unborn HEAD, ref resolution, dirty-working-tree check). Then:
+    /// fast paths for already-up-to-date and pure-fast-forward cases (no
+    /// oplog record for the former; ref move + materialize + oplog for the
+    /// latter), else a real replay over the first-parent range from the
+    /// current tip back to the merge-base (exclusive), applied oldest-first
+    /// onto target's tip. Any merge commit anywhere in that range refuses the
+    /// whole rebase up front (`Error::CannotReplayMerge`) before a single
+    /// commit is replayed. The first conflict aborts the entire rebase with
+    /// refs and the working tree untouched — nothing outside the CAS is
+    /// written until every replayed commit in the range is clean (unlike
+    /// `cherry_pick`, which leaves conflict markers for a single commit).
+    /// Same crash discipline as `cherry_pick`'s clean path: snapshots land in
+    /// the CAS, then the working tree is materialized, then the branch ref is
+    /// moved (the atomic commit point), with the oplog record written last.
+    pub fn rebase(&self, target: &str, author: &str) -> Result<RebaseResult> {
+        if crate::merge_state::in_progress(&self.layout) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
+        }
+        let ours_tip = self.head_tip()?.ok_or(Error::Unborn)?;
+        let target_tip = refs::resolve_tip(&self.layout, target)?
+            .ok_or_else(|| Error::NoSuchBranch(target.to_string()))?;
+        let dirty = self.status()?;
+        if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
+            return Err(Error::InvalidArgument(
+                "working tree has uncommitted changes; commit before rebasing".into(),
+            ));
+        }
+
+        let head = refs::current_branch(&self.layout)?;
+        let before = refs::read_branch_tip(&self.layout, &head)?;
+        let ours_snap = self.snapshot(&ours_tip)?;
+        let ours_root = ours_snap.root;
+
+        // Fast paths.
+        {
+            let store_arc = self.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            if merge::is_ancestor(&mut store, target_tip, ours_tip)? {
+                return Ok(RebaseResult::AlreadyUpToDate);
+            }
+            if merge::is_ancestor(&mut store, ours_tip, target_tip)? {
+                let target_snap = store.get_snapshot(&target_tip)?;
+                let target_root = target_snap.root;
+                let target_protection = target_snap.protection;
+                worktree::materialize(
+                    &self.layout,
+                    &mut store,
+                    target_root,
+                    Some(ours_root),
+                    &target_protection,
+                    None,
+                )?;
+                drop(store);
+                refs::write_branch_tip(&self.layout, &head, &target_tip)?;
+                crate::oplog::record(
+                    &self.layout,
+                    &format!("rebase onto {target} (ff)"),
+                    &head,
+                    &head,
+                    &[(head.clone(), before, Some(target_tip))],
+                )?;
+                return Ok(RebaseResult::FastForwarded(target_tip));
+            }
+        }
+
+        // Real replay: collect the first-parent range from ours_tip back to
+        // the merge-base (exclusive), oldest-first, then pre-scan for merge
+        // commits so a rebase either replays cleanly in full or refuses
+        // before touching anything.
+        let base = {
+            let store_arc = self.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            merge::merge_base(&mut store, ours_tip, target_tip)?.ok_or(Error::NoCommonAncestor)?
+        };
+        let mut range = Vec::new();
+        {
+            let mut cur = ours_tip;
+            while cur != base {
+                let snap = self.snapshot(&cur)?;
+                if snap.parents.len() >= 2 {
+                    return Err(Error::CannotReplayMerge(cur));
+                }
+                range.push(cur);
+                cur = snap.parents.first().copied().ok_or(Error::NoCommonAncestor)?;
+            }
+        }
+        range.reverse();
+
+        let target_snap = self.snapshot(&target_tip)?;
+        let mut acc_tip = target_tip;
+        let mut acc_root = target_snap.root;
+        let mut replayed = 0usize;
+        let mut skipped = 0usize;
+
+        for commit in range {
+            let commit_snap = self.snapshot(&commit)?;
+            match replay_commit(self, commit, acc_root)? {
+                ReplayOutcome::Empty => {
+                    skipped += 1;
+                }
+                ReplayOutcome::Clean { root } => {
+                    let id = self.build_snapshot(
+                        root,
+                        vec![acc_tip],
+                        target_snap.secrets.clone(),
+                        target_snap.protection.clone(),
+                        author,
+                        &commit_snap.message,
+                    )?;
+                    acc_tip = id;
+                    acc_root = root;
+                    replayed += 1;
+                }
+                ReplayOutcome::Conflicts { paths, .. } => {
+                    // Nothing outside the CAS has been written: no working-tree
+                    // markers, no ref moves — the whole rebase aborts cleanly.
+                    return Err(Error::RebaseConflicts { commit, paths });
+                }
+            }
+        }
+
+        {
+            let store_arc = self.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            worktree::materialize(
+                &self.layout,
+                &mut store,
+                acc_root,
+                Some(ours_root),
+                &target_snap.protection,
+                None,
+            )?;
+        }
+        refs::write_branch_tip(&self.layout, &head, &acc_tip)?;
+        crate::oplog::record(
+            &self.layout,
+            &format!("rebase onto {target} ({replayed} replayed, {skipped} skipped)"),
+            &head,
+            &head,
+            &[(head.clone(), before, Some(acc_tip))],
+        )?;
+        Ok(RebaseResult::Rebased { new_tip: acc_tip, replayed, skipped })
+    }
+}
+
+/// Outcome of [`Repo::rebase`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseResult {
+    /// Target already reachable from the current tip — nothing to do.
+    AlreadyUpToDate,
+    /// Current tip was an ancestor of target — ref fast-forwarded.
+    FastForwarded(ObjectId),
+    /// Commits replayed; branch now points at the last new snapshot.
+    Rebased { new_tip: ObjectId, replayed: usize, skipped: usize },
 }
 
 #[cfg(test)]
@@ -578,6 +739,222 @@ mod tests {
         assert_eq!(repo.head_tip().unwrap(), Some(ours_tip), "tip must not move");
 
         crate::merge_state::clear(&repo.layout).unwrap();
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rebase_replays_commits_in_order_onto_target() {
+        let root = tmp_root("rebase-order");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main gains a commit after the branch point.
+        std::fs::write(root.join("main.txt"), b"main\n").unwrap();
+        let main_tip = repo.commit("me", "main adds main.txt").unwrap();
+
+        // feature gains two commits from the old base.
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("c1.txt"), b"c1\n").unwrap();
+        let c1 = repo.commit("me", "feature c1").unwrap();
+        std::fs::write(root.join("c2.txt"), b"c2\n").unwrap();
+        let c2 = repo.commit("me", "feature c2").unwrap();
+        let _ = c2;
+
+        let outcome = repo.rebase("main", "me").unwrap();
+        let (new_tip, replayed, skipped) = match outcome {
+            RebaseResult::Rebased { new_tip, replayed, skipped } => (new_tip, replayed, skipped),
+            other => panic!("expected Rebased, got {other:?}"),
+        };
+        assert_eq!(replayed, 2);
+        assert_eq!(skipped, 0);
+        assert_eq!(repo.head_tip().unwrap(), Some(new_tip));
+
+        // Parent chain: new_tip <- c1' <- main_tip.
+        let c2_snap = repo.snapshot(&new_tip).unwrap();
+        assert_eq!(c2_snap.message, "feature c2");
+        assert_eq!(c2_snap.parents.len(), 1);
+        let c1_new_id = c2_snap.parents[0];
+        let c1_snap = repo.snapshot(&c1_new_id).unwrap();
+        assert_eq!(c1_snap.message, "feature c1");
+        assert_eq!(c1_snap.parents, vec![main_tip]);
+        assert_ne!(c1_new_id, c1);
+
+        // Working tree matches the final root: all three files present.
+        assert!(root.join("base.txt").exists());
+        assert!(root.join("main.txt").exists());
+        assert!(root.join("c1.txt").exists());
+        assert!(root.join("c2.txt").exists());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rebase_fast_paths() {
+        let root = tmp_root("rebase-ff");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // Current (main) is already an ancestor of feature (target): FastForwarded.
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("f.txt"), b"f\n").unwrap();
+        let feature_tip = repo.commit("me", "feature adds f").unwrap();
+        repo.switch("main").unwrap();
+
+        let outcome = repo.rebase("feature", "me").unwrap();
+        assert_eq!(outcome, RebaseResult::FastForwarded(feature_tip));
+        assert_eq!(repo.head_tip().unwrap(), Some(feature_tip));
+        let ops = repo.oplog().unwrap();
+        assert_eq!(ops.last().unwrap().desc, "rebase onto feature (ff)");
+
+        // Target is now an ancestor of current: AlreadyUpToDate.
+        let outcome = repo.rebase("feature", "me").unwrap();
+        assert_eq!(outcome, RebaseResult::AlreadyUpToDate);
+        assert_eq!(repo.head_tip().unwrap(), Some(feature_tip), "tip must not move");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn conflicting_rebase_aborts_with_refs_byte_identical() {
+        let root = tmp_root("rebase-conflict");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"a\nB\nc\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nZ\nc\n").unwrap();
+        repo.commit("me", "feature edits x").unwrap();
+        // Stay on feature: rebase feature onto main.
+
+        // Snapshot the entire .sc/refs dir (path -> bytes) before rebasing.
+        let refs_dir = root.join(".sc/refs");
+        let snapshot_refs = |dir: &std::path::Path| -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            let mut out = std::collections::BTreeMap::new();
+            for entry in walkdir(dir) {
+                let bytes = std::fs::read(&entry).unwrap();
+                out.insert(entry, bytes);
+            }
+            out
+        };
+        fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut out = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries {
+                    let e = e.unwrap();
+                    let p = e.path();
+                    if p.is_dir() {
+                        out.extend(walkdir(&p));
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+            out
+        }
+
+        let before_refs = snapshot_refs(&refs_dir);
+        let before_x = std::fs::read(root.join("x.txt")).unwrap();
+        let ops_before = repo.oplog().unwrap().len();
+
+        let err = repo.rebase("main", "me").unwrap_err();
+        match err {
+            Error::RebaseConflicts { paths, .. } => assert_eq!(paths, vec!["x.txt".to_string()]),
+            other => panic!("expected RebaseConflicts, got {other:?}"),
+        }
+
+        let after_refs = snapshot_refs(&refs_dir);
+        assert_eq!(before_refs, after_refs, "refs dir must be byte-identical after an aborted rebase");
+        let after_x = std::fs::read(root.join("x.txt")).unwrap();
+        assert_eq!(before_x, after_x, "working tree file must be unchanged");
+        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no new oplog record");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rebase_skips_already_applied_commits() {
+        let root = tmp_root("rebase-skip");
+        // main independently makes the exact same edit as feature's commit A
+        // (e.g. via a prior cherry-pick of an equivalent change), so replaying
+        // A onto main during the rebase is `Empty` -> skipped.
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        repo.commit("me", "feature adds a").unwrap();
+        std::fs::write(root.join("b.txt"), b"b\n").unwrap();
+        repo.commit("me", "feature adds b").unwrap();
+
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        repo.commit("me", "main makes same edit as feature's A").unwrap();
+
+        // Rebase feature onto main.
+        repo.switch("feature").unwrap();
+        let outcome = repo.rebase("main", "me").unwrap();
+        match outcome {
+            RebaseResult::Rebased { replayed, skipped, .. } => {
+                assert_eq!(replayed, 1, "only 'adds b' should replay");
+                assert_eq!(skipped, 1, "'adds a' is already present -> skipped");
+            }
+            other => panic!("expected Rebased, got {other:?}"),
+        }
+        assert!(root.join("b.txt").exists());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rebase_range_with_merge_commit_is_refused() {
+        let root = tmp_root("rebase-merge-refused");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("main2").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main2 is a side branch that feature will merge in.
+        repo.switch("main2").unwrap();
+        std::fs::write(root.join("side.txt"), b"side\n").unwrap();
+        repo.commit("me", "side commit").unwrap();
+
+        // feature merges main2 in, producing a merge commit in feature's history.
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("feat.txt"), b"feat\n").unwrap();
+        repo.commit("me", "feature commit").unwrap();
+        let merged = repo.merge("main2", "me").unwrap();
+        assert!(repo.snapshot(&merged).unwrap().parents.len() >= 2);
+        let feature_tip_before = repo.head_tip().unwrap();
+
+        // main gains an unrelated commit, so rebasing feature onto main has
+        // real work to do (not a fast path).
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("main.txt"), b"main\n").unwrap();
+        repo.commit("me", "main adds main.txt").unwrap();
+
+        repo.switch("feature").unwrap();
+        assert_eq!(repo.head_tip().unwrap(), feature_tip_before);
+
+        let err = repo.rebase("main", "me").unwrap_err();
+        assert!(matches!(err, Error::CannotReplayMerge(id) if id == merged), "got {err:?}");
+        assert_eq!(repo.head_tip().unwrap(), feature_tip_before, "feature tip must not move");
+
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
     }
