@@ -236,8 +236,10 @@ pub fn diff_worktree(
 /// escape the repo root (`..`, `.`, empty, or an absolute path). A committed
 /// tree is attacker-influenced data, so an unsafe relpath is a hard error
 /// rather than a silent skip — otherwise a malicious tree could write or delete
-/// files anywhere on disk during `materialize`.
-fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
+/// files anywhere on disk during `materialize`. `pub(crate)` so the conflicted
+/// merge path (Task 6, P15) can write plaintext marker files straight to the
+/// working tree with the same traversal guard.
+pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
     for comp in rel.split('/') {
         if comp.is_empty() || comp == "." || comp == ".." {
             return Err(crate::error::Error::BadRef(format!("unsafe path in tree: {rel}")));

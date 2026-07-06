@@ -974,8 +974,11 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str, identity: Option
     let branch = branch.ok_or_else(|| anyhow::anyhow!("merge: provide a branch or --abort"))?;
     let sk = resolve_identity_opt(identity)?;
     match repo.merge_with_identity(&branch, author, sk.as_ref()) {
-        Ok(id) => {
+        Ok((id, skipped)) => {
             println!("merged {branch}: {}", id.short());
+            for path in &skipped {
+                eprintln!("skipped (no key): {path}");
+            }
             Ok(())
         }
         Err(scl_repo::Error::MergeConflicts(n)) => {
