@@ -171,11 +171,22 @@ impl Repo {
         let message = opts.message.clone().unwrap_or_else(|| opts.cmd.join(" "));
         let (exe, args) = opts.cmd.split_first().expect("checked non-empty above");
 
-        // Spawn all agents first (they run concurrently), then await each.
-        let mut children = Vec::with_capacity(labels.len());
+        // Materialize every checkout before spawning any agent. Materialize
+        // is the only `?`-aborting step past this point (spawn failures are
+        // captured per-workspace, not propagated), so finishing it up front
+        // guarantees no early return can occur while children are running —
+        // an interleaved failure would orphan live agents and race the
+        // teardown guard's remove_dir_all underneath them.
+        let mut dirs = Vec::with_capacity(labels.len());
         for label in &labels {
             let dir = session_root.join(label);
             materialize_workspace(self, tip, &dir, opts.identity.as_ref())?;
+            dirs.push(dir);
+        }
+
+        // Spawn all agents first (they run concurrently), then await each.
+        let mut children = Vec::with_capacity(labels.len());
+        for (label, dir) in labels.iter().zip(dirs) {
             let mut c = std::process::Command::new(exe);
             c.args(args)
                 .current_dir(&dir)
@@ -341,6 +352,24 @@ mod tests {
         let outcomes2 = repo.work(opts2).unwrap();
         assert!(matches!(outcomes2[0].harvest.as_ref().unwrap(), HarvestResult::Unchanged));
         assert_eq!(crate::refs::read_branch_tip(repo.layout(), "idle-1").unwrap(), None);
+        drop(repo);
+        teardown(&root);
+    }
+
+    #[test]
+    fn spawn_failure_is_reported_not_fatal() {
+        let (root, scratch) = setup("spawnfail");
+        let repo = Repo::open(&root).unwrap();
+        // A command that cannot be exec'd: the spawn fails, the session still
+        // completes with agent_exit None and an untouched (Unchanged) checkout.
+        let opts = work_opts(1, &["/nonexistent-binary-sc-test"], &scratch);
+        let session_root = opts.session_root.clone().unwrap();
+        let outcomes = repo.work(opts).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].agent_exit, None);
+        assert!(matches!(outcomes[0].harvest.as_ref().unwrap(), HarvestResult::Unchanged));
+        assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
+        assert!(!session_root.exists(), "session root must be torn down");
         drop(repo);
         teardown(&root);
     }
