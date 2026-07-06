@@ -95,6 +95,21 @@ across every phase.
   provenance, atomic rebase, and an undo/redo round-trip byte-identical at
   the refs level. (ADR-0024.)
 
+## Active
+
+- **Phase 15 — Protected merge & replay.** Lift the fail-closed guards:
+  `sc merge`/`sc rebase`/`sc cherry-pick` work on protected content.
+  Id-level cases (unchanged / one side changed / clean deletes) resolve on
+  ciphertext ids — sound under convergent encryption — carrying wrapped
+  DEKs, with no identity required; only a content-divergent protected path
+  needs `--identity` (typed error otherwise). Protection rules merge by
+  union (nothing silently unprotects); merged plaintext re-encrypts through
+  the same wrap-reuse helper commit uses; the secret registry replays
+  through rebase/cherry-pick (closing P14's warning). Plaintext never
+  enters the CAS.
+  Spec: `docs/superpowers/specs/2026-07-06-p15-protected-merge-design.md`.
+  (ADR-0025, Proposed.)
+
 ## Completed phases (usability-first ordering)
 
 | Phase | Goal | Demoable outcome | ADR |
