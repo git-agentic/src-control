@@ -1032,8 +1032,11 @@ fn run_branch(name: &str) -> Result<()> {
 }
 
 fn run_undo() -> Result<()> {
-    let desc = open_repo()?.undo()?;
-    println!("undid: {desc}");
+    let outcome = open_repo()?.undo()?;
+    println!("undid: {}", outcome.desc);
+    for path in &outcome.skipped {
+        eprintln!("skipped (no key): {path}");
+    }
     Ok(())
 }
 
