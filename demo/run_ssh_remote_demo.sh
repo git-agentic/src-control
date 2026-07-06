@@ -80,7 +80,7 @@ cd "$A"
 echo "B: fetch + merge + push recovered ✔"
 
 # --- Confidentiality act: A protects a path and commits a secret file. ---
-# NB: protect comes AFTER the merge scenario — three-way merges of history containing protected paths are refused fail-closed (P7 guard, see repo.rs merge guard).
+# NB: protect comes AFTER the merge scenario — kept for demo-flow clarity. (Historically P7's merge guard refused protected merges; P15/ADR-0025 lifted that, so the ordering is no longer load-bearing.)
 cd "$A"
 ALICE_PK="$(awk '/public key:/{print $3}' < <("$SC" keygen --out "$KEY"))"
 printf '[recipients]\nalice = "%s"\n' "$ALICE_PK" > .sc/recipients.toml
