@@ -285,9 +285,10 @@ Phase 8 adds three tightly coupled capabilities to the persistent store:
   remote store. This replaces the prior object-at-a-time transfer.
 
 Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
-frames, bulk re-wrap, and multiple escrow keys (merge shipped as Phase 4;
+frames, bulk re-wrap, multiple escrow keys, interactive workspace sessions
+and auto-merge of clean workspace results (merge shipped as Phase 4;
 break-glass escrow shipped as Phase 11; ssh-native network transport shipped
-as Phase 12).
+as Phase 12; agent workspaces shipped as Phase 13).
 
 ## Phase 9 — Git export (built)
 
@@ -416,3 +417,17 @@ the full ssh:// path through a local shim, no sshd needed). Typed errors
 at worst unreachable objects, never a torn ref. Confidentiality is unchanged
 by construction: objects travel as canonical bytes, ciphertext stays
 ciphertext. See ADR-0022.
+
+## Phase 13 — agent workspaces (built)
+
+`sc work` is the fusion of Phase 1 and Phase 3: the session engine
+(`crates/repo/src/workspace.rs`) forks N vfs worktrees from HEAD *inside the
+repo's own budget-bounded persistent store*, so all forks share one Arc'd
+blob cache and eviction never needs a spill backend — `.sc/objects` is the
+reconstruction source. Checkout reuses the P7-aware `materialize`; harvest
+reuses the commit pipeline (`snapshot_files`, extracted from `commit`), so
+the P5 scanner and `.scignore` gate agent output exactly like a human
+commit. Each changed workspace becomes a flat `work-<i>` branch (the ref
+grammar reserves `/` for remote-tracking refs); merge is the ordinary P4
+path. The session holds the single-writer lock end to end, and teardown is
+Drop-guarded: zero residue outside `.sc/` on success, error, or panic.

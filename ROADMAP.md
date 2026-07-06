@@ -73,10 +73,7 @@ across every phase.
   drive the full ssh:// code path with no sshd. Zero new dependencies.
   Accepted limitations: 4 GiB frame cap, no repo paths with spaces over
   real ssh, `sc` must be on the server's PATH. (ADR-0022.)
-
-## Active
-
-- **Phase 13 — Agent workspaces (`sc work`).** Fuse the two halves of the
+- **Phase 13 — Agent workspaces (`sc work`).** Fused the two halves of the
   project: fork N in-RAM copy-on-write workspaces from a persistent repo's
   HEAD (the repo's budget-bounded store is the backing tier — eviction is
   safe, no spill backend), materialize each to an ephemeral temp checkout,
@@ -84,9 +81,7 @@ across every phase.
   `work-<i>` branches through the commit path (so `.scignore` and the P5
   scanner gate apply). `--with-secrets` injects decrypted secrets into each
   agent's environment via the `sc run` path — one command exercising all
-  three thesis pillars. Zero residue outside `.sc/`.
-  Spec: `docs/superpowers/specs/2026-07-06-p13-agent-workspaces-design.md`.
-  (ADR-0023, Proposed.)
+  three thesis pillars. Zero residue outside `.sc/`. (ADR-0023.)
 
 ## Completed phases (usability-first ordering)
 
@@ -101,6 +96,7 @@ across every phase.
 | **P10 — Git as a remote** | Bidirectional sync with Git | `sc remote add <name> <git-path> --git`; `sc push hub` writes commits `git log` can read; a second sc repo `sc fetch hub` + `sc merge hub/main` gets the content back | [0018](docs/adr/0018-git-as-a-remote.md) |
 | **P11 — Secret/permission lifecycle** | Cryptographic cutover + break-glass recovery for secrets | `sc secret rotate <name> --value <new>` re-seals under a fresh DEK; `sc escrow set <key>` auto-includes a recovery recipient at `secret add`/`rotate`/`protect` | [0019](docs/adr/0019-secret-lifecycle.md) |
 | **P12 — SSH-native network transport** | Sync between machines | `sc clone ssh://host/path`, `sc fetch`/`push` over the wire via `sc serve --stdio`; `demo/run_ssh_remote_demo.sh` proves the round trip with no sshd | [0022](docs/adr/0022-ssh-native-transport.md) |
+| **P13 — Agent workspaces** | Parallel agents on a real repo | `sc work --agents 3 -- <cmd>` forks 3 in-RAM workspaces, runs the command in each, harvests to `work-1..3` branches; `sc merge` integrates; zero residue outside `.sc/` | [0023](docs/adr/0023-agent-workspaces.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

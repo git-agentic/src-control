@@ -66,8 +66,11 @@ passes imported snapshots down; `repo` stays Git-agnostic.
     `.sc/` is user-owned durable state (like `.git/`). Every `Store::put` in
     persistent mode writes to `.sc/objects/`; `switch` materializes the working
     tree; `commit` snapshots it. This is correct and expected behavior.
-  The two modes are mutually exclusive — a session is either ephemeral or
-  persistent, never a mix.
+  The two modes compose in exactly one way: a `sc work` session (P13) is a
+  bounded ephemeral session *hosted by* a persistent repo — temp checkouts
+  are removed on teardown, and the only durable writes go through the same
+  commit path persistent mode already owns. Otherwise a session is either
+  ephemeral or persistent, never a mix.
 - **Memory budget bounds resident blob bytes.** Trees/snapshots/secrets stay
   resident (small) and are not evicted. Only reconstructible blobs are evictable.
   Dirty overlay writes are pinned in the worktree and never spilled.
@@ -144,6 +147,11 @@ cargo run --bin sc -- secret rotate <name> --identity <key>    # same value, fre
 cargo run --bin sc -- escrow set <pubkey-or-name>              # break-glass recovery key
 cargo run --bin sc -- escrow show
 bash demo/run_lifecycle_demo.sh                                # rotation + escrow proof
+cargo run --bin sc -- work --agents 3 -- <cmd>   # fork agent workspaces, run <cmd> in each,
+                                                 # harvest changed ones to work-<i> branches
+                                                 # (--with-secrets --identity <key> injects
+                                                 # decrypted secrets into each agent env)
+bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -228,5 +236,20 @@ ssh:// code path through a shim with no sshd. Zero new dependencies. Accepted
 limitations: 4 GiB frame cap, repo paths with spaces unsupported over real
 ssh, `sc` must be on the server's PATH. See ADR-0022.
 
+**Phase 13 is built.** Agent workspaces: `sc work --agents N -- <cmd>` forks
+N in-RAM copy-on-write workspaces from HEAD inside the repo's budget-bounded
+persistent store (eviction is safe — the store on disk is the reconstruction
+source; no spill backend in this path), materializes each to an ephemeral
+temp checkout with P7-aware decryption, runs the agent commands concurrently
+(`SC_WORKSPACE`/`SC_WORKSPACE_DIR` in env; `--with-secrets --identity <key>`
+injects decrypted secrets via the `sc run` path), and harvests each changed
+workspace through the full commit pipeline (`.scignore`, P5 scanner gate,
+protected-path re-encryption) to a flat `work-<i>` branch — integration is
+plain `sc merge`. HEAD, the current branch, and the user's working tree are
+never touched; a failed agent's partial work is still harvested; teardown
+leaves zero residue outside `.sc/`. Branch names are flat because the ref
+grammar reserves `name/branch` for remote-tracking refs. See ADR-0023.
+
 Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
-frames, bulk re-wrap, and multiple escrow keys.
+frames, bulk re-wrap, multiple escrow keys, interactive workspace sessions
+and auto-merge of clean workspace results.
