@@ -283,10 +283,18 @@ impl Repo {
         let tip = self.head_tip()?;
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
         let merging = merge_head.is_some();
+        let picking = crate::pick_state::in_progress(&self.layout);
         let id = self.snapshot_files(files, tip, merge_head, author, message)?;
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
-        let label = if merging { "commit (merge)" } else { "commit" };
+        crate::pick_state::clear(&self.layout)?;
+        let label = if merging {
+            "commit (merge)"
+        } else if picking {
+            "commit (pick)"
+        } else {
+            "commit"
+        };
         let first_line = message.lines().next().unwrap_or("");
         crate::oplog::record(
             &self.layout,
@@ -460,6 +468,16 @@ impl Repo {
         crate::merge_state::in_progress(&self.layout)
     }
 
+    /// Whether a cherry-pick is currently in progress.
+    pub fn pick_in_progress(&self) -> bool {
+        crate::pick_state::in_progress(&self.layout)
+    }
+
+    /// The commit being cherry-picked, if a cherry-pick is in progress.
+    pub fn pick_head(&self) -> Result<Option<ObjectId>> {
+        crate::pick_state::read_pick_head(&self.layout)
+    }
+
     /// Merge `branch` into the current branch. Fast-forwards when possible;
     /// auto-commits a two-parent snapshot on a clean merge; on conflicts writes
     /// markers + merge state and returns `MergeConflicts`. If the current
@@ -471,6 +489,9 @@ impl Repo {
     pub fn merge(&self, branch: &str, author: &str) -> Result<ObjectId> {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
         }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
@@ -753,6 +774,9 @@ impl Repo {
         validate_branch_name(name)?;
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
         }
         let head_before = refs::current_branch(&self.layout)?;
         // The protection-aware dirty check (status) already treats unchanged
@@ -2089,6 +2113,62 @@ mod tests {
         // Both `merge` and `switch` must refuse mid-merge.
         assert!(matches!(repo.merge("feature", "me"), Err(Error::MergeInProgress)));
         assert!(matches!(repo.switch("feature"), Err(Error::MergeInProgress)));
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commit_clears_pick_state_and_is_single_parent() {
+        let root = tmp_root("pick-commit");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        let base = repo.commit("me", "base").unwrap();
+
+        // Simulate a cherry-pick in progress: some other commit is being
+        // picked, conflict markers (none, here) are on disk.
+        let picked = ObjectId::of(b"some-picked-commit");
+        crate::pick_state::write(&repo.layout, &picked, &[]).unwrap();
+        assert!(repo.pick_in_progress());
+        assert_eq!(repo.pick_head().unwrap(), Some(picked));
+
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+        let id = repo.commit("me", "picked change").unwrap();
+
+        // Pick state is cleared, and unlike a merge commit, this stays
+        // single-parent — pick state is provenance + a guard only.
+        assert!(!repo.pick_in_progress());
+        assert_eq!(repo.pick_head().unwrap(), None);
+        let store_arc = repo.vfs.store();
+        let snap = store_arc.lock().unwrap().get_snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![base]);
+
+        let log = repo.oplog().unwrap();
+        assert!(
+            log.last().unwrap().desc.starts_with("commit (pick):"),
+            "expected pick-labeled oplog entry, got {:?}",
+            log.last()
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_switch_and_undo_refuse_during_pick() {
+        let root = tmp_root("pick-guards");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        let picked = ObjectId::of(b"some-picked-commit");
+        crate::pick_state::write(&repo.layout, &picked, &[]).unwrap();
+        assert!(repo.pick_in_progress());
+
+        assert!(matches!(repo.merge("feature", "me"), Err(Error::PickInProgress)));
+        assert!(matches!(repo.switch("feature"), Err(Error::PickInProgress)));
+        assert!(matches!(repo.undo(), Err(Error::PickInProgress)));
+
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

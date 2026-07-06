@@ -34,6 +34,10 @@ pub enum Error {
     NothingToUndo,
     #[error("merge produced {0} conflict(s); resolve the marked files then `sc commit`")]
     MergeConflicts(usize),
+    #[error("a cherry-pick is already in progress (resolve the marked files then `sc commit`)")]
+    PickInProgress,
+    #[error("cherry-pick produced {0} conflict(s); resolve the marked files then `sc commit`")]
+    PickConflicts(usize),
     #[error("merge of protected paths is not yet supported (would corrupt encrypted files): {0}")]
     MergeProtected(String),
     #[error("already up to date")]

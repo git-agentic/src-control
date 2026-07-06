@@ -307,6 +307,8 @@ impl Repo {
     /// - [`Error::NothingToUndo`] if the log is empty.
     /// - [`Error::MergeInProgress`] while a merge is in progress (mirrors the
     ///   guard `merge`/`switch` already use).
+    /// - [`Error::PickInProgress`] while a cherry-pick is in progress (same
+    ///   guard, mirrored for pick state).
     /// - [`Error::InvalidArgument`] if a re-materialize is needed and the
     ///   working tree is dirty (would silently discard uncommitted work — the
     ///   same modified/deleted check `merge` and `switch` use).
@@ -325,6 +327,9 @@ impl Repo {
 
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
         }
 
         // The branch that will be current once HEAD is restored.

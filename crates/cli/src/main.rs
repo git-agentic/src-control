@@ -889,6 +889,7 @@ fn run_status(json: bool) -> Result<()> {
                 "deleted": s.deleted,
                 "merge_in_progress": repo.merge_in_progress(),
                 "conflicts": repo.merge_conflicts()?,
+                "pick_in_progress": repo.pick_in_progress(),
             })
         );
         return Ok(());
@@ -904,9 +905,14 @@ fn run_status(json: bool) -> Result<()> {
             }
         }
     }
+    if repo.pick_in_progress() {
+        if let Some(id) = repo.pick_head()? {
+            println!("cherry-pick in progress: {}", id.short());
+        }
+    }
     let s = repo.status()?;
     if s.added.is_empty() && s.modified.is_empty() && s.deleted.is_empty() {
-        if !repo.merge_in_progress() {
+        if !repo.merge_in_progress() && !repo.pick_in_progress() {
             println!("clean (working tree matches HEAD)");
         }
         return Ok(());
