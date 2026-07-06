@@ -2,6 +2,17 @@
 //! replayed commit's first parent (empty base for a root commit). Consumed by
 //! the cherry-pick/rebase CLI surface (Tasks 8-9) to apply one commit onto an
 //! arbitrary target tree without requiring a full branch merge.
+//!
+//! P15 Task 9: the secret registry is replayed too, via the same base as the
+//! file three-way — `merge::merge_secrets(base, ours, theirs)` where `base`
+//! is the replayed commit's own first parent's registry, `ours` is the
+//! onto-side registry (the current tip for `cherry_pick`, the fold's
+//! accumulator for `rebase`), and `theirs` is the commit's own registry. A
+//! name that changed differently on both sides aborts the whole replay
+//! (`Error::SecretMergeConflict`) before anything is written. `ReplayOutcome`
+//! itself stays registry-agnostic (`replay_commit` never sees a registry) —
+//! callers merge the registry alongside the tree/protection outcome and fold
+//! the result into `Empty`'s redefinition (see below).
 
 use std::collections::BTreeMap;
 
@@ -14,19 +25,25 @@ use crate::refs;
 use crate::repo::Repo;
 use crate::worktree;
 
-/// Does `commit_id`'s secret registry differ from its first parent's (empty
-/// registry if it's a root commit)? Replay (`cherry_pick`/`rebase`) always
-/// carries the *target*-side registry forward wholesale rather than diffing
-/// and reapplying per-commit changes (see module docs) — so a commit that
-/// added, rotated, or removed a secret has that change silently dropped by
-/// the replay. Callers use this to decide whether to warn.
-fn secrets_changed_from_parent(repo: &Repo, commit_id: ObjectId) -> Result<bool> {
-    let snap = repo.snapshot(&commit_id)?;
-    let parent_secrets = match snap.parents.first() {
+/// Three-way merge of the secret registry for one replayed commit — the
+/// registry analog of `replay_commit`'s file three-way, using the same base
+/// (the commit's own first parent, empty registry if it's a root commit).
+/// `onto_secrets` is the onto side (current tip for `cherry_pick`, fold
+/// accumulator for `rebase`); `commit_secrets`/`commit_parents` are the
+/// replayed commit's own registry and parent list. Errors
+/// (`Error::SecretMergeConflict`) propagate verbatim — the caller must not
+/// have written anything yet when this is called, so the abort is atomic.
+fn merged_registry_for_replay(
+    repo: &Repo,
+    commit_parents: &[ObjectId],
+    commit_secrets: &BTreeMap<String, ObjectId>,
+    onto_secrets: &BTreeMap<String, ObjectId>,
+) -> Result<BTreeMap<String, ObjectId>> {
+    let parent_secrets = match commit_parents.first() {
         Some(p) => repo.snapshot(p)?.secrets,
         None => BTreeMap::new(),
     };
-    Ok(snap.secrets != parent_secrets)
+    merge::merge_secrets(&parent_secrets, onto_secrets, commit_secrets)
 }
 
 /// Result of replaying one commit onto a target tree.
@@ -40,7 +57,13 @@ pub(crate) enum ReplayOutcome {
         /// against the onto side's prior wraps, pruned to the merged tree).
         protection: Protection,
     },
-    /// Replayed tree equals the target — change already present.
+    /// Replayed tree equals the onto tree AND this commit's own
+    /// protection-prefix rules are unchanged from its parent's — a genuine
+    /// tree+rules no-op (P15 Task 9). The secret registry is NOT considered
+    /// here (`replay_commit` never sees a registry): callers additionally
+    /// merge the registry and must not treat this as a true no-op if that
+    /// merge changes anything — see `merged_registry_for_replay` and the
+    /// `Empty` handling in `Repo::cherry_pick`/`Repo::rebase`.
     Empty,
     /// Conflicting paths, with the raw merged working set (markers included;
     /// `needs_encrypt` entries carry plaintext that must NEVER transit the
@@ -165,7 +188,18 @@ pub(crate) fn replay_commit(
     all.extend(encrypted);
     let root = repo.vfs().write_tree_with_perms(&all)?;
 
-    if root == onto_root {
+    // Empty (P15 Task 9 extension): a tree-equal replay is a genuine no-op
+    // only when this commit's own protection-prefix rules are ALSO
+    // unchanged from its parent's. A rules-only `protect` commit whose tree
+    // never touched a matching file (root == onto_root) must still surface
+    // as Clean so the caller counts it as replayed (not skipped) and its
+    // rule reaches the assembled/accumulated protection — otherwise it is
+    // silently dropped, exactly the Task 8 review finding this closes.
+    let protection_changed_here = match base_snap.as_ref() {
+        Some(b) => theirs_prot.prefixes != b.protection.prefixes,
+        None => !theirs_prot.prefixes.is_empty(),
+    };
+    if root == onto_root && !protection_changed_here {
         return Ok(ReplayOutcome::Empty);
     }
 
@@ -226,8 +260,13 @@ impl Repo {
     /// + sidecars over the working tree and records pick state
     /// (`PICK_HEAD`/`PICK_CONFLICTS`/`PICK_DECIDED_ROOT`) — no ref moves, no
     /// oplog entry, so the current branch tip is unchanged until the conflicts
-    /// are resolved and committed. An empty replay (the change is already
-    /// present) is a no-op.
+    /// are resolved and committed. An empty replay is `AlreadyApplied` only
+    /// when the tree, the picked commit's own protection-rules delta, AND the
+    /// merged secret registry are all no-ops; a secrets-only pick lands as a
+    /// registry-only snapshot (same tree), and the registry is merged
+    /// three-way (base = the picked commit's own parent) on every pick — a
+    /// name changed differently on both sides is
+    /// [`Error::SecretMergeConflict`] with refs untouched (P15 Task 9).
     ///
     /// Protected paths (P15 Task 7) resolve exactly like
     /// [`merge_with_identity`][Repo::merge_with_identity]'s three-way:
@@ -265,22 +304,56 @@ impl Repo {
         let ours_snap = self.snapshot(&ours_tip)?;
         let ours_root = ours_snap.root;
         let picked_snap = self.snapshot(&picked_tip)?;
-        let secrets_dropped = secrets_changed_from_parent(self, picked_tip)?;
 
         match replay_commit(self, picked_tip, (ours_root, &ours_snap.protection), identity)? {
             ReplayOutcome::Empty => {
-                // AlreadyApplied means the tree content already matches, but
-                // `replay_commit` only compares roots, not secret registries
-                // — for a secrets-only commit this is actively misleading:
-                // the secret change is neither present nor going to be.
-                if secrets_dropped {
-                    eprintln!(
-                        "warning: secret-registry changes on the cherry-picked commit were not replayed; re-add them or `sc undo`"
-                    );
+                // Tree AND this commit's own protection-prefix delta are both
+                // no-ops (see `replay_commit`'s Empty gate) — but the secret
+                // registry is merged independently (P15 Task 9): a
+                // secrets-only commit still needs to land as a
+                // registry-only snapshot rather than being dropped.
+                let merged_secrets = merged_registry_for_replay(
+                    self,
+                    &picked_snap.parents,
+                    &picked_snap.secrets,
+                    &ours_snap.secrets,
+                )?;
+                if merged_secrets == ours_snap.secrets {
+                    Ok(PickResult::AlreadyApplied)
+                } else {
+                    let msg_first_line = picked_snap.message.lines().next().unwrap_or("");
+                    let message =
+                        format!("{msg_first_line} (cherry-picked from {})", picked_tip.short());
+                    // Same crash discipline as the Clean path below: CAS
+                    // write, then the ref move (atomic commit point), then
+                    // the oplog record. No materialize needed — the tree is
+                    // byte-identical to `ours_root`, already on disk.
+                    let id = self.build_snapshot(
+                        ours_root,
+                        vec![ours_tip],
+                        merged_secrets,
+                        ours_snap.protection.clone(),
+                        author,
+                        &message,
+                    )?;
+                    refs::write_branch_tip(&self.layout, &head, &id)?;
+                    crate::oplog::record(
+                        &self.layout,
+                        &format!("cherry-pick {refname}"),
+                        &head,
+                        &head,
+                        &[(head.clone(), before, Some(id))],
+                    )?;
+                    Ok(PickResult::Picked(id))
                 }
-                Ok(PickResult::AlreadyApplied)
             }
             ReplayOutcome::Clean { root, protection } => {
+                let merged_secrets = merged_registry_for_replay(
+                    self,
+                    &picked_snap.parents,
+                    &picked_snap.secrets,
+                    &ours_snap.secrets,
+                )?;
                 let msg_first_line = picked_snap.message.lines().next().unwrap_or("");
                 let message = format!("{msg_first_line} (cherry-picked from {})", picked_tip.short());
                 // Ordering matters for crash safety (same discipline as
@@ -293,11 +366,12 @@ impl Repo {
                 // protection (union rules, carry ∪ fresh wraps) is what the
                 // new snapshot records — ours' policy alone would drop the
                 // picked side's rules and the wraps of carried/re-encrypted
-                // blobs.
+                // blobs. The registry is the three-way merge computed above,
+                // not ours' verbatim (P15 Task 9).
                 let id = self.build_snapshot(
                     root,
                     vec![ours_tip],
-                    ours_snap.secrets.clone(),
+                    merged_secrets,
                     protection.clone(),
                     author,
                     &message,
@@ -325,11 +399,6 @@ impl Repo {
                     &head,
                     &[(head.clone(), before, Some(id))],
                 )?;
-                if secrets_dropped {
-                    eprintln!(
-                        "warning: secret-registry changes on the cherry-picked commit were not replayed; re-add them or `sc undo`"
-                    );
-                }
                 Ok(PickResult::Picked(id))
             }
             ReplayOutcome::Conflicts { files, sidecars, paths } => {
@@ -443,6 +512,16 @@ impl Repo {
     /// naming both the path and the commit being replayed. The final (and ff
     /// fast-path) materialize decrypts for `identity` where possible and
     /// skips the rest — never writes ciphertext to disk.
+    ///
+    /// The secret registry is replayed too (P15 Task 9): the fold's
+    /// accumulator starts from target's registry and each commit's own
+    /// registry change is merged in three-way (base = the commit's
+    /// original-history parent). A secrets-only or rules-only commit counts
+    /// as replayed — it lands as a snapshot with the accumulator's tree plus
+    /// the merged registry / assembled protection — and `skipped` is reserved
+    /// for commits whose tree, own-rules delta, AND registry delta are all
+    /// no-ops. A name changed differently on both lines aborts the whole
+    /// rebase ([`Error::SecretMergeConflict`], refs byte-identical).
     pub fn rebase(
         &self,
         target: &str,
@@ -533,21 +612,26 @@ impl Repo {
         // step sees the rules and wraps produced by the steps before it (a
         // file freshly encrypted mid-range stays decryptable downstream).
         let mut acc_protection = target_snap.protection.clone();
+        // Accumulated secret registry (P15 Task 9): starts as target's and
+        // folds each commit's own registry change in via a per-commit
+        // three-way merge (base = the commit's original-history parent,
+        // ours = the accumulator, theirs = the commit) — the registry analog
+        // of the file fold below. A `SecretMergeConflict` anywhere in the
+        // range aborts the whole rebase before anything outside the CAS is
+        // written, so refs and the working tree stay byte-identical.
+        let mut acc_secrets = target_snap.secrets.clone();
         let mut replayed = 0usize;
         let mut skipped = 0usize;
-        // Replay carries `target_snap.secrets` forward wholesale for every
-        // replayed commit (see the loop below) rather than diffing and
-        // reapplying each commit's own registry changes. Detect whether any
-        // commit in the range actually changed its registry from its
-        // (original-history) parent, so we can warn once after the rebase —
-        // not per commit — including the all-skipped case.
-        let mut secrets_dropped_anywhere = false;
 
         for commit in range {
             let commit_snap = self.snapshot(&commit)?;
-            if secrets_changed_from_parent(self, commit)? {
-                secrets_dropped_anywhere = true;
-            }
+            let merged_secrets = merged_registry_for_replay(
+                self,
+                &commit_snap.parents,
+                &commit_snap.secrets,
+                &acc_secrets,
+            )?;
+            let secrets_changed = merged_secrets != acc_secrets;
             // A rebase spans a range, so an identity/authorization abort must
             // name WHICH replay tripped, not just the path — same spirit as
             // `RebaseConflicts` carrying its commit. Nothing outside the CAS
@@ -564,18 +648,39 @@ impl Repo {
                     other => other,
                 })?;
             match outcome {
-                ReplayOutcome::Empty => {
+                ReplayOutcome::Empty if !secrets_changed => {
+                    // Empty in full — tree, this commit's own rules delta
+                    // (both inside `replay_commit`'s gate), AND registry
+                    // delta: a genuine no-op, skipped.
                     skipped += 1;
+                }
+                ReplayOutcome::Empty => {
+                    // Tree/rules no-op but the registry changed: land a
+                    // registry-only snapshot (same tree and protection as the
+                    // accumulator) so the secret change survives the rebase —
+                    // counts as replayed, not skipped.
+                    let id = self.build_snapshot(
+                        acc_root,
+                        vec![acc_tip],
+                        merged_secrets.clone(),
+                        acc_protection.clone(),
+                        author,
+                        &commit_snap.message,
+                    )?;
+                    acc_tip = id;
+                    acc_secrets = merged_secrets;
+                    replayed += 1;
                 }
                 ReplayOutcome::Clean { root, protection } => {
                     // The replay's ASSEMBLED protection (union rules, carry ∪
                     // fresh wraps — same discipline as cherry-pick's clean
                     // path) is recorded on the new snapshot AND becomes the
-                    // accumulator for the next step of the fold.
+                    // accumulator for the next step of the fold — as does the
+                    // merged registry (P15 Task 9).
                     let id = self.build_snapshot(
                         root,
                         vec![acc_tip],
-                        target_snap.secrets.clone(),
+                        merged_secrets.clone(),
                         protection.clone(),
                         author,
                         &commit_snap.message,
@@ -583,6 +688,7 @@ impl Repo {
                     acc_tip = id;
                     acc_root = root;
                     acc_protection = protection;
+                    acc_secrets = merged_secrets;
                     replayed += 1;
                 }
                 ReplayOutcome::Conflicts { paths, .. } => {
@@ -617,11 +723,6 @@ impl Repo {
             &head,
             &[(head.clone(), before, Some(acc_tip))],
         )?;
-        if secrets_dropped_anywhere {
-            eprintln!(
-                "warning: secret-registry changes on the rebased range were not replayed; re-add them or `sc undo`"
-            );
-        }
         Ok(RebaseResult::Rebased { new_tip: acc_tip, replayed, skipped })
     }
 }
@@ -1624,44 +1725,248 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Rebase's replay carries the *target*-side secret registry forward
-    /// wholesale (spec-blessed, see `secrets_changed_from_parent`) rather
-    /// than replaying a commit's own registry change — so a `secret add` in
-    /// the rebased range must not survive into the new history: HEAD's
-    /// registry afterwards must equal target's (unchanged). The warning
-    /// itself goes to stderr and isn't asserted here.
+    /// P15 Task 9: the secret registry is replayed through rebase. A
+    /// secrets-only commit in the range lands as a registry-only snapshot
+    /// (same tree as its parent) and counts as replayed, not skipped.
     #[test]
-    fn rebase_drops_secret_registry_changes_from_the_range() {
-        let root = tmp_root("rebase-secrets");
+    fn rebase_replays_secrets_only_commit_as_registry_only_snapshot() {
+        let root = tmp_root("rebase-secrets-replay");
         let repo = Repo::init(&root).unwrap();
         std::fs::write(root.join("base.txt"), b"base\n").unwrap();
         repo.commit("me", "base").unwrap();
         repo.branch("feature").unwrap();
 
-        // main gains an unrelated commit so the rebase has real work to do.
+        // main advances so the rebase has real work to do.
         std::fs::write(root.join("main.txt"), b"main\n").unwrap();
         repo.commit("me", "main adds main.txt").unwrap();
-        let target_registry = repo.snapshot(&repo.head_tip().unwrap().unwrap()).unwrap().secrets;
 
-        // feature adds a secret, which lands in its snapshot's registry.
+        // feature: a file commit + a secrets-only commit (secret_add commits
+        // a registry-only snapshot itself).
         repo.switch("feature").unwrap();
+        std::fs::write(root.join("f.txt"), b"f\n").unwrap();
+        repo.commit("me", "feature adds f").unwrap();
         let (_sk, pk) = scl_crypto::generate_keypair();
-        repo.secret_add("DB_URL", b"v1", &[pk]).unwrap();
-        assert_eq!(repo.secret_list().unwrap().len(), 1);
+        repo.secret_add("API_KEY", b"v1", &[pk]).unwrap();
 
         let outcome = repo.rebase("main", "me", None).unwrap();
-        match outcome {
-            RebaseResult::Rebased { .. } => {}
+        let new_tip = match outcome {
+            RebaseResult::Rebased { new_tip, replayed, skipped } => {
+                assert_eq!((replayed, skipped), (2, 0), "secrets-only commit replays, not skips");
+                new_tip
+            }
             other => panic!("expected Rebased, got {other:?}"),
-        }
+        };
+        assert_eq!(repo.head_tip().unwrap(), Some(new_tip));
 
-        let new_tip = repo.head_tip().unwrap().unwrap();
-        let new_registry = repo.snapshot(&new_tip).unwrap().secrets;
-        assert_eq!(
-            new_registry, target_registry,
-            "replay must carry target's registry, not the rebased commit's secret add"
+        // The new tip carries the secret through the rebase...
+        let tip_snap = repo.snapshot(&new_tip).unwrap();
+        assert!(
+            tip_snap.secrets.contains_key("API_KEY"),
+            "the rebased registry must contain the secret"
         );
-        assert!(repo.secret_list().unwrap().is_empty());
+        assert_eq!(repo.secret_list().unwrap().len(), 1);
+        // ...as a registry-only snapshot: its tree equals its parent's (the
+        // replayed file commit), which in turn holds main's + feature's files.
+        let parent_snap = repo.snapshot(&tip_snap.parents[0]).unwrap();
+        assert_eq!(tip_snap.root, parent_snap.root, "registry-only snapshot keeps the tree");
+        assert!(!parent_snap.secrets.contains_key("API_KEY"));
+        assert!(root.join("main.txt").exists());
+        assert!(root.join("f.txt").exists());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// P15 Task 9: cherry-picking a secrets-only commit produces a
+    /// registry-only snapshot (Picked, not AlreadyApplied), tree unchanged.
+    #[test]
+    fn cherry_pick_secret_add_commit_replays_registry() {
+        let root = tmp_root("cp-secrets-replay");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // work: a secrets-only commit at the tip.
+        repo.switch("work").unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        repo.secret_add("API_KEY", b"v1", &[pk]).unwrap();
+
+        repo.switch("main").unwrap();
+        let main_tip = repo.head_tip().unwrap().unwrap();
+        let main_root = repo.snapshot(&main_tip).unwrap().root;
+
+        let outcome = repo.cherry_pick("work", "me", None).unwrap();
+        let id = match outcome {
+            PickResult::Picked(id) => id,
+            other => panic!("expected Picked (not AlreadyApplied), got {other:?}"),
+        };
+        assert_eq!(repo.head_tip().unwrap(), Some(id));
+
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![main_tip], "single-parent pick completion");
+        assert!(snap.secrets.contains_key("API_KEY"), "tip registry gains the secret");
+        assert_eq!(snap.root, main_root, "tree unchanged by a secrets-only pick");
+        assert_eq!(repo.secret_list().unwrap().len(), 1);
+        let ops = repo.oplog().unwrap();
+        assert_eq!(ops.last().unwrap().desc, "cherry-pick work");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// P15 Task 9: the same secret changed differently on both lines aborts
+    /// the rebase atomically — typed `SecretMergeConflict`, refs
+    /// byte-identical, no oplog record.
+    #[test]
+    fn registry_conflict_aborts_rebase_atomically() {
+        let root = tmp_root("rebase-secrets-conflict");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        repo.secret_add("TOKEN", b"v0", &[pk.clone()]).unwrap();
+        repo.branch("feature").unwrap();
+
+        // main rotates TOKEN one way...
+        repo.secret_rotate("TOKEN", Some(b"main-v"), &[pk.clone()], None).unwrap();
+        // ...feature rotates it differently.
+        repo.switch("feature").unwrap();
+        repo.secret_rotate("TOKEN", Some(b"feat-v"), &[pk], None).unwrap();
+        let feature_tip = repo.head_tip().unwrap();
+
+        let before_refs = snapshot_dir(&root.join(".sc/refs"));
+        let ops_before = repo.oplog().unwrap().len();
+
+        let err = repo.rebase("main", "me", None).unwrap_err();
+        assert!(
+            matches!(err, Error::SecretMergeConflict(ref n) if n == "TOKEN"),
+            "got {err:?}"
+        );
+
+        assert_eq!(
+            before_refs,
+            snapshot_dir(&root.join(".sc/refs")),
+            "refs dir must be byte-identical after the aborted rebase"
+        );
+        assert_eq!(repo.head_tip().unwrap(), feature_tip, "feature tip must not move");
+        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no new oplog record");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task 8 review (Important, folded into Task 9): a rules-only `protect`
+    /// commit at the tip of the rebased range must survive — the old
+    /// root-equality-only `Empty` silently dropped it. It replays as a
+    /// snapshot with the same tree + assembled protection (counts as
+    /// replayed), and a file later committed under the rule lands PROTECTED.
+    #[test]
+    fn rebase_rules_only_commit_at_range_tip_survives() {
+        let root = tmp_root("rebase-rules-only");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main advances so the rebase has real work to do.
+        std::fs::write(root.join("main.txt"), b"main\n").unwrap();
+        repo.commit("me", "main adds main.txt").unwrap();
+
+        // feature: a rules-only protect commit AT THE RANGE TIP. `protect`
+        // lands two commits (the policy-only snapshot + a no-op encrypt
+        // pass over an empty match set); point the branch at the policy-only
+        // one — same tree, so the working tree stays consistent.
+        repo.switch("feature").unwrap();
+        let after_protect = repo.protect("keys/", &[alice_pk], None).unwrap();
+        let rules_only = repo.snapshot(&after_protect).unwrap().parents[0];
+        let head = refs::current_branch(&repo.layout).unwrap();
+        refs::write_branch_tip(&repo.layout, &head, &rules_only).unwrap();
+
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        let new_tip = match outcome {
+            RebaseResult::Rebased { new_tip, replayed, skipped } => {
+                assert_eq!((replayed, skipped), (1, 0), "rules-only commit replays, not skips");
+                new_tip
+            }
+            other => panic!("expected Rebased, got {other:?}"),
+        };
+        let snap = repo.snapshot(&new_tip).unwrap();
+        assert!(
+            snap.protection.prefixes.iter().any(|p| p.prefix == "keys/"),
+            "the rule survives to the new tip's protection"
+        );
+        // Tree-empty replay: same tree as the target tip it replayed onto.
+        let main_tip_snap = repo.snapshot(&snap.parents[0]).unwrap();
+        assert_eq!(snap.root, main_tip_snap.root, "rules-only replay keeps the tree");
+
+        // A file later committed under the rule lands PROTECTED and decrypts
+        // for the rule's recipient.
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/k.txt"), b"k contents\n").unwrap();
+        let c = repo.commit("me", "add keys/k.txt").unwrap();
+        let (k_id, perms) = tree_entry(&repo, &c, "keys/k.txt");
+        assert_ne!(perms & scl_core::PROTECTED, 0, "file under the replayed rule is PROTECTED");
+        let bytes = blob_bytes_of(&repo, &k_id);
+        assert_ne!(&bytes[..], b"k contents\n", "no plaintext in the CAS");
+        let c_snap = repo.snapshot(&c).unwrap();
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &k_id,
+            &[&c_snap.protection],
+            &alice_sk,
+            "keys/k.txt",
+        )
+        .unwrap();
+        assert_eq!(&pt[..], b"k contents\n");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Cherry-pick analog of the rules-only regression: picking a rules-only
+    /// commit is Picked (not AlreadyApplied) — same tree, union protection.
+    #[test]
+    fn cherry_pick_rules_only_commit_replays_rule() {
+        let root = tmp_root("cp-rules-only");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // work's tip: the policy-only protect commit (see the rebase analog
+        // above for why the branch is pointed at `protect`'s first commit).
+        repo.switch("work").unwrap();
+        let after_protect = repo.protect("keys/", &[alice_pk], None).unwrap();
+        let rules_only = repo.snapshot(&after_protect).unwrap().parents[0];
+        let head = refs::current_branch(&repo.layout).unwrap();
+        refs::write_branch_tip(&repo.layout, &head, &rules_only).unwrap();
+
+        repo.switch("main").unwrap();
+        let main_tip = repo.head_tip().unwrap().unwrap();
+        let main_root = repo.snapshot(&main_tip).unwrap().root;
+
+        let outcome = repo.cherry_pick("work", "me", None).unwrap();
+        let id = match outcome {
+            PickResult::Picked(id) => id,
+            other => panic!("expected Picked (not AlreadyApplied), got {other:?}"),
+        };
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![main_tip]);
+        assert_eq!(snap.root, main_root, "rules-only pick keeps the tree");
+        assert!(
+            snap.protection.prefixes.iter().any(|p| p.prefix == "keys/"),
+            "the picked rule lands on the new snapshot"
+        );
+
+        // A file later committed under the rule lands PROTECTED.
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/k.txt"), b"k contents\n").unwrap();
+        let c = repo.commit("me", "add keys/k.txt").unwrap();
+        let (_k_id, perms) = tree_entry(&repo, &c, "keys/k.txt");
+        assert_ne!(perms & scl_core::PROTECTED, 0, "file under the picked rule is PROTECTED");
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
