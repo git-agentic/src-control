@@ -24,6 +24,7 @@ pub mod stdio_transport;
 pub mod sync;
 pub mod transport;
 pub mod wire;
+pub mod workspace;
 pub mod worktree;
 
 pub use error::{Error, Result};
@@ -34,4 +35,5 @@ pub use repo::{Repo, Status};
 pub use scanner::ScanReport;
 pub use secrets::SecretInfo;
 pub use stdio_transport::{open_transport, SshUrl, StdioTransport};
+pub use workspace::HarvestResult;
 pub use worktree::Diff;
