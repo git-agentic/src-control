@@ -1,6 +1,6 @@
 # ADR-0024: History editing via replay + operation log
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-06
 - **Phase:** 14
 - **Builds on:** ADR-0012 (three-way merge), ADR-0015 (gc), ADR-0023 (agent
@@ -50,3 +50,36 @@ moving refs.
 - A torn operation (crash between ref write and oplog append) loses its
   undo record but never fabricates one (refs first, oplog last).
 - Rebase abandons already-built snapshots on abort — ordinary gc fodder.
+
+## Refinements during the build
+
+- **Materialize before the ref move, not after.** The original sketch of
+  `cherry_pick`/`rebase`'s clean path moved the branch ref and then
+  materialized the working tree. Review corrected the ordering to match
+  `merge`'s existing crash discipline: build the snapshot in the CAS,
+  materialize the working tree, *then* move the branch ref — the ref update
+  is the atomic commit point, so a crash before it leaves both tip and tree
+  consistently at the pre-operation state instead of a moved ref pointing at
+  an unmaterialized tree.
+- **`oplog::record` heals a torn tail before appending.** A crash mid-append
+  can leave a partial trailing block. Rather than treat that as fatal or
+  append blindly after it (which would hide the new record behind corrupt
+  bytes), `record()` truncates the torn tail first, so the next real record
+  is always visible and a crash can't silently poison future undo/oplog
+  reads.
+- **Undo of the initial commit is refused, not un-borne.** There is no
+  working tree to materialize back to before the first commit; rather than
+  delete the branch ref and leave stale tracked files on disk, `undo`
+  refuses with a typed error pointing at an intermediate step instead. A
+  deliberate scope cut, not an oversight.
+- **`sc undo` surfaces skipped protected paths.** Re-materializing during
+  undo can hit protected paths the caller has no key for. `UndoOutcome`
+  carries a `skipped` list (mirroring `switch`'s existing behavior) instead
+  of silently leaving stale plaintext or failing the whole undo.
+- **`sc protect` yields two oplog records, not one.** `protect` first
+  persists the new protection rule as a policy-only commit, then runs the
+  ordinary commit path to encrypt matching working-tree files — two
+  distinct ref moves, so two oplog records (policy commit, then encryption
+  commit). This gives undo a coherent before/after chain instead of
+  collapsing a two-step operation into one record that could only be
+  undone atomically.

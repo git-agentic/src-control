@@ -431,3 +431,36 @@ commit. Each changed workspace becomes a flat `work-<i>` branch (the ref
 grammar reserves `/` for remote-tracking refs); merge is the ordinary P4
 path. The session holds the single-writer lock end to end, and teardown is
 Drop-guarded: zero residue outside `.sc/` on success, error, or panic.
+
+## Phase 14 — history editing (built)
+
+Replay is merge: cherry-picking commit C onto tip T, or replaying a branch
+commit-by-commit during rebase, is diff3(base = the commit's first parent,
+ours = the current tip, theirs = the commit), computed by P4's existing
+`three_way_files` (extracted from `three_way`) — no second merge engine, no
+object mutation, and protected content is refused up front, inheriting P4's
+fail-closed guard verbatim. `sc cherry-pick` resolves like `merge`: a clean
+replay advances the branch with a single-parent snapshot; a conflict writes
+P4-style markers plus `.sc/PICK_HEAD`, and the next `sc commit` completes it.
+`sc rebase` is atomic instead: a merge commit anywhere in the replayed range
+refuses the whole operation before a single commit replays, and the first
+conflict aborts wholesale with refs and the working tree untouched — unlike
+cherry-pick's per-commit resolve flow. Both follow the same crash discipline
+as `merge`: build the snapshot in the CAS, materialize the working tree,
+*then* move the branch ref — the ref update is the atomic commit point, so a
+crash before it leaves tip and tree consistently pre-operation.
+
+A single append-only `.sc/oplog` gives every ref-moving operation (commits,
+merges, cherry-picks, rebases, switches, secret/protect ops, `sc work`
+sessions) an undo record: HEAD and every touched ref's before/after value.
+`sc undo` restores the last record's before-state and appends its own
+inverse record — refs are written first, the oplog record last, so a crash
+between the two loses an undo entry but never fabricates one, and a torn
+tail from a prior crash is healed (truncated) before the next append. Undo
+of undo is redo. `sc gc` treats oplog-referenced snapshot ids as reachability
+roots and trims records past the prune-expire window, always keeping the
+newest, so the root set stays bounded. Undoing the repo's initial commit is
+refused (there is no working tree to materialize back to) — a deliberate
+scope cut rather than a half-built rewind. The oplog is local-only, like a
+reflog: it is never copied by clone and never travels over a transport. See
+ADR-0024.

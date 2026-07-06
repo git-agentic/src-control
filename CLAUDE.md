@@ -152,6 +152,12 @@ cargo run --bin sc -- work --agents 3 -- <cmd>   # fork agent workspaces, run <c
                                                  # (--with-secrets --identity <key> injects
                                                  # decrypted secrets into each agent env)
 bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
+cargo run --bin sc -- cherry-pick <ref>       # replay one commit onto the current branch
+cargo run --bin sc -- rebase <target>         # replay current branch onto <target> (atomic;
+                                              # conflicts abort with refs untouched)
+cargo run --bin sc -- undo                    # revert the last operation (again = redo)
+cargo run --bin sc -- oplog                   # list recent operations
+bash demo/run_history_demo.sh                 # cherry-pick/rebase/undo round-trip proof
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -250,6 +256,33 @@ never touched; a failed agent's partial work is still harvested; teardown
 leaves zero residue outside `.sc/`. Branch names are flat because the ref
 grammar reserves `name/branch` for remote-tracking refs. See ADR-0023.
 
+**Phase 14 is built.** History editing: `sc cherry-pick <ref>` and `sc rebase
+<target>` are both replay, composed from P4's `three_way_files` with base =
+the replayed commit's first parent (root commits use an empty base) — no
+second merge implementation, no object mutation. `cherry-pick` resolves like
+`merge`: a clean replay advances the branch; a conflict writes P4-style
+markers plus `.sc/PICK_HEAD` and the next `sc commit` completes it
+single-parent, with `sc status` reporting the pick in progress. `rebase` is
+atomic: it refuses up front if a merge commit sits in the replayed range, and
+the first conflict aborts the whole rebase with refs and the working tree
+untouched (unlike cherry-pick's per-commit markers). Both write the CAS
+snapshot, materialize the working tree, and only then move the branch ref —
+the ref update is the atomic commit point, matching `merge`'s crash
+discipline. An append-only `.sc/oplog` records HEAD and every touched ref
+before/after each ref-moving operation (including secret/protect ops and
+`sc work` sessions); `sc undo` restores the last record's before-state and
+logs its own inverse record, so a second `sc undo` redoes the first; `sc
+oplog` lists records newest-first. Undoing the repo's initial commit is
+refused (would unbear the branch) as a deliberate scope cut. `sc gc` treats
+oplog-referenced snapshot ids as reachability roots and trims records past
+the prune-expire window, always keeping the newest. Protected content stays
+fail-closed: replay refuses any commit touching PROTECTED paths, inheriting
+P4's merge guard verbatim. The oplog is local-only, like a reflog — it never
+travels over `fetch`/`push`/`clone`. See ADR-0024.
+
 Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
-frames, bulk re-wrap, multiple escrow keys, interactive workspace sessions
-and auto-merge of clean workspace results.
+frames, bulk re-wrap, multiple escrow keys, interactive workspace sessions,
+auto-merge of clean workspace results, `sc amend`, stop-and-continue rebase
+(`--continue`), cherry-pick `--abort`, merge-commit replay (mainline
+selection), protected-path replay, operation objects in the CAS, and oplog
+entries for remote-tracking refs.
