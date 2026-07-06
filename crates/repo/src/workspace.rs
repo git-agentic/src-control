@@ -99,6 +99,11 @@ pub struct WorkOptions {
     /// unauthorized for that identity.
     pub with_secrets: bool,
     /// Session temp root override (tests); default `$TMPDIR/sc-work-<pid>`.
+    /// The directory is created fresh (`0700` on unix) and `work` refuses to
+    /// run if it already exists — a pre-existing directory at this path is
+    /// refused rather than reused, closing a squat-attack window on shared
+    /// hosts (predictable name + adopted directory could otherwise leak a
+    /// workspace's decrypted protected-path plaintext to another user).
     pub session_root: Option<std::path::PathBuf>,
 }
 
@@ -111,6 +116,33 @@ pub struct WorkspaceOutcome {
     pub agent_exit: Option<i32>,
     /// The harvest result for this workspace's checkout.
     pub harvest: Result<HarvestResult>,
+}
+
+/// Creates the session temp root exclusively: refuses if the path already
+/// exists (a predictable name plus a pre-existing directory is exactly the
+/// squat-attack scenario — a session must never adopt someone else's
+/// directory), and on unix creates it `0700` so it is not world-traversable
+/// (the session may hold decrypted protected-path plaintext on shared hosts).
+fn create_session_root(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Err(Error::InvalidArgument(format!(
+            "session root already exists (refusing to reuse it): {}",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)?;
+    }
+    Ok(())
 }
 
 /// Removes the session temp tree however the session exits (success, error,
@@ -155,9 +187,11 @@ impl Repo {
             _ => Vec::new(),
         };
 
-        let session_root = opts.session_root.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("sc-work-{}", std::process::id()))
-        });
+        let session_root = opts
+            .session_root
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("sc-work-{}", std::process::id())));
+        create_session_root(&session_root)?;
         let _teardown = Teardown(session_root.clone());
 
         // The session's in-RAM workspace handles: N forks pin the base
@@ -180,7 +214,10 @@ impl Repo {
         let mut dirs = Vec::with_capacity(labels.len());
         for label in &labels {
             let dir = session_root.join(label);
-            materialize_workspace(self, tip, &dir, opts.identity.as_ref())?;
+            let skipped = materialize_workspace(self, tip, &dir, opts.identity.as_ref())?;
+            for path in &skipped {
+                eprintln!("workspace {label}: skipped (no key): {path}");
+            }
             dirs.push(dir);
         }
 
@@ -393,6 +430,27 @@ mod tests {
             repo.work(work_opts(1, &[], &scratch)),
             Err(Error::InvalidArgument(_))
         ));
+        drop(repo);
+        teardown(&root);
+    }
+
+    #[test]
+    fn session_root_pre_existing_is_refused() {
+        let (root, scratch) = setup("squat");
+        let repo = Repo::open(&root).unwrap();
+        let opts = work_opts(1, &["true"], &scratch);
+        let session_root = opts.session_root.clone().unwrap();
+        // Pre-create the session root path — the squat scenario: a predictable
+        // name that already exists (e.g. planted by another user on a shared
+        // host) must be refused, not adopted.
+        std::fs::create_dir_all(&session_root).unwrap();
+        assert!(matches!(repo.work(opts), Err(Error::InvalidArgument(_))));
+        // No branch/child side effects: work-1 was never created, and the
+        // pre-existing dir is left exactly as it was (not torn down by the
+        // session's Drop guard, since the guard is only installed after the
+        // refusal).
+        assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
+        assert!(session_root.exists());
         drop(repo);
         teardown(&root);
     }

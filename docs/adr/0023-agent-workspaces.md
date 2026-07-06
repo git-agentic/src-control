@@ -29,6 +29,12 @@ working tree are never touched; teardown leaves zero residue outside
 Branch names are flat (`work-1`, not `work/1`): the ref-resolution grammar
 reserves `name/branch` for remote-tracking refs.
 
+The Phase 1 fusion referenced above is store-level, not object-level: the
+shared, budget-bounded blob cache (one `Arc`'d store behind the repo) serves
+every workspace's reads and eviction, while each workspace's vfs fork handle
+is just session bookkeeping — a cheap pointer into that shared cache, not an
+independent copy of Phase 1's in-memory model.
+
 ## Alternatives considered
 
 - **Direct checkouts without vfs:** nominal fusion; loses the shared
@@ -48,6 +54,10 @@ reserves `name/branch` for remote-tracking refs.
 - The ephemeral/persistent mode invariant is amended: a `sc work` session
   is a bounded ephemeral session hosted by a persistent repo; the
   persistent store is the only durable surface.
+- The P5 scanner catches recognizable secret shapes (AWS-style key ids and
+  similar high-signal patterns); it cannot catch a low-entropy secret value
+  an agent writes into a file verbatim — the same exposure `sc run` +
+  `sc commit` already carry today, unchanged by this phase.
 
 ## Refinements during the build
 
