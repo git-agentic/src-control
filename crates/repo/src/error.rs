@@ -30,6 +30,8 @@ pub enum Error {
     Unborn,
     #[error("a merge is already in progress (resolve and `sc commit`, or `sc merge --abort`)")]
     MergeInProgress,
+    #[error("nothing to undo")]
+    NothingToUndo,
     #[error("merge produced {0} conflict(s); resolve the marked files then `sc commit`")]
     MergeConflicts(usize),
     #[error("merge of protected paths is not yet supported (would corrupt encrypted files): {0}")]

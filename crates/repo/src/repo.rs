@@ -77,8 +77,9 @@ impl Repo {
         refs::head_tip(&self.layout)
     }
 
-    /// The root tree of the current tip (None if unborn).
-    fn head_root(&self) -> Result<Option<ObjectId>> {
+    /// The root tree of the current tip (None if unborn). `pub(crate)` so
+    /// `oplog::undo` (a different module) can capture the pre-restore root.
+    pub(crate) fn head_root(&self) -> Result<Option<ObjectId>> {
         match self.head_tip()? {
             Some(tip) => {
                 let store_arc = self.vfs.store();

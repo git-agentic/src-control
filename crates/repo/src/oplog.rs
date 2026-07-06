@@ -26,6 +26,9 @@ use scl_core::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::layout::Layout;
+use crate::refs;
+use crate::repo::Repo;
+use crate::worktree;
 
 /// One logged operation: HEAD and every touched local ref, before/after.
 #[derive(Debug, Clone, PartialEq)]
@@ -273,6 +276,129 @@ pub(crate) fn referenced_ids(layout: &Layout) -> Result<Vec<ObjectId>> {
         .collect())
 }
 
+impl Repo {
+    /// Every well-formed operation-log record, oldest first (see the module
+    /// docs for the on-disk grammar). Used by `sc oplog` and by callers that
+    /// want to inspect history-editing state without going through `undo`.
+    pub fn oplog(&self) -> Result<Vec<OpRecord>> {
+        read_all(&self.layout)
+    }
+
+    /// Undo the most recently appended oplog record: restore every ref it
+    /// touched (and HEAD, if it moved) to that record's before-state, and
+    /// re-materialize the working tree when the restore actually changes what
+    /// the (post-restore) current branch resolves to. The undo is itself
+    /// logged as an inverse record, so undoing twice in a row redoes the
+    /// original operation — `undo` is its own toggle.
+    ///
+    /// Refuses with:
+    /// - [`Error::NothingToUndo`] if the log is empty.
+    /// - [`Error::MergeInProgress`] while a merge is in progress (mirrors the
+    ///   guard `merge`/`switch` already use).
+    /// - [`Error::InvalidArgument`] if a re-materialize is needed and the
+    ///   working tree is dirty (would silently discard uncommitted work — the
+    ///   same modified/deleted check `merge` and `switch` use).
+    /// - [`Error::InvalidArgument`] if undoing would leave the current branch
+    ///   unborn (restoring its ref to "absent"). This is a deliberate scope
+    ///   cut: undoing the repo's very first commit has no working tree to
+    ///   materialize back to, and silently deleting the ref file while
+    ///   leaving stale tracked files on disk would be worse than refusing.
+    ///   Undo an intermediate step instead of the first commit.
+    ///
+    /// Returns the undone record's `desc`, for CLI display.
+    pub fn undo(&self) -> Result<String> {
+        let rec = last(&self.layout)?.ok_or(Error::NothingToUndo)?;
+
+        if crate::merge_state::in_progress(&self.layout) {
+            return Err(Error::MergeInProgress);
+        }
+
+        // The branch that will be current once HEAD is restored.
+        let restored_head = rec.head_before.clone();
+
+        // Does the record's refs list move the tip of `restored_head`? If the
+        // record doesn't mention it at all, its tip is untouched by this
+        // record — read the ref's current (i.e. post-restore) value.
+        let restored_head_entry = rec.refs.iter().find(|(name, _, _)| *name == restored_head);
+        let (moves_current_tip, will_be_tip) = match restored_head_entry {
+            Some((_, before, after)) => (before != after, *before),
+            None => (false, refs::read_branch_tip(&self.layout, &restored_head)?),
+        };
+        let rematerialize = rec.head_before != rec.head_after || moves_current_tip;
+
+        if rematerialize && will_be_tip.is_none() {
+            return Err(Error::InvalidArgument(
+                "cannot undo the initial commit (would unbear the branch)".into(),
+            ));
+        }
+
+        if rematerialize {
+            let dirty = self.status()?;
+            if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "working tree has uncommitted changes; commit before undo".into(),
+                ));
+            }
+        }
+
+        // Capture the tree materialized right now, before any ref changes,
+        // so re-materialize below knows what to remove.
+        let old_root = if rematerialize { self.head_root()? } else { None };
+
+        // Restore: ref writes first, inverse oplog record last (crash safety
+        // — a crash between the two leaves the refs already-restored state
+        // recoverable by re-running undo, never a torn write).
+        for (name, before, _after) in &rec.refs {
+            match before {
+                Some(id) => refs::write_branch_tip(&self.layout, name, id)?,
+                None => match std::fs::remove_file(self.layout.ref_path(name)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                },
+            }
+        }
+        if rec.head_before != rec.head_after {
+            refs::write_head(&self.layout, &rec.head_before)?;
+        }
+
+        if rematerialize {
+            // Guarded above: rematerialize implies will_be_tip is Some.
+            let target_tip = will_be_tip.expect("checked non-unborn above");
+            let (target_root, protection) = {
+                let snap = self.snapshot(&target_tip)?;
+                (snap.root, snap.protection)
+            };
+            let store_arc = self.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            worktree::materialize(
+                &self.layout,
+                &mut store,
+                target_root,
+                old_root,
+                &protection,
+                None,
+            )?;
+        }
+
+        // Log the inverse: swapped head, and every ref's before/after swapped.
+        let inverse_refs: Vec<(String, Option<ObjectId>, Option<ObjectId>)> = rec
+            .refs
+            .iter()
+            .map(|(name, before, after)| (name.clone(), *after, *before))
+            .collect();
+        record(
+            &self.layout,
+            &format!("undo of op {}: {}", rec.seq, rec.desc),
+            &rec.head_after,
+            &rec.head_before,
+            &inverse_refs,
+        )?;
+
+        Ok(rec.desc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +409,24 @@ mod tests {
         let layout = Layout::at(&root);
         std::fs::create_dir_all(&layout.dot_sc).unwrap();
         layout
+    }
+
+    /// A fresh persistent repo (via `Repo::init`) in its own temp dir, for
+    /// exercising `undo` end-to-end. Returns the open handle plus its root so
+    /// the caller can clean up (`Repo` holds the single-writer lock for its
+    /// lifetime, so it must be dropped before `remove_dir_all`).
+    fn setup_repo(tag: &str) -> (Repo, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("sc-undo-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = Repo::init(&root).unwrap();
+        (repo, root)
+    }
+
+    fn teardown_repo(repo: Repo, root: &std::path::Path) {
+        drop(repo);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]
@@ -442,5 +586,206 @@ mod tests {
 
         std::fs::remove_dir_all(&layout.root).unwrap();
         assert!(!layout.root.exists());
+    }
+
+    #[test]
+    fn undo_commit_restores_ref_and_double_undo_redoes() {
+        let (repo, root) = setup_repo("commit-undo");
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        let id1 = repo.commit("me", "commit one").unwrap();
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        let id2 = repo.commit("me", "commit two").unwrap();
+
+        let desc = repo.undo().unwrap();
+        assert_eq!(desc, "commit: commit two");
+        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(id1));
+        // The object for the undone commit is still in the store — undo never
+        // deletes objects, only moves refs.
+        assert!(repo.store().lock().unwrap().get_snapshot(&id2).is_ok());
+
+        // Double-undo redoes: the first undo logged its own inverse record,
+        // and undoing *that* restores the tip to id2.
+        let desc2 = repo.undo().unwrap();
+        assert!(desc2.starts_with("undo of op"), "got {desc2:?}");
+        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(id2));
+
+        teardown_repo(repo, &root);
+    }
+
+    #[test]
+    fn undo_branch_create_deletes_the_ref_file() {
+        let (repo, root) = setup_repo("branch-undo");
+        std::fs::write(root.join("a.txt"), "base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        assert!(repo.layout().ref_path("feature").exists());
+
+        let desc = repo.undo().unwrap();
+        assert_eq!(desc, "branch feature");
+        assert_eq!(refs::read_branch_tip(repo.layout(), "feature").unwrap(), None);
+        assert!(!repo.layout().ref_path("feature").exists());
+
+        teardown_repo(repo, &root);
+    }
+
+    #[test]
+    fn undo_switch_restores_head_and_working_tree() {
+        let (repo, root) = setup_repo("switch-undo");
+        std::fs::write(root.join("a.txt"), "main content\n").unwrap();
+        repo.commit("me", "base on main").unwrap();
+        repo.branch("feature").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("a.txt"), "feature content\n").unwrap();
+        repo.commit("me", "feature commit").unwrap();
+        repo.switch("main").unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "main content\n");
+
+        let desc = repo.undo().unwrap();
+        assert_eq!(desc, "switch main");
+        assert_eq!(refs::current_branch(repo.layout()).unwrap(), "feature");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "feature content\n");
+
+        teardown_repo(repo, &root);
+    }
+
+    #[test]
+    fn undo_work_session_removes_all_harvested_branches() {
+        let (repo, root) = setup_repo("work-undo");
+        std::fs::write(root.join("a.txt"), "base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        let scratch = root.parent().unwrap().join("work-undo-scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let opts = crate::workspace::WorkOptions {
+            agents: 2,
+            base_name: "work".into(),
+            cmd: vec!["sh".into(), "-c".into(), "echo \"$SC_WORKSPACE\" > out.txt".into()],
+            author: "me".into(),
+            message: None,
+            identity: None,
+            with_secrets: false,
+            session_root: Some(scratch.join("session")),
+        };
+        let outcomes = repo.work(opts).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(refs::read_branch_tip(repo.layout(), "work-1").unwrap().is_some());
+        assert!(refs::read_branch_tip(repo.layout(), "work-2").unwrap().is_some());
+        let main_before = refs::read_branch_tip(repo.layout(), "main").unwrap();
+
+        let desc = repo.undo().unwrap();
+        assert!(desc.starts_with("work: 2 agents"), "got {desc:?}");
+        assert_eq!(refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
+        assert_eq!(refs::read_branch_tip(repo.layout(), "work-2").unwrap(), None);
+        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), main_before);
+        assert_eq!(refs::current_branch(repo.layout()).unwrap(), "main");
+
+        std::fs::remove_dir_all(&scratch).unwrap();
+        teardown_repo(repo, &root);
+    }
+
+    #[test]
+    fn undo_with_dirty_tree_refuses_when_rematerialize_needed() {
+        let (repo, root) = setup_repo("dirty-undo");
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        repo.commit("me", "commit one").unwrap();
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        repo.commit("me", "commit two").unwrap();
+        // Dirty the tracked file without committing.
+        std::fs::write(root.join("a.txt"), "dirty\n").unwrap();
+
+        let before_main = refs::read_branch_tip(repo.layout(), "main").unwrap();
+        let err = repo.undo().unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), before_main);
+
+        teardown_repo(repo, &root);
+    }
+
+    #[test]
+    fn undo_merge_and_secret_add_round_trip() {
+        let (repo, root) = setup_repo("merge-secret-undo");
+        std::fs::write(root.join("shared.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nB\nc\n").unwrap();
+        let pre_merge = repo.commit("me", "ours").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nb\nC\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+        let merge_id = repo.merge("feature", "me").unwrap();
+        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(merge_id));
+
+        // Undo the merge: tip back to the pre-merge commit; the merge
+        // snapshot stays reachable in the CAS.
+        let desc = repo.undo().unwrap();
+        assert!(desc.starts_with("merge feature"), "got {desc:?}");
+        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(pre_merge));
+        assert!(repo.store().lock().unwrap().get_snapshot(&merge_id).is_ok());
+
+        // Redo: undoing the inverse record restores the merge tip.
+        let redo_desc = repo.undo().unwrap();
+        assert!(redo_desc.starts_with("undo of op"), "got {redo_desc:?}");
+        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(merge_id));
+
+        // secret add: moves the current branch's tip, same shape as a commit.
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        let before_secret = refs::read_branch_tip(repo.layout(), "main").unwrap();
+        repo.secret_add("DB_URL", b"v1", &[pk]).unwrap();
+        assert_eq!(repo.secret_list().unwrap().len(), 1);
+
+        let secret_undo_desc = repo.undo().unwrap();
+        assert_eq!(secret_undo_desc, "secret add DB_URL");
+        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), before_secret);
+        assert!(repo.secret_list().unwrap().is_empty());
+
+        teardown_repo(repo, &root);
+    }
+
+    #[test]
+    fn undo_of_initial_commit_is_refused_to_keep_branch_born() {
+        let (repo, root) = setup_repo("unbear");
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        let first = repo.commit("me", "first").unwrap();
+
+        let err = repo.undo().unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        // Refused before any ref write: the branch is still born at the
+        // first commit, not reverted to unborn.
+        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(first));
+        assert!(repo.layout().ref_path("main").exists());
+
+        teardown_repo(repo, &root);
+    }
+
+    #[test]
+    fn undo_on_empty_log_is_typed_error() {
+        let (repo, root) = setup_repo("empty-log-undo");
+        let err = repo.undo().unwrap_err();
+        assert!(matches!(err, Error::NothingToUndo), "got {err:?}");
+        teardown_repo(repo, &root);
+    }
+
+    #[test]
+    fn clone_does_not_copy_the_oplog() {
+        let (repo, root) = setup_repo("clone-oplog-src");
+        std::fs::write(root.join("a.txt"), "base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        assert!(!repo.oplog().unwrap().is_empty());
+
+        let dst_root = root.parent().unwrap().join("clone-oplog-dst");
+        let _ = std::fs::remove_dir_all(&dst_root);
+        let dst = Repo::clone_to(&root, &dst_root).unwrap();
+
+        // `clone_url` copies objects + refs selectively (see sync.rs), never
+        // `.sc/oplog` — so the destination's log starts empty and undo there
+        // is a typed NothingToUndo, not a reach into the source's history.
+        assert!(dst.oplog().unwrap().is_empty());
+        let err = dst.undo().unwrap_err();
+        assert!(matches!(err, Error::NothingToUndo), "got {err:?}");
+
+        drop(dst);
+        std::fs::remove_dir_all(&dst_root).unwrap();
+        teardown_repo(repo, &root);
     }
 }

@@ -223,6 +223,10 @@ enum Cmd {
         #[command(subcommand)]
         op: EscrowOp,
     },
+    /// Revert the last operation (run again to redo).
+    Undo,
+    /// List recent operations, newest first.
+    Oplog,
 }
 
 #[derive(Subcommand)]
@@ -365,6 +369,8 @@ fn main() -> Result<()> {
         Cmd::Gc { prune_expire } => run_gc(&prune_expire),
         Cmd::Export { to, r#ref, include_encrypted } => run_export(to, r#ref, include_encrypted),
         Cmd::Escrow { op } => run_escrow(op),
+        Cmd::Undo => run_undo(),
+        Cmd::Oplog => run_oplog(),
     }
 }
 
@@ -1022,6 +1028,20 @@ fn fmt_utc(ts: i64) -> String {
 fn run_branch(name: &str) -> Result<()> {
     open_repo()?.branch(name)?;
     println!("created branch {name}");
+    Ok(())
+}
+
+fn run_undo() -> Result<()> {
+    let desc = open_repo()?.undo()?;
+    println!("undid: {desc}");
+    Ok(())
+}
+
+fn run_oplog() -> Result<()> {
+    let repo = open_repo()?;
+    for rec in repo.oplog()?.iter().rev() {
+        println!("{:>4}  {}  {}", rec.seq, fmt_utc(rec.ts), rec.desc);
+    }
     Ok(())
 }
 

@@ -31,6 +31,7 @@ pub mod worktree;
 pub use error::{Error, Result};
 pub use gc::GcStats;
 pub use git_marks::MarksStore;
+pub use oplog::OpRecord;
 pub use remote::{RemoteConfig, RemoteKind};
 pub use repo::{Repo, Status};
 pub use scanner::ScanReport;
