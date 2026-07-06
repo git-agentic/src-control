@@ -581,34 +581,45 @@ impl Repo {
             (m, ours_root, ours_protection, theirs_protection)
         };
 
+        // Union protection rules across both sides: governs which recipients a
+        // needs_encrypt output (or a carried-plain file whose path is still
+        // ruled on the other side) is encrypted for, and becomes the merged
+        // snapshot's policy so future commits under either side's rules stay
+        // protected. `union_prot` exists only to drive `matching_prefix`
+        // lookups below — its `wrapped` map is irrelevant here. Computed
+        // before the interim conflict guard, which consults it.
+        let union_prefixes =
+            crate::protect::union_prefixes(&ours_protection.prefixes, &theirs_protection.prefixes);
+        let union_prot = scl_core::Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
+
         // Task 6 removes this. Clean protected merges are handled below, but a
-        // CONFLICTED merge that touches a protected (needs_encrypt) path isn't
-        // yet — resolving a protected conflict safely (markers in plaintext,
-        // re-encrypt on commit) is the next change's scope. Refuse before any
-        // write (working tree, refs, or merge state) so a re-run after that
-        // change ships just works. All-plain conflicts are unaffected: they
-        // fall through to the existing marker-file path below.
-        if merge_result
-            .conflicts
-            .iter()
-            .filter_map(|p| merge_result.files.iter().find(|f| &f.path == p))
-            .any(|f| f.needs_encrypt)
+        // CONFLICTED merge that involves protection in ANY way isn't yet —
+        // resolving conflicts safely alongside protected content is the next
+        // change's scope. "Involves protection" is deliberately wide: not just
+        // a conflicted needs_encrypt path, but any needs_encrypt output, any
+        // carried PROTECTED entry, or any file governed by a union rule. The
+        // narrow version (conflicted+needs_encrypt only) let an all-plain
+        // conflict inside a protection-carrying merge write merge state — and
+        // the pre-Task-6 conflict *completion* path (`commit` →
+        // `snapshot_files`, which reads protection from ours' tip only) then
+        // silently dropped theirs' protected files/rules and, via the keyless
+        // conflict materialize, could even delete ours' own plain file under a
+        // theirs-only rule. Refuse before ANY side effect (tree write,
+        // materialize, sidecars, merge state, refs) so a re-run after Task 6
+        // ships just works. All-plain conflicts in rule-free histories are
+        // unaffected: they fall through to the existing marker-file path.
+        if !merge_result.conflicts.is_empty()
+            && merge_result.files.iter().any(|f| {
+                f.needs_encrypt
+                    || f.perms & scl_core::PROTECTED != 0
+                    || crate::protect::matching_prefix(&union_prot, &f.path).is_some()
+            })
         {
             return Err(Error::InvalidArgument(
                 "protected conflict resolution lands in the next change; rerun after it ships"
                     .into(),
             ));
         }
-
-        // Union protection rules across both sides: governs which recipients a
-        // needs_encrypt output (or a carried-plain file whose path is still
-        // ruled on the other side) is encrypted for, and becomes the merged
-        // snapshot's policy so future commits under either side's rules stay
-        // protected. `union_prot` exists only to drive `matching_prefix`
-        // lookups below — its `wrapped` map is irrelevant here.
-        let union_prefixes =
-            crate::protect::union_prefixes(&ours_protection.prefixes, &theirs_protection.prefixes);
-        let union_prot = scl_core::Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
 
         // Split the resolved file set: carried ciphertext (needs_encrypt:
         // false, PROTECTED) stays byte-for-byte as-is; needs_encrypt outputs
@@ -1654,6 +1665,104 @@ mod tests {
         let pt = crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "keys/a.txt")
             .unwrap();
         assert_eq!(&pt[..], b"plain-for-now");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn plain_conflict_with_theirs_protected_content_refuses_before_any_side_effect() {
+        // Interim-guard regression (Task 5 review, Critical): a merge whose
+        // conflicts are ALL plain, but which carries protected content from
+        // theirs (rule + ciphertext file), must refuse keyless — the pre-Task-6
+        // conflict *completion* path (`commit` reads protection from ours' tip
+        // only) would otherwise silently drop theirs' protected file and roll
+        // back the rule. Task 6 removes this refusal.
+        let root = tmp_root("p15-plain-conflict-theirs-protected");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("shared.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // ours: plain conflicting edit.
+        std::fs::write(root.join("shared.txt"), b"a\nX\nc\n").unwrap();
+        let ours = repo.commit("me", "ours edits shared").unwrap();
+
+        // theirs: conflicting plain edit PLUS a protect rule + protected file.
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nY\nc\n").unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("protected conflict resolution")),
+            "got {err:?}"
+        );
+        // No side effects: refs untouched, no merge state, working tree intact.
+        assert_eq!(repo.head_tip().unwrap(), Some(ours), "HEAD must not advance");
+        assert!(!repo.merge_in_progress(), "no MERGE_HEAD recorded");
+        assert_eq!(
+            std::fs::read(root.join("shared.txt")).unwrap(),
+            b"a\nX\nc\n",
+            "no conflict markers written"
+        );
+        assert!(!root.join("secret/db.txt").exists(), "nothing from theirs written");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn plain_conflict_with_ours_plain_file_under_theirs_rule_refuses() {
+        // Interim-guard regression (Task 5 review, Critical): ours holds a
+        // PLAIN file whose path a theirs-only rule governs, plus an unrelated
+        // all-plain conflict. Pre-fix, the conflict path's keyless
+        // protection-aware materialize would *delete ours' own plain file*
+        // (PROTECTED merged entry, no identity → skip + stale-plaintext
+        // removal) before the user ever resolved the conflict. Must refuse
+        // with zero side effects instead. Task 6 removes this refusal.
+        let root = tmp_root("p15-plain-conflict-ours-under-theirs-rule");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("shared.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // ours: plain conflicting edit + a plain file under keys/ (no rule here).
+        std::fs::write(root.join("shared.txt"), b"a\nX\nc\n").unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/a.txt"), b"plain-for-now").unwrap();
+        let ours = repo.commit("me", "ours edits shared + adds plain keys/a.txt").unwrap();
+
+        // theirs: conflicting plain edit + records the keys/ rule (nothing to
+        // encrypt on its side).
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nY\nc\n").unwrap();
+        repo.commit("me", "theirs edits shared").unwrap();
+        repo.protect("keys/", &[alice_pk], None).unwrap();
+        repo.switch("main").unwrap();
+        assert_eq!(std::fs::read(root.join("keys/a.txt")).unwrap(), b"plain-for-now");
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("protected conflict resolution")),
+            "got {err:?}"
+        );
+        // No side effects — crucially, ours' own keys/a.txt must survive.
+        assert_eq!(repo.head_tip().unwrap(), Some(ours), "HEAD must not advance");
+        assert!(!repo.merge_in_progress(), "no MERGE_HEAD recorded");
+        assert_eq!(
+            std::fs::read(root.join("keys/a.txt")).unwrap(),
+            b"plain-for-now",
+            "ours' own plain file under theirs' rule must not be deleted"
+        );
+        assert_eq!(
+            std::fs::read(root.join("shared.txt")).unwrap(),
+            b"a\nX\nc\n",
+            "no conflict markers written"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
