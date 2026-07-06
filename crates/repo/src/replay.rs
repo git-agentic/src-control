@@ -29,11 +29,12 @@ use crate::worktree;
 /// registry analog of `replay_commit`'s file three-way, using the same base
 /// (the commit's own first parent, empty registry if it's a root commit).
 /// `onto_secrets` is the onto side (current tip for `cherry_pick`, fold
-/// accumulator for `rebase`); `commit_secrets`/`commit_parents` are the
-/// replayed commit's own registry and parent list. Errors
-/// (`Error::SecretMergeConflict`) propagate verbatim — the caller must not
-/// have written anything yet when this is called, so the abort is atomic.
-fn merged_registry_for_replay(
+/// accumulator for `rebase`, the completing tip for a conflicted pick's
+/// `sc commit`); `commit_secrets`/`commit_parents` are the replayed commit's
+/// own registry and parent list. Errors (`Error::SecretMergeConflict`)
+/// propagate verbatim — the caller must not have written anything outside
+/// the CAS when this is called, so the abort is atomic.
+pub(crate) fn merged_registry_for_replay(
     repo: &Repo,
     commit_parents: &[ObjectId],
     commit_secrets: &BTreeMap<String, ObjectId>,
@@ -305,6 +306,18 @@ impl Repo {
         let ours_root = ours_snap.root;
         let picked_snap = self.snapshot(&picked_tip)?;
 
+        // Registry three-way (P15 Task 9), hoisted above the file replay so a
+        // registry conflict fails fast — even on a pick whose FILES would
+        // conflict, the typed `SecretMergeConflict` surfaces here with refs
+        // and working tree untouched, instead of being deferred to the
+        // completing `sc commit`.
+        let merged_secrets = merged_registry_for_replay(
+            self,
+            &picked_snap.parents,
+            &picked_snap.secrets,
+            &ours_snap.secrets,
+        )?;
+
         match replay_commit(self, picked_tip, (ours_root, &ours_snap.protection), identity)? {
             ReplayOutcome::Empty => {
                 // Tree AND this commit's own protection-prefix delta are both
@@ -312,12 +325,6 @@ impl Repo {
                 // registry is merged independently (P15 Task 9): a
                 // secrets-only commit still needs to land as a
                 // registry-only snapshot rather than being dropped.
-                let merged_secrets = merged_registry_for_replay(
-                    self,
-                    &picked_snap.parents,
-                    &picked_snap.secrets,
-                    &ours_snap.secrets,
-                )?;
                 if merged_secrets == ours_snap.secrets {
                     Ok(PickResult::AlreadyApplied)
                 } else {
@@ -348,12 +355,6 @@ impl Repo {
                 }
             }
             ReplayOutcome::Clean { root, protection } => {
-                let merged_secrets = merged_registry_for_replay(
-                    self,
-                    &picked_snap.parents,
-                    &picked_snap.secrets,
-                    &ours_snap.secrets,
-                )?;
                 let msg_first_line = picked_snap.message.lines().next().unwrap_or("");
                 let message = format!("{msg_first_line} (cherry-picked from {})", picked_tip.short());
                 // Ordering matters for crash safety (same discipline as
@@ -1810,6 +1811,72 @@ mod tests {
         assert_eq!(repo.secret_list().unwrap().len(), 1);
         let ops = repo.oplog().unwrap();
         assert_eq!(ops.last().unwrap().desc, "cherry-pick work");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task 9 fix follow-on: a CONFLICTED pick whose picked commit ALSO
+    /// carries a registry delta must keep that delta through the completing
+    /// `sc commit` — the completion previously carried the tip's registry
+    /// verbatim (silent drop). No public surface mints combined
+    /// file+registry commits yet, so the picked commit is built via
+    /// `build_snapshot` directly.
+    #[test]
+    fn conflicted_pick_completion_merges_picked_registry_delta() {
+        let root = tmp_root("cp-conflict-registry");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // ours: conflicting edit of shared.txt.
+        std::fs::write(root.join("shared.txt"), b"a\nOURS\nc\n").unwrap();
+        let main_tip = repo.commit("me", "main edits shared").unwrap();
+
+        // work: conflicting edit + a registry delta on the SAME commit.
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nWORK\nc\n").unwrap();
+        let plain = repo.commit("me", "work edits shared").unwrap();
+        let plain_snap = repo.snapshot(&plain).unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        let sealed = scl_crypto::seal("PICKED_SECRET", b"v1", &[pk]);
+        let sid = {
+            let store_arc = repo.vfs().store();
+            let mut s = store_arc.lock().unwrap();
+            s.put(scl_core::Object::Secret(sealed)).unwrap()
+        };
+        let mut secrets = plain_snap.secrets.clone();
+        secrets.insert("PICKED_SECRET".to_string(), sid);
+        let combined = repo
+            .build_snapshot(
+                plain_snap.root,
+                plain_snap.parents.clone(),
+                secrets,
+                plain_snap.protection.clone(),
+                "me",
+                "work edits shared + adds secret",
+            )
+            .unwrap();
+        let head = refs::current_branch(&repo.layout).unwrap();
+        refs::write_branch_tip(&repo.layout, &head, &combined).unwrap();
+
+        repo.switch("main").unwrap();
+        let err = repo.cherry_pick("work", "me", None).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "tip must not move");
+
+        // Resolve + complete: the picked registry delta survives.
+        std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
+        let id = repo.commit("me", "resolve pick conflict").unwrap();
+        assert!(!repo.pick_in_progress());
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![main_tip], "pick completion is single-parent");
+        assert!(
+            snap.secrets.contains_key("PICKED_SECRET"),
+            "completion registry must carry the picked commit's registry delta"
+        );
+        assert_eq!(repo.secret_list().unwrap().len(), 1);
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();

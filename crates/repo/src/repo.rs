@@ -175,10 +175,23 @@ impl Repo {
                     Some(ph) => {
                         // Pick completion: union tip ∪ picked rules + wraps
                         // (same discipline as the merge-completion arm below,
-                        // tip's wrap bytes win on a shared recipient). Secrets
-                        // stay the tip's — replay never carries the picked
-                        // commit's registry (see `replay.rs` module docs).
-                        let picked_p = self.snapshot(&ph)?.protection;
+                        // tip's wrap bytes win on a shared recipient). The
+                        // secret registry is merged three-way exactly like the
+                        // clean pick path (P15 Task 9): base = the picked
+                        // commit's own first parent, ours = tip, theirs =
+                        // picked — a picked commit carrying a registry delta
+                        // alongside its conflicted files keeps that delta
+                        // through the completion, and a name changed
+                        // differently on both sides is a typed
+                        // `SecretMergeConflict` (the commit fails loudly).
+                        let picked_snap = self.snapshot(&ph)?;
+                        let secs = crate::replay::merged_registry_for_replay(
+                            self,
+                            &picked_snap.parents,
+                            &picked_snap.secrets,
+                            &snap.secrets,
+                        )?;
+                        let picked_p = picked_snap.protection;
                         let prefixes = crate::protect::union_prefixes(
                             &snap.protection.prefixes,
                             &picked_p.prefixes,
@@ -188,7 +201,7 @@ impl Repo {
                             let entry = wrapped.entry(*id).or_default();
                             *entry = crate::protect::union_wraps(entry, wks);
                         }
-                        (Protection { prefixes, wrapped }, snap.secrets)
+                        (Protection { prefixes, wrapped }, secs)
                     }
                 }
             }
