@@ -1,6 +1,6 @@
 # ADR-0025: Protected merge & replay — perms-aware three-way with decrypt-on-demand
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-06
 - **Phase:** 15
 - **Builds on:** ADR-0012 (three-way merge), ADR-0014 (encrypted paths),
@@ -52,3 +52,67 @@ replay toolkit, widening the gap.
   prior-wrap reuse keeps unchanged content's encoding stable.
 - Rule narrowing cannot happen via merge (union); explicit unprotect
   remains a future operation.
+
+## Refinements during the build
+
+Two review passes surfaced issues the design above didn't anticipate; all
+are fixed in the shipped code (task history on `p15-protected-merge`), not
+deferred.
+
+1. **Decided-root persistence + HEAD-gated reads.** The design didn't
+   specify how a *conflicted* protected merge/pick should resolve at
+   completion time. The first implementation arbitrated by parent order
+   ("ours" wins for absent protected files), which review found silently
+   **reverted content the other side had already updated** — a data-loss
+   bug, not a conflict. The fix persists the operation's decided tree
+   (`.sc/MERGE_DECIDED_ROOT`, `.sc/PICK_DECIDED_ROOT`) alongside its
+   `MERGE_HEAD`/`PICK_HEAD` marker; completion carries absent protected
+   files forward *from the decided tree*, not from either parent. A second
+   review pass then found that a decided-root file left behind by an
+   abandoned/crashed operation could be read back and silently splice into
+   an unrelated *later* completion — so reads and `sc gc`'s reachability
+   walk are now gated on the corresponding in-progress HEAD file existing;
+   the decided root is cleared in lockstep with the HEAD marker it
+   accompanies.
+2. **The I2 re-encrypt rule.** Protection-rule union can cause a path that
+   was carried forward as **plaintext** (because it wasn't touched by the
+   side that introduced or widened a matching rule) to newly match a
+   protection rule at the landing snapshot. Left alone this breaks the
+   invariant that a path's `PROTECTED` bit and its ciphertext-vs-plaintext
+   state agree. The fix re-encrypts any such carried-PLAIN file through
+   `encrypt_protected` at completion, so "protected in this snapshot" and
+   "ciphertext in this snapshot" stay synonymous everywhere, not just on
+   paths that were themselves edited.
+3. **`Empty` redefined as a tri-delta.** P14's replay treated a commit as
+   "nothing to replay" when its **tree** was unchanged from its parent.
+   Under P15 that missed commits whose only change was a protection-rule
+   edit or a secret-registry change with an unchanged tree — those were
+   silently dropped during rebase/cherry-pick. `Empty` now requires the
+   tree delta, the registry delta, **and** the protection-prefix delta to
+   all be empty, so rules-only and secrets-only commits replay correctly.
+4. **Pick-completion registry merge.** A cherry-pick that both conflicts
+   *and* carries a secret-registry change had a latent hole: the
+   conflict-completion path resolved the tree conflict but dropped the
+   picked commit's registry delta. Completion now merges the picked
+   commit's registry change via the same `merge_secrets` used elsewhere,
+   closing that combined-case gap.
+5. **`decrypt_with` distinguishes corruption from unauthorized.** The
+   initial cut reported any decrypt failure — including a truncated or
+   bit-flipped ciphertext object — as `Error::NotAuthorized`, which is
+   misleading (an authorized recipient with a corrupt object isn't
+   "unauthorized"). `decrypt_with` now surfaces corruption as a distinct
+   crypto error, reserving `NotAuthorized` for the case where no wrap
+   unwraps under the supplied identity.
+6. **`union_wraps` output sorted.** Wrap-set union initially preserved
+   whatever order the two input sets happened to have. Because wraps are
+   encoded into the canonical object bytes that determine content
+   addressing, non-deterministic ordering would make the same logical
+   merge hash differently depending on operand order. `union_wraps` (like
+   `union_prefixes`) now sorts its output deterministically.
+7. **`Zeroizing` re-exported through the crypto quarantine.** Merge/replay
+   code outside `crates/crypto` needed to name the zeroizing-on-drop buffer
+   type returned by decrypt helpers. Rather than let `repo` add its own
+   `zeroize` dependency (breaking the "RustCrypto stays quarantined in
+   `crypto`" rule), `crates/crypto` re-exports `zeroize::Zeroizing` as a
+   type alias — the dependency itself stays quarantined; only the type name
+   crosses the boundary.

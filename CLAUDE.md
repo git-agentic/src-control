@@ -112,7 +112,9 @@ cargo run --bin sc -- log                    # history: id, date, author, messag
                                              # commit/merge author: --author > $SC_AUTHOR > OS user
 cargo run --bin sc -- branch <name>          # create a new branch at current tip
 cargo run --bin sc -- switch <name>          # switch branch + materialize working tree
-cargo run --bin sc -- merge <ref>            # three-way merge (ff when possible; exits 1 on conflicts)
+cargo run --bin sc -- merge <ref> [--identity <key>]   # three-way merge (ff when possible; exits
+                                             # 1 on conflicts; --identity only needed when a
+                                             # protected path diverged in content on both sides)
 cargo run --bin sc -- scan                   # preview the commit-time secret scan
 cargo run --bin sc -- clone <src> <dst>      # copy a repo (objects + refs)
 cargo run --bin sc -- protect <prefix> --to <recipient>   # encrypt matching paths (P7)
@@ -152,12 +154,15 @@ cargo run --bin sc -- work --agents 3 -- <cmd>   # fork agent workspaces, run <c
                                                  # (--with-secrets --identity <key> injects
                                                  # decrypted secrets into each agent env)
 bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
-cargo run --bin sc -- cherry-pick <ref>       # replay one commit onto the current branch
-cargo run --bin sc -- rebase <target>         # replay current branch onto <target> (atomic;
-                                              # conflicts abort with refs untouched)
+cargo run --bin sc -- cherry-pick <ref> [--identity <key>]   # replay one commit onto the
+                                              # current branch (--identity as above)
+cargo run --bin sc -- rebase <target> [--identity <key>]     # replay current branch onto
+                                              # <target> (atomic; conflicts abort with refs
+                                              # untouched; --identity as above)
 cargo run --bin sc -- undo                    # revert the last operation (again = redo)
 cargo run --bin sc -- oplog                   # list recent operations
 bash demo/run_history_demo.sh                 # cherry-pick/rebase/undo round-trip proof
+bash demo/run_protected_merge_demo.sh         # protected merge & replay proof (P15)
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -275,17 +280,48 @@ logs its own inverse record, so a second `sc undo` redoes the first; `sc
 oplog` lists records newest-first. Undoing the repo's initial commit is
 refused (would unbear the branch) as a deliberate scope cut. `sc gc` treats
 oplog-referenced snapshot ids as reachability roots and trims records past
-the prune-expire window, always keeping the newest. Protected content stays
-fail-closed: replay refuses any commit touching PROTECTED paths, inheriting
-P4's merge guard verbatim. The oplog is local-only, like a reflog — it never
-travels over `fetch`/`push`/`clone`. Replay does not carry secret-registry
-changes: `sc rebase`/`sc cherry-pick` warn (stderr) when they skip a
-commit's registry change rather than replaying it (follow-on: registry
-replay). See ADR-0024.
+the prune-expire window, always keeping the newest. Protected content fails
+closed → lifted in P15 (ADR-0025): replay refuses any commit touching
+PROTECTED paths, inheriting P4's merge guard verbatim. The oplog is
+local-only, like a reflog — it never travels over `fetch`/`push`/`clone`.
+Replay does not carry secret-registry changes: `sc rebase`/`sc cherry-pick`
+warn (stderr) when they skip a commit's registry change rather than
+replaying it (follow-on: registry replay → closed in P15). See ADR-0024.
+
+**Phase 15 is built.** Protected content no longer fails closed on
+merge/rebase/cherry-pick. Id-level cases (unchanged / one-side-changed /
+clean-delete protected paths) resolve as ciphertext-id fast paths — sound
+under convergent encryption, no identity required — carrying ciphertext +
+unioned wrapped DEKs. Only content-divergent protected paths (both sides
+edited the plaintext) need `--identity`: the plaintexts are decrypted,
+diff3-merged, and re-encrypted through the same `encrypt_protected`/
+`reuse_prior_wraps` helpers `commit` uses, so plaintext is never written to
+the CAS (`Error::ProtectedMergeNeedsIdentity` when identity is missing,
+`Error::NotAuthorized` when the supplied identity can't unwrap). Protection
+rules merge by union (`union_prefixes`/`union_wraps`, both deterministically
+sorted) — nothing silently unprotects, including the I2 rule: a carried
+PLAIN file that matches a landing union rule is re-encrypted at completion,
+so "protected" and "ciphertext" stay synonymous in every snapshot. Conflicted
+protected merges/picks write plaintext markers only to the identity-holder's
+working tree (never the CAS) and persist the decided tree
+(`MERGE_DECIDED_ROOT`/`PICK_DECIDED_ROOT`, gc-rooted and gated on their
+in-progress HEAD so crash residue can't hijack a later completion);
+completion unions both sides' rules/wraps and carries absent protected files
+from the decided tree rather than picking one parent. The secret registry
+now replays through rebase/cherry-pick (`merge_secrets`, base = the replayed
+commit's own parent; conflicts abort atomically), and replay's `Empty` means
+tree **and** registry **and** protection-prefix deltas are all empty, so a
+rules-only or secrets-only commit replays instead of being silently skipped.
+`decrypt_with` distinguishes ciphertext corruption from a genuine
+authorization failure. `MergeProtected`/`ReplayProtected` are retired.
+`crypto::Zeroizing` is re-exported through the crate boundary so callers
+outside `crates/crypto` can zero decrypted buffers without a second
+dependency on RustCrypto/`zeroize` (the quarantine still holds — only the
+type alias crosses). See ADR-0025.
 
 Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
 frames, bulk re-wrap, multiple escrow keys, interactive workspace sessions,
 auto-merge of clean workspace results, `sc amend`, stop-and-continue rebase
 (`--continue`), cherry-pick `--abort`, merge-commit replay (mainline
-selection), protected-path replay, operation objects in the CAS, and oplog
-entries for remote-tracking refs.
+selection), operation objects in the CAS, and oplog entries for
+remote-tracking refs.
