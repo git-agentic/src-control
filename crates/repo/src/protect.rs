@@ -40,7 +40,13 @@ pub(crate) fn union_prefixes(a: &[ProtectPrefix], b: &[ProtectPrefix]) -> Vec<Pr
     out
 }
 
-/// Union two wrapped-DEK lists, deduped by recipient_id (first occurrence wins).
+/// Union two wrapped-DEK lists: deduped by `recipient_id` (first occurrence
+/// wins), then sorted by `recipient_id` for encoding determinism — wrap order
+/// inside a `wrapped`-map value feeds the snapshot's canonical encoding (the
+/// encoder does not sort `Vec<WrappedKey>`), so equivalent unions must encode
+/// identically regardless of argument order. Caveat: first-wins means that when
+/// the SAME recipient_id carries different wrap bytes on each side, the
+/// surviving bytes still depend on which argument came first.
 pub(crate) fn union_wraps(a: &[WrappedKey], b: &[WrappedKey]) -> Vec<WrappedKey> {
     let mut out: Vec<WrappedKey> = Vec::new();
     for w in a.iter().chain(b.iter()) {
@@ -48,13 +54,19 @@ pub(crate) fn union_wraps(a: &[WrappedKey], b: &[WrappedKey]) -> Vec<WrappedKey>
             out.push(w.clone());
         }
     }
+    out.sort_by(|x, y| x.recipient_id.cmp(&y.recipient_id));
     out
 }
 
 /// Decrypt a protected blob's ciphertext using `identity`, searching the
 /// given protection maps (in order) for its wrapped DEKs. Errors:
-/// `NotAuthorized(path)` when no wrap unwraps; `ProtectedMergeNeedsIdentity(path)`
-/// is the CALLER's error when identity is None — this fn requires one.
+/// `NotAuthorized(path)` when no wrap unwraps for this identity;
+/// `Error::Crypto` when a wrap DOES unwrap but the ciphertext then fails to
+/// decrypt — under convergent encryption that combination means corruption
+/// (tampered ciphertext or a stale/foreign wrap), not missing access, and the
+/// two must not be conflated (cf. `grant_surfaces_tampered_wrap_as_crypto_error_not_unauthorized`).
+/// `ProtectedMergeNeedsIdentity(path)` is the CALLER's error when identity is
+/// None — this fn requires one.
 ///
 /// NOTE: the brief's signature spells the return type `zeroize::Zeroizing<Vec<u8>>`.
 /// `scl-repo` does not depend on the `zeroize` crate directly (and per
@@ -74,12 +86,15 @@ pub(crate) fn decrypt_with(
             continue;
         };
         for wrap in wraps {
+            // A failed unwrap just means this wrap belongs to someone else —
+            // keep looking. But once a wrap unwraps, we HAVE the DEK: a decrypt
+            // failure past this point is corruption, not authorization, so
+            // propagate it (as Error::Crypto) instead of falling through to
+            // NotAuthorized.
             let Ok(dek) = scl_crypto::unwrap_dek_with(wrap, identity) else {
                 continue;
             };
-            if let Ok(plaintext) = scl_crypto::decrypt_path(ciphertext, &dek) {
-                return Ok(plaintext);
-            }
+            return Ok(scl_crypto::decrypt_path(ciphertext, &dek)?);
         }
     }
     Err(Error::NotAuthorized(path.to_string()))
@@ -150,6 +165,23 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_with_surfaces_corruption_as_crypto_error_not_unauthorized() {
+        // An authorized identity whose wrap unwraps fine, but whose ciphertext
+        // was tampered with: this is corruption, not lack of access, and must
+        // NOT be reported as NotAuthorized.
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mut cipher, dek) = scl_crypto::encrypt_path(b"hello");
+        let blob_id = scl_core::Object::blob(cipher.clone()).id();
+        let mut prot = Protection::default();
+        prot.wrapped.insert(blob_id, vec![scl_crypto::wrap_dek_for(&dek, &alice_pk)]);
+        let n = cipher.len();
+        cipher[n - 1] ^= 0xFF; // flip one ciphertext byte
+        let err = decrypt_with(&cipher, &blob_id, &[&prot], &alice_sk, "secret/x").unwrap_err();
+        assert!(!matches!(err, Error::NotAuthorized(_)), "corruption misreported as NotAuthorized: {err}");
+        assert!(matches!(err, Error::Crypto(_)), "expected Error::Crypto, got: {err}");
+    }
+
+    #[test]
     fn union_wraps_dedups_by_recipient_id() {
         let (_sk_a, pk_a) = scl_crypto::generate_keypair();
         let (_sk_b, pk_b) = scl_crypto::generate_keypair();
@@ -157,8 +189,21 @@ mod tests {
         let wa = scl_crypto::wrap_dek_for(&dek, &pk_a);
         let wa_dup = scl_crypto::wrap_dek_for(&dek, &pk_a);
         let wb = scl_crypto::wrap_dek_for(&dek, &pk_b);
-        let u = union_wraps(&[wa.clone()], &[wa_dup, wb]);
+        let u = union_wraps(&[wa.clone()], &[wa_dup, wb.clone()]);
         assert_eq!(u.len(), 2);
-        assert_eq!(u[0].recipient_id, wa.recipient_id);
+        // Dedup keeps a's wrap for pk_a (first occurrence wins).
+        let kept_a = u.iter().find(|w| w.recipient_id == wa.recipient_id).unwrap();
+        assert_eq!(kept_a.wrapped_dek, wa.wrapped_dek);
+
+        // Order-independence: equivalent contents (distinct recipients — for
+        // the SAME recipient_id with differing wrap bytes, first-wins makes the
+        // surviving bytes order-dependent by design) must union to identical
+        // output regardless of argument order, so the snapshot encoding is
+        // deterministic.
+        let ab = union_wraps(&[wa.clone()], &[wb.clone()]);
+        let ba = union_wraps(&[wb], &[wa]);
+        assert_eq!(ab, ba);
+        // And the output is sorted by recipient_id.
+        assert!(ab.windows(2).all(|w| w[0].recipient_id <= w[1].recipient_id));
     }
 }
