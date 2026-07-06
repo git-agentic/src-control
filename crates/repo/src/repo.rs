@@ -144,11 +144,17 @@ impl Repo {
     /// completion the protection policy is the UNION of both parents' rules
     /// and wraps. Used by `commit` (HEAD tip) and by workspace harvest (P13,
     /// arbitrary base tip, no merge head). Advances no refs.
+    /// `decided_root` is the merge's decided carried tree (persisted in the
+    /// merge state by the conflict path): when present, absent-still-protected
+    /// files carry forward from IT — the merge already arbitrated
+    /// base/ours/theirs, and re-arbitrating by parent order here silently
+    /// reverted theirs-side updates. Only meaningful alongside `merge_head`.
     pub(crate) fn snapshot_files(
         &self,
         files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
         tip: Option<ObjectId>,
         merge_head: Option<ObjectId>,
+        decided_root: Option<ObjectId>,
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
@@ -214,22 +220,46 @@ impl Repo {
         // blob and wrapped DEKs). This closes the hole where a non-recipient's
         // unrelated commit would otherwise destroy ciphertext they cannot even
         // read. (Explicit deletion of a protected file is a future operation,
-        // out of scope.) Scope: BOTH parents are scanned when a merge is being
-        // completed (Task 6, P15) — a theirs-side protected file that never
-        // reached disk (skipped at the conflict materialize for lack of a key)
-        // must survive the completion commit, not be silently destroyed. On a
-        // non-merge commit only `tip` is scanned, as before. Ours wins when
-        // the same absent path is protected in both parents.
+        // out of scope.) Sources, in priority order:
+        //
+        // 1. The merge's DECIDED tree (`decided_root`, persisted by the
+        //    conflict path) when completing a merge. The merge already
+        //    arbitrated base/ours/theirs — e.g. "only theirs changed → take
+        //    theirs" — so an absent protected path must carry the DECIDED
+        //    blob. (Re-arbitrating by parent order here, ours first, silently
+        //    reverted theirs' update to the stale ours version and recorded
+        //    theirs as merged — permanently, undetectably lost.) A path
+        //    PRESENT in the decided tree is decided, period: parents are
+        //    never consulted for it.
+        // 2. The parents — `tip` only on a non-merge commit (unchanged
+        //    behavior), both parents on merge completion for paths the
+        //    decided tree doesn't know (and as full fallback when the merge
+        //    state predates the decided-root record, i.e. was written by an
+        //    older code path). Ours wins across parents.
         {
-            let parents_to_scan: Vec<ObjectId> =
-                tip.into_iter().chain(merge_head.into_iter()).collect();
             let mut on_disk: std::collections::BTreeSet<String> =
                 all.iter().map(|(p, _, _, _)| p.clone()).collect();
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            for parent in parents_to_scan {
+
+            // Decided tree first (merge completion only), then the parents
+            // restricted to paths outside the decided tree.
+            let mut sources: Vec<std::collections::BTreeMap<String, (ObjectId, scl_core::FileMode, u8)>> =
+                Vec::new();
+            let mut decided_paths: std::collections::BTreeSet<String> = Default::default();
+            if let Some(dr) = decided_root {
+                let decided = worktree::tree_file_entries_with_perms(&mut store, dr)?;
+                decided_paths = decided.keys().cloned().collect();
+                sources.push(decided);
+            }
+            for parent in tip.into_iter().chain(merge_head.into_iter()) {
                 let parent_root = store.get_snapshot(&parent)?.root;
-                let entries = worktree::tree_file_entries_with_perms(&mut store, parent_root)?;
+                let mut entries = worktree::tree_file_entries_with_perms(&mut store, parent_root)?;
+                entries.retain(|p, _| !decided_paths.contains(p));
+                sources.push(entries);
+            }
+
+            for entries in sources {
                 for (path, (blob_id, mode, perms)) in entries {
                     if perms & scl_core::PROTECTED == 0
                         || crate::protect::matching_prefix(&protection, &path).is_none()
@@ -248,7 +278,7 @@ impl Repo {
                     // so the prior-wrap reuse below won't cover them — add them here.
                     // `or_insert_with` so an on-disk file already sharing this blob id
                     // keeps its freshly-wrapped DEKs. `protection.wrapped` is the
-                    // both-parents union during merge completion, so theirs-side
+                    // both-parents union during merge completion, so decided/theirs
                     // blobs find their wraps here too.
                     if let Some(prior_wks) = protection.wrapped.get(&blob_id) {
                         fresh_wrapped.entry(blob_id).or_insert_with(|| prior_wks.clone());
@@ -288,9 +318,12 @@ impl Repo {
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         let tip = self.head_tip()?;
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
+        // The merge's decided carried tree, when the conflict path recorded
+        // one (absent for merge state written before the record existed).
+        let decided_root = crate::merge_state::read_decided_root(&self.layout)?;
         let merging = merge_head.is_some();
         let picking = crate::pick_state::in_progress(&self.layout);
-        let id = self.snapshot_files(files, tip, merge_head, author, message)?;
+        let id = self.snapshot_files(files, tip, merge_head, decided_root, author, message)?;
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
         crate::pick_state::clear(&self.layout)?;
@@ -710,11 +743,22 @@ impl Repo {
                 }
                 std::fs::write(full, bytes)?;
             }
-            // Conflict markers are on disk; record MERGE_HEAD last. A crash in
-            // this window leaves marked files but no merge state — under the
-            // single-writer lock this is recoverable: re-running `merge`
-            // simply redoes the (idempotent) materialize + writes.
-            crate::merge_state::write(&self.layout, &theirs, &merge_result.conflicts)?;
+            // Conflict markers are on disk; record merge state last (its
+            // MERGE_HEAD write is the in-progress signal). A crash in this
+            // window leaves marked files but NO merge state — re-running
+            // `merge` is then refused by the dirty-tree check (the markers
+            // read as uncommitted changes), so recovery is manual: restore
+            // the working tree (e.g. `sc switch` back to this branch to
+            // re-materialize HEAD) and rerun the merge. The decided carried
+            // tree (`conflict_root`) is persisted alongside so completion
+            // carries absent protected files from the merge's DECISION rather
+            // than re-arbitrating by parent order.
+            crate::merge_state::write(
+                &self.layout,
+                &theirs,
+                &merge_result.conflicts,
+                Some(&conflict_root),
+            )?;
             return Err(Error::MergeConflicts(merge_result.conflicts.len()));
         }
 
@@ -2116,6 +2160,86 @@ mod tests {
         let (_, _, k1_perms) = entries["keys/k1.txt"];
         assert_ne!(k1_perms & scl_core::PROTECTED, 0, "theirs' keys/k1.txt carried forward");
         assert!(snap.protection.prefixes.iter().any(|p| p.prefix == "keys/"));
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn completion_carries_theirs_updated_protected_file_not_ours_stale() {
+        // Reviewer-reproduced Critical (Task 6 review): base+ours hold
+        // secret/x.txt v0; theirs updates it to v1, decided by the clean
+        // "only theirs changed → take theirs" fast path; an unrelated plain
+        // conflict forces the conflict path, and the keyless materialize
+        // skips x.txt (absent from disk at commit). Completion must carry
+        // THEIRS' v1 from the merge's DECIDED tree — the ours-first parent
+        // arbitration carried stale v0, recorded theirs as a parent anyway,
+        // and made the loss undetectable (a re-merge reported UpToDate).
+        let root = tmp_root("p15-completion-decided-tree");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x.txt"), b"v0").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // ours: only the plain conflicting edit; secret/x.txt stays v0.
+        std::fs::write(root.join("shared.txt"), b"a\nX\nc\n").unwrap();
+        let ours = repo.commit("me", "ours edits shared").unwrap();
+
+        // theirs: update secret/x.txt to v1 + the conflicting plain edit.
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/x.txt"), b"v1").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nY\nc\n").unwrap();
+        let theirs = repo.commit("me", "theirs updates secret + edits shared").unwrap();
+
+        // Theirs' v1 ciphertext id: the decided blob completion must keep.
+        let v1_id = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            let troot = s.get_snapshot(&theirs).unwrap().root;
+            worktree::tree_file_entries_with_perms(&mut s, troot).unwrap()["secret/x.txt"].0
+        };
+
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        // KEYLESS conflicted merge: x.txt is decided clean (take theirs) but
+        // cannot materialize without a key; shared.txt conflicts.
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+        assert!(!root.join("secret/x.txt").exists(), "keyless: v1 stays off disk");
+
+        std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
+        let id = repo.commit("me", "resolve").unwrap();
+        assert!(!repo.merge_in_progress());
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![ours, theirs]);
+
+        let (got_id, perms) = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap();
+            let (bid, _, perms) = entries["secret/x.txt"];
+            (bid, perms)
+        };
+        assert_ne!(perms & scl_core::PROTECTED, 0);
+        assert_eq!(
+            got_id, v1_id,
+            "completion must carry THEIRS' decided v1 ciphertext, not ours' stale v0"
+        );
+        let bytes = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            match s.get(&got_id).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("expected Blob"),
+            }
+        };
+        let pt =
+            crate::protect::decrypt_with(&bytes, &got_id, &[&snap.protection], &alice_sk, "secret/x.txt")
+                .unwrap();
+        assert_eq!(&pt[..], b"v1", "the carried blob decrypts to theirs' update");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

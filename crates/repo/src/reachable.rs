@@ -67,8 +67,10 @@ pub fn reachable_objects(src: &mut impl ObjectSource, tips: &[ObjectId]) -> Resu
 
 /// Walk `root` and every subtree it reaches, recording trees and blobs in
 /// `seen`. Uses an explicit stack rather than recursion so a deeply-nested
-/// (possibly hostile) remote tree can't overflow the call stack.
-fn walk_tree(src: &mut impl ObjectSource, root: ObjectId, seen: &mut BTreeSet<ObjectId>) -> Result<()> {
+/// (possibly hostile) remote tree can't overflow the call stack. `pub(crate)`
+/// so gc can protect an in-progress merge's decided carried tree
+/// (`MERGE_DECIDED_ROOT`), which is a TREE root, not a snapshot.
+pub(crate) fn walk_tree(src: &mut impl ObjectSource, root: ObjectId, seen: &mut BTreeSet<ObjectId>) -> Result<()> {
     let mut stack: Vec<ObjectId> = Vec::new();
     if seen.insert(root) {
         stack.push(root);

@@ -29,10 +29,12 @@ pub struct GcStats {
     pub packs_removed: usize,
 }
 
-/// The full safe root set: all branch tips + resolved HEAD + all
-/// remote-tracking tips + an in-progress merge's other parent + every
+/// The full safe root set (snapshot ids): all branch tips + resolved HEAD +
+/// all remote-tracking tips + an in-progress merge's other parent + every
 /// snapshot id still referenced by the (already-trimmed) oplog — undo/redo
-/// must never dangle a snapshot it can still restore to.
+/// must never dangle a snapshot it can still restore to. An in-progress
+/// merge's decided carried tree is a TREE root and is added separately in
+/// [`run`].
 fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     let mut set: BTreeSet<ObjectId> = BTreeSet::new();
     for (_, id) in refs::list_heads(layout)? {
@@ -67,7 +69,14 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     oplog::trim_older_than(layout, cutoff)?;
 
     let roots = roots(layout)?;
-    let reachable: BTreeSet<ObjectId> = reachable::reachable_objects(store, &roots)?;
+    let mut reachable: BTreeSet<ObjectId> = reachable::reachable_objects(store, &roots)?;
+    // An in-progress merge's decided carried tree (MERGE_DECIDED_ROOT) is a
+    // TREE root, not a snapshot: its tree nodes are freshly written by the
+    // conflict path and reachable from no snapshot yet, but merge completion
+    // needs them — protect them like any other root.
+    if let Some(tree) = merge_state::read_decided_root(layout)? {
+        reachable::walk_tree(store, tree, &mut reachable)?;
+    }
 
     // 1. Repack the entire reachable set into one fresh pack (skip if empty).
     let new_hash = if reachable.is_empty() {
@@ -205,12 +214,34 @@ mod tests {
         let theirs = repo.commit("t", "c2").unwrap();
         // Point the branch back to base; record `theirs` only via MERGE_HEAD.
         refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
-        merge_state::write(repo.layout(), &theirs, &["a.txt".into()]).unwrap();
+        // Record a decided carried tree reachable from NO snapshot — exactly
+        // what the conflict path writes; completion needs it after a mid-merge gc.
+        let (decided_blob, decided_tree) = {
+            let arc = repo.vfs().store();
+            let mut s = arc.lock().unwrap();
+            let blob = s.put(Object::blob(b"decided-only-bytes".to_vec())).unwrap();
+            let tree = s
+                .put(Object::Tree(scl_core::Tree::new(vec![scl_core::TreeEntry {
+                    name: "d.txt".into(),
+                    kind: scl_core::EntryKind::Blob,
+                    id: blob,
+                    mode: scl_core::FileMode::FILE,
+                    perms: 0,
+                }])))
+                .unwrap();
+            (blob, tree)
+        };
+        merge_state::write(repo.layout(), &theirs, &["a.txt".into()], Some(&decided_tree))
+            .unwrap();
 
         repo.gc(Duration::from_secs(0)).unwrap();
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
         assert!(s.contains(&theirs), "MERGE_HEAD must protect the in-progress other parent");
+        assert!(
+            s.contains(&decided_tree) && s.contains(&decided_blob),
+            "MERGE_DECIDED_ROOT must protect the decided carried tree + its blobs"
+        );
         drop(s);
         std::fs::remove_dir_all(&root).unwrap();
     }

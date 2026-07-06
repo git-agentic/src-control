@@ -766,7 +766,7 @@ mod tests {
 
         // Merge in progress.
         let ours_tip = repo.head_tip().unwrap().unwrap();
-        crate::merge_state::write(&repo.layout, &ours_tip, &[]).unwrap();
+        crate::merge_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
         let err = repo.cherry_pick("work-1", "me").unwrap_err();
         assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
         crate::merge_state::clear(&repo.layout).unwrap();
@@ -801,7 +801,7 @@ mod tests {
         repo.switch("main").unwrap();
 
         let ours_tip = repo.head_tip().unwrap().unwrap();
-        crate::merge_state::write(&repo.layout, &ours_tip, &[]).unwrap();
+        crate::merge_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
         let err = repo.cherry_pick("work-1", "me").unwrap_err();
         assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(ours_tip), "tip must not move");
