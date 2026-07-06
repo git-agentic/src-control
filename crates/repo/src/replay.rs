@@ -1324,6 +1324,147 @@ mod tests {
     }
 
     #[test]
+    fn stale_merge_decided_root_residue_does_not_hijack_pick_completion() {
+        // Task 7 review (Important): the conflict paths write the decided
+        // root BEFORE their HEAD (crash discipline), so a crashed conflicted
+        // merge can leave MERGE_DECIDED_ROOT with NO MERGE_HEAD. Completion
+        // must read a decided root only under its own in-progress HEAD —
+        // an ungated read let this residue hijack a later pick's completion,
+        // carrying ours' STALE v0 over the pick's decided v1.
+        let root = tmp_root("cp-stale-merge-residue");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x.txt"), b"v0").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // ours: only the plain conflicting edit; secret/x.txt stays v0.
+        std::fs::write(root.join("shared.txt"), b"a\nX\nc\n").unwrap();
+        let ours = repo.commit("me", "ours edits shared").unwrap();
+
+        // picked: update secret/x.txt to v1 + the conflicting plain edit.
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/x.txt"), b"v1").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nY\nc\n").unwrap();
+        let picked = repo.commit("me", "work updates secret + edits shared").unwrap();
+        let (v1_id, _) = tree_entry(&repo, &picked, "secret/x.txt");
+
+        repo.switch("main").unwrap();
+
+        // Crash residue: MERGE_DECIDED_ROOT pointing at OURS' tree (holds the
+        // stale v0 ciphertext), with NO MERGE_HEAD — exactly what a crash
+        // between the decided-root write and the MERGE_HEAD write leaves.
+        let ours_root = repo.snapshot(&ours).unwrap().root;
+        std::fs::write(
+            repo.layout.dot_sc.join("MERGE_DECIDED_ROOT"),
+            format!("{}\n", ours_root.to_hex()),
+        )
+        .unwrap();
+        assert!(!crate::merge_state::in_progress(&repo.layout), "no MERGE_HEAD");
+
+        // Keyless conflicted pick, resolve, complete.
+        let err = repo.cherry_pick("work", "me", None).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
+        let id = repo.commit("me", "resolve").unwrap();
+
+        let (got_id, perms) = tree_entry(&repo, &id, "secret/x.txt");
+        assert_ne!(perms & scl_core::PROTECTED, 0);
+        assert_eq!(
+            got_id, v1_id,
+            "the PICK's decided v1 must win — stale merge residue hijacked the completion"
+        );
+        // The completing commit's merge_state::clear also swept the residue.
+        assert_eq!(crate::merge_state::read_decided_root(&repo.layout).unwrap(), None);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn clean_cherry_pick_encrypts_ours_plain_file_under_picked_side_rule() {
+        // The clean-pick I2 case: ours holds a PLAIN file under a rule only
+        // the picked side knows. The replayed tree must carry it as PROTECTED
+        // ciphertext under the union rule — one side lacking the rule must
+        // not let plaintext land in the replayed snapshot (bit<->rule
+        // invariant). No identity needed: fresh encryption uses public keys.
+        let root = tmp_root("cp-clean-i2");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // ours: a plain file under keys/ — no rule on this side.
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/k1.txt"), b"k1 contents\n").unwrap();
+        let main_tip = repo.commit("me", "main adds plain keys/k1.txt").unwrap();
+
+        // picked side: add the keys/ rule, then a protected file under it.
+        repo.switch("work").unwrap();
+        repo.protect("keys/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/k2.txt"), b"k2 contents\n").unwrap();
+        let picked = repo.commit("me", "work adds protected keys/k2.txt").unwrap();
+        let (k2_id, _) = tree_entry(&repo, &picked, "keys/k2.txt");
+
+        repo.switch("main").unwrap();
+
+        // KEYLESS clean pick.
+        let outcome = repo.cherry_pick("work", "me", None).unwrap();
+        let id = match outcome {
+            PickResult::Picked(id) => id,
+            other => panic!("expected Picked, got {other:?}"),
+        };
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![main_tip]);
+        assert!(
+            snap.protection.prefixes.iter().any(|p| p.prefix == "keys/"),
+            "union rule recorded on the picked snapshot"
+        );
+
+        // Ours' formerly-plain k1 is now PROTECTED ciphertext under the union
+        // rule, freshly wrapped for the rule's recipients...
+        let (k1_id, k1_perms) = tree_entry(&repo, &id, "keys/k1.txt");
+        assert_ne!(k1_perms & scl_core::PROTECTED, 0, "I2: plain file under union rule encrypts");
+        let k1_bytes = blob_bytes_of(&repo, &k1_id);
+        assert_ne!(&k1_bytes[..], b"k1 contents\n", "no plaintext in the CAS tree");
+        let pt = crate::protect::decrypt_with(
+            &k1_bytes,
+            &k1_id,
+            &[&snap.protection],
+            &alice_sk,
+            "keys/k1.txt",
+        )
+        .unwrap();
+        assert_eq!(&pt[..], b"k1 contents\n");
+        // ...and the keyless materialize removed the now-protected plaintext
+        // from disk (confidentiality: no key, no plaintext).
+        assert!(!root.join("keys/k1.txt").exists(), "keyless: protected file leaves the disk");
+
+        // The picked side's k2 ciphertext is carried verbatim with its wraps.
+        let (got_k2, k2_perms) = tree_entry(&repo, &id, "keys/k2.txt");
+        assert_eq!(got_k2, k2_id, "picked ciphertext carried verbatim");
+        assert_ne!(k2_perms & scl_core::PROTECTED, 0);
+        let k2_bytes = blob_bytes_of(&repo, &got_k2);
+        let pt = crate::protect::decrypt_with(
+            &k2_bytes,
+            &got_k2,
+            &[&snap.protection],
+            &alice_sk,
+            "keys/k2.txt",
+        )
+        .unwrap();
+        assert_eq!(&pt[..], b"k2 contents\n");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn rebase_replays_commits_in_order_onto_target() {
         let root = tmp_root("rebase-order");
         let repo = Repo::init(&root).unwrap();

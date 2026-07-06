@@ -78,12 +78,21 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     // (MERGE_DECIDED_ROOT / PICK_DECIDED_ROOT) is a TREE root, not a
     // snapshot: its tree nodes are freshly written by the conflict path and
     // reachable from no snapshot yet, but completion needs them — protect
-    // them like any other root.
-    if let Some(tree) = merge_state::read_decided_root(layout)? {
-        reachable::walk_tree(store, tree, &mut reachable)?;
+    // them like any other root. Each is walked ONLY under its own
+    // in-progress HEAD: the conflict paths write the decided root BEFORE the
+    // HEAD (crash discipline), so a crash in that window leaves a
+    // decided-root file with no matching HEAD — such residue is inert
+    // (completion ignores it, see `Repo::commit`) and must not retain a dead
+    // tree forever.
+    if merge_state::read_merge_head(layout)?.is_some() {
+        if let Some(tree) = merge_state::read_decided_root(layout)? {
+            reachable::walk_tree(store, tree, &mut reachable)?;
+        }
     }
-    if let Some(tree) = pick_state::read_decided_root(layout)? {
-        reachable::walk_tree(store, tree, &mut reachable)?;
+    if pick_state::read_pick_head(layout)?.is_some() {
+        if let Some(tree) = pick_state::read_decided_root(layout)? {
+            reachable::walk_tree(store, tree, &mut reachable)?;
+        }
     }
 
     // 1. Repack the entire reachable set into one fresh pack (skip if empty).

@@ -355,10 +355,20 @@ impl Repo {
         // The merge's (or pick's) decided carried tree, when the conflict
         // path recorded one (absent for state written before the record
         // existed). Merge and pick are mutually exclusive (each refuses to
-        // start while the other is in progress), so at most one is set.
-        let decided_root = match crate::merge_state::read_decided_root(&self.layout)? {
-            Some(dr) => Some(dr),
-            None => crate::pick_state::read_decided_root(&self.layout)?,
+        // start while the other is in progress), so at most one HEAD is set.
+        // Each decided root is read ONLY under its own in-progress HEAD: the
+        // conflict paths write the decided root BEFORE the HEAD (crash
+        // discipline — the HEAD is the in-progress signal), so a crash in
+        // that window leaves a decided-root file with NO matching HEAD. Such
+        // residue must be inert — an ungated read here let a stale
+        // MERGE_DECIDED_ROOT hijack a later pick's completion, carrying
+        // stale blobs over the pick's decided ones.
+        let decided_root = if merge_head.is_some() {
+            crate::merge_state::read_decided_root(&self.layout)?
+        } else if pick_head.is_some() {
+            crate::pick_state::read_decided_root(&self.layout)?
+        } else {
+            None
         };
         let merging = merge_head.is_some();
         let picking = pick_head.is_some();
