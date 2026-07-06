@@ -112,7 +112,7 @@ fn split_for_encryption(
 /// against the union rules (onto-side ∪ commit-side) and the returned
 /// [`ReplayOutcome::Clean`] carries the fully assembled protection (union
 /// rules; wraps = carry ∪ fresh, wrap-reused against the onto side, pruned to
-/// the merged tree) so callers (cherry-pick now, rebase in Task 8) only
+/// the merged tree) so callers (cherry-pick, and rebase's fold) only
 /// thread it into `build_snapshot`.
 pub(crate) fn replay_commit(
     repo: &Repo,
@@ -197,29 +197,6 @@ pub(crate) fn replay_commit(
         root,
         protection: Protection { prefixes: union_prefixes, wrapped },
     })
-}
-
-/// Interim guard for REBASE only (P15 Task 7 — cherry-pick now replays
-/// protected content through the perms-aware core above): refuse a replay
-/// whose base/onto/theirs trees carry any `PROTECTED` entry, because rebase
-/// does not yet thread identity or the accumulated protection between
-/// replayed commits. Task 8 lifts this and deletes
-/// [`Error::ReplayProtected`] with it. Pure read + early return.
-fn ensure_replay_unprotected(repo: &Repo, commit_id: ObjectId, onto_root: ObjectId) -> Result<()> {
-    let snap = repo.snapshot(&commit_id)?;
-    let base_root = match snap.parents.first() {
-        Some(p) => Some(repo.snapshot(p)?.root),
-        None => None,
-    };
-    let store_arc = repo.vfs().store();
-    let mut store = store_arc.lock().unwrap();
-    for root in [base_root, Some(onto_root), Some(snap.root)].into_iter().flatten() {
-        let entries = worktree::tree_file_entries_with_perms(&mut store, root)?;
-        if entries.values().any(|(_, _, perms)| perms & scl_core::PROTECTED != 0) {
-            return Err(Error::ReplayProtected(commit_id.to_string()));
-        }
-    }
-    Ok(())
 }
 
 /// Outcome of [`Repo::cherry_pick`].
@@ -452,7 +429,26 @@ impl Repo {
     /// Same crash discipline as `cherry_pick`'s clean path: snapshots land in
     /// the CAS, then the working tree is materialized, then the branch ref is
     /// moved (the atomic commit point), with the oplog record written last.
-    pub fn rebase(&self, target: &str, author: &str) -> Result<RebaseResult> {
+    ///
+    /// Protected paths (P15 Task 8) resolve per replayed commit exactly like
+    /// [`cherry_pick`][Repo::cherry_pick]'s: ciphertext-id fast paths need no
+    /// `identity`; a protected path that diverged in content on both sides
+    /// needs one. The fold threads the ACCUMULATED protection — each clean
+    /// replay's assembled protection (union rules, carry ∪ fresh wraps)
+    /// becomes both the new snapshot's policy and the onto-side policy for
+    /// the next commit in the range, so a file freshly encrypted by an
+    /// earlier replay keeps its wraps through the rest of the fold. An
+    /// identity/authorization failure aborts the whole rebase like a conflict
+    /// does (refs and working tree byte-identical), with the typed error
+    /// naming both the path and the commit being replayed. The final (and ff
+    /// fast-path) materialize decrypts for `identity` where possible and
+    /// skips the rest — never writes ciphertext to disk.
+    pub fn rebase(
+        &self,
+        target: &str,
+        author: &str,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<RebaseResult> {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -491,7 +487,7 @@ impl Repo {
                     target_root,
                     Some(ours_root),
                     &target_protection,
-                    None,
+                    identity,
                 )?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &target_tip)?;
@@ -532,6 +528,11 @@ impl Repo {
         let target_snap = self.snapshot(&target_tip)?;
         let mut acc_tip = target_tip;
         let mut acc_root = target_snap.root;
+        // Accumulated protection: starts as target's policy and is replaced by
+        // each clean replay's ASSEMBLED protection, so the onto side of every
+        // step sees the rules and wraps produced by the steps before it (a
+        // file freshly encrypted mid-range stays decryptable downstream).
+        let mut acc_protection = target_snap.protection.clone();
         let mut replayed = 0usize;
         let mut skipped = 0usize;
         // Replay carries `target_snap.secrets` forward wholesale for every
@@ -547,32 +548,41 @@ impl Repo {
             if secrets_changed_from_parent(self, commit)? {
                 secrets_dropped_anywhere = true;
             }
-            // Interim (Task 7): rebase still refuses protected content — it
-            // does not yet thread identity or the accumulated protection
-            // between replayed commits (Task 8 does both and deletes this
-            // guard together with `Error::ReplayProtected`). Fires before
-            // anything is written for this commit.
-            ensure_replay_unprotected(self, commit, acc_root)?;
-            match replay_commit(self, commit, (acc_root, &target_snap.protection), None)? {
+            // A rebase spans a range, so an identity/authorization abort must
+            // name WHICH replay tripped, not just the path — same spirit as
+            // `RebaseConflicts` carrying its commit. Nothing outside the CAS
+            // has been written when these fire, so the abort leaves refs and
+            // the working tree byte-identical.
+            let outcome = replay_commit(self, commit, (acc_root, &acc_protection), identity)
+                .map_err(|e| match e {
+                    Error::ProtectedMergeNeedsIdentity(path) => Error::ProtectedMergeNeedsIdentity(
+                        format!("{path} (replaying commit {})", commit.short()),
+                    ),
+                    Error::NotAuthorized(path) => {
+                        Error::NotAuthorized(format!("{path} (replaying commit {})", commit.short()))
+                    }
+                    other => other,
+                })?;
+            match outcome {
                 ReplayOutcome::Empty => {
                     skipped += 1;
                 }
                 ReplayOutcome::Clean { root, protection } => {
-                    // The guard above means the assembled protection can
-                    // differ from target's only in prefix rules (never in
-                    // wraps); record it so a plain file falling under a rule
-                    // either side knows stays governed — same union
-                    // discipline as cherry-pick's clean path.
+                    // The replay's ASSEMBLED protection (union rules, carry ∪
+                    // fresh wraps — same discipline as cherry-pick's clean
+                    // path) is recorded on the new snapshot AND becomes the
+                    // accumulator for the next step of the fold.
                     let id = self.build_snapshot(
                         root,
                         vec![acc_tip],
                         target_snap.secrets.clone(),
-                        protection,
+                        protection.clone(),
                         author,
                         &commit_snap.message,
                     )?;
                     acc_tip = id;
                     acc_root = root;
+                    acc_protection = protection;
                     replayed += 1;
                 }
                 ReplayOutcome::Conflicts { paths, .. } => {
@@ -586,13 +596,17 @@ impl Repo {
         {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
+            // The LAST assembled protection covers every blob in `acc_root`
+            // (each step pruned its wrap map to its own merged tree): a
+            // PROTECTED entry decrypts for `identity` when possible, else is
+            // skipped — never writes ciphertext to disk.
             worktree::materialize(
                 &self.layout,
                 &mut store,
                 acc_root,
                 Some(ours_root),
-                &target_snap.protection,
-                None,
+                &acc_protection,
+                identity,
             )?;
         }
         refs::write_branch_tip(&self.layout, &head, &acc_tip)?;
@@ -853,37 +867,6 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// Interim Task 7 state: cherry-pick now replays protected content, but
-    /// REBASE keeps the fail-closed guard until Task 8 threads identity and
-    /// the accumulated protection through the range.
-    #[test]
-    fn rebase_over_protected_content_still_refused_until_task8() {
-        let proot = tmp_root("rebase-refused-protected");
-        let prepo = Repo::init(&proot).unwrap();
-        let (_sk, pk) = scl_crypto::generate_keypair();
-        prepo.test_set_protected_prefix("secret/", &[pk]).unwrap();
-        std::fs::create_dir_all(proot.join("secret")).unwrap();
-        std::fs::write(proot.join("secret/db.txt"), b"hunter2").unwrap();
-        prepo.commit("me", "base").unwrap();
-        prepo.branch("feature").unwrap();
-
-        // main gains a commit so the rebase has real work to do (no fast path).
-        std::fs::write(proot.join("main.txt"), b"m\n").unwrap();
-        prepo.commit("me", "main adds main.txt").unwrap();
-
-        prepo.switch("feature").unwrap();
-        std::fs::write(proot.join("other.txt"), b"o\n").unwrap();
-        prepo.commit("me", "feature adds other").unwrap();
-        let feature_tip = prepo.head_tip().unwrap();
-
-        let err = prepo.rebase("main", "me").unwrap_err();
-        assert!(matches!(err, Error::ReplayProtected(_)), "got {err:?}");
-        assert_eq!(prepo.head_tip().unwrap(), feature_tip, "feature tip must not move");
-
-        drop(prepo);
-        std::fs::remove_dir_all(&proot).ok();
     }
 
     #[test]
@@ -1484,7 +1467,7 @@ mod tests {
         let c2 = repo.commit("me", "feature c2").unwrap();
         let _ = c2;
 
-        let outcome = repo.rebase("main", "me").unwrap();
+        let outcome = repo.rebase("main", "me", None).unwrap();
         let (new_tip, replayed, skipped) = match outcome {
             RebaseResult::Rebased { new_tip, replayed, skipped } => (new_tip, replayed, skipped),
             other => panic!("expected Rebased, got {other:?}"),
@@ -1527,14 +1510,14 @@ mod tests {
         let feature_tip = repo.commit("me", "feature adds f").unwrap();
         repo.switch("main").unwrap();
 
-        let outcome = repo.rebase("feature", "me").unwrap();
+        let outcome = repo.rebase("feature", "me", None).unwrap();
         assert_eq!(outcome, RebaseResult::FastForwarded(feature_tip));
         assert_eq!(repo.head_tip().unwrap(), Some(feature_tip));
         let ops = repo.oplog().unwrap();
         assert_eq!(ops.last().unwrap().desc, "rebase onto feature (ff)");
 
         // Target is now an ancestor of current: AlreadyUpToDate.
-        let outcome = repo.rebase("feature", "me").unwrap();
+        let outcome = repo.rebase("feature", "me", None).unwrap();
         assert_eq!(outcome, RebaseResult::AlreadyUpToDate);
         assert_eq!(repo.head_tip().unwrap(), Some(feature_tip), "tip must not move");
 
@@ -1588,7 +1571,7 @@ mod tests {
         let before_x = std::fs::read(root.join("x.txt")).unwrap();
         let ops_before = repo.oplog().unwrap().len();
 
-        let err = repo.rebase("main", "me").unwrap_err();
+        let err = repo.rebase("main", "me", None).unwrap_err();
         match err {
             Error::RebaseConflicts { paths, .. } => assert_eq!(paths, vec!["x.txt".to_string()]),
             other => panic!("expected RebaseConflicts, got {other:?}"),
@@ -1627,7 +1610,7 @@ mod tests {
 
         // Rebase feature onto main.
         repo.switch("feature").unwrap();
-        let outcome = repo.rebase("main", "me").unwrap();
+        let outcome = repo.rebase("main", "me", None).unwrap();
         match outcome {
             RebaseResult::Rebased { replayed, skipped, .. } => {
                 assert_eq!(replayed, 1, "only 'adds b' should replay");
@@ -1666,7 +1649,7 @@ mod tests {
         repo.secret_add("DB_URL", b"v1", &[pk]).unwrap();
         assert_eq!(repo.secret_list().unwrap().len(), 1);
 
-        let outcome = repo.rebase("main", "me").unwrap();
+        let outcome = repo.rebase("main", "me", None).unwrap();
         match outcome {
             RebaseResult::Rebased { .. } => {}
             other => panic!("expected Rebased, got {other:?}"),
@@ -1715,9 +1698,269 @@ mod tests {
         repo.switch("feature").unwrap();
         assert_eq!(repo.head_tip().unwrap(), feature_tip_before);
 
-        let err = repo.rebase("main", "me").unwrap_err();
+        let err = repo.rebase("main", "me", None).unwrap_err();
         assert!(matches!(err, Error::CannotReplayMerge(id) if id == merged), "got {err:?}");
         assert_eq!(repo.head_tip().unwrap(), feature_tip_before, "feature tip must not move");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Snapshot every file under `dir` (path -> bytes) — the refs-dir
+    /// byte-compare pattern from `conflicting_rebase_aborts_with_refs_byte_identical`.
+    fn snapshot_dir(
+        dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    out.extend(snapshot_dir(&p));
+                } else {
+                    out.insert(p.clone(), std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rebase_protected_branch_by_non_recipient_disjoint_edits() {
+        // Feature updates a protected file the target never touched: every
+        // replay rides the ciphertext-id fast path, so a NON-RECIPIENT
+        // rebases keyless — and the accumulated protection carries the blob's
+        // wraps to the new tip, where the recipient still decrypts.
+        let root = tmp_root("rebase-prot-disjoint");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"v1").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main gains an unrelated plain commit.
+        std::fs::write(root.join("main.txt"), b"m\n").unwrap();
+        let main_tip = repo.commit("me", "main adds main.txt").unwrap();
+
+        // feature updates the protected file (identity only to materialize it
+        // for editing — the rebase itself runs keyless).
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"v2").unwrap();
+        let feature_tip = repo.commit("me", "feature updates secret").unwrap();
+        let (v2_id, _) = tree_entry(&repo, &feature_tip, "secret/db.txt");
+
+        // KEYLESS rebase of feature onto main.
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        let new_tip = match outcome {
+            RebaseResult::Rebased { new_tip, replayed, skipped } => {
+                assert_eq!((replayed, skipped), (1, 0));
+                new_tip
+            }
+            other => panic!("expected Rebased, got {other:?}"),
+        };
+        assert_eq!(repo.head_tip().unwrap(), Some(new_tip));
+        let snap = repo.snapshot(&new_tip).unwrap();
+        assert_eq!(snap.parents, vec![main_tip]);
+
+        // The feature ciphertext is carried byte-for-byte, PROTECTED, and its
+        // wraps survive into the new tip's protection: alice decrypts v2.
+        let (got_id, perms) = tree_entry(&repo, &new_tip, "secret/db.txt");
+        assert_eq!(got_id, v2_id, "ciphertext carried verbatim");
+        assert_ne!(perms & scl_core::PROTECTED, 0);
+        let bytes = blob_bytes_of(&repo, &got_id);
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &got_id,
+            &[&snap.protection],
+            &alice_sk,
+            "secret/db.txt",
+        )
+        .unwrap();
+        assert_eq!(&pt[..], b"v2", "recipient decrypts at the new tip");
+        // Keyless final materialize: main's file arrives, the protected file
+        // leaves the disk (no key, no plaintext — never ciphertext).
+        assert!(root.join("main.txt").exists());
+        assert!(!root.join("secret/db.txt").exists(), "keyless: protected file leaves the disk");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rebase_content_divergent_without_identity_aborts_byte_identical() {
+        // secret/a.txt diverged in content on both sides (mergeable lines): a
+        // keyless rebase aborts with the typed error naming BOTH the commit
+        // being replayed and the path, refs byte-identical, working tree and
+        // oplog untouched.
+        let root = tmp_root("rebase-prot-divergent-keyless");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main (target) edits line 1.
+        std::fs::write(root.join("secret/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        repo.commit("me", "main edits line 1").unwrap();
+
+        // feature edits line 3 (mergeable content divergence).
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
+        let feature_tip = repo.commit("me", "feature edits line 3").unwrap();
+
+        let before_refs = snapshot_dir(&root.join(".sc/refs"));
+        let before_a = std::fs::read(root.join("secret/a.txt")).unwrap();
+        let ops_before = repo.oplog().unwrap().len();
+
+        let err = repo.rebase("main", "me", None).unwrap_err();
+        match err {
+            Error::ProtectedMergeNeedsIdentity(ref msg) => {
+                assert!(msg.contains("secret/a.txt"), "error must name the path: {msg}");
+                assert!(
+                    msg.contains(&feature_tip.short()),
+                    "error must name the replayed commit: {msg}"
+                );
+            }
+            other => panic!("expected ProtectedMergeNeedsIdentity, got {other:?}"),
+        }
+
+        assert_eq!(
+            before_refs,
+            snapshot_dir(&root.join(".sc/refs")),
+            "refs dir must be byte-identical after the aborted rebase"
+        );
+        assert_eq!(repo.head_tip().unwrap(), Some(feature_tip), "feature tip must not move");
+        assert_eq!(std::fs::read(root.join("secret/a.txt")).unwrap(), before_a);
+        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no new oplog record");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rebase_content_divergent_with_identity_succeeds() {
+        // Same divergence as above, rebased WITH an identity: the plaintexts
+        // diff3 cleanly and the merged content is re-encrypted for ALL rule
+        // recipients, PROTECTED at the new tip, no plaintext in the CAS.
+        let root = tmp_root("rebase-prot-divergent-key");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk, bob_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        let main_tip = repo.commit("me", "main edits line 1").unwrap();
+
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
+        repo.commit("me", "feature edits line 3").unwrap();
+
+        let outcome = repo.rebase("main", "me", Some(&alice_sk)).unwrap();
+        let new_tip = match outcome {
+            RebaseResult::Rebased { new_tip, replayed, skipped } => {
+                assert_eq!((replayed, skipped), (1, 0));
+                new_tip
+            }
+            other => panic!("expected Rebased, got {other:?}"),
+        };
+        let snap = repo.snapshot(&new_tip).unwrap();
+        assert_eq!(snap.parents, vec![main_tip]);
+
+        let (blob_id, perms) = tree_entry(&repo, &new_tip, "secret/a.txt");
+        assert_ne!(perms & scl_core::PROTECTED, 0, "PROTECTED preserved at the new tip");
+        let bytes = blob_bytes_of(&repo, &blob_id);
+        assert!(!bytes.windows(4).any(|w| w == b"OURS"), "plaintext leaked into the CAS blob");
+        for (who, sk) in [("alice", &alice_sk), ("bob", &bob_sk)] {
+            let pt = crate::protect::decrypt_with(
+                &bytes,
+                &blob_id,
+                &[&snap.protection],
+                sk,
+                "secret/a.txt",
+            )
+            .unwrap();
+            assert_eq!(&pt[..], b"OURS\nl2\nTHEIRS\n", "{who} must decrypt the merged content");
+        }
+        // The identity-holder gets the merged plaintext on disk.
+        assert_eq!(
+            std::fs::read(root.join("secret/a.txt")).unwrap(),
+            b"OURS\nl2\nTHEIRS\n".to_vec()
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task 7 review regression: the interim guard aborted MID-FOLD when an
+    /// earlier replayed commit freshly encrypted a plain file under a
+    /// rules-only policy (I2) — commit B's replay then saw a PROTECTED entry
+    /// in the onto tree it had built itself. With the guard deleted and the
+    /// accumulated protection threaded, the multi-commit rebase succeeds and
+    /// the mid-range fresh wraps survive to the new tip.
+    #[test]
+    fn rebase_fresh_encryption_mid_fold_replays_next_commit_cleanly() {
+        let root = tmp_root("rebase-midfold-i2");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main (target): a rules-only keys/ policy — no keys/ file exists.
+        repo.protect("keys/", &[alice_pk], None).unwrap();
+        std::fs::write(root.join("main.txt"), b"m\n").unwrap();
+        repo.commit("me", "main adds main.txt").unwrap();
+
+        // feature, no rule on this side: commit A adds a PLAIN rule-matching
+        // file (gets freshly encrypted by I2 when replayed), commit B on top.
+        repo.switch("feature").unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/k1.txt"), b"k1 contents\n").unwrap();
+        repo.commit("me", "A: feature adds plain keys/k1.txt").unwrap();
+        std::fs::write(root.join("other.txt"), b"o\n").unwrap();
+        repo.commit("me", "B: feature adds other.txt").unwrap();
+
+        // KEYLESS rebase (fresh encryption uses public keys only).
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        let new_tip = match outcome {
+            RebaseResult::Rebased { new_tip, replayed, skipped } => {
+                assert_eq!((replayed, skipped), (2, 0), "both commits replay cleanly");
+                new_tip
+            }
+            other => panic!("expected Rebased, got {other:?}"),
+        };
+        let snap = repo.snapshot(&new_tip).unwrap();
+
+        // A's formerly-plain file is PROTECTED ciphertext at the new tip, and
+        // the fresh wraps minted while replaying A survived B's replay via
+        // the accumulated protection: alice decrypts through the TIP snapshot.
+        let (k1_id, perms) = tree_entry(&repo, &new_tip, "keys/k1.txt");
+        assert_ne!(perms & scl_core::PROTECTED, 0, "I2: plain file under union rule encrypts");
+        let bytes = blob_bytes_of(&repo, &k1_id);
+        assert_ne!(&bytes[..], b"k1 contents\n", "no plaintext in the CAS tree");
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &k1_id,
+            &[&snap.protection],
+            &alice_sk,
+            "keys/k1.txt",
+        )
+        .unwrap();
+        assert_eq!(&pt[..], b"k1 contents\n");
+
+        // B's plain addition landed, and the keyless materialize kept the
+        // now-protected file off disk.
+        assert!(root.join("other.txt").exists());
+        assert!(root.join("main.txt").exists());
+        assert!(!root.join("keys/k1.txt").exists(), "keyless: protected file leaves the disk");
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
