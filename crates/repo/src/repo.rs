@@ -870,9 +870,13 @@ fn push_file_diff(out: &mut String, path: &str, old: &[u8], new: &[u8]) {
 }
 
 
-/// Reject branch names that would escape or corrupt `refs/heads/`. A branch name
-/// becomes a single path component under `refs/heads/`, so names containing path
-/// separators, the special `.`/`..` components, or a leading dot are refused.
+/// Reject branch names that would escape or corrupt `refs/heads/` or the
+/// oplog grammar. A branch name becomes a single path component under
+/// `refs/heads/`, so names containing path separators, the special `.`/`..`
+/// components, or a leading dot are refused. The oplog's on-disk format
+/// (`oplog.rs`) is space-delimited and one-line-per-field, so a name
+/// containing whitespace or control characters would write an unparseable
+/// `ref <name> ...` line — refuse those too, before they ever reach the log.
 pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
@@ -880,6 +884,7 @@ pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
         || name.starts_with('.')
         || name.contains('/')
         || name.contains('\\')
+        || name.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return Err(Error::BadRef(format!("invalid branch name: {name:?}")));
     }
@@ -967,7 +972,7 @@ mod tests {
     #[test]
     fn rejects_unsafe_branch_names() {
         // Direct checks on the validator.
-        for bad in ["", ".", "..", "a/b", "a\\b", ".hidden"] {
+        for bad in ["", ".", "..", "a/b", "a\\b", ".hidden", "a b", "a\tb"] {
             assert!(
                 matches!(validate_branch_name(bad), Err(Error::BadRef(_))),
                 "expected {bad:?} to be rejected"
@@ -982,6 +987,9 @@ mod tests {
         repo.commit("me", "base").unwrap();
         assert!(matches!(repo.branch(".."), Err(Error::BadRef(_))));
         assert!(matches!(repo.switch("a/b"), Err(Error::BadRef(_))));
+        // Whitespace in a branch name would corrupt the oplog's space-delimited
+        // grammar (see oplog.rs) — reject it before it's ever written.
+        assert!(matches!(repo.branch("a b"), Err(Error::BadRef(_))));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

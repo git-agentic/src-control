@@ -448,7 +448,9 @@ conflict aborts wholesale with refs and the working tree untouched — unlike
 cherry-pick's per-commit resolve flow. Both follow the same crash discipline
 as `merge`: build the snapshot in the CAS, materialize the working tree,
 *then* move the branch ref — the ref update is the atomic commit point, so a
-crash before it leaves tip and tree consistently pre-operation.
+crash in that window leaves a post-operation working tree paired with a
+pre-operation tip (status reads dirty; no ref damage), not a consistently
+pre-operation state.
 
 A single append-only `.sc/oplog` gives every ref-moving operation (commits,
 merges, cherry-picks, rebases, switches, secret/protect ops, `sc work`

@@ -215,7 +215,9 @@ Tracked but out of scope for this roadmap horizon:
   (`--continue`), cherry-pick `--abort`, merge-commit replay (mainline
   selection), protected-path replay (lifts with P4's protected-merge
   follow-on), operation objects in the CAS (Jujutsu-deep upgrade to the
-  file oplog), oplog entries for remote-tracking refs.
+  file oplog), oplog entries for remote-tracking refs, secret-registry
+  replay for cherry-pick/rebase (currently the target-side registry is
+  carried forward wholesale and a skipped registry change only warns).
 - **Sub-tree / partial sharing** and sparse checkouts.
 - **Merge ergonomics**: richer conflict resolution UX beyond P4's
   detection/representation.

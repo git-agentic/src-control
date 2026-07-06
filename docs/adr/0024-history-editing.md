@@ -50,6 +50,9 @@ moving refs.
 - A torn operation (crash between ref write and oplog append) loses its
   undo record but never fabricates one (refs first, oplog last).
 - Rebase abandons already-built snapshots on abort — ordinary gc fodder.
+- Replay does not carry secret-registry changes: `sc rebase`/`sc cherry-pick`
+  warn when they skip a commit's registry change instead of replaying it
+  (follow-on: registry replay).
 
 ## Refinements during the build
 

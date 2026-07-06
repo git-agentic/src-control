@@ -3,6 +3,8 @@
 //! the cherry-pick/rebase CLI surface (Tasks 8-9) to apply one commit onto an
 //! arbitrary target tree without requiring a full branch merge.
 
+use std::collections::BTreeMap;
+
 use scl_core::{FileMode, ObjectId};
 
 use crate::error::{Error, Result};
@@ -10,6 +12,21 @@ use crate::merge;
 use crate::refs;
 use crate::repo::Repo;
 use crate::worktree;
+
+/// Does `commit_id`'s secret registry differ from its first parent's (empty
+/// registry if it's a root commit)? Replay (`cherry_pick`/`rebase`) always
+/// carries the *target*-side registry forward wholesale rather than diffing
+/// and reapplying per-commit changes (see module docs) — so a commit that
+/// added, rotated, or removed a secret has that change silently dropped by
+/// the replay. Callers use this to decide whether to warn.
+fn secrets_changed_from_parent(repo: &Repo, commit_id: ObjectId) -> Result<bool> {
+    let snap = repo.snapshot(&commit_id)?;
+    let parent_secrets = match snap.parents.first() {
+        Some(p) => repo.snapshot(p)?.secrets,
+        None => BTreeMap::new(),
+    };
+    Ok(snap.secrets != parent_secrets)
+}
 
 /// Result of replaying one commit onto a target tree.
 #[derive(Debug)]
@@ -133,9 +150,21 @@ impl Repo {
         let ours_snap = self.snapshot(&ours_tip)?;
         let ours_root = ours_snap.root;
         let picked_snap = self.snapshot(&picked_tip)?;
+        let secrets_dropped = secrets_changed_from_parent(self, picked_tip)?;
 
         match replay_commit(self, picked_tip, ours_root)? {
-            ReplayOutcome::Empty => Ok(PickResult::AlreadyApplied),
+            ReplayOutcome::Empty => {
+                // AlreadyApplied means the tree content already matches, but
+                // `replay_commit` only compares roots, not secret registries
+                // — for a secrets-only commit this is actively misleading:
+                // the secret change is neither present nor going to be.
+                if secrets_dropped {
+                    eprintln!(
+                        "warning: secret-registry changes on the cherry-picked commit were not replayed; re-add them or `sc undo`"
+                    );
+                }
+                Ok(PickResult::AlreadyApplied)
+            }
             ReplayOutcome::Clean { root } => {
                 let msg_first_line = picked_snap.message.lines().next().unwrap_or("");
                 let message = format!("{msg_first_line} (cherry-picked from {})", picked_tip.short());
@@ -174,6 +203,11 @@ impl Repo {
                     &head,
                     &[(head.clone(), before, Some(id))],
                 )?;
+                if secrets_dropped {
+                    eprintln!(
+                        "warning: secret-registry changes on the cherry-picked commit were not replayed; re-add them or `sc undo`"
+                    );
+                }
                 Ok(PickResult::Picked(id))
             }
             ReplayOutcome::Conflicts { files, sidecars, paths } => {
@@ -310,9 +344,19 @@ impl Repo {
         let mut acc_root = target_snap.root;
         let mut replayed = 0usize;
         let mut skipped = 0usize;
+        // Replay carries `target_snap.secrets` forward wholesale for every
+        // replayed commit (see the loop below) rather than diffing and
+        // reapplying each commit's own registry changes. Detect whether any
+        // commit in the range actually changed its registry from its
+        // (original-history) parent, so we can warn once after the rebase —
+        // not per commit — including the all-skipped case.
+        let mut secrets_dropped_anywhere = false;
 
         for commit in range {
             let commit_snap = self.snapshot(&commit)?;
+            if secrets_changed_from_parent(self, commit)? {
+                secrets_dropped_anywhere = true;
+            }
             match replay_commit(self, commit, acc_root)? {
                 ReplayOutcome::Empty => {
                     skipped += 1;
@@ -358,6 +402,11 @@ impl Repo {
             &head,
             &[(head.clone(), before, Some(acc_tip))],
         )?;
+        if secrets_dropped_anywhere {
+            eprintln!(
+                "warning: secret-registry changes on the rebased range were not replayed; re-add them or `sc undo`"
+            );
+        }
         Ok(RebaseResult::Rebased { new_tip: acc_tip, replayed, skipped })
     }
 }
@@ -915,6 +964,49 @@ mod tests {
             other => panic!("expected Rebased, got {other:?}"),
         }
         assert!(root.join("b.txt").exists());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Rebase's replay carries the *target*-side secret registry forward
+    /// wholesale (spec-blessed, see `secrets_changed_from_parent`) rather
+    /// than replaying a commit's own registry change — so a `secret add` in
+    /// the rebased range must not survive into the new history: HEAD's
+    /// registry afterwards must equal target's (unchanged). The warning
+    /// itself goes to stderr and isn't asserted here.
+    #[test]
+    fn rebase_drops_secret_registry_changes_from_the_range() {
+        let root = tmp_root("rebase-secrets");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main gains an unrelated commit so the rebase has real work to do.
+        std::fs::write(root.join("main.txt"), b"main\n").unwrap();
+        repo.commit("me", "main adds main.txt").unwrap();
+        let target_registry = repo.snapshot(&repo.head_tip().unwrap().unwrap()).unwrap().secrets;
+
+        // feature adds a secret, which lands in its snapshot's registry.
+        repo.switch("feature").unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        repo.secret_add("DB_URL", b"v1", &[pk]).unwrap();
+        assert_eq!(repo.secret_list().unwrap().len(), 1);
+
+        let outcome = repo.rebase("main", "me").unwrap();
+        match outcome {
+            RebaseResult::Rebased { .. } => {}
+            other => panic!("expected Rebased, got {other:?}"),
+        }
+
+        let new_tip = repo.head_tip().unwrap().unwrap();
+        let new_registry = repo.snapshot(&new_tip).unwrap().secrets;
+        assert_eq!(
+            new_registry, target_registry,
+            "replay must carry target's registry, not the rebased commit's secret add"
+        );
+        assert!(repo.secret_list().unwrap().is_empty());
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();

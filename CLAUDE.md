@@ -278,7 +278,10 @@ oplog-referenced snapshot ids as reachability roots and trims records past
 the prune-expire window, always keeping the newest. Protected content stays
 fail-closed: replay refuses any commit touching PROTECTED paths, inheriting
 P4's merge guard verbatim. The oplog is local-only, like a reflog — it never
-travels over `fetch`/`push`/`clone`. See ADR-0024.
+travels over `fetch`/`push`/`clone`. Replay does not carry secret-registry
+changes: `sc rebase`/`sc cherry-pick` warn (stderr) when they skip a
+commit's registry change rather than replaying it (follow-on: registry
+replay). See ADR-0024.
 
 Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
 frames, bulk re-wrap, multiple escrow keys, interactive workspace sessions,

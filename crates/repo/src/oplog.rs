@@ -95,6 +95,19 @@ pub(crate) fn record(
     head_after: &str,
     refs: &[(String, Option<ObjectId>, Option<ObjectId>)],
 ) -> Result<()> {
+    // Defense in depth: the on-disk grammar is space-delimited and
+    // one-line-per-field (see module docs), so a ref name containing
+    // whitespace or control characters would write an unparseable block —
+    // refuse before ever touching the file. `validate_branch_name` in
+    // repo.rs is the primary guard; this catches any other caller.
+    for (name, _, _) in refs {
+        if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(Error::InvalidArgument(format!(
+                "ref name {name:?} contains whitespace/control characters; would corrupt the oplog grammar"
+            )));
+        }
+    }
+
     let path = layout.oplog_path();
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -841,6 +854,28 @@ mod tests {
         let err = repo.undo().unwrap_err();
         assert!(matches!(err, Error::NothingToUndo), "got {err:?}");
         teardown_repo(repo, &root);
+    }
+
+    #[test]
+    fn record_refuses_ref_name_with_whitespace() {
+        let layout = tmp_layout("bad-ref-name");
+
+        let err = record(
+            &layout,
+            "commit with bad ref",
+            "main",
+            "main",
+            &[("a b".to_string(), None, Some(ObjectId::of(b"x")))],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+
+        // Nothing was written: the log stays empty rather than gaining an
+        // unparseable block.
+        assert!(read_all(&layout).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&layout.root).unwrap();
+        assert!(!layout.root.exists());
     }
 
     #[test]
