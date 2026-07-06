@@ -42,13 +42,18 @@ impl Repo {
         }
     }
 
-    /// Commit a changed registry, keeping the tip's file tree.
+    /// Commit a changed registry, keeping the tip's file tree. Logs one oplog
+    /// record (`oplog_desc`) for the branch advance — the current branch is
+    /// unchanged, only its tip moves.
     fn commit_registry(
         &self,
         registry: BTreeMap<String, ObjectId>,
         author: &str,
         message: &str,
+        oplog_desc: &str,
     ) -> Result<ObjectId> {
+        let head = crate::refs::current_branch(self.layout())?;
+        let before = crate::refs::read_branch_tip(self.layout(), &head)?;
         let tip = self.head_tip()?;
         let (root, protection) = match tip {
             Some(t) => {
@@ -58,7 +63,10 @@ impl Repo {
             }
             None => (self.vfs_handle().write_tree(&[])?, scl_core::Protection::default()),
         };
-        self.commit_snapshot(root, tip.into_iter().collect(), registry, protection, author, message)
+        let id =
+            self.commit_snapshot(root, tip.into_iter().collect(), registry, protection, author, message)?;
+        crate::oplog::record(self.layout(), oplog_desc, &head, &head, &[(head.clone(), before, Some(id))])?;
+        Ok(id)
     }
 
     /// Seal `value` to `recipients` and register it under `name`.
@@ -72,7 +80,7 @@ impl Repo {
         };
         let mut reg = self.registry()?;
         reg.insert(name.to_string(), id);
-        self.commit_registry(reg, "secret", &format!("add secret {name}"))
+        self.commit_registry(reg, "secret", &format!("add secret {name}"), &format!("secret add {name}"))
     }
 
     /// Grant `new` access to `name` by re-wrapping the DEK with `authorized`.
@@ -94,7 +102,7 @@ impl Repo {
             i
         };
         reg.insert(name.to_string(), new_id);
-        self.commit_registry(reg, "secret", &format!("grant {name}"))
+        self.commit_registry(reg, "secret", &format!("grant {name}"), &format!("secret grant {name}"))
     }
 
     /// Revoke a recipient from `name` (metadata-only re-wrap).
@@ -125,7 +133,7 @@ impl Repo {
             i
         };
         reg.insert(name.to_string(), new_id);
-        self.commit_registry(reg, "secret", &format!("revoke from {name}"))
+        self.commit_registry(reg, "secret", &format!("revoke from {name}"), &format!("secret revoke {name}"))
     }
 
     /// Rotate a secret's value under a **fresh DEK**, re-sealing for `recipients`.
@@ -177,7 +185,7 @@ impl Repo {
             i
         };
         reg.insert(name.to_string(), new_id);
-        self.commit_registry(reg, "secret", &format!("rotate {name}"))
+        self.commit_registry(reg, "secret", &format!("rotate {name}"), &format!("secret rotate {name}"))
     }
 
     /// The current recipient ids for `name` (so callers can resolve the existing
@@ -550,6 +558,48 @@ mod tests {
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].0, "DB_URL");
         assert_eq!(envs[0].1, std::ffi::OsString::from("v"));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn secret_add_grant_revoke_rotate_append_oplog_records() {
+        let root = tmp_root("oplog-secret");
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        // secret add: moves the current branch's tip.
+        let head = crate::refs::current_branch(repo.layout()).unwrap();
+        let before_add = crate::refs::read_branch_tip(repo.layout(), &head).unwrap();
+        let id_add = repo.secret_add("DB_URL", b"v1", &[alice_pk]).unwrap();
+        let rec = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert_eq!(rec.desc, "secret add DB_URL");
+        assert_eq!(rec.head_before, head);
+        assert_eq!(rec.head_after, head);
+        assert_eq!(rec.refs, vec![(head.clone(), before_add, Some(id_add))]);
+
+        // secret grant.
+        let recipient = alice_sk.public().recipient_id();
+        let id_grant = repo.secret_grant("DB_URL", &alice_sk, &bob_pk).unwrap();
+        let rec = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert_eq!(rec.desc, "secret grant DB_URL");
+        assert_eq!(rec.refs, vec![(head.clone(), Some(id_add), Some(id_grant))]);
+
+        // secret revoke.
+        let id_revoke = repo.secret_revoke("DB_URL", &recipient).unwrap();
+        let rec = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert_eq!(rec.desc, "secret revoke DB_URL");
+        assert_eq!(rec.refs, vec![(head.clone(), Some(id_grant), Some(id_revoke))]);
+
+        // secret rotate.
+        let id_rotate = repo.secret_rotate("DB_URL", Some(b"v2"), &[bob_pk], None).unwrap();
+        let rec = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert_eq!(rec.desc, "secret rotate DB_URL");
+        assert_eq!(rec.refs, vec![(head.clone(), Some(id_revoke), Some(id_rotate))]);
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();

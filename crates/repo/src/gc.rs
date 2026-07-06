@@ -12,13 +12,13 @@
 //! and is old now) — mirroring git's loose-vs-packed pruning model.
 
 use std::collections::BTreeSet;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use scl_core::{ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
-use crate::{merge_state, reachable, refs};
+use crate::{merge_state, oplog, reachable, refs};
 
 /// What a gc pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -30,7 +30,9 @@ pub struct GcStats {
 }
 
 /// The full safe root set: all branch tips + resolved HEAD + all
-/// remote-tracking tips + an in-progress merge's other parent.
+/// remote-tracking tips + an in-progress merge's other parent + every
+/// snapshot id still referenced by the (already-trimmed) oplog — undo/redo
+/// must never dangle a snapshot it can still restore to.
 fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     let mut set: BTreeSet<ObjectId> = BTreeSet::new();
     for (_, id) in refs::list_heads(layout)? {
@@ -45,12 +47,25 @@ fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     if let Some(id) = merge_state::read_merge_head(layout)? {
         set.insert(id);
     }
+    for id in oplog::referenced_ids(layout)? {
+        set.insert(id);
+    }
     Ok(set.into_iter().collect())
 }
 
 /// Run a gc pass. Caller must already hold the repo lock.
 pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStats> {
     let mut stats = GcStats::default();
+
+    // Trim oplog records past the grace window BEFORE computing roots, so a
+    // just-trimmed record's snapshot doesn't linger as a root this pass (it
+    // always keeps the newest record regardless of cutoff).
+    let cutoff = (SystemTime::now() - grace)
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    oplog::trim_older_than(layout, cutoff)?;
+
     let roots = roots(layout)?;
     let reachable: BTreeSet<ObjectId> = reachable::reachable_objects(store, &roots)?;
 
@@ -209,6 +224,114 @@ mod tests {
         repo.gc(Duration::from_secs(0)).unwrap();
         let second = repo.gc(Duration::from_secs(0)).unwrap();
         assert_eq!(second.loose_pruned, 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn oplog_referenced_snapshots_survive_gc() {
+        let root = tmp_root("oplog-roots");
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        let c1 = repo.commit("t", "c1").unwrap();
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+        let c2 = repo.commit("t", "c2").unwrap();
+
+        // Undo: tip back to c1; c2 is now unreachable from refs but still
+        // referenced by the oplog (the undo record's "after" for main).
+        repo.undo().unwrap();
+        assert_eq!(refs::head_tip(repo.layout()).unwrap(), Some(c1));
+
+        let stats = repo.gc(Duration::from_secs(0)).unwrap();
+        assert_eq!(stats.loose_pruned, 0, "oplog-referenced c2 must not be pruned");
+
+        let arc = repo.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(s.contains(&c2), "c2 must survive gc: still referenced by the oplog");
+        drop(s);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn gc_trims_old_oplog_records_and_releases_roots() {
+        let root = tmp_root("oplog-trim");
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base").unwrap();
+        let base = repo.commit("t", "base").unwrap();
+
+        // A snapshot reachable ONLY via its own commit record; rewind the
+        // branch tip directly (bypassing undo/oplog) so no inverse record is
+        // added, leaving that one commit record as `old_snap`'s only root.
+        std::fs::write(root.join("a.txt"), b"old").unwrap();
+        let old_snap = repo.commit("t", "old snap").unwrap();
+        refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
+
+        // Same shape, for a snapshot whose record must survive the trim.
+        std::fs::write(root.join("a.txt"), b"fresh").unwrap();
+        let fresh_snap = repo.commit("t", "fresh snap").unwrap();
+        refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
+
+        // Find the record whose "after" is `old_snap` and hand-adjust its
+        // timestamp far into the past by targeting its exact `ts <value>`
+        // line in the raw file — a smaller, less brittle edit than
+        // re-deriving the whole serialization format here (mirrors the
+        // spirit of oplog's own `trim_keeps_newest_and_drops_old` test, which
+        // does the analogous thing via the crate-internal `serialize`
+        // helper). `fresh_snap`'s record is left on its real (current) clock
+        // ts — it's always the newest record, so `trim_older_than` keeps it
+        // regardless.
+        let all = crate::oplog::read_all(repo.layout()).unwrap();
+        let old_rec = all
+            .iter()
+            .find(|r| r.refs.iter().any(|(_, _, after)| *after == Some(old_snap)))
+            .expect("old_snap's commit record must exist");
+        assert_ne!(old_rec.seq, all.last().unwrap().seq, "old_snap's record must not be the newest");
+        // All these records land in the same wall-clock second in a fast test
+        // run, so their `ts` lines are identical text — a blind string
+        // replace could land on the wrong block. Scope the edit to
+        // `old_rec`'s own `op <seq>` block first, then rewrite only its `ts`
+        // line within that slice.
+        let raw = std::fs::read_to_string(repo.layout().oplog_path()).unwrap();
+        let block_start = raw
+            .find(&format!("op {}\n", old_rec.seq))
+            .expect("old_rec's block must be present");
+        let block_end = block_start + raw[block_start..].find("end\n").expect("block has an end line") + "end\n".len();
+        let old_ts_line = format!("ts {}\n", old_rec.ts);
+        let block = &raw[block_start..block_end];
+        assert!(block.contains(&old_ts_line), "old record's ts line must be present in its own block");
+        let patched_block = block.replacen(&old_ts_line, "ts 100\n", 1);
+        let raw = format!("{}{}{}", &raw[..block_start], patched_block, &raw[block_end..]);
+        std::fs::write(repo.layout().oplog_path(), raw).unwrap();
+
+        // Zero grace (same convention as the other gc tests above): the
+        // dangling snapshot, once its only root (the backdated record) is
+        // trimmed, is prunable immediately.
+        let stats = repo.gc(Duration::from_secs(0)).unwrap();
+
+        let remaining = crate::oplog::read_all(repo.layout()).unwrap();
+        assert!(
+            !remaining.iter().any(|r| r.seq == old_rec.seq),
+            "old record must be trimmed: {remaining:?}"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|r| r.refs.iter().any(|(_, _, after)| *after == Some(fresh_snap))),
+            "fresh record must survive: {remaining:?}"
+        );
+
+        assert!(stats.loose_pruned >= 1, "old_snap's only root (the trimmed record) is gone");
+        let arc = repo.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(!s.contains(&old_snap), "old_snap must be pruned once its only root is trimmed");
+        assert!(s.contains(&fresh_snap), "fresh_snap stays alive via its surviving record");
+        assert!(s.contains(&base), "base stays alive via the branch tip");
+        drop(s);
+
+        // Undo (which reads the log via `oplog::last`) still sees the
+        // surviving fresh record after the trim rewrote the file.
+        let last = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert!(last.refs.iter().any(|(_, _, after)| *after == Some(fresh_snap)));
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 

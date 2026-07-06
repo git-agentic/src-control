@@ -30,8 +30,14 @@ pub enum Error {
     Unborn,
     #[error("a merge is already in progress (resolve and `sc commit`, or `sc merge --abort`)")]
     MergeInProgress,
+    #[error("nothing to undo")]
+    NothingToUndo,
     #[error("merge produced {0} conflict(s); resolve the marked files then `sc commit`")]
     MergeConflicts(usize),
+    #[error("a cherry-pick is already in progress (resolve the marked files then `sc commit`)")]
+    PickInProgress,
+    #[error("cherry-pick produced {0} conflict(s); resolve the marked files then `sc commit`")]
+    PickConflicts(usize),
     #[error("merge of protected paths is not yet supported (would corrupt encrypted files): {0}")]
     MergeProtected(String),
     #[error("already up to date")]
@@ -54,6 +60,12 @@ pub enum Error {
     Remote(String),
     #[error("secret {0} changed differently on both branches; resolve with `sc secret` then retry")]
     SecretMergeConflict(String),
+    #[error("cannot replay merge commit {0} (mainline selection not supported)")]
+    CannotReplayMerge(ObjectId),
+    #[error("replay of protected paths is not yet supported (would corrupt encrypted files): {0}")]
+    ReplayProtected(String),
+    #[error("rebase: commit {commit} conflicts on {paths:?}; rebase aborted, refs untouched — resolve via `sc merge` or per-commit `sc cherry-pick`")]
+    RebaseConflicts { commit: ObjectId, paths: Vec<String> },
     #[error(transparent)]
     Core(#[from] scl_core::Error),
     #[error(transparent)]

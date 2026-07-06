@@ -77,8 +77,9 @@ impl Repo {
         refs::head_tip(&self.layout)
     }
 
-    /// The root tree of the current tip (None if unborn).
-    fn head_root(&self) -> Result<Option<ObjectId>> {
+    /// The root tree of the current tip (None if unborn). `pub(crate)` so
+    /// `oplog::undo` (a different module) can capture the pre-restore root.
+    pub(crate) fn head_root(&self) -> Result<Option<ObjectId>> {
         match self.head_tip()? {
             Some(tip) => {
                 let store_arc = self.vfs.store();
@@ -276,13 +277,32 @@ impl Repo {
     /// Files under a protected prefix are convergently encrypted (scanner-exempt);
     /// only plaintext files are scanned.
     pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
+        let head = refs::current_branch(&self.layout)?;
+        let before = refs::read_branch_tip(&self.layout, &head)?;
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         let tip = self.head_tip()?;
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
+        let merging = merge_head.is_some();
+        let picking = crate::pick_state::in_progress(&self.layout);
         let id = self.snapshot_files(files, tip, merge_head, author, message)?;
-        let branch = refs::current_branch(&self.layout)?;
-        refs::write_branch_tip(&self.layout, &branch, &id)?;
+        refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
+        crate::pick_state::clear(&self.layout)?;
+        let label = if merging {
+            "commit (merge)"
+        } else if picking {
+            "commit (pick)"
+        } else {
+            "commit"
+        };
+        let first_line = message.lines().next().unwrap_or("");
+        crate::oplog::record(
+            &self.layout,
+            &format!("{label}: {first_line}"),
+            &head,
+            &head,
+            &[(head.clone(), before, Some(id))],
+        )?;
         Ok(id)
     }
 
@@ -448,6 +468,21 @@ impl Repo {
         crate::merge_state::in_progress(&self.layout)
     }
 
+    /// Whether a cherry-pick is currently in progress.
+    pub fn pick_in_progress(&self) -> bool {
+        crate::pick_state::in_progress(&self.layout)
+    }
+
+    /// The commit being cherry-picked, if a cherry-pick is in progress.
+    pub fn pick_head(&self) -> Result<Option<ObjectId>> {
+        crate::pick_state::read_pick_head(&self.layout)
+    }
+
+    /// Conflicted paths if a cherry-pick is in progress (empty otherwise).
+    pub fn pick_conflicts(&self) -> Result<Vec<String>> {
+        crate::pick_state::read_conflicts(&self.layout)
+    }
+
     /// Merge `branch` into the current branch. Fast-forwards when possible;
     /// auto-commits a two-parent snapshot on a clean merge; on conflicts writes
     /// markers + merge state and returns `MergeConflicts`. If the current
@@ -460,12 +495,17 @@ impl Repo {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
+        }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
             return Err(Error::InvalidArgument(
                 "working tree has uncommitted changes; commit before merging".into(),
             ));
         }
+        let head = refs::current_branch(&self.layout)?;
+        let before = refs::read_branch_tip(&self.layout, &head)?;
         let theirs = refs::resolve_tip(&self.layout, branch)?
             .ok_or_else(|| Error::NoSuchBranch(branch.to_string()))?;
         let ours = match self.head_tip()? {
@@ -486,8 +526,14 @@ impl Repo {
                     None,
                 )?;
                 drop(store);
-                let branch_name = refs::current_branch(&self.layout)?;
-                refs::write_branch_tip(&self.layout, &branch_name, &theirs)?;
+                refs::write_branch_tip(&self.layout, &head, &theirs)?;
+                crate::oplog::record(
+                    &self.layout,
+                    &format!("merge {branch} (adopt)"),
+                    &head,
+                    &head,
+                    &[(head.clone(), before, Some(theirs))],
+                )?;
                 return Ok(theirs);
             }
         };
@@ -514,8 +560,14 @@ impl Repo {
                     None,
                 )?;
                 drop(store);
-                let branch_name = refs::current_branch(&self.layout)?;
-                refs::write_branch_tip(&self.layout, &branch_name, &theirs)?;
+                refs::write_branch_tip(&self.layout, &head, &theirs)?;
+                crate::oplog::record(
+                    &self.layout,
+                    &format!("merge {branch} (ff)"),
+                    &head,
+                    &head,
+                    &[(head.clone(), before, Some(theirs))],
+                )?;
                 return Ok(theirs);
             }
         }
@@ -591,6 +643,13 @@ impl Repo {
                 ours_protection,
                 author,
                 &format!("merge {branch}"),
+            )?;
+            crate::oplog::record(
+                &self.layout,
+                &format!("merge {branch}"),
+                &head,
+                &head,
+                &[(head.clone(), before, Some(id))],
             )?;
             Ok(id)
         } else {
@@ -682,7 +741,15 @@ impl Repo {
             return Err(Error::BadRef(format!("branch already exists: {name}")));
         }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
-        refs::write_branch_tip(&self.layout, name, &tip)
+        refs::write_branch_tip(&self.layout, name, &tip)?;
+        let head = refs::current_branch(&self.layout)?;
+        crate::oplog::record(
+            &self.layout,
+            &format!("branch {name}"),
+            &head,
+            &head,
+            &[(name.to_string(), None, Some(tip))],
+        )
     }
 
     /// Switch HEAD to `name` and materialize its tip into the working tree.
@@ -713,6 +780,10 @@ impl Repo {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
+        }
+        let head_before = refs::current_branch(&self.layout)?;
         // The protection-aware dirty check (status) already treats unchanged
         // decrypted protected files and skipped/absent protected files as clean,
         // so a reported modification/deletion is a genuine uncommitted change.
@@ -743,6 +814,13 @@ impl Repo {
             )?
         };
         refs::write_head(&self.layout, name)?;
+        crate::oplog::record(
+            &self.layout,
+            &format!("switch {name}"),
+            &head_before,
+            name,
+            &[],
+        )?;
         Ok(skipped)
     }
 
@@ -772,7 +850,7 @@ impl Repo {
 /// Current unix time in seconds, for snapshot timestamps. Snapshot ids
 /// legitimately depend on commit time (as in Git); nothing in the system
 /// requires two separate commits of identical content to share an id.
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -792,9 +870,13 @@ fn push_file_diff(out: &mut String, path: &str, old: &[u8], new: &[u8]) {
 }
 
 
-/// Reject branch names that would escape or corrupt `refs/heads/`. A branch name
-/// becomes a single path component under `refs/heads/`, so names containing path
-/// separators, the special `.`/`..` components, or a leading dot are refused.
+/// Reject branch names that would escape or corrupt `refs/heads/` or the
+/// oplog grammar. A branch name becomes a single path component under
+/// `refs/heads/`, so names containing path separators, the special `.`/`..`
+/// components, or a leading dot are refused. The oplog's on-disk format
+/// (`oplog.rs`) is space-delimited and one-line-per-field, so a name
+/// containing whitespace or control characters would write an unparseable
+/// `ref <name> ...` line — refuse those too, before they ever reach the log.
 pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
@@ -802,6 +884,7 @@ pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
         || name.starts_with('.')
         || name.contains('/')
         || name.contains('\\')
+        || name.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return Err(Error::BadRef(format!("invalid branch name: {name:?}")));
     }
@@ -889,7 +972,7 @@ mod tests {
     #[test]
     fn rejects_unsafe_branch_names() {
         // Direct checks on the validator.
-        for bad in ["", ".", "..", "a/b", "a\\b", ".hidden"] {
+        for bad in ["", ".", "..", "a/b", "a\\b", ".hidden", "a b", "a\tb"] {
             assert!(
                 matches!(validate_branch_name(bad), Err(Error::BadRef(_))),
                 "expected {bad:?} to be rejected"
@@ -904,6 +987,9 @@ mod tests {
         repo.commit("me", "base").unwrap();
         assert!(matches!(repo.branch(".."), Err(Error::BadRef(_))));
         assert!(matches!(repo.switch("a/b"), Err(Error::BadRef(_))));
+        // Whitespace in a branch name would corrupt the oplog's space-delimited
+        // grammar (see oplog.rs) — reject it before it's ever written.
+        assert!(matches!(repo.branch("a b"), Err(Error::BadRef(_))));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1022,6 +1108,112 @@ mod tests {
         let snap = store_arc.lock().unwrap().get_snapshot(&merge).unwrap();
         assert_eq!(snap.parents, vec![ours, theirs]);
         let _ = base;
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commit_appends_oplog_record() {
+        let root = tmp_root("oplog-commit");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let id = repo.commit("me", "first commit\nsecond line").unwrap();
+        let rec = crate::oplog::last(repo.layout()).unwrap().expect("commit must log a record");
+        assert!(rec.desc.starts_with("commit: "), "got {:?}", rec.desc);
+        assert_eq!(rec.desc, "commit: first commit");
+        assert_eq!(rec.head_before, "main");
+        assert_eq!(rec.head_after, "main");
+        assert_eq!(rec.refs, vec![("main".to_string(), None, Some(id))]);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_ff_and_clean_merge_append_oplog_records() {
+        // Fast-forward merge.
+        let root = tmp_root("oplog-merge-ff");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("b.txt"), b"new").unwrap();
+        let feat = repo.commit("me", "feature").unwrap();
+        repo.switch("main").unwrap();
+        let merged = repo.merge("feature", "me").unwrap();
+        assert_eq!(merged, feat);
+        let rec = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert_eq!(rec.desc, "merge feature (ff)");
+        assert_eq!(rec.head_before, "main");
+        assert_eq!(rec.head_after, "main");
+        assert_eq!(rec.refs.len(), 1);
+        assert_eq!(rec.refs[0].2, Some(feat));
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // Clean (real) three-way merge.
+        let root2 = tmp_root("oplog-merge-clean");
+        let repo2 = Repo::init(&root2).unwrap();
+        std::fs::write(root2.join("shared.txt"), b"a\nb\nc\n").unwrap();
+        repo2.commit("me", "base").unwrap();
+        repo2.branch("feature").unwrap();
+        std::fs::write(root2.join("shared.txt"), b"a\nB\nc\n").unwrap();
+        let ours = repo2.commit("me", "ours").unwrap();
+        repo2.switch("feature").unwrap();
+        std::fs::write(root2.join("shared.txt"), b"a\nb\nC\n").unwrap();
+        repo2.commit("me", "theirs").unwrap();
+        repo2.switch("main").unwrap();
+        let merge = repo2.merge("feature", "me").unwrap();
+        let rec2 = crate::oplog::last(repo2.layout()).unwrap().unwrap();
+        assert_eq!(rec2.desc, "merge feature");
+        assert_eq!(rec2.head_before, "main");
+        assert_eq!(rec2.head_after, "main");
+        assert_eq!(rec2.refs, vec![("main".to_string(), Some(ours), Some(merge))]);
+        drop(repo2);
+        std::fs::remove_dir_all(&root2).unwrap();
+
+        // Conflicted merge: no record appended (no refs moved).
+        let root3 = tmp_root("oplog-merge-conflict");
+        let repo3 = Repo::init(&root3).unwrap();
+        std::fs::write(root3.join("f.txt"), b"a\nb\nc\n").unwrap();
+        repo3.commit("me", "base").unwrap();
+        repo3.branch("feature").unwrap();
+        std::fs::write(root3.join("f.txt"), b"a\nX\nc\n").unwrap();
+        repo3.commit("me", "ours").unwrap();
+        repo3.switch("feature").unwrap();
+        std::fs::write(root3.join("f.txt"), b"a\nY\nc\n").unwrap();
+        repo3.commit("me", "theirs").unwrap();
+        repo3.switch("main").unwrap();
+        let before_conflict = crate::oplog::last(repo3.layout()).unwrap().unwrap();
+        let err = repo3.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)));
+        let after_conflict = crate::oplog::last(repo3.layout()).unwrap().unwrap();
+        assert_eq!(before_conflict.seq, after_conflict.seq, "conflicted merge must log nothing");
+        drop(repo3);
+        std::fs::remove_dir_all(&root3).unwrap();
+    }
+
+    #[test]
+    fn branch_and_switch_append_oplog_records() {
+        let root = tmp_root("oplog-branch-switch");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let tip = repo.commit("me", "base").unwrap();
+
+        repo.branch("feature").unwrap();
+        let branch_rec = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert_eq!(branch_rec.desc, "branch feature");
+        assert_eq!(branch_rec.head_before, "main");
+        assert_eq!(branch_rec.head_after, "main");
+        assert_eq!(branch_rec.refs, vec![("feature".to_string(), None, Some(tip))]);
+
+        repo.switch("feature").unwrap();
+        let switch_rec = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert_eq!(switch_rec.desc, "switch feature");
+        assert_eq!(switch_rec.head_before, "main");
+        assert_eq!(switch_rec.head_after, "feature");
+        assert!(switch_rec.refs.is_empty());
+
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1532,6 +1724,48 @@ mod tests {
     }
 
     #[test]
+    fn protect_grant_and_revoke_append_oplog_records() {
+        let root = tmp_root("oplog-protect");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+
+        // `protect` logs its own policy-only record ("protect <prefix>") and
+        // then always runs a follow-up `commit` ("commit: encrypt under
+        // <prefix>") to sweep matching working-tree files — two ref moves,
+        // two records, oldest first.
+        let head = crate::refs::current_branch(repo.layout()).unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        let all = crate::oplog::read_all(repo.layout()).unwrap();
+        assert_eq!(all.len(), 2, "protect must log two records: policy + sweep commit");
+        let rec = &all[all.len() - 2];
+        assert_eq!(rec.desc, "protect secret/");
+        assert_eq!(rec.head_before, head);
+        assert_eq!(rec.head_after, head);
+        assert_eq!(rec.refs.len(), 1);
+        assert_eq!(rec.refs[0].0, head);
+        let commit_rec = all.last().unwrap();
+        assert_eq!(commit_rec.desc, "commit: encrypt under secret/");
+        let after_protect = repo.head_tip().unwrap();
+
+        // grant.
+        let c2 = repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        let rec2 = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert_eq!(rec2.desc, "grant secret/");
+        assert_eq!(rec2.refs, vec![(head.clone(), after_protect, Some(c2))]);
+
+        // revoke (bob was just granted, so revoking alice still leaves a recipient).
+        let recipient = alice_sk.public().recipient_id();
+        let c3 = repo.revoke("secret/", &recipient).unwrap();
+        let rec3 = crate::oplog::last(repo.layout()).unwrap().unwrap();
+        assert_eq!(rec3.desc, "revoke secret/");
+        assert_eq!(rec3.refs, vec![(head.clone(), Some(c2), Some(c3))]);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn grant_on_unprotected_prefix_errors_not_protected() {
         let root = tmp_root("p7-grant-noprefix");
         let repo = Repo::init(&root).unwrap();
@@ -1892,6 +2126,62 @@ mod tests {
         // Both `merge` and `switch` must refuse mid-merge.
         assert!(matches!(repo.merge("feature", "me"), Err(Error::MergeInProgress)));
         assert!(matches!(repo.switch("feature"), Err(Error::MergeInProgress)));
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commit_clears_pick_state_and_is_single_parent() {
+        let root = tmp_root("pick-commit");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        let base = repo.commit("me", "base").unwrap();
+
+        // Simulate a cherry-pick in progress: some other commit is being
+        // picked, conflict markers (none, here) are on disk.
+        let picked = ObjectId::of(b"some-picked-commit");
+        crate::pick_state::write(&repo.layout, &picked, &[]).unwrap();
+        assert!(repo.pick_in_progress());
+        assert_eq!(repo.pick_head().unwrap(), Some(picked));
+
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+        let id = repo.commit("me", "picked change").unwrap();
+
+        // Pick state is cleared, and unlike a merge commit, this stays
+        // single-parent — pick state is provenance + a guard only.
+        assert!(!repo.pick_in_progress());
+        assert_eq!(repo.pick_head().unwrap(), None);
+        let store_arc = repo.vfs.store();
+        let snap = store_arc.lock().unwrap().get_snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![base]);
+
+        let log = repo.oplog().unwrap();
+        assert!(
+            log.last().unwrap().desc.starts_with("commit (pick):"),
+            "expected pick-labeled oplog entry, got {:?}",
+            log.last()
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_switch_and_undo_refuse_during_pick() {
+        let root = tmp_root("pick-guards");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        let picked = ObjectId::of(b"some-picked-commit");
+        crate::pick_state::write(&repo.layout, &picked, &[]).unwrap();
+        assert!(repo.pick_in_progress());
+
+        assert!(matches!(repo.merge("feature", "me"), Err(Error::PickInProgress)));
+        assert!(matches!(repo.switch("feature"), Err(Error::PickInProgress)));
+        assert!(matches!(repo.undo(), Err(Error::PickInProgress)));
+
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -54,6 +54,15 @@ fn ancestors(store: &mut Store, id: ObjectId) -> Result<BTreeSet<ObjectId>> {
     Ok(set)
 }
 
+/// File-level result of a three-way tree merge (no secret registries).
+/// Extracted from [`three_way`] so replay (P14) can merge trees against an
+/// optional base — a root commit replays against the empty tree.
+pub struct FileMerge {
+    pub files: Vec<(String, FileMode, Vec<u8>)>,
+    pub sidecars: Vec<(String, Vec<u8>)>,
+    pub conflicts: Vec<String>,
+}
+
 /// Resolved result of a three-way merge, ready to materialize.
 pub struct Merge {
     /// Merged working set: `(path, mode, bytes)` (text-conflict files contain
@@ -81,9 +90,30 @@ pub fn three_way(
 
     let secrets = merge_secrets(&base_snap.secrets, &ours_snap.secrets, &theirs_snap.secrets)?;
 
-    let base_f = tree_file_entries(store, base_snap.root)?;
-    let ours_f = tree_file_entries(store, ours_snap.root)?;
-    let theirs_f = tree_file_entries(store, theirs_snap.root)?;
+    let fm = three_way_files(store, Some(base_snap.root), ours_snap.root, theirs_snap.root)?;
+
+    Ok(Merge {
+        files: fm.files,
+        sidecars: fm.sidecars,
+        conflicts: fm.conflicts,
+        secrets,
+    })
+}
+
+/// Three-way merge of file trees by root id. `base_root: None` is the empty
+/// base: every path reads as absent on the base side.
+pub(crate) fn three_way_files(
+    store: &mut Store,
+    base_root: Option<ObjectId>,
+    ours_root: ObjectId,
+    theirs_root: ObjectId,
+) -> Result<FileMerge> {
+    let base_f = match base_root {
+        Some(r) => tree_file_entries(store, r)?,
+        None => Default::default(),
+    };
+    let ours_f = tree_file_entries(store, ours_root)?;
+    let theirs_f = tree_file_entries(store, theirs_root)?;
 
     let mut paths: BTreeSet<String> = BTreeSet::new();
     paths.extend(base_f.keys().cloned());
@@ -175,7 +205,7 @@ pub fn three_way(
         }
     }
 
-    Ok(Merge { files, sidecars, conflicts, secrets })
+    Ok(FileMerge { files, sidecars, conflicts })
 }
 
 /// Three-way merge of two secret registries against base. A name changed

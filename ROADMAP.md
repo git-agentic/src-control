@@ -82,6 +82,18 @@ across every phase.
   scanner gate apply). `--with-secrets` injects decrypted secrets into each
   agent's environment via the `sc run` path — one command exercising all
   three thesis pillars. Zero residue outside `.sc/`. (ADR-0023.)
+- **Phase 14 — History editing (`sc cherry-pick` / `sc rebase` / `sc undo`).**
+  Integrated the agent branches P13 mints: `sc cherry-pick` replays one
+  commit onto the current branch (P4-style conflict resolution completed by
+  the next commit), `sc rebase` replays a whole branch onto a new base
+  (atomic: any conflict aborts with refs untouched), and a repo-wide
+  operation log made every ref-moving operation undoable (`sc undo`; run
+  twice = redo). Replay is P4's three-way merge with base = the picked
+  commit's parent — no second merge implementation, no object mutation,
+  undo is just moving refs back. Protected content fails closed, inherited
+  from P4's merge guard. `demo/run_history_demo.sh` proves cherry-pick
+  provenance, atomic rebase, and an undo/redo round-trip byte-identical at
+  the refs level. (ADR-0024.)
 
 ## Completed phases (usability-first ordering)
 
@@ -97,6 +109,7 @@ across every phase.
 | **P11 — Secret/permission lifecycle** | Cryptographic cutover + break-glass recovery for secrets | `sc secret rotate <name> --value <new>` re-seals under a fresh DEK; `sc escrow set <key>` auto-includes a recovery recipient at `secret add`/`rotate`/`protect` | [0019](docs/adr/0019-secret-lifecycle.md) |
 | **P12 — SSH-native network transport** | Sync between machines | `sc clone ssh://host/path`, `sc fetch`/`push` over the wire via `sc serve --stdio`; `demo/run_ssh_remote_demo.sh` proves the round trip with no sshd | [0022](docs/adr/0022-ssh-native-transport.md) |
 | **P13 — Agent workspaces** | Parallel agents on a real repo | `sc work --agents 3 -- <cmd>` forks 3 in-RAM workspaces, runs the command in each, harvests to `work-1..3` branches; `sc merge` integrates; zero residue outside `.sc/` | [0023](docs/adr/0023-agent-workspaces.md) |
+| **P14 — History editing** | Integrate agent branches; undo anything | `sc cherry-pick work-2`, `sc rebase main`, `sc undo`/redo round-trip proven by `demo/run_history_demo.sh` | [0024](docs/adr/0024-history-editing.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -198,9 +211,16 @@ Tracked but out of scope for this roadmap horizon:
   rotation and re-wrap apply one at a time).
 - **Multiple escrow keys** / escrow key rotation (P11 ships a single
   break-glass key in `.sc/recipients.toml [escrow]`).
+- **History-editing follow-ons:** `sc amend`, stop-and-continue rebase
+  (`--continue`), cherry-pick `--abort`, merge-commit replay (mainline
+  selection), protected-path replay (lifts with P4's protected-merge
+  follow-on), operation objects in the CAS (Jujutsu-deep upgrade to the
+  file oplog), oplog entries for remote-tracking refs, secret-registry
+  replay for cherry-pick/rebase (currently the target-side registry is
+  carried forward wholesale and a skipped registry change only warns).
 - **Sub-tree / partial sharing** and sparse checkouts.
-- **Merge ergonomics**: rebase, cherry-pick, and richer conflict resolution UX
-  beyond P4's detection/representation.
+- **Merge ergonomics**: richer conflict resolution UX beyond P4's
+  detection/representation.
 - **Signed commits / provenance** as a first-class governance feature.
 
 ## How a phase gets built

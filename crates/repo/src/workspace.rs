@@ -247,6 +247,25 @@ impl Repo {
             let harvest = harvest_workspace(self, tip, &dir, &label, &opts.author, &message);
             outcomes.push(WorkspaceOutcome { label, agent_exit, harvest });
         }
+
+        let created: Vec<(String, Option<ObjectId>, Option<ObjectId>)> = outcomes
+            .iter()
+            .filter_map(|o| match &o.harvest {
+                Ok(HarvestResult::Committed(id)) => Some((o.label.clone(), None, Some(*id))),
+                _ => None,
+            })
+            .collect();
+        if !created.is_empty() {
+            let head = refs::current_branch(self.layout())?;
+            crate::oplog::record(
+                self.layout(),
+                &format!("work: {} agents, base {}", opts.agents, opts.base_name),
+                &head,
+                &head,
+                &created,
+            )?;
+        }
+
         Ok(outcomes)
     }
 }
@@ -512,6 +531,51 @@ mod tests {
             assert!(err.to_string().contains("budget"), "unexpected error: {err}");
         }
         let repo = Repo::open(&root).unwrap();
+        drop(repo);
+        teardown(&root);
+    }
+
+    #[test]
+    fn work_session_appends_oplog_record() {
+        let (root, scratch) = setup("oplog");
+        let repo = Repo::open(&root).unwrap();
+        let opts = work_opts(2, &["sh", "-c", "echo edit > out.txt"], &scratch);
+        let outcomes = repo.work(opts).unwrap();
+        let ids: Vec<ObjectId> = outcomes
+            .iter()
+            .map(|o| match o.harvest.as_ref().unwrap() {
+                HarvestResult::Committed(id) => *id,
+                other => panic!("expected Committed, got {other:?}"),
+            })
+            .collect();
+        let rec = crate::oplog::last(repo.layout()).unwrap().expect("work session must log a record");
+        assert_eq!(rec.desc, "work: 2 agents, base work");
+        assert_eq!(rec.head_before, "main");
+        assert_eq!(rec.head_after, "main");
+        assert_eq!(
+            rec.refs,
+            vec![
+                ("work-1".to_string(), None, Some(ids[0])),
+                ("work-2".to_string(), None, Some(ids[1])),
+            ]
+        );
+        drop(repo);
+        teardown(&root);
+    }
+
+    #[test]
+    fn unchanged_work_session_logs_no_oplog_record() {
+        let (root, scratch) = setup("oplog-unchanged");
+        let repo = Repo::open(&root).unwrap();
+        let before = crate::oplog::last(repo.layout()).unwrap();
+        let opts = work_opts(1, &["true"], &scratch);
+        repo.work(opts).unwrap();
+        let after = crate::oplog::last(repo.layout()).unwrap();
+        assert_eq!(
+            before.map(|r| r.seq),
+            after.map(|r| r.seq),
+            "no branch created => no oplog record"
+        );
         drop(repo);
         teardown(&root);
     }

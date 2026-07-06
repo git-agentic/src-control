@@ -64,4 +64,8 @@ impl Layout {
     pub fn config_path(&self) -> PathBuf {
         self.dot_sc.join("config")
     }
+    /// `.sc/oplog` — the append-only operation log.
+    pub fn oplog_path(&self) -> PathBuf {
+        self.dot_sc.join("oplog")
+    }
 }

@@ -101,6 +101,30 @@ enum Cmd {
         #[arg(long)]
         author: Option<String>,
     },
+    /// Replay one commit from another branch onto the current branch.
+    ///
+    /// On conflicts this behaves like `sc merge`: markers + a pick in
+    /// progress are left on disk (exit 1), resolve then `sc commit`.
+    CherryPick {
+        /// Branch or remote-tracking ref whose tip commit to pick.
+        #[arg(value_name = "ref")]
+        refname: String,
+        /// Commit author (default $SC_AUTHOR, then the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Replay the current branch's commits onto another branch's tip.
+    ///
+    /// Any conflict aborts the whole rebase (exit 1): refs and the working
+    /// tree are left untouched, unlike `sc merge`/`sc cherry-pick`'s marker
+    /// files. Resolve via `sc merge` or per-commit `sc cherry-pick` instead.
+    Rebase {
+        /// Branch or remote-tracking ref to rebase onto.
+        target: String,
+        /// Commit author (default $SC_AUTHOR, then the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
     /// Scan the working tree for plaintext secrets without committing.
     Scan,
     /// Decrypt authorized secrets, inject them, and run a command.
@@ -223,6 +247,10 @@ enum Cmd {
         #[command(subcommand)]
         op: EscrowOp,
     },
+    /// Revert the last operation (run again to redo).
+    Undo,
+    /// List recent operations, newest first.
+    Oplog,
 }
 
 #[derive(Subcommand)]
@@ -349,6 +377,8 @@ fn main() -> Result<()> {
         Cmd::Switch { name, identity } => run_switch(&name, identity),
         Cmd::Scan => run_scan(),
         Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &resolve_author(author)),
+        Cmd::CherryPick { refname, author } => run_cherry_pick(&refname, &resolve_author(author)),
+        Cmd::Rebase { target, author } => run_rebase(&target, &resolve_author(author)),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
         Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
@@ -365,6 +395,8 @@ fn main() -> Result<()> {
         Cmd::Gc { prune_expire } => run_gc(&prune_expire),
         Cmd::Export { to, r#ref, include_encrypted } => run_export(to, r#ref, include_encrypted),
         Cmd::Escrow { op } => run_escrow(op),
+        Cmd::Undo => run_undo(),
+        Cmd::Oplog => run_oplog(),
     }
 }
 
@@ -883,6 +915,7 @@ fn run_status(json: bool) -> Result<()> {
                 "deleted": s.deleted,
                 "merge_in_progress": repo.merge_in_progress(),
                 "conflicts": repo.merge_conflicts()?,
+                "pick_in_progress": repo.pick_in_progress(),
             })
         );
         return Ok(());
@@ -898,9 +931,14 @@ fn run_status(json: bool) -> Result<()> {
             }
         }
     }
+    if repo.pick_in_progress() {
+        if let Some(id) = repo.pick_head()? {
+            println!("cherry-pick in progress: {}", id.short());
+        }
+    }
     let s = repo.status()?;
     if s.added.is_empty() && s.modified.is_empty() && s.deleted.is_empty() {
-        if !repo.merge_in_progress() {
+        if !repo.merge_in_progress() && !repo.pick_in_progress() {
             println!("clean (working tree matches HEAD)");
         }
         return Ok(());
@@ -946,6 +984,51 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
         }
         Err(scl_repo::Error::UpToDate) => {
             println!("already up to date");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn run_cherry_pick(refname: &str, author: &str) -> Result<()> {
+    let repo = open_repo()?;
+    match repo.cherry_pick(refname, author) {
+        Ok(scl_repo::PickResult::Picked(id)) => {
+            println!("picked {}", id.short());
+            Ok(())
+        }
+        Ok(scl_repo::PickResult::AlreadyApplied) => {
+            println!("already applied — nothing to do");
+            Ok(())
+        }
+        Err(scl_repo::Error::PickConflicts(n)) => {
+            println!("cherry-pick has {n} conflict(s); resolve these files then `sc commit`:");
+            for p in repo.pick_conflicts()? {
+                println!("  {p}");
+            }
+            // Exit 1 so `sc cherry-pick x && sc commit` can't commit conflict markers.
+            // Drop the repo first (releases .sc/lock) — process::exit skips
+            // destructors and would otherwise leave a stale lock file.
+            drop(repo);
+            std::process::exit(1);
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn run_rebase(target: &str, author: &str) -> Result<()> {
+    let repo = open_repo()?;
+    match repo.rebase(target, author) {
+        Ok(scl_repo::RebaseResult::AlreadyUpToDate) => {
+            println!("already up to date");
+            Ok(())
+        }
+        Ok(scl_repo::RebaseResult::FastForwarded(id)) => {
+            println!("fast-forwarded to {}", id.short());
+            Ok(())
+        }
+        Ok(scl_repo::RebaseResult::Rebased { new_tip, replayed, skipped }) => {
+            println!("rebased: {replayed} replayed, {skipped} skipped, tip {}", new_tip.short());
             Ok(())
         }
         Err(e) => Err(e.into()),
@@ -1022,6 +1105,23 @@ fn fmt_utc(ts: i64) -> String {
 fn run_branch(name: &str) -> Result<()> {
     open_repo()?.branch(name)?;
     println!("created branch {name}");
+    Ok(())
+}
+
+fn run_undo() -> Result<()> {
+    let outcome = open_repo()?.undo()?;
+    println!("undid: {}", outcome.desc);
+    for path in &outcome.skipped {
+        eprintln!("skipped (no key): {path}");
+    }
+    Ok(())
+}
+
+fn run_oplog() -> Result<()> {
+    let repo = open_repo()?;
+    for rec in repo.oplog()?.iter().rev() {
+        println!("{:>4}  {}  {}", rec.seq, fmt_utc(rec.ts), rec.desc);
+    }
     Ok(())
 }
 
