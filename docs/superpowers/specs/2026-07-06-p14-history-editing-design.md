@@ -80,8 +80,15 @@ replay_commit(store, commit_id, onto_root) -> Replayed(new_root)
   callers skip the commit with a printed note.
 - Commits with 2+ parents are refused before replay with a typed error
   (`Error::CannotReplayMerge`) — no mainline selection in MVP.
-- Protection/secrets policy on replayed snapshots: carried from the
-  **ours** side (the branch being landed on), same rule as P4 merge.
+- **Protected content fails closed, inherited from P4:** `three_way`
+  flattens trees without the perms byte, so replaying protected paths would
+  corrupt encrypted files. Cherry-pick and rebase refuse (typed error) when
+  any involved tree (base, onto, or the picked commit's) contains
+  `PROTECTED` entries — the exact guard `Repo::merge` applies today, and the
+  same backlog follow-on lifts both together.
+- Protection/secrets on replayed snapshots (unprotected repos): carried from
+  the **ours** side (the branch being landed on) wholesale — replay does not
+  merge secret registries.
 
 ## Cherry-pick semantics
 
@@ -261,5 +268,7 @@ the linear result → zero residual session dirs.
   oplog already in place).
 - Stop-and-continue rebase; cherry-pick `--abort`.
 - Replaying merge commits (mainline selection).
+- Replaying protected paths (lifts together with P4's protected-merge
+  follow-on — perms + wrapped DEKs threaded through `three_way`).
 - Operation objects in the CAS / `sc op log` time-travel beyond undo/redo.
 - Oplog entries for remote-tracking refs.
