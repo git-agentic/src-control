@@ -239,6 +239,14 @@ Tracked but out of scope for this roadmap horizon:
   file oplog), oplog entries for remote-tracking refs. (Protected-path
   replay and secret-registry replay for cherry-pick/rebase shipped in P15;
   see ADR-0025.)
+- **Rule narrowing / revocation tombstones** for protected-path prefixes.
+  P15's merge union (`union_prefixes`) is fail-closed by design but one-
+  directional: nothing can shrink a rule via merge. That means a prefix-rule
+  `sc revoke` is currently reversed by merging any branch created before the
+  revoke (the union re-adds the recipient, and future commits under the
+  prefix then seal fresh DEKs to them) — see ADR-0025 Consequences. This
+  item is the durable fix: a way to record "revoked as of here" so a later
+  union merge doesn't resurrect the recipient's standing.
 - **Sub-tree / partial sharing** and sparse checkouts.
 - **Merge ergonomics**: richer conflict resolution UX beyond P4's
   detection/representation.

@@ -52,6 +52,20 @@ replay toolkit, widening the gap.
   prior-wrap reuse keeps unchanged content's encoding stable.
 - Rule narrowing cannot happen via merge (union); explicit unprotect
   remains a future operation.
+- **A prefix-rule revoke (`sc revoke <prefix> --recipient-id <id>`) is not
+  durable against a union merge of any branch created before the revoke.**
+  `union_prefixes` re-adds the revoked recipient's entry to the rule when
+  that older branch is merged in, and every *future* commit under the
+  prefix then seals fresh DEKs to them — content they never held a key for.
+  This is distinct from the documented, harmless unchanged-blob wrap
+  resurrection (ADR-0019): that resurrection only re-exposes a *past*
+  ciphertext the recipient could already decrypt from history; this one
+  grants access to *new* content going forward. It is spec-conformant
+  (rule narrowing is an explicit deferred item, above) but currently
+  undocumented behavior a caller must know about. Durable revocation needs
+  the deferred rule-narrowing/tombstone follow-on (ROADMAP.md, Deferred).
+  Until then, after a revoke, re-check `sc protect --list` following any
+  merge and re-run `sc revoke` if the rule was re-widened.
 
 ## Refinements during the build
 

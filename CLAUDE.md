@@ -312,6 +312,11 @@ now replays through rebase/cherry-pick (`merge_secrets`, base = the replayed
 commit's own parent; conflicts abort atomically), and replay's `Empty` means
 tree **and** registry **and** protection-prefix deltas are all empty, so a
 rules-only or secrets-only commit replays instead of being silently skipped.
+**Boundary:** because protection rules merge by union, a prefix-rule revoke
+(`sc revoke`) is not durable against merging any branch created before the
+revoke — the union re-adds the recipient and future commits under that
+prefix seal fresh DEKs to them; re-check `sc protect --list` after merges
+until the deferred rule-narrowing/tombstone follow-on lands. See ADR-0025.
 `decrypt_with` distinguishes ciphertext corruption from a genuine
 authorization failure. `MergeProtected`/`ReplayProtected` are retired.
 `crypto::Zeroizing` is re-exported through the crate boundary so callers

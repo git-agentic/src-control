@@ -1687,6 +1687,11 @@ fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("bad recipient id"))?;
     repo.revoke(&prefix, &rid)?;
     println!("revoked {recipient_id} from {prefix}");
+    eprintln!(
+        "note: this is not durable against merges — merging any branch created before this \
+         revoke re-adds {recipient_id} to the rule via union, and fresh DEKs for future commits \
+         under {prefix} will seal to them again; re-check `sc protect --list` after merges"
+    );
     Ok(())
 }
 
