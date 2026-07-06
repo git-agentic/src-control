@@ -45,8 +45,19 @@ impl Repo {
             prefix: prefix.to_string(),
             recipients: recipients.iter().map(|p| p.to_bytes()).collect(),
         });
-        self.commit_snapshot(root, parents, secrets, protection, "system", &format!("protect {prefix}"))?;
+        let head = crate::refs::current_branch(self.layout())?;
+        let before = crate::refs::read_branch_tip(self.layout(), &head)?;
+        let id = self.commit_snapshot(root, parents, secrets, protection, "system", &format!("protect {prefix}"))?;
+        crate::oplog::record(
+            self.layout(),
+            &format!("protect {prefix}"),
+            &head,
+            &head,
+            &[(head.clone(), before, Some(id))],
+        )?;
         // Now encrypt matching working-tree files under the freshly-recorded rule.
+        // `commit` (repo.rs) logs its own oplog record ("commit: encrypt under
+        // <prefix>") — a second, distinct ref move, so no double-logging here.
         self.commit("system", &format!("encrypt under {prefix}"))
     }
 
@@ -117,7 +128,18 @@ impl Repo {
         if !protection.prefixes[rule_idx].recipients.contains(&new_bytes) {
             protection.prefixes[rule_idx].recipients.push(new_bytes);
         }
-        self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("grant {prefix}"))
+        let head = crate::refs::current_branch(self.layout())?;
+        let before = crate::refs::read_branch_tip(self.layout(), &head)?;
+        let id =
+            self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("grant {prefix}"))?;
+        crate::oplog::record(
+            self.layout(),
+            &format!("grant {prefix}"),
+            &head,
+            &head,
+            &[(head.clone(), before, Some(id))],
+        )?;
+        Ok(id)
     }
 
     /// Revoke `recipient_id` from `prefix`: drop its wrapped DEK from every
@@ -158,7 +180,24 @@ impl Repo {
         protection.prefixes[rule_idx]
             .recipients
             .retain(|pk| scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != rid);
-        self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("revoke from {prefix}"))
+        let head = crate::refs::current_branch(self.layout())?;
+        let before = crate::refs::read_branch_tip(self.layout(), &head)?;
+        let id = self.commit_snapshot(
+            root,
+            vec![tip],
+            secrets,
+            protection,
+            "system",
+            &format!("revoke from {prefix}"),
+        )?;
+        crate::oplog::record(
+            self.layout(),
+            &format!("revoke {prefix}"),
+            &head,
+            &head,
+            &[(head.clone(), before, Some(id))],
+        )?;
+        Ok(id)
     }
 
     /// List the tip's protected prefixes, each with its recipients' fingerprints
