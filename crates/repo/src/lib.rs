@@ -35,5 +35,5 @@ pub use repo::{Repo, Status};
 pub use scanner::ScanReport;
 pub use secrets::SecretInfo;
 pub use stdio_transport::{open_transport, SshUrl, StdioTransport};
-pub use workspace::HarvestResult;
+pub use workspace::{HarvestResult, WorkOptions, WorkspaceOutcome};
 pub use worktree::Diff;
