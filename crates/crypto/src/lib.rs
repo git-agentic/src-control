@@ -18,3 +18,7 @@ pub use envelope::{decrypt_path, encrypt_path, open, rewrap_for, revoke, seal, u
 pub use error::{Error, Result};
 pub use key::{generate_keypair, PublicKey, RecipientId, SecretKey};
 pub use provider::{FileKeyProvider, KeyProvider};
+/// Re-exported so downstream crates can name the zeroizing-on-drop wrapper
+/// type returned by `decrypt_path`/`open` without adding a direct `zeroize`
+/// dependency of their own (keeps RustCrypto-family deps quarantined here).
+pub use zeroize::Zeroizing;
