@@ -116,6 +116,10 @@ enum Cmd {
         /// Commit author (default $SC_AUTHOR, then the OS username).
         #[arg(long)]
         author: Option<String>,
+        /// Identity key to decrypt protected paths that diverged in content on
+        /// both sides (ciphertext-id fast paths need no identity at all).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
     /// Replay the current branch's commits onto another branch's tip.
     ///
@@ -383,7 +387,9 @@ fn main() -> Result<()> {
         Cmd::Merge { branch, abort, author, identity } => {
             run_merge(branch, abort, &resolve_author(author), identity)
         }
-        Cmd::CherryPick { refname, author } => run_cherry_pick(&refname, &resolve_author(author)),
+        Cmd::CherryPick { refname, author, identity } => {
+            run_cherry_pick(&refname, &resolve_author(author), identity)
+        }
         Cmd::Rebase { target, author } => run_rebase(&target, &resolve_author(author)),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
@@ -1000,9 +1006,12 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str, identity: Option
     }
 }
 
-fn run_cherry_pick(refname: &str, author: &str) -> Result<()> {
+fn run_cherry_pick(refname: &str, author: &str, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
-    match repo.cherry_pick(refname, author) {
+    // Soft-resolve like `run_merge`: a missing identity file is fine —
+    // ciphertext-id fast paths and plain picks need no identity at all.
+    let sk = resolve_identity_opt(identity)?;
+    match repo.cherry_pick(refname, author, sk.as_ref()) {
         Ok(scl_repo::PickResult::Picked(id)) => {
             println!("picked {}", id.short());
             Ok(())

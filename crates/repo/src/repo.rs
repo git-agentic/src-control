@@ -144,16 +144,23 @@ impl Repo {
     /// completion the protection policy is the UNION of both parents' rules
     /// and wraps. Used by `commit` (HEAD tip) and by workspace harvest (P13,
     /// arbitrary base tip, no merge head). Advances no refs.
-    /// `decided_root` is the merge's decided carried tree (persisted in the
-    /// merge state by the conflict path): when present, absent-still-protected
-    /// files carry forward from IT — the merge already arbitrated
-    /// base/ours/theirs, and re-arbitrating by parent order here silently
-    /// reverted theirs-side updates. Only meaningful alongside `merge_head`.
+    /// `decided_root` is the merge's (or pick's) decided carried tree
+    /// (persisted in the merge/pick state by the conflict path): when present,
+    /// absent-still-protected files carry forward from IT — the merge already
+    /// arbitrated base/ours/theirs, and re-arbitrating by parent order here
+    /// silently reverted theirs-side updates. Only meaningful alongside
+    /// `merge_head` or `pick_head`.
+    /// `pick_head` is the commit being cherry-picked when completing a
+    /// conflicted pick (P15 Task 7): the pick has no second parent, but its
+    /// rules and wraps must still union into the completion's policy — the
+    /// picked commit may carry protected updates (in the decided tree) whose
+    /// wraps only IT knows, and rules the tip lacks.
     pub(crate) fn snapshot_files(
         &self,
         files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
         tip: Option<ObjectId>,
         merge_head: Option<ObjectId>,
+        pick_head: Option<ObjectId>,
         decided_root: Option<ObjectId>,
         author: &str,
         message: &str,
@@ -163,7 +170,27 @@ impl Repo {
             (None, _) => (Protection::default(), BTreeMap::new()),
             (Some(t), None) => {
                 let snap = self.snapshot(&t)?;
-                (snap.protection, snap.secrets)
+                match pick_head {
+                    None => (snap.protection, snap.secrets),
+                    Some(ph) => {
+                        // Pick completion: union tip ∪ picked rules + wraps
+                        // (same discipline as the merge-completion arm below,
+                        // tip's wrap bytes win on a shared recipient). Secrets
+                        // stay the tip's — replay never carries the picked
+                        // commit's registry (see `replay.rs` module docs).
+                        let picked_p = self.snapshot(&ph)?.protection;
+                        let prefixes = crate::protect::union_prefixes(
+                            &snap.protection.prefixes,
+                            &picked_p.prefixes,
+                        );
+                        let mut wrapped = snap.protection.wrapped;
+                        for (id, wks) in &picked_p.wrapped {
+                            let entry = wrapped.entry(*id).or_default();
+                            *entry = crate::protect::union_wraps(entry, wks);
+                        }
+                        (Protection { prefixes, wrapped }, snap.secrets)
+                    }
+                }
             }
             (Some(t), Some(mh)) => {
                 // Merge completion (Task 6, P15): protection is the UNION of
@@ -222,20 +249,26 @@ impl Repo {
         // read. (Explicit deletion of a protected file is a future operation,
         // out of scope.) Sources, in priority order:
         //
-        // 1. The merge's DECIDED tree (`decided_root`, persisted by the
-        //    conflict path) when completing a merge. The merge already
-        //    arbitrated base/ours/theirs — e.g. "only theirs changed → take
-        //    theirs" — so an absent protected path must carry the DECIDED
-        //    blob. (Re-arbitrating by parent order here, ours first, silently
-        //    reverted theirs' update to the stale ours version and recorded
-        //    theirs as merged — permanently, undetectably lost.) A path
-        //    PRESENT in the decided tree is decided, period: parents are
-        //    never consulted for it.
+        // 1. The merge's (or pick's) DECIDED tree (`decided_root`, persisted
+        //    by the conflict path) when completing a merge or cherry-pick.
+        //    The merge already arbitrated base/ours/theirs — e.g. "only
+        //    theirs changed → take theirs" — so an absent protected path must
+        //    carry the DECIDED blob. (Re-arbitrating by parent order here,
+        //    ours first, silently reverted theirs' update to the stale ours
+        //    version and recorded theirs as merged — permanently,
+        //    undetectably lost. A conflicted pick carrying a picked-side
+        //    protected update has the exact same failure: the tip-only scan
+        //    committed the stale ours blob.) A path PRESENT in the decided
+        //    tree is decided, period: parents are never consulted for it.
         // 2. The parents — `tip` only on a non-merge commit (unchanged
         //    behavior), both parents on merge completion for paths the
         //    decided tree doesn't know (and as full fallback when the merge
         //    state predates the decided-root record, i.e. was written by an
-        //    older code path). Ours wins across parents.
+        //    older code path). Ours wins across parents. A pick's non-parent
+        //    `pick_head` is NOT a source: any picked-side content the pick
+        //    kept is in the decided tree — a protected path in the picked
+        //    commit but absent from the decided tree was decided *deleted*
+        //    and must not resurrect.
         {
             let mut on_disk: std::collections::BTreeSet<String> =
                 all.iter().map(|(p, _, _, _)| p.clone()).collect();
@@ -318,12 +351,19 @@ impl Repo {
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         let tip = self.head_tip()?;
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
-        // The merge's decided carried tree, when the conflict path recorded
-        // one (absent for merge state written before the record existed).
-        let decided_root = crate::merge_state::read_decided_root(&self.layout)?;
+        let pick_head = crate::pick_state::read_pick_head(&self.layout)?;
+        // The merge's (or pick's) decided carried tree, when the conflict
+        // path recorded one (absent for state written before the record
+        // existed). Merge and pick are mutually exclusive (each refuses to
+        // start while the other is in progress), so at most one is set.
+        let decided_root = match crate::merge_state::read_decided_root(&self.layout)? {
+            Some(dr) => Some(dr),
+            None => crate::pick_state::read_decided_root(&self.layout)?,
+        };
         let merging = merge_head.is_some();
-        let picking = crate::pick_state::in_progress(&self.layout);
-        let id = self.snapshot_files(files, tip, merge_head, decided_root, author, message)?;
+        let picking = pick_head.is_some();
+        let id =
+            self.snapshot_files(files, tip, merge_head, pick_head, decided_root, author, message)?;
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
         crate::pick_state::clear(&self.layout)?;
@@ -3087,10 +3127,12 @@ mod tests {
         std::fs::write(root.join("a.txt"), b"one").unwrap();
         let base = repo.commit("me", "base").unwrap();
 
-        // Simulate a cherry-pick in progress: some other commit is being
-        // picked, conflict markers (none, here) are on disk.
-        let picked = ObjectId::of(b"some-picked-commit");
-        crate::pick_state::write(&repo.layout, &picked, &[]).unwrap();
+        // Simulate a cherry-pick in progress: a REAL commit is being picked —
+        // completion reads the picked commit's protection rules (P15 Task 7),
+        // so a synthetic id would (rightly) fail the completing commit.
+        // Conflict markers (none, here) are on disk.
+        let picked = base;
+        crate::pick_state::write(&repo.layout, &picked, &[], None).unwrap();
         assert!(repo.pick_in_progress());
         assert_eq!(repo.pick_head().unwrap(), Some(picked));
 
@@ -3125,7 +3167,7 @@ mod tests {
         repo.branch("feature").unwrap();
 
         let picked = ObjectId::of(b"some-picked-commit");
-        crate::pick_state::write(&repo.layout, &picked, &[]).unwrap();
+        crate::pick_state::write(&repo.layout, &picked, &[], None).unwrap();
         assert!(repo.pick_in_progress());
 
         assert!(matches!(repo.merge("feature", "me"), Err(Error::PickInProgress)));

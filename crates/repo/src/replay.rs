@@ -5,10 +5,11 @@
 
 use std::collections::BTreeMap;
 
-use scl_core::{FileMode, ObjectId};
+use scl_core::{FileMode, ObjectId, Protection, WrappedKey};
 
 use crate::error::{Error, Result};
-use crate::merge;
+use crate::merge::{self, MergedFile};
+use crate::protect;
 use crate::refs;
 use crate::repo::Repo;
 use crate::worktree;
@@ -32,91 +33,193 @@ fn secrets_changed_from_parent(repo: &Repo, commit_id: ObjectId) -> Result<bool>
 #[derive(Debug)]
 pub(crate) enum ReplayOutcome {
     /// Merged tree written to the CAS.
-    Clean { root: ObjectId },
+    Clean {
+        root: ObjectId,
+        /// Assembled protection for the replayed snapshot: union rules
+        /// (onto-side ∪ commit-side), wrapped = carry ∪ fresh (wrap-reused
+        /// against the onto side's prior wraps, pruned to the merged tree).
+        protection: Protection,
+    },
     /// Replayed tree equals the target — change already present.
     Empty,
-    /// Conflicting paths, with the merged working set (markers included)
-    /// and sidecars, ready to materialize.
+    /// Conflicting paths, with the raw merged working set (markers included;
+    /// `needs_encrypt` entries carry plaintext that must NEVER transit the
+    /// CAS) and sidecars, ready for the caller's conflict-materialize path.
     Conflicts {
-        files: Vec<(String, FileMode, Vec<u8>)>,
+        files: Vec<MergedFile>,
         sidecars: Vec<(String, Vec<u8>)>,
         paths: Vec<String>,
     },
 }
 
-/// Replay (cherry-pick) `commit_id` onto `onto_root`.
+/// Split a replay/merge working set the way `Repo::merge_with_identity`'s
+/// clean path does (Task 6): carried ciphertext (`needs_encrypt: false`,
+/// PROTECTED) stays byte-for-byte as-is; `needs_encrypt` outputs
+/// (content-merged protected plaintext) get routed to encryption; a carried
+/// PLAIN file (perms 0) whose path still matches a union rule is ALSO routed
+/// through encryption — one side unprotecting a path the other side still
+/// rules must not let plaintext land in the replayed snapshot (bit<->rule
+/// invariant, Task 4 review I2). Returns `(carried, to_encrypt)` write-set
+/// halves ready for `write_tree_with_perms` / `protect::encrypt_protected`.
+#[allow(clippy::type_complexity)]
+fn split_for_encryption(
+    files: &[MergedFile],
+    union_prot: &Protection,
+) -> Result<(
+    Vec<(String, Vec<u8>, FileMode, u8)>,
+    Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)>,
+)> {
+    let mut carried: Vec<(String, Vec<u8>, FileMode, u8)> = Vec::new();
+    let mut to_encrypt: Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)> = Vec::new();
+    for f in files {
+        if f.needs_encrypt {
+            let recipients = protect::matching_prefix(union_prot, &f.path)
+                .map(|r| r.recipients.clone())
+                .ok_or_else(|| Error::NotProtected(f.path.clone()))?;
+            to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, recipients));
+        } else if f.perms & scl_core::PROTECTED == 0 {
+            match protect::matching_prefix(union_prot, &f.path) {
+                Some(rule) => to_encrypt.push((
+                    f.path.clone(),
+                    f.bytes.clone(),
+                    f.mode,
+                    rule.recipients.clone(),
+                )),
+                None => carried.push((f.path.clone(), f.bytes.clone(), f.mode, 0)),
+            }
+        } else {
+            // Carried ciphertext: bytes are already the surviving blob's raw
+            // ciphertext (fast path), never decrypted, perms verbatim.
+            carried.push((f.path.clone(), f.bytes.clone(), f.mode, f.perms));
+        }
+    }
+    Ok((carried, to_encrypt))
+}
+
+/// Replay (cherry-pick) `commit_id` onto the `onto` tree (root + the onto
+/// side's protection policy).
 ///
-/// This is a three-way merge: base = `commit_id`'s first parent's root tree
-/// (`None`, i.e. the empty tree, if `commit_id` is a root commit), ours =
-/// `onto_root`, theirs = `commit_id`'s own root tree. Merge commits (2+
-/// parents) are refused — mainline selection is not supported — as is any
-/// replay that would touch `PROTECTED` content, since flattening trees for a
-/// three-way merge drops the `perms` byte and would corrupt encrypted files.
-pub(crate) fn replay_commit(repo: &Repo, commit_id: ObjectId, onto_root: ObjectId) -> Result<ReplayOutcome> {
+/// This is a three-way merge: base = `commit_id`'s first parent (`None`, i.e.
+/// the empty tree, if `commit_id` is a root commit), ours = `onto`, theirs =
+/// `commit_id` itself — each side paired with its snapshot's protection so
+/// protected paths resolve exactly like `Repo::merge_with_identity`'s
+/// three-way (P15): ciphertext-id fast paths need no identity; a protected
+/// path that diverged in *content* on both sides needs `identity`
+/// ([`Error::ProtectedMergeNeedsIdentity`] without one). Merge commits (2+
+/// parents) are refused — mainline selection is not supported.
+///
+/// The clean path is self-contained: `needs_encrypt` outputs are encrypted
+/// against the union rules (onto-side ∪ commit-side) and the returned
+/// [`ReplayOutcome::Clean`] carries the fully assembled protection (union
+/// rules; wraps = carry ∪ fresh, wrap-reused against the onto side, pruned to
+/// the merged tree) so callers (cherry-pick now, rebase in Task 8) only
+/// thread it into `build_snapshot`.
+pub(crate) fn replay_commit(
+    repo: &Repo,
+    commit_id: ObjectId,
+    onto: (ObjectId, &Protection),
+    identity: Option<&scl_crypto::SecretKey>,
+) -> Result<ReplayOutcome> {
     let snap = repo.snapshot(&commit_id)?;
     if snap.parents.len() >= 2 {
         return Err(Error::CannotReplayMerge(commit_id));
     }
-    let base_root = match snap.parents.first() {
-        Some(p) => Some(repo.snapshot(p)?.root),
+    let (onto_root, onto_prot) = onto;
+    let base_snap = match snap.parents.first() {
+        Some(p) => Some(repo.snapshot(p)?),
         None => None,
     };
     let theirs_root = snap.root;
+    let theirs_prot = &snap.protection;
 
-    let store_arc = repo.vfs().store();
-    let mut store = store_arc.lock().unwrap();
-
-    // Fail closed on protected content (same rationale as `Repo::merge`'s
-    // guard at repo.rs ~585): `three_way_files` flattens trees without the
-    // `perms` byte, which would push raw ciphertext into the working tree as
-    // an ordinary unprotected blob. Pure read + early return: nothing is
-    // written before this guard fires.
-    for root in [base_root, Some(onto_root), Some(theirs_root)].into_iter().flatten() {
-        let entries = worktree::tree_file_entries_with_perms(&mut store, root)?;
-        if entries.values().any(|(_, _, perms)| perms & scl_core::PROTECTED != 0) {
-            return Err(Error::ReplayProtected(commit_id.to_string()));
-        }
-    }
-
-    // The guard above ensures no side has PROTECTED entries, so the merge
-    // never consults a protection policy (empty ones suffice), never needs an
-    // identity, and can't produce `needs_encrypt` outputs.
-    let no_prot = scl_core::Protection::default();
-    let fm = merge::three_way_files(
-        &mut store,
-        base_root.map(|r| (r, &no_prot)),
-        (onto_root, &no_prot),
-        (theirs_root, &no_prot),
-        None,
-    )?;
-    drop(store);
-
-    let files: Vec<(String, FileMode, Vec<u8>)> = fm
-        .files
-        .into_iter()
-        .map(|f| {
-            debug_assert!(!f.needs_encrypt, "protected guard fired above");
-            (f.path, f.mode, f.bytes)
-        })
-        .collect();
+    let fm = {
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        merge::three_way_files(
+            &mut store,
+            base_snap.as_ref().map(|b| (b.root, &b.protection)),
+            (onto_root, onto_prot),
+            (theirs_root, theirs_prot),
+            identity,
+        )?
+    };
 
     if !fm.conflicts.is_empty() {
         return Ok(ReplayOutcome::Conflicts {
-            files,
+            files: fm.files,
             sidecars: fm.sidecars,
             paths: fm.conflicts,
         });
     }
 
-    let write_set: Vec<(String, Vec<u8>, FileMode)> =
-        files.iter().map(|(p, m, b)| (p.clone(), b.clone(), *m)).collect();
-    let root = repo.vfs().write_tree(&write_set)?;
+    // Union protection rules across both sides (same discipline as the clean
+    // merge path in `Repo::merge_with_identity`): governs which recipients a
+    // needs_encrypt output is encrypted for, and becomes the replayed
+    // snapshot's rule set. `union_prot` exists only to drive
+    // `matching_prefix` lookups — its `wrapped` map is irrelevant here.
+    let union_prefixes = protect::union_prefixes(&onto_prot.prefixes, &theirs_prot.prefixes);
+    let union_prot = Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
+
+    let (mut all, to_encrypt) = split_for_encryption(&fm.files, &union_prot)?;
+    let (encrypted, fresh_wrapped) = protect::encrypt_protected(to_encrypt);
+    all.extend(encrypted);
+    let root = repo.vfs().write_tree_with_perms(&all)?;
 
     if root == onto_root {
-        Ok(ReplayOutcome::Empty)
-    } else {
-        Ok(ReplayOutcome::Clean { root })
+        return Ok(ReplayOutcome::Empty);
     }
+
+    // Assembled wrap map: carried wraps (`wrapped_carry`, for ciphertext that
+    // survived unchanged/one-sided) ∪ the freshly encrypted entries' wraps,
+    // then reuse the onto side's prior wrap bytes for any unchanged
+    // (blob, recipient), then prune to blobs actually reachable in the
+    // replayed tree — verbatim the clean-merge assembly in
+    // `Repo::merge_with_identity`, so replay and merge encode protection
+    // identically for identical content.
+    let mut wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = fm.wrapped_carry;
+    for (id, wks) in fresh_wrapped {
+        let entry = wrapped.entry(id).or_default();
+        *entry = protect::union_wraps(entry, &wks);
+    }
+    protect::reuse_prior_wraps(&mut wrapped, &onto_prot.wrapped);
+    {
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let reachable: std::collections::BTreeSet<ObjectId> =
+            worktree::tree_file_entries_with_perms(&mut store, root)?
+                .values()
+                .map(|(id, _, _)| *id)
+                .collect();
+        wrapped.retain(|id, _| reachable.contains(id));
+    }
+
+    Ok(ReplayOutcome::Clean {
+        root,
+        protection: Protection { prefixes: union_prefixes, wrapped },
+    })
+}
+
+/// Interim guard for REBASE only (P15 Task 7 — cherry-pick now replays
+/// protected content through the perms-aware core above): refuse a replay
+/// whose base/onto/theirs trees carry any `PROTECTED` entry, because rebase
+/// does not yet thread identity or the accumulated protection between
+/// replayed commits. Task 8 lifts this and deletes
+/// [`Error::ReplayProtected`] with it. Pure read + early return.
+fn ensure_replay_unprotected(repo: &Repo, commit_id: ObjectId, onto_root: ObjectId) -> Result<()> {
+    let snap = repo.snapshot(&commit_id)?;
+    let base_root = match snap.parents.first() {
+        Some(p) => Some(repo.snapshot(p)?.root),
+        None => None,
+    };
+    let store_arc = repo.vfs().store();
+    let mut store = store_arc.lock().unwrap();
+    for root in [base_root, Some(onto_root), Some(snap.root)].into_iter().flatten() {
+        let entries = worktree::tree_file_entries_with_perms(&mut store, root)?;
+        if entries.values().any(|(_, _, perms)| perms & scl_core::PROTECTED != 0) {
+            return Err(Error::ReplayProtected(commit_id.to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// Outcome of [`Repo::cherry_pick`].
@@ -144,10 +247,26 @@ impl Repo {
     /// tree consistently pre-pick), with the oplog record written last, after
     /// the ref write it describes. A conflicting replay writes conflict markers
     /// + sidecars over the working tree and records pick state
-    /// (`PICK_HEAD`/`PICK_CONFLICTS`) — no ref moves, no oplog entry, so the
-    /// current branch tip is unchanged until the conflicts are resolved and
-    /// committed. An empty replay (the change is already present) is a no-op.
-    pub fn cherry_pick(&self, refname: &str, author: &str) -> Result<PickResult> {
+    /// (`PICK_HEAD`/`PICK_CONFLICTS`/`PICK_DECIDED_ROOT`) — no ref moves, no
+    /// oplog entry, so the current branch tip is unchanged until the conflicts
+    /// are resolved and committed. An empty replay (the change is already
+    /// present) is a no-op.
+    ///
+    /// Protected paths (P15 Task 7) resolve exactly like
+    /// [`merge_with_identity`][Repo::merge_with_identity]'s three-way:
+    /// ciphertext-id fast paths need no `identity`; a protected path that
+    /// diverged in content on both sides needs one
+    /// ([`Error::ProtectedMergeNeedsIdentity`] without it, refs untouched). A
+    /// conflicted pick carrying protection writes plaintext markers to the
+    /// working tree ONLY (never through the CAS) and is completed by
+    /// `sc commit`, which unions the tip's rules with the picked commit's and
+    /// carries absent protected files from the pick's decided tree.
+    pub fn cherry_pick(
+        &self,
+        refname: &str,
+        author: &str,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<PickResult> {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -171,7 +290,7 @@ impl Repo {
         let picked_snap = self.snapshot(&picked_tip)?;
         let secrets_dropped = secrets_changed_from_parent(self, picked_tip)?;
 
-        match replay_commit(self, picked_tip, ours_root)? {
+        match replay_commit(self, picked_tip, (ours_root, &ours_snap.protection), identity)? {
             ReplayOutcome::Empty => {
                 // AlreadyApplied means the tree content already matches, but
                 // `replay_commit` only compares roots, not secret registries
@@ -184,7 +303,7 @@ impl Repo {
                 }
                 Ok(PickResult::AlreadyApplied)
             }
-            ReplayOutcome::Clean { root } => {
+            ReplayOutcome::Clean { root, protection } => {
                 let msg_first_line = picked_snap.message.lines().next().unwrap_or("");
                 let message = format!("{msg_first_line} (cherry-picked from {})", picked_tip.short());
                 // Ordering matters for crash safety (same discipline as
@@ -193,25 +312,32 @@ impl Repo {
                 // and only then move the branch ref — the ref update is the
                 // atomic commit point, so a crash before it leaves both tip
                 // and tree at the pre-pick state. The oplog record goes last,
-                // after the ref write it describes.
+                // after the ref write it describes. The replay's ASSEMBLED
+                // protection (union rules, carry ∪ fresh wraps) is what the
+                // new snapshot records — ours' policy alone would drop the
+                // picked side's rules and the wraps of carried/re-encrypted
+                // blobs.
                 let id = self.build_snapshot(
                     root,
                     vec![ours_tip],
                     ours_snap.secrets.clone(),
-                    ours_snap.protection.clone(),
+                    protection.clone(),
                     author,
                     &message,
                 )?;
                 {
                     let store_arc = self.vfs().store();
                     let mut store = store_arc.lock().unwrap();
+                    // Protection-aware materialize: a PROTECTED entry decrypts
+                    // for `identity` when possible, else is skipped (never
+                    // writes ciphertext to disk) — same as merge's clean path.
                     worktree::materialize(
                         &self.layout,
                         &mut store,
                         root,
                         Some(ours_root),
-                        &ours_snap.protection,
-                        None,
+                        &protection,
+                        identity,
                     )?;
                 }
                 refs::write_branch_tip(&self.layout, &head, &id)?;
@@ -230,26 +356,66 @@ impl Repo {
                 Ok(PickResult::Picked(id))
             }
             ReplayOutcome::Conflicts { files, sidecars, paths } => {
-                // Same conflict-materialize pattern as `Repo::merge` (repo.rs
-                // ~595-625): build the marker tree, materialize it over ours,
-                // then write sidecars. `replay_commit`'s protected guard has
-                // already refused any replay touching PROTECTED content, so
-                // `Protection::default()` here is sound for the same reason
-                // it is in `merge`'s conflict path.
-                let write_set: Vec<(String, Vec<u8>, FileMode)> =
-                    files.iter().map(|(p, m, b)| (p.clone(), b.clone(), *m)).collect();
-                let marker_root = self.vfs().write_tree(&write_set)?;
+                // Conflicted pick (P15 Task 7) — same worktree-direct-write
+                // restructure as `Repo::merge_with_identity`'s conflict path
+                // (Task 6). The working set holds plaintext `needs_encrypt`
+                // entries (conflict markers and clean content merges of
+                // protected paths; reachable only with an identity — plus
+                // ours' carried-plain files under a picked-side-only rule,
+                // the I2 case). Plaintext must NEVER transit the CAS: the CAS
+                // tree used for materialization is built from the carried
+                // entries ONLY (surviving ciphertext + plain files, all
+                // already CAS-safe), and every `needs_encrypt` file —
+                // conflicted or not — is written straight to the working tree
+                // via `safe_join`, exactly like sidecars. Re-encryption
+                // happens at completion: `sc commit` unions the tip's rules
+                // with the picked commit's (`snapshot_files`).
+                let union_prefixes = crate::protect::union_prefixes(
+                    &ours_snap.protection.prefixes,
+                    &picked_snap.protection.prefixes,
+                );
+                let union_prot = scl_core::Protection {
+                    prefixes: union_prefixes.clone(),
+                    wrapped: Default::default(),
+                };
+                let (carried, to_encrypt) = split_for_encryption(&files, &union_prot)?;
+                let conflict_root = self.vfs().write_tree_with_perms(&carried)?;
+                // Wraps for the conflict materialize: ours ∪ picked (a carried
+                // blob survives from one of the two sides, so their unioned
+                // maps cover every carried PROTECTED entry — the same
+                // coverage `wrapped_carry` provides on the merge path).
+                let mut wrapped = ours_snap.protection.wrapped.clone();
+                for (id, wks) in &picked_snap.protection.wrapped {
+                    let entry = wrapped.entry(*id).or_default();
+                    *entry = crate::protect::union_wraps(entry, wks);
+                }
+                let conflict_prot =
+                    scl_core::Protection { prefixes: union_prefixes, wrapped };
                 {
                     let store_arc = self.vfs().store();
                     let mut store = store_arc.lock().unwrap();
-                    worktree::materialize(
+                    // Carried PROTECTED entries decrypt for `identity` where
+                    // its key matches; the rest are skipped (absent from
+                    // disk). The completion commit's decided-tree
+                    // carry-forward preserves skipped content.
+                    let _skipped = worktree::materialize(
                         &self.layout,
                         &mut store,
-                        marker_root,
+                        conflict_root,
                         Some(ours_root),
-                        &scl_core::Protection::default(),
-                        None,
+                        &conflict_prot,
+                        identity,
                     )?;
+                }
+                // Direct plaintext writes AFTER materialize: its deletion pass
+                // (ours-tracked paths absent from the carried-only tree) would
+                // otherwise remove what we just wrote.
+                for (path, bytes, _mode, _recipients) in &to_encrypt {
+                    let full = worktree::safe_join(&self.layout.root, path)?;
+                    if let Some(parent) = full.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(full, bytes)?;
                 }
                 for (rel, bytes) in &sidecars {
                     let full = self.layout.root.join(rel);
@@ -258,7 +424,12 @@ impl Repo {
                     }
                     std::fs::write(full, bytes)?;
                 }
-                crate::pick_state::write(&self.layout, &picked_tip, &paths)?;
+                // Markers are on disk; record pick state last (its PICK_HEAD
+                // write is the in-progress signal). The decided carried tree
+                // (`conflict_root`) is persisted alongside so completion
+                // carries absent protected files from the pick's DECISION
+                // rather than re-reading the stale tip.
+                crate::pick_state::write(&self.layout, &picked_tip, &paths, Some(&conflict_root))?;
                 Err(Error::PickConflicts(paths.len()))
             }
         }
@@ -376,16 +547,27 @@ impl Repo {
             if secrets_changed_from_parent(self, commit)? {
                 secrets_dropped_anywhere = true;
             }
-            match replay_commit(self, commit, acc_root)? {
+            // Interim (Task 7): rebase still refuses protected content — it
+            // does not yet thread identity or the accumulated protection
+            // between replayed commits (Task 8 does both and deletes this
+            // guard together with `Error::ReplayProtected`). Fires before
+            // anything is written for this commit.
+            ensure_replay_unprotected(self, commit, acc_root)?;
+            match replay_commit(self, commit, (acc_root, &target_snap.protection), None)? {
                 ReplayOutcome::Empty => {
                     skipped += 1;
                 }
-                ReplayOutcome::Clean { root } => {
+                ReplayOutcome::Clean { root, protection } => {
+                    // The guard above means the assembled protection can
+                    // differ from target's only in prefix rules (never in
+                    // wraps); record it so a plain file falling under a rule
+                    // either side knows stays governed — same union
+                    // discipline as cherry-pick's clean path.
                     let id = self.build_snapshot(
                         root,
                         vec![acc_tip],
                         target_snap.secrets.clone(),
-                        target_snap.protection.clone(),
+                        protection,
                         author,
                         &commit_snap.message,
                     )?;
@@ -453,6 +635,42 @@ mod tests {
         p
     }
 
+    /// True if any loose CAS blob contains `needle` (same helper as repo.rs's
+    /// Task 6 tests): plaintext markers/protected content must never transit
+    /// the store.
+    fn cas_blob_contains(repo: &Repo, needle: &[u8]) -> bool {
+        let store_arc = repo.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        for id in s.list_loose().unwrap() {
+            if let Ok(scl_core::Object::Blob(b)) = s.get(&id) {
+                if b.windows(needle.len()).any(|w| w == needle) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The (blob id, perms) of `path` in `commit`'s root tree.
+    fn tree_entry(repo: &Repo, commit: &ObjectId, path: &str) -> (ObjectId, u8) {
+        let store_arc = repo.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        let root = s.get_snapshot(commit).unwrap().root;
+        let entries = worktree::tree_file_entries_with_perms(&mut s, root).unwrap();
+        let (id, _, perms) = entries[path];
+        (id, perms)
+    }
+
+    /// Raw bytes of blob `id` in the store.
+    fn blob_bytes_of(repo: &Repo, id: &ObjectId) -> Vec<u8> {
+        let store_arc = repo.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        match s.get(id).unwrap() {
+            scl_core::Object::Blob(b) => b.to_vec(),
+            _ => panic!("expected Blob"),
+        }
+    }
+
     #[test]
     fn clean_replay_produces_merged_root() {
         let root = tmp_root("clean");
@@ -472,10 +690,11 @@ mod tests {
         repo.switch("main").unwrap();
         assert_eq!(repo.head_tip().unwrap(), Some(main_tip));
 
-        let onto_root = repo.snapshot(&main_tip).unwrap().root;
-        let outcome = replay_commit(&repo, b_tip, onto_root).unwrap();
+        let onto_snap = repo.snapshot(&main_tip).unwrap();
+        let outcome =
+            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None).unwrap();
         match outcome {
-            ReplayOutcome::Clean { root: merged_root } => {
+            ReplayOutcome::Clean { root: merged_root, .. } => {
                 let store_arc = repo.vfs().store();
                 let mut store = store_arc.lock().unwrap();
                 let ids = tree_file_ids(&mut store, merged_root).unwrap();
@@ -506,12 +725,13 @@ mod tests {
         let b_tip = repo.commit("me", "b edits x").unwrap();
         repo.switch("main").unwrap();
 
-        let onto_root = repo.snapshot(&main_tip).unwrap().root;
-        let outcome = replay_commit(&repo, b_tip, onto_root).unwrap();
+        let onto_snap = repo.snapshot(&main_tip).unwrap();
+        let outcome =
+            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None).unwrap();
         match outcome {
             ReplayOutcome::Conflicts { files, paths, .. } => {
                 assert_eq!(paths, vec!["x.txt".to_string()]);
-                let x = &files.iter().find(|(p, _, _)| p == "x.txt").unwrap().2;
+                let x = &files.iter().find(|f| f.path == "x.txt").unwrap().bytes;
                 assert!(String::from_utf8_lossy(x).contains("<<<<<<<"));
             }
             _ => panic!("expected Conflicts"),
@@ -536,8 +756,9 @@ mod tests {
         std::fs::write(root.join("x.txt"), b"a\nb\n").unwrap();
         let main_tip = repo.commit("me", "main makes same edit").unwrap();
 
-        let onto_root = repo.snapshot(&main_tip).unwrap().root;
-        let outcome = replay_commit(&repo, b_tip, onto_root).unwrap();
+        let onto_snap = repo.snapshot(&main_tip).unwrap();
+        let outcome =
+            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None).unwrap();
         assert!(matches!(outcome, ReplayOutcome::Empty));
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -588,10 +809,12 @@ mod tests {
                 .unwrap();
             drop(store_b);
 
-            let onto_root = repo_b.snapshot(&b_tip).unwrap().root;
-            let outcome = replay_commit(&repo_b, copied_commit, onto_root).unwrap();
+            let onto_snap = repo_b.snapshot(&b_tip).unwrap();
+            let outcome =
+                replay_commit(&repo_b, copied_commit, (onto_snap.root, &onto_snap.protection), None)
+                    .unwrap();
             match outcome {
-                ReplayOutcome::Clean { root: merged_root } => {
+                ReplayOutcome::Clean { root: merged_root, .. } => {
                     let mut store_b = store_b_arc.lock().unwrap();
                     let ids = tree_file_ids(&mut store_b, merged_root).unwrap();
                     assert!(ids.contains_key("new.txt"));
@@ -607,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_commit_and_protected_content_are_refused() {
+    fn merge_commit_replay_is_refused() {
         let root = tmp_root("refused");
         let repo = Repo::init(&root).unwrap();
         std::fs::write(root.join("base.txt"), b"base\n").unwrap();
@@ -622,29 +845,44 @@ mod tests {
         let merged = repo.merge("main", "me").unwrap();
         assert!(repo.snapshot(&merged).unwrap().parents.len() >= 2);
 
-        let onto_root = repo.snapshot(&main_tip).unwrap().root;
-        let err = replay_commit(&repo, merged, onto_root).unwrap_err();
+        let onto_snap = repo.snapshot(&main_tip).unwrap();
+        let err = replay_commit(&repo, merged, (onto_snap.root, &onto_snap.protection), None)
+            .unwrap_err();
         assert!(matches!(err, Error::CannotReplayMerge(id) if id == merged), "got {err:?}");
         let _ = base;
 
-        // Protected content: any replay involving a protected snapshot is refused.
-        let proot = tmp_root("refused-protected");
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Interim Task 7 state: cherry-pick now replays protected content, but
+    /// REBASE keeps the fail-closed guard until Task 8 threads identity and
+    /// the accumulated protection through the range.
+    #[test]
+    fn rebase_over_protected_content_still_refused_until_task8() {
+        let proot = tmp_root("rebase-refused-protected");
         let prepo = Repo::init(&proot).unwrap();
         let (_sk, pk) = scl_crypto::generate_keypair();
         prepo.test_set_protected_prefix("secret/", &[pk]).unwrap();
         std::fs::create_dir_all(proot.join("secret")).unwrap();
         std::fs::write(proot.join("secret/db.txt"), b"hunter2").unwrap();
-        let pbase = prepo.commit("me", "base").unwrap();
+        prepo.commit("me", "base").unwrap();
+        prepo.branch("feature").unwrap();
+
+        // main gains a commit so the rebase has real work to do (no fast path).
+        std::fs::write(proot.join("main.txt"), b"m\n").unwrap();
+        prepo.commit("me", "main adds main.txt").unwrap();
+
+        prepo.switch("feature").unwrap();
         std::fs::write(proot.join("other.txt"), b"o\n").unwrap();
-        let ptip = prepo.commit("me", "adds other").unwrap();
+        prepo.commit("me", "feature adds other").unwrap();
+        let feature_tip = prepo.head_tip().unwrap();
 
-        let onto_root = prepo.snapshot(&pbase).unwrap().root;
-        let err = replay_commit(&prepo, ptip, onto_root).unwrap_err();
+        let err = prepo.rebase("main", "me").unwrap_err();
         assert!(matches!(err, Error::ReplayProtected(_)), "got {err:?}");
+        assert_eq!(prepo.head_tip().unwrap(), feature_tip, "feature tip must not move");
 
-        drop(repo);
         drop(prepo);
-        std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&proot).ok();
     }
 
@@ -662,7 +900,7 @@ mod tests {
         repo.switch("main").unwrap();
         let old_main_tip = repo.head_tip().unwrap().unwrap();
 
-        let outcome = repo.cherry_pick("work-1", "me").unwrap();
+        let outcome = repo.cherry_pick("work-1", "me", None).unwrap();
         let id = match outcome {
             PickResult::Picked(id) => id,
             other => panic!("expected Picked, got {other:?}"),
@@ -702,7 +940,7 @@ mod tests {
         repo.switch("main").unwrap();
         assert_eq!(repo.head_tip().unwrap(), Some(main_tip));
 
-        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "main tip must not move");
         assert_eq!(repo.pick_head().unwrap(), Some(picked));
@@ -737,7 +975,7 @@ mod tests {
         assert_eq!(repo.head_tip().unwrap(), Some(merged));
         let ops_before = repo.oplog().unwrap().len();
 
-        let outcome = repo.cherry_pick("work-1", "me").unwrap();
+        let outcome = repo.cherry_pick("work-1", "me", None).unwrap();
         assert!(matches!(outcome, PickResult::AlreadyApplied), "got {outcome:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(merged), "tip must not move");
         assert_eq!(repo.oplog().unwrap().len(), ops_before, "no new oplog record");
@@ -760,25 +998,25 @@ mod tests {
 
         // Dirty working tree.
         std::fs::write(root.join("x.txt"), b"dirty\n").unwrap();
-        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
         std::fs::write(root.join("x.txt"), b"a\n").unwrap();
 
         // Merge in progress.
         let ours_tip = repo.head_tip().unwrap().unwrap();
         crate::merge_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
-        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
         assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
         crate::merge_state::clear(&repo.layout).unwrap();
 
         // Pick in progress.
-        crate::pick_state::write(&repo.layout, &ours_tip, &[]).unwrap();
-        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        crate::pick_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
+        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
         assert!(matches!(err, Error::PickInProgress), "got {err:?}");
         crate::pick_state::clear(&repo.layout).unwrap();
 
         // Unknown ref.
-        let err = repo.cherry_pick("no-such-branch", "me").unwrap_err();
+        let err = repo.cherry_pick("no-such-branch", "me", None).unwrap_err();
         assert!(matches!(err, Error::NoSuchBranch(_)), "got {err:?}");
 
         drop(repo);
@@ -802,11 +1040,285 @@ mod tests {
 
         let ours_tip = repo.head_tip().unwrap().unwrap();
         crate::merge_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
-        let err = repo.cherry_pick("work-1", "me").unwrap_err();
+        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
         assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(ours_tip), "tip must not move");
 
         crate::merge_state::clear(&repo.layout).unwrap();
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cherry_pick_disjoint_protected_commit_needs_no_identity() {
+        // The picked commit updates a protected file ours never touched: the
+        // ciphertext-id fast path carries the picked blob verbatim — no
+        // identity needed — the branch advances, and the new snapshot's
+        // protection keeps the blob's wraps so recipients still decrypt.
+        let root = tmp_root("cp-prot-disjoint");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"v1").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // work updates the protected file.
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"v2").unwrap();
+        let picked = repo.commit("me", "work updates secret").unwrap();
+        let (v2_id, _) = tree_entry(&repo, &picked, "secret/db.txt");
+
+        // main gains an unrelated plain commit (keyless hop back).
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("main.txt"), b"m\n").unwrap();
+        let main_tip = repo.commit("me", "main adds main.txt").unwrap();
+
+        // KEYLESS pick.
+        let outcome = repo.cherry_pick("work", "me", None).unwrap();
+        let id = match outcome {
+            PickResult::Picked(id) => id,
+            other => panic!("expected Picked, got {other:?}"),
+        };
+        assert_eq!(repo.head_tip().unwrap(), Some(id), "branch advanced");
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![main_tip]);
+
+        // The picked ciphertext blob is carried byte-for-byte, PROTECTED.
+        let (got_id, perms) = tree_entry(&repo, &id, "secret/db.txt");
+        assert_eq!(got_id, v2_id, "ciphertext carried verbatim");
+        assert_ne!(perms & scl_core::PROTECTED, 0);
+        // ...and its wraps survive into the new snapshot's protection.
+        let bytes = blob_bytes_of(&repo, &got_id);
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &got_id,
+            &[&snap.protection],
+            &alice_sk,
+            "secret/db.txt",
+        )
+        .unwrap();
+        assert_eq!(&pt[..], b"v2", "recipient decrypts the picked update");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cherry_pick_content_divergent_requires_identity_and_reencrypts() {
+        // secret/a.txt diverged in content on both sides (mergeable lines):
+        // a keyless pick fails with the typed error and moves nothing; with
+        // an identity the plaintexts are diff3'd and the merged content is
+        // re-encrypted for ALL rule recipients.
+        let root = tmp_root("cp-prot-divergent");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk, bob_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // ours edits line 1.
+        std::fs::write(root.join("secret/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        let main_tip = repo.commit("me", "main edits line 1").unwrap();
+
+        // work edits line 3 (mergeable divergence).
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
+        repo.commit("me", "work edits line 3").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        // Keyless: typed error, refs untouched, no pick state.
+        let err = repo.cherry_pick("work", "me", None).unwrap_err();
+        assert!(
+            matches!(err, Error::ProtectedMergeNeedsIdentity(ref p) if p == "secret/a.txt"),
+            "got {err:?}"
+        );
+        assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "tip must not move");
+        assert!(!repo.pick_in_progress(), "no pick state on the identity refusal");
+
+        // With identity: clean pick, merged content re-encrypted.
+        let outcome = repo.cherry_pick("work", "me", Some(&alice_sk)).unwrap();
+        let id = match outcome {
+            PickResult::Picked(id) => id,
+            other => panic!("expected Picked, got {other:?}"),
+        };
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![main_tip]);
+        let (blob_id, perms) = tree_entry(&repo, &id, "secret/a.txt");
+        assert_ne!(perms & scl_core::PROTECTED, 0, "PROTECTED preserved");
+        let bytes = blob_bytes_of(&repo, &blob_id);
+        assert!(!bytes.windows(4).any(|w| w == b"OURS"), "plaintext leaked into the CAS blob");
+        for (who, sk) in [("alice", &alice_sk), ("bob", &bob_sk)] {
+            let pt = crate::protect::decrypt_with(
+                &bytes,
+                &blob_id,
+                &[&snap.protection],
+                sk,
+                "secret/a.txt",
+            )
+            .unwrap();
+            assert_eq!(&pt[..], b"OURS\nl2\nTHEIRS\n", "{who} must decrypt the merged content");
+        }
+        // The identity-holder gets the merged plaintext on disk.
+        assert_eq!(
+            std::fs::read(root.join("secret/a.txt")).unwrap(),
+            b"OURS\nl2\nTHEIRS\n".to_vec()
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cherry_pick_protected_conflict_writes_plaintext_markers_worktree_only() {
+        // Same-line edits of secret/a.txt on both sides: the pick conflicts.
+        // The plaintext marker file must live on DISK ONLY — no CAS object
+        // may contain the marker plaintext — and resolving + committing
+        // completes the pick with a single-parent snapshot whose re-encrypted
+        // blob keeps PROTECTED and decrypts for every recipient.
+        let root = tmp_root("cp-prot-conflict");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk, bob_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"OURS-EDIT\nl2\nl3\n").unwrap();
+        let ours = repo.commit("me", "main edits line 1").unwrap();
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"THEIRS-EDIT\nl2\nl3\n").unwrap();
+        let picked = repo.commit("me", "work edits line 1").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        let err = repo.cherry_pick("work", "me", Some(&alice_sk)).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert_eq!(repo.head_tip().unwrap(), Some(ours), "tip must not move");
+        assert_eq!(repo.pick_head().unwrap(), Some(picked));
+        assert!(
+            crate::pick_state::read_decided_root(&repo.layout).unwrap().is_some(),
+            "conflict path records the pick's decided carried tree"
+        );
+
+        // Markers are on disk as editable plaintext...
+        let marked = std::fs::read(root.join("secret/a.txt")).unwrap();
+        assert!(marked.windows(7).any(|w| w == b"<<<<<<<"), "markers on disk");
+        assert!(marked.windows(9).any(|w| w == b"OURS-EDIT"));
+        assert!(marked.windows(11).any(|w| w == b"THEIRS-EDIT"));
+        // ...and NO CAS object contains the marker plaintext.
+        assert!(!cas_blob_contains(&repo, b"<<<<<<<"), "marker plaintext leaked into the CAS");
+        assert!(!cas_blob_contains(&repo, b"OURS-EDIT"), "protected plaintext leaked into the CAS");
+
+        // Resolve and complete via commit: re-encryption happens there.
+        std::fs::write(root.join("secret/a.txt"), b"RESOLVED\nl2\nl3\n").unwrap();
+        let id = repo.commit("me", "resolve pick conflict").unwrap();
+        assert!(!repo.pick_in_progress());
+        assert_eq!(
+            crate::pick_state::read_decided_root(&repo.layout).unwrap(),
+            None,
+            "completing commit clears the pick decided root"
+        );
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![ours], "pick completion is single-parent");
+
+        let (blob_id, perms) = tree_entry(&repo, &id, "secret/a.txt");
+        assert_ne!(perms & scl_core::PROTECTED, 0, "PROTECTED preserved through completion");
+        let bytes = blob_bytes_of(&repo, &blob_id);
+        assert!(!bytes.windows(8).any(|w| w == b"RESOLVED"), "resolved plaintext in CAS blob");
+        for (who, sk) in [("alice", &alice_sk), ("bob", &bob_sk)] {
+            let pt = crate::protect::decrypt_with(
+                &bytes,
+                &blob_id,
+                &[&snap.protection],
+                sk,
+                "secret/a.txt",
+            )
+            .unwrap();
+            assert_eq!(&pt[..], b"RESOLVED\nl2\nl3\n", "{who} must decrypt the resolution");
+        }
+        // Still no marker/plaintext residue anywhere in the CAS after completion.
+        assert!(!cas_blob_contains(&repo, b"<<<<<<<"));
+        assert!(!cas_blob_contains(&repo, b"RESOLVED"));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pick_completion_carries_picked_protected_update_not_ours_stale() {
+        // The pick analog of merge scenario B (Task 6 review): a plain
+        // conflict forces the conflict path while the picked commit carries a
+        // protected update that resolves clean ("only theirs changed → take
+        // theirs"). A keyless resolver's completing commit must carry the
+        // PICKED (decided) ciphertext from PICK_DECIDED_ROOT — a tip-only
+        // carry-forward would commit ours' STALE blob and silently drop the
+        // picked update.
+        let root = tmp_root("cp-decided-tree");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x.txt"), b"v0").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // ours: only the plain conflicting edit; secret/x.txt stays v0.
+        std::fs::write(root.join("shared.txt"), b"a\nX\nc\n").unwrap();
+        let ours = repo.commit("me", "ours edits shared").unwrap();
+
+        // picked: update secret/x.txt to v1 + the conflicting plain edit.
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/x.txt"), b"v1").unwrap();
+        std::fs::write(root.join("shared.txt"), b"a\nY\nc\n").unwrap();
+        let picked = repo.commit("me", "work updates secret + edits shared").unwrap();
+        let (v1_id, _) = tree_entry(&repo, &picked, "secret/x.txt");
+
+        // KEYLESS hop back to main (secret/x.txt leaves the disk).
+        repo.switch("main").unwrap();
+
+        // KEYLESS conflicted pick: x.txt is decided clean (take picked) but
+        // cannot materialize without a key; shared.txt conflicts.
+        let err = repo.cherry_pick("work", "me", None).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert!(!root.join("secret/x.txt").exists(), "keyless: v1 stays off disk");
+
+        std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
+        let id = repo.commit("me", "resolve").unwrap();
+        assert!(!repo.pick_in_progress());
+        assert_eq!(
+            crate::pick_state::read_decided_root(&repo.layout).unwrap(),
+            None,
+            "completing commit clears the pick decided root"
+        );
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![ours], "pick completion is single-parent");
+
+        let (got_id, perms) = tree_entry(&repo, &id, "secret/x.txt");
+        assert_ne!(perms & scl_core::PROTECTED, 0);
+        assert_eq!(
+            got_id, v1_id,
+            "completion must carry the PICKED decided v1 ciphertext, not ours' stale v0"
+        );
+        // The carried blob decrypts via the completion snapshot's protection
+        // (tip ∪ picked wraps — only the picked commit knew this blob's DEK).
+        let bytes = blob_bytes_of(&repo, &got_id);
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &got_id,
+            &[&snap.protection],
+            &alice_sk,
+            "secret/x.txt",
+        )
+        .unwrap();
+        assert_eq!(&pt[..], b"v1", "the carried blob decrypts to the picked update");
+
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
     }
