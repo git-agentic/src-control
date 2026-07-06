@@ -1,6 +1,8 @@
 //! Encrypted-path policy helpers.
 
-use scl_core::{ObjectId, ProtectPrefix, Protection, WrappedKey};
+use std::collections::BTreeMap;
+
+use scl_core::{FileMode, Object, ObjectId, ProtectPrefix, Protection, WrappedKey};
 
 use crate::error::{Error, Result};
 
@@ -98,6 +100,50 @@ pub(crate) fn decrypt_with(
         }
     }
     Err(Error::NotAuthorized(path.to_string()))
+}
+
+/// Convergently encrypt `plaintexts` (path, bytes, mode, rule recipients),
+/// wrapping each fresh DEK to its recipients. Returns the ciphertext write-set
+/// entries (PROTECTED perms) and fresh wraps keyed by ciphertext blob id.
+pub(crate) fn encrypt_protected(
+    plaintexts: Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)>,
+) -> (Vec<(String, Vec<u8>, FileMode, u8)>, BTreeMap<ObjectId, Vec<WrappedKey>>) {
+    // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
+    let mut all: Vec<(String, Vec<u8>, FileMode, u8)> = Vec::new();
+    let mut fresh_wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
+    for (path, bytes, mode, recipients) in plaintexts {
+        let (blob_bytes, dek) = scl_crypto::encrypt_path(&bytes);
+        // Build the blob object once for its id; `write_tree_with_perms` does
+        // the (idempotent) store insert below — no second explicit `put`.
+        let blob_id = Object::blob(blob_bytes.clone()).id();
+        let wks: Vec<WrappedKey> = recipients
+            .iter()
+            .map(|pk| scl_crypto::wrap_dek_for(&dek, &scl_crypto::PublicKey::from_bytes(*pk)))
+            .collect();
+        fresh_wrapped.insert(blob_id, wks);
+        all.push((path, blob_bytes, mode, scl_core::PROTECTED));
+    }
+    (all, fresh_wrapped)
+}
+
+/// Prior-wrap reuse: for each (blob_id, recipient_id) already wrapped in
+/// `prior`, keep the prior wrap bytes so unchanged content's protection
+/// encoding (and thus snapshot ids) stays stable. Mutates `fresh` in place.
+pub(crate) fn reuse_prior_wraps(
+    fresh: &mut BTreeMap<ObjectId, Vec<WrappedKey>>,
+    prior: &BTreeMap<ObjectId, Vec<WrappedKey>>,
+) {
+    for (blob_id, wks) in fresh.iter_mut() {
+        if let Some(prior_wks) = prior.get(blob_id) {
+            for wk in wks.iter_mut() {
+                if let Some(existing) =
+                    prior_wks.iter().find(|p| p.recipient_id == wk.recipient_id)
+                {
+                    *wk = existing.clone();
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use scl_core::{Object, ObjectId, Protection, Snapshot, Store, WrappedKey};
+use scl_core::{Object, ObjectId, Protection, Snapshot, Store};
 use scl_vfs::Repo as VfsRepo;
 
 use crate::error::{Error, Result};
@@ -184,19 +184,8 @@ impl Repo {
         // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
         let mut all: Vec<(String, Vec<u8>, scl_core::FileMode, u8)> =
             plain.into_iter().map(|(p, b, m)| (p, b, m, 0u8)).collect();
-        let mut fresh_wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
-        for (path, bytes, mode, recipients) in protected {
-            let (blob_bytes, dek) = scl_crypto::encrypt_path(&bytes);
-            // Build the blob object once for its id; `write_tree_with_perms` does
-            // the (idempotent) store insert below — no second explicit `put`.
-            let blob_id = Object::blob(blob_bytes.clone()).id();
-            let wks: Vec<WrappedKey> = recipients
-                .iter()
-                .map(|pk| scl_crypto::wrap_dek_for(&dek, &scl_crypto::PublicKey::from_bytes(*pk)))
-                .collect();
-            fresh_wrapped.insert(blob_id, wks);
-            all.push((path, blob_bytes, mode, scl_core::PROTECTED));
-        }
+        let (protected_all, mut fresh_wrapped) = crate::protect::encrypt_protected(protected);
+        all.extend(protected_all);
 
         // Safe-by-default: carry forward still-protected files that are absent
         // from the working tree. `commit` cannot distinguish "absent because the
@@ -252,17 +241,7 @@ impl Repo {
         // prior wrap forward keeps it stable; only a newly-added recipient (or a new
         // blob) gets a fresh wrap, and a revoked recipient is already absent here.
         let prior = std::mem::take(&mut protection.wrapped);
-        for (blob_id, wks) in fresh_wrapped.iter_mut() {
-            if let Some(prior_wks) = prior.get(blob_id) {
-                for wk in wks.iter_mut() {
-                    if let Some(existing) =
-                        prior_wks.iter().find(|p| p.recipient_id == wk.recipient_id)
-                    {
-                        *wk = existing.clone();
-                    }
-                }
-            }
-        }
+        crate::protect::reuse_prior_wraps(&mut fresh_wrapped, &prior);
         protection.wrapped = fresh_wrapped;
 
         let mut parents: Vec<ObjectId> = tip.into_iter().collect();
