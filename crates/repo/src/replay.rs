@@ -101,8 +101,12 @@ impl Repo {
     /// resolving `refname` (`Error::NoSuchBranch`), then the dirty-working-tree
     /// check. A clean replay advances the current branch with a single-parent
     /// snapshot (`parents: [ours_tip]`) whose message is the picked commit's
-    /// first message line plus a `(cherry-picked from <short>)` suffix, and
-    /// materializes the new tree. A conflicting replay writes conflict markers
+    /// first message line plus a `(cherry-picked from <short>)` suffix. The
+    /// clean path follows `Repo::merge`'s crash discipline: snapshot to the
+    /// CAS, materialize the working tree, *then* move the branch ref (the ref
+    /// update is the atomic commit point — a crash before it leaves tip and
+    /// tree consistently pre-pick), with the oplog record written last, after
+    /// the ref write it describes. A conflicting replay writes conflict markers
     /// + sidecars over the working tree and records pick state
     /// (`PICK_HEAD`/`PICK_CONFLICTS`) — no ref moves, no oplog entry, so the
     /// current branch tip is unchanged until the conflicts are resolved and
@@ -135,6 +139,13 @@ impl Repo {
             ReplayOutcome::Clean { root } => {
                 let msg_first_line = picked_snap.message.lines().next().unwrap_or("");
                 let message = format!("{msg_first_line} (cherry-picked from {})", picked_tip.short());
+                // Ordering matters for crash safety (same discipline as
+                // `Repo::merge`'s ff and three-way paths): build the snapshot
+                // (CAS-only, no visible state), materialize the working tree,
+                // and only then move the branch ref — the ref update is the
+                // atomic commit point, so a crash before it leaves both tip
+                // and tree at the pre-pick state. The oplog record goes last,
+                // after the ref write it describes.
                 let id = self.build_snapshot(
                     root,
                     vec![ours_tip],
@@ -143,7 +154,6 @@ impl Repo {
                     author,
                     &message,
                 )?;
-                refs::write_branch_tip(&self.layout, &head, &id)?;
                 {
                     let store_arc = self.vfs().store();
                     let mut store = store_arc.lock().unwrap();
@@ -156,6 +166,7 @@ impl Repo {
                         None,
                     )?;
                 }
+                refs::write_branch_tip(&self.layout, &head, &id)?;
                 crate::oplog::record(
                     &self.layout,
                     &format!("cherry-pick {refname}"),
