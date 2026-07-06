@@ -127,15 +127,20 @@ impl Repo {
         }
     }
 
-    /// Snapshot the working tree into a new commit on the current branch. When a
-    /// merge is in progress, records both parents and clears the merge state.
-    /// Files under a protected prefix are convergently encrypted (scanner-exempt);
-    /// only plaintext files are scanned.
-    pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
-        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
-        let tip = self.head_tip()?;
-        let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
-
+    /// The commit pipeline minus ref movement: split protected/plaintext files,
+    /// scan the plaintext (Err(SecretDetected) on a hit), convergently encrypt
+    /// protected files, carry forward absent still-protected content from
+    /// `tip`, and persist the resulting snapshot with `tip` (+ `merge_head`)
+    /// as parents. Used by `commit` (HEAD tip) and by workspace harvest (P13,
+    /// arbitrary base tip, no merge head). Advances no refs.
+    pub(crate) fn snapshot_files(
+        &self,
+        files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
+        tip: Option<ObjectId>,
+        merge_head: Option<ObjectId>,
+        author: &str,
+        message: &str,
+    ) -> Result<ObjectId> {
         // Read the tip snapshot exactly once; extract both protection and secrets.
         let (mut protection, secrets) = match (tip, merge_head) {
             (None, _) => (Protection::default(), BTreeMap::new()),
@@ -255,7 +260,20 @@ impl Repo {
         if let Some(theirs) = merge_head {
             parents.push(theirs);
         }
-        let id = self.commit_snapshot(root, parents, secrets, protection, author, message)?;
+        self.build_snapshot(root, parents, secrets, protection, author, message)
+    }
+
+    /// Snapshot the working tree into a new commit on the current branch. When a
+    /// merge is in progress, records both parents and clears the merge state.
+    /// Files under a protected prefix are convergently encrypted (scanner-exempt);
+    /// only plaintext files are scanned.
+    pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
+        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
+        let tip = self.head_tip()?;
+        let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
+        let id = self.snapshot_files(files, tip, merge_head, author, message)?;
+        let branch = refs::current_branch(&self.layout)?;
+        refs::write_branch_tip(&self.layout, &branch, &id)?;
         crate::merge_state::clear(&self.layout)?;
         Ok(id)
     }
@@ -291,8 +309,10 @@ impl Repo {
         }
     }
 
-    /// Build + persist a snapshot and advance the current branch ref.
-    pub(crate) fn commit_snapshot(
+    /// Persist a snapshot object (no ref movement). The workspace harvest
+    /// (P13) commits to non-HEAD branches, so snapshot construction must not
+    /// be welded to "advance the current branch".
+    pub(crate) fn build_snapshot(
         &self,
         root: ObjectId,
         parents: Vec<ObjectId>,
@@ -312,6 +332,20 @@ impl Repo {
         });
         let store_arc = self.vfs.store();
         let id = store_arc.lock().unwrap().put(snap)?;
+        Ok(id)
+    }
+
+    /// Build + persist a snapshot and advance the current branch ref.
+    pub(crate) fn commit_snapshot(
+        &self,
+        root: ObjectId,
+        parents: Vec<ObjectId>,
+        secrets: BTreeMap<String, ObjectId>,
+        protection: Protection,
+        author: &str,
+        message: &str,
+    ) -> Result<ObjectId> {
+        let id = self.build_snapshot(root, parents, secrets, protection, author, message)?;
         let branch = refs::current_branch(&self.layout)?;
         refs::write_branch_tip(&self.layout, &branch, &id)?;
         Ok(id)
