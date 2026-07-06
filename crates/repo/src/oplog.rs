@@ -63,9 +63,10 @@ fn serialize(rec: &OpRecord) -> String {
     let mut out = String::new();
     out.push_str(&format!("op {}\n", rec.seq));
     out.push_str(&format!("ts {}\n", rec.ts));
-    // `desc` must not contain a newline — strip any so the one-line-per-field
-    // grammar can never be desynchronized by a hostile/careless description.
-    let desc = rec.desc.replace('\n', " ");
+    // `desc` must stay one line — strip both `\n` and `\r` so the
+    // one-line-per-field grammar can never be desynchronized by a
+    // hostile/careless description.
+    let desc = rec.desc.replace(['\n', '\r'], " ");
     out.push_str(&format!("desc {desc}\n"));
     out.push_str(&format!("head {} {}\n", rec.head_before, rec.head_after));
     for (name, before, after) in &rec.refs {
@@ -78,6 +79,12 @@ fn serialize(rec: &OpRecord) -> String {
 /// Append one operation to the log, computing `seq` as one past the current
 /// last record (starting at 1) and `ts` via the same unix-seconds helper
 /// `repo.rs` uses for snapshot timestamps.
+///
+/// If a prior crash left a torn partial block at the tail, appending after it
+/// would leave the new record (and every future one) permanently invisible to
+/// [`read_all`], which stops at the first malformed block — the log would
+/// silently stop recording forever. So `record` first truncates the file back
+/// to the end of the last well-formed block, then appends.
 pub(crate) fn record(
     layout: &Layout,
     desc: &str,
@@ -85,7 +92,22 @@ pub(crate) fn record(
     head_after: &str,
     refs: &[(String, Option<ObjectId>, Option<ObjectId>)],
 ) -> Result<()> {
-    let seq = last(layout)?.map(|r| r.seq + 1).unwrap_or(1);
+    let path = layout.oplog_path();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    let (existing, consumed) = parse_contents(&contents);
+    if consumed < contents.len() {
+        // Torn/corrupt tail: drop the unparseable bytes so the append below
+        // lands where read_all can see it.
+        let f = OpenOptions::new().write(true).open(&path)?;
+        f.set_len(consumed as u64)?;
+        f.sync_all()?;
+    }
+
+    let seq = existing.last().map(|r| r.seq + 1).unwrap_or(1);
     let rec = OpRecord {
         seq,
         ts: crate::repo::unix_now(),
@@ -95,7 +117,6 @@ pub(crate) fn record(
         refs: refs.to_vec(),
     };
     let block = serialize(&rec);
-    let path = layout.oplog_path();
     let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
     f.write_all(block.as_bytes())?;
     f.sync_all()?;
@@ -156,6 +177,42 @@ fn parse_block(lines: &[&str], i: usize) -> Option<(OpRecord, usize)> {
     ))
 }
 
+/// Parse the whole log body, returning every well-formed record in append
+/// order plus the byte offset just past the last well-formed block. Bytes
+/// beyond that offset are a torn/corrupt tail: [`read_all`] tolerates them
+/// read-only; [`record`] truncates them before appending so the log never
+/// silently stops recording.
+fn parse_contents(contents: &str) -> (Vec<OpRecord>, usize) {
+    // Split into lines while remembering where each line *ends* in the raw
+    // byte stream (newline included), so a block index maps back to a
+    // truncation offset.
+    let mut lines: Vec<&str> = Vec::new();
+    let mut line_ends: Vec<usize> = Vec::new();
+    let mut pos = 0usize;
+    for raw in contents.split_inclusive('\n') {
+        pos += raw.len();
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        lines.push(line);
+        line_ends.push(pos);
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut consumed = 0;
+    while i < lines.len() {
+        match parse_block(&lines, i) {
+            Some((rec, next)) => {
+                out.push(rec);
+                consumed = line_ends[next - 1];
+                i = next;
+            }
+            None => break,
+        }
+    }
+    (out, consumed)
+}
+
 /// Read every well-formed record from the log, in append order. Stops at the
 /// first block that fails to parse and returns everything parsed so far —
 /// the log is corrupt-tail tolerant, never fatal, so a torn/partial last
@@ -168,19 +225,7 @@ pub(crate) fn read_all(layout: &Layout) -> Result<Vec<OpRecord>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(Error::Io(e)),
     };
-    let lines: Vec<&str> = contents.lines().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        match parse_block(&lines, i) {
-            Some((rec, next)) => {
-                out.push(rec);
-                i = next;
-            }
-            None => break,
-        }
-    }
-    Ok(out)
+    Ok(parse_contents(&contents).0)
 }
 
 /// The most recently appended well-formed record, if any.
@@ -304,6 +349,39 @@ mod tests {
 
         let last_rec = last(&layout).unwrap().unwrap();
         assert_eq!(last_rec.desc, "good op");
+
+        std::fs::remove_dir_all(&layout.root).unwrap();
+        assert!(!layout.root.exists());
+    }
+
+    #[test]
+    fn record_after_torn_tail_truncates_and_stays_visible() {
+        let layout = tmp_layout("torn-tail");
+
+        record(&layout, "good op", "main", "main", &[]).unwrap();
+
+        // Simulate a crash mid-append: a genuinely truncated block — valid
+        // prefix lines but no terminating `end`.
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(layout.oplog_path())
+            .unwrap();
+        f.write_all(b"op 2\nts 123\ndesc half-written\nhead main main\n")
+            .unwrap();
+        drop(f);
+
+        // The next record must not land behind the torn bytes.
+        record(&layout, "after crash", "main", "main", &[]).unwrap();
+
+        let all = read_all(&layout).unwrap();
+        assert_eq!(all.len(), 2, "new record must be visible past the torn tail");
+        assert_eq!(all[0].desc, "good op");
+        assert_eq!(all[1].desc, "after crash");
+        assert_eq!(all[1].seq, 2);
+
+        // The torn bytes are physically gone, not just skipped.
+        let raw = std::fs::read_to_string(layout.oplog_path()).unwrap();
+        assert!(!raw.contains("half-written"), "torn tail should be truncated");
 
         std::fs::remove_dir_all(&layout.root).unwrap();
         assert!(!layout.root.exists());
