@@ -40,6 +40,8 @@ pub enum Error {
     PickConflicts(usize),
     #[error("merge of protected paths is not yet supported (would corrupt encrypted files): {0}")]
     MergeProtected(String),
+    #[error("protected path {0} changed on both sides; re-run with --identity <key> to merge its content")]
+    ProtectedMergeNeedsIdentity(String),
     #[error("already up to date")]
     UpToDate,
     #[error("{0}")]

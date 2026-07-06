@@ -78,19 +78,38 @@ pub(crate) fn replay_commit(repo: &Repo, commit_id: ObjectId, onto_root: ObjectI
         }
     }
 
-    let fm = merge::three_way_files(&mut store, base_root, onto_root, theirs_root)?;
+    // The guard above ensures no side has PROTECTED entries, so the merge
+    // never consults a protection policy (empty ones suffice), never needs an
+    // identity, and can't produce `needs_encrypt` outputs.
+    let no_prot = scl_core::Protection::default();
+    let fm = merge::three_way_files(
+        &mut store,
+        base_root.map(|r| (r, &no_prot)),
+        (onto_root, &no_prot),
+        (theirs_root, &no_prot),
+        None,
+    )?;
     drop(store);
+
+    let files: Vec<(String, FileMode, Vec<u8>)> = fm
+        .files
+        .into_iter()
+        .map(|f| {
+            debug_assert!(!f.needs_encrypt, "protected guard fired above");
+            (f.path, f.mode, f.bytes)
+        })
+        .collect();
 
     if !fm.conflicts.is_empty() {
         return Ok(ReplayOutcome::Conflicts {
-            files: fm.files,
+            files,
             sidecars: fm.sidecars,
             paths: fm.conflicts,
         });
     }
 
     let write_set: Vec<(String, Vec<u8>, FileMode)> =
-        fm.files.iter().map(|(p, m, b)| (p.clone(), b.clone(), *m)).collect();
+        files.iter().map(|(p, m, b)| (p.clone(), b.clone(), *m)).collect();
     let root = repo.vfs().write_tree(&write_set)?;
 
     if root == onto_root {

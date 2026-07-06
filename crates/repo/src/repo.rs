@@ -574,14 +574,22 @@ impl Repo {
                 }
             }
 
-            let m = crate::merge::three_way(&mut store, base, ours, theirs)?;
+            let m = crate::merge::three_way(&mut store, base, ours, theirs, None)?;
             let ours_root = store.get_snapshot(&ours)?.root;
             (m, ours_root)
         };
 
-        // Build the merged tree from the resolved file set.
-        let write_set: Vec<(String, Vec<u8>, scl_core::FileMode)> =
-            merge_result.files.iter().map(|(p, m, b)| (p.clone(), b.clone(), *m)).collect();
+        // Build the merged tree from the resolved file set. The protected
+        // guard above makes `needs_encrypt` outputs unreachable here: with no
+        // PROTECTED entry on any side, every merged file is plain.
+        let write_set: Vec<(String, Vec<u8>, scl_core::FileMode)> = merge_result
+            .files
+            .iter()
+            .map(|f| {
+                debug_assert!(!f.needs_encrypt, "protected guard fired above");
+                (f.path.clone(), f.bytes.clone(), f.mode)
+            })
+            .collect();
         let merged_root = self.vfs.write_tree(&write_set)?;
 
         // Materialize merged tree into the working dir, then write sidecars.
