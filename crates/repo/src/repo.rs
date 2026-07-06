@@ -44,18 +44,26 @@ impl Repo {
         std::fs::create_dir_all(layout.objects_dir())?;
         std::fs::create_dir_all(layout.refs_heads_dir())?;
         refs::write_head(&layout, DEFAULT_BRANCH)?;
-        Self::open_layout(layout)
+        Self::open_layout(layout, DEFAULT_BUDGET)
     }
 
     /// Open an existing repo by discovering `.sc/` at or above `start`.
     pub fn open(start: impl AsRef<Path>) -> Result<Repo> {
         let layout = Layout::discover(start)?;
-        Self::open_layout(layout)
+        Self::open_layout(layout, DEFAULT_BUDGET)
     }
 
-    fn open_layout(layout: Layout) -> Result<Repo> {
+    /// Open an existing repo with an explicit memory budget for the shared
+    /// object cache (bytes). `open` uses `DEFAULT_BUDGET`; workspace sessions
+    /// (`sc work --budget-mb`) size the cache to the fleet they fork.
+    pub fn open_with_budget(start: impl AsRef<Path>, budget_bytes: usize) -> Result<Repo> {
+        let layout = Layout::discover(start)?;
+        Self::open_layout(layout, budget_bytes)
+    }
+
+    fn open_layout(layout: Layout, budget_bytes: usize) -> Result<Repo> {
         let lock = RepoLock::acquire(&layout)?;
-        let store = Store::open_persistent(layout.objects_dir(), DEFAULT_BUDGET)?;
+        let store = Store::open_persistent(layout.objects_dir(), budget_bytes)?;
         Ok(Repo { layout, vfs: VfsRepo::new(store), _lock: lock })
     }
 
@@ -1384,6 +1392,21 @@ mod tests {
         drop(arepo);
         std::fs::remove_dir_all(&a).unwrap();
         std::fs::remove_dir_all(&b).unwrap();
+    }
+
+    #[test]
+    fn open_with_budget_bounds_the_store() {
+        let dir = std::env::temp_dir().join(format!("sc-test-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            Repo::init(&dir).unwrap();
+        } // drop → release lock
+        let repo = Repo::open_with_budget(&dir, 4 * 1024 * 1024).unwrap();
+        assert_eq!(repo.vfs().stats().budget_bytes, 4 * 1024 * 1024);
+        drop(repo);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
     }
 
     #[test]
