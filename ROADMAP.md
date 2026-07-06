@@ -83,6 +83,20 @@ across every phase.
   agent's environment via the `sc run` path — one command exercising all
   three thesis pillars. Zero residue outside `.sc/`. (ADR-0023.)
 
+## Active
+
+- **Phase 14 — History editing (`sc cherry-pick` / `sc rebase` / `sc undo`).**
+  The integration kit P13 made urgent: replay one commit onto the current
+  branch (cherry-pick, with P4-style conflict resolution completed by the
+  next commit), replay a whole branch onto a new base (rebase — atomic: any
+  conflict aborts with refs untouched), and a repo-wide operation log making
+  every ref-moving operation undoable (`sc undo`; run twice = redo). Replay
+  is P4's three-way merge with base = the picked commit's parent — no second
+  merge implementation, no object mutation, undo is just moving refs back.
+  Protected content fails closed, inherited from P4's merge guard.
+  Spec: `docs/superpowers/specs/2026-07-06-p14-history-editing-design.md`.
+  (ADR-0024, Proposed.)
+
 ## Completed phases (usability-first ordering)
 
 | Phase | Goal | Demoable outcome | ADR |
@@ -198,6 +212,11 @@ Tracked but out of scope for this roadmap horizon:
   rotation and re-wrap apply one at a time).
 - **Multiple escrow keys** / escrow key rotation (P11 ships a single
   break-glass key in `.sc/recipients.toml [escrow]`).
+- **History-editing follow-ons:** `sc amend`, stop-and-continue rebase
+  (`--continue`), cherry-pick `--abort`, merge-commit replay (mainline
+  selection), protected-path replay (lifts with P4's protected-merge
+  follow-on), operation objects in the CAS (Jujutsu-deep upgrade to the
+  file oplog), oplog entries for remote-tracking refs.
 - **Sub-tree / partial sharing** and sparse checkouts.
 - **Merge ergonomics**: rebase, cherry-pick, and richer conflict resolution UX
   beyond P4's detection/representation.
