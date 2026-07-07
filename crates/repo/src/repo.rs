@@ -2899,6 +2899,60 @@ mod tests {
     }
 
     #[test]
+    fn protect_again_preserves_tombstone() {
+        // Regression: re-protecting an already-protected prefix must never
+        // rebuild the rule wholesale — that would silently drop a revoked
+        // recipient's tombstone (ADR-0026).
+        let root = tmp_root("p16-protect-again-preserves-tombstone");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        let bob_id = bob_pk.recipient_id();
+        repo.revoke("secret/", &bob_id).unwrap();
+        // Re-protect the same prefix for alice again.
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        let listed = repo.protected_prefixes().unwrap();
+        let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
+        let alice_r = recips.iter().find(|r| r.id == alice_pk.recipient_id()).unwrap();
+        assert!(alice_r.granted, "alice must remain granted after re-protect");
+        let bob_r = recips.iter().find(|r| r.id == bob_id).unwrap();
+        assert!(!bob_r.granted, "bob's tombstone must survive re-protect");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn revoke_last_granted_refused_despite_existing_tombstone() {
+        // Regression: the empty-recipient-set guard on revoke must test the
+        // EFFECTIVE (granted) set, not raw entry count — a rule with a
+        // tombstoned entry plus one granted recipient still has only one
+        // effective recipient, and revoking them must be refused.
+        let root = tmp_root("p16-revoke-last-granted-despite-tombstone");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        let bob_id = bob_pk.recipient_id();
+        repo.revoke("secret/", &bob_id).unwrap();
+        // Now only alice is effectively granted (bob is tombstoned). Revoking
+        // alice would leave the prefix readable by nobody.
+        let alice_id = alice_pk.recipient_id();
+        let err = repo.revoke("secret/", &alice_id).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn commit_carries_forward_absent_protected_files_for_non_recipient() {
         // Regression: a non-recipient checks out (protected file skipped/absent),
         // then commits something unrelated. The absent protected file and its
