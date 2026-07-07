@@ -66,6 +66,12 @@ replay toolkit, widening the gap.
   the deferred rule-narrowing/tombstone follow-on (ROADMAP.md, Deferred).
   Until then, after a revoke, re-check `sc protect --list` following any
   merge and re-run `sc revoke` if the rule was re-widened.
+  [Closed by ADR-0026 (P16): revocation tombstones (per-recipient
+  last-writer-wins register) make this durable against merges of
+  pre-revoke branches; the re-check/re-run workaround above is no longer
+  needed. Note the surviving boundary: revoke still doesn't rotate
+  ciphertext, so a recipient who already held a wrap can still decrypt
+  pre-revoke content — see ADR-0026's Decision section.]
 
 ## Refinements during the build
 

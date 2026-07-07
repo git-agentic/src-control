@@ -192,7 +192,7 @@ impl Repo {
                             &snap.secrets,
                         )?;
                         let picked_p = picked_snap.protection;
-                        let prefixes = crate::protect::union_prefixes(
+                        let prefixes = crate::protect::merge_prefixes(
                             &snap.protection.prefixes,
                             &picked_p.prefixes,
                         );
@@ -216,7 +216,7 @@ impl Repo {
                 let ours_p = self.snapshot(&t)?.protection;
                 let theirs_p = self.snapshot(&mh)?.protection;
                 let prefixes =
-                    crate::protect::union_prefixes(&ours_p.prefixes, &theirs_p.prefixes);
+                    crate::protect::merge_prefixes(&ours_p.prefixes, &theirs_p.prefixes);
                 let mut wrapped = ours_p.wrapped;
                 for (id, wks) in &theirs_p.wrapped {
                     let entry = wrapped.entry(*id).or_default();
@@ -233,7 +233,7 @@ impl Repo {
         let mut protected: Vec<ProtectedFile> = Vec::new();
         for (path, bytes, mode) in files {
             match crate::protect::matching_prefix(&protection, &path) {
-                Some(rule) => protected.push((path, bytes, mode, rule.recipients.clone())),
+                Some(rule) => protected.push((path, bytes, mode, rule.granted_keys())),
                 None => plain.push((path, bytes, mode)),
             }
         }
@@ -247,7 +247,7 @@ impl Repo {
         // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
         let mut all: Vec<(String, Vec<u8>, scl_core::FileMode, u8)> =
             plain.into_iter().map(|(p, b, m)| (p, b, m, 0u8)).collect();
-        let (protected_all, mut fresh_wrapped) = crate::protect::encrypt_protected(protected);
+        let (protected_all, mut fresh_wrapped) = crate::protect::encrypt_protected(protected)?;
         all.extend(protected_all);
 
         // Safe-by-default: carry forward still-protected files that are absent
@@ -717,7 +717,7 @@ impl Repo {
         // protected. `union_prot` exists only to drive `matching_prefix`
         // lookups below — its `wrapped` map is irrelevant here.
         let union_prefixes =
-            crate::protect::union_prefixes(&ours_protection.prefixes, &theirs_protection.prefixes);
+            crate::protect::merge_prefixes(&ours_protection.prefixes, &theirs_protection.prefixes);
         let union_prot = scl_core::Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
 
         // Split the resolved file set: carried ciphertext (needs_encrypt:
@@ -732,13 +732,13 @@ impl Repo {
         for f in &merge_result.files {
             if f.needs_encrypt {
                 let recipients = crate::protect::matching_prefix(&union_prot, &f.path)
-                    .map(|r| r.recipients.clone())
+                    .map(|r| r.granted_keys())
                     .ok_or_else(|| Error::NotProtected(f.path.clone()))?;
                 to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, recipients));
             } else if f.perms & scl_core::PROTECTED == 0 {
                 match crate::protect::matching_prefix(&union_prot, &f.path) {
                     Some(rule) => {
-                        to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, rule.recipients.clone()))
+                        to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, rule.granted_keys()))
                     }
                     None => carried.push((f.path.clone(), f.bytes.clone(), f.mode, 0)),
                 }
@@ -825,7 +825,7 @@ impl Repo {
             return Err(Error::MergeConflicts(merge_result.conflicts.len()));
         }
 
-        let (encrypted, fresh_wrapped) = crate::protect::encrypt_protected(to_encrypt);
+        let (encrypted, fresh_wrapped) = crate::protect::encrypt_protected(to_encrypt)?;
         carried.extend(encrypted);
         let all = carried;
 
@@ -1148,7 +1148,14 @@ impl Repo {
         protection.prefixes.retain(|p| p.prefix != prefix);
         protection.prefixes.push(ProtectPrefix {
             prefix: prefix.to_string(),
-            recipients: recipients.iter().map(|pk| pk.to_bytes()).collect(),
+            recipients: recipients
+                .iter()
+                .map(|pk| scl_core::RecipientEntry {
+                    key: pk.to_bytes(),
+                    epoch: 1,
+                    state: scl_core::RecipientState::Granted,
+                })
+                .collect(),
         });
         self.commit_snapshot(root, parents, secrets, protection, "system", "set protected prefix")
     }
@@ -2866,15 +2873,200 @@ mod tests {
         let wks = snap3.protection.wrapped.values().next().unwrap();
         assert_eq!(wks.len(), 1, "only alice remains");
         assert!(!wks.iter().any(|w| w.recipient_id == bob_id.as_str()));
-        // bob is no longer in the prefix rule's recipients.
+        // bob is no longer in the prefix rule's EFFECTIVE (granted) set, but the
+        // rule retains him as a durable `Revoked` tombstone (ADR-0026) — that
+        // tombstone is what keeps the revoke durable against merging a
+        // pre-revoke branch.
         let rule = snap3.protection.prefixes.iter().find(|p| p.prefix == "secret/").unwrap();
-        assert!(!rule.recipients.iter().any(|pk| {
+        assert!(!rule.granted_keys().iter().any(|pk| {
             scl_crypto::PublicKey::from_bytes(*pk).recipient_id() == bob_id
         }));
-        // protected_prefixes reflects the surviving recipient.
+        let bob_entry = rule
+            .recipients
+            .iter()
+            .find(|e| scl_crypto::PublicKey::from_bytes(e.key).recipient_id() == bob_id)
+            .expect("bob's tombstone must remain in the rule");
+        assert_eq!(bob_entry.state, scl_core::RecipientState::Revoked);
+        // protected_prefixes reflects the surviving recipient and bob's revoked standing.
         let listed = repo.protected_prefixes().unwrap();
         let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
-        assert_eq!(recips, &vec![alice_pk.recipient_id()]);
+        let alice_r = recips.iter().find(|r| r.id == alice_pk.recipient_id()).unwrap();
+        assert!(alice_r.granted);
+        let bob_r = recips.iter().find(|r| r.id == bob_id).unwrap();
+        assert!(!bob_r.granted);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn protect_again_preserves_tombstone() {
+        // Regression: re-protecting an already-protected prefix must never
+        // rebuild the rule wholesale — that would silently drop a revoked
+        // recipient's tombstone (ADR-0026).
+        let root = tmp_root("p16-protect-again-preserves-tombstone");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        let bob_id = bob_pk.recipient_id();
+        repo.revoke("secret/", &bob_id).unwrap();
+        // Re-protect the same prefix for alice again.
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        let listed = repo.protected_prefixes().unwrap();
+        let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
+        let alice_r = recips.iter().find(|r| r.id == alice_pk.recipient_id()).unwrap();
+        assert!(alice_r.granted, "alice must remain granted after re-protect");
+        let bob_r = recips.iter().find(|r| r.id == bob_id).unwrap();
+        assert!(!bob_r.granted, "bob's tombstone must survive re-protect");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn revoke_last_granted_refused_despite_existing_tombstone() {
+        // Regression: the empty-recipient-set guard on revoke must test the
+        // EFFECTIVE (granted) set, not raw entry count — a rule with a
+        // tombstoned entry plus one granted recipient still has only one
+        // effective recipient, and revoking them must be refused.
+        let root = tmp_root("p16-revoke-last-granted-despite-tombstone");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        let bob_id = bob_pk.recipient_id();
+        repo.revoke("secret/", &bob_id).unwrap();
+        // Now only alice is effectively granted (bob is tombstoned). Revoking
+        // alice would leave the prefix readable by nobody.
+        let alice_id = alice_pk.recipient_id();
+        let err = repo.revoke("secret/", &alice_id).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn revoke_survives_merging_a_pre_revoke_branch() {
+        // The ADR-0025 boundary scenario, now closed by ADR-0026.
+        let root = tmp_root("p16-durable-revoke");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add secret").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+
+        // Fork a branch while bob is still granted, and give it its own commit.
+        repo.branch("pre-revoke").unwrap();
+        repo.switch("pre-revoke").unwrap();
+        std::fs::write(root.join("readme.txt"), b"feature work").unwrap();
+        repo.commit("me", "feature").unwrap();
+        repo.switch("main").unwrap();
+
+        // Revoke bob on main, then merge the pre-revoke branch.
+        repo.revoke("secret/", &bob_pk.recipient_id()).unwrap();
+        repo.merge("pre-revoke", "me").unwrap();
+
+        // Bob stays revoked: tombstone won the register.
+        let listed = repo.protected_prefixes().unwrap();
+        let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
+        let bob = recips.iter().find(|r| r.id == bob_pk.recipient_id()).unwrap();
+        assert!(!bob.granted, "merge resurrected a revoked recipient");
+        assert!(recips.iter().find(|r| r.id == alice_pk.recipient_id()).unwrap().granted);
+
+        // And a FRESH file under the prefix seals to alice only.
+        let before: std::collections::BTreeSet<_> = {
+            let tip = repo.head_tip().unwrap().unwrap();
+            repo.snapshot(&tip).unwrap().protection.wrapped.keys().cloned().collect()
+        };
+        std::fs::write(root.join("secret/new.txt"), b"fresh").unwrap();
+        let c = repo.commit("me", "post-revoke secret").unwrap();
+        let prot = repo.snapshot(&c).unwrap().protection;
+        let new_ids: Vec<_> = prot.wrapped.keys().filter(|k| !before.contains(k)).collect();
+        assert!(!new_ids.is_empty(), "expected a freshly sealed blob");
+        let bob_id = bob_pk.recipient_id();
+        for id in new_ids {
+            let wks = &prot.wrapped[id];
+            assert!(
+                !wks.iter().any(|w| w.recipient_id == bob_id.as_str()),
+                "fresh DEK sealed to a revoked recipient"
+            );
+            assert_eq!(wks.len(), 1, "fresh blob must be wrapped for alice only");
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn regrant_after_revoke_wins_against_old_tombstone_branch() {
+        let root = tmp_root("p16-regrant");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap(); // bob@2:Granted
+        repo.revoke("secret/", &bob_pk.recipient_id()).unwrap(); // bob@3:Revoked
+
+        // Branch carries the tombstone; main deliberately re-grants (bob@4).
+        repo.branch("tombstoned").unwrap();
+        repo.switch("tombstoned").unwrap();
+        std::fs::write(root.join("readme.txt"), b"work").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        repo.merge("tombstoned", "me").unwrap();
+
+        let listed = repo.protected_prefixes().unwrap();
+        let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
+        assert!(
+            recips.iter().find(|r| r.id == bob_pk.recipient_id()).unwrap().granted,
+            "a deliberate re-grant must out-epoch the old tombstone"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cherry_pick_of_pre_revoke_commit_does_not_resurrect_recipient() {
+        let root = tmp_root("p16-replay-revoke");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+
+        // A branch commit made while bob was granted…
+        repo.branch("work").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("notes.txt"), b"pickme").unwrap();
+        repo.commit("me", "pickable").unwrap();
+        repo.switch("main").unwrap();
+
+        // …revoke bob on main, then replay that commit onto main.
+        repo.revoke("secret/", &bob_pk.recipient_id()).unwrap();
+        repo.cherry_pick("work", "me", None).unwrap();
+
+        let listed = repo.protected_prefixes().unwrap();
+        let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
+        assert!(
+            !recips.iter().find(|r| r.id == bob_pk.recipient_id()).unwrap().granted,
+            "replay resurrected a revoked recipient"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

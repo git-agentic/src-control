@@ -14,7 +14,7 @@ pub mod store;
 pub use error::{Error, Result};
 pub use id::ObjectId;
 pub use object::{
-    EntryKind, FileMode, Object, ProtectPrefix, Protection, Secret, Snapshot, Tree, TreeEntry,
-    WrappedKey, PROTECTED,
+    EntryKind, FileMode, Object, ProtectPrefix, Protection, RecipientEntry, RecipientState,
+    Secret, Snapshot, Tree, TreeEntry, WrappedKey, PROTECTED,
 };
 pub use store::{Backend, SpillPolicy, Store, StoreConfig, StoreStats};

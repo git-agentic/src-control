@@ -9,8 +9,15 @@ use crate::repo::Repo;
 use crate::worktree;
 use std::collections::BTreeMap;
 
+/// One recipient's standing on a listed prefix, for display.
+pub struct PrefixRecipient {
+    pub id: scl_crypto::RecipientId,
+    pub epoch: u32,
+    pub granted: bool,
+}
+
 impl Repo {
-    /// Record (or replace) a protected-path rule for `prefix`, encrypting any
+    /// Record (or extend) a protected-path rule for `prefix`, encrypting any
     /// matching working-tree files for `recipients`.
     ///
     /// The rule is persisted as a policy-only snapshot first (so the subsequent
@@ -40,11 +47,27 @@ impl Repo {
                 (root, vec![], BTreeMap::new(), Protection::default())
             }
         };
-        protection.prefixes.retain(|p| p.prefix != prefix);
-        protection.prefixes.push(ProtectPrefix {
-            prefix: prefix.to_string(),
-            recipients: recipients.iter().map(|p| p.to_bytes()).collect(),
-        });
+        match protection.prefixes.iter_mut().find(|p| p.prefix == prefix) {
+            Some(rule) => {
+                // Existing rule: (re-)grant the named recipients at the next epoch.
+                // Never rebuild the rule wholesale — that would drop tombstones.
+                let epoch = rule.next_epoch();
+                for pk in recipients {
+                    rule.set_standing(pk.to_bytes(), epoch, scl_core::RecipientState::Granted);
+                }
+            }
+            None => protection.prefixes.push(ProtectPrefix {
+                prefix: prefix.to_string(),
+                recipients: recipients
+                    .iter()
+                    .map(|p| scl_core::RecipientEntry {
+                        key: p.to_bytes(),
+                        epoch: 1,
+                        state: scl_core::RecipientState::Granted,
+                    })
+                    .collect(),
+            }),
+        }
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
         let id = self.commit_snapshot(root, parents, secrets, protection, "system", &format!("protect {prefix}"))?;
@@ -124,10 +147,9 @@ impl Repo {
             protection.wrapped.get_mut(&blob_id).expect("present above").push(new_wk);
         }
 
-        let new_bytes = new.to_bytes();
-        if !protection.prefixes[rule_idx].recipients.contains(&new_bytes) {
-            protection.prefixes[rule_idx].recipients.push(new_bytes);
-        }
+        let rule = &mut protection.prefixes[rule_idx];
+        let epoch = rule.next_epoch();
+        rule.set_standing(new.to_bytes(), epoch, scl_core::RecipientState::Granted);
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
         let id =
@@ -143,8 +165,10 @@ impl Repo {
     }
 
     /// Revoke `recipient_id` from `prefix`: drop its wrapped DEK from every
-    /// protected blob under the prefix and remove its public key from the rule's
-    /// recipients. Policy-only (root tree unchanged). Errors `NotProtected` if no
+    /// protected blob under the prefix and record a durable `Revoked` tombstone
+    /// on the rule's recipient register (ADR-0026) — a fresh epoch that wins the
+    /// LWW merge against any pre-revoke branch, instead of just deleting the
+    /// entry. Policy-only (root tree unchanged). Errors `NotProtected` if no
     /// such prefix. Does not rotate content (a prior holder kept any plaintext
     /// already checked out — see the secrets-revoke rationale in ADR-0008).
     pub fn revoke(&self, prefix: &str, recipient_id: &scl_crypto::RecipientId) -> Result<ObjectId> {
@@ -158,9 +182,9 @@ impl Repo {
             .position(|p| p.prefix == prefix)
             .ok_or_else(|| Error::NotProtected(prefix.to_string()))?;
 
-        // Refuse to empty the rule's recipient set: subsequent commits under the
+        // Refuse to empty the rule's effective set: subsequent commits under the
         // prefix would seal new content for nobody (the empty-recipient footgun).
-        let survives = protection.prefixes[rule_idx].recipients.iter().any(|pk| {
+        let survives = protection.prefixes[rule_idx].granted_keys().iter().any(|pk| {
             scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != recipient_id.as_str()
         });
         if !survives {
@@ -177,9 +201,18 @@ impl Repo {
                 wks.retain(|w| w.recipient_id != rid);
             }
         }
-        protection.prefixes[rule_idx]
+        // Tombstone, don't delete: the Revoked entry at a fresh epoch is what wins
+        // the LWW register against any pre-revoke branch at merge time (ADR-0026).
+        let rule = &mut protection.prefixes[rule_idx];
+        let epoch = rule.next_epoch();
+        if let Some(e) = rule
             .recipients
-            .retain(|pk| scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != rid);
+            .iter_mut()
+            .find(|e| scl_crypto::PublicKey::from_bytes(e.key).recipient_id().as_str() == rid)
+        {
+            e.epoch = epoch;
+            e.state = scl_core::RecipientState::Revoked;
+        }
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
         let id = self.commit_snapshot(
@@ -200,9 +233,9 @@ impl Repo {
         Ok(id)
     }
 
-    /// List the tip's protected prefixes, each with its recipients' fingerprints
-    /// (for display). Empty if unborn or no prefixes are protected.
-    pub fn protected_prefixes(&self) -> Result<Vec<(String, Vec<scl_crypto::RecipientId>)>> {
+    /// List the tip's protected prefixes with every recipient register —
+    /// tombstones included, so a post-merge listing shows revocations holding.
+    pub fn protected_prefixes(&self) -> Result<Vec<(String, Vec<PrefixRecipient>)>> {
         let protection = match self.head_tip()? {
             Some(t) => self.snapshot(&t)?.protection,
             None => Protection::default(),
@@ -214,7 +247,11 @@ impl Repo {
                 let rids = p
                     .recipients
                     .iter()
-                    .map(|pk| scl_crypto::PublicKey::from_bytes(*pk).recipient_id())
+                    .map(|e| PrefixRecipient {
+                        id: scl_crypto::PublicKey::from_bytes(e.key).recipient_id(),
+                        epoch: e.epoch,
+                        granted: e.state == scl_core::RecipientState::Granted,
+                    })
                     .collect();
                 (p.prefix, rids)
             })

@@ -37,9 +37,18 @@ RecipientEntry {
   never GC'd — it is load-bearing against future union merges.
 - The **effective recipient set** — used by commit-time sealing, grant
   checks, and `--identity` authorization — is the `Granted` entries only.
+  [Correction (P16 as shipped): this held only for commit-time sealing
+  (`granted_keys()`). `sc grant`'s authorization check and `--identity`
+  decryption (`decrypt_with`) work by wrap presence in
+  `protection.wrapped`, independent of the register — a revoked
+  recipient can still decrypt ciphertext sealed before the revoke. See
+  ADR-0026's Decision section.]
 - The existing empty-set guard generalizes: any operation that would
   leave a prefix with zero *effective* recipients is refused.
   `secrets::require_recipients` remains the single chokepoint.
+  [Correction: as shipped, `require_recipients` guards the PublicKey-typed
+  seal paths (`protect`/`secret add`/`secret rotate`); the effective-set
+  guard for sealing under a prefix rule lives in `encrypt_protected`.]
 
 ### Operations
 
