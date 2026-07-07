@@ -134,9 +134,11 @@ across every phase.
 
 ## Active
 
-None — Phase 18 is next up; see the next-horizon table below.
+- **Phase 18 — Network Git remotes.** In build. Spec:
+  `docs/superpowers/specs/2026-07-07-p18-network-git-remotes-design.md`
+  (ADR-0028, Proposed → Accepted at completion).
 
-## Next horizon (P18–P20)
+## Next horizon (P19–P20)
 
 Decided 2026-07-07 (design: `docs/superpowers/specs/2026-07-07-roadmap-horizon-p16-p20-design.md`).
 Theme: finish the confidentiality story end to end before pushing for
@@ -147,7 +149,6 @@ and the arc continues toward adoption.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
-| **P18 — Network Git remotes** | fetch/push against hosted Git | `sc remote add origin git@github.com:…`; fetch, merge, push; commits visible on github.com | [0028](docs/adr/0028-network-git-remotes.md) |
 | **P19 — History-editing polish** | amend, resumable rebase, pick abort, merge replay | interrupt a rebase on a conflict, resolve, `sc rebase --continue`; proven by the extended history demo | [0029](docs/adr/0029-history-editing-polish.md) |
 | **P20 — Agent sessions + auto-merge** | Durable `sc ws` sessions; clean results land unattended | fork workspaces, return in a later invocation, harvest; clean results auto-merge to an integration branch | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
 

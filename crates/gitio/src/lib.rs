@@ -12,6 +12,8 @@ pub use export::{export_branch, read_ref, ExportOptions, ExportReport};
 mod import;
 pub use import::{import_history, ImportReport};
 
+pub mod bridge;
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
