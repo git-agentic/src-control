@@ -168,7 +168,7 @@ impl Repo {
         message: &str,
     ) -> Result<ObjectId> {
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths_at(Some(parent))?)?;
-        self.snapshot_files(files, Some(parent), None, Some(completed), decided_root, author, message)
+        self.snapshot_files(files, Some(parent), None, Some(completed), decided_root, None, author, message)
     }
 
     /// The commit pipeline minus ref movement: split protected/plaintext files,
@@ -190,6 +190,14 @@ impl Repo {
     /// rules and wraps must still union into the completion's policy — the
     /// picked commit may carry protected updates (in the decided tree) whose
     /// wraps only IT knows, and rules the tip lacks.
+    /// `parents_override`, when `Some`, replaces the parents that would
+    /// otherwise be derived from `tip`/`merge_head` on the built snapshot —
+    /// `tip` still supplies the protection/secrets/carry-forward source (the
+    /// pre-amend commit's own policy), but the recorded parents are the
+    /// caller's choice. Used by `amend` (P19 Task 3) to rebuild the tip with
+    /// the TIP's OWN parents instead of `[tip]`, replacing rather than
+    /// extending history. Every other caller passes `None`, keeping the
+    /// original `tip` (+ `merge_head`) derivation.
     pub(crate) fn snapshot_files(
         &self,
         files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
@@ -197,6 +205,7 @@ impl Repo {
         merge_head: Option<ObjectId>,
         pick_head: Option<ObjectId>,
         decided_root: Option<ObjectId>,
+        parents_override: Option<Vec<ObjectId>>,
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
@@ -382,10 +391,16 @@ impl Repo {
         crate::protect::reuse_prior_wraps(&mut fresh_wrapped, &prior);
         protection.wrapped = fresh_wrapped;
 
-        let mut parents: Vec<ObjectId> = tip.into_iter().collect();
-        if let Some(theirs) = merge_head {
-            parents.push(theirs);
-        }
+        let parents: Vec<ObjectId> = match parents_override {
+            Some(p) => p,
+            None => {
+                let mut v: Vec<ObjectId> = tip.into_iter().collect();
+                if let Some(theirs) = merge_head {
+                    v.push(theirs);
+                }
+                v
+            }
+        };
         self.build_snapshot(root, parents, secrets, protection, author, message)
     }
 
@@ -432,7 +447,7 @@ impl Repo {
             }
             _ => {
                 let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
-                self.snapshot_files(files, tip, merge_head, pick_head, decided_root, author, message)?
+                self.snapshot_files(files, tip, merge_head, pick_head, decided_root, None, author, message)?
             }
         };
         refs::write_branch_tip(&self.layout, &head, &id)?;
@@ -453,6 +468,56 @@ impl Repo {
             &head,
             &[(head.clone(), before, Some(id))],
         )?;
+        Ok(id)
+    }
+
+    /// Replace the tip commit with one built from the current working tree:
+    /// same parents as the tip (merge and root commits amend naturally —
+    /// `tip_snap.parents` is `[]`, `[p]`, or `[p1, p2]` and is carried
+    /// through unchanged), message kept unless `message` overrides. Reuses
+    /// the plain-commit assembly (`snapshot_files`) so the scanner gate,
+    /// `.scignore`, and protected re-encryption are the exact pipeline
+    /// `commit` uses — one gated path, two callers. `tip` (the pre-amend
+    /// commit) still supplies the protection/secrets/carry-forward source
+    /// (the working tree's protection state doesn't change just because the
+    /// tip is being replaced); only the recorded parents are overridden, via
+    /// `parents_override`, to the tip's own parents rather than `[tip]` —
+    /// that's what makes this a replacement instead of a second commit.
+    /// Amend does not materialize: the tree came FROM the working tree, so
+    /// there's nothing to write back. Oplog-recorded as "amend"; one `undo`
+    /// restores the old tip. No pushed-commit guard — sc has no
+    /// authoritative record of remote observers (ADR-0029).
+    pub fn amend(&self, author: &str, message: Option<&str>) -> Result<ObjectId> {
+        if crate::merge_state::in_progress(&self.layout) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
+        }
+        let tip = self.head_tip()?.ok_or(Error::Unborn)?;
+        let tip_snap = self.snapshot(&tip)?;
+        let msg = message.map(|m| m.to_string()).unwrap_or_else(|| tip_snap.message.clone());
+
+        let head = refs::current_branch(&self.layout)?;
+        let before = refs::read_branch_tip(&self.layout, &head)?;
+
+        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
+        let id = self.snapshot_files(
+            files,
+            Some(tip),
+            None,
+            None,
+            None,
+            Some(tip_snap.parents.clone()),
+            author,
+            &msg,
+        )?;
+
+        refs::write_branch_tip(&self.layout, &head, &id)?;
+        crate::oplog::record(&self.layout, "amend", &head, &head, &[(head.clone(), before, Some(id))])?;
         Ok(id)
     }
 
@@ -3577,5 +3642,200 @@ mod tests {
         drop(local);
         std::fs::remove_dir_all(&remote_root).unwrap();
         std::fs::remove_dir_all(&local_root).unwrap();
+    }
+
+    // ---- P19 Task 3: sc amend ----
+
+    #[test]
+    fn amend_replaces_tip_preserving_parents_and_message() {
+        let root = tmp_root("amend-basic");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        let a = repo.commit("me", "commit A").unwrap();
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+        let b = repo.commit("me", "commit B").unwrap();
+
+        // Edit the working tree, then amend with no message override.
+        std::fs::write(root.join("a.txt"), b"three").unwrap();
+        let b_amended = repo.amend("me", None).unwrap();
+
+        assert_ne!(b_amended, b, "amend must produce a new snapshot id");
+        let snap = repo.snapshot(&b_amended).unwrap();
+        assert_eq!(snap.parents, vec![a], "amended parents must match B's parents");
+        assert_eq!(snap.message, "commit B", "message kept unless overridden");
+
+        // The edit landed in B', and B is no longer the branch tip.
+        assert_eq!(repo.head_tip().unwrap(), Some(b_amended));
+        let store_arc = repo.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let entries = worktree::tree_file_ids(&mut store, snap.root).unwrap();
+        let a_blob = entries["a.txt"];
+        match store.get(&a_blob).unwrap() {
+            Object::Blob(bytes) => assert_eq!(&bytes[..], b"three"),
+            _ => panic!("expected Blob"),
+        }
+        drop(store);
+
+        // Oplog has an "amend" record, and one undo restores B as tip.
+        let log = repo.oplog().unwrap();
+        assert_eq!(log.last().unwrap().desc, "amend");
+        let outcome = repo.undo().unwrap();
+        assert_eq!(outcome.desc, "amend");
+        assert_eq!(repo.head_tip().unwrap(), Some(b));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_with_message_overrides() {
+        let root = tmp_root("amend-message");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "original message").unwrap();
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+
+        let id = repo.amend("me", Some("new")).unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.message, "new");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_merge_commit_keeps_both_parents() {
+        let root = tmp_root("amend-merge");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("main-only.txt"), b"m").unwrap();
+        let ours = repo.commit("me", "main work").unwrap();
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("feature-only.txt"), b"f").unwrap();
+        let theirs = repo.commit("me", "feature work").unwrap();
+        repo.switch("main").unwrap();
+
+        let m = repo.merge("feature", "me").unwrap();
+        let m_snap = repo.snapshot(&m).unwrap();
+        assert_eq!(m_snap.parents, vec![ours, theirs]);
+
+        // Edit, then amend the merge tip: parents must be preserved exactly.
+        std::fs::write(root.join("main-only.txt"), b"m-edited").unwrap();
+        let m_amended = repo.amend("me", None).unwrap();
+        let amended_snap = repo.snapshot(&m_amended).unwrap();
+        assert_eq!(amended_snap.parents, vec![ours, theirs], "merge amend must keep both parents");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_root_commit_keeps_empty_parents() {
+        let root = tmp_root("amend-root");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "root").unwrap();
+
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+        let id = repo.amend("me", None).unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        assert!(snap.parents.is_empty(), "amended root commit must keep empty parents");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_refuses_unborn_and_in_progress_states() {
+        let root = tmp_root("amend-guards");
+        let repo = Repo::init(&root).unwrap();
+
+        // Unborn: no commits yet.
+        assert!(matches!(repo.amend("me", None), Err(Error::Unborn)));
+
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // Merge in progress.
+        crate::merge_state::write(&repo.layout, &ObjectId::of(b"theirs"), &[], None).unwrap();
+        assert!(matches!(repo.amend("me", None), Err(Error::MergeInProgress)));
+        crate::merge_state::clear(&repo.layout).unwrap();
+
+        // Cherry-pick in progress.
+        crate::pick_state::write(&repo.layout, &ObjectId::of(b"picked"), &[], None).unwrap();
+        assert!(matches!(repo.amend("me", None), Err(Error::PickInProgress)));
+        crate::pick_state::clear(&repo.layout).unwrap();
+
+        // Rebase in progress.
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: ObjectId::of(b"orig"),
+            target: "feature".into(),
+            acc_tip: ObjectId::of(b"acc"),
+            conflicted: ObjectId::of(b"conflicted"),
+            remaining: vec![],
+            total: 2,
+            author: "me".into(),
+            resolved: false,
+        };
+        crate::rebase_state::write(&repo.layout, &st).unwrap();
+        assert!(matches!(repo.amend("me", None), Err(Error::RebaseInProgress)));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_runs_scanner_and_protection() {
+        let root = tmp_root("amend-scan-protect");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+
+        std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/a.txt"), b"secret-key").unwrap();
+        repo.protect("keys/", &[alice_pk], None).unwrap();
+
+        // A plaintext secret introduced via amend must be caught by the scanner.
+        std::fs::write(root.join("readme.txt"), b"key = AKIAIOSFODNN7EXAMPLE\n").unwrap();
+        let err = repo.amend("me", None).unwrap_err();
+        assert!(matches!(err, Error::SecretDetected(_)), "expected SecretDetected, got {err:?}");
+
+        // Fix the plaintext file, and edit the protected one: the amended tip's
+        // blob must remain PROTECTED ciphertext, wrapped for the granted key.
+        std::fs::write(root.join("readme.txt"), b"hi again").unwrap();
+        std::fs::write(root.join("keys/a.txt"), b"rotated-secret-key").unwrap();
+        let id = repo.amend("me", None).unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+
+        let (blob_id, perms) = {
+            let store_arc = repo.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+            let (id, _, perms) = entries["keys/a.txt"];
+            (id, perms)
+        };
+        assert_ne!(perms & scl_core::PROTECTED, 0, "amended protected file must stay protected");
+
+        let bytes = {
+            let store_arc = repo.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            match store.get(&blob_id).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("expected Blob"),
+            }
+        };
+        let pt =
+            crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "keys/a.txt")
+                .unwrap();
+        assert_eq!(&pt[..], b"rotated-secret-key");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

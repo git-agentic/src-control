@@ -52,6 +52,19 @@ enum Cmd {
         #[arg(long)]
         author: Option<String>,
     },
+    /// Replace the tip commit with one built from the current working tree.
+    /// Parents are kept from the tip (merge and root commits amend
+    /// naturally); the message is kept unless `-m` overrides it. Refuses
+    /// while unborn or while a merge/pick/rebase is in progress.
+    Amend {
+        /// New message; omit to keep the tip's existing message.
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Author recorded on the amended snapshot (default: $SC_AUTHOR,
+        /// then the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
     /// Show working-tree changes against HEAD.
     Status {
         /// Emit machine-readable JSON instead of the human listing.
@@ -417,6 +430,7 @@ fn main() -> Result<()> {
         Cmd::SecretDemo(args) => run_secret_demo(args),
         Cmd::Init => run_init(),
         Cmd::Commit { message, author } => run_commit(&resolve_author(author), &message),
+        Cmd::Amend { message, author } => run_amend(&resolve_author(author), message),
         Cmd::Status { json } => run_status(json),
         Cmd::Diff => run_diff(),
         Cmd::Log { json } => run_log(json),
@@ -957,6 +971,26 @@ fn run_commit(author: &str, message: &str) -> Result<()> {
     match repo.commit(author, message) {
         Ok(id) => {
             println!("committed {}", id.short());
+            Ok(())
+        }
+        Err(scl_repo::Error::SecretDetected(report)) => {
+            // Drop the repo (releases .sc/lock) before process::exit, which
+            // skips destructors and would otherwise leave a stale lock file.
+            drop(repo);
+            eprint!("{report}");
+            std::process::exit(1);
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn run_amend(author: &str, message: Option<String>) -> Result<()> {
+    let repo = open_repo()?;
+    let old = repo.head_tip()?;
+    match repo.amend(author, message.as_deref()) {
+        Ok(id) => {
+            let old_short = old.map(|o| o.short()).unwrap_or_else(|| "?".to_string());
+            println!("amended {} -> {}", old_short, id.short());
             Ok(())
         }
         Err(scl_repo::Error::SecretDetected(report)) => {
