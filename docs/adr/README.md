@@ -32,6 +32,15 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0019](0019-secret-lifecycle.md) | Secret/permission lifecycle (rotation + escrow) | Accepted | 11 |
 | [0020](0020-six-crate-workspace.md) | Six-crate workspace with a strict dependency direction | Accepted | foundation |
 | [0021](0021-durability-and-concurrency-hardening.md) | Durability and concurrency hardening for `.sc/` | Accepted | hardening |
+| [0022](0022-ssh-native-transport.md) | sc-native network transport over SSH (trait-mirror wire protocol) | Accepted | 12 |
+| [0023](0023-agent-workspaces.md) | Agent workspaces — vfs-backed sessions over the persistent store | Accepted | 13 |
+| [0024](0024-history-editing.md) | History editing via replay + operation log | Accepted | 14 |
+| [0025](0025-protected-merge-and-replay.md) | Protected merge & replay — perms-aware three-way with decrypt-on-demand | Accepted | 15 |
+| [0026](0026-revocation-tombstones.md) | Revocation tombstones — durable prefix-rule revocation | Proposed | 16 |
+| [0027](0027-bulk-rewrap-and-multi-escrow.md) | Bulk re-wrap and multiple escrow keys | Proposed | 17 |
+| [0028](0028-network-git-remotes.md) | Network Git remotes (GitHub over https/ssh) | Proposed | 18 |
+| [0029](0029-history-editing-polish.md) | History-editing polish — amend, resumable rebase, pick abort, merge replay | Proposed | 19 |
+| [0030](0030-agent-sessions-and-automerge.md) | Agent sessions and auto-merge of clean results | Proposed | 20 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

@@ -113,8 +113,31 @@ across every phase.
 
 ## Active
 
-None — Phase 15 was the last phase on this roadmap horizon; see Deferred
-below for tracked follow-ons.
+None — Phase 16 is next up; see the next-horizon table below. A phase
+becomes Active when its focused brainstorm → spec cycle starts.
+
+## Next horizon (P16–P20)
+
+Decided 2026-07-07 (design: `docs/superpowers/specs/2026-07-07-roadmap-horizon-p16-p20-design.md`).
+Theme: finish the confidentiality story end to end before pushing for
+adoption — P15 documented a real boundary (a prefix-rule revoke is
+reversed by union-merging any pre-revoke branch), and the headline
+per-file-permissions claim should not carry a known bypass into an
+adoption push.
+
+| Phase | Goal | Demoable outcome | ADR |
+|-------|------|------------------|-----|
+| **P16 — Revocation tombstones / rule narrowing** | `sc revoke` durable across merges | branch → revoke on main → merge the pre-revoke branch: recipient stays revoked; future seals exclude them | [0026](docs/adr/0026-revocation-tombstones.md) |
+| **P17 — Bulk re-wrap + multiple escrow keys** | Org-scale recipient/escrow cutover | change the escrow key, run one `sc rewrap`, every secret + protected prefix is sealed to the new set | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
+| **P18 — Network Git remotes** | fetch/push against hosted Git | `sc remote add origin git@github.com:…`; fetch, merge, push; commits visible on github.com | [0028](docs/adr/0028-network-git-remotes.md) |
+| **P19 — History-editing polish** | amend, resumable rebase, pick abort, merge replay | interrupt a rebase on a conflict, resolve, `sc rebase --continue`; proven by the extended history demo | [0029](docs/adr/0029-history-editing-polish.md) |
+| **P20 — Agent sessions + auto-merge** | Durable `sc ws` sessions; clean results land unattended | fork workspaces, return in a later invocation, harvest; clean results auto-merge to an integration branch | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
+
+Ordering rationale: P16+P17 are one story (durable revoke, then practical
+cutover); P18 is the adoption unlock and follows the security arc; P19
+lands before P20 because agent sessions multiply branches and the human
+integrating them wants `--continue`/`--abort`/amend in hand — and P19
+must follow P16 so the rule-merge semantics replay honors are settled.
 
 ## Completed phases (usability-first ordering)
 
@@ -218,35 +241,18 @@ These apply across phases rather than to one:
 
 ## Deferred
 
-Tracked but out of scope for this roadmap horizon:
+Tracked but out of scope for this roadmap horizon (several former entries
+graduated into P16–P20 above: revocation tombstones → P16, bulk re-wrap +
+multiple escrow keys → P17, network Git remotes → P18, amend/`--continue`/
+`--abort`/merge-commit replay → P19, interactive sessions + auto-merge →
+P20):
 
-- **HTTP transport** and **network Git remotes** (GitHub over https/ssh).
-  P12 shipped the sc-native SSH transport; P10's git-backed remotes still
-  reach local `.git` paths only — network Git is a transport swap onto the
-  same marks-map translation core.
+- **HTTP transport** (sc-native). P12 shipped the sc-native SSH transport;
+  an HTTP equivalent is a later transport swap on the same seam.
 - **Streaming (>4 GiB) wire frames** (P12 caps a frame at 4 GiB).
-- **Interactive/daemon workspace sessions** (`sc ws fork` … `sc ws harvest`
-  across invocations) and **auto-merge of clean workspace results** — both
-  explicitly out of P13's one-command session scope.
-- **Bulk re-wrap** of all secrets and protected prefixes on an org-wide
-  recipient/escrow change (P11 ships per-secret/per-path retrofit only —
-  rotation and re-wrap apply one at a time).
-- **Multiple escrow keys** / escrow key rotation (P11 ships a single
-  break-glass key in `.sc/recipients.toml [escrow]`).
-- **History-editing follow-ons:** `sc amend`, stop-and-continue rebase
-  (`--continue`), cherry-pick `--abort`, merge-commit replay (mainline
-  selection), operation objects in the CAS (Jujutsu-deep upgrade to the
-  file oplog), oplog entries for remote-tracking refs. (Protected-path
-  replay and secret-registry replay for cherry-pick/rebase shipped in P15;
-  see ADR-0025.)
-- **Rule narrowing / revocation tombstones** for protected-path prefixes.
-  P15's merge union (`union_prefixes`) is fail-closed by design but one-
-  directional: nothing can shrink a rule via merge. That means a prefix-rule
-  `sc revoke` is currently reversed by merging any branch created before the
-  revoke (the union re-adds the recipient, and future commits under the
-  prefix then seal fresh DEKs to them) — see ADR-0025 Consequences. This
-  item is the durable fix: a way to record "revoked as of here" so a later
-  union merge doesn't resurrect the recipient's standing.
+- **Remaining history-editing depth:** operation objects in the CAS
+  (Jujutsu-deep upgrade to the file oplog), oplog entries for
+  remote-tracking refs.
 - **Sub-tree / partial sharing** and sparse checkouts.
 - **Merge ergonomics**: richer conflict resolution UX beyond P4's
   detection/representation.
