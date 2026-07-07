@@ -229,11 +229,19 @@ impl Repo {
                         // differently on both sides is a typed
                         // `SecretMergeConflict` (the commit fails loudly).
                         let picked_snap = self.snapshot(&ph)?;
+                        // `base_override: None` — `pick_state` does not
+                        // persist the `--mainline` selection a conflicted
+                        // pick was started with (out of scope for this fix;
+                        // see P19 review), so completion cannot recover
+                        // which parent's registry to base against and falls
+                        // back to the picked commit's own first parent, as
+                        // it did before mainline picks existed.
                         let secs = crate::replay::merged_registry_for_replay(
                             self,
                             &picked_snap.parents,
                             &picked_snap.secrets,
                             &snap.secrets,
+                            None,
                         )?;
                         let picked_p = picked_snap.protection;
                         let prefixes = crate::protect::merge_prefixes(

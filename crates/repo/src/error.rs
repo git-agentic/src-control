@@ -62,8 +62,16 @@ pub enum Error {
     Remote(String),
     #[error("secret {0} changed differently on both branches; resolve with `sc secret` then retry")]
     SecretMergeConflict(String),
-    #[error("cannot replay merge commit {0}; use --mainline <N> to pick relative to parent N")]
-    CannotReplayMerge(ObjectId),
+    /// Refused to replay a merge commit. Field 1 is the full, call-site-
+    /// contextualized message: `cherry_pick`'s `replay_commit` guard points
+    /// at `--mainline <N>` (a real remedy there); rebase's merge-in-range
+    /// pre-scan has no such flag (rebase replays a whole linear range, not
+    /// one commit), so it names rebase and suggests linearizing/dropping the
+    /// commit instead (P19 review fix — the two call sites share one
+    /// variant, contextualized like `ProtectedMergeNeedsIdentity`/
+    /// `NotAuthorized` are in `replay.rs`'s rebase fold).
+    #[error("{1}")]
+    CannotReplayMerge(ObjectId, String),
     #[error(transparent)]
     Core(#[from] scl_core::Error),
     #[error(transparent)]

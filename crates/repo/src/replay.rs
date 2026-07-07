@@ -31,17 +31,27 @@ use crate::worktree;
 /// `onto_secrets` is the onto side (current tip for `cherry_pick`, fold
 /// accumulator for `rebase`, the completing tip for a conflicted pick's
 /// `sc commit`); `commit_secrets`/`commit_parents` are the replayed commit's
-/// own registry and parent list. Errors (`Error::SecretMergeConflict`)
-/// propagate verbatim — the caller must not have written anything outside
-/// the CAS when this is called, so the abort is atomic.
+/// own registry and parent list. `base_override` mirrors `replay_commit`'s
+/// parameter of the same name (P19 Task 4 `--mainline`): when the file
+/// replay's base is substituted with a chosen parent of a merge commit, the
+/// registry three-way's base must be that SAME parent's registry, not the
+/// commit's first parent — otherwise a mainline pick can silently re-add (or
+/// drop) a secret that only the non-mainline side touched, since the
+/// registry base would disagree with the file base about what "already
+/// there" means. `None` (all non-mainline callers, including rebase's fold,
+/// which only ever replays non-merge commits) preserves the original
+/// first-parent base. Errors (`Error::SecretMergeConflict`) propagate
+/// verbatim — the caller must not have written anything outside the CAS when
+/// this is called, so the abort is atomic.
 pub(crate) fn merged_registry_for_replay(
     repo: &Repo,
     commit_parents: &[ObjectId],
     commit_secrets: &BTreeMap<String, ObjectId>,
     onto_secrets: &BTreeMap<String, ObjectId>,
+    base_override: Option<ObjectId>,
 ) -> Result<BTreeMap<String, ObjectId>> {
-    let parent_secrets = match commit_parents.first() {
-        Some(p) => repo.snapshot(p)?.secrets,
+    let parent_secrets = match base_override.or_else(|| commit_parents.first().copied()) {
+        Some(p) => repo.snapshot(&p)?.secrets,
         None => BTreeMap::new(),
     };
     merge::merge_secrets(&parent_secrets, onto_secrets, commit_secrets)
@@ -152,7 +162,12 @@ pub(crate) fn replay_commit(
 ) -> Result<ReplayOutcome> {
     let snap = repo.snapshot(&commit_id)?;
     if snap.parents.len() >= 2 && base_override.is_none() {
-        return Err(Error::CannotReplayMerge(commit_id));
+        return Err(Error::CannotReplayMerge(
+            commit_id,
+            format!(
+                "cannot replay merge commit {commit_id}; use --mainline <N> to pick relative to parent N"
+            ),
+        ));
     }
     let (onto_root, onto_prot) = onto;
     let base_snap = match base_override.or_else(|| snap.parents.first().copied()) {
@@ -348,12 +363,18 @@ impl Repo {
         // registry conflict fails fast — even on a pick whose FILES would
         // conflict, the typed `SecretMergeConflict` surfaces here with refs
         // and working tree untouched, instead of being deferred to the
-        // completing `sc commit`.
+        // completing `sc commit`. `base_override` (P19 Task 4 review fix)
+        // threads the SAME mainline-resolved parent into the registry base
+        // as the file replay below uses — a mainline pick's registry three-
+        // way must agree with its file three-way about what "unchanged"
+        // means, else the non-mainline side's secret edits silently leak
+        // into (or get dropped from) the new tip.
         let merged_secrets = merged_registry_for_replay(
             self,
             &picked_snap.parents,
             &picked_snap.secrets,
             &ours_snap.secrets,
+            base_override,
         )?;
 
         match replay_commit(
@@ -686,7 +707,17 @@ impl Repo {
             while cur != base {
                 let snap = self.snapshot(&cur)?;
                 if snap.parents.len() >= 2 {
-                    return Err(Error::CannotReplayMerge(cur));
+                    // Rebase-specific contextualization (P19 review fix):
+                    // rebase replays a whole linear range, so there is no
+                    // single "relative to which parent" choice to offer —
+                    // unlike cherry-pick's per-commit `--mainline`, the fix
+                    // here is to linearize the range or drop the merge.
+                    return Err(Error::CannotReplayMerge(
+                        cur,
+                        format!(
+                            "rebase cannot replay merge commit {cur}; linearize or drop it first"
+                        ),
+                    ));
                 }
                 range.push(cur);
                 cur = snap.parents.first().copied().ok_or(Error::NoCommonAncestor)?;
@@ -747,11 +778,15 @@ impl Repo {
 
         while let Some(commit) = remaining.pop_front() {
             let commit_snap = self.snapshot(&commit)?;
+            // `base_override: None` — the pre-scan above already refused any
+            // merge commit in the replayed range, so this is always a
+            // first-parent-base replay (no mainline selection applies).
             let merged_secrets = merged_registry_for_replay(
                 self,
                 &commit_snap.parents,
                 &commit_snap.secrets,
                 &acc_secrets,
+                None,
             )?;
             let secrets_changed = merged_secrets != acc_secrets;
             // A rebase spans a range, so an identity/authorization abort must
@@ -1296,7 +1331,7 @@ mod tests {
         let onto_snap = repo.snapshot(&main_tip).unwrap();
         let err = replay_commit(&repo, merged, (onto_snap.root, &onto_snap.protection), None, None)
             .unwrap_err();
-        assert!(matches!(err, Error::CannotReplayMerge(id) if id == merged), "got {err:?}");
+        assert!(matches!(err, Error::CannotReplayMerge(id, _) if id == merged), "got {err:?}");
         let _ = base;
 
         drop(repo);
@@ -1545,7 +1580,7 @@ mod tests {
         repo.switch("target").unwrap();
         let err = repo.cherry_pick("a-side", "me", None, None).unwrap_err();
         match err {
-            Error::CannotReplayMerge(_) => {
+            Error::CannotReplayMerge(_, _) => {
                 assert!(err.to_string().contains("--mainline"), "got: {err}");
             }
             other => panic!("expected CannotReplayMerge, got {other:?}"),
@@ -1565,6 +1600,81 @@ mod tests {
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// P19 review fix: a mainline pick's secret-registry three-way must base
+    /// off the SAME chosen parent as the file three-way, not always the
+    /// picked commit's first parent. M = merge(a_tip, b_tip) where ONLY
+    /// b-side added SECRET_X, so M.parents == [a_tip, b_tip] and relative to
+    /// b_tip (mainline 2) the secret delta is empty — landing that pick on a
+    /// target that lacks SECRET_X must NOT introduce it. Before the fix, the
+    /// registry base was unconditionally `commit_parents.first()` (a_tip,
+    /// which lacks the secret), so `merge_secrets` saw onto==base (both
+    /// missing) and resolved to theirs (M, which has it) — a spurious add.
+    /// Mainline 1 (base = a_tip, correct even before the fix) is asserted
+    /// too so the pair pins both the fixed direction and the still-working
+    /// one.
+    #[test]
+    fn mainline_pick_registry_bases_off_chosen_parent() {
+        let root = tmp_root("cp-mainline-registry");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.branch("a-side").unwrap();
+        repo.branch("b-side").unwrap();
+
+        repo.switch("a-side").unwrap();
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        repo.commit("me", "a-side adds a.txt").unwrap();
+        let a_tip = repo.head_tip().unwrap().unwrap();
+        // Both mainline targets are branched here, at a_tip — BEFORE b-side
+        // adds its secret below — so neither target starts with SECRET_X in
+        // its registry (mirrors `mainline_pick_applies_delta_relative_to_
+        // chosen_parent`'s target1/target2 setup).
+        repo.branch("target-m1").unwrap();
+        repo.branch("target-m2").unwrap();
+
+        repo.switch("b-side").unwrap();
+        std::fs::write(root.join("b.txt"), b"b\n").unwrap();
+        repo.commit("me", "b-side adds b.txt").unwrap();
+        // A second, registry-only commit on b-side adds the secret —
+        // `secret_add` commits against HEAD's existing tree, it does not
+        // pick up uncommitted working-tree changes.
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        repo.secret_add("SECRET_X", b"v1", &[pk]).unwrap();
+        let b_tip = repo.head_tip().unwrap().unwrap();
+        assert!(repo.snapshot(&b_tip).unwrap().secrets.contains_key("SECRET_X"));
+
+        repo.switch("a-side").unwrap();
+        let m = repo.merge("b-side", "me").unwrap();
+        let m_snap = repo.snapshot(&m).unwrap();
+        assert_eq!(m_snap.parents, vec![a_tip, b_tip]);
+        assert!(m_snap.secrets.contains_key("SECRET_X"), "merge carries the secret forward");
+
+        // --mainline 2: base = b_tip, which ALREADY has SECRET_X — the
+        // delta relative to it is empty, so picking onto a target that
+        // lacks the secret must not add it.
+        repo.switch("target-m2").unwrap();
+        repo.cherry_pick("a-side", "me", None, Some(2)).unwrap();
+        let tip2 = repo.head_tip().unwrap().unwrap();
+        assert!(
+            !repo.snapshot(&tip2).unwrap().secrets.contains_key("SECRET_X"),
+            "mainline 2's base (b_tip) already has SECRET_X, so no delta should land it"
+        );
+
+        // --mainline 1: base = a_tip, which lacks SECRET_X — the delta
+        // relative to it is "add SECRET_X", so it DOES land on the target.
+        repo.switch("target-m1").unwrap();
+        repo.cherry_pick("a-side", "me", None, Some(1)).unwrap();
+        let tip1 = repo.head_tip().unwrap().unwrap();
+        assert!(
+            repo.snapshot(&tip1).unwrap().secrets.contains_key("SECRET_X"),
+            "mainline 1's base (a_tip) lacks SECRET_X, so the delta adds it"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -2608,7 +2718,12 @@ mod tests {
         assert_eq!(repo.head_tip().unwrap(), feature_tip_before);
 
         let err = repo.rebase("main", "me", None).unwrap_err();
-        assert!(matches!(err, Error::CannotReplayMerge(id) if id == merged), "got {err:?}");
+        assert!(matches!(err, Error::CannotReplayMerge(id, _) if id == merged), "got {err:?}");
+        // Rebase-side contextualization (P19 review fix): no `--mainline`
+        // hint (rebase has no such flag), and the message names rebase.
+        let msg = err.to_string();
+        assert!(!msg.contains("--mainline"), "got: {msg}");
+        assert!(msg.contains("rebase"), "got: {msg}");
         assert_eq!(repo.head_tip().unwrap(), feature_tip_before, "feature tip must not move");
 
         drop(repo);
