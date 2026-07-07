@@ -1544,13 +1544,45 @@ fn run_serve(stdio: bool, path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// The local git path P10's import/export machinery should operate on for
+/// `remote`: the URL itself when it is a local path, or the synced bare
+/// mirror when it is a network URL (ADR-0028 bridge). `sync_from_network`
+/// runs `git fetch` into the mirror first — wanted on sc fetch (fresh data)
+/// and on clone; NOT on push (export goes into the mirror as-is; a stale
+/// mirror head just means git push reports non-ff, verbatim).
+fn git_remote_effective_path(
+    repo: &scl_repo::Repo,
+    remote: &str,
+    url: &str,
+    sync_from_network: bool,
+) -> Result<std::path::PathBuf> {
+    if !scl_gitio::bridge::is_network_git_url(url) {
+        return Ok(std::path::PathBuf::from(url));
+    }
+    let mirror_dir = repo.layout().dot_sc.join("git-remotes").join(remote).join("mirror.git");
+    let mirror = scl_gitio::bridge::ensure_mirror(&mirror_dir, url)?;
+    if sync_from_network {
+        scl_gitio::bridge::mirror_fetch(&mirror)?;
+    }
+    Ok(mirror)
+}
+
 fn run_remote(op: RemoteOp) -> Result<()> {
     let repo = open_repo()?;
     match op {
         RemoteOp::Add { name, url, git } => {
             if git {
+                if !scl_gitio::bridge::is_network_git_url(&url)
+                    && !std::path::Path::new(&url).join("HEAD").exists()
+                    && !std::path::Path::new(&url).join(".git").exists()
+                {
+                    anyhow::bail!("'{url}' is neither a git URL nor a local git repo");
+                }
                 repo.remote_add_git(&name, &url)?;
                 println!("added git remote {name} -> {url}");
+                if scl_gitio::bridge::is_network_git_url(&url) {
+                    println!("  (network: transport via the system git binary)");
+                }
             } else {
                 if url.starts_with("ssh://") {
                     scl_repo::SshUrl::parse(&url)?; // fail fast on malformed URLs
@@ -1605,6 +1637,7 @@ fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
     let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
     let url = cfg.url(remote).ok_or_else(|| anyhow::anyhow!("no such remote: {remote}"))?.to_string();
     let branch = scl_repo::refs::current_branch(repo.layout())?;
+    let path = git_remote_effective_path(repo, remote, &url, true)?;
 
     // Known marks: git-oid-hex -> sc-id.
     let marks = scl_repo::MarksStore::open(repo.layout(), remote)?;
@@ -1617,7 +1650,7 @@ fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
     let report = {
         let store_arc = repo.vfs().store();
         let mut store = store_arc.lock().unwrap();
-        scl_gitio::import_history(&mut store, std::path::Path::new(&url), &branch, &known)?
+        scl_gitio::import_history(&mut store, &path, &branch, &known)?
     };
 
     // Persist new marks first, then the reachability root (the tracking ref) last.
@@ -1661,6 +1694,7 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
     let branch = scl_repo::refs::current_branch(repo.layout())?;
     let ref_name = format!("refs/heads/{branch}");
     let local_tip = repo.head_tip()?.ok_or_else(|| anyhow::anyhow!("branch is unborn — nothing to push"))?;
+    let path = git_remote_effective_path(repo, remote, &url, false)?;
 
     // Load marks both directions.
     let marks = scl_repo::MarksStore::open(repo.layout(), remote)?;
@@ -1673,8 +1707,12 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
         known_sc_to_git.insert(id, g.clone());
     }
 
-    // Fast-forward gate against the remote git ref.
-    if let Some(remote_git_hex) = scl_gitio::read_ref(std::path::Path::new(&url), &ref_name)? {
+    // Fast-forward gate against the remote git ref. For a network remote,
+    // `path` is the local mirror, which reflects the last `sc fetch` — this
+    // is exactly the spec's intended semantics (ff-only at the sc layer
+    // against last-known state; the network's own non-ff rejection on
+    // `mirror_push` below is authoritative for genuinely stale mirrors).
+    if let Some(remote_git_hex) = scl_gitio::read_ref(&path, &ref_name)? {
         match git_to_sc.get(&remote_git_hex) {
             Some(&remote_sc) if remote_sc == local_tip => {
                 println!("push {remote} (git): already up to date");
@@ -1701,7 +1739,7 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
         let store_arc = repo.vfs().store();
         let mut store = store_arc.lock().unwrap();
         let opts = scl_gitio::ExportOptions {
-            to: std::path::Path::new(&url),
+            to: &path,
             ref_name: &ref_name,
             include_encrypted,
             known_git_commits: &known_sc_to_git,
@@ -1722,6 +1760,16 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
             "  warning: {} protected file(s) pushed as ciphertext; {} secret(s) dropped (Git cannot enforce confidentiality)",
             report.protected_blobs_as_ciphertext, report.secrets_dropped
         );
+    }
+
+    // Ordering: export + marks precede the network push (mirroring the
+    // atomicity comment above) — a crash after export/marks but before
+    // `mirror_push` leaves the mirror ahead of the network, and the next
+    // `sc push` retries `mirror_push` idempotently. The stale-network-ff
+    // case is caught by git itself.
+    if scl_gitio::bridge::is_network_git_url(&url) {
+        scl_gitio::bridge::mirror_push(&path, &branch)?;
+        println!("pushed {remote} -> network ({url})");
     }
     Ok(())
 }
@@ -2037,5 +2085,40 @@ mod tests {
         assert!(!content.contains("[escrow]"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn network_git_remote_round_trip_over_file_url() {
+        let root = std::env::temp_dir().join(format!("scl-cli-netgit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A bare hub reachable only through a file:// URL (network-shaped).
+        let hub = root.join("hub.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main", hub.to_str().unwrap()])
+            .status().unwrap();
+        let url = format!("file://{}", hub.display());
+
+        // sc repo with one commit.
+        let work = root.join("repo");
+        std::fs::create_dir_all(&work).unwrap();
+        let repo = scl_repo::Repo::init(&work).unwrap();
+        std::fs::write(work.join("readme.txt"), "hello").unwrap();
+        repo.commit("me", "first").unwrap();
+        repo.remote_add_git("origin", &url).unwrap();
+
+        // Push through the mirror, then verify the HUB (not the mirror) has it.
+        run_push_git(&repo, "origin", false).unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(&hub).args(["log", "--oneline"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("first"),
+            "commit must be visible on the hub via git log");
+
+        // Fetch back through the mirror (round trip sanity).
+        run_fetch_git(&repo, "origin").unwrap();
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
