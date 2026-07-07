@@ -377,6 +377,7 @@ mod tests {
             remaining: vec![ObjectId::of(b"remaining-commit")],
             total: 3,
             author: "t".into(),
+            resolved: false,
         };
         crate::rebase_state::write(repo.layout(), &st).unwrap();
         crate::rebase_state::write_decided_root(repo.layout(), decided_tree).unwrap();

@@ -38,8 +38,23 @@ pub struct RebaseState {
     /// "k of n" status.
     pub total: usize,
     /// The author to record on the completion commit once the rebase folds
-    /// through its last commit.
+    /// through its last commit. NOT used as a default: the author passed to
+    /// `sc rebase --continue` always wins (git-like — the resuming call's
+    /// author, not the original rebase invocation's, is recorded on newly
+    /// landed commits). Persisted for forward-compatibility / diagnostics
+    /// only.
     pub author: String,
+    /// True when `conflicted` has already been completed into `acc_tip` by a
+    /// prior (possibly failed) `rebase_continue` call, and the fold over
+    /// `remaining` is what's left to (re)do. This is what makes
+    /// `rebase_continue` idempotent and error-recoverable (P19 review fix):
+    /// if the resumed fold errors (e.g. `ProtectedMergeNeedsIdentity` on a
+    /// later commit in `remaining`), state is NOT cleared, and a retry sees
+    /// `resolved == true` and skips straight to the fold instead of
+    /// re-completing `conflicted` (which would double-apply it). Defaults to
+    /// `false` when absent from an on-disk file written before this field
+    /// existed.
+    pub resolved: bool,
 }
 
 fn state_path(layout: &Layout) -> std::path::PathBuf {
@@ -87,6 +102,7 @@ fn serialize(st: &RebaseState) -> String {
     out.push_str(&format!("conflicted={}\n", st.conflicted.to_hex()));
     out.push_str(&format!("total={}\n", st.total));
     out.push_str(&format!("author={}\n", st.author));
+    out.push_str(&format!("resolved={}\n", st.resolved));
     for id in &st.remaining {
         out.push_str(&format!("{}\n", id.to_hex()));
     }
@@ -96,7 +112,7 @@ fn serialize(st: &RebaseState) -> String {
 /// Parse `REBASE_STATE`'s on-disk text format. Strict: any malformed or
 /// missing field is `Error::BadRef` rather than a silent default.
 fn deserialize(text: &str) -> Result<RebaseState> {
-    let mut lines = text.lines();
+    let mut lines = text.lines().peekable();
     let branch = parse_kv(lines.next().ok_or_else(|| bad("missing branch"))?, "branch")?;
     let original_tip = parse_id(
         &parse_kv(lines.next().ok_or_else(|| bad("missing original_tip"))?, "original_tip")?,
@@ -114,11 +130,32 @@ fn deserialize(text: &str) -> Result<RebaseState> {
     let total_text = parse_kv(lines.next().ok_or_else(|| bad("missing total"))?, "total")?;
     let total: usize = total_text.parse().map_err(|_| bad(format!("bad total: {total_text}")))?;
     let author = parse_kv(lines.next().ok_or_else(|| bad("missing author"))?, "author")?;
+    // `resolved=` is optional on parse (added after the initial P19 shape) —
+    // a file written before this field existed simply defaults to `false`,
+    // which is the correct reading: nothing has completed yet beyond what
+    // `acc_tip` already reflects.
+    let resolved = match lines.peek() {
+        Some(line) if line.starts_with("resolved=") => {
+            let text = parse_kv(lines.next().unwrap(), "resolved")?;
+            text.parse::<bool>().map_err(|_| bad(format!("bad resolved: {text}")))?
+        }
+        _ => false,
+    };
     let mut remaining = Vec::new();
     for line in lines {
         remaining.push(parse_id(line, "remaining")?);
     }
-    Ok(RebaseState { branch, original_tip, target, acc_tip, conflicted, remaining, total, author })
+    Ok(RebaseState {
+        branch,
+        original_tip,
+        target,
+        acc_tip,
+        conflicted,
+        remaining,
+        total,
+        author,
+        resolved,
+    })
 }
 
 /// Write the stopped rebase's state. `REBASE_STATE` is written LAST — it is
@@ -239,6 +276,7 @@ mod tests {
             ],
             total: 4,
             author: "me".into(),
+            resolved: false,
         }
     }
 
@@ -315,6 +353,41 @@ mod tests {
             None,
             "decided root must be inert once REBASE_STATE is gone"
         );
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn resolved_roundtrip() {
+        let layout = tmp_layout("resolved");
+        let mut st = sample("resolved");
+        st.resolved = true;
+        write(&layout, &st).unwrap();
+        assert_eq!(read(&layout).unwrap(), Some(st));
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn resolved_defaults_false_when_absent_from_file() {
+        // Simulates a REBASE_STATE written before the `resolved` field
+        // existed: no "resolved=" line at all, remaining ids immediately
+        // follow "author=".
+        let layout = tmp_layout("resolved-absent");
+        let st = sample("resolved-absent");
+        let mut text = String::new();
+        text.push_str(&format!("branch={}\n", st.branch));
+        text.push_str(&format!("original_tip={}\n", st.original_tip.to_hex()));
+        text.push_str(&format!("target={}\n", st.target));
+        text.push_str(&format!("acc_tip={}\n", st.acc_tip.to_hex()));
+        text.push_str(&format!("conflicted={}\n", st.conflicted.to_hex()));
+        text.push_str(&format!("total={}\n", st.total));
+        text.push_str(&format!("author={}\n", st.author));
+        for id in &st.remaining {
+            text.push_str(&format!("{}\n", id.to_hex()));
+        }
+        std::fs::write(state_path(&layout), text).unwrap();
+        let read_back = read(&layout).unwrap().unwrap();
+        assert!(!read_back.resolved, "must default to false when the field is absent");
+        assert_eq!(read_back.remaining, st.remaining, "remaining ids must still parse correctly");
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 

@@ -3485,6 +3485,7 @@ mod tests {
             remaining: vec![],
             total: 2,
             author: "me".into(),
+            resolved: false,
         };
         crate::rebase_state::write(&repo.layout, &st).unwrap();
         assert!(repo.rebase_in_progress());

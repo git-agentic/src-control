@@ -816,6 +816,7 @@ impl Repo {
                             remaining: remaining_after_current,
                             total,
                             author: author.to_string(),
+                            resolved: false,
                         },
                     )?;
                     return Ok(RebaseResult::Stopped { conflicted: commit, paths, done, total });
@@ -847,6 +848,12 @@ impl Repo {
             &head,
             &[(head.clone(), Some(original_tip), Some(acc_tip))],
         )?;
+        // Clear any resumable-rebase state here, at the completion tail, NOT
+        // up front in `rebase_continue` (P19 review fix): this is the point
+        // where the operation is actually done — the ref has moved and the
+        // oplog record is written. A no-op (removes nothing) on `rebase`'s
+        // own first pass, where no state exists yet.
+        crate::rebase_state::clear(&self.layout)?;
         Ok(RebaseResult::Rebased { new_tip: acc_tip, replayed, skipped })
     }
 
@@ -854,12 +861,28 @@ impl Repo {
     /// the conflicted commit from the resolved working tree (single
     /// completion parent = the fold's `acc_tip`, via the same extracted
     /// pick-completion assembly `commit` uses for a resolved pick —
-    /// `assemble_completion_snapshot`), clear the rebase state, then keep
-    /// folding the remaining commits via `rebase_fold_and_finish` — stopping
-    /// again on the next conflict (`RebaseResult::Stopped`, as many times as
-    /// needed) or completing (`RebaseResult::Rebased`, moving the branch ref
-    /// once and recording ONE oplog entry whose `before` is the rebase's
-    /// original pre-rebase tip, no matter how many stops preceded it).
+    /// `assemble_completion_snapshot`), then keep folding the remaining
+    /// commits via `rebase_fold_and_finish` — stopping again on the next
+    /// conflict (`RebaseResult::Stopped`, as many times as needed) or
+    /// completing (`RebaseResult::Rebased`, moving the branch ref once and
+    /// recording ONE oplog entry whose `before` is the rebase's original
+    /// pre-rebase tip, no matter how many stops preceded it).
+    ///
+    /// **Error-recoverable and idempotent (P19 review fix):** state is only
+    /// cleared by the fold's OWN completion tail (full `Rebased`) or
+    /// overwritten by its next stop (`Stopped`) — never up front here. If the
+    /// resumed fold errors on a LATER commit in `remaining` (a typed
+    /// `ProtectedMergeNeedsIdentity`/`NotAuthorized`/`SecretMergeConflict`,
+    /// e.g. `--continue` was called without `--identity`), the rebase is
+    /// still in progress afterward: the user can retry `--continue` with the
+    /// right identity, or `--abort`. Retrying must not re-complete `conflicted`
+    /// a second time — `RebaseState::resolved` tracks whether that step
+    /// already ran: once `assemble_completion_snapshot` succeeds, state is
+    /// immediately rewritten with `acc_tip` advanced and `resolved = true`
+    /// BEFORE the fold is attempted, so a retry after a fold error sees
+    /// `resolved == true` and skips straight to the fold using the
+    /// already-advanced `acc_tip`.
+    ///
     /// Errors [`Error::InvalidArgument`] if no rebase is in progress.
     pub fn rebase_continue(
         &self,
@@ -871,23 +894,44 @@ impl Repo {
                 "no rebase in progress — nothing to continue".into(),
             ));
         };
-        let decided = crate::rebase_state::read_decided_root(&self.layout)?;
-        let completed_msg = self.snapshot(&st.conflicted)?.message;
-        let new_tip = self.assemble_completion_snapshot(
-            st.acc_tip,
-            st.conflicted,
-            decided,
-            author,
-            &completed_msg,
-        )?;
-        // Clean up this conflict's ".theirs" sidecars (mirrors
-        // `merge_abort`'s cleanup): once resolved, they're pure working-tree
-        // litter — never part of the tracked tree, so `materialize` never
-        // touches them itself.
-        for path in crate::rebase_state::read_conflicts(&self.layout)? {
-            let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
-        }
-        crate::rebase_state::clear(&self.layout)?;
+        let new_tip = if st.resolved {
+            // A previous `--continue` already completed `st.conflicted` into
+            // `st.acc_tip` but the resumed fold errored before finishing (or
+            // stopping on a new conflict, which would have overwritten this
+            // state already). Re-running `assemble_completion_snapshot` here
+            // would double-apply the resolved commit — skip straight to the
+            // fold.
+            st.acc_tip
+        } else {
+            let decided = crate::rebase_state::read_decided_root(&self.layout)?;
+            let completed_msg = self.snapshot(&st.conflicted)?.message;
+            let new_tip = self.assemble_completion_snapshot(
+                st.acc_tip,
+                st.conflicted,
+                decided,
+                author,
+                &completed_msg,
+            )?;
+            // Clean up this conflict's ".theirs" sidecars (mirrors
+            // `merge_abort`'s cleanup): once resolved, they're pure
+            // working-tree litter — never part of the tracked tree, so
+            // `materialize` never touches them itself.
+            for path in crate::rebase_state::read_conflicts(&self.layout)? {
+                let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
+            }
+            // Advance state BEFORE attempting the fold, so an error from the
+            // fold below (on a later commit) leaves a retryable, idempotent
+            // `--continue` rather than losing resumability. `rebase_abort`
+            // reads `decided_root`/`conflicted`/`remaining` from this same
+            // state, all still valid: `conflicted` is now purely historical
+            // (its completion already landed in `acc_tip`) and `--abort`
+            // restores to `original_tip` regardless.
+            crate::rebase_state::write(
+                &self.layout,
+                &crate::rebase_state::RebaseState { acc_tip: new_tip, resolved: true, ..st.clone() },
+            )?;
+            new_tip
+        };
         self.rebase_fold_and_finish(
             st.branch,
             st.original_tip,
@@ -911,17 +955,28 @@ impl Repo {
         for path in crate::rebase_state::read_conflicts(&self.layout)? {
             let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
         }
+        // The stop's own conflict-materialize wrote `REBASE_DECIDED_ROOT`
+        // (`conflict_root` in `rebase_fold_and_finish`'s Conflicts arm) to
+        // disk as the tree the working tree currently, actually reflects —
+        // pass it as `old_root` so the deletion pass drops files the stop
+        // pulled in from the target side (e.g. a target-only new file) that
+        // `original_tip` never had (P19 review fix, mirrors `merge_abort`'s
+        // `theirs_root`-as-`old_root` pattern in `crates/repo/src/repo.rs`).
+        // Falls back to `None` (full clean materialize) only for residue
+        // where the decided root is unexpectedly absent.
+        let decided = crate::rebase_state::read_decided_root(&self.layout)?;
         let snap = self.snapshot(&st.original_tip)?;
         {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
-            // None for `from`: the tree carries conflict markers/sidecars a
-            // diff-based materialize could miss — do a full clean
-            // materialize instead (same reasoning as `merge_abort`'s
-            // restore, generalized: here the ORIGINAL tip is also the
-            // "theirs" side conceptually, so `old_root` has nothing useful
-            // to diff against beyond a full rewrite).
-            worktree::materialize(&self.layout, &mut store, snap.root, None, &snap.protection, None)?;
+            worktree::materialize(
+                &self.layout,
+                &mut store,
+                snap.root,
+                decided,
+                &snap.protection,
+                None,
+            )?;
         }
         crate::rebase_state::clear(&self.layout)
     }
@@ -2802,6 +2857,168 @@ mod tests {
         let outcome = repo.rebase_continue("me", None).unwrap();
         assert!(matches!(outcome, RebaseResult::Rebased { .. }));
         assert!(!repo.rebase_in_progress());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- P19 review fixes: error-recoverable/idempotent --continue, and
+    // --abort dropping stop-materialized target-only files ----
+
+    #[test]
+    fn rebase_continue_error_preserves_state_and_retry_succeeds() {
+        // feature's first commit (A) plain-conflicts with main on x.txt;
+        // feature's second commit (B) diverges main's content edit to a
+        // PROTECTED path — a genuine content-divergent protected merge that
+        // needs `--identity`. Stop at A, resolve, `--continue` WITHOUT an
+        // identity: A completes (assemble_completion_snapshot needs no
+        // identity — it only reads the resolved plaintext off disk), then
+        // the resumed fold hits B and errors typed
+        // (`ProtectedMergeNeedsIdentity`). The rebase must still be in
+        // progress afterward (state not cleared by the failed attempt), and
+        // a retry WITH the identity must complete WITHOUT re-resolving A
+        // (proving the completion was not re-applied) and land in exactly
+        // ONE oplog record for the whole operation.
+        let root = tmp_root("rebase-continue-error-recoverable");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // main (target): edits x.txt (will conflict with feature's A) AND
+        // edits secret/a.txt line 1 (will diverge from feature's B).
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        let main_tip = repo.commit("me", "main edits x and secret").unwrap();
+
+        // feature commit A: conflicting x.txt edit only.
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nFEATURE\nc\n").unwrap();
+        let commit_a = repo.commit("me", "feature edits x (conflicts)").unwrap();
+
+        // feature commit B: edits secret/a.txt line 3 — mergeable but
+        // content-divergent from main's line-1 edit.
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
+        repo.commit("me", "feature edits secret (protected divergence)").unwrap();
+        let original_feature_tip = repo.head_tip().unwrap().unwrap();
+
+        let ops_before = repo.oplog().unwrap().len();
+
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        match outcome {
+            RebaseResult::Stopped { conflicted, .. } => assert_eq!(conflicted, commit_a),
+            other => panic!("expected Stopped at commit A, got {other:?}"),
+        }
+        assert_eq!(repo.head_tip().unwrap(), Some(original_feature_tip));
+
+        // Resolve A's conflict.
+        std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
+
+        // --continue without identity: A completes, then B's replay errors.
+        let err = repo.rebase_continue("me", None).unwrap_err();
+        assert!(
+            matches!(err, Error::ProtectedMergeNeedsIdentity(_) | Error::NotAuthorized(_)),
+            "expected a typed identity error, got {err:?}"
+        );
+        assert!(repo.rebase_in_progress(), "state must survive the failed --continue for retry");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(original_feature_tip),
+            "branch ref must still not have moved"
+        );
+        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no oplog record from the failed retry");
+
+        // Retry with the identity: must NOT re-ask for A's resolution — the
+        // working tree still holds A's resolved x.txt, untouched by the
+        // failed attempt, and completion must not re-run against it.
+        let outcome = repo.rebase_continue("me", Some(&alice_sk)).unwrap();
+        let new_tip = match outcome {
+            RebaseResult::Rebased { new_tip, .. } => new_tip,
+            other => panic!("expected Rebased on retry, got {other:?}"),
+        };
+        assert!(!repo.rebase_in_progress());
+        assert_eq!(repo.head_tip().unwrap(), Some(new_tip));
+        assert_eq!(
+            std::fs::read_to_string(root.join("x.txt")).unwrap(),
+            "a\nresolved\nc\n",
+            "A's resolution must be preserved, not re-asked"
+        );
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before + 1,
+            "exactly ONE new oplog record for the whole stop+retry rebase"
+        );
+        // Discriminating check (not just "the visible result looks right"):
+        // walk the parent chain and confirm A was completed EXACTLY ONCE,
+        // directly atop main_tip. If the failed retry had re-completed A
+        // (the bug `resolved` prevents), B's snapshot would have an extra
+        // no-op A'' between A' and main_tip — every assertion above would
+        // still pass despite the double-application.
+        let b_snap = repo.snapshot(&new_tip).unwrap();
+        assert_eq!(b_snap.parents.len(), 1, "B's completion is single-parent");
+        let a_completion = repo.snapshot(&b_snap.parents[0]).unwrap();
+        assert_eq!(
+            a_completion.parents,
+            vec![main_tip],
+            "A must have completed exactly once, directly atop main_tip — \
+             the failed retry must not have re-applied it"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rebase_abort_drops_stop_materialized_target_files() {
+        // main (target) both edits x.txt (conflicting with feature) AND adds
+        // a brand-new file the stop's conflict-materialize pulls onto disk.
+        // `--abort` must drop that target-only file, not leave it as
+        // untracked residue the next commit would silently absorb.
+        let root = tmp_root("rebase-abort-drops-target-only");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"a\nB\nc\n").unwrap();
+        std::fs::write(root.join("new.txt"), b"from-main\n").unwrap();
+        repo.commit("me", "main edits x, adds new.txt").unwrap();
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nZ\nc\n").unwrap();
+        repo.commit("me", "feature edits x").unwrap();
+        let original_tip = repo.head_tip().unwrap().unwrap();
+
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        assert!(matches!(outcome, RebaseResult::Stopped { .. }));
+        assert!(
+            root.join("new.txt").exists(),
+            "the stop's conflict-materialize must pull in target's new.txt"
+        );
+
+        repo.rebase_abort().unwrap();
+
+        assert!(!repo.rebase_in_progress());
+        assert!(
+            !root.join("new.txt").exists(),
+            "abort must drop the stop-materialized target-only file"
+        );
+        assert_eq!(
+            std::fs::read(root.join("x.txt")).unwrap(),
+            b"a\nZ\nc\n",
+            "x.txt restored to feature's pre-rebase content"
+        );
+        assert_eq!(repo.head_tip().unwrap(), Some(original_tip));
+
+        let status = repo.status().unwrap();
+        assert!(
+            status.added.is_empty() && status.modified.is_empty() && status.deleted.is_empty(),
+            "status must report clean after abort: {status:?}"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
