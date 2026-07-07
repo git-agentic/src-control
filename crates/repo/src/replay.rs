@@ -185,7 +185,7 @@ pub(crate) fn replay_commit(
     let union_prot = Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
 
     let (mut all, to_encrypt) = split_for_encryption(&fm.files, &union_prot)?;
-    let (encrypted, fresh_wrapped) = protect::encrypt_protected(to_encrypt);
+    let (encrypted, fresh_wrapped) = protect::encrypt_protected(to_encrypt)?;
     all.extend(encrypted);
     let root = repo.vfs().write_tree_with_perms(&all)?;
 

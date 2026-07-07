@@ -247,7 +247,7 @@ impl Repo {
         // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
         let mut all: Vec<(String, Vec<u8>, scl_core::FileMode, u8)> =
             plain.into_iter().map(|(p, b, m)| (p, b, m, 0u8)).collect();
-        let (protected_all, mut fresh_wrapped) = crate::protect::encrypt_protected(protected);
+        let (protected_all, mut fresh_wrapped) = crate::protect::encrypt_protected(protected)?;
         all.extend(protected_all);
 
         // Safe-by-default: carry forward still-protected files that are absent
@@ -825,7 +825,7 @@ impl Repo {
             return Err(Error::MergeConflicts(merge_result.conflicts.len()));
         }
 
-        let (encrypted, fresh_wrapped) = crate::protect::encrypt_protected(to_encrypt);
+        let (encrypted, fresh_wrapped) = crate::protect::encrypt_protected(to_encrypt)?;
         carried.extend(encrypted);
         let all = carried;
 

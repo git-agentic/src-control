@@ -116,13 +116,22 @@ pub(crate) fn decrypt_with(
 /// Convergently encrypt `plaintexts` (path, bytes, mode, rule recipients),
 /// wrapping each fresh DEK to its recipients. Returns the ciphertext write-set
 /// entries (PROTECTED perms) and fresh wraps keyed by ciphertext blob id.
+/// Errors `InvalidArgument` if any file's recipient list is empty: a rule whose
+/// every recipient is tombstoned (e.g. crossed revokes merged together) must fail
+/// the seal loudly — sealing to nobody mints permanently unreadable ciphertext.
 pub(crate) fn encrypt_protected(
     plaintexts: Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)>,
-) -> (Vec<(String, Vec<u8>, FileMode, u8)>, BTreeMap<ObjectId, Vec<WrappedKey>>) {
+) -> Result<(Vec<(String, Vec<u8>, FileMode, u8)>, BTreeMap<ObjectId, Vec<WrappedKey>>)> {
     // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
     let mut all: Vec<(String, Vec<u8>, FileMode, u8)> = Vec::new();
     let mut fresh_wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
     for (path, bytes, mode, recipients) in plaintexts {
+        if recipients.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "{path} is protected but its rule has no granted recipients \
+                 (all revoked?); run `sc grant` before committing under this prefix"
+            )));
+        }
         let (blob_bytes, dek) = scl_crypto::encrypt_path(&bytes);
         // Build the blob object once for its id; `write_tree_with_perms` does
         // the (idempotent) store insert below — no second explicit `put`.
@@ -134,7 +143,7 @@ pub(crate) fn encrypt_protected(
         fresh_wrapped.insert(blob_id, wks);
         all.push((path, blob_bytes, mode, scl_core::PROTECTED));
     }
-    (all, fresh_wrapped)
+    Ok((all, fresh_wrapped))
 }
 
 /// Prior-wrap reuse: for each (blob_id, recipient_id) already wrapped in
@@ -315,5 +324,31 @@ mod tests {
         assert_eq!(ab, ba);
         // And the output is sorted by recipient_id.
         assert!(ab.windows(2).all(|w| w[0].recipient_id <= w[1].recipient_id));
+    }
+
+    #[test]
+    fn encrypt_protected_refuses_empty_recipient_list() {
+        let err = encrypt_protected(vec![(
+            "secret/x".into(),
+            b"v".to_vec(),
+            FileMode::FILE,
+            vec![],
+        )])
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "sealing to nobody must fail loudly, got {err:?}"
+        );
+        assert!(format!("{err}").contains("secret/x"), "error must name the path");
+    }
+
+    #[test]
+    fn merge_prefixes_crossed_revokes_can_empty_a_rule() {
+        // Each side revoked a DIFFERENT one of the two recipients: the merged
+        // rule has zero granted keys. This is exactly why sealing must guard.
+        let a = vec![rule("secret/", vec![entry(1, 2, false), entry(2, 1, true)])];
+        let b = vec![rule("secret/", vec![entry(1, 1, true), entry(2, 2, false)])];
+        let m = merge_prefixes(&a, &b);
+        assert!(m[0].granted_keys().is_empty());
     }
 }
