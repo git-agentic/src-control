@@ -232,7 +232,8 @@ two DAGs is carried by the marks map, not by a fatter object model — the
 content-addressing invariant is unchanged. The git-remote path dispatches above
 the P6 `Transport` trait rather than implementing it (a Git remote has a
 different id space and encoding than sc's `Transport` assumes). Scope is local
-`.git` paths on disk only; network Git is deferred. One accepted MVP
+`.git` paths on disk only; network Git is deferred — lifted in P18 (network Git
+via system-git mirror bridge). One accepted MVP
 limitation: fetching from Git repo A and pushing a Git-origin commit to a
 *different* Git repo B re-synthesizes with dropped committer/timezone/gpgsig
 and a different Git oid than A had — same-remote fetch/push stays clean. A side
