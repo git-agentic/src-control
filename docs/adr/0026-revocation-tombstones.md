@@ -58,6 +58,13 @@ no versioned decode.
   never GC'd (they are load-bearing against future merges).
 - `sc protect --list` shows per-recipient state and epoch, replacing the
   ADR-0025 "re-check rules after merges" caveat with visible evidence.
+- Merging a pre-revoke branch re-attaches the revoked recipient's old
+  wraps to the live tip (`union_wraps` keeps historical facts), and since
+  `grant` authorizes by wrap presence, a revoked-but-wrap-holding
+  recipient can still grant others access to that pre-revoke ciphertext.
+  Standing and fresh seals stay tombstone-gated regardless; the full
+  cutover for old ciphertext remains rotation (ADR-0019) / bulk re-wrap
+  (ADR-0027). Verified empirically at the P16 final review.
 
 ## Alternatives considered
 

@@ -342,7 +342,11 @@ unchanged: they work by wrap presence in `protection.wrapped`, and
 `union_wraps` deliberately preserves old wraps as historical facts, so a
 revoked recipient can still decrypt ciphertext sealed before the revoke
 (they already held the key; cryptographic cutover is rotation, not
-revoke). Crossed revokes can empty a rule's granted set
+revoke). Corollary: merging a pre-revoke branch re-attaches the revoked
+recipient's old wraps to the live tip, and since `grant` authorizes by
+wrap presence, a revoked-but-wrap-holding recipient can still grant others
+access to that pre-revoke ciphertext — standing and fresh seals stay
+tombstone-gated regardless. Crossed revokes can empty a rule's granted set
 entirely; `encrypt_protected` is now fallible and refuses the seal loudly
 (pointing at `sc grant`) rather than minting ciphertext nobody can read.
 This is a rules-format break: the snapshot tag bumped `2 → 4`
