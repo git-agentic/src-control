@@ -4,6 +4,7 @@
 - **Date:** 2026-07-07
 - **Phase:** 20
 - **Builds on:** ADR-0023 (agent workspaces), ADR-0012 (three-way merge), ADR-0024 (oplog)
+- **Spec:** `docs/superpowers/specs/2026-07-07-p20-agent-sessions-design.md`
 
 ## Context
 
@@ -14,28 +15,62 @@ mechanical toil the tool can absorb.
 
 ## Decision
 
-Durable workspace sessions: `sc ws fork` / `sc ws list` / `sc ws run` /
-`sc ws harvest` / `sc ws abandon` persist session state under `.sc/`
-across invocations. Ephemeral checkouts remain zero-residue on teardown —
-the mode-scoped disk invariant holds, with the session bounded by an
-explicit `harvest`/`abandon` instead of one process lifetime. On harvest,
-results that merge cleanly onto a designated integration branch land
-automatically; anything conflicting falls back to a `work-<i>` branch for
-manual `sc merge`. No conflict markers ever land unattended. All ref
-moves are oplog-recorded and undoable.
+Durable sessions whose workspace state IS the checkout directory. One
+unnamed session per repo: `sc ws fork --agents N` materializes N
+checkouts from the current tip into `.sc/ws/<i>/` (P7-aware) and writes
+an atomic manifest (`.sc/ws/session.toml`: base snapshot, base branch,
+dirs; never key material). Agents work in the dirs directly across
+invocations; `sc ws list`/`run` mirror P13's env + secret-injection
+surface. `sc ws abandon` drops workspaces without an oplog record
+(nothing moved).
+
+`sc ws harvest [--into <branch>] [--identity <key>]` processes
+workspaces in ascending order through P13's existing `harvest_workspace`
+pipeline (scanner, `.scignore`, protected re-encryption), then
+auto-merges each candidate onto the landing branch — default the
+session's **base branch** (user-decided), `--into` overrides. Clean
+merges (including ff) land immediately, one oplog record per landing,
+cumulatively (each merge sees the previous). Anything conflicted —
+including protected divergences lacking `--identity` — falls back to a
+flat `work-<i>` branch (collision-suffixed), landing branch untouched,
+no conflict markers written unattended. Harvest is a ref-mover and joins
+the P19 guard family. The session ends (dirs + manifest removed, zero
+residue) when no workspaces remain.
+
+Crash-safety: manifest atomic-write; a crash mid-session preserves the
+session. gc roots the base snapshot gated on manifest presence (the
+P15/P19 state-gating discipline); candidates become branch/merge-
+reachable within the lock-held harvest, leaving no prunable window.
+
+The mode-scoped disk invariant holds: `.sc/` is durable by design, and
+session teardown removes `.sc/ws/` entirely — the ephemeral-checkout
+guarantee is bounded by explicit harvest/abandon instead of one process
+lifetime. `sc work` (P13) is unchanged.
 
 ## Consequences
 
-- Fork workspaces, return in a later invocation, harvest — clean results
-  integrate without manual merges; the demo proves the multi-invocation
-  round trip.
-- Session state in `.sc/` must be crash-safe and gc-aware (workspace
-  snapshots become reachability roots while a session is live).
+- Fork workspaces, return in later invocations, harvest — clean results
+  land on the base branch without manual merges; the demo proves the
+  multi-invocation round trip, cumulative landings, a conflict fallback,
+  and an undo of a landing.
+- New persisted session state that gc and the guard family respect —
+  the fourth in-progress-adjacent state, but NOT one that blocks other
+  operations (only harvest itself is guarded as a ref-mover; fork/run/
+  abandon coexist with normal work).
+- Harvesting onto the currently-checked-out branch inherits the merge
+  path's dirty-tree refusal — commit the user tree first.
 
 ## Alternatives considered
 
-- **Long-lived daemon process:** keeps worktrees in RAM between commands
-  but adds a lifecycle/IPC surface; persisted session state over the
-  existing store is simpler and crash-safer.
-- **Auto-merge everything with markers:** violates the no-silent-
-  destruction principle; conflicted work must be a deliberate human merge.
+- **Long-lived daemon holding in-RAM worktrees:** lifecycle/IPC surface
+  for no gain — durable checkout dirs give persistence for free and
+  survive crashes; rejected (was the draft's stance too).
+- **Snapshot-persistent sessions (re-materialize per invocation, `sc ws
+  save`):** CAS churn, and agents holding open files across invocations
+  break; rejected.
+- **Auto-merge with markers on conflict:** violates the no-silent-
+  destruction principle; conflicted work must be a deliberate human
+  merge (fallback branches). Rejected in the draft; upheld.
+- **Dedicated integration branch / mandatory `--into`:** safer-feeling
+  but adds a manual merge to every session while landings are already
+  individually undoable; user chose base-branch landing.
