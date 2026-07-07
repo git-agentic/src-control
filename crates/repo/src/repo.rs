@@ -2953,6 +2953,125 @@ mod tests {
     }
 
     #[test]
+    fn revoke_survives_merging_a_pre_revoke_branch() {
+        // The ADR-0025 boundary scenario, now closed by ADR-0026.
+        let root = tmp_root("p16-durable-revoke");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add secret").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+
+        // Fork a branch while bob is still granted, and give it its own commit.
+        repo.branch("pre-revoke").unwrap();
+        repo.switch("pre-revoke").unwrap();
+        std::fs::write(root.join("readme.txt"), b"feature work").unwrap();
+        repo.commit("me", "feature").unwrap();
+        repo.switch("main").unwrap();
+
+        // Revoke bob on main, then merge the pre-revoke branch.
+        repo.revoke("secret/", &bob_pk.recipient_id()).unwrap();
+        repo.merge("pre-revoke", "me").unwrap();
+
+        // Bob stays revoked: tombstone won the register.
+        let listed = repo.protected_prefixes().unwrap();
+        let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
+        let bob = recips.iter().find(|r| r.id == bob_pk.recipient_id()).unwrap();
+        assert!(!bob.granted, "merge resurrected a revoked recipient");
+        assert!(recips.iter().find(|r| r.id == alice_pk.recipient_id()).unwrap().granted);
+
+        // And a FRESH file under the prefix seals to alice only.
+        let before: std::collections::BTreeSet<_> = {
+            let tip = repo.head_tip().unwrap().unwrap();
+            repo.snapshot(&tip).unwrap().protection.wrapped.keys().cloned().collect()
+        };
+        std::fs::write(root.join("secret/new.txt"), b"fresh").unwrap();
+        let c = repo.commit("me", "post-revoke secret").unwrap();
+        let prot = repo.snapshot(&c).unwrap().protection;
+        let new_ids: Vec<_> = prot.wrapped.keys().filter(|k| !before.contains(k)).collect();
+        assert!(!new_ids.is_empty(), "expected a freshly sealed blob");
+        let bob_id = bob_pk.recipient_id();
+        for id in new_ids {
+            let wks = &prot.wrapped[id];
+            assert!(
+                !wks.iter().any(|w| w.recipient_id == bob_id.as_str()),
+                "fresh DEK sealed to a revoked recipient"
+            );
+            assert_eq!(wks.len(), 1, "fresh blob must be wrapped for alice only");
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn regrant_after_revoke_wins_against_old_tombstone_branch() {
+        let root = tmp_root("p16-regrant");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap(); // bob@2:Granted
+        repo.revoke("secret/", &bob_pk.recipient_id()).unwrap(); // bob@3:Revoked
+
+        // Branch carries the tombstone; main deliberately re-grants (bob@4).
+        repo.branch("tombstoned").unwrap();
+        repo.switch("tombstoned").unwrap();
+        std::fs::write(root.join("readme.txt"), b"work").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        repo.merge("tombstoned", "me").unwrap();
+
+        let listed = repo.protected_prefixes().unwrap();
+        let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
+        assert!(
+            recips.iter().find(|r| r.id == bob_pk.recipient_id()).unwrap().granted,
+            "a deliberate re-grant must out-epoch the old tombstone"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cherry_pick_of_pre_revoke_commit_does_not_resurrect_recipient() {
+        let root = tmp_root("p16-replay-revoke");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+
+        // A branch commit made while bob was granted…
+        repo.branch("work").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("notes.txt"), b"pickme").unwrap();
+        repo.commit("me", "pickable").unwrap();
+        repo.switch("main").unwrap();
+
+        // …revoke bob on main, then replay that commit onto main.
+        repo.revoke("secret/", &bob_pk.recipient_id()).unwrap();
+        repo.cherry_pick("work", "me", None).unwrap();
+
+        let listed = repo.protected_prefixes().unwrap();
+        let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
+        assert!(
+            !recips.iter().find(|r| r.id == bob_pk.recipient_id()).unwrap().granted,
+            "replay resurrected a revoked recipient"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn commit_carries_forward_absent_protected_files_for_non_recipient() {
         // Regression: a non-recipient checks out (protected file skipped/absent),
         // then commits something unrelated. The absent protected file and its
