@@ -203,6 +203,12 @@ enum Cmd {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Manage a durable `sc ws` session: workspaces forked from HEAD that
+    /// survive the process exiting (unlike `sc work`'s one-shot session).
+    Ws {
+        #[command(subcommand)]
+        op: WsOp,
+    },
     /// Clone a repo (local path or `ssh://` URL) into a new directory.
     Clone {
         src: String,
@@ -326,6 +332,32 @@ enum EscrowOp {
     Remove { id_or_name: String },
     /// List the configured escrow keys.
     Show,
+}
+
+#[derive(Subcommand)]
+enum WsOp {
+    /// Fork N durable workspaces from HEAD under `.sc/ws/<i>/`.
+    Fork {
+        /// Number of workspaces to fork.
+        #[arg(long, default_value_t = 2)]
+        agents: u32,
+        /// Identity file to decrypt protected paths at checkout (default
+        /// ~/.sc/identity or $SC_IDENTITY; optional — unmatched protected
+        /// paths are just skipped).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Author recorded on any commit a later harvest produces (default
+        /// $SC_AUTHOR, then the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// List the open session's workspaces (changed/unchanged vs base).
+    List,
+    /// Abandon one workspace (by index) or the whole session.
+    Abandon {
+        /// Workspace index to abandon. Omit to abandon the whole session.
+        index: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -458,6 +490,7 @@ fn main() -> Result<()> {
         Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
             run_work(agents, name, budget_mb, with_secrets, identity, author, cmd)
         }
+        Cmd::Ws { op } => run_ws(op),
         Cmd::Clone { src, dst, git } => run_clone(src, dst, git),
         Cmd::Serve { stdio, path } => run_serve(stdio, path),
         Cmd::Remote { op } => run_remote(op),
@@ -1561,6 +1594,55 @@ fn run_work(
     // destructors — same reasoning as run_run).
     drop(repo);
     std::process::exit(if failed { 1 } else { 0 });
+}
+
+/// `sc ws`: durable agent-workspace session (fork/list/abandon).
+fn run_ws(op: WsOp) -> Result<()> {
+    let repo = open_repo()?;
+    match op {
+        WsOp::Fork { agents, identity, author } => {
+            let sk = resolve_identity_opt(identity)?;
+            let session = repo.ws_fork(agents, &resolve_author(author), sk.as_ref())?;
+            println!(
+                "forked {} workspace(s) from branch {} @ {}",
+                session.workspaces.len(),
+                session.base_branch,
+                session.base_snapshot.short()
+            );
+            for entry in &session.workspaces {
+                println!("  {:<3} {}", entry.index, entry.dir.display());
+            }
+        }
+        WsOp::List => match repo.ws_session()? {
+            None => println!("no workspace session open"),
+            Some(session) => {
+                println!(
+                    "session base: branch {} @ {}",
+                    session.base_branch,
+                    session.base_snapshot.short()
+                );
+                println!("index  status     dir");
+                for entry in &session.workspaces {
+                    let status = if !entry.live {
+                        "abandoned".to_string()
+                    } else if repo.ws_changed(entry)? {
+                        "changed".to_string()
+                    } else {
+                        "unchanged".to_string()
+                    };
+                    println!("{:<6} {:<10} {}", entry.index, status, entry.dir.display());
+                }
+            }
+        },
+        WsOp::Abandon { index } => {
+            let remaining = repo.ws_abandon(index)?;
+            match index {
+                Some(i) => println!("abandoned workspace {i}; {remaining} still live"),
+                None => println!("abandoned the session ({remaining} workspace(s) remain)"),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn load_identity(flag: Option<PathBuf>) -> Result<scl_crypto::SecretKey> {

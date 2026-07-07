@@ -164,26 +164,14 @@ across every phase.
 
 ## Active
 
-None — Phase 20 is next up.
+- **Phase 20 — Agent sessions + auto-merge.** In build. Spec:
+  `docs/superpowers/specs/2026-07-07-p20-agent-sessions-design.md`
+  (ADR-0030, Proposed → Accepted at completion).
 
-## Next horizon (P20)
+## Next horizon
 
-Decided 2026-07-07 (design: `docs/superpowers/specs/2026-07-07-roadmap-horizon-p16-p20-design.md`).
-Theme: finish the confidentiality story end to end before pushing for
-adoption — P16 closed the ADR-0025 boundary (a prefix-rule revoke is now
-durable across merges of pre-revoke branches), P17 closed the practical
-cutover at org scale (one `sc rewrap` after an escrow/recipient change),
-and the arc continues toward adoption.
-
-| Phase | Goal | Demoable outcome | ADR |
-|-------|------|------------------|-----|
-| **P20 — Agent sessions + auto-merge** | Durable `sc ws` sessions; clean results land unattended | fork workspaces, return in a later invocation, harvest; clean results auto-merge to an integration branch | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
-
-Ordering rationale: P16+P17 are one story (durable revoke, then practical
-cutover); P18 is the adoption unlock and follows the security arc; P19
-lands before P20 because agent sessions multiply branches and the human
-integrating them wants `--continue`/`--abort`/amend in hand — and P19
-must follow P16 so the rule-merge semantics replay honors are settled.
+P20 is the last phase of this horizon; a new horizon gets brainstormed at
+its completion.
 
 ## Completed phases (usability-first ordering)
 

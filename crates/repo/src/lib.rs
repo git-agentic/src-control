@@ -29,6 +29,7 @@ pub mod stdio_transport;
 pub mod sync;
 pub mod transport;
 pub mod wire;
+pub(crate) mod ws;
 pub mod workspace;
 pub mod worktree;
 
@@ -46,3 +47,4 @@ pub use secrets::SecretInfo;
 pub use stdio_transport::{open_transport, SshUrl, StdioTransport};
 pub use workspace::{HarvestResult, WorkOptions, WorkspaceOutcome};
 pub use worktree::Diff;
+pub use ws::{WsEntry, WsSession};
