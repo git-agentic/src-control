@@ -125,7 +125,19 @@ impl Repo {
     /// Paths tracked by HEAD (empty when the branch is unborn). `.scignore`
     /// rules never hide these — same model as git.
     fn tracked_paths(&self) -> Result<std::collections::BTreeSet<String>> {
-        match self.head_tip()? {
+        self.tracked_paths_at(self.head_tip()?)
+    }
+
+    /// Paths tracked by `tip` (empty when `tip` is `None`). Generalizes
+    /// `tracked_paths` to an explicit tip rather than HEAD — needed by
+    /// `assemble_completion_snapshot`, where the completing parent (a pick's
+    /// `tip`, or a rebase fold's `acc_tip`) can differ from the branch's own
+    /// unmoved HEAD while a pick/rebase is in progress.
+    fn tracked_paths_at(
+        &self,
+        tip: Option<ObjectId>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        match tip {
             None => Ok(Default::default()),
             Some(tip) => {
                 let root = self.snapshot(&tip)?.root;
@@ -134,6 +146,29 @@ impl Repo {
                 Ok(worktree::tree_file_ids(&mut store, root)?.into_keys().collect())
             }
         }
+    }
+
+    /// The pick/rebase-completion snapshot assembly, extracted from
+    /// `commit`'s pick-completion arm (P19 Task 2 groundwork) so
+    /// `Repo::rebase_continue` can reuse it verbatim: read the resolved
+    /// working tree (tracked paths computed from `parent`, NOT necessarily
+    /// HEAD — a rebase fold's `parent` is the accumulated tip, which can
+    /// differ from the branch's own unmoved ref while the rebase is
+    /// stopped), then run the same `snapshot_files` pipeline as a pick
+    /// completion (`merge_head: None`, `pick_head: Some(completed)`) —
+    /// scanner gate on plain files, protected re-encryption under the
+    /// unioned rules, decided-root carry-forward. Builds the snapshot only;
+    /// callers move the branch ref and record the oplog entry themselves.
+    pub(crate) fn assemble_completion_snapshot(
+        &self,
+        parent: ObjectId,
+        completed: ObjectId,
+        decided_root: Option<ObjectId>,
+        author: &str,
+        message: &str,
+    ) -> Result<ObjectId> {
+        let files = worktree::read_worktree(&self.layout, &self.tracked_paths_at(Some(parent))?)?;
+        self.snapshot_files(files, Some(parent), None, Some(completed), decided_root, author, message)
     }
 
     /// The commit pipeline minus ref movement: split protected/plaintext files,
@@ -364,7 +399,6 @@ impl Repo {
         }
         let head = refs::current_branch(&self.layout)?;
         let before = refs::read_branch_tip(&self.layout, &head)?;
-        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         let tip = self.head_tip()?;
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
         let pick_head = crate::pick_state::read_pick_head(&self.layout)?;
@@ -388,8 +422,19 @@ impl Repo {
         };
         let merging = merge_head.is_some();
         let picking = pick_head.is_some();
-        let id =
-            self.snapshot_files(files, tip, merge_head, pick_head, decided_root, author, message)?;
+        // Pick completion (no merge in progress) is the extracted assembly
+        // (P19 Task 2 groundwork), shared with `rebase_continue`. Every
+        // other case (plain commit, merge completion) still calls
+        // `snapshot_files` directly with a freshly read working tree.
+        let id = match (tip, merge_head, pick_head) {
+            (Some(t), None, Some(ph)) => {
+                self.assemble_completion_snapshot(t, ph, decided_root, author, message)?
+            }
+            _ => {
+                let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
+                self.snapshot_files(files, tip, merge_head, pick_head, decided_root, author, message)?
+            }
+        };
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
         crate::pick_state::clear(&self.layout)?;
