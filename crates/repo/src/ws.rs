@@ -309,6 +309,257 @@ impl Repo {
         let status = command.status()?;
         Ok(status.code().unwrap_or(1))
     }
+
+    /// Read-only conflict probe: would merging `theirs` into `ours` land
+    /// clean? Composes the same primitives the real merge uses (`three_way` +
+    /// `merge_secrets`) but touches neither the working tree nor any ref —
+    /// this is what guarantees "no conflict markers land unattended"
+    /// (ADR-0030). Identity/authorization shortfalls on protected paths count
+    /// as NOT clean (fallback), not errors.
+    ///
+    /// The follow-up `merge_secrets` call mirrors `three_way`'s own internal
+    /// call (same base/ours/theirs registries) and is therefore provably
+    /// dead once `three_way` has already returned `Ok`: `three_way` computes
+    /// `merge_secrets` *before* the file merge and propagates
+    /// `Error::SecretMergeConflict` via `?`, so a secret-only conflict
+    /// surfaces through the outer `Err(e) => Err(e)` arm, not this inner
+    /// match. That is not a probe/merge disagreement: `merge_with_identity`
+    /// (repo.rs:900) calls `three_way` the same way, so a secret-only
+    /// conflict is a hard `Err` there too — probe and real merge agree.
+    fn would_merge_cleanly(
+        &self,
+        ours: ObjectId,
+        theirs: ObjectId,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<bool> {
+        let store_arc = self.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        if crate::merge::is_ancestor(&mut store, theirs, ours)? {
+            return Ok(true); // nothing to add -> ff-ish no-op
+        }
+        if crate::merge::is_ancestor(&mut store, ours, theirs)? {
+            return Ok(true); // pure ff
+        }
+        let Some(base) = crate::merge::merge_base(&mut store, ours, theirs)? else {
+            return Ok(false);
+        };
+        // Mirrors merge_with_identity's three_way call (repo.rs:900) exactly:
+        // same base/ours/theirs, same identity threading.
+        match crate::merge::three_way(&mut store, base, ours, theirs, identity) {
+            Ok(m) if !m.conflicts.is_empty() => Ok(false),
+            Ok(_) => {
+                // Secrets can conflict independently of files (see doc comment
+                // above: this call is dead in practice, kept for parity with
+                // three_way's own internal check).
+                let base_snap = store.get_snapshot(&base)?;
+                let ours_snap = store.get_snapshot(&ours)?;
+                let theirs_snap = store.get_snapshot(&theirs)?;
+                match crate::merge::merge_secrets(
+                    &base_snap.secrets,
+                    &ours_snap.secrets,
+                    &theirs_snap.secrets,
+                ) {
+                    Ok(_) => Ok(true),
+                    Err(Error::SecretMergeConflict(_)) => Ok(false),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(Error::ProtectedMergeNeedsIdentity(_)) | Err(Error::NotAuthorized(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Harvest every live workspace in the open session, landing clean
+    /// results cumulatively onto the checked-out landing branch and falling
+    /// back to a `work-<i>` branch on conflict, scanner rejection, or an
+    /// authorization shortfall. Refuses while a merge/pick/rebase is in
+    /// progress. The landing branch (`into`, default the session's base
+    /// branch) must be the currently-checked-out branch — the merge
+    /// machinery `ws_harvest` reuses whole is head-centric, and reusing it
+    /// whole (rather than re-deriving a headless variant) is the point.
+    ///
+    /// Live workspaces are processed ascending by index so results land in a
+    /// deterministic, cumulative order (a later workspace's probe/merge sees
+    /// every earlier landing already folded into the landing branch's tip).
+    /// The manifest is rewritten after each workspace resolves, so a crash
+    /// mid-harvest loses nothing: resolved workspaces are torn down and
+    /// recorded, live ones are untouched. Once no live workspace remains,
+    /// `.sc/ws/` is removed entirely (the session has ended).
+    pub fn ws_harvest(
+        &self,
+        into: Option<&str>,
+        author: &str,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<Vec<WsHarvestOutcome>> {
+        if crate::merge_state::in_progress(&self.layout) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
+        }
+
+        let mut session = read_manifest(self.layout())?
+            .ok_or_else(|| Error::InvalidArgument("no workspace session open".into()))?;
+
+        let landing = into.unwrap_or(&session.base_branch).to_string();
+        let current = refs::current_branch(self.layout())?;
+        if current != landing {
+            return Err(Error::InvalidArgument(format!(
+                "landing branch '{landing}' is not checked out; run `sc switch {landing}` first"
+            )));
+        }
+
+        let mut live_indices: Vec<u32> =
+            session.workspaces.iter().filter(|e| e.live).map(|e| e.index).collect();
+        live_indices.sort_unstable();
+
+        let mut outcomes = Vec::with_capacity(live_indices.len());
+        for i in live_indices {
+            let dir = session
+                .workspaces
+                .iter()
+                .find(|e| e.index == i)
+                .expect("index came from this session's own live list")
+                .dir
+                .clone();
+            let entry = WsEntry { index: i, dir: dir.clone(), live: true };
+
+            // Step 1: unchanged workspaces resolve with no branch created.
+            if !self.ws_changed(&entry)? {
+                resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                outcomes.push(WsHarvestOutcome::Unchanged { index: i });
+                continue;
+            }
+
+            // Step 2: pick a fallback candidate branch name, suffixed on
+            // collision (a prior harvest or a pre-existing branch of the
+            // same name).
+            let mut branch = format!("work-{i}");
+            let mut suffix = 2;
+            while refs::resolve_tip(self.layout(), &branch)?.is_some() {
+                branch = format!("work-{i}-{suffix}");
+                suffix += 1;
+            }
+
+            // Step 3: run the workspace through the full commit pipeline
+            // (scanner gate, protected-path re-encryption) onto the
+            // candidate branch. `tip` is the candidate's parent, which per
+            // P13's contract is the session's base snapshot, not the
+            // landing branch's current (possibly since-advanced) tip.
+            let msg = format!("ws-{i} harvest");
+            match crate::workspace::harvest_workspace(
+                self,
+                session.base_snapshot,
+                &dir,
+                &branch,
+                author,
+                &msg,
+            )? {
+                crate::workspace::HarvestResult::Rejected(report) => {
+                    // DESIGN DECISION (spec precision note, Task 5): a
+                    // scanner-rejected workspace stays LIVE so the offending
+                    // file can be fixed in place and re-harvested, unlike
+                    // P13's one-shot `sc work` which treats rejection as
+                    // terminal. No candidate branch was created
+                    // (`harvest_workspace` never calls `write_branch_tip` on
+                    // the `SecretDetected` path), so nothing to clean up; the
+                    // manifest is untouched for this entry.
+                    outcomes.push(WsHarvestOutcome::Rejected { index: i, report: report.to_string() });
+                }
+                crate::workspace::HarvestResult::Unchanged => {
+                    // `ws_changed` already confirmed a diff, but
+                    // `harvest_workspace` re-diffs independently against its
+                    // own `tip` argument (session.base_snapshot, same value
+                    // here) — so this arm is unreachable in practice, kept
+                    // only so the match is exhaustive without a panic.
+                    resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                    outcomes.push(WsHarvestOutcome::Unchanged { index: i });
+                }
+                crate::workspace::HarvestResult::Committed(id) => {
+                    let current_tip = refs::read_branch_tip(self.layout(), &landing)?
+                        .ok_or(Error::Unborn)?;
+                    let clean = self.would_merge_cleanly(current_tip, id, identity)?;
+                    if clean {
+                        // The probe promised a clean merge. `merge_with_identity`
+                        // returns `Ok` only when the merge is actually clean
+                        // (a real conflict is `Err(MergeConflicts(_))`, raised
+                        // *after* writing markers to disk) — so a disagreement
+                        // here means our own mirroring of three_way's
+                        // parameters is wrong, not a normal user-facing
+                        // conflict. Bail loudly before any teardown; the
+                        // second tuple element is skipped protected paths
+                        // (missing-identity skips), not conflicts, and is
+                        // intentionally not inspected here.
+                        let (merged, _skipped) =
+                            self.merge_with_identity(&branch, author, identity).map_err(|e| {
+                                if matches!(e, Error::MergeConflicts(_)) {
+                                    Error::BadRef(format!(
+                                        "ws harvest: probe predicted a clean merge of {branch} \
+                                         into {landing}, but merge_with_identity found conflicts \
+                                         ({e}) — this is a probe/merge disagreement bug, not a \
+                                         normal conflict; conflict markers from the failed merge \
+                                         attempt may already be on disk in {landing}'s working \
+                                         tree; investigate before retrying `sc ws harvest`"
+                                    ))
+                                } else {
+                                    e
+                                }
+                            })?;
+                        // The candidate ref served its purpose (merge_with_identity
+                        // resolved by branch name, not object id).
+                        refs::delete_branch(self.layout(), &branch)?;
+                        resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                        outcomes.push(WsHarvestOutcome::Landed { index: i, merged_tip: merged });
+                    } else {
+                        // Keep the candidate branch for manual resolution.
+                        resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                        outcomes.push(WsHarvestOutcome::FallbackBranch { index: i, branch });
+                    }
+                }
+            }
+        }
+
+        if session.workspaces.iter().all(|e| !e.live) {
+            let _ = std::fs::remove_dir_all(ws_dir(self.layout()));
+        }
+
+        Ok(outcomes)
+    }
+}
+
+/// Mark workspace `i` resolved (`live = false`), tear down its checkout dir,
+/// and persist the manifest — the shared tail of every non-`Rejected`
+/// `ws_harvest` outcome, so a crash right after this point has already
+/// recorded the resolution durably.
+fn resolve_and_teardown(
+    layout: &Layout,
+    session: &mut WsSession,
+    index: u32,
+    dir: &std::path::Path,
+) -> Result<()> {
+    if let Some(entry) = session.workspaces.iter_mut().find(|e| e.index == index) {
+        entry.live = false;
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    write_manifest(layout, session)
+}
+
+/// Outcome of harvesting one live workspace.
+#[derive(Debug)]
+pub enum WsHarvestOutcome {
+    /// Landed cleanly onto the landing branch at `merged_tip`.
+    Landed { index: u32, merged_tip: ObjectId },
+    /// Conflicted (or an authorization shortfall on a protected path); kept
+    /// as its own branch for manual resolution via `sc merge <branch>`.
+    FallbackBranch { index: u32, branch: String },
+    /// The checkout never diverged from the session's base snapshot.
+    Unchanged { index: u32 },
+    /// The P5 scanner found plaintext secrets; the workspace stays live so
+    /// the offending file can be fixed in place and re-harvested.
+    Rejected { index: u32, report: String },
 }
 
 #[cfg(test)]
@@ -590,6 +841,260 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
         assert!(err.to_string().contains("no such workspace: 1"));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_lands_clean_results_cumulatively() {
+        let root = tmp_root("harvest-clean");
+        let repo = init(&root);
+        let session = repo.ws_fork(2, "t", None).unwrap();
+        std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited-a\n").unwrap();
+        std::fs::write(session.workspaces[1].dir.join("b.txt"), "new-b\n").unwrap();
+
+        let oplog_before = repo.oplog().unwrap().len();
+        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        match &outcomes[0] {
+            WsHarvestOutcome::Landed { index: 1, .. } => {}
+            other => panic!("expected Landed(1), got {other:?}"),
+        }
+        match &outcomes[1] {
+            WsHarvestOutcome::Landed { index: 2, .. } => {}
+            other => panic!("expected Landed(2), got {other:?}"),
+        }
+
+        // main's tip contains BOTH edits.
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "edited-a\n");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "new-b\n");
+
+        // Exactly 2 new oplog records (one per landing).
+        let oplog_after = repo.oplog().unwrap().len();
+        assert_eq!(oplog_after - oplog_before, 2);
+
+        // No work-1/work-2 branches remain (candidate refs deleted after landing).
+        assert!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap().is_none());
+        assert!(crate::refs::read_branch_tip(repo.layout(), "work-2").unwrap().is_none());
+
+        // Session ended.
+        assert!(repo.ws_session().unwrap().is_none());
+        assert!(!repo.layout().dot_sc.join("ws").exists());
+
+        // sc undo reverts ONLY the second landing: a.txt edit still present,
+        // b.txt edit gone.
+        repo.undo().unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "edited-a\n");
+        assert!(!root.join("b.txt").exists());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_conflict_falls_back_without_touching_anything() {
+        let root = tmp_root("harvest-conflict");
+        let repo = init(&root);
+        std::fs::write(root.join("x.txt"), "base-x\n").unwrap();
+        repo.commit("t", "add x").unwrap();
+
+        let session = repo.ws_fork(2, "t", None).unwrap();
+        std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited-a\n").unwrap();
+        std::fs::write(session.workspaces[1].dir.join("x.txt"), "ws2-x\n").unwrap();
+
+        // A conflicting x.txt change lands on main AFTER fork, so ws-2's
+        // eventual merge (base = the fork-time tip) conflicts on x.txt.
+        std::fs::write(root.join("x.txt"), "main-x\n").unwrap();
+        repo.commit("t", "conflict x on main").unwrap();
+
+        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        match &outcomes[0] {
+            WsHarvestOutcome::Landed { index: 1, .. } => {}
+            other => panic!("expected Landed(1), got {other:?}"),
+        }
+        match &outcomes[1] {
+            WsHarvestOutcome::FallbackBranch { index: 2, branch } => {
+                assert_eq!(branch, "work-2");
+            }
+            other => panic!("expected FallbackBranch(2, \"work-2\"), got {other:?}"),
+        }
+
+        // main tip contains ws-1's edit and NOT ws-2's.
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "edited-a\n");
+        assert_eq!(std::fs::read_to_string(root.join("x.txt")).unwrap(), "main-x\n");
+
+        // work-2 branch exists with ws-2's commit.
+        assert!(crate::refs::read_branch_tip(repo.layout(), "work-2").unwrap().is_some());
+
+        // NO conflict markers anywhere in main's working tree.
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().is_file() {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    assert!(
+                        !content.contains("<<<<<<<"),
+                        "unexpected conflict marker in {:?}",
+                        entry.path()
+                    );
+                }
+            }
+        }
+        assert!(!crate::merge_state::in_progress(repo.layout()));
+
+        // Session ended.
+        assert!(repo.ws_session().unwrap().is_none());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_requires_landing_branch_checked_out() {
+        let root = tmp_root("harvest-notcheckedout");
+        let repo = init(&root);
+        repo.branch("other").unwrap();
+        let session = repo.ws_fork(1, "t", None).unwrap();
+        repo.switch("other").unwrap();
+
+        let err = repo.ws_harvest(None, "t", None).unwrap_err();
+        match err {
+            Error::InvalidArgument(msg) => {
+                assert!(msg.contains("main"), "message must name the landing branch: {msg}");
+                assert!(msg.contains("sc switch"), "message must suggest sc switch: {msg}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+
+        // Session still open; nothing moved.
+        let after = repo.ws_session().unwrap().expect("session must still be open");
+        assert_eq!(after.workspaces.len(), session.workspaces.len());
+        assert!(after.workspaces[0].live);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_respects_into_and_collision_suffix() {
+        let root = tmp_root("harvest-collision");
+        let repo = init(&root);
+        std::fs::write(root.join("x.txt"), "base-x\n").unwrap();
+        repo.commit("t", "add x").unwrap();
+
+        let session = repo.ws_fork(2, "t", None).unwrap();
+        std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited-a\n").unwrap();
+        std::fs::write(session.workspaces[1].dir.join("x.txt"), "ws2-x\n").unwrap();
+        std::fs::write(root.join("x.txt"), "main-x\n").unwrap();
+        repo.commit("t", "conflict x on main").unwrap();
+
+        // Pre-create branch "work-2" so ws-2's fallback must suffix.
+        repo.branch("work-2").unwrap();
+
+        // --into with the checked-out branch name behaves as default.
+        let outcomes = repo.ws_harvest(Some("main"), "t", None).unwrap();
+        match &outcomes[1] {
+            WsHarvestOutcome::FallbackBranch { index: 2, branch } => {
+                assert_eq!(branch, "work-2-2");
+            }
+            other => panic!("expected FallbackBranch(2, \"work-2-2\"), got {other:?}"),
+        }
+
+        // --into a non-checked-out branch errors.
+        let _session2 = repo.ws_fork(1, "t", None).unwrap();
+        let err = repo.ws_harvest(Some("nonexistent-branch"), "t", None).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_guards_and_dirty_tree() {
+        let root = tmp_root("harvest-guards");
+        let repo = init(&root);
+        let session = repo.ws_fork(1, "t", None).unwrap();
+
+        // (a) merge/pick/rebase in progress -> typed errors.
+        crate::merge_state::write(repo.layout(), &ObjectId::of(b"theirs"), &[], None).unwrap();
+        assert!(matches!(repo.ws_harvest(None, "t", None), Err(Error::MergeInProgress)));
+        crate::merge_state::clear(repo.layout()).unwrap();
+
+        crate::pick_state::write(repo.layout(), &ObjectId::of(b"picked"), &[], None, None).unwrap();
+        assert!(matches!(repo.ws_harvest(None, "t", None), Err(Error::PickInProgress)));
+        crate::pick_state::clear(repo.layout()).unwrap();
+
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: ObjectId::of(b"orig"),
+            target: "other".into(),
+            acc_tip: ObjectId::of(b"acc"),
+            conflicted: ObjectId::of(b"conflicted"),
+            remaining: vec![],
+            total: 1,
+            author: "t".into(),
+            resolved: false,
+        };
+        crate::rebase_state::write(repo.layout(), &st).unwrap();
+        assert!(matches!(repo.ws_harvest(None, "t", None), Err(Error::RebaseInProgress)));
+        crate::rebase_state::clear(repo.layout()).unwrap();
+
+        // (b) dirty user working tree -> InvalidArgument (the merge path's
+        // dirty refusal), session intact.
+        std::fs::write(session.workspaces[0].dir.join("a.txt"), "ws-edit\n").unwrap();
+        std::fs::write(root.join("a.txt"), "dirty-uncommitted\n").unwrap();
+        let err = repo.ws_harvest(None, "t", None).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+
+        let after = repo.ws_session().unwrap().expect("session must still be open");
+        assert!(after.workspaces[0].live, "workspace must remain live after the abort");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_partial_leaves_session_open() {
+        let root = tmp_root("harvest-partial");
+        let repo = init(&root);
+        let session = repo.ws_fork(2, "t", None).unwrap();
+        std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited-a\n").unwrap();
+        // An AWS-style key id trips the P5 scanner in ws-2's checkout.
+        std::fs::write(session.workspaces[1].dir.join("leak.txt"), "AKIAIOSFODNN7EXAMPLE\n").unwrap();
+
+        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        match &outcomes[0] {
+            WsHarvestOutcome::Landed { index: 1, .. } => {}
+            other => panic!("expected Landed(1), got {other:?}"),
+        }
+        match &outcomes[1] {
+            WsHarvestOutcome::Rejected { index: 2, .. } => {}
+            other => panic!("expected Rejected(2), got {other:?}"),
+        }
+
+        // ws-2 stays LIVE (rejected != resolved); session still open with
+        // ws-2 only.
+        let after = repo.ws_session().unwrap().expect("session must still be open");
+        assert_eq!(after.workspaces.len(), 2);
+        let e1 = after.workspaces.iter().find(|e| e.index == 1).unwrap();
+        let e2 = after.workspaces.iter().find(|e| e.index == 2).unwrap();
+        assert!(!e1.live, "ws-1 landed and should be resolved");
+        assert!(e2.live, "ws-2 was rejected and must stay live");
+
+        // No stray branch for the rejected workspace.
+        assert!(crate::refs::read_branch_tip(repo.layout(), "work-2").unwrap().is_none());
+
+        // Fixing the file then re-harvesting completes and ends the session.
+        std::fs::remove_file(e2.dir.join("leak.txt")).unwrap();
+        let outcomes2 = repo.ws_harvest(None, "t", None).unwrap();
+        assert_eq!(outcomes2.len(), 1);
+        match &outcomes2[0] {
+            WsHarvestOutcome::Unchanged { index: 2 } => {}
+            other => panic!("expected Unchanged(2) once the leak is removed, got {other:?}"),
+        }
+        assert!(repo.ws_session().unwrap().is_none());
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();

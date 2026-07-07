@@ -373,6 +373,24 @@ enum WsOp {
         /// Workspace index to abandon. Omit to abandon the whole session.
         index: Option<u32>,
     },
+    /// Read-only conflict probe + cumulative auto-merge of every live
+    /// workspace onto the landing branch (default: the session's base
+    /// branch). Conflicted/rejected workspaces fall back to a `work-<i>`
+    /// branch for manual resolution and keep the session open.
+    Harvest {
+        /// Landing branch; must be the currently-checked-out branch
+        /// (default: the session's base branch).
+        #[arg(long)]
+        into: Option<String>,
+        /// Identity key to decrypt protected paths that diverged in content
+        /// on both sides (ciphertext-id fast paths need no identity at all).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Author recorded on any landing commit (default $SC_AUTHOR, then
+        /// the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1669,6 +1687,33 @@ fn run_ws(op: WsOp) -> Result<()> {
                 Some(i) => println!("abandoned workspace {i}; {remaining} still live"),
                 None => println!("abandoned the session ({remaining} workspace(s) remain)"),
             }
+        }
+        WsOp::Harvest { into, identity, author } => {
+            let sk = resolve_identity_opt(identity)?;
+            let outcomes = repo.ws_harvest(into.as_deref(), &resolve_author(author), sk.as_ref())?;
+            let mut failed = false;
+            for o in &outcomes {
+                match o {
+                    scl_repo::WsHarvestOutcome::Landed { index, merged_tip } => {
+                        println!("{index:<3} landed @ {}", merged_tip.short());
+                    }
+                    scl_repo::WsHarvestOutcome::FallbackBranch { index, branch } => {
+                        failed = true;
+                        println!("{index:<3} fallback: branch {branch} — resolve with `sc merge {branch}`");
+                    }
+                    scl_repo::WsHarvestOutcome::Unchanged { index } => {
+                        println!("{index:<3} unchanged");
+                    }
+                    scl_repo::WsHarvestOutcome::Rejected { index, report } => {
+                        failed = true;
+                        println!("{index:<3} REJECTED by secret scanner: {report} — fix and re-run `sc ws harvest`");
+                    }
+                }
+            }
+            // Drop before exit so the RepoLock's Drop runs (process::exit
+            // skips destructors — same reasoning as run_run/run_work).
+            drop(repo);
+            std::process::exit(if failed { 1 } else { 0 });
         }
     }
     Ok(())

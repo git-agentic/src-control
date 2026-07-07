@@ -47,4 +47,4 @@ pub use secrets::SecretInfo;
 pub use stdio_transport::{open_transport, SshUrl, StdioTransport};
 pub use workspace::{HarvestResult, WorkOptions, WorkspaceOutcome};
 pub use worktree::Diff;
-pub use ws::{WsEntry, WsSession};
+pub use ws::{WsEntry, WsHarvestOutcome, WsSession};
