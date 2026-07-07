@@ -120,19 +120,20 @@ across every phase.
 
 ## Active
 
-None — Phase 17 is next up; see the next-horizon table below.
+- **Phase 17 — Bulk re-wrap + multiple escrow keys.** In build. Spec:
+  `docs/superpowers/specs/2026-07-07-p17-bulk-rewrap-design.md`
+  (ADR-0027, Proposed → Accepted at completion).
 
-## Next horizon (P17–P20)
+## Next horizon (P18–P20)
 
 Decided 2026-07-07 (design: `docs/superpowers/specs/2026-07-07-roadmap-horizon-p16-p20-design.md`).
 Theme: finish the confidentiality story end to end before pushing for
 adoption — P16 closed the ADR-0025 boundary (a prefix-rule revoke is now
-durable across merges of pre-revoke branches), and the arc continues with
-practical cutover at org scale.
+durable across merges of pre-revoke branches), and P17 enables practical
+cutover at org scale; the arc continues toward adoption.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
-| **P17 — Bulk re-wrap + multiple escrow keys** | Org-scale recipient/escrow cutover | change the escrow key, run one `sc rewrap`, every secret + protected prefix is sealed to the new set | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
 | **P18 — Network Git remotes** | fetch/push against hosted Git | `sc remote add origin git@github.com:…`; fetch, merge, push; commits visible on github.com | [0028](docs/adr/0028-network-git-remotes.md) |
 | **P19 — History-editing polish** | amend, resumable rebase, pick abort, merge replay | interrupt a rebase on a conflict, resolve, `sc rebase --continue`; proven by the extended history demo | [0029](docs/adr/0029-history-editing-polish.md) |
 | **P20 — Agent sessions + auto-merge** | Durable `sc ws` sessions; clean results land unattended | fork workspaces, return in a later invocation, harvest; clean results auto-merge to an integration branch | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
@@ -160,6 +161,7 @@ must follow P16 so the rule-merge semantics replay honors are settled.
 | **P14 — History editing** | Integrate agent branches; undo anything | `sc cherry-pick work-2`, `sc rebase main`, `sc undo`/redo round-trip proven by `demo/run_history_demo.sh` | [0024](docs/adr/0024-history-editing.md) |
 | **P15 — Protected merge & replay** | Confidentiality composes with collaboration | keyless merge of disjoint protected edits; `sc merge --identity` content-merges colliding ones; registry replays through rebase; proven by `demo/run_protected_merge_demo.sh` | [0025](docs/adr/0025-protected-merge-and-replay.md) |
 | **P16 — Revocation tombstones** | `sc revoke` durable across merges | branch → revoke → merge pre-revoke branch: recipient stays revoked; proven by `demo/run_revoke_demo.sh` | [0026](docs/adr/0026-revocation-tombstones.md) |
+| **P17 — Bulk re-wrap + multiple escrow keys** | Org-scale recipient/escrow cutover | CLI-managed escrow key list: `sc escrow add/remove/show`; `sc rewrap` seals every secret + protected prefix to the new set | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
