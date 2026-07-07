@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::repo::Repo;
 
 /// What a `rewrap` run did (or would do, on dry-run).
+#[derive(Debug)]
 pub struct RewrapReport {
     pub secrets_rewrapped: Vec<String>,
     pub blobs_rewrapped: usize,
@@ -34,6 +35,17 @@ impl Repo {
         known_keys: &[PublicKey],
         dry_run: bool,
     ) -> Result<RewrapReport> {
+        // Refuse mid-merge/mid-pick: completion unions the OLD wraps back in
+        // over rewrap's cutover, silently resurrecting a stripped recipient
+        // at the tip (final-review I1). Checked even on --dry-run — a
+        // dry-run report computed against a state that's about to be
+        // unioned away would be just as misleading as a real commit.
+        if crate::merge_state::in_progress(self.layout()) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(self.layout()) {
+            return Err(Error::PickInProgress);
+        }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let snap = self.snapshot(&tip)?;
         let mut skipped: Vec<(String, String)> = Vec::new();
@@ -192,6 +204,7 @@ impl Repo {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::Error;
     use crate::repo::Repo;
 
     fn tmp_root(tag: &str) -> std::path::PathBuf {
@@ -388,6 +401,41 @@ mod tests {
         assert_eq!(report.blobs_rewrapped, 0);
         assert_eq!(report.skipped.len(), 1);
         assert!(report.skipped[0].1.contains("sc grant"), "reason must point at sc grant");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rewrap_refuses_during_in_progress_merge() {
+        // final-review I1: rewrap must not cut over while a conflicted
+        // merge is live — completion would union the OLD wraps back in on
+        // top of rewrap's cutover, silently resurrecting a stripped wrap.
+        let root = tmp_root("in-progress-merge");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("f.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        std::fs::write(root.join("f.txt"), b"a\nX\nc\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("f.txt"), b"a\nY\nc\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+        let _ = repo.merge("feature", "me").unwrap_err();
+        assert!(repo.merge_in_progress());
+
+        let err = repo
+            .rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), false)
+            .unwrap_err();
+        assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
+
+        // Same guard must fire on --dry-run: a report against a state
+        // that's about to be unioned away would be equally misleading.
+        let err = repo
+            .rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), true)
+            .unwrap_err();
+        assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
