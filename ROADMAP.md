@@ -86,7 +86,8 @@ across every phase.
   Integrated the agent branches P13 mints: `sc cherry-pick` replays one
   commit onto the current branch (P4-style conflict resolution completed by
   the next commit), `sc rebase` replays a whole branch onto a new base
-  (atomic: any conflict aborts with refs untouched), and a repo-wide
+  (atomic: any conflict aborts with refs untouched — stop-and-continue default
+  since P19 (ADR-0029)), and a repo-wide
   operation log made every ref-moving operation undoable (`sc undo`; run
   twice = redo). Replay is P4's three-way merge with base = the picked
   commit's parent — no second merge implementation, no object mutation,

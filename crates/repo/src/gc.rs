@@ -303,7 +303,7 @@ mod tests {
                 .unwrap();
             (blob, tree)
         };
-        crate::pick_state::write(repo.layout(), &picked, &["a.txt".into()], Some(&decided_tree))
+        crate::pick_state::write(repo.layout(), &picked, &["a.txt".into()], Some(&decided_tree), None)
             .unwrap();
 
         repo.gc(Duration::from_secs(0)).unwrap();

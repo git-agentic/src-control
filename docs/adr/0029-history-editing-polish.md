@@ -188,3 +188,45 @@ implementation:
   for the tail fold), not the cumulative total across all stops — the ref
   move and undo/redo semantics are correct, only the printed description
   undercounts. Ledger'd as a follow-on rather than fixed in P19.
+- **Final-review fixes: `switch`/`undo` were missing the rebase guard,
+  `--continue` could force-write over a moved branch, and a conflicted
+  mainline pick's completion recomputed the registry against the wrong
+  parent.** Three findings from the whole-branch final review, all fixed
+  before merge. (1) Critical: `switch_with_identity`
+  (`crates/repo/src/repo.rs:1156`) and `undo` (`crates/repo/src/oplog.rs:341`)
+  guarded merge- and pick-in-progress but not rebase-in-progress — a
+  stopped rebase's branch could be switched away from or undone, and the
+  next `--continue` would silently force-write over the discarded work.
+  Fixed with the same 3-line `rebase_state::in_progress` guard `commit`/
+  `merge`/`cherry_pick`/`rebase`/`rewrap` already have. Regression tests:
+  `switch_refused_during_stopped_rebase`, `undo_refused_during_stopped_rebase`
+  (`crates/repo/src/repo.rs`). (2) Important: `rebase_continue`
+  (`crates/repo/src/replay.rs`) force-wrote `acc_tip` over the branch ref
+  at completion without checking it still equalled `RebaseState`'s
+  `original_tip` — `sc secret add`/`sc protect` and friends have no
+  in-progress guard of their own and can move the tip while the rebase is
+  stopped, so completing silently discarded that commit. Fixed by refusing
+  up front, before any state mutation, with a typed
+  `Error::InvalidArgument` naming both tips when they disagree — state is
+  left untouched, so `--abort` still works. Regression test:
+  `rebase_continue_refuses_when_branch_moved` (`crates/repo/src/replay.rs`).
+  (3) Important: a CONFLICTED `--mainline` pick's completion recomputed the
+  secret-registry three-way against the picked commit's first parent
+  instead of the mainline-resolved parent — the same bug class the clean
+  path already closed (`mainline_pick_registry_bases_off_chosen_parent`),
+  still open on the conflict path because `pick_state` did not persist the
+  `--mainline` selection. Fixed by persisting it: `pick_state` gained an
+  optional `PICK_MAINLINE_BASE` (`crates/repo/src/pick_state.rs`, same
+  absent-means-`None` backward-compatible shape as `PICK_DECIDED_ROOT`),
+  written alongside the decided root when a mainline pick conflicts
+  (`crates/repo/src/replay.rs:544`), and threaded through
+  `assemble_completion_snapshot` → `snapshot_files` as a new
+  `pick_registry_base` parameter into the same `merged_registry_for_replay`
+  call the clean path already fixed. Rebase's own fold completion (which
+  also calls `assemble_completion_snapshot`) always passes `None` — rebase
+  has no `--mainline` concept, since `rebase` refuses up front if a merge
+  commit is anywhere in the replayed range. Regression test:
+  `conflicted_mainline_pick_completion_bases_registry_off_chosen_parent`
+  (`crates/repo/src/replay.rs`), which forces a mainline-2 pick with both a
+  file conflict and a B-side secret and asserts no spurious secret delta
+  after resolving and completing via `sc commit`.

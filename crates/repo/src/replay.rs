@@ -541,7 +541,13 @@ impl Repo {
                 // (`conflict_root`) is persisted alongside so completion
                 // carries absent protected files from the pick's DECISION
                 // rather than re-reading the stale tip.
-                crate::pick_state::write(&self.layout, &picked_tip, &paths, Some(&conflict_root))?;
+                crate::pick_state::write(
+                    &self.layout,
+                    &picked_tip,
+                    &paths,
+                    Some(&conflict_root),
+                    base_override.as_ref(),
+                )?;
                 Err(Error::PickConflicts(paths.len()))
             }
         }
@@ -990,7 +996,12 @@ impl Repo {
     /// `resolved == true` and skips straight to the fold using the
     /// already-advanced `acc_tip`.
     ///
-    /// Errors [`Error::InvalidArgument`] if no rebase is in progress.
+    /// Errors [`Error::InvalidArgument`] if no rebase is in progress, or if
+    /// `st.branch`'s tip no longer matches `st.original_tip` (P19
+    /// final-review fix I1: an unguarded op such as `sc secret add` or `sc
+    /// protect` moved the branch while the rebase was stopped — completing
+    /// would force-write over that commit). Rebase state is left untouched
+    /// in that case, so `--abort` still works.
     pub fn rebase_continue(
         &self,
         author: &str,
@@ -1001,6 +1012,23 @@ impl Repo {
                 "no rebase in progress — nothing to continue".into(),
             ));
         };
+        // P19 final-review fix (I1): `sc secret add`/`sc protect`/friends have
+        // no in-progress guards of their own and can move `st.branch`'s tip
+        // while the rebase is stopped. The fold below force-writes `acc_tip`
+        // over whatever the ref currently is, which would silently discard
+        // any such intervening commit. Refuse up front instead — state is
+        // untouched, so `--abort` still works, and the user can re-run the
+        // rebase after inspecting what moved the branch.
+        let current_tip = refs::read_branch_tip(&self.layout, &st.branch)?;
+        if current_tip != Some(st.original_tip) {
+            let current_hex = current_tip.map(|id| id.to_hex()[..8].to_string());
+            return Err(Error::InvalidArgument(format!(
+                "the branch moved while the rebase was stopped (tip {} != {}); \
+                 `sc rebase --abort` and re-run the rebase",
+                current_hex.as_deref().unwrap_or("<unborn>"),
+                &st.original_tip.to_hex()[..8],
+            )));
+        }
         let new_tip = if st.resolved {
             // A previous `--continue` already completed `st.conflicted` into
             // `st.acc_tip` but the resumed fold errored before finishing (or
@@ -1012,10 +1040,16 @@ impl Repo {
         } else {
             let decided = crate::rebase_state::read_decided_root(&self.layout)?;
             let completed_msg = self.snapshot(&st.conflicted)?.message;
+            // `pick_registry_base: None` — a rebase fold has no `--mainline`
+            // concept (its replayed commits are single-parent by
+            // construction; `rebase` refuses up front if a merge commit is
+            // in the replayed range), so the registry base is always the
+            // conflicted commit's own first parent.
             let new_tip = self.assemble_completion_snapshot(
                 st.acc_tip,
                 st.conflicted,
                 decided,
+                None,
                 author,
                 &completed_msg,
             )?;
@@ -1680,6 +1714,80 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// P19 final-review fix I2: a CONFLICTED mainline pick's completion must
+    /// also base its secret-registry three-way on the SAME chosen parent as
+    /// the (already-persisted) decided file tree — not silently fall back to
+    /// the picked commit's first parent, which is exactly the T4 bug class
+    /// `mainline_pick_registry_bases_off_chosen_parent` closed for the CLEAN
+    /// path. Same M = merge(a_tip, b_tip) shape as that test (only b-side
+    /// adds SECRET_X), but target-m2 also independently edits x.txt so the
+    /// mainline-2 delta (b_tip -> M) conflicts with target's own edit,
+    /// forcing `PickConflicts` and a completing `sc commit` instead of a
+    /// clean pick. Mainline 2's base (b_tip) already has SECRET_X, so — as
+    /// in the clean-path test — completing on a target that lacks it must
+    /// NOT introduce it. Before the fix (pick_state not persisting the
+    /// mainline selection), completion would base the registry off a_tip
+    /// (which lacks SECRET_X), reading the secret as newly added and landing
+    /// it on the target — a spurious add this test would catch.
+    #[test]
+    fn conflicted_mainline_pick_completion_bases_registry_off_chosen_parent() {
+        let root = tmp_root("cp-mainline-conflict-registry");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"x\n").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.branch("a-side").unwrap();
+        repo.branch("b-side").unwrap();
+
+        repo.switch("a-side").unwrap();
+        std::fs::write(root.join("x.txt"), b"a-edit\n").unwrap();
+        repo.commit("me", "a-side edits x.txt").unwrap();
+        let a_tip = repo.head_tip().unwrap().unwrap();
+        repo.branch("target-m2").unwrap();
+
+        // target-m2 independently edits x.txt so the mainline-2 delta
+        // (b_tip -> M, "x\n" -> "a-edit\n") conflicts with it.
+        repo.switch("target-m2").unwrap();
+        std::fs::write(root.join("x.txt"), b"target-edit\n").unwrap();
+        repo.commit("me", "target independently edits x.txt").unwrap();
+
+        repo.switch("b-side").unwrap();
+        std::fs::write(root.join("b.txt"), b"b\n").unwrap();
+        repo.commit("me", "b-side adds b.txt").unwrap();
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        repo.secret_add("SECRET_X", b"v1", &[pk]).unwrap();
+        let b_tip = repo.head_tip().unwrap().unwrap();
+        assert!(repo.snapshot(&b_tip).unwrap().secrets.contains_key("SECRET_X"));
+
+        repo.switch("a-side").unwrap();
+        let m = repo.merge("b-side", "me").unwrap();
+        let m_snap = repo.snapshot(&m).unwrap();
+        assert_eq!(m_snap.parents, vec![a_tip, b_tip]);
+        assert!(m_snap.secrets.contains_key("SECRET_X"), "merge carries the secret forward");
+
+        // --mainline 2 onto target-m2: conflicts on x.txt (forced above).
+        repo.switch("target-m2").unwrap();
+        let err = repo.cherry_pick("a-side", "me", None, Some(2)).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        let on_disk = std::fs::read_to_string(root.join("x.txt")).unwrap();
+        assert!(on_disk.contains("<<<<<<<"), "got: {on_disk}");
+
+        // Resolve and complete via `sc commit`.
+        std::fs::write(root.join("x.txt"), b"resolved\n").unwrap();
+        let resolved = repo.commit("me", "resolve mainline-2 conflict").unwrap();
+        assert!(!repo.pick_in_progress());
+
+        let resolved_snap = repo.snapshot(&resolved).unwrap();
+        assert!(
+            !resolved_snap.secrets.contains_key("SECRET_X"),
+            "mainline 2's base (b_tip) already has SECRET_X, so the conflicted \
+             pick's completion must not spuriously add it (T4 bug class)"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn cherry_pick_already_applied_is_a_noop() {
         let root = tmp_root("cp-empty");
@@ -1732,7 +1840,7 @@ mod tests {
         crate::merge_state::clear(&repo.layout).unwrap();
 
         // Pick in progress.
-        crate::pick_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
+        crate::pick_state::write(&repo.layout, &ours_tip, &[], None, None).unwrap();
         let err = repo.cherry_pick("work-1", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickInProgress), "got {err:?}");
         crate::pick_state::clear(&repo.layout).unwrap();
@@ -3064,6 +3172,60 @@ mod tests {
         // One undo restores the original (pre-rebase) tip.
         repo.undo().unwrap();
         assert_eq!(repo.head_tip().unwrap(), Some(original_feature_tip), "undo restores the original tip");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rebase_continue_refuses_when_branch_moved() {
+        // P19 final-review fix I1: `sc secret add`/`sc protect` and friends
+        // have no in-progress guard of their own. If one moves the stopped
+        // rebase's branch tip directly (probe P3: via the registry/protect
+        // commit path), `--continue` must refuse instead of force-writing
+        // `acc_tip` over the ref and silently discarding that commit.
+        let root = tmp_root("rebase-continue-branch-moved");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"a\nB\nc\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nZ\nc\n").unwrap();
+        repo.commit("me", "feature edits x").unwrap();
+        let original_feature_tip = repo.head_tip().unwrap().unwrap();
+
+        // Stop on conflict.
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        assert!(matches!(outcome, RebaseResult::Stopped { .. }));
+        assert_eq!(repo.head_tip().unwrap(), Some(original_feature_tip));
+
+        // Simulate an unguarded op (e.g. `sc secret add`) moving the branch
+        // ref directly while the rebase is stopped.
+        let moved_tip = ObjectId::of(b"unguarded-op-moved-the-branch");
+        refs::write_branch_tip(&repo.layout, "feature", &moved_tip).unwrap();
+
+        // Resolve the conflict on disk and attempt to continue.
+        std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
+        let err = repo.rebase_continue("me", None).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(msg) if msg.contains("branch moved while the rebase was stopped")),
+            "expected branch-moved InvalidArgument, got {err:?}"
+        );
+
+        // State is untouched: still in progress, ref still at the moved tip
+        // (rebase_continue must not have written anything).
+        assert!(repo.rebase_in_progress());
+        assert_eq!(refs::read_branch_tip(&repo.layout, "feature").unwrap(), Some(moved_tip));
+        let st = crate::rebase_state::read(&repo.layout).unwrap().unwrap();
+        assert!(!st.resolved, "must not have advanced past the guard");
+
+        // `--abort` still works (state was untouched by the refused continue).
+        repo.rebase_abort().unwrap();
+        assert!(!repo.rebase_in_progress());
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();

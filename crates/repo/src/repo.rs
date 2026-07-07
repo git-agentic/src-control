@@ -159,16 +159,35 @@ impl Repo {
     /// scanner gate on plain files, protected re-encryption under the
     /// unioned rules, decided-root carry-forward. Builds the snapshot only;
     /// callers move the branch ref and record the oplog entry themselves.
+    /// `pick_registry_base` (P19 final-review fix I2) is the picked commit's
+    /// `--mainline`-resolved parent, persisted by `pick_state` at the
+    /// conflict stop: threading it into `snapshot_files`'s registry
+    /// three-way keeps a completed mainline pick's secret delta consistent
+    /// with the file delta it already landed, instead of silently
+    /// re-basing the registry against the picked commit's first parent.
+    /// `None` for every non-mainline pick and for rebase's own fold
+    /// completion (rebase has no `--mainline` concept).
     pub(crate) fn assemble_completion_snapshot(
         &self,
         parent: ObjectId,
         completed: ObjectId,
         decided_root: Option<ObjectId>,
+        pick_registry_base: Option<ObjectId>,
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths_at(Some(parent))?)?;
-        self.snapshot_files(files, Some(parent), None, Some(completed), decided_root, None, author, message)
+        self.snapshot_files(
+            files,
+            Some(parent),
+            None,
+            Some(completed),
+            decided_root,
+            pick_registry_base,
+            None,
+            author,
+            message,
+        )
     }
 
     /// The commit pipeline minus ref movement: split protected/plaintext files,
@@ -190,6 +209,13 @@ impl Repo {
     /// rules and wraps must still union into the completion's policy — the
     /// picked commit may carry protected updates (in the decided tree) whose
     /// wraps only IT knows, and rules the tip lacks.
+    /// `pick_registry_base` (P19 final-review fix I2), meaningful only
+    /// alongside `pick_head`, is the picked commit's `--mainline`-resolved
+    /// parent (persisted by `pick_state` at the conflict stop): threaded
+    /// into the registry three-way below so a completed mainline pick's
+    /// secret delta agrees with the file delta it already landed. `None`
+    /// for a non-mainline pick (falls back to the picked commit's own first
+    /// parent, unchanged behavior) and for every other caller.
     /// `parents_override`, when `Some`, replaces the parents that would
     /// otherwise be derived from `tip`/`merge_head` on the built snapshot —
     /// `tip` still supplies the protection/secrets/carry-forward source (the
@@ -205,6 +231,7 @@ impl Repo {
         merge_head: Option<ObjectId>,
         pick_head: Option<ObjectId>,
         decided_root: Option<ObjectId>,
+        pick_registry_base: Option<ObjectId>,
         parents_override: Option<Vec<ObjectId>>,
         author: &str,
         message: &str,
@@ -229,19 +256,20 @@ impl Repo {
                         // differently on both sides is a typed
                         // `SecretMergeConflict` (the commit fails loudly).
                         let picked_snap = self.snapshot(&ph)?;
-                        // `base_override: None` — `pick_state` does not
-                        // persist the `--mainline` selection a conflicted
-                        // pick was started with (out of scope for this fix;
-                        // see P19 review), so completion cannot recover
-                        // which parent's registry to base against and falls
-                        // back to the picked commit's own first parent, as
-                        // it did before mainline picks existed.
+                        // `pick_registry_base` (P19 final-review fix I2):
+                        // `pick_state` now persists the `--mainline`
+                        // selection a conflicted pick was started with, so
+                        // completion can recover which parent's registry to
+                        // base against instead of always falling back to
+                        // the picked commit's own first parent — a
+                        // non-mainline pick still passes `None` here and
+                        // gets exactly that fallback (unchanged behavior).
                         let secs = crate::replay::merged_registry_for_replay(
                             self,
                             &picked_snap.parents,
                             &picked_snap.secrets,
                             &snap.secrets,
-                            None,
+                            pick_registry_base,
                         )?;
                         let picked_p = picked_snap.protection;
                         let prefixes = crate::protect::merge_prefixes(
@@ -443,6 +471,12 @@ impl Repo {
         } else {
             None
         };
+        // The pick's `--mainline`-resolved parent, if it was started with
+        // one (P19 final-review fix I2) — same gating as `decided_root`:
+        // only meaningful, and only read, while a pick is actually in
+        // progress.
+        let pick_registry_base =
+            if pick_head.is_some() { crate::pick_state::read_mainline_base(&self.layout)? } else { None };
         let merging = merge_head.is_some();
         let picking = pick_head.is_some();
         // Pick completion (no merge in progress) is the extracted assembly
@@ -450,12 +484,27 @@ impl Repo {
         // other case (plain commit, merge completion) still calls
         // `snapshot_files` directly with a freshly read working tree.
         let id = match (tip, merge_head, pick_head) {
-            (Some(t), None, Some(ph)) => {
-                self.assemble_completion_snapshot(t, ph, decided_root, author, message)?
-            }
+            (Some(t), None, Some(ph)) => self.assemble_completion_snapshot(
+                t,
+                ph,
+                decided_root,
+                pick_registry_base,
+                author,
+                message,
+            )?,
             _ => {
                 let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
-                self.snapshot_files(files, tip, merge_head, pick_head, decided_root, None, author, message)?
+                self.snapshot_files(
+                    files,
+                    tip,
+                    merge_head,
+                    pick_head,
+                    decided_root,
+                    pick_registry_base,
+                    None,
+                    author,
+                    message,
+                )?
             }
         };
         refs::write_branch_tip(&self.layout, &head, &id)?;
@@ -516,6 +565,7 @@ impl Repo {
         let id = self.snapshot_files(
             files,
             Some(tip),
+            None,
             None,
             None,
             None,
@@ -1159,6 +1209,9 @@ impl Repo {
         }
         if crate::pick_state::in_progress(&self.layout) {
             return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
         }
         let head_before = refs::current_branch(&self.layout)?;
         // The protection-aware dirty check (status) already treats unchanged
@@ -3491,7 +3544,7 @@ mod tests {
         // so a synthetic id would (rightly) fail the completing commit.
         // Conflict markers (none, here) are on disk.
         let picked = base;
-        crate::pick_state::write(&repo.layout, &picked, &[], None).unwrap();
+        crate::pick_state::write(&repo.layout, &picked, &[], None, None).unwrap();
         assert!(repo.pick_in_progress());
         assert_eq!(repo.pick_head().unwrap(), Some(picked));
 
@@ -3526,7 +3579,7 @@ mod tests {
         repo.branch("feature").unwrap();
 
         let picked = ObjectId::of(b"some-picked-commit");
-        crate::pick_state::write(&repo.layout, &picked, &[], None).unwrap();
+        crate::pick_state::write(&repo.layout, &picked, &[], None, None).unwrap();
         assert!(repo.pick_in_progress());
 
         assert!(matches!(repo.merge("feature", "me"), Err(Error::PickInProgress)));
@@ -3571,6 +3624,87 @@ mod tests {
             repo.rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), false),
             Err(Error::RebaseInProgress)
         ));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn switch_refused_during_stopped_rebase() {
+        // P19 final-review C1: `switch` was missing the rebase guard that
+        // `merge`/`pick` already have — probe P1 proved a stopped rebase's
+        // resolution could be silently discarded by switching branches and
+        // then completing the rebase against the other branch's tree.
+        let root = tmp_root("rebase-guard-switch");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        let before_tip = refs::read_branch_tip(&repo.layout, "main").unwrap();
+
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: ObjectId::of(b"orig"),
+            target: "feature".into(),
+            acc_tip: ObjectId::of(b"acc"),
+            conflicted: ObjectId::of(b"conflicted"),
+            remaining: vec![],
+            total: 2,
+            author: "me".into(),
+            resolved: false,
+        };
+        crate::rebase_state::write(&repo.layout, &st).unwrap();
+        assert!(repo.rebase_in_progress());
+
+        assert!(matches!(repo.switch("feature"), Err(Error::RebaseInProgress)));
+
+        // Branch ref and current branch untouched; rebase state still present.
+        assert_eq!(refs::current_branch(&repo.layout).unwrap(), "main");
+        assert_eq!(refs::read_branch_tip(&repo.layout, "main").unwrap(), before_tip);
+        assert!(repo.rebase_in_progress());
+        let reread = crate::rebase_state::read(&repo.layout).unwrap().unwrap();
+        assert_eq!(reread.original_tip, st.original_tip);
+        assert_eq!(reread.acc_tip, st.acc_tip);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn undo_refused_during_stopped_rebase() {
+        // P19 final-review C1: `undo` was missing the rebase guard — probe P2
+        // proved a stopped rebase's resolution could be undone and then
+        // `--continue` would force-write over the undo, discarding it and
+        // desyncing the oplog's recorded `before` state from reality.
+        let root = tmp_root("rebase-guard-undo");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        let before_tip = refs::read_branch_tip(&repo.layout, "main").unwrap();
+
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: ObjectId::of(b"orig"),
+            target: "feature".into(),
+            acc_tip: ObjectId::of(b"acc"),
+            conflicted: ObjectId::of(b"conflicted"),
+            remaining: vec![],
+            total: 2,
+            author: "me".into(),
+            resolved: false,
+        };
+        crate::rebase_state::write(&repo.layout, &st).unwrap();
+        assert!(repo.rebase_in_progress());
+
+        assert!(matches!(repo.undo(), Err(Error::RebaseInProgress)));
+
+        // Branch ref untouched; rebase state still present.
+        assert_eq!(refs::read_branch_tip(&repo.layout, "main").unwrap(), before_tip);
+        assert!(repo.rebase_in_progress());
+        let reread = crate::rebase_state::read(&repo.layout).unwrap().unwrap();
+        assert_eq!(reread.original_tip, st.original_tip);
+        assert_eq!(reread.acc_tip, st.acc_tip);
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -3775,7 +3909,7 @@ mod tests {
         crate::merge_state::clear(&repo.layout).unwrap();
 
         // Cherry-pick in progress.
-        crate::pick_state::write(&repo.layout, &ObjectId::of(b"picked"), &[], None).unwrap();
+        crate::pick_state::write(&repo.layout, &ObjectId::of(b"picked"), &[], None, None).unwrap();
         assert!(matches!(repo.amend("me", None), Err(Error::PickInProgress)));
         crate::pick_state::clear(&repo.layout).unwrap();
 
