@@ -361,8 +361,7 @@ enum WsOp {
         /// (requires --identity to be set).
         #[arg(long)]
         with_secrets: bool,
-        /// Identity file to decrypt protected paths and/or secrets (default
-        /// ~/.sc/identity or $SC_IDENTITY; required when --with-secrets is set).
+        /// Identity for --with-secrets decryption.
         #[arg(long)]
         identity: Option<PathBuf>,
         /// The command to run; `--` separates it from flags.

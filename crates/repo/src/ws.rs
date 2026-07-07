@@ -299,7 +299,8 @@ impl Repo {
         command
             .args(args)
             .current_dir(&entry.dir)
-            .env("SC_WORKSPACE", format!("ws-{}", entry.index))
+            // Label matches the work-<i> branch namespace a harvest fallback would mint (P13 parity: label == branch name).
+            .env("SC_WORKSPACE", format!("work-{}", entry.index))
             .env("SC_WORKSPACE_DIR", &entry.dir);
         for (k, v) in &secret_envs {
             command.env(k, v);
@@ -494,7 +495,7 @@ mod tests {
         let root = tmp_root("ws_run_env");
         let repo = init(&root);
         let session = repo.ws_fork(2, "t", None).unwrap();
-        let entry = &session.workspaces[1]; // ws-2
+        let entry = &session.workspaces[1]; // work-2
 
         // Run a command that writes SC_WORKSPACE and pwd to files.
         let exit = repo
@@ -512,9 +513,9 @@ mod tests {
 
         assert_eq!(exit, 0);
 
-        // Check SC_WORKSPACE holds the label "ws-2".
+        // Check SC_WORKSPACE holds the label "work-2".
         let env_content = std::fs::read_to_string(entry.dir.join("env.txt")).unwrap();
-        assert_eq!(env_content.trim(), "ws-2");
+        assert_eq!(env_content.trim(), "work-2");
 
         // Check pwd matches the workspace dir (canonicalize both to handle symlinks).
         let cwd_content = std::fs::read_to_string(entry.dir.join("cwd.txt")).unwrap();
