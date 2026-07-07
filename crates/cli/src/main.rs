@@ -124,8 +124,15 @@ enum Cmd {
     /// progress are left on disk (exit 1), resolve then `sc commit`.
     CherryPick {
         /// Branch or remote-tracking ref whose tip commit to pick.
-        #[arg(value_name = "ref")]
-        refname: String,
+        #[arg(value_name = "ref", conflicts_with = "abort")]
+        refname: Option<String>,
+        /// Abandon an in-progress cherry-pick and restore the working tree.
+        #[arg(long, conflicts_with_all = ["refname", "mainline"])]
+        abort: bool,
+        /// Replay a merge commit relative to its Nth parent (1-based); required
+        /// when the picked commit is a merge, refused otherwise.
+        #[arg(long)]
+        mainline: Option<u32>,
         /// Commit author (default $SC_AUTHOR, then the OS username).
         #[arg(long)]
         author: Option<String>,
@@ -440,8 +447,8 @@ fn main() -> Result<()> {
         Cmd::Merge { branch, abort, author, identity } => {
             run_merge(branch, abort, &resolve_author(author), identity)
         }
-        Cmd::CherryPick { refname, author, identity } => {
-            run_cherry_pick(&refname, &resolve_author(author), identity)
+        Cmd::CherryPick { refname, abort, mainline, author, identity } => {
+            run_cherry_pick(refname, abort, mainline, &resolve_author(author), identity)
         }
         Cmd::Rebase { target, r#continue, abort, author, identity } => {
             run_rebase(target, r#continue, abort, &resolve_author(author), identity)
@@ -1120,12 +1127,25 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str, identity: Option
     }
 }
 
-fn run_cherry_pick(refname: &str, author: &str, identity: Option<PathBuf>) -> Result<()> {
+fn run_cherry_pick(
+    refname: Option<String>,
+    abort: bool,
+    mainline: Option<u32>,
+    author: &str,
+    identity: Option<PathBuf>,
+) -> Result<()> {
     let repo = open_repo()?;
+    if abort {
+        repo.cherry_pick_abort()?;
+        println!("cherry-pick aborted; working tree restored");
+        return Ok(());
+    }
+    let refname =
+        refname.ok_or_else(|| anyhow::anyhow!("cherry-pick needs a ref or --abort"))?;
     // Soft-resolve like `run_merge`: a missing identity file is fine —
     // ciphertext-id fast paths and plain picks need no identity at all.
     let sk = resolve_identity_opt(identity)?;
-    match repo.cherry_pick(refname, author, sk.as_ref()) {
+    match repo.cherry_pick(&refname, author, sk.as_ref(), mainline) {
         Ok(scl_repo::PickResult::Picked(id)) => {
             println!("picked {}", id.short());
             Ok(())

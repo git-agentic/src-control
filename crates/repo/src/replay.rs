@@ -130,7 +130,12 @@ fn split_for_encryption(
 /// three-way (P15): ciphertext-id fast paths need no identity; a protected
 /// path that diverged in *content* on both sides needs `identity`
 /// ([`Error::ProtectedMergeNeedsIdentity`] without one). Merge commits (2+
-/// parents) are refused — mainline selection is not supported.
+/// parents) are refused unless `base_override` is supplied (P19 Task 4
+/// `--mainline`): passing it substitutes the chosen parent's tree/protection
+/// as the merge base in place of the derived first-parent base, so the
+/// replay's delta is computed relative to that parent instead. All non-
+/// mainline callers pass `None`, preserving the original "no mainline
+/// selection" refusal for merge commits.
 ///
 /// The clean path is self-contained: `needs_encrypt` outputs are encrypted
 /// against the union rules (onto-side ∪ commit-side) and the returned
@@ -143,14 +148,15 @@ pub(crate) fn replay_commit(
     commit_id: ObjectId,
     onto: (ObjectId, &Protection),
     identity: Option<&scl_crypto::SecretKey>,
+    base_override: Option<ObjectId>,
 ) -> Result<ReplayOutcome> {
     let snap = repo.snapshot(&commit_id)?;
-    if snap.parents.len() >= 2 {
+    if snap.parents.len() >= 2 && base_override.is_none() {
         return Err(Error::CannotReplayMerge(commit_id));
     }
     let (onto_root, onto_prot) = onto;
-    let base_snap = match snap.parents.first() {
-        Some(p) => Some(repo.snapshot(p)?),
+    let base_snap = match base_override.or_else(|| snap.parents.first().copied()) {
+        Some(p) => Some(repo.snapshot(&p)?),
         None => None,
     };
     let theirs_root = snap.root;
@@ -278,11 +284,21 @@ impl Repo {
     /// working tree ONLY (never through the CAS) and is completed by
     /// `sc commit`, which unions the tip's rules with the picked commit's and
     /// carries absent protected files from the pick's decided tree.
+    ///
+    /// `mainline` (P19 Task 4, `--mainline <N>`) selects which parent of a
+    /// merge commit to replay relative to: required (else
+    /// [`Error::CannotReplayMerge`], text extended to point at the flag) when
+    /// `picked_tip` has 2+ parents, and `1 <= N <= parents.len()` (else
+    /// [`Error::InvalidArgument`]); `N` picks `parents[N-1]` as the base, so
+    /// the replayed delta is "what changed relative to that parent". `Some`
+    /// on a non-merge commit is also [`Error::InvalidArgument`] — mainline
+    /// only makes sense when there is more than one parent to choose among.
     pub fn cherry_pick(
         &self,
         refname: &str,
         author: &str,
         identity: Option<&scl_crypto::SecretKey>,
+        mainline: Option<u32>,
     ) -> Result<PickResult> {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
@@ -309,6 +325,25 @@ impl Repo {
         let ours_root = ours_snap.root;
         let picked_snap = self.snapshot(&picked_tip)?;
 
+        let base_override = match mainline {
+            Some(n) => {
+                if picked_snap.parents.len() < 2 {
+                    return Err(Error::InvalidArgument(
+                        "--mainline only applies to merge commits".into(),
+                    ));
+                }
+                let idx = usize::try_from(n).ok().filter(|&i| i >= 1 && i <= picked_snap.parents.len());
+                let idx = idx.ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "--mainline {n} is out of range (commit has {} parents)",
+                        picked_snap.parents.len()
+                    ))
+                })?;
+                Some(picked_snap.parents[idx - 1])
+            }
+            None => None,
+        };
+
         // Registry three-way (P15 Task 9), hoisted above the file replay so a
         // registry conflict fails fast — even on a pick whose FILES would
         // conflict, the typed `SecretMergeConflict` surfaces here with refs
@@ -321,7 +356,13 @@ impl Repo {
             &ours_snap.secrets,
         )?;
 
-        match replay_commit(self, picked_tip, (ours_root, &ours_snap.protection), identity)? {
+        match replay_commit(
+            self,
+            picked_tip,
+            (ours_root, &ours_snap.protection),
+            identity,
+            base_override,
+        )? {
             ReplayOutcome::Empty => {
                 // Tree AND this commit's own protection-prefix delta are both
                 // no-ops (see `replay_commit`'s Empty gate) — but the secret
@@ -483,6 +524,37 @@ impl Repo {
                 Err(Error::PickConflicts(paths.len()))
             }
         }
+    }
+
+    /// Abandon a cherry-pick stopped on conflict: clear the pick state and
+    /// re-materialize the untouched current tip — mirrors
+    /// [`rebase_abort`][Repo::rebase_abort]'s shape exactly, including its
+    /// deletion-baseline fix: pass the pick's `PICK_DECIDED_ROOT` (the tree
+    /// the working tree actually, currently reflects — a conflicted pick may
+    /// have materialized theirs-side-only files onto disk) as `old_root`, so
+    /// the deletion pass drops them. Falls back to a full clean materialize
+    /// (`old_root = None`) only for residue where the decided root is
+    /// unexpectedly absent (older pick state). No oplog record — no ref ever
+    /// moved, so abort is its own inverse; nothing to undo. Errors
+    /// [`Error::InvalidArgument`] if no cherry-pick is in progress.
+    pub fn cherry_pick_abort(&self) -> Result<()> {
+        if !crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::InvalidArgument(
+                "no cherry-pick in progress — nothing to abort".into(),
+            ));
+        }
+        for path in crate::pick_state::read_conflicts(&self.layout)? {
+            let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
+        }
+        let decided = crate::pick_state::read_decided_root(&self.layout)?;
+        let ours_tip = self.head_tip()?;
+        if let Some(tip) = ours_tip {
+            let snap = self.snapshot(&tip)?;
+            let store_arc = self.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            worktree::materialize(&self.layout, &mut store, snap.root, decided, &snap.protection, None)?;
+        }
+        crate::pick_state::clear(&self.layout)
     }
 
     /// Replay the current branch's commits onto `target`'s tip (rebase).
@@ -688,7 +760,7 @@ impl Repo {
             // refs and the working tree byte-identical — unlike a real
             // `Conflicts` outcome below, an identity failure still aborts
             // the WHOLE rebase rather than stopping it.
-            let outcome = replay_commit(self, commit, (acc_root, &acc_protection), identity)
+            let outcome = replay_commit(self, commit, (acc_root, &acc_protection), identity, None)
                 .map_err(|e| match e {
                     Error::ProtectedMergeNeedsIdentity(path) => Error::ProtectedMergeNeedsIdentity(
                         format!("{path} (replaying commit {})", commit.short()),
@@ -1068,7 +1140,7 @@ mod tests {
 
         let onto_snap = repo.snapshot(&main_tip).unwrap();
         let outcome =
-            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None).unwrap();
+            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None, None).unwrap();
         match outcome {
             ReplayOutcome::Clean { root: merged_root, .. } => {
                 let store_arc = repo.vfs().store();
@@ -1103,7 +1175,7 @@ mod tests {
 
         let onto_snap = repo.snapshot(&main_tip).unwrap();
         let outcome =
-            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None).unwrap();
+            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None, None).unwrap();
         match outcome {
             ReplayOutcome::Conflicts { files, paths, .. } => {
                 assert_eq!(paths, vec!["x.txt".to_string()]);
@@ -1134,7 +1206,7 @@ mod tests {
 
         let onto_snap = repo.snapshot(&main_tip).unwrap();
         let outcome =
-            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None).unwrap();
+            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None, None).unwrap();
         assert!(matches!(outcome, ReplayOutcome::Empty));
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -1187,7 +1259,7 @@ mod tests {
 
             let onto_snap = repo_b.snapshot(&b_tip).unwrap();
             let outcome =
-                replay_commit(&repo_b, copied_commit, (onto_snap.root, &onto_snap.protection), None)
+                replay_commit(&repo_b, copied_commit, (onto_snap.root, &onto_snap.protection), None, None)
                     .unwrap();
             match outcome {
                 ReplayOutcome::Clean { root: merged_root, .. } => {
@@ -1222,7 +1294,7 @@ mod tests {
         assert!(repo.snapshot(&merged).unwrap().parents.len() >= 2);
 
         let onto_snap = repo.snapshot(&main_tip).unwrap();
-        let err = replay_commit(&repo, merged, (onto_snap.root, &onto_snap.protection), None)
+        let err = replay_commit(&repo, merged, (onto_snap.root, &onto_snap.protection), None, None)
             .unwrap_err();
         assert!(matches!(err, Error::CannotReplayMerge(id) if id == merged), "got {err:?}");
         let _ = base;
@@ -1245,7 +1317,7 @@ mod tests {
         repo.switch("main").unwrap();
         let old_main_tip = repo.head_tip().unwrap().unwrap();
 
-        let outcome = repo.cherry_pick("work-1", "me", None).unwrap();
+        let outcome = repo.cherry_pick("work-1", "me", None, None).unwrap();
         let id = match outcome {
             PickResult::Picked(id) => id,
             other => panic!("expected Picked, got {other:?}"),
@@ -1285,7 +1357,7 @@ mod tests {
         repo.switch("main").unwrap();
         assert_eq!(repo.head_tip().unwrap(), Some(main_tip));
 
-        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
+        let err = repo.cherry_pick("work-1", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "main tip must not move");
         assert_eq!(repo.pick_head().unwrap(), Some(picked));
@@ -1298,6 +1370,201 @@ mod tests {
         let resolved_snap = repo.snapshot(&resolved).unwrap();
         assert_eq!(resolved_snap.parents, vec![main_tip]);
         assert!(!repo.pick_in_progress());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- P19 Task 4: cherry-pick --abort and --mainline ----
+
+    #[test]
+    fn cherry_pick_abort_restores_pre_pick_tree() {
+        // work (theirs) both conflicts with main on x.txt AND adds a brand-new
+        // file (new.txt) — the pick's conflict-materialize pulls that
+        // theirs-only file onto disk (mirrors rebase_abort's
+        // target-only-file review finding). --abort must drop it, not leave
+        // it as untracked residue the next commit would silently absorb.
+        let root = tmp_root("cp-abort");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        std::fs::write(root.join("stable.txt"), b"stable\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"a\nB\nc\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+        let main_tip = repo.head_tip().unwrap().unwrap();
+
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nZ\nc\n").unwrap();
+        std::fs::write(root.join("new.txt"), b"from-work\n").unwrap();
+        repo.commit("me", "work edits x, adds new.txt").unwrap();
+        repo.switch("main").unwrap();
+        assert_eq!(repo.head_tip().unwrap(), Some(main_tip));
+
+        let before_x = std::fs::read(root.join("x.txt")).unwrap();
+        let before_stable = std::fs::read(root.join("stable.txt")).unwrap();
+        let ops_before = repo.oplog().unwrap().len();
+
+        let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert!(
+            root.join("new.txt").exists(),
+            "the pick's conflict-materialize must pull in work's new.txt"
+        );
+
+        // Dirty the tree further beyond the markers/pulled-in file themselves.
+        std::fs::write(root.join("x.txt"), b"garbage\n").unwrap();
+        std::fs::write(root.join("stable.txt"), b"also garbage\n").unwrap();
+
+        repo.cherry_pick_abort().unwrap();
+
+        assert!(!repo.pick_in_progress(), "state cleared");
+        assert_eq!(repo.pick_head().unwrap(), None);
+        assert_eq!(repo.pick_conflicts().unwrap(), Vec::<String>::new());
+        assert_eq!(
+            crate::pick_state::read_decided_root(&repo.layout).unwrap(),
+            None,
+            "PICK_DECIDED_ROOT cleared"
+        );
+        assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "branch tip unchanged");
+        assert_eq!(std::fs::read(root.join("x.txt")).unwrap(), before_x, "x.txt byte-identical");
+        assert_eq!(
+            std::fs::read(root.join("stable.txt")).unwrap(),
+            before_stable,
+            "stable.txt byte-identical"
+        );
+        assert!(
+            !root.join("new.txt").exists(),
+            "abort must drop the pick-materialized theirs-only file"
+        );
+        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no oplog record from abort");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cherry_pick_abort_without_pick_errors() {
+        let root = tmp_root("cp-abort-no-state");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\n").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        let err = repo.cherry_pick_abort().unwrap_err();
+        match err {
+            Error::InvalidArgument(msg) => {
+                assert!(msg.contains("no cherry-pick in progress"), "got: {msg}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mainline_pick_applies_delta_relative_to_chosen_parent() {
+        // M = merge of a-side (adds a.txt) and b-side (adds b.txt), so
+        // M.parents == [a_tip, b_tip] (`Repo::merge`'s `[ours, theirs]`
+        // convention). target1/target2 are fresh branches at a_tip.
+        let root = tmp_root("cp-mainline");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.branch("a-side").unwrap();
+        repo.branch("b-side").unwrap();
+
+        repo.switch("a-side").unwrap();
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        repo.commit("me", "a-side adds a.txt").unwrap();
+        let a_tip = repo.head_tip().unwrap().unwrap();
+        repo.branch("target1").unwrap();
+        repo.branch("target2").unwrap();
+
+        repo.switch("b-side").unwrap();
+        std::fs::write(root.join("b.txt"), b"b\n").unwrap();
+        repo.commit("me", "b-side adds b.txt").unwrap();
+        let b_tip = repo.head_tip().unwrap().unwrap();
+
+        repo.switch("a-side").unwrap();
+        let m = repo.merge("b-side", "me").unwrap();
+        let m_snap = repo.snapshot(&m).unwrap();
+        assert_eq!(m_snap.parents, vec![a_tip, b_tip]);
+
+        // --mainline 1: base = parents[0] (a-side) → the delta is b-side's
+        // addition. Onto a fresh a-side branch (already has a.txt), the pick
+        // lands b.txt.
+        repo.switch("target1").unwrap();
+        let outcome = repo.cherry_pick("a-side", "me", None, Some(1)).unwrap();
+        assert!(matches!(outcome, PickResult::Picked(_)), "got {outcome:?}");
+        assert!(root.join("b.txt").exists(), "mainline 1 lands b-side's addition");
+        assert!(root.join("a.txt").exists());
+
+        // --mainline 2: base = parents[1] (b-side) → the delta is a-side's
+        // addition. Onto a fresh a-side branch (already has a.txt and lacks
+        // b.txt), nothing new lands — already applied.
+        repo.switch("target2").unwrap();
+        let outcome = repo.cherry_pick("a-side", "me", None, Some(2)).unwrap();
+        assert!(matches!(outcome, PickResult::AlreadyApplied), "got {outcome:?}");
+        assert!(root.join("a.txt").exists());
+        assert!(!root.join("b.txt").exists(), "mainline 2 excludes b-side's addition");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mainline_validation() {
+        let root = tmp_root("cp-mainline-validation");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.branch("a-side").unwrap();
+        repo.branch("b-side").unwrap();
+
+        repo.switch("a-side").unwrap();
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        repo.commit("me", "a-side adds a.txt").unwrap();
+        // "target" points at a-side's single-parent tip, BEFORE the merge
+        // below advances a-side to the two-parent merge commit — used to
+        // exercise the non-merge --mainline case.
+        repo.branch("target").unwrap();
+
+        repo.switch("b-side").unwrap();
+        std::fs::write(root.join("b.txt"), b"b\n").unwrap();
+        repo.commit("me", "b-side adds b.txt").unwrap();
+
+        repo.switch("a-side").unwrap();
+        repo.merge("b-side", "me").unwrap();
+        // a-side now points at the 2-parent merge commit.
+
+        // A merge without --mainline is refused, and the error names the flag.
+        repo.switch("target").unwrap();
+        let err = repo.cherry_pick("a-side", "me", None, None).unwrap_err();
+        match err {
+            Error::CannotReplayMerge(_) => {
+                assert!(err.to_string().contains("--mainline"), "got: {err}");
+            }
+            other => panic!("expected CannotReplayMerge, got {other:?}"),
+        }
+
+        // --mainline 3 on a 2-parent merge is out of range.
+        let err = repo.cherry_pick("a-side", "me", None, Some(3)).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+
+        // --mainline on a non-merge commit (target's own single-parent tip,
+        // picked from b-side) is refused.
+        repo.switch("b-side").unwrap();
+        let err = repo.cherry_pick("target", "me", None, Some(1)).unwrap_err();
+        match err {
+            Error::InvalidArgument(msg) => {
+                assert!(msg.contains("--mainline"), "got: {msg}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -1320,7 +1587,7 @@ mod tests {
         assert_eq!(repo.head_tip().unwrap(), Some(merged));
         let ops_before = repo.oplog().unwrap().len();
 
-        let outcome = repo.cherry_pick("work-1", "me", None).unwrap();
+        let outcome = repo.cherry_pick("work-1", "me", None, None).unwrap();
         assert!(matches!(outcome, PickResult::AlreadyApplied), "got {outcome:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(merged), "tip must not move");
         assert_eq!(repo.oplog().unwrap().len(), ops_before, "no new oplog record");
@@ -1343,25 +1610,25 @@ mod tests {
 
         // Dirty working tree.
         std::fs::write(root.join("x.txt"), b"dirty\n").unwrap();
-        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
+        let err = repo.cherry_pick("work-1", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
         std::fs::write(root.join("x.txt"), b"a\n").unwrap();
 
         // Merge in progress.
         let ours_tip = repo.head_tip().unwrap().unwrap();
         crate::merge_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
-        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
+        let err = repo.cherry_pick("work-1", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
         crate::merge_state::clear(&repo.layout).unwrap();
 
         // Pick in progress.
         crate::pick_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
-        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
+        let err = repo.cherry_pick("work-1", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickInProgress), "got {err:?}");
         crate::pick_state::clear(&repo.layout).unwrap();
 
         // Unknown ref.
-        let err = repo.cherry_pick("no-such-branch", "me", None).unwrap_err();
+        let err = repo.cherry_pick("no-such-branch", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::NoSuchBranch(_)), "got {err:?}");
 
         drop(repo);
@@ -1385,7 +1652,7 @@ mod tests {
 
         let ours_tip = repo.head_tip().unwrap().unwrap();
         crate::merge_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
-        let err = repo.cherry_pick("work-1", "me", None).unwrap_err();
+        let err = repo.cherry_pick("work-1", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(ours_tip), "tip must not move");
 
@@ -1421,7 +1688,7 @@ mod tests {
         let main_tip = repo.commit("me", "main adds main.txt").unwrap();
 
         // KEYLESS pick.
-        let outcome = repo.cherry_pick("work", "me", None).unwrap();
+        let outcome = repo.cherry_pick("work", "me", None, None).unwrap();
         let id = match outcome {
             PickResult::Picked(id) => id,
             other => panic!("expected Picked, got {other:?}"),
@@ -1477,7 +1744,7 @@ mod tests {
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
         // Keyless: typed error, refs untouched, no pick state.
-        let err = repo.cherry_pick("work", "me", None).unwrap_err();
+        let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
         assert!(
             matches!(err, Error::ProtectedMergeNeedsIdentity(ref p) if p == "secret/a.txt"),
             "got {err:?}"
@@ -1486,7 +1753,7 @@ mod tests {
         assert!(!repo.pick_in_progress(), "no pick state on the identity refusal");
 
         // With identity: clean pick, merged content re-encrypted.
-        let outcome = repo.cherry_pick("work", "me", Some(&alice_sk)).unwrap();
+        let outcome = repo.cherry_pick("work", "me", Some(&alice_sk), None).unwrap();
         let id = match outcome {
             PickResult::Picked(id) => id,
             other => panic!("expected Picked, got {other:?}"),
@@ -1542,7 +1809,7 @@ mod tests {
         let picked = repo.commit("me", "work edits line 1").unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
-        let err = repo.cherry_pick("work", "me", Some(&alice_sk)).unwrap_err();
+        let err = repo.cherry_pick("work", "me", Some(&alice_sk), None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(ours), "tip must not move");
         assert_eq!(repo.pick_head().unwrap(), Some(picked));
@@ -1630,7 +1897,7 @@ mod tests {
 
         // KEYLESS conflicted pick: x.txt is decided clean (take picked) but
         // cannot materialize without a key; shared.txt conflicts.
-        let err = repo.cherry_pick("work", "me", None).unwrap_err();
+        let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
         assert!(!root.join("secret/x.txt").exists(), "keyless: v1 stays off disk");
 
@@ -1711,7 +1978,7 @@ mod tests {
         assert!(!crate::merge_state::in_progress(&repo.layout), "no MERGE_HEAD");
 
         // Keyless conflicted pick, resolve, complete.
-        let err = repo.cherry_pick("work", "me", None).unwrap_err();
+        let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
         std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
         let id = repo.commit("me", "resolve").unwrap();
@@ -1759,7 +2026,7 @@ mod tests {
         repo.switch("main").unwrap();
 
         // KEYLESS clean pick.
-        let outcome = repo.cherry_pick("work", "me", None).unwrap();
+        let outcome = repo.cherry_pick("work", "me", None, None).unwrap();
         let id = match outcome {
             PickResult::Picked(id) => id,
             other => panic!("expected Picked, got {other:?}"),
@@ -2067,7 +2334,7 @@ mod tests {
         let main_tip = repo.head_tip().unwrap().unwrap();
         let main_root = repo.snapshot(&main_tip).unwrap().root;
 
-        let outcome = repo.cherry_pick("work", "me", None).unwrap();
+        let outcome = repo.cherry_pick("work", "me", None, None).unwrap();
         let id = match outcome {
             PickResult::Picked(id) => id,
             other => panic!("expected Picked (not AlreadyApplied), got {other:?}"),
@@ -2132,7 +2399,7 @@ mod tests {
         refs::write_branch_tip(&repo.layout, &head, &combined).unwrap();
 
         repo.switch("main").unwrap();
-        let err = repo.cherry_pick("work", "me", None).unwrap_err();
+        let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "tip must not move");
 
@@ -2285,7 +2552,7 @@ mod tests {
         let main_tip = repo.head_tip().unwrap().unwrap();
         let main_root = repo.snapshot(&main_tip).unwrap().root;
 
-        let outcome = repo.cherry_pick("work", "me", None).unwrap();
+        let outcome = repo.cherry_pick("work", "me", None, None).unwrap();
         let id = match outcome {
             PickResult::Picked(id) => id,
             other => panic!("expected Picked (not AlreadyApplied), got {other:?}"),

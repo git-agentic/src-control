@@ -62,7 +62,7 @@ pub enum Error {
     Remote(String),
     #[error("secret {0} changed differently on both branches; resolve with `sc secret` then retry")]
     SecretMergeConflict(String),
-    #[error("cannot replay merge commit {0} (mainline selection not supported)")]
+    #[error("cannot replay merge commit {0}; use --mainline <N> to pick relative to parent N")]
     CannotReplayMerge(ObjectId),
     #[error(transparent)]
     Core(#[from] scl_core::Error),

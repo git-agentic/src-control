@@ -3195,7 +3195,7 @@ mod tests {
 
         // …revoke bob on main, then replay that commit onto main.
         repo.revoke("secret/", &bob_pk.recipient_id()).unwrap();
-        repo.cherry_pick("work", "me", None).unwrap();
+        repo.cherry_pick("work", "me", None, None).unwrap();
 
         let listed = repo.protected_prefixes().unwrap();
         let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
@@ -3557,7 +3557,7 @@ mod tests {
 
         assert!(matches!(repo.commit("me", "should refuse"), Err(Error::RebaseInProgress)));
         assert!(matches!(repo.merge("feature", "me"), Err(Error::RebaseInProgress)));
-        assert!(matches!(repo.cherry_pick("feature", "me", None), Err(Error::RebaseInProgress)));
+        assert!(matches!(repo.cherry_pick("feature", "me", None, None), Err(Error::RebaseInProgress)));
         assert!(matches!(repo.rebase("feature", "me", None), Err(Error::RebaseInProgress)));
         assert!(matches!(
             repo.rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), false),
