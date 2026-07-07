@@ -176,6 +176,9 @@ impl Repo {
         let branch = refs::current_branch(self.layout())?;
 
         let root = ws_dir(self.layout());
+        // No manifest proves any .sc/ws content is crash residue from a
+        // killed fork — always safe to clear before materializing.
+        let _ = std::fs::remove_dir_all(&root);
         let mut workspaces = Vec::with_capacity(agents as usize);
         for i in 1..=agents {
             let dir = root.join(i.to_string());
@@ -673,6 +676,69 @@ mod tests {
         }
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn fork_clears_manifestless_crash_residue() {
+        let root = tmp_root("fork-residue");
+        let repo = init(&root);
+        let tip = repo.head_tip().unwrap().unwrap();
+
+        // Simulate a kill -9 mid-fork: a workspace dir exists with a stray
+        // file but no manifest was ever written to announce the session.
+        let ws_root = ws_dir(repo.layout());
+        std::fs::create_dir_all(ws_root.join("1")).unwrap();
+        std::fs::write(ws_root.join("1").join("residue.txt"), "stale\n").unwrap();
+        assert!(repo.ws_session().unwrap().is_none());
+
+        let session = repo.ws_fork(2, "t", None).unwrap();
+        assert_eq!(session.base_snapshot, tip);
+        assert_eq!(session.workspaces.len(), 2);
+
+        // Neither freshly forked workspace shows the residue as a change.
+        for entry in &session.workspaces {
+            assert!(
+                !repo.ws_changed(entry).unwrap(),
+                "residue must not leak into a freshly forked workspace"
+            );
+        }
+
+        // The stray file is gone everywhere under .sc/ws.
+        for entry in walkdir_files(&ws_root) {
+            assert_ne!(
+                entry.file_name().unwrap().to_str(),
+                Some("residue.txt"),
+                "crash residue must be cleared before materializing: {entry:?}"
+            );
+        }
+
+        // Harvesting the untouched workspaces lands nothing and leaves the
+        // base branch tip unchanged.
+        let base_before = repo.head_tip().unwrap().unwrap();
+        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        assert!(outcomes
+            .iter()
+            .all(|o| matches!(o, WsHarvestOutcome::Unchanged { .. })));
+        assert!(repo.ws_session().unwrap().is_none());
+        assert_eq!(repo.head_tip().unwrap().unwrap(), base_before);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(walkdir_files(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
     }
 
     #[test]
