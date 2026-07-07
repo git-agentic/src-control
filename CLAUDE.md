@@ -334,10 +334,15 @@ register — `RecipientEntry { key, epoch, state: Granted | Revoked }` — in
 place of the bare key list; grant/revoke mint a fresh `epoch = max(current)
 + 1`, and `merge_prefixes` keeps the higher-epoch entry per recipient,
 resolving an epoch tie with disagreeing states as **Revoked** (fail-closed).
-Commit-time sealing, grant checks, and `--identity` authorization all read
-the effective set through `granted_keys()` — Granted entries only, so a
-tombstoned recipient never seals a fresh DEK again even when a pre-revoke
-branch is merged in later. Crossed revokes can empty a rule's granted set
+Commit-time sealing reads the effective set through `granted_keys()` —
+Granted entries only, so a tombstoned recipient never seals a fresh DEK
+again even when a pre-revoke branch is merged in later. `sc grant`'s
+authorization check and `--identity` decryption (`decrypt_with`) are
+unchanged: they work by wrap presence in `protection.wrapped`, and
+`union_wraps` deliberately preserves old wraps as historical facts, so a
+revoked recipient can still decrypt ciphertext sealed before the revoke
+(they already held the key; cryptographic cutover is rotation, not
+revoke). Crossed revokes can empty a rule's granted set
 entirely; `encrypt_protected` is now fallible and refuses the seal loudly
 (pointing at `sc grant`) rather than minting ciphertext nobody can read.
 This is a rules-format break: the snapshot tag bumped `2 → 4`

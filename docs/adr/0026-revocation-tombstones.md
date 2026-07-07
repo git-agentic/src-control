@@ -23,10 +23,15 @@ Each `(prefix, recipient)` becomes a last-writer-wins register:
 tombstone and is retained forever. Grant/revoke write
 `epoch = max(current) + 1`; merge keeps the higher-epoch entry per
 recipient, and an epoch tie with disagreeing states resolves **Revoked**
-(fail-closed). The effective recipient set — commit-time sealing, grant
-checks, `--identity` authorization — is the Granted entries only, and the
-zero-effective-recipients guard is enforced at
-`secrets::require_recipients`. Replay (rebase/cherry-pick) inherits the
+(fail-closed). The effective recipient set — the Granted entries only —
+gates commit-time sealing (`granted_keys()`). Grant checks and
+`--identity` authorization are a separate surface: they work by wrap
+presence in `protection.wrapped`, unaffected by the register, so a
+tombstoned recipient can still open ciphertext sealed before the revoke
+(historical wraps). `secrets::require_recipients` continues to guard the
+PublicKey-typed seal paths (`protect`/`secret add`/`secret rotate`); the
+effective-set (Granted-only) guard for sealing under a prefix rule lives
+in `encrypt_protected`. Replay (rebase/cherry-pick) inherits the
 semantics via the shared rule-merge helper; `union_wraps` is untouched
 (wrapped DEKs on existing ciphertext are historical facts — tombstones
 govern future seals only).
