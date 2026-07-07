@@ -176,7 +176,16 @@ enum Cmd {
         cmd: Vec<String>,
     },
     /// Clone a repo (local path or `ssh://` URL) into a new directory.
-    Clone { src: String, dst: PathBuf },
+    Clone {
+        src: String,
+        dst: PathBuf,
+        /// Treat `src` as a Git remote (https/http, scp-style, ssh://,
+        /// file://) and clone via the system-git mirror bridge instead of
+        /// sc's native transport. Required for `ssh://` because bare
+        /// `ssh://` already means an sc-native remote (ADR-0022/ADR-0028).
+        #[arg(long)]
+        git: bool,
+    },
     /// Serve a repo over stdin/stdout to a remote `sc` client (invoked by
     /// `ssh` for ssh:// remotes; not intended for interactive use).
     Serve {
@@ -419,7 +428,7 @@ fn main() -> Result<()> {
         Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
             run_work(agents, name, budget_mb, with_secrets, identity, author, cmd)
         }
-        Cmd::Clone { src, dst } => run_clone(src, dst),
+        Cmd::Clone { src, dst, git } => run_clone(src, dst, git),
         Cmd::Serve { stdio, path } => run_serve(stdio, path),
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
@@ -1525,10 +1534,37 @@ fn resolve_ids_to_pubkeys(
     Ok(out)
 }
 
-fn run_clone(src: String, dst: PathBuf) -> Result<()> {
+fn run_clone(src: String, dst: PathBuf, git: bool) -> Result<()> {
+    if git {
+        return run_clone_git(&src, &dst);
+    }
     let repo = scl_repo::Repo::clone_url(&src, &dst)?;
     let n = repo.branches()?.len();
     println!("cloned {} into {} ({} branch(es))", src, dst.display(), n);
+    Ok(())
+}
+
+/// Clone from a hosted Git URL (`--git`): init + remote add origin --git +
+/// fetch + adopt the remote's default branch (P10's unborn fast-forward
+/// adoption). Requires the explicit flag because bare `ssh://` already means
+/// an sc-native remote (ADR-0022) — URL shape alone can't disambiguate.
+fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    let repo = scl_repo::Repo::init(dst)?;
+    repo.remote_add_git("origin", url)?;
+
+    // Sync the mirror, then point the unborn HEAD at the remote's default
+    // branch name BEFORE fetching, so the tracking ref and local branch agree.
+    let mirror = git_remote_effective_path(&repo, "origin", url, true)?;
+    let default = scl_gitio::bridge::remote_default_branch(&mirror)?;
+    scl_repo::refs::write_head(repo.layout(), &default)?;
+
+    run_fetch_git(&repo, "origin")?;
+    // Adopt: merge the tracking ref into the unborn branch (ADR-0018's
+    // unborn fast-forward). Author resolution mirrors run_merge's.
+    let author = resolve_author(None);
+    repo.merge(&format!("origin/{default}"), &author)?;
+    println!("cloned {url} into {} (branch {default})", dst.display());
     Ok(())
 }
 
@@ -2202,6 +2238,35 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stdout).contains("first"),
             "retry must land the commit on the hub");
 
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clone_from_network_git_url_adopts_default_branch() {
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-gitclone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Hub with default branch "trunk" and one seeded commit.
+        let hub = root.join("hub.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "trunk", hub.to_str().unwrap()]).status().unwrap();
+        let seed = root.join("seed");
+        std::process::Command::new("git").args(["init", "-b", "trunk", seed.to_str().unwrap()]).status().unwrap();
+        std::fs::write(seed.join("a.txt"), "x").unwrap();
+        for args in [vec!["add", "."], vec!["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "seed"]] {
+            std::process::Command::new("git").current_dir(&seed).args(&args).status().unwrap();
+        }
+        std::process::Command::new("git").current_dir(&seed)
+            .args(["push", &format!("file://{}", hub.display()), "trunk"]).status().unwrap();
+
+        let dst = root.join("cloned");
+        run_clone_git(&format!("file://{}", hub.display()), &dst).unwrap();
+        let repo = scl_repo::Repo::open(&dst).unwrap();
+        assert_eq!(scl_repo::refs::current_branch(repo.layout()).unwrap(), "trunk",
+            "local branch must adopt the remote default name");
+        assert!(dst.join("a.txt").exists(), "working tree must be materialized");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
