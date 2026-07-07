@@ -68,7 +68,7 @@ pub(crate) fn harvest_workspace(
         return Ok(HarvestResult::Unchanged);
     }
     let files = worktree::read_worktree(&ws, &tracked)?;
-    match repo.snapshot_files(files, Some(tip), None, None, None, author, message) {
+    match repo.snapshot_files(files, Some(tip), None, None, None, None, None, author, message) {
         Ok(id) => {
             refs::write_branch_tip(repo.layout(), branch, &id)?;
             Ok(HarvestResult::Committed(id))

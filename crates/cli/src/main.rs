@@ -52,6 +52,19 @@ enum Cmd {
         #[arg(long)]
         author: Option<String>,
     },
+    /// Replace the tip commit with one built from the current working tree.
+    /// Parents are kept from the tip (merge and root commits amend
+    /// naturally); the message is kept unless `-m` overrides it. Refuses
+    /// while unborn or while a merge/pick/rebase is in progress.
+    Amend {
+        /// New message; omit to keep the tip's existing message.
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Author recorded on the amended snapshot (default: $SC_AUTHOR,
+        /// then the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
     /// Show working-tree changes against HEAD.
     Status {
         /// Emit machine-readable JSON instead of the human listing.
@@ -111,8 +124,15 @@ enum Cmd {
     /// progress are left on disk (exit 1), resolve then `sc commit`.
     CherryPick {
         /// Branch or remote-tracking ref whose tip commit to pick.
-        #[arg(value_name = "ref")]
-        refname: String,
+        #[arg(value_name = "ref", conflicts_with = "abort")]
+        refname: Option<String>,
+        /// Abandon an in-progress cherry-pick and restore the working tree.
+        #[arg(long, conflicts_with_all = ["refname", "mainline"])]
+        abort: bool,
+        /// Replay a merge commit relative to its Nth parent (1-based); required
+        /// when the picked commit is a merge, refused otherwise.
+        #[arg(long)]
+        mainline: Option<u32>,
         /// Commit author (default $SC_AUTHOR, then the OS username).
         #[arg(long)]
         author: Option<String>,
@@ -123,12 +143,20 @@ enum Cmd {
     },
     /// Replay the current branch's commits onto another branch's tip.
     ///
-    /// Any conflict aborts the whole rebase (exit 1): refs and the working
-    /// tree are left untouched, unlike `sc merge`/`sc cherry-pick`'s marker
-    /// files. Resolve via `sc merge` or per-commit `sc cherry-pick` instead.
+    /// A conflict STOPS the rebase (exit 1): P4-style markers are left on
+    /// disk and the branch ref does not move — resolve then
+    /// `sc rebase --continue`, or `sc rebase --abort` to give up and restore
+    /// the pre-rebase tree. A resumed rebase (any number of stops) still
+    /// collapses into a single `sc undo`-able operation.
     Rebase {
         /// Branch or remote-tracking ref to rebase onto.
-        target: String,
+        target: Option<String>,
+        /// Resume a stopped rebase after resolving conflicts.
+        #[arg(long, conflicts_with = "target")]
+        r#continue: bool,
+        /// Abandon a stopped rebase; restores the pre-rebase working tree.
+        #[arg(long, conflicts_with_all = ["target", "continue"])]
+        abort: bool,
         /// Commit author (default $SC_AUTHOR, then the OS username).
         #[arg(long)]
         author: Option<String>,
@@ -409,6 +437,7 @@ fn main() -> Result<()> {
         Cmd::SecretDemo(args) => run_secret_demo(args),
         Cmd::Init => run_init(),
         Cmd::Commit { message, author } => run_commit(&resolve_author(author), &message),
+        Cmd::Amend { message, author } => run_amend(&resolve_author(author), message),
         Cmd::Status { json } => run_status(json),
         Cmd::Diff => run_diff(),
         Cmd::Log { json } => run_log(json),
@@ -418,11 +447,11 @@ fn main() -> Result<()> {
         Cmd::Merge { branch, abort, author, identity } => {
             run_merge(branch, abort, &resolve_author(author), identity)
         }
-        Cmd::CherryPick { refname, author, identity } => {
-            run_cherry_pick(&refname, &resolve_author(author), identity)
+        Cmd::CherryPick { refname, abort, mainline, author, identity } => {
+            run_cherry_pick(refname, abort, mainline, &resolve_author(author), identity)
         }
-        Cmd::Rebase { target, author, identity } => {
-            run_rebase(&target, &resolve_author(author), identity)
+        Cmd::Rebase { target, r#continue, abort, author, identity } => {
+            run_rebase(target, r#continue, abort, &resolve_author(author), identity)
         }
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
@@ -962,6 +991,26 @@ fn run_commit(author: &str, message: &str) -> Result<()> {
     }
 }
 
+fn run_amend(author: &str, message: Option<String>) -> Result<()> {
+    let repo = open_repo()?;
+    let old = repo.head_tip()?;
+    match repo.amend(author, message.as_deref()) {
+        Ok(id) => {
+            let old_short = old.map(|o| o.short()).unwrap_or_else(|| "?".to_string());
+            println!("amended {} -> {}", old_short, id.short());
+            Ok(())
+        }
+        Err(scl_repo::Error::SecretDetected(report)) => {
+            // Drop the repo (releases .sc/lock) before process::exit, which
+            // skips destructors and would otherwise leave a stale lock file.
+            drop(repo);
+            eprint!("{report}");
+            std::process::exit(1);
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn run_scan() -> Result<()> {
     let repo = open_repo()?;
     let report = repo.scan_worktree()?;
@@ -989,6 +1038,7 @@ fn run_status(json: bool) -> Result<()> {
                 "merge_in_progress": repo.merge_in_progress(),
                 "conflicts": repo.merge_conflicts()?,
                 "pick_in_progress": repo.pick_in_progress(),
+                "rebase_in_progress": repo.rebase_in_progress(),
             })
         );
         return Ok(());
@@ -1009,9 +1059,19 @@ fn run_status(json: bool) -> Result<()> {
             println!("cherry-pick in progress: {}", id.short());
         }
     }
+    if repo.rebase_in_progress() {
+        if let Some((conflicted, done, total)) = repo.rebase_progress()? {
+            println!(
+                "rebase in progress: stopped at {} ({} of {}); resolve conflicts then 'sc rebase --continue', or 'sc rebase --abort'",
+                conflicted.short(),
+                done + 1,
+                total
+            );
+        }
+    }
     let s = repo.status()?;
     if s.added.is_empty() && s.modified.is_empty() && s.deleted.is_empty() {
-        if !repo.merge_in_progress() && !repo.pick_in_progress() {
+        if !repo.merge_in_progress() && !repo.pick_in_progress() && !repo.rebase_in_progress() {
             println!("clean (working tree matches HEAD)");
         }
         return Ok(());
@@ -1067,12 +1127,25 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str, identity: Option
     }
 }
 
-fn run_cherry_pick(refname: &str, author: &str, identity: Option<PathBuf>) -> Result<()> {
+fn run_cherry_pick(
+    refname: Option<String>,
+    abort: bool,
+    mainline: Option<u32>,
+    author: &str,
+    identity: Option<PathBuf>,
+) -> Result<()> {
     let repo = open_repo()?;
+    if abort {
+        repo.cherry_pick_abort()?;
+        println!("cherry-pick aborted; working tree restored");
+        return Ok(());
+    }
+    let refname =
+        refname.ok_or_else(|| anyhow::anyhow!("cherry-pick needs a ref or --abort"))?;
     // Soft-resolve like `run_merge`: a missing identity file is fine —
     // ciphertext-id fast paths and plain picks need no identity at all.
     let sk = resolve_identity_opt(identity)?;
-    match repo.cherry_pick(refname, author, sk.as_ref()) {
+    match repo.cherry_pick(&refname, author, sk.as_ref(), mainline) {
         Ok(scl_repo::PickResult::Picked(id)) => {
             println!("picked {}", id.short());
             Ok(())
@@ -1096,12 +1169,30 @@ fn run_cherry_pick(refname: &str, author: &str, identity: Option<PathBuf>) -> Re
     }
 }
 
-fn run_rebase(target: &str, author: &str, identity: Option<PathBuf>) -> Result<()> {
+fn run_rebase(
+    target: Option<String>,
+    r#continue: bool,
+    abort: bool,
+    author: &str,
+    identity: Option<PathBuf>,
+) -> Result<()> {
     let repo = open_repo()?;
+    if abort {
+        repo.rebase_abort()?;
+        println!("rebase aborted; working tree restored");
+        return Ok(());
+    }
     // Soft-resolve like `run_merge`/`run_cherry_pick`: a missing identity file
     // is fine — ciphertext-id fast paths and plain rebases need no identity.
     let sk = resolve_identity_opt(identity)?;
-    match repo.rebase(target, author, sk.as_ref()) {
+    let outcome = if r#continue {
+        repo.rebase_continue(author, sk.as_ref())
+    } else {
+        let target = target
+            .ok_or_else(|| anyhow::anyhow!("rebase needs a target, --continue, or --abort"))?;
+        repo.rebase(&target, author, sk.as_ref())
+    };
+    match outcome {
         Ok(scl_repo::RebaseResult::AlreadyUpToDate) => {
             println!("already up to date");
             Ok(())
@@ -1113,6 +1204,23 @@ fn run_rebase(target: &str, author: &str, identity: Option<PathBuf>) -> Result<(
         Ok(scl_repo::RebaseResult::Rebased { new_tip, replayed, skipped }) => {
             println!("rebased: {replayed} replayed, {skipped} skipped, tip {}", new_tip.short());
             Ok(())
+        }
+        Ok(scl_repo::RebaseResult::Stopped { conflicted, paths, done, total }) => {
+            println!(
+                "rebase stopped at {} ({} of {}) with {} conflict(s); resolve these files then `sc rebase --continue`:",
+                conflicted.short(),
+                done + 1,
+                total,
+                paths.len()
+            );
+            for p in &paths {
+                println!("  {p}");
+            }
+            // Exit 1 so `sc rebase x && sc commit` can't commit conflict
+            // markers — mirrors `run_merge`/`run_cherry_pick`. Drop the repo
+            // first (releases .sc/lock) — process::exit skips destructors.
+            drop(repo);
+            std::process::exit(1);
         }
         Err(e) => Err(e.into()),
     }

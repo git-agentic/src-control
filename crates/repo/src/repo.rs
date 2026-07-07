@@ -125,7 +125,19 @@ impl Repo {
     /// Paths tracked by HEAD (empty when the branch is unborn). `.scignore`
     /// rules never hide these — same model as git.
     fn tracked_paths(&self) -> Result<std::collections::BTreeSet<String>> {
-        match self.head_tip()? {
+        self.tracked_paths_at(self.head_tip()?)
+    }
+
+    /// Paths tracked by `tip` (empty when `tip` is `None`). Generalizes
+    /// `tracked_paths` to an explicit tip rather than HEAD — needed by
+    /// `assemble_completion_snapshot`, where the completing parent (a pick's
+    /// `tip`, or a rebase fold's `acc_tip`) can differ from the branch's own
+    /// unmoved HEAD while a pick/rebase is in progress.
+    fn tracked_paths_at(
+        &self,
+        tip: Option<ObjectId>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        match tip {
             None => Ok(Default::default()),
             Some(tip) => {
                 let root = self.snapshot(&tip)?.root;
@@ -134,6 +146,48 @@ impl Repo {
                 Ok(worktree::tree_file_ids(&mut store, root)?.into_keys().collect())
             }
         }
+    }
+
+    /// The pick/rebase-completion snapshot assembly, extracted from
+    /// `commit`'s pick-completion arm (P19 Task 2 groundwork) so
+    /// `Repo::rebase_continue` can reuse it verbatim: read the resolved
+    /// working tree (tracked paths computed from `parent`, NOT necessarily
+    /// HEAD — a rebase fold's `parent` is the accumulated tip, which can
+    /// differ from the branch's own unmoved ref while the rebase is
+    /// stopped), then run the same `snapshot_files` pipeline as a pick
+    /// completion (`merge_head: None`, `pick_head: Some(completed)`) —
+    /// scanner gate on plain files, protected re-encryption under the
+    /// unioned rules, decided-root carry-forward. Builds the snapshot only;
+    /// callers move the branch ref and record the oplog entry themselves.
+    /// `pick_registry_base` (P19 final-review fix I2) is the picked commit's
+    /// `--mainline`-resolved parent, persisted by `pick_state` at the
+    /// conflict stop: threading it into `snapshot_files`'s registry
+    /// three-way keeps a completed mainline pick's secret delta consistent
+    /// with the file delta it already landed, instead of silently
+    /// re-basing the registry against the picked commit's first parent.
+    /// `None` for every non-mainline pick and for rebase's own fold
+    /// completion (rebase has no `--mainline` concept).
+    pub(crate) fn assemble_completion_snapshot(
+        &self,
+        parent: ObjectId,
+        completed: ObjectId,
+        decided_root: Option<ObjectId>,
+        pick_registry_base: Option<ObjectId>,
+        author: &str,
+        message: &str,
+    ) -> Result<ObjectId> {
+        let files = worktree::read_worktree(&self.layout, &self.tracked_paths_at(Some(parent))?)?;
+        self.snapshot_files(
+            files,
+            Some(parent),
+            None,
+            Some(completed),
+            decided_root,
+            pick_registry_base,
+            None,
+            author,
+            message,
+        )
     }
 
     /// The commit pipeline minus ref movement: split protected/plaintext files,
@@ -155,6 +209,21 @@ impl Repo {
     /// rules and wraps must still union into the completion's policy — the
     /// picked commit may carry protected updates (in the decided tree) whose
     /// wraps only IT knows, and rules the tip lacks.
+    /// `pick_registry_base` (P19 final-review fix I2), meaningful only
+    /// alongside `pick_head`, is the picked commit's `--mainline`-resolved
+    /// parent (persisted by `pick_state` at the conflict stop): threaded
+    /// into the registry three-way below so a completed mainline pick's
+    /// secret delta agrees with the file delta it already landed. `None`
+    /// for a non-mainline pick (falls back to the picked commit's own first
+    /// parent, unchanged behavior) and for every other caller.
+    /// `parents_override`, when `Some`, replaces the parents that would
+    /// otherwise be derived from `tip`/`merge_head` on the built snapshot —
+    /// `tip` still supplies the protection/secrets/carry-forward source (the
+    /// pre-amend commit's own policy), but the recorded parents are the
+    /// caller's choice. Used by `amend` (P19 Task 3) to rebuild the tip with
+    /// the TIP's OWN parents instead of `[tip]`, replacing rather than
+    /// extending history. Every other caller passes `None`, keeping the
+    /// original `tip` (+ `merge_head`) derivation.
     pub(crate) fn snapshot_files(
         &self,
         files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
@@ -162,6 +231,8 @@ impl Repo {
         merge_head: Option<ObjectId>,
         pick_head: Option<ObjectId>,
         decided_root: Option<ObjectId>,
+        pick_registry_base: Option<ObjectId>,
+        parents_override: Option<Vec<ObjectId>>,
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
@@ -185,11 +256,20 @@ impl Repo {
                         // differently on both sides is a typed
                         // `SecretMergeConflict` (the commit fails loudly).
                         let picked_snap = self.snapshot(&ph)?;
+                        // `pick_registry_base` (P19 final-review fix I2):
+                        // `pick_state` now persists the `--mainline`
+                        // selection a conflicted pick was started with, so
+                        // completion can recover which parent's registry to
+                        // base against instead of always falling back to
+                        // the picked commit's own first parent — a
+                        // non-mainline pick still passes `None` here and
+                        // gets exactly that fallback (unchanged behavior).
                         let secs = crate::replay::merged_registry_for_replay(
                             self,
                             &picked_snap.parents,
                             &picked_snap.secrets,
                             &snap.secrets,
+                            pick_registry_base,
                         )?;
                         let picked_p = picked_snap.protection;
                         let prefixes = crate::protect::merge_prefixes(
@@ -347,10 +427,16 @@ impl Repo {
         crate::protect::reuse_prior_wraps(&mut fresh_wrapped, &prior);
         protection.wrapped = fresh_wrapped;
 
-        let mut parents: Vec<ObjectId> = tip.into_iter().collect();
-        if let Some(theirs) = merge_head {
-            parents.push(theirs);
-        }
+        let parents: Vec<ObjectId> = match parents_override {
+            Some(p) => p,
+            None => {
+                let mut v: Vec<ObjectId> = tip.into_iter().collect();
+                if let Some(theirs) = merge_head {
+                    v.push(theirs);
+                }
+                v
+            }
+        };
         self.build_snapshot(root, parents, secrets, protection, author, message)
     }
 
@@ -359,9 +445,11 @@ impl Repo {
     /// Files under a protected prefix are convergently encrypted (scanner-exempt);
     /// only plaintext files are scanned.
     pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
+        }
         let head = refs::current_branch(&self.layout)?;
         let before = refs::read_branch_tip(&self.layout, &head)?;
-        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         let tip = self.head_tip()?;
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
         let pick_head = crate::pick_state::read_pick_head(&self.layout)?;
@@ -383,10 +471,42 @@ impl Repo {
         } else {
             None
         };
+        // The pick's `--mainline`-resolved parent, if it was started with
+        // one (P19 final-review fix I2) — same gating as `decided_root`:
+        // only meaningful, and only read, while a pick is actually in
+        // progress.
+        let pick_registry_base =
+            if pick_head.is_some() { crate::pick_state::read_mainline_base(&self.layout)? } else { None };
         let merging = merge_head.is_some();
         let picking = pick_head.is_some();
-        let id =
-            self.snapshot_files(files, tip, merge_head, pick_head, decided_root, author, message)?;
+        // Pick completion (no merge in progress) is the extracted assembly
+        // (P19 Task 2 groundwork), shared with `rebase_continue`. Every
+        // other case (plain commit, merge completion) still calls
+        // `snapshot_files` directly with a freshly read working tree.
+        let id = match (tip, merge_head, pick_head) {
+            (Some(t), None, Some(ph)) => self.assemble_completion_snapshot(
+                t,
+                ph,
+                decided_root,
+                pick_registry_base,
+                author,
+                message,
+            )?,
+            _ => {
+                let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
+                self.snapshot_files(
+                    files,
+                    tip,
+                    merge_head,
+                    pick_head,
+                    decided_root,
+                    pick_registry_base,
+                    None,
+                    author,
+                    message,
+                )?
+            }
+        };
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
         crate::pick_state::clear(&self.layout)?;
@@ -405,6 +525,57 @@ impl Repo {
             &head,
             &[(head.clone(), before, Some(id))],
         )?;
+        Ok(id)
+    }
+
+    /// Replace the tip commit with one built from the current working tree:
+    /// same parents as the tip (merge and root commits amend naturally —
+    /// `tip_snap.parents` is `[]`, `[p]`, or `[p1, p2]` and is carried
+    /// through unchanged), message kept unless `message` overrides. Reuses
+    /// the plain-commit assembly (`snapshot_files`) so the scanner gate,
+    /// `.scignore`, and protected re-encryption are the exact pipeline
+    /// `commit` uses — one gated path, two callers. `tip` (the pre-amend
+    /// commit) still supplies the protection/secrets/carry-forward source
+    /// (the working tree's protection state doesn't change just because the
+    /// tip is being replaced); only the recorded parents are overridden, via
+    /// `parents_override`, to the tip's own parents rather than `[tip]` —
+    /// that's what makes this a replacement instead of a second commit.
+    /// Amend does not materialize: the tree came FROM the working tree, so
+    /// there's nothing to write back. Oplog-recorded as "amend"; one `undo`
+    /// restores the old tip. No pushed-commit guard — sc has no
+    /// authoritative record of remote observers (ADR-0029).
+    pub fn amend(&self, author: &str, message: Option<&str>) -> Result<ObjectId> {
+        if crate::merge_state::in_progress(&self.layout) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
+        }
+        let tip = self.head_tip()?.ok_or(Error::Unborn)?;
+        let tip_snap = self.snapshot(&tip)?;
+        let msg = message.map(|m| m.to_string()).unwrap_or_else(|| tip_snap.message.clone());
+
+        let head = refs::current_branch(&self.layout)?;
+        let before = refs::read_branch_tip(&self.layout, &head)?;
+
+        let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
+        let id = self.snapshot_files(
+            files,
+            Some(tip),
+            None,
+            None,
+            None,
+            None,
+            Some(tip_snap.parents.clone()),
+            author,
+            &msg,
+        )?;
+
+        refs::write_branch_tip(&self.layout, &head, &id)?;
+        crate::oplog::record(&self.layout, "amend", &head, &head, &[(head.clone(), before, Some(id))])?;
         Ok(id)
     }
 
@@ -585,6 +756,26 @@ impl Repo {
         crate::pick_state::read_conflicts(&self.layout)
     }
 
+    /// Whether a rebase is currently stopped mid-flight.
+    pub fn rebase_in_progress(&self) -> bool {
+        crate::rebase_state::in_progress(&self.layout)
+    }
+
+    /// The stopped rebase's progress, if any: (conflicted commit, done
+    /// count, total count). `done` counts the commits landed before the
+    /// stopped one — `total - remaining.len() - 1` — so callers display
+    /// "stopped at commit X (done + 1 of total)". Saturating: a
+    /// semantically-inconsistent state file (`remaining.len() + 1 > total`,
+    /// which a hand-corrupted or foreign-written `REBASE_STATE` could
+    /// produce) reports `done = 0` instead of panicking `sc status` on
+    /// underflow — `write` never produces such a file itself.
+    pub fn rebase_progress(&self) -> Result<Option<(ObjectId, usize, usize)>> {
+        Ok(crate::rebase_state::read(&self.layout)?.map(|st| {
+            let done = st.total.saturating_sub(st.remaining.len()).saturating_sub(1);
+            (st.conflicted, done, st.total)
+        }))
+    }
+
     /// Merge `branch` into the current branch. Fast-forwards when possible;
     /// auto-commits a two-parent snapshot on a clean merge; on conflicts writes
     /// markers + merge state and returns `MergeConflicts`. If the current
@@ -621,6 +812,9 @@ impl Repo {
         }
         if crate::pick_state::in_progress(&self.layout) {
             return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
         }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
@@ -1015,6 +1209,9 @@ impl Repo {
         }
         if crate::pick_state::in_progress(&self.layout) {
             return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
         }
         let head_before = refs::current_branch(&self.layout)?;
         // The protection-aware dirty check (status) already treats unchanged
@@ -3059,7 +3256,7 @@ mod tests {
 
         // …revoke bob on main, then replay that commit onto main.
         repo.revoke("secret/", &bob_pk.recipient_id()).unwrap();
-        repo.cherry_pick("work", "me", None).unwrap();
+        repo.cherry_pick("work", "me", None, None).unwrap();
 
         let listed = repo.protected_prefixes().unwrap();
         let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
@@ -3347,7 +3544,7 @@ mod tests {
         // so a synthetic id would (rightly) fail the completing commit.
         // Conflict markers (none, here) are on disk.
         let picked = base;
-        crate::pick_state::write(&repo.layout, &picked, &[], None).unwrap();
+        crate::pick_state::write(&repo.layout, &picked, &[], None, None).unwrap();
         assert!(repo.pick_in_progress());
         assert_eq!(repo.pick_head().unwrap(), Some(picked));
 
@@ -3382,12 +3579,132 @@ mod tests {
         repo.branch("feature").unwrap();
 
         let picked = ObjectId::of(b"some-picked-commit");
-        crate::pick_state::write(&repo.layout, &picked, &[], None).unwrap();
+        crate::pick_state::write(&repo.layout, &picked, &[], None, None).unwrap();
         assert!(repo.pick_in_progress());
 
         assert!(matches!(repo.merge("feature", "me"), Err(Error::PickInProgress)));
         assert!(matches!(repo.switch("feature"), Err(Error::PickInProgress)));
         assert!(matches!(repo.undo(), Err(Error::PickInProgress)));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commit_merge_pick_rebase_and_rewrap_refuse_during_rebase() {
+        // P19 Task 1: no other ref-moving or cutover operation may proceed
+        // while a rebase is stopped mid-fold — `sc rebase --continue` (Task
+        // 2) or `sc rebase --abort` are the only ways forward.
+        let root = tmp_root("rebase-guards");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: ObjectId::of(b"orig"),
+            target: "feature".into(),
+            acc_tip: ObjectId::of(b"acc"),
+            conflicted: ObjectId::of(b"conflicted"),
+            remaining: vec![],
+            total: 2,
+            author: "me".into(),
+            resolved: false,
+        };
+        crate::rebase_state::write(&repo.layout, &st).unwrap();
+        assert!(repo.rebase_in_progress());
+
+        assert!(matches!(repo.commit("me", "should refuse"), Err(Error::RebaseInProgress)));
+        assert!(matches!(repo.merge("feature", "me"), Err(Error::RebaseInProgress)));
+        assert!(matches!(repo.cherry_pick("feature", "me", None, None), Err(Error::RebaseInProgress)));
+        assert!(matches!(repo.rebase("feature", "me", None), Err(Error::RebaseInProgress)));
+        assert!(matches!(
+            repo.rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), false),
+            Err(Error::RebaseInProgress)
+        ));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn switch_refused_during_stopped_rebase() {
+        // P19 final-review C1: `switch` was missing the rebase guard that
+        // `merge`/`pick` already have — probe P1 proved a stopped rebase's
+        // resolution could be silently discarded by switching branches and
+        // then completing the rebase against the other branch's tree.
+        let root = tmp_root("rebase-guard-switch");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        let before_tip = refs::read_branch_tip(&repo.layout, "main").unwrap();
+
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: ObjectId::of(b"orig"),
+            target: "feature".into(),
+            acc_tip: ObjectId::of(b"acc"),
+            conflicted: ObjectId::of(b"conflicted"),
+            remaining: vec![],
+            total: 2,
+            author: "me".into(),
+            resolved: false,
+        };
+        crate::rebase_state::write(&repo.layout, &st).unwrap();
+        assert!(repo.rebase_in_progress());
+
+        assert!(matches!(repo.switch("feature"), Err(Error::RebaseInProgress)));
+
+        // Branch ref and current branch untouched; rebase state still present.
+        assert_eq!(refs::current_branch(&repo.layout).unwrap(), "main");
+        assert_eq!(refs::read_branch_tip(&repo.layout, "main").unwrap(), before_tip);
+        assert!(repo.rebase_in_progress());
+        let reread = crate::rebase_state::read(&repo.layout).unwrap().unwrap();
+        assert_eq!(reread.original_tip, st.original_tip);
+        assert_eq!(reread.acc_tip, st.acc_tip);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn undo_refused_during_stopped_rebase() {
+        // P19 final-review C1: `undo` was missing the rebase guard — probe P2
+        // proved a stopped rebase's resolution could be undone and then
+        // `--continue` would force-write over the undo, discarding it and
+        // desyncing the oplog's recorded `before` state from reality.
+        let root = tmp_root("rebase-guard-undo");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        let before_tip = refs::read_branch_tip(&repo.layout, "main").unwrap();
+
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: ObjectId::of(b"orig"),
+            target: "feature".into(),
+            acc_tip: ObjectId::of(b"acc"),
+            conflicted: ObjectId::of(b"conflicted"),
+            remaining: vec![],
+            total: 2,
+            author: "me".into(),
+            resolved: false,
+        };
+        crate::rebase_state::write(&repo.layout, &st).unwrap();
+        assert!(repo.rebase_in_progress());
+
+        assert!(matches!(repo.undo(), Err(Error::RebaseInProgress)));
+
+        // Branch ref untouched; rebase state still present.
+        assert_eq!(refs::read_branch_tip(&repo.layout, "main").unwrap(), before_tip);
+        assert!(repo.rebase_in_progress());
+        let reread = crate::rebase_state::read(&repo.layout).unwrap().unwrap();
+        assert_eq!(reread.original_tip, st.original_tip);
+        assert_eq!(reread.acc_tip, st.acc_tip);
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -3467,5 +3784,200 @@ mod tests {
         drop(local);
         std::fs::remove_dir_all(&remote_root).unwrap();
         std::fs::remove_dir_all(&local_root).unwrap();
+    }
+
+    // ---- P19 Task 3: sc amend ----
+
+    #[test]
+    fn amend_replaces_tip_preserving_parents_and_message() {
+        let root = tmp_root("amend-basic");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        let a = repo.commit("me", "commit A").unwrap();
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+        let b = repo.commit("me", "commit B").unwrap();
+
+        // Edit the working tree, then amend with no message override.
+        std::fs::write(root.join("a.txt"), b"three").unwrap();
+        let b_amended = repo.amend("me", None).unwrap();
+
+        assert_ne!(b_amended, b, "amend must produce a new snapshot id");
+        let snap = repo.snapshot(&b_amended).unwrap();
+        assert_eq!(snap.parents, vec![a], "amended parents must match B's parents");
+        assert_eq!(snap.message, "commit B", "message kept unless overridden");
+
+        // The edit landed in B', and B is no longer the branch tip.
+        assert_eq!(repo.head_tip().unwrap(), Some(b_amended));
+        let store_arc = repo.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let entries = worktree::tree_file_ids(&mut store, snap.root).unwrap();
+        let a_blob = entries["a.txt"];
+        match store.get(&a_blob).unwrap() {
+            Object::Blob(bytes) => assert_eq!(&bytes[..], b"three"),
+            _ => panic!("expected Blob"),
+        }
+        drop(store);
+
+        // Oplog has an "amend" record, and one undo restores B as tip.
+        let log = repo.oplog().unwrap();
+        assert_eq!(log.last().unwrap().desc, "amend");
+        let outcome = repo.undo().unwrap();
+        assert_eq!(outcome.desc, "amend");
+        assert_eq!(repo.head_tip().unwrap(), Some(b));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_with_message_overrides() {
+        let root = tmp_root("amend-message");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "original message").unwrap();
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+
+        let id = repo.amend("me", Some("new")).unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.message, "new");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_merge_commit_keeps_both_parents() {
+        let root = tmp_root("amend-merge");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("base.txt"), b"base").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("main-only.txt"), b"m").unwrap();
+        let ours = repo.commit("me", "main work").unwrap();
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("feature-only.txt"), b"f").unwrap();
+        let theirs = repo.commit("me", "feature work").unwrap();
+        repo.switch("main").unwrap();
+
+        let m = repo.merge("feature", "me").unwrap();
+        let m_snap = repo.snapshot(&m).unwrap();
+        assert_eq!(m_snap.parents, vec![ours, theirs]);
+
+        // Edit, then amend the merge tip: parents must be preserved exactly.
+        std::fs::write(root.join("main-only.txt"), b"m-edited").unwrap();
+        let m_amended = repo.amend("me", None).unwrap();
+        let amended_snap = repo.snapshot(&m_amended).unwrap();
+        assert_eq!(amended_snap.parents, vec![ours, theirs], "merge amend must keep both parents");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_root_commit_keeps_empty_parents() {
+        let root = tmp_root("amend-root");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "root").unwrap();
+
+        std::fs::write(root.join("a.txt"), b"two").unwrap();
+        let id = repo.amend("me", None).unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        assert!(snap.parents.is_empty(), "amended root commit must keep empty parents");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_refuses_unborn_and_in_progress_states() {
+        let root = tmp_root("amend-guards");
+        let repo = Repo::init(&root).unwrap();
+
+        // Unborn: no commits yet.
+        assert!(matches!(repo.amend("me", None), Err(Error::Unborn)));
+
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        // Merge in progress.
+        crate::merge_state::write(&repo.layout, &ObjectId::of(b"theirs"), &[], None).unwrap();
+        assert!(matches!(repo.amend("me", None), Err(Error::MergeInProgress)));
+        crate::merge_state::clear(&repo.layout).unwrap();
+
+        // Cherry-pick in progress.
+        crate::pick_state::write(&repo.layout, &ObjectId::of(b"picked"), &[], None, None).unwrap();
+        assert!(matches!(repo.amend("me", None), Err(Error::PickInProgress)));
+        crate::pick_state::clear(&repo.layout).unwrap();
+
+        // Rebase in progress.
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: ObjectId::of(b"orig"),
+            target: "feature".into(),
+            acc_tip: ObjectId::of(b"acc"),
+            conflicted: ObjectId::of(b"conflicted"),
+            remaining: vec![],
+            total: 2,
+            author: "me".into(),
+            resolved: false,
+        };
+        crate::rebase_state::write(&repo.layout, &st).unwrap();
+        assert!(matches!(repo.amend("me", None), Err(Error::RebaseInProgress)));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn amend_runs_scanner_and_protection() {
+        let root = tmp_root("amend-scan-protect");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+
+        std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/a.txt"), b"secret-key").unwrap();
+        repo.protect("keys/", &[alice_pk], None).unwrap();
+
+        // A plaintext secret introduced via amend must be caught by the scanner.
+        std::fs::write(root.join("readme.txt"), b"key = AKIAIOSFODNN7EXAMPLE\n").unwrap();
+        let err = repo.amend("me", None).unwrap_err();
+        assert!(matches!(err, Error::SecretDetected(_)), "expected SecretDetected, got {err:?}");
+
+        // Fix the plaintext file, and edit the protected one: the amended tip's
+        // blob must remain PROTECTED ciphertext, wrapped for the granted key.
+        std::fs::write(root.join("readme.txt"), b"hi again").unwrap();
+        std::fs::write(root.join("keys/a.txt"), b"rotated-secret-key").unwrap();
+        let id = repo.amend("me", None).unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+
+        let (blob_id, perms) = {
+            let store_arc = repo.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+            let (id, _, perms) = entries["keys/a.txt"];
+            (id, perms)
+        };
+        assert_ne!(perms & scl_core::PROTECTED, 0, "amended protected file must stay protected");
+
+        let bytes = {
+            let store_arc = repo.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            match store.get(&blob_id).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("expected Blob"),
+            }
+        };
+        let pt =
+            crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "keys/a.txt")
+                .unwrap();
+        assert_eq!(&pt[..], b"rotated-secret-key");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

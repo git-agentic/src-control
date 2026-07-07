@@ -322,6 +322,9 @@ impl Repo {
     ///   guard `merge`/`switch` already use).
     /// - [`Error::PickInProgress`] while a cherry-pick is in progress (same
     ///   guard, mirrored for pick state).
+    /// - [`Error::RebaseInProgress`] while a rebase is stopped at a conflict
+    ///   (same guard, mirrored for rebase state — undoing mid-rebase would
+    ///   let `--continue` force-write over the undone ref move).
     /// - [`Error::InvalidArgument`] if a re-materialize is needed and the
     ///   working tree is dirty (would silently discard uncommitted work — the
     ///   same modified/deleted check `merge` and `switch` use).
@@ -343,6 +346,9 @@ impl Repo {
         }
         if crate::pick_state::in_progress(&self.layout) {
             return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
         }
 
         // The branch that will be current once HEAD is restored.
