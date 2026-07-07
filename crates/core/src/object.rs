@@ -12,19 +12,67 @@ use crate::id::ObjectId;
 /// Object kind tags, written as the first byte of every encoding.
 const TAG_BLOB: u8 = 0;
 const TAG_TREE: u8 = 1;
-const TAG_SNAPSHOT: u8 = 2;
+const TAG_SNAPSHOT_LEGACY: u8 = 2; // pre-P16 encoding; refused with a clear error
 const TAG_SECRET: u8 = 3;
+const TAG_SNAPSHOT: u8 = 4;
 
 /// Perms-byte bit: this blob entry holds a `nonce‖ciphertext` envelope (an
 /// encrypted file), not plaintext. Set on protected-path entries (P7).
 pub const PROTECTED: u8 = 0b0000_0001;
 
-/// A protected path prefix and the recipient public keys its files are
-/// encrypted for (used at commit time to wrap new files' DEKs).
+/// A recipient's standing on a protected prefix: active or tombstoned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecipientState {
+    Granted,
+    Revoked,
+}
+
+/// One recipient's standing on a protected prefix — a last-writer-wins
+/// register ordered by `epoch`. A `Revoked` entry IS the tombstone that keeps
+/// a revocation durable across merges (ADR-0026): rule merges keep the
+/// higher-epoch entry, so a pre-revoke branch cannot resurrect the grant.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RecipientEntry {
+    pub key: [u8; 32],
+    pub epoch: u32,
+    pub state: RecipientState,
+}
+
+/// A protected path prefix and the per-recipient standing registers used at
+/// commit time to decide who new files' DEKs are wrapped for.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProtectPrefix {
     pub prefix: String,
-    pub recipients: Vec<[u8; 32]>,
+    pub recipients: Vec<RecipientEntry>,
+}
+
+impl ProtectPrefix {
+    /// The effective recipient set: keys with `Granted` standing. This is the
+    /// only set sealing may wrap DEKs for — tombstoned keys are excluded.
+    pub fn granted_keys(&self) -> Vec<[u8; 32]> {
+        self.recipients
+            .iter()
+            .filter(|e| e.state == RecipientState::Granted)
+            .map(|e| e.key)
+            .collect()
+    }
+
+    /// The epoch a new standing change on this prefix must carry to win over
+    /// every existing entry.
+    pub fn next_epoch(&self) -> u32 {
+        self.recipients.iter().map(|e| e.epoch).max().unwrap_or(0) + 1
+    }
+
+    /// Set `key`'s register to (`epoch`, `state`), inserting it if absent.
+    pub fn set_standing(&mut self, key: [u8; 32], epoch: u32, state: RecipientState) {
+        match self.recipients.iter_mut().find(|e| e.key == key) {
+            Some(e) => {
+                e.epoch = epoch;
+                e.state = state;
+            }
+            None => self.recipients.push(RecipientEntry { key, epoch, state }),
+        }
+    }
 }
 
 /// Per-snapshot encrypted-path policy: which prefixes are protected (+ for whom),
@@ -205,12 +253,17 @@ impl Object {
                 for p in &prefixes {
                     w.str(&p.prefix);
                     w.u32(p.recipients.len() as u32);
-                    // Sort recipients so the same logical policy hashes
-                    // identically regardless of the order they were added in.
+                    // Sort registers by key so the same logical policy hashes
+                    // identically regardless of insertion order.
                     let mut sorted = p.recipients.clone();
-                    sorted.sort_unstable();
+                    sorted.sort_unstable_by(|a, b| a.key.cmp(&b.key));
                     for r in &sorted {
-                        w.raw(r); // 32 bytes
+                        w.raw(&r.key); // 32 bytes
+                        w.u32(r.epoch);
+                        w.u8(match r.state {
+                            RecipientState::Granted => 0,
+                            RecipientState::Revoked => 1,
+                        });
                     }
                 }
                 w.u32(s.protection.wrapped.len() as u32);
@@ -260,6 +313,13 @@ impl Object {
                 }
                 Object::Tree(Tree { entries })
             }
+            TAG_SNAPSHOT_LEGACY => {
+                return Err(Error::Malformed(
+                    "pre-P16 snapshot encoding (tag 2): this store predates the ADR-0026 \
+                     protection-rule format break and cannot be read by this version"
+                        .into(),
+                ))
+            }
             TAG_SNAPSHOT => {
                 let root = r.id()?;
                 let np = r.u32()?;
@@ -286,7 +346,13 @@ impl Object {
                     for _ in 0..n_recipients {
                         let mut rk = [0u8; 32];
                         rk.copy_from_slice(r.take(32)?);
-                        recipients.push(rk);
+                        let epoch = r.u32()?;
+                        let state = match r.u8()? {
+                            0 => RecipientState::Granted,
+                            1 => RecipientState::Revoked,
+                            s => return Err(Error::Malformed(format!("bad recipient state {s}"))),
+                        };
+                        recipients.push(RecipientEntry { key: rk, epoch, state });
                     }
                     prefixes.push(ProtectPrefix { prefix, recipients });
                 }
@@ -521,7 +587,10 @@ mod tests {
         let mut wrapped = std::collections::BTreeMap::new();
         wrapped.insert(cid, vec![WrappedKey { recipient_id: "rid".into(), wrapped_dek: vec![7; 80] }]);
         let prot = Protection {
-            prefixes: vec![ProtectPrefix { prefix: "secrets/".into(), recipients: vec![[9u8; 32]] }],
+            prefixes: vec![ProtectPrefix {
+                prefix: "secrets/".into(),
+                recipients: vec![RecipientEntry { key: [9u8; 32], epoch: 1, state: RecipientState::Granted }],
+            }],
             wrapped,
         };
         let snap = Object::Snapshot(Snapshot {
@@ -534,9 +603,9 @@ mod tests {
     #[test]
     fn protection_recipients_order_independent_id() {
         let root = Object::blob(b"r".to_vec()).id();
-        let a = [1u8; 32];
-        let b = [2u8; 32];
-        let snap = |recipients: Vec<[u8; 32]>| {
+        let a = RecipientEntry { key: [1u8; 32], epoch: 1, state: RecipientState::Granted };
+        let b = RecipientEntry { key: [2u8; 32], epoch: 1, state: RecipientState::Granted };
+        let snap = |recipients: Vec<RecipientEntry>| {
             Object::Snapshot(Snapshot {
                 root,
                 parents: vec![],
@@ -551,6 +620,81 @@ mod tests {
             })
         };
         // Same recipient set, opposite order -> identical canonical id.
-        assert_eq!(snap(vec![a, b]).id(), snap(vec![b, a]).id());
+        assert_eq!(snap(vec![a.clone(), b.clone()]).id(), snap(vec![b, a]).id());
+    }
+
+    #[test]
+    fn snapshot_roundtrips_recipient_registers_and_tombstones() {
+        let snap = Snapshot {
+            root: ObjectId::from_bytes([1; 32]),
+            parents: vec![],
+            author: "a".into(),
+            timestamp: 0,
+            message: "m".into(),
+            secrets: Default::default(),
+            protection: Protection {
+                prefixes: vec![ProtectPrefix {
+                    prefix: "secret/".into(),
+                    recipients: vec![
+                        RecipientEntry { key: [2; 32], epoch: 3, state: RecipientState::Granted },
+                        RecipientEntry { key: [1; 32], epoch: 2, state: RecipientState::Revoked },
+                    ],
+                }],
+                wrapped: Default::default(),
+            },
+        };
+        let bytes = Object::Snapshot(snap.clone()).encode();
+        let Object::Snapshot(back) = Object::decode(&bytes).unwrap() else { panic!("not a snapshot") };
+        // Entries round-trip, sorted by key in the encoding.
+        let rule = &back.protection.prefixes[0];
+        assert_eq!(rule.recipients.len(), 2);
+        let revoked = rule.recipients.iter().find(|e| e.key == [1; 32]).unwrap();
+        assert_eq!((revoked.epoch, revoked.state), (2, RecipientState::Revoked));
+        let granted = rule.recipients.iter().find(|e| e.key == [2; 32]).unwrap();
+        assert_eq!((granted.epoch, granted.state), (3, RecipientState::Granted));
+    }
+
+    #[test]
+    fn recipient_entry_order_does_not_change_snapshot_id() {
+        let mk = |entries: Vec<RecipientEntry>| {
+            Object::Snapshot(Snapshot {
+                root: ObjectId::from_bytes([1; 32]),
+                parents: vec![],
+                author: "a".into(),
+                timestamp: 0,
+                message: "m".into(),
+                secrets: Default::default(),
+                protection: Protection {
+                    prefixes: vec![ProtectPrefix { prefix: "secret/".into(), recipients: entries }],
+                    wrapped: Default::default(),
+                },
+            })
+            .id()
+        };
+        let e1 = RecipientEntry { key: [1; 32], epoch: 1, state: RecipientState::Granted };
+        let e2 = RecipientEntry { key: [2; 32], epoch: 2, state: RecipientState::Revoked };
+        assert_eq!(mk(vec![e1.clone(), e2.clone()]), mk(vec![e2, e1]));
+    }
+
+    #[test]
+    fn pre_p16_snapshot_tag_fails_with_clear_error() {
+        // Tag 2 was the pre-P16 snapshot encoding. It must be refused loudly,
+        // not misparsed into garbage.
+        let err = Object::decode(&[2u8, 0, 0]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("pre-P16"), "unhelpful error: {msg}");
+    }
+
+    #[test]
+    fn granted_keys_next_epoch_set_standing() {
+        let mut rule = ProtectPrefix { prefix: "secret/".into(), recipients: vec![] };
+        assert_eq!(rule.next_epoch(), 1);
+        rule.set_standing([1; 32], 1, RecipientState::Granted);
+        rule.set_standing([2; 32], 1, RecipientState::Granted);
+        assert_eq!(rule.next_epoch(), 2);
+        rule.set_standing([2; 32], 2, RecipientState::Revoked); // upsert, not append
+        assert_eq!(rule.recipients.len(), 2);
+        assert_eq!(rule.granted_keys(), vec![[1; 32]]);
+        assert_eq!(rule.next_epoch(), 3);
     }
 }

@@ -21,18 +21,29 @@ pub fn matching_prefix<'a>(protection: &'a Protection, path: &str) -> Option<&'a
         .max_by_key(|p| p.prefix.len())
 }
 
-/// Union of two protection policies' prefix rules: prefixes united by
-/// `prefix` string; a prefix present on both sides unions its recipient
-/// sets (deduped by pubkey bytes). Fail-closed: nothing present on either
-/// side is dropped.
-pub(crate) fn union_prefixes(a: &[ProtectPrefix], b: &[ProtectPrefix]) -> Vec<ProtectPrefix> {
+/// Merge two protection policies' prefix rules. Prefixes unite by `prefix`
+/// string (rules never disappear — fail-closed, ADR-0025). Within a shared
+/// prefix each recipient key is a last-writer-wins register: the higher-epoch
+/// entry survives, and an epoch tie with disagreeing states resolves
+/// `Revoked` (fail-closed, ADR-0026) — this is what makes `sc revoke` durable
+/// against merging a pre-revoke branch.
+pub(crate) fn merge_prefixes(a: &[ProtectPrefix], b: &[ProtectPrefix]) -> Vec<ProtectPrefix> {
+    use scl_core::RecipientState;
     let mut out: Vec<ProtectPrefix> = Vec::new();
     for p in a.iter().chain(b.iter()) {
         match out.iter_mut().find(|existing| existing.prefix == p.prefix) {
             Some(existing) => {
                 for r in &p.recipients {
-                    if !existing.recipients.contains(r) {
-                        existing.recipients.push(*r);
+                    match existing.recipients.iter_mut().find(|e| e.key == r.key) {
+                        Some(e) => {
+                            if r.epoch > e.epoch
+                                || (r.epoch == e.epoch && r.state == RecipientState::Revoked)
+                            {
+                                e.epoch = r.epoch;
+                                e.state = r.state;
+                            }
+                        }
+                        None => existing.recipients.push(r.clone()),
                     }
                 }
             }
@@ -182,18 +193,71 @@ mod tests {
         assert!(matching_prefix(&p, "secret-evil/x").is_none());
     }
 
+    fn entry(key: u8, epoch: u32, granted: bool) -> scl_core::RecipientEntry {
+        scl_core::RecipientEntry {
+            key: [key; 32],
+            epoch,
+            state: if granted { scl_core::RecipientState::Granted } else { scl_core::RecipientState::Revoked },
+        }
+    }
+
+    fn rule(prefix: &str, entries: Vec<scl_core::RecipientEntry>) -> ProtectPrefix {
+        ProtectPrefix { prefix: prefix.into(), recipients: entries }
+    }
+
     #[test]
-    fn union_prefixes_unions_by_prefix_and_recipients() {
-        let a = vec![ProtectPrefix { prefix: "secret/".into(), recipients: vec![[1; 32]] }];
+    fn merge_prefixes_higher_epoch_wins_both_directions() {
+        // The ADR-0025 boundary case: ours revoked B at epoch 2, theirs (a
+        // pre-revoke branch) still has B granted at epoch 1. Revoke holds —
+        // in either argument order.
+        let ours = vec![rule("secret/", vec![entry(1, 1, true), entry(2, 2, false)])];
+        let theirs = vec![rule("secret/", vec![entry(1, 1, true), entry(2, 1, true)])];
+        for (a, b) in [(&ours, &theirs), (&theirs, &ours)] {
+            let m = merge_prefixes(a, b);
+            let r = m.iter().find(|p| p.prefix == "secret/").unwrap();
+            assert_eq!(r.granted_keys(), vec![[1; 32]]);
+            let b_entry = r.recipients.iter().find(|e| e.key == [2; 32]).unwrap();
+            assert_eq!((b_entry.epoch, b_entry.state), (2, scl_core::RecipientState::Revoked));
+        }
+    }
+
+    #[test]
+    fn merge_prefixes_regrant_beats_older_tombstone() {
+        // B was revoked at epoch 2, then deliberately re-granted at epoch 3 on
+        // one side; the other side still carries the epoch-2 tombstone.
+        let regranted = vec![rule("secret/", vec![entry(1, 1, true), entry(2, 3, true)])];
+        let tombstoned = vec![rule("secret/", vec![entry(1, 1, true), entry(2, 2, false)])];
+        let m = merge_prefixes(&regranted, &tombstoned);
+        let r = m.iter().find(|p| p.prefix == "secret/").unwrap();
+        let mut granted = r.granted_keys();
+        granted.sort_unstable();
+        assert_eq!(granted, vec![[1; 32], [2; 32]]);
+    }
+
+    #[test]
+    fn merge_prefixes_epoch_tie_resolves_revoked() {
+        // Concurrent revoke and re-grant minted the same epoch: fail-closed.
+        let revoked = vec![rule("secret/", vec![entry(1, 1, true), entry(2, 2, false)])];
+        let granted = vec![rule("secret/", vec![entry(1, 1, true), entry(2, 2, true)])];
+        for (a, b) in [(&revoked, &granted), (&granted, &revoked)] {
+            let m = merge_prefixes(a, b);
+            let r = m.iter().find(|p| p.prefix == "secret/").unwrap();
+            assert_eq!(r.granted_keys(), vec![[1; 32]], "tie must resolve Revoked");
+        }
+    }
+
+    #[test]
+    fn merge_prefixes_disjoint_recipients_and_prefixes_compose() {
+        let a = vec![rule("secret/", vec![entry(1, 1, true)])];
         let b = vec![
-            ProtectPrefix { prefix: "secret/".into(), recipients: vec![[1; 32], [2; 32]] },
-            ProtectPrefix { prefix: "keys/".into(), recipients: vec![[3; 32]] },
+            rule("secret/", vec![entry(2, 1, true)]),
+            rule("keys/", vec![entry(3, 1, true)]),
         ];
-        let u = union_prefixes(&a, &b);
-        assert_eq!(u.len(), 2);
-        let secret = u.iter().find(|p| p.prefix == "secret/").unwrap();
-        assert_eq!(secret.recipients.len(), 2); // [1;32] deduped, [2;32] added
-        assert!(u.iter().any(|p| p.prefix == "keys/"));
+        let m = merge_prefixes(&a, &b);
+        assert_eq!(m.len(), 2);
+        let secret = m.iter().find(|p| p.prefix == "secret/").unwrap();
+        assert_eq!(secret.recipients.len(), 2);
+        assert!(m.iter().any(|p| p.prefix == "keys/"));
     }
 
     #[test]

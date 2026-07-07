@@ -192,7 +192,7 @@ impl Repo {
                             &snap.secrets,
                         )?;
                         let picked_p = picked_snap.protection;
-                        let prefixes = crate::protect::union_prefixes(
+                        let prefixes = crate::protect::merge_prefixes(
                             &snap.protection.prefixes,
                             &picked_p.prefixes,
                         );
@@ -216,7 +216,7 @@ impl Repo {
                 let ours_p = self.snapshot(&t)?.protection;
                 let theirs_p = self.snapshot(&mh)?.protection;
                 let prefixes =
-                    crate::protect::union_prefixes(&ours_p.prefixes, &theirs_p.prefixes);
+                    crate::protect::merge_prefixes(&ours_p.prefixes, &theirs_p.prefixes);
                 let mut wrapped = ours_p.wrapped;
                 for (id, wks) in &theirs_p.wrapped {
                     let entry = wrapped.entry(*id).or_default();
@@ -233,7 +233,7 @@ impl Repo {
         let mut protected: Vec<ProtectedFile> = Vec::new();
         for (path, bytes, mode) in files {
             match crate::protect::matching_prefix(&protection, &path) {
-                Some(rule) => protected.push((path, bytes, mode, rule.recipients.clone())),
+                Some(rule) => protected.push((path, bytes, mode, rule.granted_keys())),
                 None => plain.push((path, bytes, mode)),
             }
         }
@@ -717,7 +717,7 @@ impl Repo {
         // protected. `union_prot` exists only to drive `matching_prefix`
         // lookups below — its `wrapped` map is irrelevant here.
         let union_prefixes =
-            crate::protect::union_prefixes(&ours_protection.prefixes, &theirs_protection.prefixes);
+            crate::protect::merge_prefixes(&ours_protection.prefixes, &theirs_protection.prefixes);
         let union_prot = scl_core::Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
 
         // Split the resolved file set: carried ciphertext (needs_encrypt:
@@ -732,13 +732,13 @@ impl Repo {
         for f in &merge_result.files {
             if f.needs_encrypt {
                 let recipients = crate::protect::matching_prefix(&union_prot, &f.path)
-                    .map(|r| r.recipients.clone())
+                    .map(|r| r.granted_keys())
                     .ok_or_else(|| Error::NotProtected(f.path.clone()))?;
                 to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, recipients));
             } else if f.perms & scl_core::PROTECTED == 0 {
                 match crate::protect::matching_prefix(&union_prot, &f.path) {
                     Some(rule) => {
-                        to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, rule.recipients.clone()))
+                        to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, rule.granted_keys()))
                     }
                     None => carried.push((f.path.clone(), f.bytes.clone(), f.mode, 0)),
                 }
@@ -1148,7 +1148,14 @@ impl Repo {
         protection.prefixes.retain(|p| p.prefix != prefix);
         protection.prefixes.push(ProtectPrefix {
             prefix: prefix.to_string(),
-            recipients: recipients.iter().map(|pk| pk.to_bytes()).collect(),
+            recipients: recipients
+                .iter()
+                .map(|pk| scl_core::RecipientEntry {
+                    key: pk.to_bytes(),
+                    epoch: 1,
+                    state: scl_core::RecipientState::Granted,
+                })
+                .collect(),
         });
         self.commit_snapshot(root, parents, secrets, protection, "system", "set protected prefix")
     }
@@ -2866,15 +2873,27 @@ mod tests {
         let wks = snap3.protection.wrapped.values().next().unwrap();
         assert_eq!(wks.len(), 1, "only alice remains");
         assert!(!wks.iter().any(|w| w.recipient_id == bob_id.as_str()));
-        // bob is no longer in the prefix rule's recipients.
+        // bob is no longer in the prefix rule's EFFECTIVE (granted) set, but the
+        // rule retains him as a durable `Revoked` tombstone (ADR-0026) — that
+        // tombstone is what keeps the revoke durable against merging a
+        // pre-revoke branch.
         let rule = snap3.protection.prefixes.iter().find(|p| p.prefix == "secret/").unwrap();
-        assert!(!rule.recipients.iter().any(|pk| {
+        assert!(!rule.granted_keys().iter().any(|pk| {
             scl_crypto::PublicKey::from_bytes(*pk).recipient_id() == bob_id
         }));
-        // protected_prefixes reflects the surviving recipient.
+        let bob_entry = rule
+            .recipients
+            .iter()
+            .find(|e| scl_crypto::PublicKey::from_bytes(e.key).recipient_id() == bob_id)
+            .expect("bob's tombstone must remain in the rule");
+        assert_eq!(bob_entry.state, scl_core::RecipientState::Revoked);
+        // protected_prefixes reflects the surviving recipient and bob's revoked standing.
         let listed = repo.protected_prefixes().unwrap();
         let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
-        assert_eq!(recips, &vec![alice_pk.recipient_id()]);
+        let alice_r = recips.iter().find(|r| r.id == alice_pk.recipient_id()).unwrap();
+        assert!(alice_r.granted);
+        let bob_r = recips.iter().find(|r| r.id == bob_id).unwrap();
+        assert!(!bob_r.granted);
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

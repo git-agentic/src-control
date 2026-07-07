@@ -98,7 +98,7 @@ fn split_for_encryption(
     for f in files {
         if f.needs_encrypt {
             let recipients = protect::matching_prefix(union_prot, &f.path)
-                .map(|r| r.recipients.clone())
+                .map(|r| r.granted_keys())
                 .ok_or_else(|| Error::NotProtected(f.path.clone()))?;
             to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, recipients));
         } else if f.perms & scl_core::PROTECTED == 0 {
@@ -107,7 +107,7 @@ fn split_for_encryption(
                     f.path.clone(),
                     f.bytes.clone(),
                     f.mode,
-                    rule.recipients.clone(),
+                    rule.granted_keys(),
                 )),
                 None => carried.push((f.path.clone(), f.bytes.clone(), f.mode, 0)),
             }
@@ -181,7 +181,7 @@ pub(crate) fn replay_commit(
     // needs_encrypt output is encrypted for, and becomes the replayed
     // snapshot's rule set. `union_prot` exists only to drive
     // `matching_prefix` lookups — its `wrapped` map is irrelevant here.
-    let union_prefixes = protect::union_prefixes(&onto_prot.prefixes, &theirs_prot.prefixes);
+    let union_prefixes = protect::merge_prefixes(&onto_prot.prefixes, &theirs_prot.prefixes);
     let union_prot = Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
 
     let (mut all, to_encrypt) = split_for_encryption(&fm.files, &union_prot)?;
@@ -417,7 +417,7 @@ impl Repo {
                 // via `safe_join`, exactly like sidecars. Re-encryption
                 // happens at completion: `sc commit` unions the tip's rules
                 // with the picked commit's (`snapshot_files`).
-                let union_prefixes = crate::protect::union_prefixes(
+                let union_prefixes = crate::protect::merge_prefixes(
                     &ours_snap.protection.prefixes,
                     &picked_snap.protection.prefixes,
                 );

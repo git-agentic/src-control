@@ -1656,7 +1656,7 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool) -> Result<()
     let repo = open_repo()?;
     if list || prefix.is_none() {
         for (p, recips) in repo.protected_prefixes()? {
-            println!("{p}  ({} recipient(s))", recips.len());
+            println!("{p}  ({} recipient(s))", recips.iter().filter(|r| r.granted).count());
         }
         return Ok(());
     }

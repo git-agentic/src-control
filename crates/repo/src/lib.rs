@@ -34,6 +34,7 @@ pub use error::{Error, Result};
 pub use gc::GcStats;
 pub use git_marks::MarksStore;
 pub use oplog::{OpRecord, UndoOutcome};
+pub use protect_ops::PrefixRecipient;
 pub use remote::{RemoteConfig, RemoteKind};
 pub use replay::{PickResult, RebaseResult};
 pub use repo::{Repo, Status};

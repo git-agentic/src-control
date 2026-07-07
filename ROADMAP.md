@@ -113,8 +113,9 @@ across every phase.
 
 ## Active
 
-None — Phase 16 is next up; see the next-horizon table below. A phase
-becomes Active when its focused brainstorm → spec cycle starts.
+- **Phase 16 — Revocation tombstones / rule narrowing.** In build. Spec:
+  `docs/superpowers/specs/2026-07-07-p16-revocation-tombstones-design.md`
+  (ADR-0026, Proposed → Accepted at completion).
 
 ## Next horizon (P16–P20)
 
