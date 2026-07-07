@@ -51,7 +51,12 @@ the run/secrets plumbing.
 1. Unchanged workspace → skipped, dir torn down.
 2. Changed workspace → P13's existing `harvest_workspace` pipeline
    (`.scignore`, P5 scanner gate, protected re-encryption) produces a
-   candidate snapshot (child of the session base).
+   candidate snapshot (child of the session base). **[As shipped: a
+   scanner-Rejected workspace stays LIVE (no candidate branch was ever
+   created) so the offending file can be fixed in place and re-harvested
+   — unlike P13's one-shot `sc work`, where rejection is terminal for
+   the session. A durable, multi-invocation session can do better. See
+   ADR-0030.]**
 3. The candidate merges onto the **landing branch** — default the
    session's base branch, `--into <branch>` overrides — via the standard
    merge machinery:
@@ -71,6 +76,11 @@ Interactions:
 - Harvesting onto the currently-checked-out branch goes through the
   normal merge path, so the existing dirty-working-tree refusal applies
   (resolve by committing/stashing the user tree first). Documented.
+  **[As shipped: the landing branch (default the session's base branch,
+  `--into` overrides) must BE the currently-checked-out branch; `sc ws
+  harvest` refuses with an `InvalidArgument` naming the landing branch
+  and a `sc switch` hint otherwise, because the merge machinery it
+  reuses whole (`merge_with_identity`) is head-centric — see ADR-0030.]**
 - Harvest is a ref-mover: it refuses while merge/pick/rebase state is in
   progress (the P19 guard family). Fork/list/run/abandon are not
   ref-movers and need no guards beyond the repo lock.
