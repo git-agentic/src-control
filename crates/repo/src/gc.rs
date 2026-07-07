@@ -18,7 +18,7 @@ use scl_core::{ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
-use crate::{merge_state, oplog, pick_state, reachable, refs};
+use crate::{merge_state, oplog, pick_state, reachable, rebase_state, refs};
 
 /// What a gc pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,8 +34,10 @@ pub struct GcStats {
 /// in-progress cherry-pick's picked commit (completion re-reads its rules;
 /// its source branch could be deleted mid-pick) + every snapshot id still
 /// referenced by the (already-trimmed) oplog — undo/redo must never dangle a
-/// snapshot it can still restore to. An in-progress merge's or pick's decided
-/// carried tree is a TREE root and is added separately in [`run`].
+/// snapshot it can still restore to + a stopped rebase's accumulated fold
+/// tip (`acc_tip` — the last landed snapshot; a `--continue` folds onward
+/// from it). An in-progress merge's, pick's, or rebase's decided carried
+/// tree is a TREE root and is added separately in [`run`].
 fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     let mut set: BTreeSet<ObjectId> = BTreeSet::new();
     for (_, id) in refs::list_heads(layout)? {
@@ -52,6 +54,9 @@ fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     }
     if let Some(id) = pick_state::read_pick_head(layout)? {
         set.insert(id);
+    }
+    if let Some(st) = rebase_state::read(layout)? {
+        set.insert(st.acc_tip);
     }
     for id in oplog::referenced_ids(layout)? {
         set.insert(id);
@@ -93,6 +98,9 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
         if let Some(tree) = pick_state::read_decided_root(layout)? {
             reachable::walk_tree(store, tree, &mut reachable)?;
         }
+    }
+    if let Some(tree) = rebase_state::read_decided_root(layout)? {
+        reachable::walk_tree(store, tree, &mut reachable)?;
     }
 
     // 1. Repack the entire reachable set into one fresh pack (skip if empty).
@@ -305,6 +313,81 @@ mod tests {
         assert!(
             s.contains(&decided_tree) && s.contains(&decided_blob),
             "PICK_DECIDED_ROOT must protect the decided carried tree + its blobs"
+        );
+        drop(s);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn gc_protects_rebase_acc_tip_and_rebase_decided_root() {
+        // P19 Task 1: a stopped rebase's accumulated fold tip (REBASE_STATE's
+        // acc_tip) and its decided carried tree (REBASE_DECIDED_ROOT) must
+        // survive a mid-rebase gc — `--continue` folds onward from acc_tip,
+        // and completion carries absent protected files from the decided
+        // tree, mirroring the merge/pick decided-root protections above.
+        let root = tmp_root("rebasestate");
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base").unwrap();
+        let base = repo.commit("t", "c1").unwrap();
+        // Build `acc_tip` as a snapshot object put directly into the store
+        // (never through `repo.commit`), so it is reachable from no ref AND
+        // referenced by no oplog record — the only thing keeping it alive
+        // is REBASE_STATE's `acc_tip` field. Going through `repo.commit`
+        // would leave an oplog record naming it too, masking whether
+        // `roots()`'s `set.insert(st.acc_tip)` is actually load-bearing.
+        let acc_tip = {
+            let arc = repo.vfs().store();
+            let mut s = arc.lock().unwrap();
+            let base_snap = s.get_snapshot(&base).unwrap();
+            s.put(Object::Snapshot(scl_core::Snapshot {
+                root: base_snap.root,
+                parents: vec![base],
+                author: "t".into(),
+                timestamp: base_snap.timestamp,
+                message: "folded".into(),
+                secrets: Default::default(),
+                protection: Default::default(),
+            }))
+            .unwrap()
+        };
+        // Record a decided carried tree reachable from NO snapshot — exactly
+        // what the rebase conflict path writes; completion needs it after a
+        // mid-rebase gc.
+        let (decided_blob, decided_tree) = {
+            let arc = repo.vfs().store();
+            let mut s = arc.lock().unwrap();
+            let blob = s.put(Object::blob(b"rebase-decided-only-bytes".to_vec())).unwrap();
+            let tree = s
+                .put(Object::Tree(scl_core::Tree::new(vec![scl_core::TreeEntry {
+                    name: "d.txt".into(),
+                    kind: scl_core::EntryKind::Blob,
+                    id: blob,
+                    mode: scl_core::FileMode::FILE,
+                    perms: 0,
+                }])))
+                .unwrap();
+            (blob, tree)
+        };
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: acc_tip,
+            target: "target".into(),
+            acc_tip,
+            conflicted: ObjectId::of(b"conflicted-commit"),
+            remaining: vec![ObjectId::of(b"remaining-commit")],
+            total: 3,
+            author: "t".into(),
+        };
+        crate::rebase_state::write(repo.layout(), &st).unwrap();
+        crate::rebase_state::write_decided_root(repo.layout(), decided_tree).unwrap();
+
+        repo.gc(Duration::from_secs(0)).unwrap();
+        let arc = repo.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(s.contains(&acc_tip), "REBASE_STATE's acc_tip must protect the fold's landed progress");
+        assert!(
+            s.contains(&decided_tree) && s.contains(&decided_blob),
+            "REBASE_DECIDED_ROOT must protect the decided carried tree + its blobs"
         );
         drop(s);
         std::fs::remove_dir_all(&root).unwrap();

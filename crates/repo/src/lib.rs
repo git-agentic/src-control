@@ -18,6 +18,7 @@ pub mod pick_state;
 pub mod protect;
 pub mod protect_ops;
 pub mod reachable;
+pub mod rebase_state;
 pub mod refs;
 pub mod remote;
 pub mod replay;

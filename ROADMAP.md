@@ -148,9 +148,11 @@ across every phase.
 
 ## Active
 
-None — Phase 19 is next up.
+- **Phase 19 — History-editing polish.** In build. Spec:
+  `docs/superpowers/specs/2026-07-07-p19-history-polish-design.md`
+  (ADR-0029, Proposed → Accepted at completion).
 
-## Next horizon (P19–P20)
+## Next horizon (P20)
 
 Decided 2026-07-07 (design: `docs/superpowers/specs/2026-07-07-roadmap-horizon-p16-p20-design.md`).
 Theme: finish the confidentiality story end to end before pushing for
@@ -161,7 +163,6 @@ and the arc continues toward adoption.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
-| **P19 — History-editing polish** | amend, resumable rebase, pick abort, merge replay | interrupt a rebase on a conflict, resolve, `sc rebase --continue`; proven by the extended history demo | [0029](docs/adr/0029-history-editing-polish.md) |
 | **P20 — Agent sessions + auto-merge** | Durable `sc ws` sessions; clean results land unattended | fork workspaces, return in a later invocation, harvest; clean results auto-merge to an integration branch | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
 
 Ordering rationale: P16+P17 are one story (durable revoke, then practical

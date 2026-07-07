@@ -989,6 +989,7 @@ fn run_status(json: bool) -> Result<()> {
                 "merge_in_progress": repo.merge_in_progress(),
                 "conflicts": repo.merge_conflicts()?,
                 "pick_in_progress": repo.pick_in_progress(),
+                "rebase_in_progress": repo.rebase_in_progress(),
             })
         );
         return Ok(());
@@ -1009,9 +1010,19 @@ fn run_status(json: bool) -> Result<()> {
             println!("cherry-pick in progress: {}", id.short());
         }
     }
+    if repo.rebase_in_progress() {
+        if let Some((conflicted, done, total)) = repo.rebase_progress()? {
+            println!(
+                "rebase in progress: stopped at {} ({} of {}); resolve conflicts then 'sc rebase --continue', or 'sc rebase --abort'",
+                conflicted.short(),
+                done + 1,
+                total
+            );
+        }
+    }
     let s = repo.status()?;
     if s.added.is_empty() && s.modified.is_empty() && s.deleted.is_empty() {
-        if !repo.merge_in_progress() && !repo.pick_in_progress() {
+        if !repo.merge_in_progress() && !repo.pick_in_progress() && !repo.rebase_in_progress() {
             println!("clean (working tree matches HEAD)");
         }
         return Ok(());

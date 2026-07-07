@@ -290,6 +290,9 @@ impl Repo {
         if crate::pick_state::in_progress(&self.layout) {
             return Err(Error::PickInProgress);
         }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
+        }
         let ours_tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let picked_tip = refs::resolve_tip(&self.layout, refname)?
             .ok_or_else(|| Error::NoSuchBranch(refname.to_string()))?;
@@ -534,6 +537,9 @@ impl Repo {
         }
         if crate::pick_state::in_progress(&self.layout) {
             return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
         }
         let ours_tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let target_tip = refs::resolve_tip(&self.layout, target)?

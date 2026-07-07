@@ -46,6 +46,9 @@ impl Repo {
         if crate::pick_state::in_progress(self.layout()) {
             return Err(Error::PickInProgress);
         }
+        if crate::rebase_state::in_progress(self.layout()) {
+            return Err(Error::RebaseInProgress);
+        }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let snap = self.snapshot(&tip)?;
         let mut skipped: Vec<(String, String)> = Vec::new();

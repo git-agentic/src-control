@@ -36,6 +36,8 @@ pub enum Error {
     MergeConflicts(usize),
     #[error("a cherry-pick is already in progress (resolve the marked files then `sc commit`)")]
     PickInProgress,
+    #[error("a rebase is already in progress (resolve and `sc rebase --continue`, or `sc rebase --abort`)")]
+    RebaseInProgress,
     #[error("cherry-pick produced {0} conflict(s); resolve the marked files then `sc commit`")]
     PickConflicts(usize),
     #[error("protected path {0} changed on both sides; re-run with --identity <key> to merge its content")]

@@ -359,6 +359,9 @@ impl Repo {
     /// Files under a protected prefix are convergently encrypted (scanner-exempt);
     /// only plaintext files are scanned.
     pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
+        }
         let head = refs::current_branch(&self.layout)?;
         let before = refs::read_branch_tip(&self.layout, &head)?;
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
@@ -585,6 +588,20 @@ impl Repo {
         crate::pick_state::read_conflicts(&self.layout)
     }
 
+    /// Whether a rebase is currently stopped mid-flight.
+    pub fn rebase_in_progress(&self) -> bool {
+        crate::rebase_state::in_progress(&self.layout)
+    }
+
+    /// The stopped rebase's progress, if any: (conflicted commit, done
+    /// count, total count). `done` counts the commits landed before the
+    /// stopped one — `total - remaining.len() - 1` — so callers display
+    /// "stopped at commit X (done + 1 of total)".
+    pub fn rebase_progress(&self) -> Result<Option<(ObjectId, usize, usize)>> {
+        Ok(crate::rebase_state::read(&self.layout)?
+            .map(|st| (st.conflicted, st.total - st.remaining.len() - 1, st.total)))
+    }
+
     /// Merge `branch` into the current branch. Fast-forwards when possible;
     /// auto-commits a two-parent snapshot on a clean merge; on conflicts writes
     /// markers + merge state and returns `MergeConflicts`. If the current
@@ -621,6 +638,9 @@ impl Repo {
         }
         if crate::pick_state::in_progress(&self.layout) {
             return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
         }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
@@ -3388,6 +3408,44 @@ mod tests {
         assert!(matches!(repo.merge("feature", "me"), Err(Error::PickInProgress)));
         assert!(matches!(repo.switch("feature"), Err(Error::PickInProgress)));
         assert!(matches!(repo.undo(), Err(Error::PickInProgress)));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commit_merge_pick_rebase_and_rewrap_refuse_during_rebase() {
+        // P19 Task 1: no other ref-moving or cutover operation may proceed
+        // while a rebase is stopped mid-fold — `sc rebase --continue` (Task
+        // 2) or `sc rebase --abort` are the only ways forward.
+        let root = tmp_root("rebase-guards");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+
+        let st = crate::rebase_state::RebaseState {
+            branch: "main".into(),
+            original_tip: ObjectId::of(b"orig"),
+            target: "feature".into(),
+            acc_tip: ObjectId::of(b"acc"),
+            conflicted: ObjectId::of(b"conflicted"),
+            remaining: vec![],
+            total: 2,
+            author: "me".into(),
+        };
+        crate::rebase_state::write(&repo.layout, &st).unwrap();
+        assert!(repo.rebase_in_progress());
+
+        assert!(matches!(repo.commit("me", "should refuse"), Err(Error::RebaseInProgress)));
+        assert!(matches!(repo.merge("feature", "me"), Err(Error::RebaseInProgress)));
+        assert!(matches!(repo.cherry_pick("feature", "me", None), Err(Error::RebaseInProgress)));
+        assert!(matches!(repo.rebase("feature", "me", None), Err(Error::RebaseInProgress)));
+        assert!(matches!(
+            repo.rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), false),
+            Err(Error::RebaseInProgress)
+        ));
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
