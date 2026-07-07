@@ -353,6 +353,22 @@ enum WsOp {
     },
     /// List the open session's workspaces (changed/unchanged vs base).
     List,
+    /// Run a command in one workspace checkout.
+    Run {
+        /// Workspace index to run in.
+        index: u32,
+        /// Decrypt and inject registered secrets into the command's environment
+        /// (requires --identity to be set).
+        #[arg(long)]
+        with_secrets: bool,
+        /// Identity file to decrypt protected paths and/or secrets (default
+        /// ~/.sc/identity or $SC_IDENTITY; required when --with-secrets is set).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// The command to run; `--` separates it from flags.
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// Abandon one workspace (by index) or the whole session.
     Abandon {
         /// Workspace index to abandon. Omit to abandon the whole session.
@@ -1596,7 +1612,7 @@ fn run_work(
     std::process::exit(if failed { 1 } else { 0 });
 }
 
-/// `sc ws`: durable agent-workspace session (fork/list/abandon).
+/// `sc ws`: durable agent-workspace session (fork/list/abandon/run).
 fn run_ws(op: WsOp) -> Result<()> {
     let repo = open_repo()?;
     match op {
@@ -1634,6 +1650,20 @@ fn run_ws(op: WsOp) -> Result<()> {
                 }
             }
         },
+        WsOp::Run { index, with_secrets, identity, cmd } => {
+            // Resolve identity: --with-secrets requires it (hard error);
+            // otherwise it's optional and only decrypts protected paths.
+            let sk = if with_secrets {
+                Some(load_identity(identity)?)
+            } else {
+                resolve_identity_opt(identity)?
+            };
+            let code = repo.ws_run(index, &cmd, with_secrets, sk.as_ref())?;
+            // Drop the repo before process::exit to ensure the RepoLock's Drop
+            // runs and releases .sc/lock (process::exit skips destructors).
+            drop(repo);
+            std::process::exit(code);
+        }
         WsOp::Abandon { index } => {
             let remaining = repo.ws_abandon(index)?;
             match index {

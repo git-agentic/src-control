@@ -257,6 +257,57 @@ impl Repo {
         }
         Ok(remaining)
     }
+
+    /// Run a command in one workspace checkout: spawns `cmd` in `entry.dir`
+    /// with SC_WORKSPACE and SC_WORKSPACE_DIR env vars set, optionally injecting
+    /// decrypted secrets, and returns the child's exit code. The workspace must be
+    /// live (not abandoned); the session must be open. No oplog record, no harvest,
+    /// no manifest rewrite — the workspace checkout persists for later harvest.
+    pub fn ws_run(
+        &self,
+        index: u32,
+        cmd: &[String],
+        with_secrets: bool,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<i32> {
+        let session = read_manifest(self.layout())?
+            .ok_or_else(|| Error::InvalidArgument("no workspace session open".into()))?;
+        let entry = session
+            .workspaces
+            .iter()
+            .find(|e| e.index == index)
+            .ok_or_else(|| Error::InvalidArgument(format!("no such workspace: {index}")))?;
+        if !entry.live {
+            return Err(Error::InvalidArgument(format!("no such workspace: {index}")));
+        }
+
+        // Build secret env vars if requested (strict mode, mirroring `sc work`).
+        let secret_envs = if with_secrets {
+            let sk = identity.ok_or_else(|| {
+                Error::InvalidArgument("--with-secrets requires an identity".into())
+            })?;
+            self.secret_env(sk, /*strict=*/ true)?
+        } else {
+            Vec::new()
+        };
+
+        // Spawn the command in the workspace directory with env vars set.
+        let (exe, args) = cmd
+            .split_first()
+            .ok_or_else(|| Error::InvalidArgument("empty command".into()))?;
+        let mut command = std::process::Command::new(exe);
+        command
+            .args(args)
+            .current_dir(&entry.dir)
+            .env("SC_WORKSPACE", format!("ws-{}", entry.index))
+            .env("SC_WORKSPACE_DIR", &entry.dir);
+        for (k, v) in &secret_envs {
+            command.env(k, v);
+        }
+
+        let status = command.status()?;
+        Ok(status.code().unwrap_or(1))
+    }
 }
 
 #[cfg(test)]
@@ -433,6 +484,111 @@ mod tests {
             "once the session is abandoned, the base snapshot may be pruned"
         );
         drop(s);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ws_run_sets_env_and_cwd() {
+        let root = tmp_root("ws_run_env");
+        let repo = init(&root);
+        let session = repo.ws_fork(2, "t", None).unwrap();
+        let entry = &session.workspaces[1]; // ws-2
+
+        // Run a command that writes SC_WORKSPACE and pwd to files.
+        let exit = repo
+            .ws_run(
+                entry.index,
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo \"$SC_WORKSPACE\" > env.txt; pwd > cwd.txt".to_string(),
+                ],
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(exit, 0);
+
+        // Check SC_WORKSPACE holds the label "ws-2".
+        let env_content = std::fs::read_to_string(entry.dir.join("env.txt")).unwrap();
+        assert_eq!(env_content.trim(), "ws-2");
+
+        // Check pwd matches the workspace dir (canonicalize both to handle symlinks).
+        let cwd_content = std::fs::read_to_string(entry.dir.join("cwd.txt")).unwrap();
+        let expected_dir = std::fs::canonicalize(&entry.dir).unwrap();
+        let actual_dir = std::fs::canonicalize(cwd_content.trim()).unwrap();
+        assert_eq!(actual_dir, expected_dir);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ws_run_with_secrets_injects() {
+        let root = tmp_root("ws_run_secrets");
+        let repo = init(&root);
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.secret_add("DEMO_TOKEN", b"tok-123", &[pk]).unwrap();
+
+        let session = repo.ws_fork(1, "t", Some(&sk)).unwrap();
+        let entry = &session.workspaces[0];
+
+        let exit = repo
+            .ws_run(
+                entry.index,
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf %s \"$DEMO_TOKEN\" > tok.txt".to_string(),
+                ],
+                true,
+                Some(&sk),
+            )
+            .unwrap();
+
+        assert_eq!(exit, 0);
+
+        // Verify the decrypted secret value was written to the file.
+        let tok_content = std::fs::read_to_string(entry.dir.join("tok.txt")).unwrap();
+        assert_eq!(tok_content, "tok-123");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ws_run_bad_index_errors() {
+        let root = tmp_root("ws_run_bad");
+        let repo = init(&root);
+        let _session = repo.ws_fork(2, "t", None).unwrap();
+
+        // Non-existent workspace index.
+        let err = repo
+            .ws_run(
+                999,
+                &["sh".to_string(), "-c".to_string(), "true".to_string()],
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+        assert!(err.to_string().contains("no such workspace: 999"));
+
+        // Abandon workspace 1, then try to run in it.
+        repo.ws_abandon(Some(1)).unwrap();
+        let err = repo
+            .ws_run(
+                1,
+                &["sh".to_string(), "-c".to_string(), "true".to_string()],
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+        assert!(err.to_string().contains("no such workspace: 1"));
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
