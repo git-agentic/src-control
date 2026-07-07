@@ -416,6 +416,33 @@ impl Repo {
             session.workspaces.iter().filter(|e| e.live).map(|e| e.index).collect();
         live_indices.sort_unstable();
 
+        // Preflight: if any live workspace actually diverged, a candidate
+        // branch is about to be minted for it and landed via
+        // `merge_with_identity`, whose own dirty-tree guard fires only
+        // *after* `harvest_workspace` has already created that branch — with
+        // no CLI command to delete a stray branch, that guard tripping mid-
+        // loop leaves permanent residue. Run the same check here, up front,
+        // before any `harvest_workspace` call, so a dirty landing tree is
+        // refused before anything is minted. A session where every live
+        // workspace is unchanged never merges anything, so it still harvests
+        // (and ends) even with a dirty tree.
+        let any_changed = session
+            .workspaces
+            .iter()
+            .filter(|e| e.live)
+            .map(|e| self.ws_changed(e))
+            .collect::<Result<Vec<bool>>>()?
+            .into_iter()
+            .any(|changed| changed);
+        if any_changed {
+            let dirty = self.status()?;
+            if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
+                return Err(Error::InvalidArgument(
+                    "working tree has uncommitted changes; commit before harvesting".into(),
+                ));
+            }
+        }
+
         let mut outcomes = Vec::with_capacity(live_indices.len());
         for i in live_indices {
             let dir = session
@@ -483,36 +510,67 @@ impl Repo {
                         .ok_or(Error::Unborn)?;
                     let clean = self.would_merge_cleanly(current_tip, id, identity)?;
                     if clean {
-                        // The probe promised a clean merge. `merge_with_identity`
-                        // returns `Ok` only when the merge is actually clean
-                        // (a real conflict is `Err(MergeConflicts(_))`, raised
-                        // *after* writing markers to disk) — so a disagreement
-                        // here means our own mirroring of three_way's
-                        // parameters is wrong, not a normal user-facing
-                        // conflict. Bail loudly before any teardown; the
-                        // second tuple element is skipped protected paths
-                        // (missing-identity skips), not conflicts, and is
-                        // intentionally not inspected here.
-                        let (merged, _skipped) =
-                            self.merge_with_identity(&branch, author, identity).map_err(|e| {
-                                if matches!(e, Error::MergeConflicts(_)) {
+                        // The second tuple element on `Ok` is skipped
+                        // protected paths (missing-identity skips), not
+                        // conflicts, and is intentionally not inspected here.
+                        match self.merge_with_identity(&branch, author, identity) {
+                            Ok((merged, _skipped)) => {
+                                // The candidate ref served its purpose
+                                // (merge_with_identity resolved by branch
+                                // name, not object id).
+                                refs::delete_branch(self.layout(), &branch)?;
+                                resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                                outcomes.push(WsHarvestOutcome::Landed { index: i, merged_tip: merged });
+                            }
+                            Err(Error::UpToDate) => {
+                                // The candidate is already an ancestor of the
+                                // landing tip. Reproduced by: land ws-i
+                                // normally, then kill -9 between the branch
+                                // ref update and the manifest rewrite that
+                                // resolves the entry — a re-harvest of the
+                                // same workspace at the same clock second
+                                // re-mints an IDENTICAL candidate id (same
+                                // parent, same tree, same author/message/
+                                // timestamp), which is already reachable from
+                                // `landing`. This is not a conflict or a
+                                // probe/merge disagreement: the work IS
+                                // already in the landing history, so this is
+                                // a successful no-op resolution, not an
+                                // error.
+                                refs::delete_branch(self.layout(), &branch)?;
+                                resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                                outcomes.push(WsHarvestOutcome::Landed {
+                                    index: i,
+                                    merged_tip: current_tip,
+                                });
+                            }
+                            Err(e) => {
+                                // The probe promised a clean merge.
+                                // `merge_with_identity` returns `Ok` only
+                                // when the merge is actually clean (a real
+                                // conflict is `Err(MergeConflicts(_))`,
+                                // raised *after* writing markers to disk;
+                                // `Err(UpToDate)` is handled above) — so a
+                                // disagreement here means our own mirroring
+                                // of three_way's parameters is wrong, not a
+                                // normal user-facing conflict. Bail loudly
+                                // before any teardown.
+                                return Err(if matches!(e, Error::MergeConflicts(_)) {
                                     Error::BadRef(format!(
                                         "ws harvest: probe predicted a clean merge of {branch} \
                                          into {landing}, but merge_with_identity found conflicts \
                                          ({e}) — this is a probe/merge disagreement bug, not a \
-                                         normal conflict; conflict markers from the failed merge \
-                                         attempt may already be on disk in {landing}'s working \
-                                         tree; investigate before retrying `sc ws harvest`"
+                                         normal conflict. Conflict markers ARE on disk in \
+                                         {landing}'s working tree and a merge is now in progress: \
+                                         resolve the markers then `sc commit` to complete the \
+                                         landing (the next `sc ws harvest` is guarded meanwhile by \
+                                         the merge-in-progress check)"
                                     ))
                                 } else {
                                     e
-                                }
-                            })?;
-                        // The candidate ref served its purpose (merge_with_identity
-                        // resolved by branch name, not object id).
-                        refs::delete_branch(self.layout(), &branch)?;
-                        resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
-                        outcomes.push(WsHarvestOutcome::Landed { index: i, merged_tip: merged });
+                                });
+                            }
+                        }
                     } else {
                         // Keep the candidate branch for manual resolution.
                         resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
@@ -543,8 +601,15 @@ fn resolve_and_teardown(
     if let Some(entry) = session.workspaces.iter_mut().find(|e| e.index == index) {
         entry.live = false;
     }
+    // Manifest first, then dir removal: a crash between the two leaves the
+    // entry already recorded `live = false` with a dir that still happens to
+    // exist (harmless, cleaned up by a future `sc ws fork`'s root removal or
+    // left as inert residue) rather than `live = true` pointing at a dir that
+    // is already gone (which would wedge a later `ws_changed`/harvest on an
+    // io error with no recorded recovery path).
+    write_manifest(layout, session)?;
     let _ = std::fs::remove_dir_all(dir);
-    write_manifest(layout, session)
+    Ok(())
 }
 
 /// Outcome of harvesting one live workspace.
@@ -1040,8 +1105,10 @@ mod tests {
         assert!(matches!(repo.ws_harvest(None, "t", None), Err(Error::RebaseInProgress)));
         crate::rebase_state::clear(repo.layout()).unwrap();
 
-        // (b) dirty user working tree -> InvalidArgument (the merge path's
-        // dirty refusal), session intact.
+        // (b) dirty user working tree -> InvalidArgument, caught by the
+        // up-front preflight (not merge_with_identity's own dirty guard) so
+        // no candidate branch is ever minted for the live, changed workspace.
+        // Session intact.
         std::fs::write(session.workspaces[0].dir.join("a.txt"), "ws-edit\n").unwrap();
         std::fs::write(root.join("a.txt"), "dirty-uncommitted\n").unwrap();
         let err = repo.ws_harvest(None, "t", None).unwrap_err();
@@ -1049,6 +1116,13 @@ mod tests {
 
         let after = repo.ws_session().unwrap().expect("session must still be open");
         assert!(after.workspaces[0].live, "workspace must remain live after the abort");
+
+        // No stray work-1 branch: the preflight refused before
+        // `harvest_workspace` ever ran.
+        assert!(
+            crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap().is_none(),
+            "preflight must refuse before any candidate branch is minted"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -1094,6 +1168,71 @@ mod tests {
             WsHarvestOutcome::Unchanged { index: 2 } => {}
             other => panic!("expected Unchanged(2) once the leak is removed, got {other:?}"),
         }
+        assert!(repo.ws_session().unwrap().is_none());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_reharvest_after_crash_window_is_idempotent() {
+        let root = tmp_root("harvest-reharvest");
+        let repo = init(&root);
+        let session = repo.ws_fork(1, "t", None).unwrap();
+        let dir = session.workspaces[0].dir.clone();
+        std::fs::write(dir.join("a.txt"), "edited-a\n").unwrap();
+
+        // Reproduction requires the two `harvest_workspace` calls below to
+        // fall in the same `unix_now()` second (both mint a commit from the
+        // same parent/tree/author/message; only the timestamp can differ).
+        // Align to a fresh second boundary first so the whole sequence below
+        // — which takes low tens of milliseconds — has close to a full
+        // second of headroom, instead of racing an arbitrary boundary.
+        let start_second = crate::repo::unix_now();
+        while crate::repo::unix_now() == start_second {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        let landed_tip = match &outcomes[0] {
+            WsHarvestOutcome::Landed { index: 1, merged_tip } => *merged_tip,
+            other => panic!("expected Landed(1), got {other:?}"),
+        };
+        assert!(repo.ws_session().unwrap().is_none(), "session must have ended");
+
+        // Simulate a kill -9 between the candidate branch landing and the
+        // manifest rewrite that would have resolved the entry: re-mark ws-1
+        // live and restore its checkout dir with identical content, so a
+        // re-harvest re-mints an identical candidate id (same parent, tree,
+        // author, and message; timestamp matches too as long as this test
+        // doesn't straddle a wall-clock second boundary).
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "edited-a\n").unwrap();
+        let crashed = WsSession {
+            base_snapshot: session.base_snapshot,
+            base_branch: session.base_branch.clone(),
+            author: session.author.clone(),
+            workspaces: vec![WsEntry { index: 1, dir: dir.clone(), live: true }],
+        };
+        write_manifest(repo.layout(), &crashed).unwrap();
+
+        // Re-harvest: no error, resolves as a no-op Landed at the existing
+        // tip, and leaves no stray branch behind.
+        let outcomes2 = repo.ws_harvest(None, "t", None).unwrap();
+        assert_eq!(outcomes2.len(), 1);
+        match &outcomes2[0] {
+            WsHarvestOutcome::Landed { index: 1, merged_tip } => {
+                assert_eq!(
+                    *merged_tip, landed_tip,
+                    "re-harvest of an already-landed workspace must resolve to the existing landing tip"
+                );
+            }
+            other => panic!("expected Landed(1), got {other:?}"),
+        }
+        assert!(
+            crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap().is_none(),
+            "no stray candidate branch after the UpToDate no-op resolution"
+        );
         assert!(repo.ws_session().unwrap().is_none());
 
         drop(repo);
