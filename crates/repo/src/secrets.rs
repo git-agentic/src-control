@@ -26,12 +26,12 @@ impl Repo {
     }
 
     /// Return the Arc-wrapped store (avoids borrow-of-temporary issues).
-    fn store_arc(&self) -> Arc<Mutex<Store>> {
+    pub(crate) fn store_arc(&self) -> Arc<Mutex<Store>> {
         self.store()
     }
 
     /// The current tip's secret registry (empty if unborn).
-    fn registry(&self) -> Result<BTreeMap<String, ObjectId>> {
+    pub(crate) fn registry(&self) -> Result<BTreeMap<String, ObjectId>> {
         match self.head_tip()? {
             Some(t) => {
                 let arc = self.store_arc();
@@ -305,6 +305,18 @@ pub(crate) fn require_recipients(recipients: &[PublicKey]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Append `extra` onto `base`, deduping by `recipient_id` (base wins on
+/// collision). The same dedupe-append loop `append_escrow` does CLI-side,
+/// shared here so `rewrap` composes it instead of re-implementing it.
+pub(crate) fn append_dedup(mut base: Vec<PublicKey>, extra: &[PublicKey]) -> Vec<PublicKey> {
+    for pk in extra {
+        if !base.iter().any(|t| t.recipient_id() == pk.recipient_id()) {
+            base.push(pk.clone());
+        }
+    }
+    base
 }
 
 #[cfg(test)]

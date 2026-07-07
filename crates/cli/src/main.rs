@@ -262,6 +262,16 @@ enum Cmd {
         #[command(subcommand)]
         op: EscrowOp,
     },
+    /// Re-seal every secret and protected file's wrap list at the tip to the
+    /// current recipient + escrow sets, in one undoable commit.
+    Rewrap {
+        /// Identity able to open the entries being re-wrapped.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Report what would be re-wrapped without committing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Revert the last operation (run again to redo).
     Undo,
     /// List recent operations, newest first.
@@ -270,9 +280,13 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum EscrowOp {
-    /// Set the escrow key (a `scl-pk-…` pubkey, or a name from [recipients]).
+    /// Replace the whole escrow list with this one key (back-compat sugar).
     Set { key_or_name: String },
-    /// Show the configured escrow key (and its recovery non-guarantee).
+    /// Append a key to the escrow list (deduped).
+    Add { key_or_name: String },
+    /// Remove one escrow key by recipient id or [recipients] name.
+    Remove { id_or_name: String },
+    /// List the configured escrow keys.
     Show,
 }
 
@@ -416,6 +430,7 @@ fn main() -> Result<()> {
         Cmd::Gc { prune_expire } => run_gc(&prune_expire),
         Cmd::Export { to, r#ref, include_encrypted } => run_export(to, r#ref, include_encrypted),
         Cmd::Escrow { op } => run_escrow(op),
+        Cmd::Rewrap { identity, dry_run } => run_rewrap(identity, dry_run),
         Cmd::Undo => run_undo(),
         Cmd::Oplog => run_oplog(),
     }
@@ -689,19 +704,23 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
 // ---- .sc/recipients.toml loader ------------------------------------
 
 /// Parsed `.sc/recipients.toml`: `[recipients] name -> scl-pk-<hex>`, plus an
-/// optional `[escrow]` break-glass key auto-included at seal/protect time.
+/// optional `[escrow]` break-glass keys auto-included at seal/protect time.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct RecipientsFile {
     #[serde(default)]
     recipients: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    escrow: Option<EscrowEntry>,
+    escrow: Option<EscrowSection>,
 }
 
-/// A single break-glass escrow recipient entry: `[escrow] key = "scl-pk-…"`.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct EscrowEntry {
-    key: String,
+/// The `[escrow]` section: historically a single `key = "scl-pk-…"`, now a
+/// `keys = […]` list. Both forms parse; writes always emit `keys` (P17).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct EscrowSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    keys: Vec<String>,
 }
 
 /// Resolve recipient names to public keys from a recipients file.
@@ -720,22 +739,45 @@ fn load_recipients(
     Ok(out)
 }
 
-/// The configured escrow public key, if any. Missing file or missing `[escrow]`
-/// section → `None`.
-fn load_escrow(path: &std::path::Path) -> Result<Option<scl_crypto::PublicKey>> {
+/// All configured escrow public keys (old `key` + new `keys`, deduped, in
+/// file order). Missing file or section → empty vec.
+fn load_escrows(path: &std::path::Path) -> Result<Vec<scl_crypto::PublicKey>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
     let parsed: RecipientsFile = toml::from_str(&text)?;
-    match parsed.escrow {
-        Some(e) => Ok(Some(
-            scl_crypto::PublicKey::from_key_string(&e.key)
-                .map_err(|_| anyhow::anyhow!("bad escrow public key"))?,
-        )),
-        None => Ok(None),
+    let Some(section) = parsed.escrow else { return Ok(Vec::new()) };
+    let mut out: Vec<scl_crypto::PublicKey> = Vec::new();
+    for k in section.key.iter().chain(section.keys.iter()) {
+        let pk = scl_crypto::PublicKey::from_key_string(k)
+            .map_err(|_| anyhow::anyhow!("bad escrow public key"))?;
+        if !out.iter().any(|e| e.recipient_id() == pk.recipient_id()) {
+            out.push(pk);
+        }
     }
+    Ok(out)
+}
+
+/// Write escrow keys to `.sc/recipients.toml`, normalizing to the `keys` list
+/// form (never `key`). Preserves `[recipients]`. Removes `[escrow]` if empty.
+fn write_escrow_keys(path: &std::path::Path, keys: Vec<scl_crypto::PublicKey>) -> Result<()> {
+    let mut file: RecipientsFile = match std::fs::read_to_string(path) {
+        Ok(t) => toml::from_str(&t)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RecipientsFile::default(),
+        Err(e) => return Err(e.into()),
+    };
+    file.escrow = if keys.is_empty() {
+        None
+    } else {
+        Some(EscrowSection {
+            key: None,
+            keys: keys.iter().map(|k| k.to_key_string()).collect(),
+        })
+    };
+    std::fs::write(path, toml::to_string(&file)?)?;
+    Ok(())
 }
 
 // ---- sc secret-demo ------------------------------------------------
@@ -1177,7 +1219,8 @@ fn run_secret(op: SecretOp) -> Result<()> {
             };
             let dir = load_recipients(&recipients_path)?;
             let mut pks = resolve_names(&dir, &to)?;
-            pks = append_escrow(pks, load_escrow(&recipients_path)?);
+            let escrows = load_escrows(&recipients_path)?;
+            pks = append_escrow(pks, &escrows);
             repo.secret_add(&name, value.as_bytes(), &pks)?;
             println!("added secret {name} for {} recipient(s)", pks.len());
         }
@@ -1195,7 +1238,7 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("bad recipient id"))?;
             repo.secret_revoke(&name, &rid)?;
             println!("revoked {recipient_id} from {name}");
-            eprintln!("note: revoke is metadata-only; run `sc secret rotate {name}` for a cryptographic cutover");
+            eprintln!("hint: run `sc secret rotate {name} --identity <key>` for a cryptographic cutover of this secret, or `sc rewrap` to re-seal everything at once");
         }
         SecretOp::List { json } => {
             let infos = repo.secret_list()?;
@@ -1218,20 +1261,18 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 (None, false) => None,
             };
             let dir = load_recipients(&recipients_path)?;
-            let escrow = load_escrow(&recipients_path)?;
+            let escrows = load_escrows(&recipients_path)?;
             // Recipient set: explicit --to, else the secret's current recipients.
             let pks = if to.is_empty() {
                 let ids = repo.secret_recipients(&name)?;
                 // Pool = named recipients + escrow, so an escrow-only id resolves.
                 let mut pool: Vec<scl_crypto::PublicKey> = dir.values().cloned().collect();
-                if let Some(e) = escrow.clone() {
-                    pool.push(e);
-                }
+                pool.extend(escrows.iter().cloned());
                 resolve_ids_to_pubkeys(&ids, &pool)?
             } else {
                 resolve_names(&dir, &to)?
             };
-            let pks = append_escrow(pks, escrow);
+            let pks = append_escrow(pks, &escrows);
             let new_value = value.as_deref().map(|s| s.as_bytes());
             let identity = match &value {
                 Some(_) => None, // sealing a new value needs no decryption
@@ -1247,45 +1288,76 @@ fn run_secret(op: SecretOp) -> Result<()> {
     Ok(())
 }
 
-/// `sc escrow set/show`: configure (or display) the break-glass escrow
-/// recipient in `.sc/recipients.toml`. Config only — auto-including the
-/// escrow key at seal/protect time is a separate concern.
+/// `sc escrow set/add/remove/show`: manage the break-glass escrow recipient
+/// keys in `.sc/recipients.toml`. Config only — auto-including the escrow
+/// keys at seal/protect time is a separate concern.
 fn run_escrow(op: EscrowOp) -> Result<()> {
     let repo = open_repo()?;
     let path = repo.layout().dot_sc.join("recipients.toml");
+
+    // Helper to resolve a public-key-or-name string to a PublicKey.
+    let resolve_pubkey = |s: &str| -> Result<scl_crypto::PublicKey> {
+        match scl_crypto::PublicKey::from_key_string(s) {
+            Ok(pk) => Ok(pk),
+            Err(_) => {
+                let dir = load_recipients(&path)?;
+                dir.get(s)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("'{s}' is not a public key or a known recipient"))
+            }
+        }
+    };
+
     match op {
         EscrowOp::Set { key_or_name } => {
-            // Accept a raw pubkey, else resolve a [recipients] name.
-            let pk = match scl_crypto::PublicKey::from_key_string(&key_or_name) {
-                Ok(pk) => pk,
-                Err(_) => {
-                    let dir = load_recipients(&path)?;
-                    dir.get(&key_or_name).cloned().ok_or_else(|| {
-                        anyhow::anyhow!("'{key_or_name}' is not a public key or a known recipient")
-                    })?
-                }
-            };
-            // Round-trip the file so [recipients] is preserved.
-            let mut file: RecipientsFile = match std::fs::read_to_string(&path) {
-                Ok(t) => toml::from_str(&t)?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => RecipientsFile::default(),
-                Err(e) => return Err(e.into()),
-            };
-            file.escrow = Some(EscrowEntry { key: pk.to_key_string() });
-            std::fs::write(&path, toml::to_string(&file)?)?;
+            let pk = resolve_pubkey(&key_or_name)?;
+            write_escrow_keys(&path, vec![pk.clone()])?;
             println!("escrow set to {}", pk.recipient_id());
         }
-        EscrowOp::Show => match load_escrow(&path)? {
-            Some(pk) => {
-                println!("escrow key: {}", pk.to_key_string());
-                println!("recipient id: {}", pk.recipient_id());
-                println!(
-                    "note: escrow is a recovery *policy* convenience, not enforcement — a \
-                     committer using the raw API can seal without it."
-                );
+        EscrowOp::Add { key_or_name } => {
+            let pk = resolve_pubkey(&key_or_name)?;
+            let mut keys = load_escrows(&path)?;
+            keys = append_escrow(keys, &[pk.clone()]);
+            write_escrow_keys(&path, keys.clone())?;
+            println!("escrow key added: {} ({} total)", pk.recipient_id(), keys.len());
+        }
+        EscrowOp::Remove { id_or_name } => {
+            // Try parsing as a recipient id; if that fails, look it up in [recipients].
+            let target_id = match scl_crypto::RecipientId::from_hex(&id_or_name) {
+                Ok(rid) => rid,
+                Err(_) => {
+                    let dir = load_recipients(&path)?;
+                    dir.get(&id_or_name)
+                        .ok_or_else(|| anyhow::anyhow!("'{id_or_name}' is not an escrow key"))?
+                        .recipient_id()
+                }
+            };
+            let keys = load_escrows(&path)?;
+            let before_count = keys.len();
+            let keys: Vec<_> = keys
+                .into_iter()
+                .filter(|k| k.recipient_id() != target_id)
+                .collect();
+            if keys.len() == before_count {
+                return Err(anyhow::anyhow!("'{id_or_name}' is not an escrow key"));
             }
-            None => println!("no escrow key set"),
-        },
+            write_escrow_keys(&path, keys.clone())?;
+            println!("escrow key removed: {} ({} remain)", target_id, keys.len());
+        }
+        EscrowOp::Show => {
+            let keys = load_escrows(&path)?;
+            if keys.is_empty() {
+                println!("no escrow keys set");
+            } else {
+                for pk in keys {
+                    println!("{}: {}", pk.to_key_string(), pk.recipient_id());
+                }
+            }
+            println!(
+                "note: escrow is a recovery *policy* convenience, not enforcement — a \
+                 committer using the raw API can seal without it."
+            );
+        }
     }
     Ok(())
 }
@@ -1406,15 +1478,14 @@ fn resolve_identity_opt(flag: Option<PathBuf>) -> Result<Option<scl_crypto::Secr
     Ok(Some(scl_crypto::FileKeyProvider::new(path).identity()?))
 }
 
-/// Append `escrow` to `pks` unless a key with the same bytes is already present
-/// (so passing escrow explicitly is harmless).
+/// Append every escrow key to a seal recipient set, deduped by recipient id.
 fn append_escrow(
     mut pks: Vec<scl_crypto::PublicKey>,
-    escrow: Option<scl_crypto::PublicKey>,
+    escrows: &[scl_crypto::PublicKey],
 ) -> Vec<scl_crypto::PublicKey> {
-    if let Some(e) = escrow {
-        if !pks.iter().any(|p| p.to_bytes() == e.to_bytes()) {
-            pks.push(e);
+    for e in escrows {
+        if !pks.iter().any(|p| p.recipient_id() == e.recipient_id()) {
+            pks.push(e.clone());
         }
     }
     pks
@@ -1687,9 +1758,11 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
         return Ok(());
     }
     let prefix = prefix.unwrap();
-    let dir = load_recipients(&repo.layout().dot_sc.join("recipients.toml"))?;
+    let recipients_path = repo.layout().dot_sc.join("recipients.toml");
+    let dir = load_recipients(&recipients_path)?;
     let mut pks = resolve_names(&dir, &to)?;
-    pks = append_escrow(pks, load_escrow(&repo.layout().dot_sc.join("recipients.toml"))?);
+    let escrows = load_escrows(&recipients_path)?;
+    pks = append_escrow(pks, &escrows);
     let id = repo.protect(&prefix, &pks, None)?;
     println!("protected {prefix} for {} recipient(s): {}", pks.len(), id.short());
     Ok(())
@@ -1715,9 +1788,9 @@ fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
     println!("revoked {recipient_id} from {prefix}");
     eprintln!(
         "note: the revocation is recorded as a tombstone and holds across merges; \
-         it stops FUTURE seals only — run `sc secret rotate` / re-encrypt flows for \
-         a cryptographic cutover of existing values, and rotate the underlying \
-         external credential itself"
+         it stops FUTURE seals only. Run `sc rewrap --identity <key>` to strip the \
+         recipient's wraps from the tip (old history snapshots keep theirs), and \
+         rotate the underlying external credential itself for a real cutover"
     );
     Ok(())
 }
@@ -1779,6 +1852,56 @@ fn run_gc(prune_expire: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_rewrap(identity: Option<PathBuf>, dry_run: bool) -> Result<()> {
+    let repo = open_repo()?;
+    let sk = load_identity(identity)?;
+    let recipients_path = repo.layout().dot_sc.join("recipients.toml");
+    let escrows = load_escrows(&recipients_path)?;
+    // Known-key pool for reverse recipient_id resolution: every [recipients]
+    // key + every escrow key + the identity's own public key.
+    let mut known: Vec<scl_crypto::PublicKey> = match load_recipients(&recipients_path) {
+        Ok(dir) => dir.into_values().collect(),
+        Err(_) => Vec::new(), // missing file: pool is escrow + self
+    };
+    for e in &escrows {
+        if !known.iter().any(|k| k.recipient_id() == e.recipient_id()) {
+            known.push(e.clone());
+        }
+    }
+    let me = sk.public();
+    if !known.iter().any(|k| k.recipient_id() == me.recipient_id()) {
+        known.push(me);
+    }
+
+    let report = repo.rewrap(&sk, &escrows, &known, dry_run)?;
+    let verb = if dry_run { "would rewrap" } else { "rewrapped" };
+    println!(
+        "{verb} {} secret(s), {} protected blob(s)",
+        report.secrets_rewrapped.len(),
+        report.blobs_rewrapped
+    );
+    if let Some(id) = &report.commit {
+        println!("commit: {}", id.short());
+    }
+    if !report.skipped.is_empty() {
+        eprintln!("skipped {} entr(ies):", report.skipped.len());
+        for (entry, reason) in &report.skipped {
+            eprintln!("  {entry}: {reason}");
+        }
+        eprintln!("re-run `sc rewrap` with an identity that can open them to complete the sweep");
+    }
+    eprintln!(
+        "note: rewrap cuts the live tip only — snapshots already in history keep \
+         their old wraps and secret objects (content addressing); rotating the \
+         underlying external credential is still the real cutover"
+    );
+    if !report.skipped.is_empty() {
+        drop(repo);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1836,6 +1959,82 @@ mod tests {
         let corrupt = dir.join("corrupt");
         std::fs::write(&corrupt, b"not a real scl-sk- key").unwrap();
         assert!(resolve_identity_opt(Some(corrupt)).is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn escrow_toml_reads_old_single_key_form() {
+        let dir = std::env::temp_dir().join(format!("scl-escrow-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recipients.toml");
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        std::fs::write(&path, format!("[escrow]\nkey = \"{}\"\n", pk.to_key_string())).unwrap();
+        let keys = load_escrows(&path).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].recipient_id(), pk.recipient_id());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn escrow_toml_reads_list_form_and_missing_is_empty() {
+        let dir = std::env::temp_dir().join(format!("scl-escrow-list-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recipients.toml");
+        let (_s1, p1) = scl_crypto::generate_keypair();
+        let (_s2, p2) = scl_crypto::generate_keypair();
+        std::fs::write(
+            &path,
+            format!("[escrow]\nkeys = [\"{}\", \"{}\"]\n", p1.to_key_string(), p2.to_key_string()),
+        )
+        .unwrap();
+        let keys = load_escrows(&path).unwrap();
+        assert_eq!(keys.len(), 2);
+        // Missing file → empty, not an error.
+        assert!(load_escrows(&dir.join("absent.toml")).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn append_escrow_appends_all_deduped() {
+        let (_s1, p1) = scl_crypto::generate_keypair();
+        let (_s2, p2) = scl_crypto::generate_keypair();
+        let out = append_escrow(vec![p1.clone()], &[p1.clone(), p2.clone()]);
+        assert_eq!(out.len(), 2, "p1 deduped, p2 appended");
+        assert!(out.iter().any(|k| k.recipient_id() == p2.recipient_id()));
+    }
+
+    #[test]
+    fn escrow_remove_and_empty_list_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("scl-escrow-remove-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recipients.toml");
+
+        // Write two escrow keys
+        let (_s1, p1) = scl_crypto::generate_keypair();
+        let (_s2, p2) = scl_crypto::generate_keypair();
+        write_escrow_keys(&path, vec![p1.clone(), p2.clone()]).unwrap();
+
+        // Load and verify 2 keys
+        let keys = load_escrows(&path).unwrap();
+        assert_eq!(keys.len(), 2);
+
+        // Simulate removal by writing back minus one key
+        write_escrow_keys(&path, vec![p1.clone()]).unwrap();
+
+        // Load and verify 1 key and the right one remains
+        let keys = load_escrows(&path).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].recipient_id(), p1.recipient_id());
+
+        // Write empty list and assert load_escrows returns empty
+        write_escrow_keys(&path, vec![]).unwrap();
+        let keys = load_escrows(&path).unwrap();
+        assert!(keys.is_empty());
+
+        // Assert the written file no longer contains an [escrow] section
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("[escrow]"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
