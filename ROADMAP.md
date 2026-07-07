@@ -307,7 +307,18 @@ P20):
   found (and fixed for `rewrap`) that a policy commit landed mid-merge/pick
   gets its wraps unioned back by the completion — `grant`/`revoke`/`secret
   add/rotate` share this pre-existing gap and should gain the same
-  `MergeInProgress`/`PickInProgress` guards `rewrap` and the ref-movers use.
+  `MergeInProgress`/`PickInProgress`/`RebaseInProgress` guards `rewrap`
+  and the ref-movers use. Escalated by P19's final review: an unguarded
+  `secret add` mid-stopped-rebase moved the tip and (pre-fix) had its
+  commit silently discarded by `--continue` — `rebase_continue` now
+  refuses on a moved tip as a backstop, but guarding the ops themselves
+  is the durable fix.
+- **Rebase/pick abort ergonomics (P19 minors):** aborts silently discard
+  the protected-skip list `merge_abort` reports; `sc status` shows stale
+  "resolve conflicts" text in the resolved-but-not-continued window; the
+  ref-write→state-clear crash window can duplicate an oplog record
+  (recoverable; wants a comment). Conflict-materialization block now
+  exists in 3 copies (merge/pick/rebase) — extraction candidate.
 - **Marks-map staleness recovery.** A rejected non-ff push (or any P10-era
   flow) followed by a `git gc` inside the git repo/mirror can leave marks
   pointing at pruned git objects — a pre-existing P10 staleness class with
