@@ -166,9 +166,23 @@ cargo run --bin sc -- work --agents 3 -- <cmd>   # fork agent workspaces, run <c
 bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
 cargo run --bin sc -- cherry-pick <ref> [--identity <key>]   # replay one commit onto the
                                               # current branch (--identity as above)
+cargo run --bin sc -- cherry-pick <ref> --mainline <N>       # replay a merge commit relative
+                                              # to its Nth (1-indexed) parent; required for
+                                              # merge commits, refused on non-merges (P19)
+cargo run --bin sc -- cherry-pick --abort     # abandon a stopped pick; restores the
+                                              # untouched tip (no oplog record — no ref
+                                              # ever moved) (P19)
 cargo run --bin sc -- rebase <target> [--identity <key>]     # replay current branch onto
-                                              # <target> (atomic; conflicts abort with refs
-                                              # untouched; --identity as above)
+                                              # <target>; a conflict STOPS (not aborts) with
+                                              # persisted state — resolve then --continue
+                                              # (default since P19; --identity as above)
+cargo run --bin sc -- rebase --continue [--identity <key>]   # resume a stopped rebase;
+                                              # any number of stops still collapses into ONE
+                                              # oplog record / ONE undo (P19)
+cargo run --bin sc -- rebase --abort          # abandon a stopped rebase; restores the
+                                              # pre-rebase working tree (P19)
+cargo run --bin sc -- amend [-m <msg>]        # rebuild the tip from the working tree, tip's
+                                              # own parents kept, message kept unless -m (P19)
 cargo run --bin sc -- undo                    # revert the last operation (again = redo)
 cargo run --bin sc -- oplog                   # list recent operations
 bash demo/run_history_demo.sh                 # cherry-pick/rebase/undo round-trip proof
@@ -297,7 +311,9 @@ markers plus `.sc/PICK_HEAD` and the next `sc commit` completes it
 single-parent, with `sc status` reporting the pick in progress. `rebase` is
 atomic: it refuses up front if a merge commit sits in the replayed range, and
 the first conflict aborts the whole rebase with refs and the working tree
-untouched (unlike cherry-pick's per-commit markers). Both write the CAS
+untouched (unlike cherry-pick's per-commit markers) — **→ resumable in P19**
+(stop-and-continue replaces abort-on-conflict as the default; see below).
+Both write the CAS
 snapshot, materialize the working tree, and only then move the branch ref —
 the ref update is the atomic commit point, matching `merge`'s crash
 discipline. An append-only `.sc/oplog` records HEAD and every touched ref
@@ -447,8 +463,51 @@ any success output, even on that branch, so a previously-failed push is
 retried instead of silently reported up to date (regression test:
 `network_push_failure_is_retryable`). See ADR-0028.
 
+**Phase 19 is built.** History-editing ergonomics, riding the existing
+P14/P15 replay core with no second merge implementation. `sc amend [-m
+<msg>]` rebuilds the tip commit from the current working tree with the
+tip's own parents kept (merge and root commits amend naturally), message
+kept unless `-m` overrides, through the full commit pipeline (scanner,
+`.scignore`, protected re-encryption, registry carried) — it reuses the
+shared `snapshot_files` pipeline via a `parents_override` parameter, so
+there is one commit-assembly path, not a parallel one. **Resumable
+rebase is now the default** (revising P14's atomic-abort): a conflict
+stops with P4 markers and persisted `.sc/REBASE_STATE` rather than
+aborting the whole rebase; `sc rebase --continue [--identity]` completes
+the conflicted commit (via `assemble_completion_snapshot`, extracted out
+of `commit`'s pick-completion arm so pick and rebase completion share one
+implementation) and resumes the fold (`rebase_fold_and_finish`, shared by
+`rebase`'s first pass and every resumed continuation) — any number of
+stops still collapses into ONE oplog record and ONE `sc undo` for the
+whole operation, because the branch ref only moves at final completion.
+`sc cherry-pick --abort` clears pick state and restores the untouched tip
+(no oplog record — no ref ever moved, so abort is its own inverse). `sc
+cherry-pick <ref> --mainline <N>` replays a merge commit relative to its
+Nth (1-indexed) parent; merge picks without the flag stay refused, now
+with a hint; `--mainline` on a non-merge errors. Rebase over a
+merge-containing range stays refused, with a hint to linearize or drop it
+first (a rebase replays a whole range, so there's no single "relative to
+which parent" a flag could resolve). A review Critical: `rebase
+--continue` originally cleared `REBASE_STATE` before running the resumed
+fold, so a typed error (missing `--identity`, authorization failure, a
+secret-registry conflict) on a later commit in the range destroyed
+resumability — no retry, no abort. State is now cleared only by the
+fold's own completion tail or overwritten by the next stop; a `resolved`
+flag on `RebaseState` makes a retried `--continue` idempotent (it skips
+re-completing the already-landed commit). A second Important: mainline
+picks originally based the secret-registry three-way on the commit's
+first parent while file replay based it on the chosen parent N — a silent
+wrong-registry bug, closed by threading the same resolved parent
+(`base_override`) through both. `rebase_abort`/`cherry_pick_abort` both
+needed a deletion baseline (the stop's `REBASE_DECIDED_ROOT`/
+`PICK_DECIDED_ROOT` as `old_root`, mirroring `merge_abort`'s pattern) —
+review caught that a full clean materialize (`old_root: None`) left
+stop-materialized theirs-side-only files as untracked residue. Proven by
+the extended `demo/run_history_demo.sh`: an interrupted-and-resumed
+rebase asserting exactly one new oplog record, an aborted cherry-pick
+verified byte-identical by checksum, and an `sc amend` message fix with
+history length unchanged. See ADR-0029.
+
 Remaining follow-ons: HTTP transport, streaming (>4 GiB) frames,
 interactive workspace sessions, auto-merge of clean workspace results,
-`sc amend`, stop-and-continue rebase (`--continue`), cherry-pick
-`--abort`, merge-commit replay (mainline selection), operation objects in
-the CAS, and oplog entries for remote-tracking refs.
+operation objects in the CAS, and oplog entries for remote-tracking refs.

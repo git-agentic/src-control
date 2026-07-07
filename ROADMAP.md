@@ -145,12 +145,25 @@ across every phase.
   transport/pack code, no network, no auth); the demo prints the
   real-GitHub recipe (`sc clone git@github.com:… --git` / push visible on
   github.com). (ADR-0028.)
+- **Phase 19 — History-editing polish.** `sc amend [-m <msg>]` rebuilds the
+  tip commit from the working tree with the tip's own parents kept.
+  Stop-and-continue rebase is now the default: a conflict stops with P4
+  markers and persisted state rather than aborting the whole rebase;
+  `sc rebase --continue [--identity]` completes the conflicted commit and
+  resumes the fold (as many stops as needed, still ONE oplog record and
+  ONE `sc undo` for the whole operation); `sc rebase --abort` restores the
+  pre-rebase tree. `sc cherry-pick --abort` clears pick state and restores
+  the untouched tip (no oplog record — no ref ever moved). `sc cherry-pick
+  <ref> --mainline <N>` replays a merge commit relative to its Nth parent;
+  rebase over a merge-containing range stays refused, now with a hint to
+  linearize or drop it. Proven by the extended
+  `demo/run_history_demo.sh` (stop/resolve/`--continue`/undo, an aborted
+  pick verified byte-identical by checksum, and an `sc amend` message fix
+  with history length unchanged). (ADR-0029.)
 
 ## Active
 
-- **Phase 19 — History-editing polish.** In build. Spec:
-  `docs/superpowers/specs/2026-07-07-p19-history-polish-design.md`
-  (ADR-0029, Proposed → Accepted at completion).
+None — Phase 20 is next up.
 
 ## Next horizon (P20)
 
@@ -190,6 +203,7 @@ must follow P16 so the rule-merge semantics replay honors are settled.
 | **P16 — Revocation tombstones** | `sc revoke` durable across merges | branch → revoke → merge pre-revoke branch: recipient stays revoked; proven by `demo/run_revoke_demo.sh` | [0026](docs/adr/0026-revocation-tombstones.md) |
 | **P17 — Bulk re-wrap + multiple escrow keys** | org-scale recipient/escrow cutover | change escrow, one `sc rewrap`, every entry re-sealed; R1 wraps stripped; proven by `demo/run_rewrap_demo.sh` | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
 | **P18 — Network Git remotes** | fetch/push against hosted Git | `sc clone git@github.com:…` / push visible on github.com; proven hermetically by `demo/run_network_git_demo.sh` | [0028](docs/adr/0028-network-git-remotes.md) |
+| **P19 — History-editing polish** | `sc amend`, resumable rebase, pick abort, mainline picks | `sc rebase main` stops on conflict (not aborts), `sc rebase --continue` resumes and lands in ONE oplog record; `sc cherry-pick --abort` restores byte-identical; `sc amend -m` fixes the tip message; proven by the extended `demo/run_history_demo.sh` | [0029](docs/adr/0029-history-editing-polish.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
