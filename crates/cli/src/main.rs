@@ -1708,13 +1708,20 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
     }
 
     // Fast-forward gate against the remote git ref. For a network remote,
-    // `path` is the local mirror, which reflects the last `sc fetch` — this
-    // is exactly the spec's intended semantics (ff-only at the sc layer
-    // against last-known state; the network's own non-ff rejection on
-    // `mirror_push` below is authoritative for genuinely stale mirrors).
+    // `path` is the local mirror, which is advanced by BOTH `sc fetch` and
+    // our own `export_branch` below — it is last-known-or-locally-exported
+    // state, not confirmed network state. That is exactly why the network
+    // leg (`mirror_push`) must always run for network remotes, even when
+    // the mirror already matches `local_tip`: a prior `mirror_push` may
+    // have failed after `export_branch` had already advanced the mirror,
+    // stranding the commit behind this gate. git itself no-ops the push
+    // when the network is truly current, and retries it otherwise.
     if let Some(remote_git_hex) = scl_gitio::read_ref(&path, &ref_name)? {
         match git_to_sc.get(&remote_git_hex) {
             Some(&remote_sc) if remote_sc == local_tip => {
+                if scl_gitio::bridge::is_network_git_url(&url) {
+                    scl_gitio::bridge::mirror_push(&path, &branch)?;
+                }
                 println!("push {remote} (git): already up to date");
                 return Ok(());
             }
@@ -1750,6 +1757,18 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
         report.new_marks.iter().map(|(g, s)| (g.clone(), s.to_hex().to_string())).collect();
     marks.append(&new)?;
 
+    // Ordering: export + marks precede the network push (mirroring the
+    // atomicity comment above) — a crash after export/marks but before
+    // `mirror_push` leaves the mirror ahead of the network, and the next
+    // `sc push` retries `mirror_push` (via the ff-gate above, which now
+    // always attempts the network leg for network remotes). The
+    // stale-network-ff case is caught by git itself. This must run BEFORE
+    // the success println below — a failed network leg must not print
+    // success.
+    if scl_gitio::bridge::is_network_git_url(&url) {
+        scl_gitio::bridge::mirror_push(&path, &branch)?;
+    }
+
     println!(
         "pushed {} commit(s) to {remote} (git) at {ref_name}: {}",
         report.new_marks.len(),
@@ -1761,14 +1780,7 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
             report.protected_blobs_as_ciphertext, report.secrets_dropped
         );
     }
-
-    // Ordering: export + marks precede the network push (mirroring the
-    // atomicity comment above) — a crash after export/marks but before
-    // `mirror_push` leaves the mirror ahead of the network, and the next
-    // `sc push` retries `mirror_push` idempotently. The stale-network-ff
-    // case is caught by git itself.
     if scl_gitio::bridge::is_network_git_url(&url) {
-        scl_gitio::bridge::mirror_push(&path, &branch)?;
         println!("pushed {remote} -> network ({url})");
     }
     Ok(())
@@ -2087,8 +2099,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // Env mutation (SC_GIT) races parallel tests in this crate that also
+    // spawn git for network remotes — serialize with a local lock, mirroring
+    // crates/gitio/src/bridge.rs's GIT_ENV_LOCK pattern. Both network tests
+    // in this module take it.
+    static GIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn network_git_remote_round_trip_over_file_url() {
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let root = std::env::temp_dir().join(format!("scl-cli-netgit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -2117,6 +2136,71 @@ mod tests {
 
         // Fetch back through the mirror (round trip sanity).
         run_fetch_git(&repo, "origin").unwrap();
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Reproduces the stranded-push bug: if `mirror_push` fails after
+    /// `export_branch` has already advanced the mirror ref, the mirror now
+    /// matches `local_tip` and the ff-gate's "already up to date" early
+    /// return must not skip retrying the network leg — otherwise the commit
+    /// is stuck on the mirror forever and never reaches the hub.
+    #[test]
+    fn network_push_failure_is_retryable() {
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-netgit-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let hub = root.join("hub.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main", hub.to_str().unwrap()])
+            .status().unwrap();
+        let url = format!("file://{}", hub.display());
+
+        let work = root.join("repo");
+        std::fs::create_dir_all(&work).unwrap();
+        let repo = scl_repo::Repo::init(&work).unwrap();
+        std::fs::write(work.join("readme.txt"), "hello").unwrap();
+        repo.commit("me", "first").unwrap();
+        repo.remote_add_git("origin", &url).unwrap();
+
+        // A shim that execs the real git for everything except `push`,
+        // where it fails loudly — simulating a network outage that hits
+        // only the mirror_push leg after export_branch has already
+        // advanced the mirror ref.
+        let shim = root.join("git-shim.sh");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\ncase \"$*\" in\n  *push*) echo 'shim: network down' >&2; exit 9;;\nesac\nexec git \"$@\"\n",
+        ).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        std::env::set_var("SC_GIT", shim.to_str().unwrap());
+        let err = run_push_git(&repo, "origin", false);
+        std::env::remove_var("SC_GIT");
+        assert!(err.is_err(), "first push must fail when the network leg fails");
+
+        // The hub must NOT have the commit yet.
+        let out = std::process::Command::new("git")
+            .current_dir(&hub).args(["log", "--oneline"]).output().unwrap();
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("first"),
+            "hub must not have the commit after a failed network push");
+
+        // Retry with the real git — must succeed and land the commit on the
+        // hub, proving the ff-gate didn't strand it behind "already up to
+        // date" now that the mirror was advanced by the failed attempt's
+        // export_branch call.
+        run_push_git(&repo, "origin", false).unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(&hub).args(["log", "--oneline"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("first"),
+            "retry must land the commit on the hub");
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
