@@ -1556,6 +1556,15 @@ fn run_clone(src: String, dst: PathBuf, git: bool) -> Result<()> {
 /// Reached by auto-detect for unambiguous git URL forms, or by `--git` for
 /// `ssh://` git hosts (bare `ssh://` stays sc-native, ADR-0022).
 fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
+    // Guard: --git requires a network git URL. For local paths, use
+    // `sc remote add <name> <path> --git` + `sc fetch` instead.
+    if !scl_gitio::bridge::is_network_git_url(url) {
+        anyhow::bail!(
+            "clone --git needs a git URL (https://, git@host:path, ssh://, file://); \
+             for a local git repo, use `sc remote add <name> <path> --git` + `sc fetch` instead"
+        );
+    }
+
     std::fs::create_dir_all(dst)?;
     let repo = scl_repo::Repo::init(dst)?;
     repo.remote_add_git("origin", url)?;
@@ -2304,6 +2313,38 @@ mod tests {
             err.to_string().contains("sc-native-ssh-probe"),
             "bare ssh:// without --git must reach the sc-native transport \
              (spawn error should name $SC_SSH), got: {err}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clone_git_flag_with_local_path_errors_clearly() {
+        // Env mutation (git init) — serialize with the shared git-env lock.
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-gitflag-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Create a local bare git repo (plain path, no file:// URL scheme).
+        let local_git_repo = root.join("local.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main", local_git_repo.to_str().unwrap()])
+            .status().unwrap();
+
+        // Calling run_clone_git directly with a local path must bail with
+        // a clear error message mentioning "git URL", not misroute into
+        // ls-remote queries inside the SOURCE repo.
+        let dst = root.join("cloned");
+        let err = run_clone_git(local_git_repo.to_str().unwrap(), &dst).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("git URL"),
+            "error must mention 'git URL' to guide users; got: {msg}"
+        );
+        assert!(
+            msg.contains("sc remote add"),
+            "error must suggest the correct workflow; got: {msg}"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
