@@ -1,6 +1,6 @@
 # ADR-0026: Revocation tombstones — durable prefix-rule revocation across merges
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-07
 - **Phase:** 16
 - **Builds on:** ADR-0014 (encrypted paths), ADR-0025 (protected merge & replay)
@@ -66,3 +66,23 @@ no versioned decode.
   re-grant without issuing a new keypair; too blunt.
 - **Last-writer-wins by wall clock:** no trustworthy global clock in a
   DVCS; epochs are causal enough and deterministic.
+
+## Refinements discovered during the build
+
+- **Format break needed a clear-error mechanism, not silent misreads.** The
+  snapshot tag bumped `2 → 4` (`TAG_SNAPSHOT_LEGACY = 2`) so a pre-P16 store
+  refuses to decode with an explicit "pre-P16 snapshot encoding" `Malformed`
+  error instead of misparsing the new `Protection` layout.
+- **`protect` on an already-protected prefix changed from replace to
+  extend/re-grant.** The spec's implicit assumption — a second `sc protect
+  <prefix>` replaces the rule wholesale — would silently drop tombstones.
+  It now (re-)grants the named recipients at the rule's next epoch, so
+  existing `Revoked` entries survive a later `protect` call on the same
+  prefix.
+- **`encrypt_protected` became fallible.** The zero-effective-recipients
+  guard (crossed revokes emptying a rule) lives inside `encrypt_protected`
+  itself rather than at a caller checkpoint, so every commit path that seals
+  protected content gets the loud failure for free.
+- **`sc protect --list` gained `--json` and per-recipient state rendering**
+  (`granted@eN` / `REVOKED@eN`), turning the ADR-0025 "re-check rules after
+  merges" caveat into something a user can actually see.

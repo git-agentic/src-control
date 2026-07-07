@@ -110,25 +110,28 @@ across every phase.
   (`MERGE_DECIDED_ROOT`/`PICK_DECIDED_ROOT`, HEAD-gated) so completion can
   union rules and carry forward absent protected files without reverting a
   concurrent update. Proven by `demo/run_protected_merge_demo.sh`. (ADR-0025.)
+- **Phase 16 — Revocation tombstones.** `(prefix, recipient)` becomes a
+  last-writer-wins register (`{key, epoch, state: Granted | Revoked}`);
+  merge keeps the higher-epoch entry and resolves epoch ties Revoked
+  (fail-closed). The effective recipient set for sealing is Granted entries
+  only, closing the ADR-0025 boundary: branch → revoke → merge pre-revoke
+  branch now leaves the recipient revoked. Proven by
+  `demo/run_revoke_demo.sh`. (ADR-0026.)
 
 ## Active
 
-- **Phase 16 — Revocation tombstones / rule narrowing.** In build. Spec:
-  `docs/superpowers/specs/2026-07-07-p16-revocation-tombstones-design.md`
-  (ADR-0026, Proposed → Accepted at completion).
+None — Phase 17 is next up; see the next-horizon table below.
 
-## Next horizon (P16–P20)
+## Next horizon (P17–P20)
 
 Decided 2026-07-07 (design: `docs/superpowers/specs/2026-07-07-roadmap-horizon-p16-p20-design.md`).
 Theme: finish the confidentiality story end to end before pushing for
-adoption — P15 documented a real boundary (a prefix-rule revoke is
-reversed by union-merging any pre-revoke branch), and the headline
-per-file-permissions claim should not carry a known bypass into an
-adoption push.
+adoption — P16 closed the ADR-0025 boundary (a prefix-rule revoke is now
+durable across merges of pre-revoke branches), and the arc continues with
+practical cutover at org scale.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
-| **P16 — Revocation tombstones / rule narrowing** | `sc revoke` durable across merges | branch → revoke on main → merge the pre-revoke branch: recipient stays revoked; future seals exclude them | [0026](docs/adr/0026-revocation-tombstones.md) |
 | **P17 — Bulk re-wrap + multiple escrow keys** | Org-scale recipient/escrow cutover | change the escrow key, run one `sc rewrap`, every secret + protected prefix is sealed to the new set | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
 | **P18 — Network Git remotes** | fetch/push against hosted Git | `sc remote add origin git@github.com:…`; fetch, merge, push; commits visible on github.com | [0028](docs/adr/0028-network-git-remotes.md) |
 | **P19 — History-editing polish** | amend, resumable rebase, pick abort, merge replay | interrupt a rebase on a conflict, resolve, `sc rebase --continue`; proven by the extended history demo | [0029](docs/adr/0029-history-editing-polish.md) |
@@ -156,6 +159,7 @@ must follow P16 so the rule-merge semantics replay honors are settled.
 | **P13 — Agent workspaces** | Parallel agents on a real repo | `sc work --agents 3 -- <cmd>` forks 3 in-RAM workspaces, runs the command in each, harvests to `work-1..3` branches; `sc merge` integrates; zero residue outside `.sc/` | [0023](docs/adr/0023-agent-workspaces.md) |
 | **P14 — History editing** | Integrate agent branches; undo anything | `sc cherry-pick work-2`, `sc rebase main`, `sc undo`/redo round-trip proven by `demo/run_history_demo.sh` | [0024](docs/adr/0024-history-editing.md) |
 | **P15 — Protected merge & replay** | Confidentiality composes with collaboration | keyless merge of disjoint protected edits; `sc merge --identity` content-merges colliding ones; registry replays through rebase; proven by `demo/run_protected_merge_demo.sh` | [0025](docs/adr/0025-protected-merge-and-replay.md) |
+| **P16 — Revocation tombstones** | `sc revoke` durable across merges | branch → revoke → merge pre-revoke branch: recipient stays revoked; proven by `demo/run_revoke_demo.sh` | [0026](docs/adr/0026-revocation-tombstones.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

@@ -119,7 +119,9 @@ cargo run --bin sc -- scan                   # preview the commit-time secret sc
 cargo run --bin sc -- clone <src> <dst>      # copy a repo (objects + refs)
 cargo run --bin sc -- protect <prefix> --to <recipient>   # encrypt matching paths (P7)
 cargo run --bin sc -- grant <prefix> --to <recipient> --identity <key>   # path-protection grant
-cargo run --bin sc -- revoke <prefix> --recipient-id <id>                # path-protection revoke
+cargo run --bin sc -- revoke <prefix> --recipient-id <id>                # path-protection revoke;
+                                             # tombstone-durable across merges of pre-revoke
+                                             # branches (P16)
                                              # NB: top-level grant/revoke act on protected
                                              # path prefixes; `secret grant/revoke` act on
                                              # named secrets — two different surfaces
@@ -163,6 +165,7 @@ cargo run --bin sc -- undo                    # revert the last operation (again
 cargo run --bin sc -- oplog                   # list recent operations
 bash demo/run_history_demo.sh                 # cherry-pick/rebase/undo round-trip proof
 bash demo/run_protected_merge_demo.sh         # protected merge & replay proof (P15)
+bash demo/run_revoke_demo.sh                  # revocation-tombstone durability proof (P16)
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -312,17 +315,40 @@ now replays through rebase/cherry-pick (`merge_secrets`, base = the replayed
 commit's own parent; conflicts abort atomically), and replay's `Empty` means
 tree **and** registry **and** protection-prefix deltas are all empty, so a
 rules-only or secrets-only commit replays instead of being silently skipped.
-**Boundary:** because protection rules merge by union, a prefix-rule revoke
-(`sc revoke`) is not durable against merging any branch created before the
-revoke — the union re-adds the recipient and future commits under that
-prefix seal fresh DEKs to them; re-check `sc protect --list` after merges
-until the deferred rule-narrowing/tombstone follow-on lands. See ADR-0025.
+**Boundary (closed in P16):** because protection rules merge by union, a
+prefix-rule revoke (`sc revoke`) was not durable against merging any branch
+created before the revoke — the union re-added the recipient and future
+commits under that prefix sealed fresh DEKs to them. P16's per-recipient
+revocation tombstones (below) close this: revoke now survives merging any
+pre-revoke branch. See ADR-0025.
 `decrypt_with` distinguishes ciphertext corruption from a genuine
 authorization failure. `MergeProtected`/`ReplayProtected` are retired.
 `crypto::Zeroizing` is re-exported through the crate boundary so callers
 outside `crates/crypto` can zero decrypted buffers without a second
 dependency on RustCrypto/`zeroize` (the quarantine still holds — only the
 type alias crosses). See ADR-0025.
+
+**Phase 16 is built.** `sc revoke` is now durable across merges. Each
+protection rule's recipient standing is a per-recipient last-writer-wins
+register — `RecipientEntry { key, epoch, state: Granted | Revoked }` — in
+place of the bare key list; grant/revoke mint a fresh `epoch = max(current)
++ 1`, and `merge_prefixes` keeps the higher-epoch entry per recipient,
+resolving an epoch tie with disagreeing states as **Revoked** (fail-closed).
+Commit-time sealing, grant checks, and `--identity` authorization all read
+the effective set through `granted_keys()` — Granted entries only, so a
+tombstoned recipient never seals a fresh DEK again even when a pre-revoke
+branch is merged in later. Crossed revokes can empty a rule's granted set
+entirely; `encrypt_protected` is now fallible and refuses the seal loudly
+(pointing at `sc grant`) rather than minting ciphertext nobody can read.
+This is a rules-format break: the snapshot tag bumped `2 → 4`
+(`TAG_SNAPSHOT_LEGACY = 2`), so a pre-P16 store fails to decode with an
+explicit "pre-P16 snapshot encoding" error instead of silently misparsing
+the new layout. A second `sc protect` on an already-protected prefix
+changed from replacing the rule wholesale to extending/re-granting at the
+next epoch, so tombstones survive re-protect. `sc protect --list` gained
+`--json` and per-recipient `granted@eN` / `REVOKED@eN` rendering. This
+closes the ADR-0025 boundary note: merging any branch created before a
+revoke no longer resurrects the revoked recipient. See ADR-0026.
 
 Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
 frames, bulk re-wrap, multiple escrow keys, interactive workspace sessions,
