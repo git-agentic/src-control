@@ -273,6 +273,11 @@ P20):
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
+- **In-progress guards for the remaining policy ops.** P17's final review
+  found (and fixed for `rewrap`) that a policy commit landed mid-merge/pick
+  gets its wraps unioned back by the completion — `grant`/`revoke`/`secret
+  add/rotate` share this pre-existing gap and should gain the same
+  `MergeInProgress`/`PickInProgress` guards `rewrap` and the ref-movers use.
 - **Sub-tree / partial sharing** and sparse checkouts.
 - **Merge ergonomics**: richer conflict resolution UX beyond P4's
   detection/representation.
