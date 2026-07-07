@@ -439,7 +439,7 @@ commit-by-commit during rebase, is diff3(base = the commit's first parent,
 ours = the current tip, theirs = the commit), computed by P4's existing
 `three_way_files` (extracted from `three_way`) — no second merge engine, no
 object mutation, and protected content is refused up front, inheriting P4's
-fail-closed guard verbatim. `sc cherry-pick` resolves like `merge`: a clean
+fail-closed guard verbatim → lifted in P15 (ADR-0025). `sc cherry-pick` resolves like `merge`: a clean
 replay advances the branch with a single-parent snapshot; a conflict writes
 P4-style markers plus `.sc/PICK_HEAD`, and the next `sc commit` completes it.
 `sc rebase` is atomic instead: a merge commit anywhere in the replayed range
@@ -466,3 +466,55 @@ refused (there is no working tree to materialize back to) — a deliberate
 scope cut rather than a half-built rewind. The oplog is local-only, like a
 reflog: it is never copied by clone and never travels over a transport. See
 ADR-0024.
+
+## Phase 15 — protected merge & replay (built)
+
+Every merge/rebase/cherry-pick used to fail closed on protected content —
+**lifted in P15 (ADR-0025)**. The key observation is that P7's path encryption is
+**convergent** (equal plaintext ⇒ equal ciphertext blob id), so most
+three-way cases resolve on ciphertext ids alone: unchanged, one-side-changed,
+and clean-delete protected paths merge with no identity at all, carrying
+ciphertext blobs plus a union of wrapped DEKs. Only a **content-divergent**
+protected path — both sides edited the plaintext — needs an authorized
+`--identity`: the two plaintexts are decrypted, diff3-merged, and the result
+is re-encrypted through the same `encrypt_protected`/`reuse_prior_wraps`
+helpers `commit` already used (extracted, single-sourced), so plaintext is
+never written to the CAS — conflict markers and sidecars for protected paths
+go straight to the identity-holder's working tree instead. Missing identity
+raises `Error::ProtectedMergeNeedsIdentity`; a supplied identity that can't
+unwrap raises `Error::NotAuthorized`; `decrypt_with` distinguishes ciphertext
+corruption from either, so a truncated object never misreports as an
+authorization failure. Protection rules merge by **union**
+(`union_prefixes`/`union_wraps`, both deterministically sorted for encoding
+stability) — narrowing protection is not something a merge can do silently.
+This closes an internal-consistency case (I2): a file carried forward as
+PLAIN that matches a rule landing at the merge is re-encrypted at
+completion, so a path's protection bit and its ciphertext-or-plaintext state
+never drift apart in any snapshot.
+
+Conflicted protected merges and picks persist the merge/pick's **decided
+tree** — `.sc/MERGE_DECIDED_ROOT` / `.sc/PICK_DECIDED_ROOT`, written
+alongside the operation's HEAD marker and cleared with it, gc-rooted only
+while that HEAD file exists so crash residue from an abandoned operation
+can't be read back and hijack a later, unrelated completion. Completion
+unions both parents' (or tip-and-picked) protection rules and wraps, and
+carries any protected file *absent from the working tree* forward from the
+decided tree rather than arbitrating by parent order — plain ours-first
+carry-forward was found during the build to silently revert content the
+other side had already updated.
+
+The secret registry now **replays** through `sc rebase`/`sc cherry-pick`
+via the existing `merge_secrets` helper, with each replayed commit's own
+parent as the merge base; a registry conflict aborts the operation
+atomically, same as a tree conflict. Replay's `Empty` check was redefined
+to mean the tree delta **and** the registry delta **and** the
+protection-prefix delta are all empty, so a rules-only or secrets-only
+commit now replays instead of being silently dropped (P14's `Empty` checked
+the tree only). A conflicted cherry-pick's completion also merges the
+picked commit's registry change, closing a hole where a combined
+conflict+registry-change commit lost the registry side. `MergeProtected`
+and `ReplayProtected` — the P4/P14 fail-closed guards — are retired now that
+every path they blocked has a decrypt-on-demand or ciphertext-id
+resolution. `demo/run_protected_merge_demo.sh` proves the keyless disjoint
+case, the identity-gated content-divergent case, and registry replay
+end-to-end. See ADR-0025.

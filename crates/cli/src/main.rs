@@ -100,6 +100,10 @@ enum Cmd {
         /// OS username).
         #[arg(long)]
         author: Option<String>,
+        /// Identity key to decrypt protected paths that diverged in content on
+        /// both sides (ciphertext-id fast paths need no identity at all).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
     /// Replay one commit from another branch onto the current branch.
     ///
@@ -112,6 +116,10 @@ enum Cmd {
         /// Commit author (default $SC_AUTHOR, then the OS username).
         #[arg(long)]
         author: Option<String>,
+        /// Identity key to decrypt protected paths that diverged in content on
+        /// both sides (ciphertext-id fast paths need no identity at all).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
     /// Replay the current branch's commits onto another branch's tip.
     ///
@@ -124,6 +132,10 @@ enum Cmd {
         /// Commit author (default $SC_AUTHOR, then the OS username).
         #[arg(long)]
         author: Option<String>,
+        /// Identity key to decrypt protected paths that diverged in content on
+        /// both sides (ciphertext-id fast paths need no identity at all).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
     /// Scan the working tree for plaintext secrets without committing.
     Scan,
@@ -376,9 +388,15 @@ fn main() -> Result<()> {
         Cmd::Branch { name } => run_branch(&name),
         Cmd::Switch { name, identity } => run_switch(&name, identity),
         Cmd::Scan => run_scan(),
-        Cmd::Merge { branch, abort, author } => run_merge(branch, abort, &resolve_author(author)),
-        Cmd::CherryPick { refname, author } => run_cherry_pick(&refname, &resolve_author(author)),
-        Cmd::Rebase { target, author } => run_rebase(&target, &resolve_author(author)),
+        Cmd::Merge { branch, abort, author, identity } => {
+            run_merge(branch, abort, &resolve_author(author), identity)
+        }
+        Cmd::CherryPick { refname, author, identity } => {
+            run_cherry_pick(&refname, &resolve_author(author), identity)
+        }
+        Cmd::Rebase { target, author, identity } => {
+            run_rebase(&target, &resolve_author(author), identity)
+        }
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
         Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
@@ -955,7 +973,7 @@ fn run_status(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
+fn run_merge(branch: Option<String>, abort: bool, author: &str, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
     if abort {
         let skipped = repo.merge_abort()?;
@@ -966,9 +984,13 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
         return Ok(());
     }
     let branch = branch.ok_or_else(|| anyhow::anyhow!("merge: provide a branch or --abort"))?;
-    match repo.merge(&branch, author) {
-        Ok(id) => {
+    let sk = resolve_identity_opt(identity)?;
+    match repo.merge_with_identity(&branch, author, sk.as_ref()) {
+        Ok((id, skipped)) => {
             println!("merged {branch}: {}", id.short());
+            for path in &skipped {
+                eprintln!("skipped (no key): {path}");
+            }
             Ok(())
         }
         Err(scl_repo::Error::MergeConflicts(n)) => {
@@ -990,9 +1012,12 @@ fn run_merge(branch: Option<String>, abort: bool, author: &str) -> Result<()> {
     }
 }
 
-fn run_cherry_pick(refname: &str, author: &str) -> Result<()> {
+fn run_cherry_pick(refname: &str, author: &str, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
-    match repo.cherry_pick(refname, author) {
+    // Soft-resolve like `run_merge`: a missing identity file is fine —
+    // ciphertext-id fast paths and plain picks need no identity at all.
+    let sk = resolve_identity_opt(identity)?;
+    match repo.cherry_pick(refname, author, sk.as_ref()) {
         Ok(scl_repo::PickResult::Picked(id)) => {
             println!("picked {}", id.short());
             Ok(())
@@ -1016,9 +1041,12 @@ fn run_cherry_pick(refname: &str, author: &str) -> Result<()> {
     }
 }
 
-fn run_rebase(target: &str, author: &str) -> Result<()> {
+fn run_rebase(target: &str, author: &str, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
-    match repo.rebase(target, author) {
+    // Soft-resolve like `run_merge`/`run_cherry_pick`: a missing identity file
+    // is fine — ciphertext-id fast paths and plain rebases need no identity.
+    let sk = resolve_identity_opt(identity)?;
+    match repo.rebase(target, author, sk.as_ref()) {
         Ok(scl_repo::RebaseResult::AlreadyUpToDate) => {
             println!("already up to date");
             Ok(())
@@ -1659,6 +1687,11 @@ fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("bad recipient id"))?;
     repo.revoke(&prefix, &rid)?;
     println!("revoked {recipient_id} from {prefix}");
+    eprintln!(
+        "note: this is not durable against merges — merging any branch created before this \
+         revoke re-adds {recipient_id} to the rule via union, and fresh DEKs for future commits \
+         under {prefix} will seal to them again; re-check `sc protect --list` after merges"
+    );
     Ok(())
 }
 

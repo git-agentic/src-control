@@ -90,10 +90,31 @@ across every phase.
   operation log made every ref-moving operation undoable (`sc undo`; run
   twice = redo). Replay is P4's three-way merge with base = the picked
   commit's parent — no second merge implementation, no object mutation,
-  undo is just moving refs back. Protected content fails closed, inherited
-  from P4's merge guard. `demo/run_history_demo.sh` proves cherry-pick
-  provenance, atomic rebase, and an undo/redo round-trip byte-identical at
-  the refs level. (ADR-0024.)
+  undo is just moving refs back. Protected content fails closed (lifted in
+  P15, ADR-0025), inherited from P4's merge guard. `demo/run_history_demo.sh`
+  proves cherry-pick provenance, atomic rebase, and an undo/redo round-trip
+  byte-identical at the refs level. (ADR-0024.)
+- **Phase 15 — Protected merge & replay.** Lifted the fail-closed guards:
+  `sc merge`/`sc rebase`/`sc cherry-pick` work on protected content.
+  Id-level cases (unchanged / one side changed / clean deletes) resolve on
+  ciphertext ids — sound under convergent encryption — carrying unioned
+  wrapped DEKs, with no identity required; only a content-divergent
+  protected path needs `--identity` (`ProtectedMergeNeedsIdentity`/
+  `NotAuthorized` otherwise). Protection rules merge by union (nothing
+  silently unprotects, including re-encrypting a carried PLAIN file that
+  matches a landing rule); merged plaintext re-encrypts through the same
+  wrap-reuse helper `commit` uses; the secret registry replays through
+  rebase/cherry-pick (closing P14's warning — a rules-only or secrets-only
+  commit now replays instead of being skipped). Plaintext never enters the
+  CAS; conflicted merges/picks persist a decided tree
+  (`MERGE_DECIDED_ROOT`/`PICK_DECIDED_ROOT`, HEAD-gated) so completion can
+  union rules and carry forward absent protected files without reverting a
+  concurrent update. Proven by `demo/run_protected_merge_demo.sh`. (ADR-0025.)
+
+## Active
+
+None — Phase 15 was the last phase on this roadmap horizon; see Deferred
+below for tracked follow-ons.
 
 ## Completed phases (usability-first ordering)
 
@@ -110,6 +131,7 @@ across every phase.
 | **P12 — SSH-native network transport** | Sync between machines | `sc clone ssh://host/path`, `sc fetch`/`push` over the wire via `sc serve --stdio`; `demo/run_ssh_remote_demo.sh` proves the round trip with no sshd | [0022](docs/adr/0022-ssh-native-transport.md) |
 | **P13 — Agent workspaces** | Parallel agents on a real repo | `sc work --agents 3 -- <cmd>` forks 3 in-RAM workspaces, runs the command in each, harvests to `work-1..3` branches; `sc merge` integrates; zero residue outside `.sc/` | [0023](docs/adr/0023-agent-workspaces.md) |
 | **P14 — History editing** | Integrate agent branches; undo anything | `sc cherry-pick work-2`, `sc rebase main`, `sc undo`/redo round-trip proven by `demo/run_history_demo.sh` | [0024](docs/adr/0024-history-editing.md) |
+| **P15 — Protected merge & replay** | Confidentiality composes with collaboration | keyless merge of disjoint protected edits; `sc merge --identity` content-merges colliding ones; registry replays through rebase; proven by `demo/run_protected_merge_demo.sh` | [0025](docs/adr/0025-protected-merge-and-replay.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -213,11 +235,18 @@ Tracked but out of scope for this roadmap horizon:
   break-glass key in `.sc/recipients.toml [escrow]`).
 - **History-editing follow-ons:** `sc amend`, stop-and-continue rebase
   (`--continue`), cherry-pick `--abort`, merge-commit replay (mainline
-  selection), protected-path replay (lifts with P4's protected-merge
-  follow-on), operation objects in the CAS (Jujutsu-deep upgrade to the
-  file oplog), oplog entries for remote-tracking refs, secret-registry
-  replay for cherry-pick/rebase (currently the target-side registry is
-  carried forward wholesale and a skipped registry change only warns).
+  selection), operation objects in the CAS (Jujutsu-deep upgrade to the
+  file oplog), oplog entries for remote-tracking refs. (Protected-path
+  replay and secret-registry replay for cherry-pick/rebase shipped in P15;
+  see ADR-0025.)
+- **Rule narrowing / revocation tombstones** for protected-path prefixes.
+  P15's merge union (`union_prefixes`) is fail-closed by design but one-
+  directional: nothing can shrink a rule via merge. That means a prefix-rule
+  `sc revoke` is currently reversed by merging any branch created before the
+  revoke (the union re-adds the recipient, and future commits under the
+  prefix then seal fresh DEKs to them) — see ADR-0025 Consequences. This
+  item is the durable fix: a way to record "revoked as of here" so a later
+  union merge doesn't resurrect the recipient's standing.
 - **Sub-tree / partial sharing** and sparse checkouts.
 - **Merge ergonomics**: richer conflict resolution UX beyond P4's
   detection/representation.

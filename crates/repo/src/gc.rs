@@ -18,7 +18,7 @@ use scl_core::{ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
-use crate::{merge_state, oplog, reachable, refs};
+use crate::{merge_state, oplog, pick_state, reachable, refs};
 
 /// What a gc pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -29,10 +29,13 @@ pub struct GcStats {
     pub packs_removed: usize,
 }
 
-/// The full safe root set: all branch tips + resolved HEAD + all
-/// remote-tracking tips + an in-progress merge's other parent + every
-/// snapshot id still referenced by the (already-trimmed) oplog — undo/redo
-/// must never dangle a snapshot it can still restore to.
+/// The full safe root set (snapshot ids): all branch tips + resolved HEAD +
+/// all remote-tracking tips + an in-progress merge's other parent + an
+/// in-progress cherry-pick's picked commit (completion re-reads its rules;
+/// its source branch could be deleted mid-pick) + every snapshot id still
+/// referenced by the (already-trimmed) oplog — undo/redo must never dangle a
+/// snapshot it can still restore to. An in-progress merge's or pick's decided
+/// carried tree is a TREE root and is added separately in [`run`].
 fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     let mut set: BTreeSet<ObjectId> = BTreeSet::new();
     for (_, id) in refs::list_heads(layout)? {
@@ -45,6 +48,9 @@ fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
         set.insert(id);
     }
     if let Some(id) = merge_state::read_merge_head(layout)? {
+        set.insert(id);
+    }
+    if let Some(id) = pick_state::read_pick_head(layout)? {
         set.insert(id);
     }
     for id in oplog::referenced_ids(layout)? {
@@ -67,7 +73,27 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     oplog::trim_older_than(layout, cutoff)?;
 
     let roots = roots(layout)?;
-    let reachable: BTreeSet<ObjectId> = reachable::reachable_objects(store, &roots)?;
+    let mut reachable: BTreeSet<ObjectId> = reachable::reachable_objects(store, &roots)?;
+    // An in-progress merge's or cherry-pick's decided carried tree
+    // (MERGE_DECIDED_ROOT / PICK_DECIDED_ROOT) is a TREE root, not a
+    // snapshot: its tree nodes are freshly written by the conflict path and
+    // reachable from no snapshot yet, but completion needs them — protect
+    // them like any other root. Each is walked ONLY under its own
+    // in-progress HEAD: the conflict paths write the decided root BEFORE the
+    // HEAD (crash discipline), so a crash in that window leaves a
+    // decided-root file with no matching HEAD — such residue is inert
+    // (completion ignores it, see `Repo::commit`) and must not retain a dead
+    // tree forever.
+    if merge_state::read_merge_head(layout)?.is_some() {
+        if let Some(tree) = merge_state::read_decided_root(layout)? {
+            reachable::walk_tree(store, tree, &mut reachable)?;
+        }
+    }
+    if pick_state::read_pick_head(layout)?.is_some() {
+        if let Some(tree) = pick_state::read_decided_root(layout)? {
+            reachable::walk_tree(store, tree, &mut reachable)?;
+        }
+    }
 
     // 1. Repack the entire reachable set into one fresh pack (skip if empty).
     let new_hash = if reachable.is_empty() {
@@ -205,12 +231,81 @@ mod tests {
         let theirs = repo.commit("t", "c2").unwrap();
         // Point the branch back to base; record `theirs` only via MERGE_HEAD.
         refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
-        merge_state::write(repo.layout(), &theirs, &["a.txt".into()]).unwrap();
+        // Record a decided carried tree reachable from NO snapshot — exactly
+        // what the conflict path writes; completion needs it after a mid-merge gc.
+        let (decided_blob, decided_tree) = {
+            let arc = repo.vfs().store();
+            let mut s = arc.lock().unwrap();
+            let blob = s.put(Object::blob(b"decided-only-bytes".to_vec())).unwrap();
+            let tree = s
+                .put(Object::Tree(scl_core::Tree::new(vec![scl_core::TreeEntry {
+                    name: "d.txt".into(),
+                    kind: scl_core::EntryKind::Blob,
+                    id: blob,
+                    mode: scl_core::FileMode::FILE,
+                    perms: 0,
+                }])))
+                .unwrap();
+            (blob, tree)
+        };
+        merge_state::write(repo.layout(), &theirs, &["a.txt".into()], Some(&decided_tree))
+            .unwrap();
 
         repo.gc(Duration::from_secs(0)).unwrap();
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
         assert!(s.contains(&theirs), "MERGE_HEAD must protect the in-progress other parent");
+        assert!(
+            s.contains(&decided_tree) && s.contains(&decided_blob),
+            "MERGE_DECIDED_ROOT must protect the decided carried tree + its blobs"
+        );
+        drop(s);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn gc_protects_pick_head_and_pick_decided_root() {
+        // P15 Task 7: an in-progress cherry-pick's picked commit (PICK_HEAD)
+        // and its decided carried tree (PICK_DECIDED_ROOT) must survive a
+        // mid-pick gc — completion reads the picked commit's rules and
+        // carries absent protected files from the decided tree.
+        let root = tmp_root("pickhead");
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base").unwrap();
+        let base = repo.commit("t", "c1").unwrap();
+        std::fs::write(root.join("a.txt"), b"picked").unwrap();
+        let picked = repo.commit("t", "c2").unwrap();
+        // Point the branch back to base; record `picked` only via PICK_HEAD.
+        refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
+        // Record a decided carried tree reachable from NO snapshot — exactly
+        // what the pick conflict path writes; completion needs it after a
+        // mid-pick gc.
+        let (decided_blob, decided_tree) = {
+            let arc = repo.vfs().store();
+            let mut s = arc.lock().unwrap();
+            let blob = s.put(Object::blob(b"pick-decided-only-bytes".to_vec())).unwrap();
+            let tree = s
+                .put(Object::Tree(scl_core::Tree::new(vec![scl_core::TreeEntry {
+                    name: "d.txt".into(),
+                    kind: scl_core::EntryKind::Blob,
+                    id: blob,
+                    mode: scl_core::FileMode::FILE,
+                    perms: 0,
+                }])))
+                .unwrap();
+            (blob, tree)
+        };
+        crate::pick_state::write(repo.layout(), &picked, &["a.txt".into()], Some(&decided_tree))
+            .unwrap();
+
+        repo.gc(Duration::from_secs(0)).unwrap();
+        let arc = repo.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(s.contains(&picked), "PICK_HEAD must protect the in-progress picked commit");
+        assert!(
+            s.contains(&decided_tree) && s.contains(&decided_blob),
+            "PICK_DECIDED_ROOT must protect the decided carried tree + its blobs"
+        );
         drop(s);
         std::fs::remove_dir_all(&root).unwrap();
     }
