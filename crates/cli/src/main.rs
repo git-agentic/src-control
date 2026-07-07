@@ -123,12 +123,20 @@ enum Cmd {
     },
     /// Replay the current branch's commits onto another branch's tip.
     ///
-    /// Any conflict aborts the whole rebase (exit 1): refs and the working
-    /// tree are left untouched, unlike `sc merge`/`sc cherry-pick`'s marker
-    /// files. Resolve via `sc merge` or per-commit `sc cherry-pick` instead.
+    /// A conflict STOPS the rebase (exit 1): P4-style markers are left on
+    /// disk and the branch ref does not move — resolve then
+    /// `sc rebase --continue`, or `sc rebase --abort` to give up and restore
+    /// the pre-rebase tree. A resumed rebase (any number of stops) still
+    /// collapses into a single `sc undo`-able operation.
     Rebase {
         /// Branch or remote-tracking ref to rebase onto.
-        target: String,
+        target: Option<String>,
+        /// Resume a stopped rebase after resolving conflicts.
+        #[arg(long, conflicts_with = "target")]
+        r#continue: bool,
+        /// Abandon a stopped rebase; restores the pre-rebase working tree.
+        #[arg(long, conflicts_with_all = ["target", "continue"])]
+        abort: bool,
         /// Commit author (default $SC_AUTHOR, then the OS username).
         #[arg(long)]
         author: Option<String>,
@@ -421,8 +429,8 @@ fn main() -> Result<()> {
         Cmd::CherryPick { refname, author, identity } => {
             run_cherry_pick(&refname, &resolve_author(author), identity)
         }
-        Cmd::Rebase { target, author, identity } => {
-            run_rebase(&target, &resolve_author(author), identity)
+        Cmd::Rebase { target, r#continue, abort, author, identity } => {
+            run_rebase(target, r#continue, abort, &resolve_author(author), identity)
         }
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
@@ -1107,12 +1115,30 @@ fn run_cherry_pick(refname: &str, author: &str, identity: Option<PathBuf>) -> Re
     }
 }
 
-fn run_rebase(target: &str, author: &str, identity: Option<PathBuf>) -> Result<()> {
+fn run_rebase(
+    target: Option<String>,
+    r#continue: bool,
+    abort: bool,
+    author: &str,
+    identity: Option<PathBuf>,
+) -> Result<()> {
     let repo = open_repo()?;
+    if abort {
+        repo.rebase_abort()?;
+        println!("rebase aborted; working tree restored");
+        return Ok(());
+    }
     // Soft-resolve like `run_merge`/`run_cherry_pick`: a missing identity file
     // is fine — ciphertext-id fast paths and plain rebases need no identity.
     let sk = resolve_identity_opt(identity)?;
-    match repo.rebase(target, author, sk.as_ref()) {
+    let outcome = if r#continue {
+        repo.rebase_continue(author, sk.as_ref())
+    } else {
+        let target = target
+            .ok_or_else(|| anyhow::anyhow!("rebase needs a target, --continue, or --abort"))?;
+        repo.rebase(&target, author, sk.as_ref())
+    };
+    match outcome {
         Ok(scl_repo::RebaseResult::AlreadyUpToDate) => {
             println!("already up to date");
             Ok(())
@@ -1124,6 +1150,23 @@ fn run_rebase(target: &str, author: &str, identity: Option<PathBuf>) -> Result<(
         Ok(scl_repo::RebaseResult::Rebased { new_tip, replayed, skipped }) => {
             println!("rebased: {replayed} replayed, {skipped} skipped, tip {}", new_tip.short());
             Ok(())
+        }
+        Ok(scl_repo::RebaseResult::Stopped { conflicted, paths, done, total }) => {
+            println!(
+                "rebase stopped at {} ({} of {}) with {} conflict(s); resolve these files then `sc rebase --continue`:",
+                conflicted.short(),
+                done + 1,
+                total,
+                paths.len()
+            );
+            for p in &paths {
+                println!("  {p}");
+            }
+            // Exit 1 so `sc rebase x && sc commit` can't commit conflict
+            // markers — mirrors `run_merge`/`run_cherry_pick`. Drop the repo
+            // first (releases .sc/lock) — process::exit skips destructors.
+            drop(repo);
+            std::process::exit(1);
         }
         Err(e) => Err(e.into()),
     }

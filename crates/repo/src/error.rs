@@ -64,8 +64,6 @@ pub enum Error {
     SecretMergeConflict(String),
     #[error("cannot replay merge commit {0} (mainline selection not supported)")]
     CannotReplayMerge(ObjectId),
-    #[error("rebase: commit {commit} conflicts on {paths:?}; rebase aborted, refs untouched — resolve via `sc merge` or per-commit `sc cherry-pick`")]
-    RebaseConflicts { commit: ObjectId, paths: Vec<String> },
     #[error(transparent)]
     Core(#[from] scl_core::Error),
     #[error(transparent)]

@@ -641,10 +641,16 @@ impl Repo {
     /// The stopped rebase's progress, if any: (conflicted commit, done
     /// count, total count). `done` counts the commits landed before the
     /// stopped one — `total - remaining.len() - 1` — so callers display
-    /// "stopped at commit X (done + 1 of total)".
+    /// "stopped at commit X (done + 1 of total)". Saturating: a
+    /// semantically-inconsistent state file (`remaining.len() + 1 > total`,
+    /// which a hand-corrupted or foreign-written `REBASE_STATE` could
+    /// produce) reports `done = 0` instead of panicking `sc status` on
+    /// underflow — `write` never produces such a file itself.
     pub fn rebase_progress(&self) -> Result<Option<(ObjectId, usize, usize)>> {
-        Ok(crate::rebase_state::read(&self.layout)?
-            .map(|st| (st.conflicted, st.total - st.remaining.len() - 1, st.total)))
+        Ok(crate::rebase_state::read(&self.layout)?.map(|st| {
+            let done = st.total.saturating_sub(st.remaining.len()).saturating_sub(1);
+            (st.conflicted, done, st.total)
+        }))
     }
 
     /// Merge `branch` into the current branch. Fast-forwards when possible;
