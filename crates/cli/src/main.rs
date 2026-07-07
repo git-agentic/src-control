@@ -176,7 +176,17 @@ enum Cmd {
         cmd: Vec<String>,
     },
     /// Clone a repo (local path or `ssh://` URL) into a new directory.
-    Clone { src: String, dst: PathBuf },
+    Clone {
+        src: String,
+        dst: PathBuf,
+        /// Force cloning via the system-git mirror bridge. Unambiguous git
+        /// URL forms (https/http, scp-style `git@host:path`, file://) are
+        /// auto-detected and need no flag; `--git` is only required for
+        /// `ssh://` git hosts, because bare `ssh://` already means an
+        /// sc-native remote (ADR-0022/ADR-0028).
+        #[arg(long)]
+        git: bool,
+    },
     /// Serve a repo over stdin/stdout to a remote `sc` client (invoked by
     /// `ssh` for ssh:// remotes; not intended for interactive use).
     Serve {
@@ -419,7 +429,7 @@ fn main() -> Result<()> {
         Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
             run_work(agents, name, budget_mb, with_secrets, identity, author, cmd)
         }
-        Cmd::Clone { src, dst } => run_clone(src, dst),
+        Cmd::Clone { src, dst, git } => run_clone(src, dst, git),
         Cmd::Serve { stdio, path } => run_serve(stdio, path),
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
@@ -1525,10 +1535,52 @@ fn resolve_ids_to_pubkeys(
     Ok(out)
 }
 
-fn run_clone(src: String, dst: PathBuf) -> Result<()> {
+fn run_clone(src: String, dst: PathBuf, git: bool) -> Result<()> {
+    // Auto-detect unambiguous git URL forms (https/http, scp-style, file://):
+    // those can never be sc-native, so no flag is needed. Bare `ssh://` is
+    // ambiguous — it means an sc-native remote (ADR-0022) unless `--git`
+    // forces the mirror-bridge path (ADR-0028; user-adjudicated).
+    let git_shaped =
+        scl_gitio::bridge::is_network_git_url(&src) && !src.starts_with("ssh://");
+    if git || git_shaped {
+        return run_clone_git(&src, &dst);
+    }
     let repo = scl_repo::Repo::clone_url(&src, &dst)?;
     let n = repo.branches()?.len();
     println!("cloned {} into {} ({} branch(es))", src, dst.display(), n);
+    Ok(())
+}
+
+/// Clone from a hosted Git URL: init + remote add origin --git + fetch +
+/// adopt the remote's default branch (P10's unborn fast-forward adoption).
+/// Reached by auto-detect for unambiguous git URL forms, or by `--git` for
+/// `ssh://` git hosts (bare `ssh://` stays sc-native, ADR-0022).
+fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
+    // Guard: --git requires a network git URL. For local paths, use
+    // `sc remote add <name> <path> --git` + `sc fetch` instead.
+    if !scl_gitio::bridge::is_network_git_url(url) {
+        anyhow::bail!(
+            "clone --git needs a git URL (https://, git@host:path, ssh://, file://); \
+             for a local git repo, use `sc remote add <name> <path> --git` + `sc fetch` instead"
+        );
+    }
+
+    std::fs::create_dir_all(dst)?;
+    let repo = scl_repo::Repo::init(dst)?;
+    repo.remote_add_git("origin", url)?;
+
+    // Sync the mirror, then point the unborn HEAD at the remote's default
+    // branch name BEFORE fetching, so the tracking ref and local branch agree.
+    let mirror = git_remote_effective_path(&repo, "origin", url, true)?;
+    let default = scl_gitio::bridge::remote_default_branch(&mirror)?;
+    scl_repo::refs::write_head(repo.layout(), &default)?;
+
+    run_fetch_git(&repo, "origin")?;
+    // Adopt: merge the tracking ref into the unborn branch (ADR-0018's
+    // unborn fast-forward). Author resolution mirrors run_merge's.
+    let author = resolve_author(None);
+    repo.merge(&format!("origin/{default}"), &author)?;
+    println!("cloned {url} into {} (branch {default})", dst.display());
     Ok(())
 }
 
@@ -1544,13 +1596,45 @@ fn run_serve(stdio: bool, path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// The local git path P10's import/export machinery should operate on for
+/// `remote`: the URL itself when it is a local path, or the synced bare
+/// mirror when it is a network URL (ADR-0028 bridge). `sync_from_network`
+/// runs `git fetch` into the mirror first — wanted on sc fetch (fresh data)
+/// and on clone; NOT on push (export goes into the mirror as-is; a stale
+/// mirror head just means git push reports non-ff, verbatim).
+fn git_remote_effective_path(
+    repo: &scl_repo::Repo,
+    remote: &str,
+    url: &str,
+    sync_from_network: bool,
+) -> Result<std::path::PathBuf> {
+    if !scl_gitio::bridge::is_network_git_url(url) {
+        return Ok(std::path::PathBuf::from(url));
+    }
+    let mirror_dir = repo.layout().dot_sc.join("git-remotes").join(remote).join("mirror.git");
+    let mirror = scl_gitio::bridge::ensure_mirror(&mirror_dir, url)?;
+    if sync_from_network {
+        scl_gitio::bridge::mirror_fetch(&mirror)?;
+    }
+    Ok(mirror)
+}
+
 fn run_remote(op: RemoteOp) -> Result<()> {
     let repo = open_repo()?;
     match op {
         RemoteOp::Add { name, url, git } => {
             if git {
+                if !scl_gitio::bridge::is_network_git_url(&url)
+                    && !std::path::Path::new(&url).join("HEAD").exists()
+                    && !std::path::Path::new(&url).join(".git").exists()
+                {
+                    anyhow::bail!("'{url}' is neither a git URL nor a local git repo");
+                }
                 repo.remote_add_git(&name, &url)?;
                 println!("added git remote {name} -> {url}");
+                if scl_gitio::bridge::is_network_git_url(&url) {
+                    println!("  (network: transport via the system git binary)");
+                }
             } else {
                 if url.starts_with("ssh://") {
                     scl_repo::SshUrl::parse(&url)?; // fail fast on malformed URLs
@@ -1605,6 +1689,7 @@ fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
     let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
     let url = cfg.url(remote).ok_or_else(|| anyhow::anyhow!("no such remote: {remote}"))?.to_string();
     let branch = scl_repo::refs::current_branch(repo.layout())?;
+    let path = git_remote_effective_path(repo, remote, &url, true)?;
 
     // Known marks: git-oid-hex -> sc-id.
     let marks = scl_repo::MarksStore::open(repo.layout(), remote)?;
@@ -1617,7 +1702,7 @@ fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
     let report = {
         let store_arc = repo.vfs().store();
         let mut store = store_arc.lock().unwrap();
-        scl_gitio::import_history(&mut store, std::path::Path::new(&url), &branch, &known)?
+        scl_gitio::import_history(&mut store, &path, &branch, &known)?
     };
 
     // Persist new marks first, then the reachability root (the tracking ref) last.
@@ -1661,6 +1746,7 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
     let branch = scl_repo::refs::current_branch(repo.layout())?;
     let ref_name = format!("refs/heads/{branch}");
     let local_tip = repo.head_tip()?.ok_or_else(|| anyhow::anyhow!("branch is unborn — nothing to push"))?;
+    let path = git_remote_effective_path(repo, remote, &url, false)?;
 
     // Load marks both directions.
     let marks = scl_repo::MarksStore::open(repo.layout(), remote)?;
@@ -1673,10 +1759,21 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
         known_sc_to_git.insert(id, g.clone());
     }
 
-    // Fast-forward gate against the remote git ref.
-    if let Some(remote_git_hex) = scl_gitio::read_ref(std::path::Path::new(&url), &ref_name)? {
+    // Fast-forward gate against the remote git ref. For a network remote,
+    // `path` is the local mirror, which is advanced by BOTH `sc fetch` and
+    // our own `export_branch` below — it is last-known-or-locally-exported
+    // state, not confirmed network state. That is exactly why the network
+    // leg (`mirror_push`) must always run for network remotes, even when
+    // the mirror already matches `local_tip`: a prior `mirror_push` may
+    // have failed after `export_branch` had already advanced the mirror,
+    // stranding the commit behind this gate. git itself no-ops the push
+    // when the network is truly current, and retries it otherwise.
+    if let Some(remote_git_hex) = scl_gitio::read_ref(&path, &ref_name)? {
         match git_to_sc.get(&remote_git_hex) {
             Some(&remote_sc) if remote_sc == local_tip => {
+                if scl_gitio::bridge::is_network_git_url(&url) {
+                    scl_gitio::bridge::mirror_push(&path, &branch)?;
+                }
                 println!("push {remote} (git): already up to date");
                 return Ok(());
             }
@@ -1701,7 +1798,7 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
         let store_arc = repo.vfs().store();
         let mut store = store_arc.lock().unwrap();
         let opts = scl_gitio::ExportOptions {
-            to: std::path::Path::new(&url),
+            to: &path,
             ref_name: &ref_name,
             include_encrypted,
             known_git_commits: &known_sc_to_git,
@@ -1711,6 +1808,18 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
     let new: Vec<(String, String)> =
         report.new_marks.iter().map(|(g, s)| (g.clone(), s.to_hex().to_string())).collect();
     marks.append(&new)?;
+
+    // Ordering: export + marks precede the network push (mirroring the
+    // atomicity comment above) — a crash after export/marks but before
+    // `mirror_push` leaves the mirror ahead of the network, and the next
+    // `sc push` retries `mirror_push` (via the ff-gate above, which now
+    // always attempts the network leg for network remotes). The
+    // stale-network-ff case is caught by git itself. This must run BEFORE
+    // the success println below — a failed network leg must not print
+    // success.
+    if scl_gitio::bridge::is_network_git_url(&url) {
+        scl_gitio::bridge::mirror_push(&path, &branch)?;
+    }
 
     println!(
         "pushed {} commit(s) to {remote} (git) at {ref_name}: {}",
@@ -1722,6 +1831,9 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
             "  warning: {} protected file(s) pushed as ciphertext; {} secret(s) dropped (Git cannot enforce confidentiality)",
             report.protected_blobs_as_ciphertext, report.secrets_dropped
         );
+    }
+    if scl_gitio::bridge::is_network_git_url(&url) {
+        println!("pushed {remote} -> network ({url})");
     }
     Ok(())
 }
@@ -2037,5 +2149,204 @@ mod tests {
         assert!(!content.contains("[escrow]"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Env mutation (SC_GIT) races parallel tests in this crate that also
+    // spawn git for network remotes — serialize with a local lock, mirroring
+    // crates/gitio/src/bridge.rs's GIT_ENV_LOCK pattern. Both network tests
+    // in this module take it.
+    static GIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn network_git_remote_round_trip_over_file_url() {
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-netgit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A bare hub reachable only through a file:// URL (network-shaped).
+        let hub = root.join("hub.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main", hub.to_str().unwrap()])
+            .status().unwrap();
+        let url = format!("file://{}", hub.display());
+
+        // sc repo with one commit.
+        let work = root.join("repo");
+        std::fs::create_dir_all(&work).unwrap();
+        let repo = scl_repo::Repo::init(&work).unwrap();
+        std::fs::write(work.join("readme.txt"), "hello").unwrap();
+        repo.commit("me", "first").unwrap();
+        repo.remote_add_git("origin", &url).unwrap();
+
+        // Push through the mirror, then verify the HUB (not the mirror) has it.
+        run_push_git(&repo, "origin", false).unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(&hub).args(["log", "--oneline"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("first"),
+            "commit must be visible on the hub via git log");
+
+        // Fetch back through the mirror (round trip sanity).
+        run_fetch_git(&repo, "origin").unwrap();
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Reproduces the stranded-push bug: if `mirror_push` fails after
+    /// `export_branch` has already advanced the mirror ref, the mirror now
+    /// matches `local_tip` and the ff-gate's "already up to date" early
+    /// return must not skip retrying the network leg — otherwise the commit
+    /// is stuck on the mirror forever and never reaches the hub.
+    #[test]
+    fn network_push_failure_is_retryable() {
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-netgit-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let hub = root.join("hub.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main", hub.to_str().unwrap()])
+            .status().unwrap();
+        let url = format!("file://{}", hub.display());
+
+        let work = root.join("repo");
+        std::fs::create_dir_all(&work).unwrap();
+        let repo = scl_repo::Repo::init(&work).unwrap();
+        std::fs::write(work.join("readme.txt"), "hello").unwrap();
+        repo.commit("me", "first").unwrap();
+        repo.remote_add_git("origin", &url).unwrap();
+
+        // A shim that execs the real git for everything except `push`,
+        // where it fails loudly — simulating a network outage that hits
+        // only the mirror_push leg after export_branch has already
+        // advanced the mirror ref.
+        let shim = root.join("git-shim.sh");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\ncase \"$*\" in\n  *push*) echo 'shim: network down' >&2; exit 9;;\nesac\nexec git \"$@\"\n",
+        ).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        std::env::set_var("SC_GIT", shim.to_str().unwrap());
+        let err = run_push_git(&repo, "origin", false);
+        std::env::remove_var("SC_GIT");
+        assert!(err.is_err(), "first push must fail when the network leg fails");
+
+        // The hub must NOT have the commit yet.
+        let out = std::process::Command::new("git")
+            .current_dir(&hub).args(["log", "--oneline"]).output().unwrap();
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("first"),
+            "hub must not have the commit after a failed network push");
+
+        // Retry with the real git — must succeed and land the commit on the
+        // hub, proving the ff-gate didn't strand it behind "already up to
+        // date" now that the mirror was advanced by the failed attempt's
+        // export_branch call.
+        run_push_git(&repo, "origin", false).unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(&hub).args(["log", "--oneline"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("first"),
+            "retry must land the commit on the hub");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clone_from_network_git_url_adopts_default_branch() {
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-gitclone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Hub with default branch "trunk" and one seeded commit.
+        let hub = root.join("hub.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "trunk", hub.to_str().unwrap()]).status().unwrap();
+        let seed = root.join("seed");
+        std::process::Command::new("git").args(["init", "-b", "trunk", seed.to_str().unwrap()]).status().unwrap();
+        std::fs::write(seed.join("a.txt"), "x").unwrap();
+        for args in [vec!["add", "."], vec!["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "seed"]] {
+            std::process::Command::new("git").current_dir(&seed).args(&args).status().unwrap();
+        }
+        std::process::Command::new("git").current_dir(&seed)
+            .args(["push", &format!("file://{}", hub.display()), "trunk"]).status().unwrap();
+
+        // Route through run_clone WITHOUT --git: file:// is an unambiguous
+        // git URL form, so auto-detect must pick the mirror-bridge path.
+        let dst = root.join("cloned");
+        run_clone(format!("file://{}", hub.display()), dst.clone(), false).unwrap();
+        let repo = scl_repo::Repo::open(&dst).unwrap();
+        assert_eq!(scl_repo::refs::current_branch(repo.layout()).unwrap(), "trunk",
+            "local branch must adopt the remote default name");
+        assert!(dst.join("a.txt").exists(), "working tree must be materialized");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clone_bare_ssh_url_without_git_flag_stays_sc_native() {
+        // Env mutation (SC_SSH) — serialize with the shared git-env lock.
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-sshclone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Point SC_SSH at a program that cannot exist: if the sc-native
+        // transport is taken, the spawn failure names it (stdio_transport's
+        // contract). The git-mirror path would spawn `git` instead and fail
+        // with a hostname-resolution error that never mentions this path.
+        std::env::set_var("SC_SSH", "/nonexistent/sc-native-ssh-probe");
+        let err = run_clone(
+            "ssh://testhost/srv/repo".to_string(),
+            root.join("cloned-ssh"),
+            false,
+        )
+        .unwrap_err();
+        std::env::remove_var("SC_SSH");
+        assert!(
+            err.to_string().contains("sc-native-ssh-probe"),
+            "bare ssh:// without --git must reach the sc-native transport \
+             (spawn error should name $SC_SSH), got: {err}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clone_git_flag_with_local_path_errors_clearly() {
+        // Env mutation (git init) — serialize with the shared git-env lock.
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-gitflag-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Create a local bare git repo (plain path, no file:// URL scheme).
+        let local_git_repo = root.join("local.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main", local_git_repo.to_str().unwrap()])
+            .status().unwrap();
+
+        // Calling run_clone_git directly with a local path must bail with
+        // a clear error message mentioning "git URL", not misroute into
+        // ls-remote queries inside the SOURCE repo.
+        let dst = root.join("cloned");
+        let err = run_clone_git(local_git_repo.to_str().unwrap(), &dst).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("git URL"),
+            "error must mention 'git URL' to guide users; got: {msg}"
+        );
+        assert!(
+            msg.contains("sc remote add"),
+            "error must suggest the correct workflow; got: {msg}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

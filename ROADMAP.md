@@ -131,12 +131,26 @@ across every phase.
   `.sc/recipients.toml [escrow]` reads both the old `key` and new `keys`
   form and writes only `keys`. Proven by `demo/run_rewrap_demo.sh`.
   (ADR-0027.)
+- **Phase 18 — Network Git remotes.** `sc clone <git-url> <dst>` and
+  `sc remote add <name> <url> --git` now reach hosted Git (https/ssh) via
+  a lazily-created bare mirror at `.sc/git-remotes/<name>/mirror.git`: the
+  spawned system `git` binary is transport-only, and P10's in-process
+  `gix` translation, marks map, and confidentiality gate run unchanged
+  against the mirror. Auth is fully delegated to `git` (ssh-agent,
+  credential helpers, tokens); `sc` has no credential surface. Clone
+  routing auto-detects unambiguous git URL forms (https/http, scp-style,
+  file://); bare `ssh://` stays sc-native (P12) unless `--git` forces the
+  mirror path; `remote add` keeps `--git` required in every case. Proven
+  hermetically over `file://` by `demo/run_network_git_demo.sh` (real git
+  transport/pack code, no network, no auth); the demo prints the
+  real-GitHub recipe (`sc clone git@github.com:… --git` / push visible on
+  github.com). (ADR-0028.)
 
 ## Active
 
-None — Phase 18 is next up; see the next-horizon table below.
+None — Phase 19 is next up.
 
-## Next horizon (P18–P20)
+## Next horizon (P19–P20)
 
 Decided 2026-07-07 (design: `docs/superpowers/specs/2026-07-07-roadmap-horizon-p16-p20-design.md`).
 Theme: finish the confidentiality story end to end before pushing for
@@ -147,7 +161,6 @@ and the arc continues toward adoption.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
-| **P18 — Network Git remotes** | fetch/push against hosted Git | `sc remote add origin git@github.com:…`; fetch, merge, push; commits visible on github.com | [0028](docs/adr/0028-network-git-remotes.md) |
 | **P19 — History-editing polish** | amend, resumable rebase, pick abort, merge replay | interrupt a rebase on a conflict, resolve, `sc rebase --continue`; proven by the extended history demo | [0029](docs/adr/0029-history-editing-polish.md) |
 | **P20 — Agent sessions + auto-merge** | Durable `sc ws` sessions; clean results land unattended | fork workspaces, return in a later invocation, harvest; clean results auto-merge to an integration branch | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
 
@@ -175,6 +188,7 @@ must follow P16 so the rule-merge semantics replay honors are settled.
 | **P15 — Protected merge & replay** | Confidentiality composes with collaboration | keyless merge of disjoint protected edits; `sc merge --identity` content-merges colliding ones; registry replays through rebase; proven by `demo/run_protected_merge_demo.sh` | [0025](docs/adr/0025-protected-merge-and-replay.md) |
 | **P16 — Revocation tombstones** | `sc revoke` durable across merges | branch → revoke → merge pre-revoke branch: recipient stays revoked; proven by `demo/run_revoke_demo.sh` | [0026](docs/adr/0026-revocation-tombstones.md) |
 | **P17 — Bulk re-wrap + multiple escrow keys** | org-scale recipient/escrow cutover | change escrow, one `sc rewrap`, every entry re-sealed; R1 wraps stripped; proven by `demo/run_rewrap_demo.sh` | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
+| **P18 — Network Git remotes** | fetch/push against hosted Git | `sc clone git@github.com:…` / push visible on github.com; proven hermetically by `demo/run_network_git_demo.sh` | [0028](docs/adr/0028-network-git-remotes.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

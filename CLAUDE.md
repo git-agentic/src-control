@@ -174,6 +174,21 @@ cargo run --bin sc -- oplog                   # list recent operations
 bash demo/run_history_demo.sh                 # cherry-pick/rebase/undo round-trip proof
 bash demo/run_protected_merge_demo.sh         # protected merge & replay proof (P15)
 bash demo/run_revoke_demo.sh                  # revocation-tombstone durability proof (P16)
+cargo run --bin sc -- clone <git-url> <dst> [--git]   # auto-detects hosted-git URL forms
+                                              # (https://, http://, scp-style git@host:path,
+                                              # file://) and routes through the git mirror
+                                              # bridge (P18); bare ssh:// stays sc-native (P12)
+                                              # unless --git forces the mirror path; network
+                                              # forms require git on PATH (SC_GIT to override
+                                              # the binary)
+cargo run --bin sc -- remote add <name> <url> --git   # --git also accepts network URL forms
+                                              # (https://, http://, scp-style, ssh://) as of
+                                              # P18, alongside P10's local .git paths; --git
+                                              # stays required in every case; network forms
+                                              # require git on PATH (SC_GIT to override)
+bash demo/run_network_git_demo.sh             # hosted-git round trip over file:// (P18; prints
+                                              # the real-GitHub recipe: sc remote add origin
+                                              # git@github.com:… --git)
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -217,7 +232,8 @@ two DAGs is carried by the marks map, not by a fatter object model — the
 content-addressing invariant is unchanged. The git-remote path dispatches above
 the P6 `Transport` trait rather than implementing it (a Git remote has a
 different id space and encoding than sc's `Transport` assumes). Scope is local
-`.git` paths on disk only; network Git is deferred. One accepted MVP
+`.git` paths on disk only; network Git is deferred — lifted in P18 (network Git
+via system-git mirror bridge). One accepted MVP
 limitation: fetching from Git repo A and pushing a Git-origin commit to a
 *different* Git repo B re-synthesizes with dropped committer/timezone/gpgsig
 and a different Git oid than A had — same-remote fetch/push stays clean. A side
@@ -398,8 +414,41 @@ the practical answer to the ADR-0026 R1 corollary above: change the
 escrow/recipient set, run one `sc rewrap`, and the re-attached wraps are
 gone from the live tip. See ADR-0027.
 
-Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
-frames, interactive workspace sessions, auto-merge of clean workspace
-results, `sc amend`, stop-and-continue rebase (`--continue`), cherry-pick
+**Phase 18 is built.** Hosted Git (GitHub over https/ssh) is now reachable
+via a system-git mirror bridge, because upstream `gix` (pinned 0.85) can
+fetch/clone but not push — a pure in-process network path is impossible
+today. Each git-backed network remote keeps a lazily-created bare mirror
+at `.sc/git-remotes/<name>/mirror.git`, beside (not replacing) P10's
+`marks` file in the same directory; deleting `mirror.git` is always safe
+(next op reconstructs it), deleting `marks` is not (it carries `git_oid
+↔ sc_id` identity). The spawned system `git` binary (`crates/gitio/src/
+bridge.rs`) is transport-only: `sc fetch` runs `git fetch --prune` into
+the mirror, then P10's unchanged in-process import; `sc push` runs P10's
+unchanged export into the mirror, then `git push`, reusing the P9/P10
+confidentiality gate verbatim. `sc clone <git-url> <dst>` composes init +
+`remote add --git` + fetch + adopt-default-branch. Auth is fully
+delegated to the spawned `git` (ssh-agent, credential helpers, tokens);
+its stderr passes through unmodified and `sc` has no credential surface.
+Clone routing auto-detects unambiguous git URL forms — `https://`,
+`http://`, scp-style `git@host:path`, `file://` — none of which can ever
+mean an sc-native remote; bare `ssh://` stays sc-native (P12/ADR-0022)
+unless `--git` forces the mirror path. `sc remote add <name> <url> --git`
+now also accepts these network forms, but `--git` stays required there in
+every case (no clone-time ambiguity to resolve). `file://` deliberately
+routes through the bridge too, so tests and `demo/run_network_git_demo.sh`
+exercise git's genuine transport/pack code hermetically. `SC_GIT`
+overrides the spawned binary (the P12 `SC_SSH` pattern); `git` becomes a
+runtime requirement for network remotes only — local-path git remotes and
+everything else keep working without it. A review Critical: `export_branch`
+advances the *mirror's* ref, not the network's, so the fast-forward gate
+must not treat "mirror matches local tip" as "nothing to push" for network
+remotes — `sc push` now always runs the network leg (`mirror_push`) before
+any success output, even on that branch, so a previously-failed push is
+retried instead of silently reported up to date (regression test:
+`network_push_failure_is_retryable`). See ADR-0028.
+
+Remaining follow-ons: HTTP transport, streaming (>4 GiB) frames,
+interactive workspace sessions, auto-merge of clean workspace results,
+`sc amend`, stop-and-continue rebase (`--continue`), cherry-pick
 `--abort`, merge-commit replay (mainline selection), operation objects in
 the CAS, and oplog entries for remote-tracking refs.

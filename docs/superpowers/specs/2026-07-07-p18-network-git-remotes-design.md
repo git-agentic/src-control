@@ -51,6 +51,12 @@ sc push origin [--include-encrypted]
 - `sc clone <git-url> <dst>` — new sugar, pure composition: init +
   `remote add origin <url> --git` + fetch + adopt the mirror's `HEAD`
   default branch (the P10 unborn-branch adoption path).
+  [Precision (P18 as shipped, user-adjudicated): clone routing
+  auto-detects unambiguous git URL forms — `https://`, `http://`,
+  scp-style `git@host:path`, `file://` — which can never be sc-native,
+  so no flag is needed for them. Bare `ssh://` stays sc-native (P12,
+  ADR-0022); `sc clone ssh://… --git` forces the git-mirror path. The
+  `remote add` rule above is unchanged: `--git` stays required there.]
 
 ### Auth: fully delegated
 
