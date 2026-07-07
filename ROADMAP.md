@@ -161,7 +161,6 @@ must follow P16 so the rule-merge semantics replay honors are settled.
 | **P14 — History editing** | Integrate agent branches; undo anything | `sc cherry-pick work-2`, `sc rebase main`, `sc undo`/redo round-trip proven by `demo/run_history_demo.sh` | [0024](docs/adr/0024-history-editing.md) |
 | **P15 — Protected merge & replay** | Confidentiality composes with collaboration | keyless merge of disjoint protected edits; `sc merge --identity` content-merges colliding ones; registry replays through rebase; proven by `demo/run_protected_merge_demo.sh` | [0025](docs/adr/0025-protected-merge-and-replay.md) |
 | **P16 — Revocation tombstones** | `sc revoke` durable across merges | branch → revoke → merge pre-revoke branch: recipient stays revoked; proven by `demo/run_revoke_demo.sh` | [0026](docs/adr/0026-revocation-tombstones.md) |
-| **P17 — Bulk re-wrap + multiple escrow keys** | Org-scale recipient/escrow cutover | CLI-managed escrow key list: `sc escrow add/remove/show`; `sc rewrap` seals every secret + protected prefix to the new set | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

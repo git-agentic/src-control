@@ -1942,4 +1942,39 @@ mod tests {
         assert_eq!(out.len(), 2, "p1 deduped, p2 appended");
         assert!(out.iter().any(|k| k.recipient_id() == p2.recipient_id()));
     }
+
+    #[test]
+    fn escrow_remove_and_empty_list_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("scl-escrow-remove-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recipients.toml");
+
+        // Write two escrow keys
+        let (_s1, p1) = scl_crypto::generate_keypair();
+        let (_s2, p2) = scl_crypto::generate_keypair();
+        write_escrow_keys(&path, vec![p1.clone(), p2.clone()]).unwrap();
+
+        // Load and verify 2 keys
+        let keys = load_escrows(&path).unwrap();
+        assert_eq!(keys.len(), 2);
+
+        // Simulate removal by writing back minus one key
+        write_escrow_keys(&path, vec![p1.clone()]).unwrap();
+
+        // Load and verify 1 key and the right one remains
+        let keys = load_escrows(&path).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].recipient_id(), p1.recipient_id());
+
+        // Write empty list and assert load_escrows returns empty
+        write_escrow_keys(&path, vec![]).unwrap();
+        let keys = load_escrows(&path).unwrap();
+        assert!(keys.is_empty());
+
+        // Assert the written file no longer contains an [escrow] section
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("[escrow]"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
