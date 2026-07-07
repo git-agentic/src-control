@@ -105,12 +105,12 @@ unchanged. The `sc revoke` / `secret revoke` hints are re-worded to name
   `scl_crypto::open` (fails if the identity holds no wrap on the secret),
   and the paths half looks up the caller's own wrap in
   `protection.wrapped` before unwrapping the DEK. Rewrap *seals* the
-  rebuilt entry to `rule.granted_keys() + escrow` (paths) or the resolved
-  recipient set `+ escrow` (secrets) — the tombstone-aware set, not wrap
-  presence. Conflating the two would either lock out a still-wrapped-but-
-  revoked recipient's rewrap attempt (they can open) or reseal to them
-  (they must not be resealed to) — this ADR keeps them separate exactly as
-  ADR-0026 established for `grant`/decrypt vs. sealing.
+  rebuilt entry: paths to the tombstone-aware `rule.granted_keys() + escrow`,
+  secrets to their current (wrap-derived) recipient set `+ escrow` — both by
+  the resolved set, not wrap presence. Conflating the two would either lock
+  out a still-wrapped-but-revoked recipient's rewrap attempt (they can open)
+  or reseal to them (they must not be resealed to) — this ADR keeps them
+  separate exactly as ADR-0026 established for `grant`/decrypt vs. sealing.
 - **`sc undo` and `sc switch` interact with the demo, not the design.**
   `sc undo` reverts only the single most recent oplog record, and `sc
   switch` records its own oplog entry even when it is a no-op (same branch,

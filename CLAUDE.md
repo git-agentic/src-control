@@ -237,12 +237,12 @@ per-file protected paths use convergent encryption, where DEK "rotation" is
 either dedup-breaking or security-meaningless, so path lifecycle stays on
 recipient re-wrap (`grant`/`revoke`). `sc secret revoke` remains
 metadata-only (unchanged behavior), now printing a hint to run `rotate` for
-an actual cryptographic cutover. `sc escrow set <pubkey-or-name>` / `sc escrow
-show` configure a single break-glass recipient key in `.sc/recipients.toml
-[escrow]`, auto-appended (deduped) whenever `secret add`, `secret rotate`, or
-`protect` seals/wraps — forward-only (existing secrets/paths gain escrow only
-when next rotated/re-wrapped) and policy, not enforcement (nothing stops a
-caller from bypassing the CLI and omitting it). **Rotation ≠ erasure:**
+an actual cryptographic cutover. `sc escrow {add,remove,show}` / `sc escrow set` (single break-glass key →
+managed list in P17; `set` kept as replace-with-one sugar) in
+`.sc/recipients.toml [escrow]`, auto-appended (deduped) whenever `secret add`,
+`secret rotate`, or `protect` seals/wraps — forward-only (existing secrets/paths
+gain escrow only when next rotated/re-wrapped) and policy, not enforcement
+(nothing stops a caller from bypassing the CLI and omitting it). **Rotation ≠ erasure:**
 content-addressed history means the old ciphertext object remains reachable
 and decryptable by anyone who kept the old DEK; rotation cuts off *future*
 reads through the current registry, and real security requires rotating the
