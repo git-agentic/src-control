@@ -1,6 +1,6 @@
 # ADR-0027: Bulk re-wrap and multiple escrow keys
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-07
 - **Phase:** 17
 - **Builds on:** ADR-0019 (secret lifecycle), ADR-0009 (key management), ADR-0026 (revocation tombstones)
@@ -70,3 +70,61 @@ unchanged. The `sc revoke` / `secret revoke` hints are re-worded to name
 - **Atomic all-or-nothing rewrap:** unusable in the presence of
   forward-only escrow (one pre-escrow secret blocks the whole cutover);
   rejected for skip-and-report with a non-zero exit.
+
+## Refinements discovered during the build
+
+- **Known-key pool for reverse `recipient_id` resolution lives in the CLI,
+  not `repo`.** `run_rewrap` assembles it from `[recipients]` in
+  `recipients.toml` + every escrow key + the identity's own public key,
+  deduped by `recipient_id`; a missing or unreadable `recipients.toml`
+  degrades to escrow + self rather than failing the command outright.
+  `repo::rewrap` takes the resolved `known_keys: &[PublicKey]` as a plain
+  argument and never reads `recipients.toml` itself.
+- **Exit-code plumbing reuses the `run_merge` pattern.** `run_rewrap` calls
+  `drop(repo)` before `std::process::exit(1)` when the report has any
+  skipped entries, so the repo's single-writer lock file is released before
+  the process exits. The `rewrapped N secret(s), M protected blob(s)`
+  summary (and commit id) print to stdout; the skipped-entry list, the
+  "re-run with an identity that can open them" hint, and the ADR-0019
+  honesty caveat all print to stderr.
+- **Wrap-list rebuild is target-set-driven, not reuse-everything.**
+  `repo::rewrap` builds the new wrap list by iterating exactly
+  `granted_keys() ∪ escrow` and, for each target, reuses the prior wrap
+  bytes only when that recipient is already present in `prior` — otherwise
+  it mints a fresh wrap. Recipients present in `prior` but absent from the
+  target set are never copied forward. This is what strips a tombstoned
+  recipient's re-attached wrap (the ADR-0026 R1 corollary) rather than
+  merely leaving it stale; the acceptance test
+  (`rewrap_strips_reattached_wraps_after_pre_revoke_merge`, rewrap.rs)
+  reproduces the R1 scenario end to end — merges a pre-revoke branch,
+  confirms bob's wrap is back at the tip as a precondition, runs `rewrap`,
+  and asserts no wrap in the resulting snapshot's `protection.wrapped`
+  carries bob's `recipient_id` while the root tree id is unchanged.
+- **Authorization surfaces stay distinct, per the P16 review's correction.**
+  Rewrap *opens* an entry by wrap presence: the secrets half calls
+  `scl_crypto::open` (fails if the identity holds no wrap on the secret),
+  and the paths half looks up the caller's own wrap in
+  `protection.wrapped` before unwrapping the DEK. Rewrap *seals* the
+  rebuilt entry to `rule.granted_keys() + escrow` (paths) or the resolved
+  recipient set `+ escrow` (secrets) — the tombstone-aware set, not wrap
+  presence. Conflating the two would either lock out a still-wrapped-but-
+  revoked recipient's rewrap attempt (they can open) or reseal to them
+  (they must not be resealed to) — this ADR keeps them separate exactly as
+  ADR-0026 established for `grant`/decrypt vs. sealing.
+- **`sc undo` and `sc switch` interact with the demo, not the design.**
+  `sc undo` reverts only the single most recent oplog record, and `sc
+  switch` records its own oplog entry even when it is a no-op (same branch,
+  same tip) — so `demo/run_rewrap_demo.sh` asserts the undo/redo round trip
+  immediately after `rewrap`, before any further `switch`, to keep the
+  targeted record the rewrap commit.
+- **`crates/repo/src/secrets.rs` grew one new visibility, not a new
+  module.** `append_dedup` (dedup-appending escrow keys onto a resolved
+  target list) is `pub(crate)` so `rewrap.rs` can reuse it; `Repo::store_arc`
+  widened from private to `pub(crate)` for the same reason. No new public
+  API surface.
+- **Escrow TOML back-compat is a parse-time union, write-time
+  normalization.** `EscrowSection { key: Option<String>, keys: Vec<String> }`
+  reads both the old singular `key` and the new `keys` list (chained,
+  deduped by `recipient_id`); every write normalizes to `keys` only, and an
+  empty list drops the `[escrow]` section entirely rather than writing
+  `keys = []`.

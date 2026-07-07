@@ -117,20 +117,33 @@ across every phase.
   only, closing the ADR-0025 boundary: branch → revoke → merge pre-revoke
   branch now leaves the recipient revoked. Proven by
   `demo/run_revoke_demo.sh`. (ADR-0026.)
+- **Phase 17 — Bulk re-wrap + multiple escrow keys.** `sc rewrap
+  [--identity <key>] [--dry-run]` re-seals every secret and every protected
+  blob's wrap list at the tip to the current recipient/escrow sets, in one
+  commit and one oplog record. Secrets are recovered and re-sealed under a
+  fresh DEK (P11 rotate machinery); protected blobs get their wrap list
+  replaced with exactly `granted_keys() + escrow`, stripping any
+  tombstoned recipient's wraps re-attached by a pre-revoke merge (closing
+  the ADR-0026 R1 corollary). Skip-and-report: entries the identity can't
+  open are skipped and named, the command commits what succeeded, and
+  exits non-zero when incomplete. Escrow became a managed list
+  (`sc escrow add/remove/show`, `set` kept as replace-with-one sugar);
+  `.sc/recipients.toml [escrow]` reads both the old `key` and new `keys`
+  form and writes only `keys`. Proven by `demo/run_rewrap_demo.sh`.
+  (ADR-0027.)
 
 ## Active
 
-- **Phase 17 — Bulk re-wrap + multiple escrow keys.** In build. Spec:
-  `docs/superpowers/specs/2026-07-07-p17-bulk-rewrap-design.md`
-  (ADR-0027, Proposed → Accepted at completion).
+None — Phase 18 is next up; see the next-horizon table below.
 
 ## Next horizon (P18–P20)
 
 Decided 2026-07-07 (design: `docs/superpowers/specs/2026-07-07-roadmap-horizon-p16-p20-design.md`).
 Theme: finish the confidentiality story end to end before pushing for
 adoption — P16 closed the ADR-0025 boundary (a prefix-rule revoke is now
-durable across merges of pre-revoke branches), and P17 enables practical
-cutover at org scale; the arc continues toward adoption.
+durable across merges of pre-revoke branches), P17 closed the practical
+cutover at org scale (one `sc rewrap` after an escrow/recipient change),
+and the arc continues toward adoption.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
@@ -161,6 +174,7 @@ must follow P16 so the rule-merge semantics replay honors are settled.
 | **P14 — History editing** | Integrate agent branches; undo anything | `sc cherry-pick work-2`, `sc rebase main`, `sc undo`/redo round-trip proven by `demo/run_history_demo.sh` | [0024](docs/adr/0024-history-editing.md) |
 | **P15 — Protected merge & replay** | Confidentiality composes with collaboration | keyless merge of disjoint protected edits; `sc merge --identity` content-merges colliding ones; registry replays through rebase; proven by `demo/run_protected_merge_demo.sh` | [0025](docs/adr/0025-protected-merge-and-replay.md) |
 | **P16 — Revocation tombstones** | `sc revoke` durable across merges | branch → revoke → merge pre-revoke branch: recipient stays revoked; proven by `demo/run_revoke_demo.sh` | [0026](docs/adr/0026-revocation-tombstones.md) |
+| **P17 — Bulk re-wrap + multiple escrow keys** | org-scale recipient/escrow cutover | change escrow, one `sc rewrap`, every entry re-sealed; R1 wraps stripped; proven by `demo/run_rewrap_demo.sh` | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

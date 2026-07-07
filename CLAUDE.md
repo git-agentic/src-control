@@ -149,8 +149,16 @@ bash demo/run_ssh_remote_demo.sh                    # ssh transport round-trip p
 cargo run --bin sc -- secret rotate <name> --value <new>       # re-seal under a fresh DEK
 cargo run --bin sc -- secret rotate <name> --identity <key>    # same value, fresh DEK
 cargo run --bin sc -- escrow set <pubkey-or-name>              # break-glass recovery key
-cargo run --bin sc -- escrow show
+                                                                # (replace-with-one sugar, P17)
 bash demo/run_lifecycle_demo.sh                                # rotation + escrow proof
+cargo run --bin sc -- rewrap [--identity <key>] [--dry-run]   # one-commit bulk reseal of all
+                                              # secrets + protected wrap lists to current
+                                              # recipient/escrow sets (skip-and-report;
+                                              # exits 1 when entries were skipped)
+cargo run --bin sc -- escrow add <pubkey-or-name>    # append a break-glass key (list)
+cargo run --bin sc -- escrow remove <id-or-name>
+cargo run --bin sc -- escrow show                    # lists all escrow keys
+bash demo/run_rewrap_demo.sh                          # bulk rewrap + escrow-list proof
 cargo run --bin sc -- work --agents 3 -- <cmd>   # fork agent workspaces, run <cmd> in each,
                                                  # harvest changed ones to work-<i> branches
                                                  # (--with-secrets --identity <key> injects
@@ -346,7 +354,11 @@ revoke). Corollary: merging a pre-revoke branch re-attaches the revoked
 recipient's old wraps to the live tip, and since `grant` authorizes by
 wrap presence, a revoked-but-wrap-holding recipient can still grant others
 access to that pre-revoke ciphertext — standing and fresh seals stay
-tombstone-gated regardless. Crossed revokes can empty a rule's granted set
+tombstone-gated regardless. **P17's `sc rewrap` is the practical answer to
+this corollary:** it replaces the live tip's wrap list with exactly the
+rule's current `granted_keys() + escrow`, stripping the re-attached wraps
+from the tip in one commit (history keeps them, per the ADR-0019
+boundary). Crossed revokes can empty a rule's granted set
 entirely; `encrypt_protected` is now fallible and refuses the seal loudly
 (pointing at `sc grant`) rather than minting ciphertext nobody can read.
 This is a rules-format break: the snapshot tag bumped `2 → 4`
@@ -359,9 +371,35 @@ next epoch, so tombstones survive re-protect. `sc protect --list` gained
 closes the ADR-0025 boundary note: merging any branch created before a
 revoke no longer resurrects the revoked recipient. See ADR-0026.
 
+**Phase 17 is built.** `sc rewrap [--identity <key>] [--dry-run]` is a
+one-command, one-commit, one-oplog-record bulk cutover of every secret and
+protected blob at the tip to the current recipient/escrow sets — undoable
+like any other ref-moving operation. Secrets are recovered with the
+identity and re-sealed under a fresh DEK to their current recipients plus
+the full escrow list (P11's rotate machinery, batched into a single
+registry commit); every PROTECTED blob has its DEK unwrapped by wrap
+presence and its wrap list **replaced** with exactly the governing rule's
+`granted_keys() + escrow`, so a tombstoned recipient's wraps re-attached by
+a pre-revoke merge do not survive the sweep. Convergent DEKs keep
+ciphertext ids unchanged, so the commit is policy-only (root tree
+byte-identical). **Skip-and-report:** entries the identity cannot open are
+skipped and named (not silently dropped); the command commits whatever it
+could and exits non-zero when anything was skipped, printing a hint to
+re-run with an identity that can open the rest. **Honesty caveat (same
+ADR-0019 boundary):** rewrap cuts the live tip only — old snapshots in
+history keep their old wraps and old secret objects via content
+addressing, so real cutover of an external credential still means
+rotating the credential itself. Escrow is now a managed list rather than a
+single key: `sc escrow add/remove/show` join `set` (kept as
+replace-with-one sugar); `.sc/recipients.toml [escrow]` grows from
+`key = "…"` to `keys = […]` (old singular form still read on load, every
+write normalizes to `keys`, and an empty list drops the section). This is
+the practical answer to the ADR-0026 R1 corollary above: change the
+escrow/recipient set, run one `sc rewrap`, and the re-attached wraps are
+gone from the live tip. See ADR-0027.
+
 Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
-frames, bulk re-wrap, multiple escrow keys, interactive workspace sessions,
-auto-merge of clean workspace results, `sc amend`, stop-and-continue rebase
-(`--continue`), cherry-pick `--abort`, merge-commit replay (mainline
-selection), operation objects in the CAS, and oplog entries for
-remote-tracking refs.
+frames, interactive workspace sessions, auto-merge of clean workspace
+results, `sc amend`, stop-and-continue rebase (`--continue`), cherry-pick
+`--abort`, merge-commit replay (mainline selection), operation objects in
+the CAS, and oplog entries for remote-tracking refs.
