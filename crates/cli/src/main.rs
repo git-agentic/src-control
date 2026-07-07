@@ -262,6 +262,16 @@ enum Cmd {
         #[command(subcommand)]
         op: EscrowOp,
     },
+    /// Re-seal every secret and protected file's wrap list at the tip to the
+    /// current recipient + escrow sets, in one undoable commit.
+    Rewrap {
+        /// Identity able to open the entries being re-wrapped.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Report what would be re-wrapped without committing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Revert the last operation (run again to redo).
     Undo,
     /// List recent operations, newest first.
@@ -420,6 +430,7 @@ fn main() -> Result<()> {
         Cmd::Gc { prune_expire } => run_gc(&prune_expire),
         Cmd::Export { to, r#ref, include_encrypted } => run_export(to, r#ref, include_encrypted),
         Cmd::Escrow { op } => run_escrow(op),
+        Cmd::Rewrap { identity, dry_run } => run_rewrap(identity, dry_run),
         Cmd::Undo => run_undo(),
         Cmd::Oplog => run_oplog(),
     }
@@ -1227,7 +1238,7 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("bad recipient id"))?;
             repo.secret_revoke(&name, &rid)?;
             println!("revoked {recipient_id} from {name}");
-            eprintln!("note: revoke is metadata-only; run `sc secret rotate {name}` for a cryptographic cutover");
+            eprintln!("hint: run `sc secret rotate {name} --identity <key>` for a cryptographic cutover of this secret, or `sc rewrap` to re-seal everything at once");
         }
         SecretOp::List { json } => {
             let infos = repo.secret_list()?;
@@ -1777,9 +1788,9 @@ fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
     println!("revoked {recipient_id} from {prefix}");
     eprintln!(
         "note: the revocation is recorded as a tombstone and holds across merges; \
-         it stops FUTURE seals only — run `sc secret rotate` / re-encrypt flows for \
-         a cryptographic cutover of existing values, and rotate the underlying \
-         external credential itself"
+         it stops FUTURE seals only. Run `sc rewrap --identity <key>` to strip the \
+         recipient's wraps from the tip (old history snapshots keep theirs), and \
+         rotate the underlying external credential itself for a real cutover"
     );
     Ok(())
 }
@@ -1838,6 +1849,56 @@ fn run_gc(prune_expire: &str) -> Result<()> {
         "gc: packed {} object(s), pruned {} loose, kept {} recent, removed {} old pack(s)",
         stats.packed, stats.loose_pruned, stats.loose_kept, stats.packs_removed
     );
+    Ok(())
+}
+
+fn run_rewrap(identity: Option<PathBuf>, dry_run: bool) -> Result<()> {
+    let repo = open_repo()?;
+    let sk = load_identity(identity)?;
+    let recipients_path = repo.layout().dot_sc.join("recipients.toml");
+    let escrows = load_escrows(&recipients_path)?;
+    // Known-key pool for reverse recipient_id resolution: every [recipients]
+    // key + every escrow key + the identity's own public key.
+    let mut known: Vec<scl_crypto::PublicKey> = match load_recipients(&recipients_path) {
+        Ok(dir) => dir.into_values().collect(),
+        Err(_) => Vec::new(), // missing file: pool is escrow + self
+    };
+    for e in &escrows {
+        if !known.iter().any(|k| k.recipient_id() == e.recipient_id()) {
+            known.push(e.clone());
+        }
+    }
+    let me = sk.public();
+    if !known.iter().any(|k| k.recipient_id() == me.recipient_id()) {
+        known.push(me);
+    }
+
+    let report = repo.rewrap(&sk, &escrows, &known, dry_run)?;
+    let verb = if dry_run { "would rewrap" } else { "rewrapped" };
+    println!(
+        "{verb} {} secret(s), {} protected blob(s)",
+        report.secrets_rewrapped.len(),
+        report.blobs_rewrapped
+    );
+    if let Some(id) = &report.commit {
+        println!("commit: {}", id.short());
+    }
+    if !report.skipped.is_empty() {
+        eprintln!("skipped {} entr(ies):", report.skipped.len());
+        for (entry, reason) in &report.skipped {
+            eprintln!("  {entry}: {reason}");
+        }
+        eprintln!("re-run `sc rewrap` with an identity that can open them to complete the sweep");
+    }
+    eprintln!(
+        "note: rewrap cuts the live tip only — snapshots already in history keep \
+         their old wraps and secret objects (content addressing); rotating the \
+         underlying external credential is still the real cutover"
+    );
+    if !report.skipped.is_empty() {
+        drop(repo);
+        std::process::exit(1);
+    }
     Ok(())
 }
 
