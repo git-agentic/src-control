@@ -215,6 +215,9 @@ enum Cmd {
         /// List protected prefixes instead of adding one.
         #[arg(long)]
         list: bool,
+        /// Machine-readable output for --list.
+        #[arg(long)]
+        json: bool,
     },
     /// Grant a recipient read access to an already-protected prefix (policy-only;
     /// no file objects change). Requires your identity to re-wrap the DEK.
@@ -407,7 +410,7 @@ fn main() -> Result<()> {
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
         Cmd::Push { remote, include_encrypted } => run_push(&remote, include_encrypted),
-        Cmd::Protect { prefix, to, list } => run_protect(prefix, to, list),
+        Cmd::Protect { prefix, to, list, json } => run_protect(prefix, to, list, json),
         Cmd::Grant { prefix, to, identity } => run_grant(prefix, to, identity),
         Cmd::Revoke { prefix, recipient_id } => run_revoke(prefix, recipient_id),
         Cmd::Gc { prune_expire } => run_gc(&prune_expire),
@@ -1652,11 +1655,34 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
     Ok(())
 }
 
-fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool) -> Result<()> {
+fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) -> Result<()> {
     let repo = open_repo()?;
     if list || prefix.is_none() {
-        for (p, recips) in repo.protected_prefixes()? {
-            println!("{p}  ({} recipient(s))", recips.iter().filter(|r| r.granted).count());
+        let prefixes = repo.protected_prefixes()?;
+        if json {
+            let v: Vec<_> = prefixes
+                .iter()
+                .map(|(p, recips)| {
+                    serde_json::json!({
+                        "prefix": p,
+                        "recipients": recips.iter().map(|r| serde_json::json!({
+                            "id": r.id.as_str(),
+                            "epoch": r.epoch,
+                            "state": if r.granted { "granted" } else { "revoked" },
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            return Ok(());
+        }
+        for (p, recips) in prefixes {
+            let granted = recips.iter().filter(|r| r.granted).count();
+            println!("{p}  ({granted} granted)");
+            for r in recips {
+                let state = if r.granted { "granted" } else { "REVOKED" };
+                println!("  {}  {}@e{}", r.id.as_str(), state, r.epoch);
+            }
         }
         return Ok(());
     }
@@ -1688,9 +1714,10 @@ fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
     repo.revoke(&prefix, &rid)?;
     println!("revoked {recipient_id} from {prefix}");
     eprintln!(
-        "note: this is not durable against merges — merging any branch created before this \
-         revoke re-adds {recipient_id} to the rule via union, and fresh DEKs for future commits \
-         under {prefix} will seal to them again; re-check `sc protect --list` after merges"
+        "note: the revocation is recorded as a tombstone and holds across merges; \
+         it stops FUTURE seals only — run `sc secret rotate` / re-encrypt flows for \
+         a cryptographic cutover of existing values, and rotate the underlying \
+         external credential itself"
     );
     Ok(())
 }
