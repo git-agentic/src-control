@@ -179,10 +179,11 @@ enum Cmd {
     Clone {
         src: String,
         dst: PathBuf,
-        /// Treat `src` as a Git remote (https/http, scp-style, ssh://,
-        /// file://) and clone via the system-git mirror bridge instead of
-        /// sc's native transport. Required for `ssh://` because bare
-        /// `ssh://` already means an sc-native remote (ADR-0022/ADR-0028).
+        /// Force cloning via the system-git mirror bridge. Unambiguous git
+        /// URL forms (https/http, scp-style `git@host:path`, file://) are
+        /// auto-detected and need no flag; `--git` is only required for
+        /// `ssh://` git hosts, because bare `ssh://` already means an
+        /// sc-native remote (ADR-0022/ADR-0028).
         #[arg(long)]
         git: bool,
     },
@@ -1535,7 +1536,13 @@ fn resolve_ids_to_pubkeys(
 }
 
 fn run_clone(src: String, dst: PathBuf, git: bool) -> Result<()> {
-    if git {
+    // Auto-detect unambiguous git URL forms (https/http, scp-style, file://):
+    // those can never be sc-native, so no flag is needed. Bare `ssh://` is
+    // ambiguous — it means an sc-native remote (ADR-0022) unless `--git`
+    // forces the mirror-bridge path (ADR-0028; user-adjudicated).
+    let git_shaped =
+        scl_gitio::bridge::is_network_git_url(&src) && !src.starts_with("ssh://");
+    if git || git_shaped {
         return run_clone_git(&src, &dst);
     }
     let repo = scl_repo::Repo::clone_url(&src, &dst)?;
@@ -1544,10 +1551,10 @@ fn run_clone(src: String, dst: PathBuf, git: bool) -> Result<()> {
     Ok(())
 }
 
-/// Clone from a hosted Git URL (`--git`): init + remote add origin --git +
-/// fetch + adopt the remote's default branch (P10's unborn fast-forward
-/// adoption). Requires the explicit flag because bare `ssh://` already means
-/// an sc-native remote (ADR-0022) — URL shape alone can't disambiguate.
+/// Clone from a hosted Git URL: init + remote add origin --git + fetch +
+/// adopt the remote's default branch (P10's unborn fast-forward adoption).
+/// Reached by auto-detect for unambiguous git URL forms, or by `--git` for
+/// `ssh://` git hosts (bare `ssh://` stays sc-native, ADR-0022).
 fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     let repo = scl_repo::Repo::init(dst)?;
@@ -2261,13 +2268,44 @@ mod tests {
         std::process::Command::new("git").current_dir(&seed)
             .args(["push", &format!("file://{}", hub.display()), "trunk"]).status().unwrap();
 
+        // Route through run_clone WITHOUT --git: file:// is an unambiguous
+        // git URL form, so auto-detect must pick the mirror-bridge path.
         let dst = root.join("cloned");
-        run_clone_git(&format!("file://{}", hub.display()), &dst).unwrap();
+        run_clone(format!("file://{}", hub.display()), dst.clone(), false).unwrap();
         let repo = scl_repo::Repo::open(&dst).unwrap();
         assert_eq!(scl_repo::refs::current_branch(repo.layout()).unwrap(), "trunk",
             "local branch must adopt the remote default name");
         assert!(dst.join("a.txt").exists(), "working tree must be materialized");
         drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clone_bare_ssh_url_without_git_flag_stays_sc_native() {
+        // Env mutation (SC_SSH) — serialize with the shared git-env lock.
+        let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!("scl-cli-sshclone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Point SC_SSH at a program that cannot exist: if the sc-native
+        // transport is taken, the spawn failure names it (stdio_transport's
+        // contract). The git-mirror path would spawn `git` instead and fail
+        // with a hostname-resolution error that never mentions this path.
+        std::env::set_var("SC_SSH", "/nonexistent/sc-native-ssh-probe");
+        let err = run_clone(
+            "ssh://testhost/srv/repo".to_string(),
+            root.join("cloned-ssh"),
+            false,
+        )
+        .unwrap_err();
+        std::env::remove_var("SC_SSH");
+        assert!(
+            err.to_string().contains("sc-native-ssh-probe"),
+            "bare ssh:// without --git must reach the sc-native transport \
+             (spawn error should name $SC_SSH), got: {err}"
+        );
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
