@@ -292,6 +292,12 @@ P20):
   gets its wraps unioned back by the completion — `grant`/`revoke`/`secret
   add/rotate` share this pre-existing gap and should gain the same
   `MergeInProgress`/`PickInProgress` guards `rewrap` and the ref-movers use.
+- **Marks-map staleness recovery.** A rejected non-ff push (or any P10-era
+  flow) followed by a `git gc` inside the git repo/mirror can leave marks
+  pointing at pruned git objects — a pre-existing P10 staleness class with
+  a new P18 trigger (mirror `git gc`). Wants a documented recovery path
+  (re-fetch rebuilds, or a marks-verify subcommand). Flagged at the P18
+  final review.
 - **Sub-tree / partial sharing** and sparse checkouts.
 - **Merge ergonomics**: richer conflict resolution UX beyond P4's
   detection/representation.
