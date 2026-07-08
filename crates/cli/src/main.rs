@@ -1476,38 +1476,67 @@ fn run_log(json: bool) -> Result<()> {
     let repo = open_repo()?;
     let entries = repo.log()?;
     let trust = load_trust_map(&repo.layout().dot_sc.join("recipients.toml"))?;
+    // Pre-compute every commit's signature status up front, before any
+    // printing starts. `sig_status` does disk I/O against the signature
+    // index; interleaving it between per-commit `println!`s widens the
+    // window in which a downstream reader (e.g. `sc log | grep -q x` under
+    // `set -o pipefail`) can close its end of the pipe mid-loop. Batching the
+    // I/O here doesn't fully close that window (see `print_line` below for
+    // the general fix), but it does remove the regression's specific cause.
+    let statuses: Vec<_> = entries
+        .iter()
+        .map(|(id, _)| repo.sig_status(id, &trust))
+        .collect::<std::result::Result<_, _>>()?;
     if json {
         let mut arr = Vec::with_capacity(entries.len());
-        for (id, snap) in &entries {
-            let status = repo.sig_status(id, &trust)?;
+        for ((id, snap), status) in entries.iter().zip(&statuses) {
             arr.push(serde_json::json!({
                 "id": id.to_hex(),
                 "author": snap.author,
                 "timestamp": snap.timestamp,
                 "message": snap.message,
                 "parents": snap.parents.iter().map(|p| p.to_hex()).collect::<Vec<_>>(),
-                "signature": sig_status_json(&status),
+                "signature": sig_status_json(status),
             }));
         }
-        println!("{}", serde_json::Value::Array(arr));
+        print_line(&serde_json::Value::Array(arr).to_string());
         return Ok(());
     }
-    for (id, snap) in entries {
+    for ((id, snap), status) in entries.iter().zip(&statuses) {
         let merge = if snap.parents.len() > 1 { " (merge)" } else { "" };
-        println!(
+        print_line(&format!(
             "{} {} {} — {}{}",
             id.short(),
             fmt_utc(snap.timestamp),
             snap.author,
             snap.message,
             merge
-        );
-        let status = repo.sig_status(&id, &trust)?;
-        if let Some(line) = render_sig_status_line(&status) {
-            println!("{line}");
+        ));
+        if let Some(line) = render_sig_status_line(status) {
+            print_line(&line);
         }
     }
     Ok(())
+}
+
+/// Print a line to stdout, exiting quietly (code 0) rather than panicking
+/// when the reader end of the pipe has already closed — the common
+/// `sc log | grep -q x` idiom under `set -o pipefail`, where `grep -q`
+/// exits as soon as it finds a match and closes its stdin. The idiomatic
+/// Unix fix is to reset SIGPIPE to its default disposition at process
+/// startup so the process is killed by the signal like `cat`/`grep`
+/// themselves, but that needs `libc`; catching `BrokenPipe` at the point of
+/// writing gets the same externally-visible result (clean exit, no panic)
+/// without a new dependency.
+fn print_line(line: &str) {
+    use std::io::Write;
+    if let Err(e) = writeln!(std::io::stdout(), "{line}") {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("sc: error writing to stdout: {e}");
+        std::process::exit(1);
+    }
 }
 
 /// Show line-level working-tree changes against HEAD.

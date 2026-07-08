@@ -288,3 +288,47 @@ fn verify_walks_all_parents_of_a_merge_not_just_mainline() {
 
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// `sc log` must tolerate its reader closing the pipe early — the common
+/// `sc log | grep -q x` idiom under `set -o pipefail`. `run_log` interleaves
+/// per-commit `sig_status` disk I/O with `println!`s; if `grep -q` matches
+/// an early line (log is newest-first) and exits, closing its stdin, `sc`'s
+/// next write must not panic with a broken-pipe error — that turns into a
+/// nonzero exit that `pipefail` propagates even though `grep` itself
+/// succeeded. Regression test for the P22 provenance review fix.
+#[test]
+fn log_output_survives_a_closed_reader_pipe() {
+    let root = tmp("brokenpipe");
+    let repo = root.join("work");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(sc(&repo, &["init"]).status.success());
+    // Enough commits that sig_status's I/O has room to run while grep is
+    // still consuming — and reading, not draining, the earlier lines.
+    for i in 0..20 {
+        std::fs::write(repo.join("f.txt"), format!("v{i}\n")).unwrap();
+        assert!(sc(&repo, &["commit", "-m", &format!("c{i}")]).status.success());
+    }
+
+    let sc_bin = env!("CARGO_BIN_EXE_sc");
+    // Newest-first log output means "c19" (the last commit made) is on the
+    // very first printed line, so grep -q matches and exits immediately,
+    // closing the pipe while `sc log` still has 19 more entries queued.
+    let script = format!("set -euo pipefail; \"{sc_bin}\" log | grep -q 'c19'");
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .current_dir(&repo)
+        .output()
+        .expect("bash runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "sc log | grep -q under pipefail must exit cleanly, not propagate a broken-pipe panic: stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("Broken pipe") && !stderr.contains("panicked"),
+        "sc log must not panic on BrokenPipe: stderr={stderr}"
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
