@@ -378,6 +378,21 @@ enum Cmd {
         #[arg(long)]
         require: bool,
     },
+    /// Sparse-checkout operations.
+    Sparse {
+        #[command(subcommand)]
+        op: SparseOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum SparseOp {
+    /// Print the repo's current sparse-checkout prefixes.
+    Show {
+        /// Emit machine-readable JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -604,6 +619,34 @@ fn main() -> Result<()> {
         Cmd::Oplog => run_oplog(),
         Cmd::Sign { r#ref, identity } => run_sign(&r#ref, identity),
         Cmd::Verify { r#ref, require } => run_verify(r#ref, require),
+        Cmd::Sparse { op } => run_sparse(op),
+    }
+}
+
+fn run_sparse(op: SparseOp) -> Result<()> {
+    match op {
+        SparseOp::Show { json } => {
+            let repo = open_repo()?;
+            let spec = repo.sparse_spec()?;
+            if json {
+                print_line(
+                    &serde_json::json!({
+                        "full": spec.is_full(),
+                        "prefixes": spec.prefixes(),
+                    })
+                    .to_string(),
+                );
+                return Ok(());
+            }
+            if spec.is_full() {
+                print_line("sparse: disabled (full checkout)");
+            } else {
+                for p in spec.prefixes() {
+                    print_line(p);
+                }
+            }
+            Ok(())
+        }
     }
 }
 

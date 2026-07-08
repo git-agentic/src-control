@@ -258,19 +258,14 @@ across every phase.
 
 ## Active
 
-None — Phase 24 is next up.
+- **Phase 24 — Sparse checkouts / sub-tree sharing.** In build. Spec:
+  `docs/superpowers/specs/2026-07-08-p24-sparse-checkouts-design.md`
+  (ADR-0034, Proposed → Accepted at completion).
 
-## Next horizon (P24)
+## Next horizon
 
-Decided 2026-07-08 (design: `docs/superpowers/specs/2026-07-08-roadmap-horizon-p21-p24-design.md`).
-Theme: invest in daily feel and scale once P22 closes out the trust story.
-
-| Phase | Goal | Demoable outcome | ADR |
-|-------|------|------------------|-----|
-| **P24 — Sparse checkouts / sub-tree sharing** | Monorepo-width working trees | work in one subtree with the rest absent from disk; commits carry absent subtrees byte-identically | [0034](docs/adr/0034-sparse-checkouts.md) |
-
-Ordering rationale: P23 before P24 (conflict UX pays off daily and sparse
-users will want it too).
+P24 is the last phase of this horizon; a new horizon gets brainstormed at
+its completion.
 
 ## Completed phases (usability-first ordering)
 
