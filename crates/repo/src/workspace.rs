@@ -28,31 +28,27 @@ pub enum HarvestResult {
 /// Materialize the snapshot at `tip` into `dir` (created if absent), applying
 /// the same P7 protected-path rules as `sc switch`: decrypt with `identity`
 /// when possible, otherwise skip. Returns the skipped protected paths.
+///
+/// `sparse` (P24 Task 4) is caller-chosen, not implicit: `sc work` (P13,
+/// one-shot ephemeral agents) always passes `Sparse::default()` — an agent
+/// needs the complete tree to operate correctly, and silently narrowing what
+/// it sees to the primary repo's sparse view would be a surprising,
+/// unrequested behavior change. `sc ws fork` (P20, durable sessions) passes
+/// the host repo's own `sparse_spec()` — a durable workspace is closer to a
+/// second working tree for the same repo, so it inherits the same view.
 pub(crate) fn materialize_workspace(
     repo: &Repo,
     tip: ObjectId,
     dir: &Path,
     identity: Option<&scl_crypto::SecretKey>,
+    sparse: &crate::sparse::Sparse,
 ) -> Result<Vec<String>> {
     std::fs::create_dir_all(dir)?;
     let snap = repo.snapshot(&tip)?;
     let ws = Layout::at(dir);
     let store_arc = repo.vfs().store();
     let mut store = store_arc.lock().unwrap();
-    // Full materialization regardless of the primary repo's sparse spec: an
-    // agent workspace is a separate ephemeral checkout (P13), not the user's
-    // real working tree, and needs the complete content to work with — the
-    // primary sparse view is a convenience for that one tree, not a policy
-    // that should silently narrow what an agent can see.
-    worktree::materialize(
-        &ws,
-        &mut store,
-        snap.root,
-        None,
-        &snap.protection,
-        identity,
-        &crate::sparse::Sparse::default(),
-    )
+    worktree::materialize(&ws, &mut store, snap.root, None, &snap.protection, identity, sparse)
 }
 
 /// Diff the checkout at `dir` against the base snapshot `tip`; if changed,
@@ -66,6 +62,7 @@ pub(crate) fn harvest_workspace(
     branch: &str,
     author: &str,
     message: &str,
+    sparse: &crate::sparse::Sparse,
 ) -> Result<HarvestResult> {
     let snap = repo.snapshot(&tip)?;
     let ws = Layout::at(dir);
@@ -74,13 +71,7 @@ pub(crate) fn harvest_workspace(
         let mut store = store_arc.lock().unwrap();
         let tracked: std::collections::BTreeSet<String> =
             worktree::tree_file_ids(&mut store, snap.root)?.into_keys().collect();
-        let d = worktree::diff_worktree(
-            &ws,
-            &mut store,
-            Some(snap.root),
-            &snap.protection,
-            &crate::sparse::Sparse::default(),
-        )?;
+        let d = worktree::diff_worktree(&ws, &mut store, Some(snap.root), &snap.protection, sparse)?;
         (tracked, !(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
     };
     if !changed {
@@ -233,7 +224,13 @@ impl Repo {
         let mut dirs = Vec::with_capacity(labels.len());
         for label in &labels {
             let dir = session_root.join(label);
-            let skipped = materialize_workspace(self, tip, &dir, opts.identity.as_ref())?;
+            let skipped = materialize_workspace(
+                self,
+                tip,
+                &dir,
+                opts.identity.as_ref(),
+                &crate::sparse::Sparse::default(),
+            )?;
             for path in &skipped {
                 eprintln!("workspace {label}: skipped (no key): {path}");
             }
@@ -263,7 +260,15 @@ impl Repo {
                     None
                 }
             };
-            let harvest = harvest_workspace(self, tip, &dir, &label, &opts.author, &message);
+            let harvest = harvest_workspace(
+                self,
+                tip,
+                &dir,
+                &label,
+                &opts.author,
+                &message,
+                &crate::sparse::Sparse::default(),
+            );
             outcomes.push(WorkspaceOutcome { label, agent_exit, harvest });
         }
 
@@ -323,12 +328,21 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        let skipped = materialize_workspace(&repo, tip, &dir, None).unwrap();
+        let skipped = materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default()).unwrap();
         assert!(skipped.is_empty());
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "base\n");
 
         std::fs::write(dir.join("a.txt"), "edited\n").unwrap();
-        let res = harvest_workspace(&repo, tip, &dir, "work-1", "test", "msg").unwrap();
+        let res = harvest_workspace(
+            &repo,
+            tip,
+            &dir,
+            "work-1",
+            "test",
+            "msg",
+            &crate::sparse::Sparse::default(),
+        )
+        .unwrap();
         let id = match res {
             HarvestResult::Committed(id) => id,
             other => panic!("expected Committed, got {other:?}"),
@@ -347,8 +361,17 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        materialize_workspace(&repo, tip, &dir, None).unwrap();
-        let res = harvest_workspace(&repo, tip, &dir, "work-1", "test", "msg").unwrap();
+        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default()).unwrap();
+        let res = harvest_workspace(
+            &repo,
+            tip,
+            &dir,
+            "work-1",
+            "test",
+            "msg",
+            &crate::sparse::Sparse::default(),
+        )
+        .unwrap();
         assert!(matches!(res, HarvestResult::Unchanged));
         assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
         drop(repo);
@@ -361,10 +384,19 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        materialize_workspace(&repo, tip, &dir, None).unwrap();
+        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default()).unwrap();
         // An AWS-style key id trips the P5 pattern rules.
         std::fs::write(dir.join("leak.txt"), "AKIAIOSFODNN7EXAMPLE\n").unwrap();
-        let res = harvest_workspace(&repo, tip, &dir, "work-1", "test", "msg").unwrap();
+        let res = harvest_workspace(
+            &repo,
+            tip,
+            &dir,
+            "work-1",
+            "test",
+            "msg",
+            &crate::sparse::Sparse::default(),
+        )
+        .unwrap();
         assert!(matches!(res, HarvestResult::Rejected(_)));
         assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
         drop(repo);

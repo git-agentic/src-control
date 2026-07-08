@@ -1333,6 +1333,7 @@ fn run_status(json: bool) -> Result<()> {
     if json {
         let s = repo.status()?;
         let conflicts = conflicts_json(&repo)?;
+        let sparse = repo.sparse_spec()?;
         println!(
             "{}",
             serde_json::json!({
@@ -1344,6 +1345,7 @@ fn run_status(json: bool) -> Result<()> {
                 "pick_in_progress": repo.pick_in_progress(),
                 "rebase_in_progress": repo.rebase_in_progress(),
                 "rebase_resolved": repo.rebase_resolved()?,
+                "sparse": sparse.prefixes(),
             })
         );
         return Ok(());
@@ -1395,6 +1397,10 @@ fn run_status(json: bool) -> Result<()> {
         }
     }
     let s = repo.status()?;
+    let sparse = repo.sparse_spec()?;
+    if !sparse.prefixes().is_empty() {
+        println!("sparse: {}", sparse.prefixes().join(", "));
+    }
     if s.added.is_empty() && s.modified.is_empty() && s.deleted.is_empty() {
         if !repo.merge_in_progress() && !repo.pick_in_progress() && !repo.rebase_in_progress() {
             println!("clean (working tree matches HEAD)");

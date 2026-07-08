@@ -510,6 +510,7 @@ impl Repo {
                     &conflict_prot,
                     ours_root,
                     identity,
+                    &paths,
                 )?;
                 // Markers are on disk; record pick state last (its PICK_HEAD
                 // write is the in-progress signal). The decided carried tree
@@ -887,6 +888,7 @@ impl Repo {
                         &conflict_prot,
                         disk_root,
                         identity,
+                        &paths,
                     )?;
                     let remaining_after_current: Vec<ObjectId> = remaining.into_iter().collect();
                     let done = total.saturating_sub(remaining_after_current.len()).saturating_sub(1);

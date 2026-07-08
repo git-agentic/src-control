@@ -191,6 +191,11 @@ impl Repo {
         }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let branch = refs::current_branch(self.layout())?;
+        // A durable `sc ws` workspace inherits the host repo's sparse view
+        // (P24 Task 4) — unlike `sc work`'s one-shot ephemeral agents, a
+        // durable session is closer to a second working tree for the same
+        // repo, so it should see the same narrowed checkout the user does.
+        let sparse = self.sparse_spec()?;
 
         let root = ws_dir(self.layout());
         // No manifest proves any .sc/ws content is crash residue from a
@@ -199,7 +204,9 @@ impl Repo {
         let mut workspaces = Vec::with_capacity(agents as usize);
         for i in 1..=agents {
             let dir = root.join(i.to_string());
-            if let Err(e) = crate::workspace::materialize_workspace(self, tip, &dir, identity) {
+            if let Err(e) =
+                crate::workspace::materialize_workspace(self, tip, &dir, identity, &sparse)
+            {
                 // Nothing announced yet (no manifest written) — tear down
                 // whatever partial checkouts exist so a failed fork leaves
                 // no residue under .sc/ws.
@@ -250,15 +257,14 @@ impl Repo {
     pub fn ws_changed_for(&self, session: &WsSession, entry: &WsEntry) -> Result<bool> {
         let base = self.snapshot(&session.base_snapshot)?;
         let ws = Layout::at(&entry.dir);
+        // Sparse-aware (P24 Task 4), same reasoning as `ws_fork`: a workspace
+        // inherits the host's sparse view, so an absent out-of-sparse path
+        // must diff as clean, not as a deletion (mirrors `Repo::status`'s
+        // fix in Task 3).
+        let sparse = self.sparse_spec()?;
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
-        let d = worktree::diff_worktree(
-            &ws,
-            &mut store,
-            Some(base.root),
-            &base.protection,
-            &crate::sparse::Sparse::default(),
-        )?;
+        let d = worktree::diff_worktree(&ws, &mut store, Some(base.root), &base.protection, &sparse)?;
         Ok(!(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
     }
 
@@ -583,6 +589,7 @@ impl Repo {
                 &branch,
                 author,
                 &msg,
+                &self.sparse_spec()?,
             )? {
                 crate::workspace::HarvestResult::Rejected(report) => {
                     // DESIGN DECISION (spec precision note, Task 5): a
@@ -782,6 +789,58 @@ mod tests {
             ),
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ws_fork_inherits_sparse() {
+        // P24 Task 4: a durable `sc ws` workspace inherits the host repo's
+        // sparse view — unlike `sc work`'s one-shot ephemeral agents, which
+        // stay full (unchanged, out of this task's scope).
+        let root = tmp_root("fork-sparse");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
+        std::fs::write(root.join("docs/x"), b"doc v1").unwrap();
+        repo.commit("t", "base").unwrap();
+
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        assert!(!root.join("docs/x").exists());
+
+        let session = repo.ws_fork(1, "t", None).unwrap();
+        let entry = &session.workspaces[0];
+        assert!(entry.dir.join("src/a.txt").exists(), "in-sparse file must materialize");
+        assert!(!entry.dir.join("docs/x").exists(), "out-of-sparse file must not materialize");
+
+        // Harvest carries the untouched out-of-sparse subtree verbatim.
+        std::fs::write(entry.dir.join("src/a.txt"), b"a v2").unwrap();
+        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            WsHarvestOutcome::Landed { index: 1, .. } => {}
+            other => panic!("expected Landed(1), got {other:?}"),
+        }
+        let tip = repo.head_tip().unwrap().unwrap();
+        let snap = repo.snapshot(&tip).unwrap();
+        let entries = {
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap()
+        };
+        assert!(entries.contains_key("docs/x"), "harvest must carry the out-of-sparse subtree");
+        let blob = entries.get("docs/x").map(|(id, _, _)| *id).unwrap();
+        let bytes = {
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            match s.get(&blob).unwrap() {
+                scl_core::Object::Blob(b) => b,
+                _ => panic!("expected blob"),
+            }
+        };
+        assert_eq!(&*bytes, b"doc v1", "carried content must be unchanged");
+
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
