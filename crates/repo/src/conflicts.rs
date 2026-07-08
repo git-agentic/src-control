@@ -8,7 +8,7 @@ use scl_core::{Object, ObjectId, Store, PROTECTED};
 
 use crate::error::{Error, Result};
 use crate::repo::Repo;
-use crate::worktree::tree_file_entries_with_perms;
+use crate::worktree::{safe_join, tree_file_entries_with_perms};
 
 /// Which in-progress operation owns the current conflicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +39,14 @@ pub enum ConflictKind {
     Text,
     Binary,
     Protected,
+}
+
+/// Which side of a conflict `Repo::resolve_path` should write to the working
+/// tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveSide {
+    Ours,
+    Theirs,
 }
 
 /// The three snapshot ids that frame a conflicted path under the active op:
@@ -99,7 +107,15 @@ impl Repo {
                 let ours = self
                     .head_tip()?
                     .ok_or_else(|| Error::BadRef("HEAD unborn while a cherry-pick is in progress".into()))?;
-                let base = self.snapshot(&theirs)?.parents.first().copied();
+                // A `--mainline`-resolved base (persisted in PICK_MAINLINE_BASE,
+                // P19 I2) takes priority: a conflicted mainline pick's replay
+                // used that parent as its base, so conflict_versions must
+                // agree — falling back to parents[0] here would silently
+                // re-derive the WRONG base for a mainline != 1 pick.
+                let base = match crate::pick_state::read_mainline_base(&self.layout)? {
+                    Some(mainline_base) => Some(mainline_base),
+                    None => self.snapshot(&theirs)?.parents.first().copied(),
+                };
                 Ok(OpTriple { ours, theirs, base })
             }
             Some(ActiveOp::Rebase) => {
@@ -155,6 +171,69 @@ impl Repo {
         let ours = side_for(&mut store, triple.ours, identity, path)?;
         let theirs = side_for(&mut store, triple.theirs, identity, path)?;
         Ok(ConflictVersions { base, ours, theirs })
+    }
+
+    /// Resolve one conflicted path to `side`: write that side's content to
+    /// the working file (or delete the file if the side is `Absent`),
+    /// remove any `.theirs`/`.base`/`.ours` sidecar, and drop `path` from
+    /// the active op's conflict record. Protected paths need `identity`
+    /// (decrypt only — this never re-encrypts; completion's commit path does
+    /// that). Errors if `path` is not currently conflicted or no op is in
+    /// progress.
+    pub fn resolve_path(
+        &self,
+        path: &str,
+        side: ResolveSide,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<()> {
+        let op = self
+            .active_conflict_op()?
+            .ok_or_else(|| Error::InvalidArgument("no merge/pick/rebase is in progress".into()))?;
+        let conflicts = self.active_conflicts()?;
+        if !conflicts.iter().any(|p| p == path) {
+            return Err(Error::InvalidArgument(format!("{path} is not currently conflicted")));
+        }
+
+        let versions = self.conflict_versions(path, identity)?;
+        let chosen = match side {
+            ResolveSide::Ours => versions.ours,
+            ResolveSide::Theirs => versions.theirs,
+        };
+
+        let full = safe_join(&self.layout.root, path)?;
+        match chosen {
+            Side::Present(bytes) => {
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&full, &bytes)?;
+            }
+            Side::Absent => match std::fs::remove_file(&full) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            },
+        }
+
+        // Drop any leftover sidecars this path may have (only `.theirs` is
+        // currently written by a binary conflict, but `.base`/`.ours` are
+        // cleaned up defensively — harmless if never written).
+        for ext in ["theirs", "base", "ours"] {
+            let sidecar = safe_join(&self.layout.root, &format!("{path}.{ext}"))?;
+            match std::fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        let remaining: Vec<String> = conflicts.into_iter().filter(|p| p != path).collect();
+        match op {
+            ActiveOp::Merge => crate::merge_state::set_conflicts(&self.layout, &remaining)?,
+            ActiveOp::Pick => crate::pick_state::set_conflicts(&self.layout, &remaining)?,
+            ActiveOp::Rebase => crate::rebase_state::write_conflicts(&self.layout, &remaining)?,
+        }
+        Ok(())
     }
 }
 
@@ -452,6 +531,359 @@ mod tests {
         assert_eq!(repo.conflict_kind("text.txt").unwrap(), ConflictKind::Text);
         assert_eq!(repo.conflict_kind("bin.dat").unwrap(), ConflictKind::Binary);
 
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_ours_writes_clean_and_drops_record() {
+        let root = tmp_root("resolve-ours");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("a.txt"), b"theirs\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+
+        repo.resolve_path("a.txt", ResolveSide::Ours, None).unwrap();
+
+        let on_disk = std::fs::read(root.join("a.txt")).unwrap();
+        assert_eq!(on_disk, b"ours\n");
+        assert!(
+            !String::from_utf8_lossy(&on_disk).contains("<<<<<<<"),
+            "resolved file must be clean of markers"
+        );
+        assert!(
+            repo.active_conflicts().unwrap().is_empty(),
+            "resolved path must be dropped from the record"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_theirs_across_pick_and_rebase() {
+        // Pick side.
+        let root = tmp_root("resolve-theirs-pick");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"main-edit\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("x.txt"), b"work-edit\n").unwrap();
+        repo.commit("me", "work edits x").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+
+        repo.resolve_path("x.txt", ResolveSide::Theirs, None).unwrap();
+        let on_disk = std::fs::read(root.join("x.txt")).unwrap();
+        assert_eq!(on_disk, b"work-edit\n");
+        assert!(repo.active_conflicts().unwrap().is_empty());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+
+        // Rebase side.
+        let root = tmp_root("resolve-theirs-rebase");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"main-edit\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("x.txt"), b"feature-edit\n").unwrap();
+        repo.commit("me", "feature edits x").unwrap();
+
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        assert!(matches!(outcome, crate::replay::RebaseResult::Stopped { .. }), "got {outcome:?}");
+        assert!(repo.rebase_in_progress());
+
+        repo.resolve_path("x.txt", ResolveSide::Theirs, None).unwrap();
+        let on_disk = std::fs::read(root.join("x.txt")).unwrap();
+        assert_eq!(on_disk, b"feature-edit\n");
+        assert!(repo.active_conflicts().unwrap().is_empty());
+
+        repo.rebase_abort().unwrap();
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_absent_side_deletes_file() {
+        let root = tmp_root("resolve-absent");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("a.txt"), b"ours-edit\n").unwrap();
+        repo.commit("me", "ours edits").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        repo.commit("me", "theirs deletes").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+
+        // theirs is Absent: resolving to Theirs must delete the file.
+        repo.resolve_path("a.txt", ResolveSide::Theirs, None).unwrap();
+        assert!(!root.join("a.txt").exists());
+        assert!(repo.active_conflicts().unwrap().is_empty());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_removes_theirs_sidecar() {
+        let root = tmp_root("resolve-sidecar");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), [0u8, 159, 146, 150]).unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("bin.dat"), [1u8, 159, 146, 150]).unwrap();
+        repo.commit("me", "ours edits bin").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("bin.dat"), [2u8, 159, 146, 150]).unwrap();
+        repo.commit("me", "theirs edits bin").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+        assert!(root.join("bin.dat.theirs").exists(), "test setup: sidecar must be on disk");
+
+        repo.resolve_path("bin.dat", ResolveSide::Ours, None).unwrap();
+        assert!(!root.join("bin.dat.theirs").exists(), "sidecar must be removed on resolve");
+        assert_eq!(std::fs::read(root.join("bin.dat")).unwrap(), vec![1u8, 159, 146, 150]);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_one_of_several_conflicts_leaves_the_rest() {
+        // Every other resolve test conflicts on exactly one path, so
+        // `retain != path` always degenerates to the empty-list case. This
+        // test conflicts on three paths and resolves only one, exercising
+        // the "drop one, keep the rest" branch the task is named for.
+        let root = tmp_root("resolve-partial");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base\n").unwrap();
+        std::fs::write(root.join("b.txt"), b"base\n").unwrap();
+        std::fs::write(root.join("c.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("a.txt"), b"ours-a\n").unwrap();
+        std::fs::write(root.join("b.txt"), b"ours-b\n").unwrap();
+        std::fs::write(root.join("c.txt"), b"ours-c\n").unwrap();
+        repo.commit("me", "ours edits all").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("a.txt"), b"theirs-a\n").unwrap();
+        std::fs::write(root.join("b.txt"), b"theirs-b\n").unwrap();
+        std::fs::write(root.join("c.txt"), b"theirs-c\n").unwrap();
+        repo.commit("me", "theirs edits all").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(3)), "got {err:?}");
+        let mut before = repo.active_conflicts().unwrap();
+        before.sort();
+        assert_eq!(before, vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()]);
+
+        repo.resolve_path("b.txt", ResolveSide::Ours, None).unwrap();
+
+        let mut after = repo.active_conflicts().unwrap();
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["a.txt".to_string(), "c.txt".to_string()],
+            "only b.txt is dropped; a.txt and c.txt remain conflicted"
+        );
+        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"ours-b\n");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_protected_needs_identity() {
+        let root = tmp_root("resolve-protected");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours edits secret").unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"theirs\n").unwrap();
+        repo.commit("me", "theirs edits secret").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        let err = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+
+        let err = repo.resolve_path("secret/a.txt", ResolveSide::Ours, None).unwrap_err();
+        assert!(
+            matches!(err, Error::ProtectedMergeNeedsIdentity(ref p) if p == "secret/a.txt"),
+            "got {err:?}"
+        );
+
+        repo.resolve_path("secret/a.txt", ResolveSide::Ours, Some(&alice_sk)).unwrap();
+        assert_eq!(std::fs::read(root.join("secret/a.txt")).unwrap(), b"ours\n");
+        assert!(repo.active_conflicts().unwrap().is_empty());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolved_merge_completes_via_commit() {
+        let root = tmp_root("resolve-completes");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("a.txt"), b"theirs\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+
+        repo.resolve_path("a.txt", ResolveSide::Ours, None).unwrap();
+        let tip = repo.commit("me", "resolve via ours").unwrap();
+        assert!(repo.active_conflict_op().unwrap().is_none(), "merge state cleared by commit");
+
+        let snap = repo.snapshot(&tip).unwrap();
+        let store_arc = repo.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let entries = tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+        let (blob_id, _, _) = entries.get("a.txt").copied().unwrap();
+        let bytes = match store.get(&blob_id).unwrap() {
+            Object::Blob(b) => b,
+            _ => panic!("expected blob"),
+        };
+        assert_eq!(&bytes[..], b"ours\n");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_nonconflicted_or_no_op_errors() {
+        let root = tmp_root("resolve-errors");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        // No op in progress at all.
+        let err = repo.resolve_path("a.txt", ResolveSide::Ours, None).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+
+        // An op is in progress, but the path named isn't one of its conflicts.
+        repo.branch("feature").unwrap();
+        std::fs::write(root.join("a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("a.txt"), b"theirs\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+
+        let err = repo.resolve_path("does-not-exist.txt", ResolveSide::Ours, None).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Task 2 mandatory carry-in from Task 1 review: `op_triple`'s Pick arm
+    /// must base a conflicted MAINLINE pick's `conflict_versions` on
+    /// `PICK_MAINLINE_BASE` (the parent `--mainline` resolved to and the file
+    /// replay actually used), not silently fall back to the picked commit's
+    /// `parents[0]` — that would re-derive the WRONG base whenever
+    /// `--mainline` selected any parent other than 1. Mirrors the shape of
+    /// `replay.rs`'s `conflicted_mainline_pick_completion_bases_registry_off_chosen_parent`:
+    /// a-side and b-side both branch off a common base, target-m2 branches
+    /// off a-side and independently edits x.txt so mainline-2's delta
+    /// (b_tip -> merge) conflicts, forcing `PickConflicts`.
+    #[test]
+    fn versions_from_mainline_pick_uses_chosen_parent_base() {
+        let root = tmp_root("mainline-pick-base");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"x\n").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.branch("a-side").unwrap();
+        repo.branch("b-side").unwrap();
+
+        repo.switch("a-side").unwrap();
+        std::fs::write(root.join("x.txt"), b"a-edit\n").unwrap();
+        repo.commit("me", "a-side edits x.txt").unwrap();
+        let a_tip = repo.head_tip().unwrap().unwrap();
+        repo.branch("target-m2").unwrap();
+
+        // target-m2 independently edits x.txt so the mainline-2 delta
+        // (b_tip -> merge, "x\n" -> "a-edit\n") conflicts with it.
+        repo.switch("target-m2").unwrap();
+        std::fs::write(root.join("x.txt"), b"target-edit\n").unwrap();
+        repo.commit("me", "target independently edits x.txt").unwrap();
+
+        repo.switch("b-side").unwrap();
+        // b-side does not touch x.txt: b_tip's x.txt stays "x\n".
+        std::fs::write(root.join("b.txt"), b"b\n").unwrap();
+        repo.commit("me", "b-side adds b.txt").unwrap();
+        let b_tip = repo.head_tip().unwrap().unwrap();
+
+        repo.switch("a-side").unwrap();
+        let m = repo.merge("b-side", "me").unwrap();
+        let m_snap = repo.snapshot(&m).unwrap();
+        assert_eq!(m_snap.parents, vec![a_tip, b_tip]);
+
+        // --mainline 2 onto target-m2: base = b_tip (unchanged x.txt = "x\n"),
+        // NOT parents[0] = a_tip (x.txt = "a-edit\n").
+        repo.switch("target-m2").unwrap();
+        let err = repo.cherry_pick("a-side", "me", None, Some(2)).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+
+        let versions = repo.conflict_versions("x.txt", None).unwrap();
+        assert_eq!(
+            versions.base,
+            Side::Present(b"x\n".to_vec()),
+            "base must track the --mainline 2-chosen parent (b_tip), not parents[0] (a_tip)"
+        );
+
+        repo.resolve_path("x.txt", ResolveSide::Theirs, None).unwrap();
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
     }

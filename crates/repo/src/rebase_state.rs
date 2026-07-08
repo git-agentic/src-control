@@ -230,7 +230,11 @@ pub fn read_conflicts(layout: &Layout) -> Result<Vec<String>> {
 
 /// Record the conflicted paths for the in-progress rebase's stopped commit.
 pub fn write_conflicts(layout: &Layout, paths: &[String]) -> Result<()> {
-    atomic_write(&conflicts_path(layout), (paths.join("\n") + "\n").as_bytes())
+    // An empty list must serialize to an empty file, not "\n" — `"\n".lines()`
+    // yields one empty-string element, not zero, which would make the last
+    // resolved path look like it's still conflicted (as `""`).
+    let text = if paths.is_empty() { String::new() } else { format!("{}\n", paths.join("\n")) };
+    atomic_write(&conflicts_path(layout), text.as_bytes())
 }
 
 /// The decided-carried tree of the in-progress rebase's stopped commit, if
