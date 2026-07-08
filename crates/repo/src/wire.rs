@@ -30,6 +30,19 @@ const OP_PUT_PACK: u8 = 0x17;
 const ST_OK: u8 = 0;
 const ST_ERR: u8 = 1;
 
+// Pack sub-stream frame markers (P25). Distinct from the request opcodes and
+// response status bytes above, since a debugging dump of raw frames should
+// never have to guess which "namespace" a leading byte belongs to — though
+// each frame stream (requests, responses, pack sub-stream) is only ever
+// interpreted in its own context.
+const ST_PACK_CHUNK: u8 = 0x20;
+const ST_PACK_END: u8 = 0x21;
+
+/// Chunk size `write_pack_stream` callers use by default in production: 1 MiB.
+/// Bounds peak RAM on both ends of a streamed pack transfer. Additive,
+/// unversioned wire addition (P25) — does not change `PROTOCOL_VERSION`.
+pub const CHUNK_SIZE: usize = 1 << 20;
+
 // Wire error codes. Typed errors that sync logic relies on get their own code;
 // everything else degrades to EC_OTHER and surfaces as `Error::Remote(msg)`.
 const EC_NOT_A_REPO: u8 = 1;
@@ -251,6 +264,74 @@ fn read_frame_inner(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
     r.read_exact(&mut buf)
         .map_err(|_| Error::Protocol(format!("EOF inside {len}-byte frame body")))?;
     Ok(Some(buf))
+}
+
+// --- pack sub-stream (P25) ---
+//
+// A pack stream is a sequence of ordinary frames (via `write_frame`/
+// `read_frame`) layered on top of the existing framing with no format
+// change to `Request`/`Response`: each frame's payload starts with either
+// `ST_PACK_CHUNK` followed by up to `chunk_size` bytes of pack data, or
+// `ST_PACK_END` with no payload. Where in the protocol a stream begins is a
+// Task 4 concern (which request/response introduces it); this only defines
+// the chunk+end framing itself.
+
+/// Stream everything from `src` to `w` as `ST_PACK_CHUNK` frames of at most
+/// `chunk_size` bytes each, terminated by one `ST_PACK_END` frame. Peak RAM
+/// is `chunk_size` (one buffer, reused per chunk). `chunk_size` is a
+/// parameter so tests can force a tiny value; production callers pass
+/// [`CHUNK_SIZE`].
+pub fn write_pack_stream(w: &mut impl Write, src: &mut impl Read, chunk_size: usize) -> Result<()> {
+    let mut buf = vec![0u8; chunk_size];
+    loop {
+        let n = read_up_to(src, &mut buf)?;
+        if n == 0 {
+            write_frame(w, &[ST_PACK_END])?;
+            return Ok(());
+        }
+        let mut payload = Vec::with_capacity(1 + n);
+        payload.push(ST_PACK_CHUNK);
+        payload.extend_from_slice(&buf[..n]);
+        write_frame(w, &payload)?;
+    }
+}
+
+/// Fill `buf` by repeated `read` calls until either `buf` is full or `src`
+/// hits EOF, returning the number of bytes filled. Unlike `read_exact`, a
+/// short read at EOF is not an error — it's how the last, possibly-ragged
+/// chunk is detected.
+fn read_up_to(src: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = src.read(&mut buf[filled..])?;
+        if n == 0 {
+            break; // EOF
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
+/// Read `ST_PACK_CHUNK` frames from `r`, writing each chunk's bytes to
+/// `sink`, until `ST_PACK_END`. Peak RAM is one chunk (frames are read whole,
+/// as `read_frame` already requires, but never buffered across chunks).
+/// Returns the total number of bytes streamed. Any frame that is neither a
+/// well-formed chunk nor the end marker — including EOF before `ST_PACK_END`
+/// — is `Err(Error::Protocol(_))`.
+pub fn read_pack_stream(r: &mut impl Read, sink: &mut impl Write) -> Result<u64> {
+    let mut total: u64 = 0;
+    loop {
+        let frame = read_frame_opt(r)?
+            .ok_or_else(|| Error::Protocol("EOF before ST_PACK_END".into()))?;
+        match frame.split_first() {
+            Some((&ST_PACK_CHUNK, rest)) => {
+                sink.write_all(rest)?;
+                total += rest.len() as u64;
+            }
+            Some((&ST_PACK_END, rest)) if rest.is_empty() => return Ok(total),
+            _ => return Err(Error::Protocol("unexpected frame in pack stream".into())),
+        }
+    }
 }
 
 // --- responses ---
@@ -688,5 +769,71 @@ mod tests {
         assert!(responses[1].is_err());
         assert_eq!(decode_str_body(responses[2].as_ref().unwrap()).unwrap(), "main");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pack_stream_round_trip_many_chunks() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let mut buf = Vec::new();
+        write_pack_stream(&mut buf, &mut std::io::Cursor::new(&data), 7).unwrap();
+
+        // More than one chunk frame must have been written: 10_000 / 7 chunks
+        // plus one END frame.
+        let mut count = 0;
+        let mut r = std::io::Cursor::new(buf.clone());
+        while let Some(_frame) = read_frame_opt(&mut r).unwrap() {
+            count += 1;
+        }
+        assert!(count > 1, "expected many chunk frames, got {count}");
+
+        let mut sink = Vec::new();
+        let mut r = std::io::Cursor::new(buf);
+        let total = read_pack_stream(&mut r, &mut sink).unwrap();
+        assert_eq!(total, data.len() as u64);
+        assert_eq!(sink, data);
+    }
+
+    #[test]
+    fn pack_stream_exact_multiple_and_ragged() {
+        let chunk_size = 16;
+        for extra in [0usize, 3] {
+            let len = 2 * chunk_size + extra;
+            let data: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            let mut buf = Vec::new();
+            write_pack_stream(&mut buf, &mut std::io::Cursor::new(&data), chunk_size).unwrap();
+            let mut sink = Vec::new();
+            let total = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap();
+            assert_eq!(total, data.len() as u64);
+            assert_eq!(sink, data, "mismatch for len={len}");
+        }
+    }
+
+    #[test]
+    fn pack_stream_empty() {
+        let data: Vec<u8> = Vec::new();
+        let mut buf = Vec::new();
+        write_pack_stream(&mut buf, &mut std::io::Cursor::new(&data), 7).unwrap();
+        let mut sink = Vec::new();
+        let total = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap();
+        assert_eq!(total, 0);
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn read_pack_stream_rejects_missing_end() {
+        // Chunk frames followed by EOF, no ST_PACK_END.
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[ST_PACK_CHUNK, b'a', b'b']).unwrap();
+        let mut sink = Vec::new();
+        let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "expected Protocol error, got {err:?}");
+
+        // A wrong-opcode frame mid-stream.
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &[ST_PACK_CHUNK, b'a']).unwrap();
+        write_frame(&mut buf, &[ST_OK]).unwrap(); // not a valid pack-stream marker
+        let mut sink = Vec::new();
+        let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "expected Protocol error, got {err:?}");
     }
 }
