@@ -172,6 +172,19 @@ impl Repo {
 
         // Build one pack of the objects the remote lacks, send it in bulk, then
         // advance the remote ref.
+        //
+        // Bounded client push (P25 final-review fix): this used to collect
+        // every missing object's encoded bytes into `send: Vec<(ObjectId,
+        // Vec<u8>)>` and call `build_pack`, holding roughly two full pack
+        // images in RAM (the `send` Vec plus `build_pack`'s output) — the
+        // same unbounded-RAM shape the fetch side had. Now only the id list
+        // is collected (32 bytes each); the pack itself is built one object
+        // at a time into a guarded temp file via
+        // `transport::write_ids_to_temp_pack` (the same PackWriter-based
+        // helper `LocalTransport::build_pack_tempfile` uses — one
+        // ids-to-temp-pack-file implementation shared by both), and an
+        // opened `File` reader of that temp file is handed to
+        // `transport.put_pack` — peak RAM is one object.
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
@@ -184,15 +197,20 @@ impl Repo {
             // every indexed signature covering a snapshot already in it.
             let snaps: Vec<ObjectId> = reachable.iter().copied().collect();
             let sig_ids = crate::signatures::indexed_signature_ids_for(&self.layout, &snaps)?;
-            let mut send: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+            let mut send_ids: Vec<ObjectId> = Vec::new();
             for id in reachable.into_iter().chain(sig_ids) {
                 if !transport.has_object(&id)? {
-                    send.push((id, store.get(&id)?.encode()));
+                    send_ids.push(id);
                 }
             }
-            if !send.is_empty() {
-                let (pack, _idx) = scl_core::pack::build_pack(&send)?;
-                transport.put_pack(&pack)?;
+            if !send_ids.is_empty() {
+                let guard = crate::transport::write_ids_to_temp_pack(
+                    &self.layout,
+                    &mut store,
+                    &send_ids,
+                )?;
+                let mut f = std::fs::File::open(guard.path())?;
+                transport.put_pack(&mut f)?;
             }
         }
         transport.update_ref(&branch, &local_tip, expected_old.as_ref())?;
@@ -222,9 +240,8 @@ pub(crate) fn local_have_tips(layout: &Layout, store: &Store) -> Result<Vec<Obje
 
 /// Pull every object reachable from `tips` out of `transport` and into `store`.
 /// `haves` tells the remote which objects the local store already has so it can
-/// omit them from the pack; `parse_pack` verifies each record. Callers hold the
-/// store lock across this call, so it must not acquire any other lock. Shared by
-/// `clone_to` and `fetch`.
+/// omit them from the pack. Callers hold the store lock across this call, so it
+/// must not acquire any other lock. Shared by `clone_to` and `fetch`.
 ///
 /// Receiver seam (P22 Task 3): this is the client-side ingestion path for
 /// BOTH `fetch` and `clone_url` (over local paths and ssh:// alike — this
@@ -233,6 +250,18 @@ pub(crate) fn local_have_tips(layout: &Layout, store: &Store) -> Result<Vec<Obje
 /// here, so `index_incoming` on exactly the ids this call just wrote is the
 /// matching seam. `clone_url` additionally runs a full `signatures::reindex`
 /// once its transfer is complete (see there for why the belt-and-suspenders).
+///
+/// Bounded client fetch (P25 final-review fix): `transport.get_pack` used to
+/// destream the whole pack into a `Vec<u8>` here before a non-streaming
+/// `parse_pack` — for a large clone/fetch, the receiving end is typically
+/// this client, so that `Vec` was exactly the unbounded-RAM cap-lift the P25
+/// spec explicitly chose *not* to ship. Instead, spill `get_pack`'s output
+/// into a guarded temp file under `.sc/tmp/` (removed on drop, success or
+/// error alike) and hand the path to [`crate::transport::ingest_pack_file`],
+/// the same two-pass atomic-after-verify bounded ingest the server and the
+/// ssh wire already use — peak RAM here is one object, not the whole pack.
+/// `ingest_pack_file` already calls `index_incoming` on exactly the ids it
+/// wrote, so this function must not call it a second time.
 fn transfer_objects(
     layout: &Layout,
     transport: &dyn Transport,
@@ -240,17 +269,12 @@ fn transfer_objects(
     tips: &[ObjectId],
     haves: &[ObjectId],
 ) -> Result<()> {
-    let pack = transport.get_pack(tips, haves)?;
-    // parse_pack verifies every record; write each object into the local store.
-    let mut written = Vec::new();
-    for (id, obj) in scl_core::pack::parse_pack(&pack)? {
-        let got = store.put(obj)?;
-        if got != id {
-            return Err(Error::CorruptObject(id));
-        }
-        written.push(id);
+    let guard = crate::transport::TempPackGuard::new(layout)?;
+    {
+        let mut f = std::fs::File::create(guard.path())?;
+        transport.get_pack(tips, haves, &mut f)?;
     }
-    crate::signatures::index_incoming(layout, store, &written)?;
+    crate::transport::ingest_pack_file(layout, store, guard.path())?;
     Ok(())
 }
 
@@ -426,6 +450,133 @@ mod tests {
         drop(dst);
         std::fs::remove_dir_all(&src_root).unwrap();
         std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    fn tmp_dir_is_empty(layout: &crate::layout::Layout) -> bool {
+        match std::fs::read_dir(layout.tmp_dir()) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => panic!("unexpected error reading .sc/tmp: {e}"),
+        }
+    }
+
+    /// P25 final-review fix: `transfer_objects` (the client-side fetch/clone
+    /// ingestion path) used to destream the whole pack into a `Vec<u8>`
+    /// before a non-streaming `parse_pack` — unbounded client RAM on the
+    /// dominant large-clone scenario. It now spills through a guarded temp
+    /// file and `ingest_pack_file`, the same bounded two-pass machinery the
+    /// server and the ssh wire already use. Driven over the real chunked
+    /// wire (`WireClient`/`wire::serve`, mirroring
+    /// `signatures_ride_ssh_transport`) so this exercises the actual client
+    /// code path a real `ssh://` clone/fetch takes, not just `LocalTransport`.
+    /// Asserts: every object lands with the right id, AND the client's
+    /// `.sc/tmp` is empty afterward (peak-RAM boundedness isn't directly
+    /// observable from a test, but zero residue is the same "spilled and
+    /// cleaned up, not buffered in a `Vec`" signature the sibling
+    /// zero-residue tests use).
+    #[test]
+    fn fetch_client_ingests_via_tempfile_zero_residue() {
+        use crate::stdio_transport::WireClient;
+        use crate::wire;
+
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-fetchtmp-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-fetchtmp-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(&src_root).unwrap();
+
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("a.txt"), b"one").unwrap();
+        let c1 = src.commit("t", "c1").unwrap();
+        std::fs::write(src_root.join("a.txt"), b"two").unwrap();
+        let c2 = src.commit("t", "c2").unwrap();
+
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server_root = src_root.clone();
+        let server =
+            std::thread::spawn(move || wire::serve(&server_root, &mut server_read, &mut server_write));
+        let client = WireClient::handshake(client_read, client_write).unwrap();
+
+        let dst = Repo::init(&dst_root).unwrap();
+        {
+            let store_arc = dst.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            transfer_objects(dst.layout(), &client, &mut store, &[c2], &[]).unwrap();
+            assert!(store.contains(&c1), "c1 must have landed (ancestor of the want)");
+            assert!(store.contains(&c2), "c2 (the want) must have landed");
+        }
+        client.bye().unwrap();
+        drop(client);
+        server.join().unwrap().unwrap();
+
+        assert!(
+            tmp_dir_is_empty(dst.layout()),
+            "client's .sc/tmp must be empty after a successful fetch — spilled temp pack file \
+             must be cleaned up, not left as residue"
+        );
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// P25 final-review fix, push side: `Repo::push` used to collect every
+    /// missing object's encoded bytes into a `Vec<(ObjectId, Vec<u8>)>` and
+    /// call `build_pack` fully in RAM — roughly two full pack images resident
+    /// (the `send` Vec plus `build_pack`'s output). It now collects only ids
+    /// and streams the pack to a guarded temp file one object at a time via
+    /// `transport::write_ids_to_temp_pack`, then hands an opened `File`
+    /// reader to `transport.put_pack`. A plain local-path remote already
+    /// dispatches through the real `Transport` trait (`LocalTransport`, the
+    /// same seam an `ssh://` remote's `StdioTransport` implements) so this
+    /// exercises the actual `Repo::push` client code, not a bypass.
+    #[test]
+    fn push_client_builds_via_tempfile_zero_residue() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-pushtmp-src-{pid}"));
+        let remote_root = std::env::temp_dir().join(format!("scl-pushtmp-remote-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&remote_root);
+        std::fs::create_dir_all(&src_root).unwrap();
+
+        // The "remote" is itself a full repo (push needs a repo with a valid
+        // .sc/ to fast-forward-update refs into) that the pusher pushes to
+        // over a plain local path — exercising `Repo::push`'s real client code.
+        let remote = Repo::init(&remote_root).unwrap();
+        std::fs::write(remote_root.join("seed.txt"), b"seed").unwrap();
+        let seed = remote.commit("t", "seed").unwrap();
+        drop(remote);
+
+        let pusher = Repo::clone_to(&remote_root, &src_root).unwrap();
+        std::fs::write(src_root.join("a.txt"), b"one").unwrap();
+        let c1 = pusher.commit("t", "c1").unwrap();
+
+        let pushed_tip = pusher.push("origin").unwrap();
+        assert_eq!(pushed_tip, c1);
+
+        // Every object the pusher sent must be present on the remote.
+        let remote_reopened = Repo::open(&remote_root).unwrap();
+        {
+            let store_arc = remote_reopened.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(store.contains(&seed), "pre-existing remote object must still be present");
+            assert!(store.contains(&c1), "pushed commit must have landed on the remote");
+        }
+        assert_eq!(remote_reopened.head_tip().unwrap(), Some(c1));
+
+        assert!(
+            tmp_dir_is_empty(pusher.layout()),
+            "pusher's own .sc/tmp must be empty after a successful push — the guarded temp pack \
+             file built via write_ids_to_temp_pack must be cleaned up, not left as residue"
+        );
+
+        drop(pusher);
+        drop(remote_reopened);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&remote_root).unwrap();
     }
 
     #[test]

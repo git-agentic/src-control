@@ -11,6 +11,8 @@
 //! BLAKE3-verified against its id before decoding, so the content-addressing
 //! invariant holds exactly as for loose objects.
 
+use std::io::{Read, Write};
+
 use crate::error::{Error, Result};
 use crate::id::ObjectId;
 use crate::object::Object;
@@ -63,6 +65,88 @@ pub fn build_pack(objects: &[(ObjectId, Vec<u8>)]) -> Result<(Vec<u8>, Vec<u8>)>
         idx.extend_from_slice(&e.length.to_le_bytes());
     }
     Ok((pack, idx))
+}
+
+/// Incremental pack writer: appends objects one at a time to any `Write`,
+/// accumulating only the (small) index in RAM instead of the whole pack
+/// body. Writes the exact same header/record framing `build_pack` does, so
+/// for the same objects in the same order the output is byte-identical
+/// (pinned by `pack_writer_matches_build_pack_byte_for_byte` — packs are
+/// content-addressed downstream, so a format drift would be a silent
+/// correctness break, not just a style nit).
+pub struct PackWriter<W: Write> {
+    w: W,
+    /// Running byte offset into the pack body written so far (starts after
+    /// the 8-byte header), used to compute each record's index offset
+    /// without buffering prior records.
+    pos: u64,
+    count_written: u32,
+    expected_count: u32,
+    entries: Vec<IndexEntry>,
+}
+
+impl<W: Write> PackWriter<W> {
+    /// Start a pack for exactly `count` objects. Writes the pack header
+    /// immediately; `count` itself is never serialized into the pack body
+    /// (matching `build_pack`, whose header is magic+version only) — it is
+    /// tracked in memory purely so `finish` can catch a short write.
+    pub fn new(mut w: W, count: u32) -> Result<Self> {
+        w.write_all(PACK_MAGIC).map_err(Error::Io)?;
+        w.write_all(&FORMAT_VERSION.to_le_bytes()).map_err(Error::Io)?;
+        Ok(PackWriter {
+            w,
+            pos: 8,
+            count_written: 0,
+            expected_count: count,
+            entries: Vec::with_capacity(count as usize),
+        })
+    }
+
+    /// Append one object's canonical bytes under `id`. The caller is
+    /// responsible for `id == BLAKE3(bytes)` (ids come from the store, which
+    /// already guarantees this); this only frames and compresses.
+    pub fn write_object(&mut self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
+        let compressed =
+            zstd::encode_all(std::io::Cursor::new(bytes), COMPRESSION_LEVEL).map_err(Error::Io)?;
+        // Record layout: [id:32][compressed_len:4][compressed_data:N] — same
+        // as build_pack. The index offset points at compressed_len, matching
+        // read_object_at's expectations.
+        self.w.write_all(id.as_bytes()).map_err(Error::Io)?;
+        self.pos += 32;
+        let offset = self.pos;
+        let len = compressed.len() as u32;
+        self.w.write_all(&len.to_le_bytes()).map_err(Error::Io)?;
+        self.pos += 4;
+        self.w.write_all(&compressed).map_err(Error::Io)?;
+        self.pos += compressed.len() as u64;
+        self.entries.push(IndexEntry { id: *id, offset, length: compressed.len() as u64 });
+        self.count_written += 1;
+        Ok(())
+    }
+
+    /// Finish the pack and return the `.idx` bytes (same layout
+    /// `parse_index` expects: sorted by id). Errors if fewer than the
+    /// promised `count` objects were written.
+    pub fn finish(mut self) -> Result<Vec<u8>> {
+        if self.count_written != self.expected_count {
+            return Err(Error::PackCorrupt(format!(
+                "PackWriter finished with {} of {} promised objects written",
+                self.count_written, self.expected_count
+            )));
+        }
+        self.w.flush().map_err(Error::Io)?;
+        self.entries.sort_by_key(|e| e.id);
+        let mut idx = Vec::new();
+        idx.extend_from_slice(IDX_MAGIC);
+        idx.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        idx.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
+        for e in &self.entries {
+            idx.extend_from_slice(e.id.as_bytes());
+            idx.extend_from_slice(&e.offset.to_le_bytes());
+            idx.extend_from_slice(&e.length.to_le_bytes());
+        }
+        Ok(idx)
+    }
 }
 
 /// Parse a `.idx` into ascending-by-id entries. Rejects a bad magic/version,
@@ -176,6 +260,76 @@ pub fn parse_pack(pack: &[u8]) -> Result<Vec<(ObjectId, Object)>> {
     Ok(out)
 }
 
+/// Fill `buf` from `r`, tolerating a clean EOF at the very start (0 bytes
+/// read). Returns the number of bytes actually read: `0` means "stream
+/// ended exactly at a record boundary" (the normal end-of-pack case);
+/// `1..buf.len()` means a mid-record EOF (truncation, an error case);
+/// `buf.len()` means a full read.
+fn read_up_to<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match r.read(&mut buf[total..])? {
+            0 => break,
+            n => total += n,
+        }
+    }
+    Ok(total)
+}
+
+/// Stream a pack from a reader, calling `f` with each `(id, Object)` after
+/// verifying its hash, without holding the whole pack body in memory (peak
+/// RAM is one record's compressed + decompressed bytes). Reads the 8-byte
+/// header, then loops reading records until a clean EOF falls exactly on a
+/// record boundary — the same termination `parse_pack` gets from `pos <
+/// pack.len()`, generalized to a reader that has no total length to check
+/// against.
+pub fn parse_pack_reader<R: Read>(
+    mut r: R,
+    mut f: impl FnMut(ObjectId, Object) -> Result<()>,
+) -> Result<()> {
+    let mut header = [0u8; 8];
+    r.read_exact(&mut header).map_err(|e| Error::PackCorrupt(format!("truncated header: {e}")))?;
+    if &header[..4] != PACK_MAGIC {
+        return Err(Error::PackCorrupt("missing magic".into()));
+    }
+    let ver = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if ver != FORMAT_VERSION {
+        return Err(Error::PackCorrupt(format!("unsupported version {ver}")));
+    }
+
+    loop {
+        let mut id_bytes = [0u8; 32];
+        let n = read_up_to(&mut r, &mut id_bytes).map_err(Error::Io)?;
+        if n == 0 {
+            return Ok(()); // clean end of pack
+        }
+        if n != 32 {
+            return Err(Error::PackCorrupt("truncated record id".into()));
+        }
+        let expected_id = ObjectId::from_bytes(id_bytes);
+
+        let mut len_bytes = [0u8; 4];
+        r.read_exact(&mut len_bytes)
+            .map_err(|e| Error::PackCorrupt(format!("truncated record length: {e}")))?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        let mut payload = vec![0u8; len];
+        r.read_exact(&mut payload)
+            .map_err(|e| Error::PackCorrupt(format!("truncated record payload: {e}")))?;
+
+        let canonical = zstd::decode_all(std::io::Cursor::new(&payload))
+            .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+        let actual_id = ObjectId::of(&canonical);
+        if actual_id != expected_id {
+            return Err(Error::PackCorrupt(format!(
+                "hash mismatch: expected {expected_id}, got {actual_id}"
+            )));
+        }
+        let obj = Object::decode(&canonical)?;
+        f(actual_id, obj)?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +374,76 @@ mod tests {
     fn bad_index_magic_rejected() {
         let err = parse_index(b"XXXXnot an index").unwrap_err();
         assert!(matches!(err, crate::error::Error::BadPackIndex(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn pack_writer_matches_build_pack_byte_for_byte() {
+        let a = Object::blob(b"alpha".to_vec());
+        let b = Object::blob(b"bravo bravo".to_vec());
+        let c = Object::blob(b"charlie charlie charlie".to_vec());
+        let objs = vec![enc(&a), enc(&b), enc(&c)];
+
+        let (want_pack, want_idx) = build_pack(&objs).unwrap();
+
+        let mut got_pack = Vec::new();
+        let mut writer = PackWriter::new(&mut got_pack, objs.len() as u32).unwrap();
+        for (id, bytes) in &objs {
+            writer.write_object(id, bytes).unwrap();
+        }
+        let got_idx = writer.finish().unwrap();
+
+        assert_eq!(got_pack, want_pack);
+        assert_eq!(got_idx, want_idx);
+    }
+
+    #[test]
+    fn parse_pack_reader_round_trips_and_verifies() {
+        let a = Object::blob(b"alpha".to_vec());
+        let b = Object::blob(b"bravo bravo".to_vec());
+        let c = Object::blob(b"charlie charlie charlie".to_vec());
+        let objs = vec![enc(&a), enc(&b), enc(&c)];
+        let (pack, _idx) = build_pack(&objs).unwrap();
+
+        let mut streamed = Vec::new();
+        parse_pack_reader(&pack[..], |id, obj| {
+            streamed.push((id, obj));
+            Ok(())
+        })
+        .unwrap();
+
+        let want = parse_pack(&pack).unwrap();
+        assert_eq!(streamed.len(), want.len());
+        for ((got_id, got_obj), (want_id, want_obj)) in streamed.iter().zip(want.iter()) {
+            assert_eq!(got_id, want_id);
+            assert_eq!(got_obj.encode(), want_obj.encode());
+        }
+
+        // Corrupt one byte of the last record's compressed payload; the
+        // reader must surface a hash-mismatch error at that record instead
+        // of silently yielding wrong content.
+        let mut corrupt = pack.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        let err = parse_pack_reader(&corrupt[..], |_id, _obj| Ok(())).unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::PackCorrupt(_) | crate::error::Error::Malformed(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pack_writer_finish_short_count_errors() {
+        let a = Object::blob(b"alpha".to_vec());
+        let b = Object::blob(b"bravo".to_vec());
+        let objs = vec![enc(&a), enc(&b)];
+
+        let mut buf = Vec::new();
+        let mut writer = PackWriter::new(&mut buf, 3).unwrap();
+        for (id, bytes) in &objs {
+            writer.write_object(id, bytes).unwrap();
+        }
+        let err = writer.finish().unwrap_err();
+        assert!(matches!(err, crate::error::Error::PackCorrupt(_)), "got {err:?}");
     }
 
     #[test]

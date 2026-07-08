@@ -82,11 +82,37 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
         })?;
         Ok(())
     }
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>> {
-        self.call(Request::GetPack { wants: wants.to_vec(), haves: haves.to_vec() })
+    /// Bounded (P25): send the request, then destream the server's
+    /// `ST_PACK_CHUNK`/`ST_PACK_END` response frames straight into `out` via
+    /// `read_pack_stream` — peak RAM is one chunk. `out` ends up holding the
+    /// exact raw `.pack` bytes the pre-P25 single-frame response used to
+    /// deliver directly, so this stays a drop-in `Transport::get_pack`: every
+    /// existing caller (`sync::transfer_objects`, the repo.rs delta-fetch
+    /// regression test) still calls `parse_pack` on `out` unchanged. Doesn't
+    /// use `self.call` — that helper only reads one response frame, and this
+    /// needs to keep reading off the same connection afterward.
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
+        let mut rw = self.rw.borrow_mut();
+        wire::write_frame(
+            &mut rw.1,
+            &Request::GetPack { wants: wants.to_vec(), haves: haves.to_vec() }.encode(),
+        )?;
+        let frame = wire::read_frame(&mut rw.0)?;
+        wire::parse_response(frame)?; // Ok(empty body) means "stream follows"; Err propagates typed
+        wire::read_pack_stream(&mut rw.0, out)?;
+        Ok(())
     }
-    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>> {
-        wire::decode_ids_body(&self.call(Request::PutPack(pack.to_vec()))?)
+
+    /// Bounded (P25): send the marker request, then stream `src` onto the
+    /// connection as `ST_PACK_CHUNK`/`ST_PACK_END` frames (peak RAM one
+    /// chunk) before reading the response — the server destreams as it
+    /// reads, so nothing on either side ever buffers the whole pack.
+    fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
+        let mut rw = self.rw.borrow_mut();
+        wire::write_frame(&mut rw.1, &Request::PutPack.encode())?;
+        wire::write_pack_stream(&mut rw.1, src, wire::pack_chunk_size())?;
+        let frame = wire::read_frame(&mut rw.0)?;
+        wire::decode_ids_body(&wire::parse_response(frame)?)
     }
 }
 
@@ -170,11 +196,11 @@ impl Transport for StdioTransport {
     ) -> Result<()> {
         self.client.update_ref(branch, id, expected_old)
     }
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>> {
-        self.client.get_pack(wants, haves)
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
+        self.client.get_pack(wants, haves, out)
     }
-    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>> {
-        self.client.put_pack(pack)
+    fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
+        self.client.put_pack(src)
     }
 }
 
@@ -355,7 +381,8 @@ mod tests {
         assert!(client.put_object(&id, b"tampered").is_err());
 
         // pack roundtrip: everything reachable from the tip, no haves
-        let pack = client.get_pack(&[tip], &[]).unwrap();
+        let mut pack = Vec::new();
+        client.get_pack(&[tip], &[], &mut pack).unwrap();
         assert!(!scl_core::pack::parse_pack(&pack).unwrap().is_empty());
 
         // CAS semantics survive the wire (mirrors transport.rs::update_ref_is_compare_and_swap)
@@ -386,14 +413,17 @@ mod tests {
     }
 
     #[test]
-    fn handshake_rejects_version_skew() {
-        // Hand-rolled "future server" that answers HELLO with version 2.
+    fn handshake_rejects_v1_peer() {
+        // Hand-rolled "old server" that answers HELLO with the retired v1
+        // (P25 bumped PROTOCOL_VERSION 1 -> 2 and dropped the single-frame
+        // pack encoding v1 spoke, so a v1 peer must be refused just as
+        // cleanly as a too-new one).
         let (client_read, mut server_write) = std::io::pipe().unwrap();
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let server = std::thread::spawn(move || {
             let f = wire::read_frame(&mut server_read).unwrap();
             assert!(matches!(wire::Request::decode(&f).unwrap(), wire::Request::Hello { .. }));
-            wire::write_ok(&mut server_write, &wire::u32_body(2)).unwrap();
+            wire::write_ok(&mut server_write, &wire::u32_body(1)).unwrap();
         });
         let err = WireClient::handshake(client_read, client_write).unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
@@ -424,8 +454,10 @@ mod tests {
                 };
                 match wire::Request::decode(&f).unwrap() {
                     wire::Request::UpdateRef { .. } => return, // die without replying
-                    wire::Request::PutPack(p) => {
-                        let ids = t.put_pack(&p).unwrap();
+                    wire::Request::PutPack => {
+                        let mut buf = Vec::new();
+                        wire::read_pack_stream(&mut server_read, &mut buf).unwrap();
+                        let ids = t.put_pack(&mut &buf[..]).unwrap();
                         wire::write_ok(&mut server_write, &wire::ids_body(&ids)).unwrap();
                     }
                     other => panic!("unexpected request {other:?}"),
@@ -437,7 +469,7 @@ mod tests {
         // "Push": transfer a pack, then try to advance the ref.
         let blob = Object::blob(b"new object".to_vec());
         let (pack, _idx) = scl_core::pack::build_pack(&[(blob.id(), blob.encode())]).unwrap();
-        client.put_pack(&pack).unwrap();
+        client.put_pack(&mut &pack[..]).unwrap();
         let err = client.update_ref("main", &blob.id(), Some(&tip)).unwrap_err();
         assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
         drop(client);
@@ -448,6 +480,204 @@ mod tests {
         assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), tip)]);
         assert!(t.has_object(&blob.id()).unwrap());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // SC_PACK_CHUNK env mutation races parallel tests in this module that
+    // also transfer packs over the wire (their assertions don't depend on
+    // chunk count, so a stray override is harmless to them — see the P25
+    // task report — but two tests in THIS module deliberately want a small,
+    // stable override for their own duration). Mirrors
+    // `crates/cli/src/main.rs`'s `GIT_ENV_LOCK` pattern.
+    static PACK_CHUNK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// P25 correctness heart, end-to-end: a real `wire::serve` thread on
+    /// each side, `GetPack` fetched with the server forced to a tiny
+    /// `SC_PACK_CHUNK` (so its `ST_PACK_CHUNK` response is provably
+    /// many-framed, hand-counted below since `WireClient::get_pack`
+    /// de-chunks internally), then the fetched pack pushed into a second
+    /// repo via `PutPack` streamed with an explicit tiny `chunk_size` (no
+    /// env var needed for this leg — full control without touching global
+    /// state).
+    #[test]
+    fn streaming_push_and_fetch_round_trip_tiny_chunks() {
+        let _env_guard = PACK_CHUNK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let root = tmp_repo("streaming-src");
+        for i in 0..5 {
+            std::fs::write(
+                root.join(format!("f{i}.txt")),
+                format!("payload number {i} — filler filler filler filler").repeat(20),
+            )
+            .unwrap();
+        }
+        let tip = crate::repo::Repo::open(&root).unwrap().commit("t", "many files").unwrap();
+
+        // ── GetPack leg: hand-rolled client counts ST_PACK_CHUNK frames ──
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let root2 = root.clone();
+        let server = std::thread::spawn(move || {
+            std::env::set_var("SC_PACK_CHUNK", "37");
+            let result = wire::serve(&root2, &mut server_read, &mut server_write);
+            std::env::remove_var("SC_PACK_CHUNK");
+            result
+        });
+        let mut client_read = client_read;
+        let mut client_write = client_write;
+        wire::write_frame(
+            &mut client_write,
+            &Request::Hello { version: wire::PROTOCOL_VERSION }.encode(),
+        )
+        .unwrap();
+        wire::parse_response(wire::read_frame(&mut client_read).unwrap()).unwrap();
+
+        wire::write_frame(
+            &mut client_write,
+            &Request::GetPack { wants: vec![tip], haves: vec![] }.encode(),
+        )
+        .unwrap();
+        // Empty OK body: "a chunk stream follows".
+        wire::parse_response(wire::read_frame(&mut client_read).unwrap()).unwrap();
+
+        let mut chunk_frames = 0usize;
+        let mut pack_bytes = Vec::new();
+        loop {
+            let frame = wire::read_frame(&mut client_read).unwrap();
+            match frame.first() {
+                Some(&wire::ST_PACK_CHUNK) => {
+                    chunk_frames += 1;
+                    pack_bytes.extend_from_slice(&frame[1..]);
+                }
+                Some(&wire::ST_PACK_END) => break,
+                other => panic!("unexpected pack-stream marker byte {other:?}"),
+            }
+        }
+        assert!(chunk_frames > 1, "expected multiple chunk frames, got {chunk_frames}");
+        let fetched = scl_core::pack::parse_pack(&pack_bytes).unwrap();
+        assert!(fetched.iter().any(|(id, _)| *id == tip));
+
+        wire::write_frame(&mut client_write, &Request::Bye.encode()).unwrap();
+        drop(client_write);
+        drop(client_read);
+        server.join().unwrap().unwrap();
+
+        // ── PutPack leg: push the fetched pack into a fresh repo over tiny,
+        // explicitly-sized chunks (no env var — full control). ──
+        let dst_root =
+            std::env::temp_dir().join(format!("scl-stdio-streaming-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(&dst_root).unwrap();
+        crate::repo::Repo::init(&dst_root).unwrap();
+
+        let (client_read2, mut server_write2) = std::io::pipe().unwrap();
+        let (mut server_read2, client_write2) = std::io::pipe().unwrap();
+        let dst_root2 = dst_root.clone();
+        let server2 =
+            std::thread::spawn(move || wire::serve(&dst_root2, &mut server_read2, &mut server_write2));
+        let client2 = WireClient::handshake(client_read2, client_write2).unwrap();
+
+        // Drive PutPack's wire shape directly so the chunk size is explicit
+        // and tiny, independent of SC_PACK_CHUNK.
+        {
+            let mut rw = client2.rw.borrow_mut();
+            wire::write_frame(&mut rw.1, &Request::PutPack.encode()).unwrap();
+            wire::write_pack_stream(&mut rw.1, &mut &pack_bytes[..], 11).unwrap();
+        }
+        let resp = {
+            let mut rw = client2.rw.borrow_mut();
+            wire::read_frame(&mut rw.0).unwrap()
+        };
+        let written = wire::decode_ids_body(&wire::parse_response(resp).unwrap()).unwrap();
+        assert_eq!(written.len(), fetched.len());
+        for (id, _) in &fetched {
+            assert!(client2.has_object(id).unwrap());
+        }
+        client2.bye().unwrap();
+        drop(client2);
+        server2.join().unwrap().unwrap();
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// P25 carry-in pin: a successful chunked `put_pack` leaves the temp
+    /// pack file gone; a `put_pack` whose FINAL wire chunk is corrupted
+    /// leaves the temp file gone too AND lands zero objects — the two-pass
+    /// `ingest_pack_file` verifies the whole (destreamed) pack before
+    /// writing anything, so corruption anywhere, including the very last
+    /// byte, is caught before pass 2 ever runs.
+    #[test]
+    fn streaming_receiver_leaves_zero_residue_on_success_and_error() {
+        let root = tmp_repo("zeroresidue");
+        let layout = crate::layout::Layout::at(&root);
+
+        let a = Object::blob(b"alpha payload for the zero-residue check".to_vec());
+        let b = Object::blob(b"bravo payload, also long enough to span chunks".to_vec());
+        let (pack, _idx) =
+            scl_core::pack::build_pack(&[(a.id(), a.encode()), (b.id(), b.encode())]).unwrap();
+
+        // ── success: chunked put_pack lands both objects, tmp dir ends empty ──
+        let (client, server) = connect(root.clone());
+        let written = client.put_pack(&mut &pack[..]).unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(client.has_object(&a.id()).unwrap());
+        assert!(client.has_object(&b.id()).unwrap());
+        client.bye().unwrap();
+        drop(client);
+        server.join().unwrap().unwrap();
+        assert!(tmp_dir_is_empty(&layout), "temp pack file must be gone after a successful put_pack");
+
+        // ── failure: corrupt the LAST byte of the pack (lands in the final
+        // wire chunk given a small chunk_size); nothing must land ──
+        let c = Object::blob(b"charlie payload, corrupted on the wire before it lands".to_vec());
+        let (mut pack2, _idx2) = scl_core::pack::build_pack(&[(c.id(), c.encode())]).unwrap();
+        let last = pack2.len() - 1;
+        pack2[last] ^= 0xFF;
+
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let root2 = root.clone();
+        let server2 =
+            std::thread::spawn(move || wire::serve(&root2, &mut server_read, &mut server_write));
+        let mut client_write = client_write;
+        let mut client_read = client_read;
+        wire::write_frame(
+            &mut client_write,
+            &Request::Hello { version: wire::PROTOCOL_VERSION }.encode(),
+        )
+        .unwrap();
+        wire::parse_response(wire::read_frame(&mut client_read).unwrap()).unwrap();
+        wire::write_frame(&mut client_write, &Request::PutPack.encode()).unwrap();
+        // Small explicit chunk_size so the corrupted final byte really does
+        // land in the FINAL chunk frame, not the first.
+        wire::write_pack_stream(&mut client_write, &mut &pack2[..], 16).unwrap();
+        let err = wire::parse_response(wire::read_frame(&mut client_read).unwrap()).unwrap_err();
+        assert!(
+            matches!(err, Error::Remote(_) | Error::Protocol(_)),
+            "expected a typed ingest error, got {err:?}"
+        );
+
+        wire::write_frame(&mut client_write, &Request::Bye.encode()).unwrap();
+        drop(client_write);
+        drop(client_read);
+        server2.join().unwrap().unwrap();
+
+        let t = LocalTransport::open(&root).unwrap();
+        assert!(
+            !t.has_object(&c.id()).unwrap(),
+            "corrupt pack must not land any object — atomic after verify"
+        );
+        assert!(tmp_dir_is_empty(&layout), "temp pack file must be gone after a corrupt ingest too");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn tmp_dir_is_empty(layout: &crate::layout::Layout) -> bool {
+        match std::fs::read_dir(layout.tmp_dir()) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => panic!("unexpected error reading .sc/tmp: {e}"),
+        }
     }
 
     #[test]

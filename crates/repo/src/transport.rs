@@ -3,7 +3,9 @@
 //! SSH/HTTP transports.
 
 use std::cell::RefCell;
+use std::io::{Read, Write};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use scl_core::{Object, ObjectId, Store};
 
@@ -34,13 +36,15 @@ pub trait Transport {
     fn update_ref(&self, branch: &str, id: &ObjectId, expected_old: Option<&ObjectId>)
         -> Result<()>;
 
-    /// Build a pack of every object reachable from `wants` but not already
-    /// implied by `haves` (the receiver's closure). Returns `.pack` bytes.
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>>;
+    /// Stream a pack of every object reachable from `wants` but not already
+    /// implied by `haves` (the receiver's closure) into `out`. An
+    /// implementation may buffer internally before writing.
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()>;
 
-    /// Receive a pack: verify every record (BLAKE3) and write each object into
-    /// the store. Returns the contained ids. Refs are the caller's job.
-    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>>;
+    /// Ingest a pack read from `src`: verify every record (BLAKE3) and write
+    /// each object into the store. Returns the contained ids. Refs are the
+    /// caller's job.
+    fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>>;
 }
 
 /// Transport over a remote `.sc/` directory on the local filesystem.
@@ -64,6 +68,202 @@ impl LocalTransport {
         let store = Store::open_persistent(layout.objects_dir(), crate::repo::DEFAULT_BUDGET)?;
         Ok(LocalTransport { layout, store: RefCell::new(store) })
     }
+
+    /// This transport's layout — `wire::serve` (a sibling module) needs it to
+    /// spill an incoming chunk stream to a temp pack file before handing the
+    /// path to [`ingest_pack_file`] directly (P25), bypassing a second
+    /// `Transport::put_pack`-level spill.
+    pub(crate) fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// Bounded pack sender (P25): gather the transfer set exactly as before,
+    /// but instead of collecting every object's encoded bytes into one
+    /// `Vec<(ObjectId, Vec<u8>)>` (unbounded RAM) and calling `build_pack`,
+    /// stream each object straight into a fresh temp pack file via
+    /// `PackWriter` — peak RAM is one object's encoded + compressed bytes.
+    /// Returns an RAII-guarded path to the finished pack file; the caller
+    /// reads it and the guard removes it on drop (success or error alike).
+    /// Shared by `Transport::get_pack` (one bounded copy into `out`) and
+    /// `wire::serve`'s `GetPack` handling (one `write_pack_stream` straight
+    /// off this same file — no second spill).
+    pub(crate) fn build_pack_tempfile(
+        &self,
+        wants: &[ObjectId],
+        haves: &[ObjectId],
+    ) -> Result<TempPackGuard> {
+        use std::collections::BTreeSet;
+        let mut store = self.store.borrow_mut();
+        // Reachable-from-wants minus reachable-from-haves, computed on this
+        // (the remote) store. `haves` the remote doesn't have are skipped.
+        let mut want_set = crate::reachable::reachable_objects(&mut *store, wants)?;
+
+        let mut have_set: BTreeSet<ObjectId> = BTreeSet::new();
+        for h in haves {
+            if store.contains(h) {
+                have_set.extend(crate::reachable::reachable_objects(&mut *store, &[*h])?);
+            }
+        }
+
+        // Sender seam (P22 Task 3, carried through the P25 bounded rewrite
+        // unchanged): a SignatureObj is a leaf referenced by no tree/
+        // snapshot, so the reachability walks above never find it on their
+        // own — it has to be pulled in explicitly via the `.sc/signatures`
+        // index. See the (now-moved) original comment history in the P22/P25
+        // diffs for the retroactive-signing rationale; behavior is
+        // unchanged: over-send every indexed signature covering any
+        // transfer-relevant snapshot, never subtract any of them from
+        // `have_set`.
+        let all_snaps: Vec<ObjectId> = want_set.iter().chain(have_set.iter()).copied().collect();
+        want_set.extend(crate::signatures::indexed_signature_ids_for(&self.layout, &all_snaps)?);
+
+        let ids: Vec<ObjectId> =
+            want_set.into_iter().filter(|id| !have_set.contains(id)).collect();
+
+        write_ids_to_temp_pack(&self.layout, &mut store, &ids)
+    }
+
+    /// Bounded pack receiver (P25): ingest an already-on-disk pack file
+    /// (produced either by `Transport::put_pack`'s own spill, below, or by
+    /// `wire::serve` destreaming an incoming chunk stream) via
+    /// [`ingest_pack_file`]'s two-pass atomic-after-verify contract.
+    pub(crate) fn ingest_from(&self, path: &std::path::Path) -> Result<Vec<ObjectId>> {
+        let mut store = self.store.borrow_mut();
+        ingest_pack_file(&self.layout, &mut store, path)
+    }
+}
+
+/// RAII guard for a per-transfer temporary pack file under `.sc/tmp/`
+/// (P25). Removes the file on drop — success, verification failure, or a
+/// dropped connection alike — so a streamed pack transfer never leaves
+/// residue outside `.sc/`. Reserves a path unique enough for concurrent
+/// transfers within one process (pid + a monotonic per-process counter);
+/// does not remove `.sc/tmp/` itself, matching how other `.sc/` subdirs
+/// (e.g. `.sc/ws/`) are left in place between uses.
+pub(crate) struct TempPackGuard {
+    path: std::path::PathBuf,
+}
+
+impl TempPackGuard {
+    /// Create `.sc/tmp/` if needed and reserve a fresh path inside it. The
+    /// file itself is not created here — callers open/create it themselves
+    /// (as a writer for a fresh spill, or a reader once written).
+    pub(crate) fn new(layout: &Layout) -> Result<TempPackGuard> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = layout.tmp_dir();
+        std::fs::create_dir_all(&dir)?;
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("pack-{}-{n}.tmp", std::process::id()));
+        Ok(TempPackGuard { path })
+    }
+
+    /// The reserved path.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempPackGuard {
+    fn drop(&mut self) {
+        // Best-effort: a file that was never created (an error before the
+        // first write) is a no-op `remove_file` failure, not a bug.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Write the objects named by `ids` (already fully resolved — no reachability
+/// or have-set filtering here, that's the caller's job) into a fresh guarded
+/// temp pack file via `PackWriter`, one object at a time. Peak RAM is one
+/// object's encoded + compressed bytes. Shared by
+/// [`LocalTransport::build_pack_tempfile`] (the remote-side sender, which
+/// resolves `ids` via reachability) and `Repo::push` (P25's client-side
+/// sender, which resolves `ids` via a local reachability walk filtered by
+/// `Transport::has_object`) — one ids-to-temp-pack-file implementation, not
+/// two.
+pub(crate) fn write_ids_to_temp_pack(
+    layout: &Layout,
+    store: &mut Store,
+    ids: &[ObjectId],
+) -> Result<TempPackGuard> {
+    let guard = TempPackGuard::new(layout)?;
+    {
+        let mut f = std::fs::File::create(guard.path())?;
+        let mut writer = scl_core::pack::PackWriter::new(&mut f, ids.len() as u32)?;
+        for id in ids {
+            let bytes = store.get(id)?.encode();
+            writer.write_object(id, &bytes)?;
+        }
+        writer.finish()?; // .idx discarded — transfer needs the .pack body only
+    }
+    Ok(guard)
+}
+
+/// Ingest a pack **file** into `store`, atomically after verification
+/// (P25's correctness heart): pass 1 walks every record via
+/// `parse_pack_reader`, verifying its BLAKE3 hash, and writes nothing; pass 2
+/// walks the same file again, this time writing each verified object into
+/// `store`. A corrupt record anywhere in the pack is therefore caught in
+/// pass 1, before any object from THIS pack reaches the store — a
+/// corrupt/tampered transfer never partially lands. Peak RAM is one record's
+/// compressed + decompressed bytes, whichever pass is running — the file on
+/// disk, not a `Vec<u8>`, is the thing being re-read.
+///
+/// # Why re-reading the file (not the untrusted wire) is what makes the
+/// per-record length prefix safe (Task 1 carry-in #1)
+///
+/// `parse_pack_reader` trusts each record's `u32` length prefix and
+/// allocates `vec![0u8; len]` for it — up to 4 GiB per record, unchecked.
+/// Read live off an untrusted socket that cap would be a memory-exhaustion
+/// footgun. Both passes here read the *already-fully-spilled* temp file
+/// instead (whether it was spilled by `Transport::put_pack`'s own bounded
+/// copy from `src`, or by `wire::serve` destreaming a chunked wire
+/// transfer): the total bytes any record's length prefix can possibly claim
+/// is bounded by the file's own size on disk, which was itself bounded by
+/// however many bytes the sender actually sent — so a hostile length prefix
+/// can time out (large but bounded `vec!` alloc) but cannot allocate more
+/// than the attacker already transferred. No separate per-record cap was
+/// added to `parse_pack_reader` itself; every call site in this codebase
+/// (both here and `wire::serve`'s own dispatch) reads a spilled file, never
+/// the live connection.
+///
+/// # Task 1 carry-in #2 (exact-EOF framing)
+///
+/// `parse_pack_reader` also relies on its source ending EXACTLY at the last
+/// record. `Transport::put_pack`'s spill uses `std::io::copy(src, &mut f)`
+/// (writes exactly what `src` produced, nothing appended); `wire::serve`'s
+/// spill uses `read_pack_stream`, which writes exactly the streamed pack
+/// body and returns once `ST_PACK_END` is seen (nothing trails it either).
+/// Both temp files therefore end exactly at the last record, matching
+/// `parse_pack_reader`'s termination contract.
+pub(crate) fn ingest_pack_file(
+    layout: &Layout,
+    store: &mut Store,
+    path: &std::path::Path,
+) -> Result<Vec<ObjectId>> {
+    // Pass 1: verify every record's hash; write nothing.
+    {
+        let f = std::fs::File::open(path)?;
+        scl_core::pack::parse_pack_reader(f, |_id, _obj| Ok(()))?;
+    }
+    // Pass 2: every record verified in pass 1 — now write each into the store.
+    let f = std::fs::File::open(path)?;
+    let mut ids = Vec::new();
+    scl_core::pack::parse_pack_reader(f, |id, obj| {
+        let got = store.put(obj)?;
+        // Defense in depth: pass 1 already verified this record's hash; this
+        // guards against a future change that weakens that.
+        if got != id {
+            return Err(scl_core::Error::PackCorrupt(format!(
+                "packed object {id} landed under a different id ({got})"
+            )));
+        }
+        ids.push(id);
+        Ok(())
+    })?;
+    // Receiver seam (P22 Task 3): every id above was just written to this
+    // store, so `index_incoming`'s "ids just written" contract holds.
+    crate::signatures::index_incoming(layout, store, &ids)?;
+    Ok(ids)
 }
 
 impl Transport for LocalTransport {
@@ -131,102 +331,49 @@ impl Transport for LocalTransport {
         crate::refs::write_branch_tip(&self.layout, branch, id)
     }
 
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>> {
-        use std::collections::BTreeSet;
-        let mut store = self.store.borrow_mut();
-        // Reachable-from-wants minus reachable-from-haves, computed on this
-        // (the remote) store. `haves` the remote doesn't have are skipped.
-        let mut want_set = crate::reachable::reachable_objects(&mut *store, wants)?;
-
-        let mut have_set: BTreeSet<ObjectId> = BTreeSet::new();
-        for h in haves {
-            if store.contains(h) {
-                have_set.extend(crate::reachable::reachable_objects(&mut *store, &[*h])?);
-            }
-        }
-
-        // Sender seam (P22 Task 3, fixed after review): a SignatureObj is a
-        // leaf referenced by no tree/snapshot, so the reachability walks
-        // above never find it on their own — it has to be pulled in
-        // explicitly via the `.sc/signatures` index.
-        //
-        // The original version of this seam extended `have_set` with the
-        // signatures indexed for every *have*-reachable snapshot, on the
-        // assumption that "receiver already has the snapshot" implies
-        // "receiver already has every signature ever indexed for it". That
-        // assumption is wrong: a signature added to a snapshot AFTER the
-        // receiver's last sync (retroactive signing, ADR-0032) would then be
-        // excluded from every subsequent fetch forever, because the
-        // extension only looked at reachability, never at which exact
-        // signature ids the receiver holds. Push already gets this right
-        // (`sync.rs`'s `push` checks `transport.has_object` per exact id);
-        // `get_pack` cannot do the same because the wire has no verb for the
-        // receiver to report which signature ids it already has (a
-        // zero-wire-change constraint for this fix).
-        //
-        // So instead: include every indexed signature covering ANY snapshot
-        // in the full transfer-relevant set (want side and have side alike)
-        // in `want_set`, and do NOT add any of them to `have_set`. This
-        // deliberately over-sends — a signature the receiver already holds
-        // gets sent again — but that is cheap (signature objects are small)
-        // and harmless (the receiver's `put_pack` -> `index_incoming` is
-        // idempotent: writing an already-stored content-addressed object is
-        // a no-op, and re-indexing an already-indexed signature is a no-op
-        // too). The alternative — exact per-id have/want negotiation for
-        // signatures — would need a new wire verb.
-        let all_snaps: Vec<ObjectId> = want_set.iter().chain(have_set.iter()).copied().collect();
-        want_set.extend(crate::signatures::indexed_signature_ids_for(&self.layout, &all_snaps)?);
-
-        let send: Vec<(ObjectId, Vec<u8>)> = want_set
-            .into_iter()
-            .filter(|id| !have_set.contains(id))
-            .map(|id| Ok((id, store.get(&id)?.encode())))
-            .collect::<Result<Vec<_>>>()?;
-        let (pack, _idx) = scl_core::pack::build_pack(&send)?;
-        Ok(pack)
+    /// Bounded sender (P25): builds the transfer set into a temp pack file
+    /// via [`LocalTransport::build_pack_tempfile`] (peak RAM one object),
+    /// then copies that file's raw bytes into `out` with a small fixed
+    /// buffer (`std::io::copy`) — `out` still receives exactly the raw
+    /// `.pack` bytes `build_pack` used to hand back directly, so every
+    /// existing caller of this trait method (`sync::transfer_objects`, the
+    /// `fetch_transfers_only_delta_not_full_history` regression test) is
+    /// unaffected. `wire::serve`'s `GetPack` handling does NOT go through
+    /// this method — it calls `build_pack_tempfile` itself and streams the
+    /// same temp file straight onto the wire in `ST_PACK_CHUNK` frames, so
+    /// there is exactly one spill either way, never two.
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
+        let guard = self.build_pack_tempfile(wants, haves)?;
+        let mut f = std::fs::File::open(guard.path())?;
+        std::io::copy(&mut f, out)?;
+        Ok(())
     }
 
-    /// Receive a pack: verify every record (BLAKE3) and write each object into the store.
-    /// Returns the ids of every object written. Ref updates are the caller's responsibility.
-    ///
-    /// # Verification
-    ///
-    /// `parse_pack` BLAKE3-verifies every record in the pack **before** any object is written.
-    /// A corrupt or tampered pack is therefore rejected in full, with no objects written, and
-    /// returns `Err`.
-    ///
-    /// # Non-transactional writes
-    ///
-    /// After the upfront verification passes, objects are written one-by-one. These writes are
-    /// **not** atomic: if a later `store.put` fails (e.g. disk full), earlier objects are already
-    /// durably stored and the call returns `Err`. This cannot corrupt the store — every written
-    /// object is valid and uniquely identified by its own BLAKE3 hash — but a partially-applied
-    /// pack is observable (`has_object` may return `true` for some ids and `false` for others).
+    /// Bounded receiver (P25): spills `src` to a temp pack file with a small
+    /// fixed buffer (`std::io::copy` — bounded RAM, and writes exactly what
+    /// `src` produced, satisfying Task 1 carry-in #2's exact-EOF framing
+    /// requirement), then ingests it via [`ingest_pack_file`]'s two-pass
+    /// atomic-after-verify contract (see that function's doc comment for the
+    /// full correctness argument, including Task 1 carry-in #1). The temp
+    /// file is removed on drop regardless of outcome.
     ///
     /// # Caller contract on `Err`
     ///
-    /// Treat any `Err` return as "the pack was not fully applied". Do **not** update refs on
-    /// failure. Any partially-written objects are unreferenced and will be reclaimed by `sc gc`.
-    /// Retrying is safe because content-addressed `put` is idempotent.
-    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>> {
-        let mut store = self.store.borrow_mut();
-        let mut ids = Vec::new();
-        // parse_pack verifies every record's hash before we write anything.
-        for (id, obj) in scl_core::pack::parse_pack(pack)? {
-            let got = store.put(obj)?;
-            // Defense in depth: parse_pack already verified each record's hash; this guards
-            // against a future change that weakens that.
-            if got != id {
-                return Err(Error::CorruptObject(id));
-            }
-            ids.push(id);
+    /// Treat any `Err` return as "the pack was not fully applied" — with the
+    /// P25 two-pass rewrite this is now backed by a real guarantee: a
+    /// corrupt/tampered pack is rejected in pass 1 before any object of it
+    /// reaches the store. Do **not** update refs on failure. The only
+    /// remaining non-atomicity is a `store.put` failure mid-pass-2 (e.g.
+    /// disk full) on an already-verified pack; any objects written before
+    /// that point are durably stored and harmless (content-addressed,
+    /// reclaimable by `sc gc`). Retrying is always safe (idempotent `put`).
+    fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
+        let guard = TempPackGuard::new(&self.layout)?;
+        {
+            let mut f = std::fs::File::create(guard.path())?;
+            std::io::copy(src, &mut f)?;
         }
-        // Receiver seam (P22 Task 3): every id above was just written to
-        // this store, so `index_incoming`'s "ids just written" contract
-        // holds. `sc serve --stdio` dispatches onto this same
-        // `LocalTransport`, so an ssh push indexes automatically too.
-        crate::signatures::index_incoming(&self.layout, &mut store, &ids)?;
-        Ok(ids)
+        self.ingest_from(guard.path())
     }
 }
 
@@ -357,7 +504,8 @@ mod tests {
 
         let t = LocalTransport::open(&src_root).unwrap();
         // Want c2, already have c1: the pack must omit c1's objects but include c2.
-        let pack = t.get_pack(&[c2], &[c1]).unwrap();
+        let mut pack = Vec::new();
+        t.get_pack(&[c2], &[c1], &mut pack).unwrap();
         let ids: Vec<_> = scl_core::pack::parse_pack(&pack).unwrap().into_iter().map(|(id, _)| id).collect();
         assert!(ids.contains(&c2));
         assert!(!ids.contains(&c1));
@@ -365,7 +513,7 @@ mod tests {
         // put_pack into a fresh empty remote writes + returns the ids.
         let _ = crate::repo::Repo::init(&dst_root).unwrap();
         let t2 = LocalTransport::open(&dst_root).unwrap();
-        let written = t2.put_pack(&pack).unwrap();
+        let written = t2.put_pack(&mut &pack[..]).unwrap();
         assert!(written.contains(&c2));
         assert!(t2.has_object(&c2).unwrap());
 
@@ -373,9 +521,54 @@ mod tests {
         let mut bad = pack.clone();
         let n = bad.len() - 1;
         bad[n] ^= 0xFF;
-        assert!(t2.put_pack(&bad).is_err());
+        assert!(t2.put_pack(&mut &bad[..]).is_err());
 
         std::fs::remove_dir_all(&src_root).unwrap();
         std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    fn tmp_dir_is_empty(layout: &Layout) -> bool {
+        match std::fs::read_dir(layout.tmp_dir()) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => panic!("unexpected error reading .sc/tmp: {e}"),
+        }
+    }
+
+    /// P25 correctness heart, exercised directly against `LocalTransport`
+    /// (the sibling `stdio_transport::streaming_receiver_leaves_zero_residue_on_success_and_error`
+    /// exercises the same guarantee through the actual chunked wire path —
+    /// this test pins the underlying `ingest_pack_file`/`TempPackGuard`
+    /// contract in isolation, with no wire framing in the way).
+    #[test]
+    fn put_pack_leaves_zero_residue_on_success_and_error() {
+        let layout = tmp_remote("residue");
+        let t = LocalTransport::open(&layout.root).unwrap();
+
+        let a = Object::blob(b"alpha".to_vec());
+        let b = Object::blob(b"bravo bravo".to_vec());
+        let (pack, _idx) =
+            scl_core::pack::build_pack(&[(a.id(), a.encode()), (b.id(), b.encode())]).unwrap();
+
+        // Success: both objects land, and the temp pack file is gone.
+        let written = t.put_pack(&mut &pack[..]).unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(t.has_object(&a.id()).unwrap());
+        assert!(t.has_object(&b.id()).unwrap());
+        assert!(tmp_dir_is_empty(&layout), "temp pack file must be gone after a successful put_pack");
+
+        // Failure: corrupt the one record's compressed payload. Pass 1 of
+        // ingest_pack_file must reject it BEFORE any write, so the object
+        // must not land, and the temp file must still be cleaned up.
+        let c = Object::blob(b"charlie charlie charlie".to_vec());
+        let (mut pack2, _idx2) = scl_core::pack::build_pack(&[(c.id(), c.encode())]).unwrap();
+        let last = pack2.len() - 1;
+        pack2[last] ^= 0xFF;
+
+        assert!(t.put_pack(&mut &pack2[..]).is_err());
+        assert!(!t.has_object(&c.id()).unwrap(), "corrupt pack must not land any object — atomic after verify");
+        assert!(tmp_dir_is_empty(&layout), "temp pack file must be gone after a corrupt ingest too");
+
+        std::fs::remove_dir_all(&layout.root).unwrap();
     }
 }

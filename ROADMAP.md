@@ -272,10 +272,49 @@ across every phase.
   `demo/run_sparse_demo.sh` (three subtrees, one narrowed in, edited and
   committed under sparse, then both `sc sparse disable` and an independent
   full clone restore the other two byte-identical). (ADR-0034.)
+- **Phase 25 — Streaming pack transfer (bounded-RAM, >4 GiB).** An
+  incremental `PackWriter` (`crates/core/src/pack.rs`) appends objects one
+  at a time to any `Write`, accumulating only the (small) index in RAM, and
+  is byte-identical to `build_pack` for the same object sequence
+  (`pack_writer_matches_build_pack_byte_for_byte`); a streaming
+  `parse_pack_reader` verifies each record's BLAKE3 hash off a `Read`
+  without holding the whole pack body, terminating cleanly at a
+  record-boundary EOF since the pack format carries no object count. The
+  wire (`crates/repo/src/wire.rs`) frames a pack as `ST_PACK_CHUNK`/
+  `ST_PACK_END` opcodes under the unchanged `u32` frame header
+  (`write_pack_stream`/`read_pack_stream`, `CHUNK_SIZE` = 1 MiB, overridable
+  via `SC_PACK_CHUNK` for tuning/testing); `PROTOCOL_VERSION` bumped `1 → 2`
+  with v1 dropped outright (one pack encoding, no legacy fallback — a
+  version mismatch is rejected cleanly at the handshake). The sender
+  (`LocalTransport::build_pack_tempfile`) streams objects one at a time into
+  a temp pack file instead of collecting a `Vec<(ObjectId, Vec<u8>)>`; the
+  receiver (`ingest_pack_file`) does a two-pass atomic-after-verify ingest —
+  pass 1 verifies every record's hash writing nothing, pass 2 writes each
+  verified object — so a corrupt or truncated pack never partially lands; a
+  `TempPackGuard` RAII type removes the temp file on success or any error.
+  No new user command — streaming is transparent to every existing
+  `push`/`fetch`/`clone` invocation. Proven by `demo/run_streaming_demo.sh`
+  (a ~1 MiB signed blob crosses an ssh:// clone with `SC_PACK_CHUNK=4096`
+  forcing 250+ chunk frames; object set, working tree, and `sc log` are
+  byte-for-byte identical to the origin, and `sc verify --require` is clean
+  in the clone, proving the signature rode the chunked stream — run twice
+  into fresh destinations, zero `.sc/tmp` residue on either end both
+  times). **The client is bounded too (closed in the P25 final-review
+  fix):** `crates/repo/src/sync.rs::transfer_objects` (the fetch/clone
+  ingestion path) now spills `get_pack`'s output into a guarded temp file
+  and ingests it via the same `ingest_pack_file` two-pass bounded machinery
+  the server and wire use, peak RAM one object; `Repo::push` now collects
+  only ids, then streams the outgoing pack to a guarded temp file one
+  object at a time via a shared `write_ids_to_temp_pack` helper (also used
+  by `LocalTransport::build_pack_tempfile`) before handing an opened `File`
+  to `transport.put_pack`. Both temp files are removed on success and every
+  error (`TempPackGuard`), pinned by
+  `fetch_client_ingests_via_tempfile_zero_residue` and
+  `push_client_builds_via_tempfile_zero_residue`. (ADR-0035.)
 
 ## Active
 
-None — the P21–P24 horizon is complete; brainstorm the next horizon.
+None — P25 done; P26 sc-native HTTP transport is next up.
 
 ## Completed phases (usability-first ordering)
 
@@ -302,6 +341,7 @@ None — the P21–P24 horizon is complete; brainstorm the next horizon.
 | **P22 — Signed commits & provenance** | Detect history rewriting; attribute commits to an identity | `sc keygen` v2 identities (X25519 + Ed25519 from one seed), `sc commit --sign`/`sc sign <ref>`, `sc log` four-state markers, `sc verify --require`; signatures ride existing packs with zero wire changes; proven by `demo/run_provenance_demo.sh` (rewrite attack caught in a clone while the original stays clean) | [0032](docs/adr/0032-signed-commits-provenance.md) |
 | **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts [<path>]` lists/shows base-ours-theirs (decrypted under `--identity` for protected paths); `sc resolve --ours\|--theirs <path>` writes clean content; proven by `demo/run_merge_ergonomics_demo.sh` (text + protected conflicts resolved end-to-end) | [0033](docs/adr/0033-merge-ergonomics.md) |
 | **P24 — Sparse checkouts / sub-tree sharing** | Materialize one subtree of a large repo, leave the rest on the CAS | `sc sparse set <prefix…>`/`show`/`disable`; `commit`'s absent-path carry widens to out-of-sparse paths (byte-identical carried subtrees); `materialize` filters both its write and removal loops; proven by `demo/run_sparse_demo.sh` (narrow, edit, commit, then disable/clone restore byte-identical) | [0034](docs/adr/0034-sparse-checkouts.md) |
+| **P25 — Streaming pack transfer (bounded-RAM, >4 GiB)** | `push`/`fetch`/`clone` over ssh:// don't hold a whole pack in RAM anywhere — server, wire, or client | `PackWriter`/`parse_pack_reader` (bounded-RAM pack build/parse); `ST_PACK_CHUNK`/`ST_PACK_END` chunk framing (`SC_PACK_CHUNK`-tunable); `PROTOCOL_VERSION` 2, v1 dropped; two-pass atomic-after-verify ingest + `TempPackGuard`; the ssh client's own `sync.rs` fetch/push call sites route through the same `ingest_pack_file`/`write_ids_to_temp_pack` machinery (final-review fix); proven by `demo/run_streaming_demo.sh` (forced 4 KiB chunks, byte-for-byte clone, signature rides the stream, zero temp residue) | [0035](docs/adr/0035-streaming-transfer.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -393,11 +433,11 @@ graduated twice over: revocation tombstones → P16, bulk re-wrap + escrow
 keys → P17, network Git remotes → P18, history-editing polish → P19,
 sessions + auto-merge → P20; and now policy-op guards + marks recovery +
 abort/status minors → P21, signed commits → P22, merge ergonomics → P23,
-sparse checkouts → P24):
+sparse checkouts → P24, and streaming (>4 GiB) wire frames → P25):
 
-- **HTTP transport** (sc-native). P12 shipped the sc-native SSH transport;
-  an HTTP equivalent is a later transport swap on the same seam.
-- **Streaming (>4 GiB) wire frames** (P12 caps a frame at 4 GiB).
+- **HTTP transport** (sc-native). P12 shipped the sc-native SSH transport
+  and P25 made the wire itself stream in bounded chunks; an HTTP
+  equivalent is the next transport swap on the same seam (P26).
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
