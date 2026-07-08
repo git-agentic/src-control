@@ -11,7 +11,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use scl_core::{Backend, FileMode, SpillPolicy, Store, StoreConfig};
-use scl_crypto::KeyProvider;
 use scl_vfs::Repo;
 
 #[derive(Parser)]
@@ -32,9 +31,10 @@ enum Cmd {
         #[arg(long)]
         repo: PathBuf,
     },
-    /// Generate an X25519 identity keypair (private key written to disk 0600).
+    /// Generate a v2 identity (private file written to disk 0600): a single
+    /// seed deriving both an X25519 encryption key and an Ed25519 signing key.
     Keygen {
-        /// Where to write the private key (default: ~/.sc/identity).
+        /// Where to write the private identity (default: ~/.sc/identity).
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -51,6 +51,13 @@ enum Cmd {
         /// username).
         #[arg(long)]
         author: Option<String>,
+        /// Sign the resulting commit with your identity's signing key
+        /// (requires a v2 identity; see `sc keygen`).
+        #[arg(long)]
+        sign: bool,
+        /// Identity file for --sign (default ~/.sc/identity or $SC_IDENTITY).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
     /// Replace the tip commit with one built from the current working tree.
     /// Parents are kept from the tip (merge and root commits amend
@@ -64,6 +71,13 @@ enum Cmd {
         /// then the OS username).
         #[arg(long)]
         author: Option<String>,
+        /// Sign the resulting commit with your identity's signing key
+        /// (requires a v2 identity; see `sc keygen`).
+        #[arg(long)]
+        sign: bool,
+        /// Identity file for --sign (default ~/.sc/identity or $SC_IDENTITY).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
     /// Show working-tree changes against HEAD.
     Status {
@@ -320,6 +334,24 @@ enum Cmd {
     Undo,
     /// List recent operations, newest first.
     Oplog,
+    /// Sign a ref's tip snapshot with your identity's signing key.
+    Sign {
+        /// Branch or remote-tracking ref to sign the tip of.
+        r#ref: String,
+        /// Identity file (requires a v2 identity; default ~/.sc/identity or
+        /// $SC_IDENTITY).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Verify signatures across a ref's full history (all parents, not just
+    /// the mainline).
+    Verify {
+        /// Branch or remote-tracking ref to verify (default: HEAD).
+        r#ref: Option<String>,
+        /// Exit 1 if any commit in the walked history is not Trusted.
+        #[arg(long)]
+        require: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -501,8 +533,12 @@ fn main() -> Result<()> {
         Cmd::Keygen { out } => run_keygen(out),
         Cmd::SecretDemo(args) => run_secret_demo(args),
         Cmd::Init => run_init(),
-        Cmd::Commit { message, author } => run_commit(&resolve_author(author), &message),
-        Cmd::Amend { message, author } => run_amend(&resolve_author(author), message),
+        Cmd::Commit { message, author, sign, identity } => {
+            run_commit(&resolve_author(author), &message, sign, identity)
+        }
+        Cmd::Amend { message, author, sign, identity } => {
+            run_amend(&resolve_author(author), message, sign, identity)
+        }
         Cmd::Status { json } => run_status(json),
         Cmd::Diff => run_diff(),
         Cmd::Log { json } => run_log(json),
@@ -538,6 +574,8 @@ fn main() -> Result<()> {
         Cmd::Rewrap { identity, dry_run } => run_rewrap(identity, dry_run),
         Cmd::Undo => run_undo(),
         Cmd::Oplog => run_oplog(),
+        Cmd::Sign { r#ref, identity } => run_sign(&r#ref, identity),
+        Cmd::Verify { r#ref, require } => run_verify(r#ref, require),
     }
 }
 
@@ -764,6 +802,17 @@ fn resolve_identity_path(flag: Option<PathBuf>) -> PathBuf {
     default_identity_path()
 }
 
+/// `sc keygen`: generate a v2 identity — a single random seed from which both
+/// the X25519 encryption key and the Ed25519 signing key are deterministically
+/// derived (`scl_crypto::generate_identity_v2`). Only the seed (the `scl-id-`
+/// line) is written to disk, 0600, and never echoed to stdout — it is the
+/// whole private identity, encryption *and* signing, so it gets the same
+/// discipline the v1 private key always had (see the P5-scanner memory: an
+/// identity file is scanner-bait and must stay outside any working tree).
+/// Both PUBLIC halves are printed, with registration hints for both
+/// `.sc/recipients.toml` sections a v2 identity plugs into: `[recipients]`
+/// (encryption, unchanged since P7) and `[signing]`/`[signers]` (P22 trust
+/// config, new here).
 fn run_keygen(out: Option<PathBuf>) -> Result<()> {
     let path = out.unwrap_or_else(default_identity_path);
     if let Some(parent) = path.parent() {
@@ -778,7 +827,13 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    let (sk, pk) = scl_crypto::generate_keypair();
+    let (seed_line, identity) = scl_crypto::generate_identity_v2();
+    let signing = identity
+        .signing
+        .as_ref()
+        .expect("generate_identity_v2 always derives a signing half");
+    let enc_pk = identity.enc.public();
+    let sig_pk = signing.public();
     // Create the key file 0600 *atomically* so the private key is never visible
     // group/world-readable through the umask window between write and chmod.
     // `create_new(true)` refuses to clobber an existing identity.
@@ -792,30 +847,54 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
             .mode(0o600)
             .open(&path)
             .with_context(|| format!("identity already exists at {} (refusing to overwrite)", path.display()))?;
-        f.write_all(sk.to_key_string().as_bytes())?;
+        f.write_all(seed_line.as_bytes())?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&path, sk.to_key_string())?;
+        std::fs::write(&path, &seed_line)?;
     }
-    println!("wrote private key: {} (0600)", path.display());
-    println!("public key:   {}", pk.to_key_string());
-    println!("recipient id: {}", pk.recipient_id());
-    println!("\nAdd to .sc/recipients.toml under [recipients]:");
-    println!("  <name> = \"{}\"", pk.to_key_string());
+    println!("wrote identity: {} (0600)", path.display());
+    println!("encryption public key: {}", enc_pk.to_key_string());
+    println!("signing public key:    {}", sig_pk.to_key_string());
+    println!("recipient id: {}", enc_pk.recipient_id());
+    println!("\nAdd to .sc/recipients.toml to grant/protect/seal to this identity:");
+    println!("  [recipients]");
+    println!("  <name> = \"{}\"", enc_pk.to_key_string());
+    println!("\nAdd to .sc/recipients.toml to sign commits and be verifiable:");
+    println!("  [signing]");
+    println!("  <name> = \"{}\"", sig_pk.to_key_string());
+    println!("\nTo TRUST this signer for `sc verify` / `sc log`, list <name> under:");
+    println!("  [signers]");
+    println!("  trusted = [\"<name>\"]");
     Ok(())
 }
 
 // ---- .sc/recipients.toml loader ------------------------------------
 
 /// Parsed `.sc/recipients.toml`: `[recipients] name -> scl-pk-<hex>`, plus an
-/// optional `[escrow]` break-glass keys auto-included at seal/protect time.
+/// optional `[escrow]` break-glass keys auto-included at seal/protect time,
+/// and (P22) an optional `[signing] name -> scl-sig-<hex>` registry of known
+/// signer public keys plus `[signers] trusted = […]` selecting which of them
+/// are trusted for `sc verify`/`sc log` — the same name/key-registry shape as
+/// `[recipients]`, mirrored for the signing half of a v2 identity.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct RecipientsFile {
     #[serde(default)]
     recipients: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     escrow: Option<EscrowSection>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    signing: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signers: Option<SignersSection>,
+}
+
+/// The `[signers]` section: which `[signing]` names are trusted for
+/// signature verification.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct SignersSection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    trusted: Vec<String>,
 }
 
 /// The `[escrow]` section: historically a single `key = "scl-pk-…"`, now a
@@ -840,6 +919,37 @@ fn load_recipients(
         let pk = scl_crypto::PublicKey::from_key_string(&key_str)
             .map_err(|_| anyhow::anyhow!("bad public key for recipient '{name}'"))?;
         out.insert(name, pk);
+    }
+    Ok(out)
+}
+
+/// Trust map for `Repo::sig_status`: signer pubkey bytes -> display name,
+/// built from `[signing]` (name -> `scl-sig-<hex>`) filtered down to the
+/// names listed under `[signers] trusted`. A missing file (or a file with
+/// neither section) yields an empty trust map — every signature verifies as
+/// `Untrusted` rather than `Trusted`, which is the safe default. A name
+/// listed in `trusted` with no matching `[signing]` entry is a config error,
+/// not a silent skip: trusting a name the operator can't resolve to a key
+/// would be a no-op that looks like it did something.
+fn load_trust_map(path: &std::path::Path) -> Result<std::collections::HashMap<[u8; 32], String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(std::collections::HashMap::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let parsed: RecipientsFile = toml::from_str(&text)?;
+    let trusted_names = parsed.signers.map(|s| s.trusted).unwrap_or_default();
+    let mut out = std::collections::HashMap::new();
+    for name in trusted_names {
+        let key_str = parsed.signing.get(&name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "'{name}' is listed in [signers] trusted but has no [signing] entry in {}",
+                path.display()
+            )
+        })?;
+        let pk = scl_crypto::SigPublicKey::from_key_string(key_str)
+            .map_err(|_| anyhow::anyhow!("bad signing public key for '{name}' in {}", path.display()))?;
+        out.insert(pk.to_bytes(), name);
     }
     Ok(out)
 }
@@ -1039,11 +1149,28 @@ fn run_init() -> Result<()> {
     Ok(())
 }
 
-fn run_commit(author: &str, message: &str) -> Result<()> {
+/// Sign `snapshot` with `identity` and print the `sc sign`-style
+/// confirmation line. Shared by `sc sign` and the `--sign` flag on
+/// `commit`/`amend` so the two surfaces can't drift in output shape.
+fn sign_and_report(repo: &scl_repo::Repo, snapshot: scl_core::ObjectId, identity: Option<PathBuf>) -> Result<()> {
+    let identity = load_identity_full(identity)?;
+    repo.sign_snapshot(snapshot, &identity)?;
+    let signing = identity
+        .signing
+        .as_ref()
+        .expect("sign_snapshot succeeded, so identity carries a signing half");
+    println!("signed {} as {}", snapshot.short(), signing.public().to_key_string());
+    Ok(())
+}
+
+fn run_commit(author: &str, message: &str, sign: bool, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
     match repo.commit(author, message) {
         Ok(id) => {
             println!("committed {}", id.short());
+            if sign {
+                sign_and_report(&repo, id, identity)?;
+            }
             Ok(())
         }
         Err(scl_repo::Error::SecretDetected(report)) => {
@@ -1057,13 +1184,16 @@ fn run_commit(author: &str, message: &str) -> Result<()> {
     }
 }
 
-fn run_amend(author: &str, message: Option<String>) -> Result<()> {
+fn run_amend(author: &str, message: Option<String>, sign: bool, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
     let old = repo.head_tip()?;
     match repo.amend(author, message.as_deref()) {
         Ok(id) => {
             let old_short = old.map(|o| o.short()).unwrap_or_else(|| "?".to_string());
             println!("amended {} -> {}", old_short, id.short());
+            if sign {
+                sign_and_report(&repo, id, identity)?;
+            }
             Ok(())
         }
         Err(scl_repo::Error::SecretDetected(report)) => {
@@ -1313,22 +1443,52 @@ fn run_rebase(
     }
 }
 
+/// Render one [`scl_repo::SigStatus`] into `sc log`'s human-readable
+/// second line (`None` for `Unsigned` — the brief is explicit that an
+/// unsigned commit gets no line at all, not an empty/negative one).
+/// Separated from `run_log` so the four states can be unit-tested directly
+/// against `SigStatus` values rather than string-matching full CLI output.
+fn render_sig_status_line(status: &scl_repo::SigStatus) -> Option<String> {
+    match status {
+        scl_repo::SigStatus::Trusted(name) => Some(format!("  signed: {name} \u{2713}")),
+        scl_repo::SigStatus::Untrusted(signer) => {
+            Some(format!("  signed: {}\u{2026} ?", hex::encode(&signer[..4])))
+        }
+        scl_repo::SigStatus::Invalid => Some("  signature INVALID \u{2717}".to_string()),
+        scl_repo::SigStatus::Unsigned => None,
+    }
+}
+
+/// Render one [`scl_repo::SigStatus`] into the `"signature"` field `sc log
+/// --json` embeds per entry.
+fn sig_status_json(status: &scl_repo::SigStatus) -> serde_json::Value {
+    match status {
+        scl_repo::SigStatus::Trusted(name) => serde_json::json!({"status": "trusted", "name": name}),
+        scl_repo::SigStatus::Untrusted(signer) => {
+            serde_json::json!({"status": "untrusted", "signer": hex::encode(signer)})
+        }
+        scl_repo::SigStatus::Invalid => serde_json::json!({"status": "invalid"}),
+        scl_repo::SigStatus::Unsigned => serde_json::json!({"status": "unsigned"}),
+    }
+}
+
 fn run_log(json: bool) -> Result<()> {
     let repo = open_repo()?;
     let entries = repo.log()?;
+    let trust = load_trust_map(&repo.layout().dot_sc.join("recipients.toml"))?;
     if json {
-        let arr: Vec<serde_json::Value> = entries
-            .iter()
-            .map(|(id, snap)| {
-                serde_json::json!({
-                    "id": id.to_hex(),
-                    "author": snap.author,
-                    "timestamp": snap.timestamp,
-                    "message": snap.message,
-                    "parents": snap.parents.iter().map(|p| p.to_hex()).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
+        let mut arr = Vec::with_capacity(entries.len());
+        for (id, snap) in &entries {
+            let status = repo.sig_status(id, &trust)?;
+            arr.push(serde_json::json!({
+                "id": id.to_hex(),
+                "author": snap.author,
+                "timestamp": snap.timestamp,
+                "message": snap.message,
+                "parents": snap.parents.iter().map(|p| p.to_hex()).collect::<Vec<_>>(),
+                "signature": sig_status_json(&status),
+            }));
+        }
         println!("{}", serde_json::Value::Array(arr));
         return Ok(());
     }
@@ -1342,6 +1502,10 @@ fn run_log(json: bool) -> Result<()> {
             snap.message,
             merge
         );
+        let status = repo.sig_status(&id, &trust)?;
+        if let Some(line) = render_sig_status_line(&status) {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -1399,6 +1563,94 @@ fn run_oplog() -> Result<()> {
     let repo = open_repo()?;
     for rec in repo.oplog()?.iter().rev() {
         println!("{:>4}  {}  {}", rec.seq, fmt_utc(rec.ts), rec.desc);
+    }
+    Ok(())
+}
+
+/// Resolve a branch or remote-tracking ref name to its tip; a missing ref
+/// errors clearly rather than the confusing `None` a raw `resolve_tip` call
+/// would surface as.
+fn resolve_ref_tip(repo: &scl_repo::Repo, refname: &str) -> Result<scl_core::ObjectId> {
+    scl_repo::refs::resolve_tip(repo.layout(), refname)?
+        .ok_or_else(|| anyhow::anyhow!("no such ref: {refname}"))
+}
+
+fn run_sign(refname: &str, identity: Option<PathBuf>) -> Result<()> {
+    let repo = open_repo()?;
+    let tip = resolve_ref_tip(&repo, refname)?;
+    sign_and_report(&repo, tip, identity)
+}
+
+/// All ancestors of `tip`, `tip` included: BFS over EVERY parent (not just
+/// the mainline `Repo::log` follows), deduped. `sc verify` needs this because
+/// a merge's non-mainline side can carry an unsigned or badly-signed commit
+/// that `sc log`'s first-parent walk would never visit.
+fn history_all_parents(repo: &scl_repo::Repo, tip: scl_core::ObjectId) -> Result<Vec<scl_core::ObjectId>> {
+    use std::collections::{BTreeSet, VecDeque};
+    let mut seen: BTreeSet<scl_core::ObjectId> = BTreeSet::new();
+    let mut queue: VecDeque<scl_core::ObjectId> = VecDeque::new();
+    let mut order = Vec::new();
+    seen.insert(tip);
+    queue.push_back(tip);
+    while let Some(id) = queue.pop_front() {
+        order.push(id);
+        let snap = {
+            let store = repo.store();
+            let mut store = store.lock().unwrap();
+            store.get_snapshot(&id)?
+        };
+        for p in &snap.parents {
+            if seen.insert(*p) {
+                queue.push_back(*p);
+            }
+        }
+    }
+    Ok(order)
+}
+
+fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
+    let repo = open_repo()?;
+    let tip = match refname {
+        Some(r) => resolve_ref_tip(&repo, &r)?,
+        None => repo.head_tip()?.ok_or_else(|| anyhow::anyhow!("HEAD is unborn"))?,
+    };
+    let trust = load_trust_map(&repo.layout().dot_sc.join("recipients.toml"))?;
+    let history = history_all_parents(&repo, tip)?;
+
+    let (mut trusted, mut untrusted, mut invalid, mut unsigned) = (0u32, 0u32, 0u32, 0u32);
+    for id in &history {
+        let status = repo.sig_status(id, &trust)?;
+        let label = match &status {
+            scl_repo::SigStatus::Trusted(name) => {
+                trusted += 1;
+                format!("trusted: {name}")
+            }
+            scl_repo::SigStatus::Untrusted(signer) => {
+                untrusted += 1;
+                format!("untrusted: {}…", hex::encode(&signer[..4]))
+            }
+            scl_repo::SigStatus::Invalid => {
+                invalid += 1;
+                "INVALID".to_string()
+            }
+            scl_repo::SigStatus::Unsigned => {
+                unsigned += 1;
+                "unsigned".to_string()
+            }
+        };
+        println!("{} {label}", id.short());
+    }
+    println!(
+        "\nsummary: {trusted} trusted, {untrusted} untrusted, {invalid} invalid, {unsigned} unsigned ({} commit(s))",
+        history.len()
+    );
+
+    if require && (untrusted + invalid + unsigned) > 0 {
+        // Drop the repo (releases .sc/lock) before process::exit, which skips
+        // destructors and would otherwise leave a stale lock file — same
+        // discipline as the other exit-1 paths in this file.
+        drop(repo);
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -1734,9 +1986,24 @@ fn run_ws(op: WsOp) -> Result<()> {
     Ok(())
 }
 
-fn load_identity(flag: Option<PathBuf>) -> Result<scl_crypto::SecretKey> {
+/// Load the full identity (both halves when present) from a v1 (`scl-sk-`,
+/// encryption-only) or v2 (`scl-id-`, encryption + signing) identity file.
+/// Signing surfaces (`sc sign`, `sc commit --sign`, `sc amend --sign`) need
+/// this; encryption-only callers keep going through [`load_identity`], which
+/// is this function with `.enc` projected out — same file format handling,
+/// same errors, just a narrower return type so none of those call sites had
+/// to change shape.
+fn load_identity_full(flag: Option<PathBuf>) -> Result<scl_crypto::Identity> {
     let path = resolve_identity_path(flag);
-    scl_crypto::FileKeyProvider::new(path).identity().map_err(Into::into)
+    let contents = scl_crypto::Zeroizing::new(
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("reading identity {}", path.display()))?,
+    );
+    scl_crypto::parse_identity(&contents).map_err(Into::into)
+}
+
+fn load_identity(flag: Option<PathBuf>) -> Result<scl_crypto::SecretKey> {
+    Ok(load_identity_full(flag)?.enc)
 }
 
 /// Read a secret value from stdin (for `secret add` without `--value` and
@@ -1760,11 +2027,11 @@ fn read_value_from_stdin() -> Result<String> {
 /// resolved path doesn't exist, `Ok(Some(..))` when it loads, and propagates the
 /// error when a present file fails to parse.
 fn resolve_identity_opt(flag: Option<PathBuf>) -> Result<Option<scl_crypto::SecretKey>> {
-    let path = resolve_identity_path(flag);
+    let path = resolve_identity_path(flag.clone());
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(scl_crypto::FileKeyProvider::new(path).identity()?))
+    Ok(Some(load_identity_full(flag)?.enc))
 }
 
 /// Append every escrow key to a seal recipient set, deduped by recipient id.
@@ -2651,5 +2918,108 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn four_log_states_render_distinctly() {
+        let trusted = scl_repo::SigStatus::Trusted("alice".to_string());
+        let untrusted = scl_repo::SigStatus::Untrusted([0xab; 32]);
+        let invalid = scl_repo::SigStatus::Invalid;
+        let unsigned = scl_repo::SigStatus::Unsigned;
+
+        let t = render_sig_status_line(&trusted).unwrap();
+        assert!(t.contains("alice") && t.contains('\u{2713}'), "trusted line: {t}");
+
+        let u = render_sig_status_line(&untrusted).unwrap();
+        assert!(u.contains("abababab") && u.contains('?'), "untrusted line shows an 8-hex prefix: {u}");
+        assert!(!u.contains('\u{2713}'), "untrusted must not carry the trusted check mark: {u}");
+
+        let i = render_sig_status_line(&invalid).unwrap();
+        assert!(i.contains("INVALID") && i.contains('\u{2717}'), "invalid line: {i}");
+
+        assert!(render_sig_status_line(&unsigned).is_none(), "unsigned must render no line at all");
+
+        // The four states are pairwise distinct as rendered text.
+        let rendered: Vec<String> =
+            [&trusted, &untrusted, &invalid].iter().map(|s| render_sig_status_line(s).unwrap()).collect();
+        assert_eq!(rendered.len(), rendered.iter().collect::<std::collections::HashSet<_>>().len());
+
+        assert_eq!(sig_status_json(&trusted)["status"], "trusted");
+        assert_eq!(sig_status_json(&trusted)["name"], "alice");
+        assert_eq!(sig_status_json(&untrusted)["status"], "untrusted");
+        assert_eq!(sig_status_json(&invalid)["status"], "invalid");
+        assert_eq!(sig_status_json(&unsigned)["status"], "unsigned");
+    }
+
+    #[test]
+    fn trust_map_builds_from_signing_and_signers_and_errors_on_missing_entry() {
+        let dir = std::env::temp_dir().join(format!("scl-trust-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recipients.toml");
+
+        // Missing file → empty trust map, not an error.
+        assert!(load_trust_map(&dir.join("absent.toml")).unwrap().is_empty());
+
+        let (_s, alice) = scl_crypto::generate_identity_v2();
+        let alice_sig = alice.signing.as_ref().unwrap().public();
+
+        // [signing] with no [signers] section → nobody trusted yet.
+        std::fs::write(&path, format!("[signing]\nalice = \"{}\"\n", alice_sig.to_key_string())).unwrap();
+        assert!(load_trust_map(&path).unwrap().is_empty());
+
+        // Listing alice as trusted resolves her key.
+        std::fs::write(
+            &path,
+            format!(
+                "[signing]\nalice = \"{}\"\n\n[signers]\ntrusted = [\"alice\"]\n",
+                alice_sig.to_key_string()
+            ),
+        )
+        .unwrap();
+        let map = load_trust_map(&path).unwrap();
+        assert_eq!(map.get(&alice_sig.to_bytes()), Some(&"alice".to_string()));
+
+        // A trusted name absent from [signing] is a clear config error, not a
+        // silent no-op.
+        std::fs::write(&path, "[signers]\ntrusted = [\"bob\"]\n").unwrap();
+        let err = load_trust_map(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bob") && msg.contains("signing"), "error names the fix: {msg}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn history_all_parents_walks_both_sides_of_a_merge_deduped() {
+        let dir = std::env::temp_dir().join(format!("scl-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = scl_repo::Repo::init(&dir).unwrap();
+
+        std::fs::write(dir.join("base.txt"), b"base").unwrap();
+        let base = repo.commit("t", "base").unwrap();
+        repo.branch("side").unwrap();
+
+        std::fs::write(dir.join("m.txt"), b"main").unwrap();
+        repo.commit("t", "on-main").unwrap();
+
+        repo.switch("side").unwrap();
+        std::fs::write(dir.join("s.txt"), b"side").unwrap();
+        repo.commit("t", "on-side").unwrap();
+
+        repo.switch("main").unwrap();
+        let merge_id = repo.merge("side", "t").unwrap();
+
+        let history = history_all_parents(&repo, merge_id).unwrap();
+        // merge + on-main + on-side + base = 4 distinct commits, base only once
+        // despite being an ancestor of BOTH merge parents.
+        assert_eq!(history.len(), 4, "history: {history:?}");
+        assert!(history.contains(&base));
+        assert!(history.contains(&merge_id));
+        let unique: std::collections::BTreeSet<_> = history.iter().collect();
+        assert_eq!(unique.len(), history.len(), "no duplicate ids in the walk");
+
+        drop(repo);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -176,7 +176,7 @@ fn unauthorized_ssh_clone_receives_ciphertext_it_cannot_read() {
     let pk = stdout
         .lines()
         .find(|l| l.contains("public key:"))
-        .and_then(|l| l.split_whitespace().nth(2))
+        .and_then(|l| l.split_whitespace().find(|w| w.starts_with("scl-pk-")))
         .expect("keygen prints the public key")
         .to_string();
     std::fs::write(a.join(".sc/recipients.toml"), format!("[recipients]\nalice = \"{pk}\"\n"))

@@ -133,14 +133,16 @@ fn push_refuses_encrypted_content_without_flag() {
 
     sc(&screpo, &["init"]);
 
-    // Generate an identity; grab its public key (line: "public key:   scl-pk-…").
+    // Generate a (P22 v2) identity; grab its encryption public key (line:
+    // "encryption public key: scl-pk-…"). Matched by prefix, not position, so
+    // it doesn't care where on the line the token lands.
     let kg = sc(&screpo, &["keygen", "--out", id.to_str().unwrap()]);
     assert!(kg.status.success(), "keygen failed: {}", String::from_utf8_lossy(&kg.stderr));
     let kg_out = String::from_utf8_lossy(&kg.stdout);
     let pubkey = kg_out
         .lines()
         .find(|l| l.contains("public key"))
-        .and_then(|l| l.split_whitespace().nth(2))
+        .and_then(|l| l.split_whitespace().find(|w| w.starts_with("scl-pk-")))
         .expect("keygen prints a public key")
         .to_string();
 
