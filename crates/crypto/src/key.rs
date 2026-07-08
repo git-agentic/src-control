@@ -61,6 +61,14 @@ pub fn generate_keypair_with_rng<R: RngCore + CryptoRng>(rng: &mut R) -> (Secret
 }
 
 impl SecretKey {
+    /// Wrap an already-derived `StaticSecret` (used by the v2 identity's
+    /// seed derivation in `signing.rs`; kept crate-private since callers
+    /// outside `scl-crypto` only ever construct a `SecretKey` from a key
+    /// string or `generate_keypair`).
+    pub(crate) fn from_static_secret(sk: x25519_dalek::StaticSecret) -> Self {
+        SecretKey(sk)
+    }
+
     /// The public key for this identity.
     pub fn public(&self) -> PublicKey {
         PublicKey(x25519_dalek::PublicKey::from(&self.0))

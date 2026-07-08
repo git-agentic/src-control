@@ -96,7 +96,10 @@ cargo run --bin sc -- demo --agents 4        # parallel-agent demo
 cargo run --bin sc -- demo --agents 6 --budget-mb 4 --spill   # exercise eviction
 cargo run --bin sc -- import --repo <path>   # import a Git repo's HEAD
 bash demo/run_demo.sh                         # independent zero-residue proof
-cargo run --bin sc -- keygen                 # generate an X25519 identity
+cargo run --bin sc -- keygen                 # v2 identity: one seed derives BOTH an X25519
+                                             # encryption key and an Ed25519 signing key (P22);
+                                             # a pre-P22 v1 (scl-sk-) identity still parses and
+                                             # still encrypts, but cannot sign
 cargo run --bin sc -- secret-demo            # committed-secrets authorize/deny/grant proof
 
 # Persistent repo commands (sc init creates .sc/ in the working directory):
@@ -216,6 +219,22 @@ cargo run --bin sc -- remote add <name> <url> --git   # --git also accepts netwo
 bash demo/run_network_git_demo.sh             # hosted-git round trip over file:// (P18; prints
                                               # the real-GitHub recipe: sc remote add origin
                                               # git@github.com:… --git)
+cargo run --bin sc -- commit -m "msg" --sign [--identity <key>]   # sign the new tip (P22;
+                                              # requires a v2 identity — see `sc keygen`)
+cargo run --bin sc -- amend [-m <msg>] --sign [--identity <key>]  # sign the amended tip (P22)
+cargo run --bin sc -- sign <ref> [--identity <key>]   # retroactively sign any ref's tip
+                                              # snapshot (P22; also the MVP path for signing a
+                                              # merge/pick/rebase result — re-sign after)
+cargo run --bin sc -- verify [<ref>] [--require]   # walk history (all parents, not just
+                                              # mainline), report each commit's signature
+                                              # status (trusted ✓ / untrusted ? / INVALID ✗ /
+                                              # unsigned); --require exits 1 unless every
+                                              # commit is trusted (P22)
+bash demo/run_provenance_demo.sh              # signed-history + rewrite-attack proof (P22):
+                                              # alice signs, clone verifies clean, `sc amend`
+                                              # in the clone is caught by `sc verify --require`
+                                              # while the original stays clean, bob's
+                                              # retroactive `sc sign` shows ? until trusted
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -616,6 +635,51 @@ listing loop now loads the session manifest once instead of re-parsing
 it per workspace. Every closed finding's original repro is a pinned
 regression test; the phase's demoable outcome is every existing demo
 staying green, not a new demo script. See ADR-0031.
+
+**Phase 22 is built.** Signed commits & provenance. `sc keygen` now emits a
+v2 identity: one random seed, HKDF-SHA256-derived (domain strings
+`"scl-id-v2-enc"`/`"scl-id-v2-sig"`) into an X25519 encryption key and an
+Ed25519 signing key, written as a single `scl-id-<hex>` file; a v1
+`scl-sk-` identity still parses and still encrypts, but has no signing
+half and errors clearly if asked to sign. Signatures are CAS objects
+(`TAG_SIGNATURE`, bytes-only in `crates/core` — no crypto crosses the
+quarantine) over the domain-separated snapshot id
+(`"sc-snapshot-sig-v1" || id`); a local `.sc/signatures` index maps
+snapshot → signature ids, gc-rooted and pruned alongside dead snapshots.
+Verification (`sig_status`) is strict four-state: any invalid signature
+makes the whole snapshot `Invalid` (checked first, order-independent);
+otherwise `Trusted(name)` beats `Untrusted(signer)` beats `Unsigned`.
+Surface: `sc commit --sign`/`sc amend --sign` sign the new tip inline;
+`sc sign <ref>` retroactively signs any ref's tip (the MVP path for
+signing merge/pick/rebase results — re-sign after, rather than threading
+`--sign` through every history-editing op); `sc log` renders a
+per-commit marker (`signed: name ✓` / `signed: hex… ?` / `signature
+INVALID ✗` / nothing when unsigned); `sc verify [<ref>] [--require]`
+walks every parent (not just the mainline) and `--require` exits 1 on
+anything short of fully trusted. `recipients.toml` gains `[signing]`
+(name → `scl-sig-<hex>`) and `[signers] trusted = […]`, mirroring
+`[recipients]`'s shape. Transfer needs zero wire changes — signatures
+are ordinary objects riding the existing pack; receivers run
+`index_incoming` over newly-written ids (`NotFound` there is a hard
+error, since the seam's contract is "ids `put_pack` just wrote must
+resolve"), and `sc clone` reindexes from a full post-copy object scan
+rather than depending on transfer-time bookkeeping. A review-caught
+Critical: `fetch` originally skipped resending a signature for a
+snapshot the receiver already had, so a signature added upstream
+*after* an earlier fetch never arrived on a later re-fetch — fixed by
+over-sending every indexed signature for the transfer set, deduped
+idempotently on receipt (pinned by
+`retroactive_signature_propagates_on_refetch`). Git export/push drops
+signatures (no Git-native form exists yet) and reports a
+`signatures_dropped` count. `ed25519-dalek` is the only new dependency,
+quarantined to `crates/crypto`. **Threat model, stated plainly:**
+signing defends against history rewriting in clones/remotes and
+attribution disputes; it does NOT defend against a trusted signer acting
+maliciously, code quality, or replay of a legitimately signed snapshot
+into a different branch position (a signature binds identity to a
+snapshot id, not to a branch position) — and `amend`/`rebase`/`merge`
+results start unsigned by design, since a new snapshot id is a new
+claim. See ADR-0032.
 
 Remaining follow-ons: HTTP transport, streaming (>4 GiB) frames,
 operation objects in the CAS, and oplog entries for remote-tracking refs.

@@ -136,13 +136,47 @@ impl Transport for LocalTransport {
         let mut store = self.store.borrow_mut();
         // Reachable-from-wants minus reachable-from-haves, computed on this
         // (the remote) store. `haves` the remote doesn't have are skipped.
-        let want_set = crate::reachable::reachable_objects(&mut *store, wants)?;
+        let mut want_set = crate::reachable::reachable_objects(&mut *store, wants)?;
+
         let mut have_set: BTreeSet<ObjectId> = BTreeSet::new();
         for h in haves {
             if store.contains(h) {
                 have_set.extend(crate::reachable::reachable_objects(&mut *store, &[*h])?);
             }
         }
+
+        // Sender seam (P22 Task 3, fixed after review): a SignatureObj is a
+        // leaf referenced by no tree/snapshot, so the reachability walks
+        // above never find it on their own — it has to be pulled in
+        // explicitly via the `.sc/signatures` index.
+        //
+        // The original version of this seam extended `have_set` with the
+        // signatures indexed for every *have*-reachable snapshot, on the
+        // assumption that "receiver already has the snapshot" implies
+        // "receiver already has every signature ever indexed for it". That
+        // assumption is wrong: a signature added to a snapshot AFTER the
+        // receiver's last sync (retroactive signing, ADR-0032) would then be
+        // excluded from every subsequent fetch forever, because the
+        // extension only looked at reachability, never at which exact
+        // signature ids the receiver holds. Push already gets this right
+        // (`sync.rs`'s `push` checks `transport.has_object` per exact id);
+        // `get_pack` cannot do the same because the wire has no verb for the
+        // receiver to report which signature ids it already has (a
+        // zero-wire-change constraint for this fix).
+        //
+        // So instead: include every indexed signature covering ANY snapshot
+        // in the full transfer-relevant set (want side and have side alike)
+        // in `want_set`, and do NOT add any of them to `have_set`. This
+        // deliberately over-sends — a signature the receiver already holds
+        // gets sent again — but that is cheap (signature objects are small)
+        // and harmless (the receiver's `put_pack` -> `index_incoming` is
+        // idempotent: writing an already-stored content-addressed object is
+        // a no-op, and re-indexing an already-indexed signature is a no-op
+        // too). The alternative — exact per-id have/want negotiation for
+        // signatures — would need a new wire verb.
+        let all_snaps: Vec<ObjectId> = want_set.iter().chain(have_set.iter()).copied().collect();
+        want_set.extend(crate::signatures::indexed_signature_ids_for(&self.layout, &all_snaps)?);
+
         let send: Vec<(ObjectId, Vec<u8>)> = want_set
             .into_iter()
             .filter(|id| !have_set.contains(id))
@@ -187,6 +221,11 @@ impl Transport for LocalTransport {
             }
             ids.push(id);
         }
+        // Receiver seam (P22 Task 3): every id above was just written to
+        // this store, so `index_incoming`'s "ids just written" contract
+        // holds. `sc serve --stdio` dispatches onto this same
+        // `LocalTransport`, so an ssh push indexes automatically too.
+        crate::signatures::index_incoming(&self.layout, &mut store, &ids)?;
         Ok(ids)
     }
 }

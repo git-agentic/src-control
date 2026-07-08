@@ -212,26 +212,42 @@ across every phase.
   every existing demo staying green plus the pinned regression test for
   each closed finding — a pure-hardening phase ships no new demo script.
   (ADR-0031.)
+- **Phase 22 — Signed commits & provenance.** Optional Ed25519 commit
+  signatures as content-addressed objects (`TAG_SIGNATURE = 5`, bytes-only
+  in `core`), signing the domain-separated snapshot id
+  (`"sc-snapshot-sig-v1" || id`) so snapshot ids are untouched and
+  retroactive signing is natural. A unified identity v2 (`scl-id-…`) seeds
+  both the X25519 encryption key and the Ed25519 signing key via HKDF with
+  distinct info strings; v1 `scl-sk-` files keep encrypting but cannot
+  sign. Signatures ride existing packs with ZERO wire-protocol changes
+  (senders include indexed signatures for the transfer set; receivers
+  index `TAG_SIGNATURE` arrivals and dedup idempotently — a review-caught
+  Critical fixed retroactive signatures failing to propagate on refetch),
+  a gc-rooted `.sc/signatures` index prunes signatures of dead snapshots,
+  and git export drops them with a count. `sc verify [--require]` walks
+  all parents reporting four distinct states (trusted ✓ / untrusted ? /
+  INVALID ✗ / unsigned), `sc log` renders them, and trust policy rides
+  `recipients.toml [signing]`/`[signers]`. Signatures defend against
+  history rewriting, not trusted-signer misuse or code quality. Proven by
+  `demo/run_provenance_demo.sh` (a clone-rewrite attack `sc verify`
+  catches while the original stays clean). (ADR-0032.)
 
 ## Active
 
-None — Phase 22 is next up.
+None — Phase 23 is next up.
 
-## Next horizon (P22–P24)
+## Next horizon (P23–P24)
 
 Decided 2026-07-08 (design: `docs/superpowers/specs/2026-07-08-roadmap-horizon-p21-p24-design.md`).
-Theme: complete the trust story, then invest in daily feel and scale —
-P21 closes the P16–P20 review tail before more surface accretes.
+Theme: invest in daily feel and scale once P22 closes out the trust story.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
-| **P22 — Signed commits & provenance** | Integrity attribution | sign commits; tamper with a clone's history; `sc verify` catches it; untrusted signers visibly flagged | [0032](docs/adr/0032-signed-commits-provenance.md) |
 | **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts` + `sc resolve --ours/--theirs` end-to-end on a conflicted merge | [0033](docs/adr/0033-merge-ergonomics.md) |
 | **P24 — Sparse checkouts / sub-tree sharing** | Monorepo-width working trees | work in one subtree with the rest absent from disk; commits carry absent subtrees byte-identically | [0034](docs/adr/0034-sparse-checkouts.md) |
 
-Ordering rationale: P22 before P23/P24 (provenance is the last unbuilt
-security pillar — settle it before more surface accretes); P23 before P24
-(conflict UX pays off daily and sparse users will want it too).
+Ordering rationale: P23 before P24 (conflict UX pays off daily and sparse
+users will want it too).
 
 ## Completed phases (usability-first ordering)
 
@@ -255,6 +271,7 @@ security pillar — settle it before more surface accretes); P23 before P24
 | **P19 — History-editing polish** | `sc amend`, resumable rebase, pick abort, mainline picks | `sc rebase main` stops on conflict (not aborts), `sc rebase --continue` resumes and lands in ONE oplog record; `sc cherry-pick --abort` restores byte-identical; `sc amend -m` fixes the tip message; proven by the extended `demo/run_history_demo.sh` | [0029](docs/adr/0029-history-editing-polish.md) |
 | **P20 — Agent sessions + auto-merge** | Multi-invocation agent sessions with hands-off integration | `sc ws fork --agents N`, edit across separate invocations, `sc ws harvest` auto-merges clean results cumulatively and falls back to `work-<i>` on conflict; proven by `demo/run_ws_demo.sh` | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
 | **P21 — Hardening & consolidation** | Close the P16–P20 review tail before new capability work | policy ops refuse during in-progress merge/pick/rebase; a pruned git commit behind a stale mark self-heals on push; rebase/pick aborts report the protected-skip list; `sc ws list` names an undone landing truthfully; every existing demo stays green plus new pinned regression tests | [0031](docs/adr/0031-hardening-consolidation.md) |
+| **P22 — Signed commits & provenance** | Detect history rewriting; attribute commits to an identity | `sc keygen` v2 identities (X25519 + Ed25519 from one seed), `sc commit --sign`/`sc sign <ref>`, `sc log` four-state markers, `sc verify --require`; signatures ride existing packs with zero wire changes; proven by `demo/run_provenance_demo.sh` (rewrite attack caught in a clone while the original stays clean) | [0032](docs/adr/0032-signed-commits-provenance.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

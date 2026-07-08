@@ -305,6 +305,16 @@ pub struct ExportReport {
     /// no Git-native equivalent and cannot be exported safely). Deduped by name
     /// across all snapshots.
     pub secrets_dropped: usize,
+    /// Number of P22 snapshot-signature objects dropped from history (Git has
+    /// no native equivalent for a detached signature over an sc snapshot id,
+    /// and re-signing the synthesized Git commit would be a different,
+    /// unverifiable claim — so signatures are silently absent from the
+    /// exported Git history, counted here like `secrets_dropped`). Counts
+    /// every `Object::Signature` in the store whose `snapshot` field is one
+    /// of the exported DAG's snapshot ids — not deduped by signer, since
+    /// (unlike secret names) two signers signing the same snapshot are two
+    /// genuinely distinct dropped signatures, not the same one repeated.
+    pub signatures_dropped: usize,
     /// Commits written *this call* as `(git_oid_hex, sc_id)`, for the caller to
     /// persist into the marks map. Excludes reused (already-known) commits.
     pub new_marks: Vec<(String, ObjectId)>,
@@ -321,7 +331,16 @@ pub struct ExportReport {
 /// Secret names are deduped across snapshots (the same name in N commits counts
 /// once) so `secrets_dropped` in the report reflects unique names, not
 /// per-snapshot occurrences.
-fn scan_encrypted(store: &mut Store, tip: ObjectId) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+///
+/// Also returns every snapshot id visited — the caller uses it to count P22
+/// signature objects covering this DAG (see `count_signatures`): a
+/// `SignatureObj` is a leaf referenced by no tree/snapshot, so it can't be
+/// discovered by this walk itself, only cross-referenced against the
+/// snapshot ids the walk found.
+fn scan_encrypted(
+    store: &mut Store,
+    tip: ObjectId,
+) -> anyhow::Result<(Vec<String>, Vec<String>, std::collections::HashSet<ObjectId>)> {
     let mut protected_paths = Vec::new();
     let mut secret_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut seen_snaps: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
@@ -339,7 +358,31 @@ fn scan_encrypted(store: &mut Store, tip: ObjectId) -> anyhow::Result<(Vec<Strin
             snaps.push(*p);
         }
     }
-    Ok((protected_paths, secret_names.into_iter().collect()))
+    Ok((protected_paths, secret_names.into_iter().collect(), seen_snaps))
+}
+
+/// Count P22 `Object::Signature` objects covering any snapshot in
+/// `seen_snaps` (the exported DAG). Not a reachability walk — a signature is
+/// referenced by no tree/parent, so this scans every object the store can
+/// resolve (`Store::all_ids`, loose + packed) and filters by kind + snapshot
+/// membership. `crates/gitio` has no dependency on `crates/repo` (the
+/// dependency rule is `repo -> gitio`, not the reverse) and so cannot read
+/// the repo-side `.sc/signatures` index directly — this is the CAS-only
+/// substitute, giving the same answer because every indexed signature is
+/// also a store object with a `snapshot` field naming what it covers.
+fn count_signatures(
+    store: &mut Store,
+    seen_snaps: &std::collections::HashSet<ObjectId>,
+) -> anyhow::Result<usize> {
+    let mut count = 0;
+    for id in store.all_ids()? {
+        if let Object::Signature(sig) = store.get(&id)? {
+            if seen_snaps.contains(&sig.snapshot) {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// Record PROTECTED entry paths under `prefix`, recursing into subtrees. Uses an
@@ -376,7 +419,7 @@ fn scan_tree(store: &mut Store, root: ObjectId, prefix: String, out: &mut Vec<St
 /// ciphertext and secrets are dropped (counted in the report).
 pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> anyhow::Result<ExportReport> {
     // Fail closed BEFORE creating or writing anything.
-    let (protected_paths, secret_names) = scan_encrypted(store, tip)?;
+    let (protected_paths, secret_names, seen_snaps) = scan_encrypted(store, tip)?;
     if !opts.include_encrypted && (!protected_paths.is_empty() || !secret_names.is_empty()) {
         anyhow::bail!(
             "refusing to export encrypted content without --include-encrypted:\n  protected paths: {:?}\n  secrets: {:?}",
@@ -384,6 +427,10 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
         );
     }
     let secrets_dropped = secret_names.len();
+    // Signatures have no fail-closed gate (unlike protected content/secrets,
+    // a dropped signature is a provenance-completeness loss, not a
+    // confidentiality one) — always counted, exported or not.
+    let signatures_dropped = count_signatures(store, &seen_snaps)?;
 
     let target = GitTarget::open_or_init_bare(opts.to)?;
 
@@ -449,6 +496,7 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
         commits_written: commit_memo.len(),
         protected_blobs_as_ciphertext: protected,
         secrets_dropped,
+        signatures_dropped,
         new_marks,
         stale_marks,
     })
@@ -795,6 +843,35 @@ mod tests {
 
         std::fs::remove_dir_all(&gsrc).unwrap();
         std::fs::remove_dir_all(&dst).unwrap();
+    }
+
+    #[test]
+    fn export_drops_signatures_with_count() {
+        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot, SignatureObj};
+        use std::collections::BTreeMap;
+
+        let mut store = Store::new(StoreConfig::default());
+        let b = store.put(Object::blob(b"x".to_vec())).unwrap();
+        let root = store.put(Object::Tree(Tree::new(vec![
+            TreeEntry { name: "a".into(), kind: EntryKind::Blob, id: b, mode: FileMode::FILE, perms: 0 },
+        ]))).unwrap();
+        let snap = store.put(Object::Snapshot(Snapshot {
+            root, parents: vec![], author: "t".into(), timestamp: 1, message: "m".into(),
+            secrets: BTreeMap::new(), protection: Default::default(),
+        })).unwrap();
+        // A signature object over `snap`, no fail-closed gate over it (unlike
+        // protected content/secrets) — bytes don't need to be a real Ed25519
+        // signature for this test since export never verifies them.
+        store.put(Object::Signature(SignatureObj { snapshot: snap, signer: [1u8; 32], sig: [2u8; 64] })).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("scl-sigdrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let empty = std::collections::HashMap::new();
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
+        let report = export_branch(&mut store, snap, &opts).unwrap();
+        assert_eq!(report.signatures_dropped, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

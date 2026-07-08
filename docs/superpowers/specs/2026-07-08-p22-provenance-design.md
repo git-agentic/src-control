@@ -61,7 +61,11 @@ untouched; retroactive signing of any historical commit is natural.
 - `sc commit --sign` / `sc amend --sign` — sign the new tip with the
   identity from the usual resolution chain (flag, `SC_IDENTITY`,
   default path); errors clearly on a v1 (signing-incapable) identity.
-- `sc sign <ref> [--identity <key>]` — retroactively sign any commit.
+- `sc sign <ref> [--identity <key>]` — retroactively sign a ref's tip.
+  [As shipped (P22): `<ref>` resolves via `refs::resolve_tip` — a branch
+  or remote-tracking name, not an arbitrary historical commit id. Signing
+  a mid-history commit means checking it out (or a branch pointing at it)
+  first; a resolve-a-bare-commit-id surface is a deferred follow-on.]
   This is also the MVP answer for merge/pick/rebase results: re-sign
   after, instead of threading `--sign` through every operation.
 - `sc log` — per-commit marker: `signed: <name> ✓` (trusted),
