@@ -185,6 +185,7 @@ impl Repo {
             decided_root,
             pick_registry_base,
             None,
+            &self.sparse_spec()?,
             author,
             message,
         )
@@ -224,6 +225,20 @@ impl Repo {
     /// the TIP's OWN parents instead of `[tip]`, replacing rather than
     /// extending history. Every other caller passes `None`, keeping the
     /// original `tip` (+ `merge_head`) derivation.
+    /// `sparse` (P24 final-review fix, Critical 1 / Important 1) is the
+    /// carry predicate's sparse view, now an explicit input instead of an
+    /// ambient `self.sparse_spec()?` read: the host-repo callers (`commit`,
+    /// `amend`, `assemble_completion_snapshot`) pass the live host spec —
+    /// correct there, since the working tree they read reflects it — but
+    /// `sc ws harvest` must pass the WORKSPACE'S OWN fork-time spec (the
+    /// checkout was materialized under it, possibly a spec ago) and `sc
+    /// work` must pass `Sparse::default()` (its checkouts are always full,
+    /// so a genuine out-of-sparse deletion must land, not be carried as if
+    /// merely unmaterialized). Reading the host's live spec ambiently here
+    /// previously conflated "the view this working tree was actually given"
+    /// with "the view the host repo happens to have right now" — the two
+    /// diverge exactly when a `sc ws` session outlives a `sparse set/disable`
+    /// on the host, or when the caller is `sc work` at all.
     pub(crate) fn snapshot_files(
         &self,
         files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
@@ -233,6 +248,7 @@ impl Repo {
         decided_root: Option<ObjectId>,
         pick_registry_base: Option<ObjectId>,
         parents_override: Option<Vec<ObjectId>>,
+        sparse: &crate::sparse::Sparse,
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
@@ -362,6 +378,21 @@ impl Repo {
         //    kept is in the decided tree — a protected path in the picked
         //    commit but absent from the decided tree was decided *deleted*
         //    and must not resurrect.
+        //
+        // P24 Task 2 widening: the same "commit cannot tell absent-because-
+        // skipped from absent-because-deleted" ambiguity applies to sparse
+        // checkouts once Task 3 stops materializing out-of-sparse paths — an
+        // absent path outside the sparse set reads as clean exactly like an
+        // absent protected path does today. So an absent HEAD-tracked path is
+        // now carried iff it is still-protected-and-not-a-recipient (as
+        // before) OR it falls outside the current sparse spec
+        // (`!sparse.matches(path)`); when neither holds, absence is a genuine
+        // deletion. `sparse` is the caller-supplied spec (see the doc comment
+        // on `snapshot_files` for why it must not be read ambiently here), so
+        // every path in the loop below is checked against the same spec.
+        // This landing is dormant when `sparse` is full: with no narrowing in
+        // effect every path matches and the OR term is always false —
+        // behavior is unchanged from P15 for a full checkout.
         {
             let mut on_disk: std::collections::BTreeSet<String> =
                 all.iter().map(|(p, _, _, _)| p.clone()).collect();
@@ -387,17 +418,25 @@ impl Repo {
 
             for entries in sources {
                 for (path, (blob_id, mode, perms)) in entries {
-                    if perms & scl_core::PROTECTED == 0
-                        || crate::protect::matching_prefix(&protection, &path).is_none()
-                        || on_disk.contains(&path)
-                    {
+                    if on_disk.contains(&path) {
+                        continue;
+                    }
+                    let still_protected = perms & scl_core::PROTECTED != 0
+                        && crate::protect::matching_prefix(&protection, &path).is_some();
+                    let out_of_sparse = !sparse.matches(&path);
+                    if !still_protected && !out_of_sparse {
                         continue;
                     }
                     let bytes = match store.get(&blob_id)? {
                         Object::Blob(b) => b.to_vec(),
                         _ => continue,
                     };
-                    all.push((path.clone(), bytes, mode, scl_core::PROTECTED));
+                    // Carry the SOURCE's own perms bit unchanged (was
+                    // hardcoded to `scl_core::PROTECTED` before this
+                    // widening, which was safe when only protected paths
+                    // could reach this arm; a carried plain out-of-sparse
+                    // path must land plain, not acquire PROTECTED).
+                    all.push((path.clone(), bytes, mode, perms));
                     on_disk.insert(path);
                     // Preserve this blob's wraps. Carried-forward blobs are absent
                     // from `fresh_wrapped` (they never hit the on-disk encrypt loop),
@@ -502,6 +541,7 @@ impl Repo {
                     decided_root,
                     pick_registry_base,
                     None,
+                    &self.sparse_spec()?,
                     author,
                     message,
                 )?
@@ -570,6 +610,7 @@ impl Repo {
             None,
             None,
             Some(tip_snap.parents.clone()),
+            &self.sparse_spec()?,
             author,
             &msg,
         )?;
@@ -663,7 +704,7 @@ impl Repo {
         };
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
-        worktree::diff_worktree(&self.layout, &mut store, head_root, &protection)
+        worktree::diff_worktree(&self.layout, &mut store, head_root, &protection, &self.sparse_spec()?)
     }
 
     /// Line-level unified diff of the working tree against HEAD (`sc diff`).
@@ -673,9 +714,14 @@ impl Repo {
     /// the same rules as [`Repo::status`]: absent-on-disk is clean (skipped
     /// checkout, not a deletion), an on-disk edit is detected by convergent
     /// re-encryption — but the content is never shown (it would be ciphertext
-    /// vs plaintext noise at best, a leak at worst).
+    /// vs plaintext noise at best, a leak at worst). A HEAD path outside the
+    /// sparse spec is absent on disk by design (see `materialize`), so it
+    /// gets the same "absent is clean, not a deletion" treatment — otherwise
+    /// `sc diff` right after `sc sparse set` would render the whole
+    /// out-of-sparse subtree as deleted.
     pub fn diff_unified(&self) -> Result<String> {
         use scl_core::PROTECTED;
+        let sparse = self.sparse_spec()?;
         let head_root = self.head_tip()?.map(|t| self.snapshot(&t)).transpose()?.map(|s| s.root);
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
@@ -713,6 +759,10 @@ impl Repo {
                     }
                 }
                 Some((blob_id, _mode, _perms)) => {
+                    if disk.is_none() && !sparse.matches(path) {
+                        // Out-of-sparse: expected-absent, not a deletion.
+                        continue;
+                    }
                     let old = match store.get(blob_id)? {
                         Object::Blob(b) => b,
                         _ => continue,
@@ -856,6 +906,7 @@ impl Repo {
                     None,
                     &theirs_protection,
                     identity,
+                    &self.sparse_spec()?,
                 )?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
@@ -890,6 +941,7 @@ impl Repo {
                     Some(ours_root),
                     &theirs_protection,
                     identity,
+                    &self.sparse_spec()?,
                 )?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
@@ -986,6 +1038,7 @@ impl Repo {
                 &conflict_prot,
                 ours_root,
                 identity,
+                &merge_result.conflicts,
             )?;
             // Conflict markers are on disk; record merge state last (its
             // MERGE_HEAD write is the in-progress signal). A crash in this
@@ -1053,6 +1106,7 @@ impl Repo {
                 Some(ours_root),
                 &merged_protection,
                 identity,
+                &self.sparse_spec()?,
             )?
         };
 
@@ -1098,6 +1152,19 @@ impl Repo {
     /// this write sequence — genuinely identical across all three — is
     /// extracted. Returns the CAS `conflict_root` so the caller can persist
     /// it as decided-root state.
+    ///
+    /// `conflicted_paths` (P24 Task 4) is the operation's own conflict list —
+    /// NOT `carried`/`to_encrypt`'s path sets, which also include stable
+    /// carried survivors that never needed a marker. Before any marker or
+    /// sidecar is written, every conflicted path is checked against the
+    /// repo's sparse spec: a conflict outside the sparse view can't be shown
+    /// to the user (there's nowhere on disk to put the markers without
+    /// silently materializing a path they asked to exclude), so this refuses
+    /// up front with a widen hint, before `carried` is even written to the
+    /// CAS — no out-of-sparse marker is ever written, not even transiently.
+    /// A CLEAN out-of-sparse change never reaches here at all: it resolves
+    /// on tree ids inside `three_way`/replay and lands via the ordinary
+    /// materialize skip-write path (P24 Task 3), no markers involved.
     pub(crate) fn materialize_conflict_state(
         &self,
         carried: &[(String, Vec<u8>, scl_core::FileMode, u8)],
@@ -1106,7 +1173,21 @@ impl Repo {
         conflict_prot: &scl_core::Protection,
         old_root: ObjectId,
         identity: Option<&scl_crypto::SecretKey>,
+        conflicted_paths: &[String],
     ) -> Result<ObjectId> {
+        let sparse = self.sparse_spec()?;
+        let needs_widen: Vec<&String> =
+            conflicted_paths.iter().filter(|p| !sparse.matches(p)).collect();
+        if !needs_widen.is_empty() {
+            let names = needs_widen
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::InvalidArgument(format!(
+                "conflict in {names} is outside your sparse checkout; run `sc sparse set` to include it, then retry"
+            )));
+        }
         let conflict_root = self.vfs.write_tree_with_perms(carried)?;
         {
             let store_arc = self.vfs.store();
@@ -1123,6 +1204,7 @@ impl Repo {
                 Some(old_root),
                 conflict_prot,
                 identity,
+                &self.sparse_spec()?,
             )?;
         }
         for (path, bytes, _mode, _recipients) in to_encrypt {
@@ -1179,6 +1261,7 @@ impl Repo {
                 Some(theirs_root),
                 &ours_protection,
                 None,
+                &self.sparse_spec()?,
             )?;
         }
         crate::merge_state::clear(&self.layout)?;
@@ -1294,6 +1377,7 @@ impl Repo {
                 old_root,
                 &target_protection,
                 identity,
+                &self.sparse_spec()?,
             )?
         };
         refs::write_head(&self.layout, name)?;
@@ -3384,6 +3468,274 @@ mod tests {
     }
 
     #[test]
+    fn commit_carries_out_of_sparse_absent_path_verbatim() {
+        // P24 Task 2: an absent path outside the sparse set is carried
+        // forward byte-identical, exactly like an absent still-protected
+        // path — simulated here by writing the spec directly and deleting
+        // the out-of-sparse file (Task 3's materialize filtering doesn't
+        // exist yet, so nothing does this automatically today).
+        let root = tmp_root("sparse-carry-out");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b v1").unwrap();
+        let c1 = repo.commit("me", "base").unwrap();
+
+        // Capture docs/b.txt's blob id and perms from the base commit.
+        let snap1 = repo.snapshot(&c1).unwrap();
+        let blob1_base = {
+            let entries = {
+                let a = repo.vfs_handle().store();
+                let mut s = a.lock().unwrap();
+                worktree::tree_file_entries_with_perms(&mut s, snap1.root).unwrap()
+            };
+            let (id, _mode, perms) = entries.get("docs/b.txt").copied().unwrap();
+            assert_eq!(perms & scl_core::PROTECTED, 0, "docs/b.txt must be plain (PROTECTED) in base");
+            id
+        };
+
+        crate::sparse::store(repo.layout(), &crate::sparse::Sparse::new(vec!["src/".into()]))
+            .unwrap();
+        std::fs::remove_file(root.join("docs/b.txt")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a v2").unwrap();
+        let c2 = repo.commit("me", "edit in-sparse").unwrap();
+
+        let snap2 = repo.snapshot(&c2).unwrap();
+        let entries = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
+        };
+        assert!(entries.contains_key("docs/b.txt"), "out-of-sparse absent path must be carried");
+        let (blob1_carried, _mode, perms_carried) = entries.get("docs/b.txt").copied().unwrap();
+        assert_eq!(blob1_carried, blob1_base, "carried blob id must match base commit byte-identically");
+        assert_eq!(perms_carried & scl_core::PROTECTED, 0, "carried plain file must not acquire PROTECTED");
+        let a_bytes = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            match s.get(&entries["src/a.txt"].0).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("expected blob"),
+            }
+        };
+        assert_eq!(a_bytes, b"a v2", "in-sparse edit must land");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commit_treats_in_sparse_absent_path_as_deletion() {
+        // Absence INSIDE the sparse set is a genuine deletion — the widening
+        // must not carry paths the sparse spec says should be materialized.
+        let root = tmp_root("sparse-carry-in-del");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        crate::sparse::store(repo.layout(), &crate::sparse::Sparse::new(vec!["src/".into()]))
+            .unwrap();
+        std::fs::remove_file(root.join("src/a.txt")).unwrap();
+        let c2 = repo.commit("me", "delete in-sparse file").unwrap();
+
+        let snap2 = repo.snapshot(&c2).unwrap();
+        let entries = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
+        };
+        assert!(!entries.contains_key("src/a.txt"), "in-sparse absence must be a real deletion");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn carry_composes_protected_and_sparse() {
+        // Both carry reasons compose independently: a protected path outside
+        // the sparse set, absent for a non-recipient, is carried (both
+        // reasons apply); a protected path INSIDE the sparse set, absent for
+        // a non-recipient, is still carried (protected reason alone, P15
+        // behavior unchanged by this widening).
+        let root = tmp_root("sparse-carry-compose");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mallory_sk, _mallory_pk) = scl_crypto::generate_keypair();
+
+        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        repo.branch("other").unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        std::fs::write(root.join("secret/in_sparse.txt"), b"hunter3").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
+        let c1 = repo.commit("me", "add secrets").unwrap();
+
+        let snap1 = repo.snapshot(&c1).unwrap();
+        let (blob_out, blob_in) = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut s, snap1.root).unwrap();
+            (entries["secret/db.txt"].0, entries["secret/in_sparse.txt"].0)
+        };
+
+        // Sparse set covers `src/` and `secret/in_sparse.txt` only —
+        // `secret/db.txt` is outside the sparse set.
+        crate::sparse::store(
+            repo.layout(),
+            &crate::sparse::Sparse::new(vec!["src/".into(), "secret/in_sparse.txt".into()]),
+        )
+        .unwrap();
+
+        // As mallory (non-recipient): switch away and back so both protected
+        // files are skipped/absent, then commit something unrelated.
+        repo.switch_with_identity("other", Some(&mallory_sk)).unwrap();
+        repo.switch_with_identity("main", Some(&mallory_sk)).unwrap();
+        assert!(!root.join("secret/db.txt").exists());
+        assert!(!root.join("secret/in_sparse.txt").exists());
+        std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+        let c2 = repo.commit("mallory", "unrelated").unwrap();
+
+        let snap2 = repo.snapshot(&c2).unwrap();
+        let entries2 = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
+        };
+        assert_eq!(
+            entries2.get("secret/db.txt").map(|(id, _, _)| *id),
+            Some(blob_out),
+            "protected + out-of-sparse must carry"
+        );
+        assert_eq!(
+            entries2.get("secret/in_sparse.txt").map(|(id, _, _)| *id),
+            Some(blob_in),
+            "protected + in-sparse must still carry (P15 behavior unchanged)"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn no_sparse_spec_behaves_exactly_as_before() {
+        // Regression guard: with no sparse spec (the full-checkout default),
+        // deleting a plain tracked file is a genuine deletion — the widening
+        // must be a total no-op when sparse is off.
+        let root = tmp_root("sparse-carry-noop");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"a v1").unwrap();
+        std::fs::write(root.join("b.txt"), b"b v1").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        std::fs::remove_file(root.join("b.txt")).unwrap();
+        let c2 = repo.commit("me", "delete b").unwrap();
+
+        let snap2 = repo.snapshot(&c2).unwrap();
+        let entries = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
+        };
+        assert!(!entries.contains_key("b.txt"), "deletion with no sparse spec must not be carried");
+        assert!(entries.contains_key("a.txt"));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_clean_out_of_sparse_change_lands() {
+        // P24 Task 4: a CLEAN merge touching only an out-of-sparse path never
+        // materializes it (resolves on tree ids, P15's fast path) but still
+        // lands the change in the CAS/snapshot.
+        let root = tmp_root("sparse-clean-merge");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
+        std::fs::write(root.join("docs/x"), b"doc v1").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        assert!(!root.join("docs/x").exists(), "docs/x must not be materialized once sparse");
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("docs/x"), b"doc v2").unwrap();
+        repo.commit("me", "edit docs/x on feature").unwrap();
+        repo.switch("main").unwrap();
+
+        let (id, _skipped) = repo.merge_with_identity("feature", "me", None).unwrap();
+        assert!(
+            !root.join("docs/x").exists(),
+            "clean out-of-sparse merge must not materialize the file"
+        );
+        let snap = repo.snapshot(&id).unwrap();
+        let entries = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap()
+        };
+        let blob = entries.get("docs/x").map(|(id, _, _)| *id).unwrap();
+        let bytes = {
+            let a = repo.vfs_handle().store();
+            let mut s = a.lock().unwrap();
+            match s.get(&blob).unwrap() {
+                scl_core::Object::Blob(b) => b,
+                _ => panic!("expected blob"),
+            }
+        };
+        assert_eq!(&*bytes, b"doc v2", "merged content must land in the CAS");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_conflict_out_of_sparse_reports_widen_hint() {
+        // P24 Task 4: a CONFLICTED merge on an out-of-sparse path must not
+        // write markers to disk — it refuses up front with a widen hint.
+        let root = tmp_root("sparse-conflict-merge");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
+        std::fs::write(root.join("docs/x"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("docs/x"), b"ours\n").unwrap();
+        repo.commit("me", "ours edits docs/x").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("docs/x"), b"theirs\n").unwrap();
+        repo.commit("me", "theirs edits docs/x").unwrap();
+        repo.switch("main").unwrap();
+
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        assert!(!root.join("docs/x").exists());
+
+        let err = repo.merge_with_identity("feature", "me", None).unwrap_err();
+        match err {
+            Error::InvalidArgument(msg) => {
+                assert!(msg.contains("docs/x"), "message must name the path: {msg}");
+                assert!(
+                    msg.contains("sc sparse set"),
+                    "message must suggest widening the sparse set: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument widen hint, got {other:?}"),
+        }
+        assert!(!root.join("docs/x").exists(), "no marker may land outside the sparse view");
+        assert!(!repo.merge_in_progress(), "the refused merge must not start an in-progress merge");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn push_creates_a_new_remote_branch() {
         let a = tmp_root("push-newbr-remote");
         {
@@ -4185,6 +4537,188 @@ mod tests {
             crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "keys/a.txt")
                 .unwrap();
         assert_eq!(&pt[..], b"rotated-secret-key");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn set_sparse_materializes_only_the_subset() {
+        let root = tmp_root("sparse-set");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+
+        assert!(root.join("src/a.txt").exists(), "in-sparse file must stay materialized");
+        assert!(!root.join("docs/b.txt").exists(), "out-of-sparse file must be pruned from disk");
+        assert!(repo.layout().sparse_path().exists(), "sparse spec must persist");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn disable_sparse_rematerializes_fully() {
+        let root = tmp_root("sparse-disable");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        assert!(!root.join("docs/b.txt").exists());
+
+        repo.disable_sparse(None).unwrap();
+
+        assert!(root.join("src/a.txt").exists());
+        assert!(root.join("docs/b.txt").exists(), "disable must restore the full tree");
+        assert!(!repo.layout().sparse_path().exists(), "sparse spec must be cleared");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn switch_honors_persisted_sparse() {
+        let root = tmp_root("sparse-switch");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        assert!(!root.join("docs/b.txt").exists());
+
+        repo.branch("other").unwrap();
+        repo.switch("other").unwrap();
+        assert!(root.join("src/a.txt").exists());
+        assert!(!root.join("docs/b.txt").exists(), "spec persists across switch away");
+
+        repo.switch("main").unwrap();
+        assert!(root.join("src/a.txt").exists());
+        assert!(!root.join("docs/b.txt").exists(), "spec persists across switch back");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sparse_roundtrip_commit_then_full_clone_sees_all() {
+        let root = tmp_root("sparse-roundtrip");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"original").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        assert!(!root.join("docs/b.txt").exists());
+
+        // Edit an in-sparse file and commit while sparse (docs/b.txt is
+        // carried verbatim by the P24 Task 2 carry generalization).
+        std::fs::write(root.join("src/a.txt"), b"edited").unwrap();
+        repo.commit("me", "edit under sparse").unwrap();
+
+        // A full checkout (disable) must see the out-of-sparse subtree
+        // byte-identical to what was last on disk before sparse narrowed it.
+        repo.disable_sparse(None).unwrap();
+        assert!(root.join("docs/b.txt").exists());
+        assert_eq!(std::fs::read(root.join("docs/b.txt")).unwrap(), b"original");
+        assert_eq!(std::fs::read(root.join("src/a.txt")).unwrap(), b"edited");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sparse_out_of_view_file_is_clean_not_deleted_in_status_and_diff() {
+        // Regression coverage for the gap the advisor caught: diff_unified is
+        // an independent HEAD-vs-disk reader from diff_worktree/status, and
+        // must not report an out-of-sparse path as a deletion either.
+        let root = tmp_root("sparse-diff");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        assert!(!root.join("docs/b.txt").exists());
+
+        let st = repo.status().unwrap();
+        assert!(st.deleted.is_empty(), "out-of-sparse path must not read as deleted: {:?}", st);
+
+        let diff = repo.diff_unified().unwrap();
+        assert!(!diff.contains("docs/b.txt"), "sc diff must not show the out-of-sparse path: {diff}");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn status_shows_sparse_spec() {
+        // P24 Task 4: `sc status` (`run_status` in the CLI) reuses
+        // `Repo::sparse_spec()` to print the active prefixes; this pins the
+        // accessor contract the CLI line depends on. The absent out-of-sparse
+        // subtree must not be listed as a deletion (Task 3's status fix,
+        // reconfirmed here alongside the accessor).
+        let root = tmp_root("sparse-status-line");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        // No sparse spec: the accessor reports empty (full checkout).
+        assert!(repo.sparse_spec().unwrap().prefixes().is_empty());
+
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        assert_eq!(repo.sparse_spec().unwrap().prefixes(), &["src/".to_string()]);
+
+        let st = repo.status().unwrap();
+        assert!(
+            st.deleted.is_empty(),
+            "absent out-of-sparse subtree must not be listed as a deletion: {st:?}"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn set_sparse_and_disable_sparse_refuse_a_dirty_working_tree() {
+        let root = tmp_root("sparse-dirty-guard");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        // Uncommitted edit to a tracked file must block set_sparse...
+        std::fs::write(root.join("src/a.txt"), b"dirty edit").unwrap();
+        assert!(matches!(
+            repo.set_sparse(&["src/".to_string()], None),
+            Err(Error::InvalidArgument(_))
+        ));
+        // ...and it must not have persisted the spec or touched the file.
+        assert!(!repo.layout().sparse_path().exists());
+        assert_eq!(std::fs::read(root.join("src/a.txt")).unwrap(), b"dirty edit");
+
+        // Clean up the dirty state, set sparse, then dirty again to check disable_sparse.
+        repo.commit("me", "commit the edit").unwrap();
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"dirty again").unwrap();
+        assert!(matches!(repo.disable_sparse(None), Err(Error::InvalidArgument(_))));
+        assert!(repo.layout().sparse_path().exists(), "disable must not have cleared the spec");
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();

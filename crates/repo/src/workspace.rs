@@ -28,18 +28,27 @@ pub enum HarvestResult {
 /// Materialize the snapshot at `tip` into `dir` (created if absent), applying
 /// the same P7 protected-path rules as `sc switch`: decrypt with `identity`
 /// when possible, otherwise skip. Returns the skipped protected paths.
+///
+/// `sparse` (P24 Task 4) is caller-chosen, not implicit: `sc work` (P13,
+/// one-shot ephemeral agents) always passes `Sparse::default()` — an agent
+/// needs the complete tree to operate correctly, and silently narrowing what
+/// it sees to the primary repo's sparse view would be a surprising,
+/// unrequested behavior change. `sc ws fork` (P20, durable sessions) passes
+/// the host repo's own `sparse_spec()` — a durable workspace is closer to a
+/// second working tree for the same repo, so it inherits the same view.
 pub(crate) fn materialize_workspace(
     repo: &Repo,
     tip: ObjectId,
     dir: &Path,
     identity: Option<&scl_crypto::SecretKey>,
+    sparse: &crate::sparse::Sparse,
 ) -> Result<Vec<String>> {
     std::fs::create_dir_all(dir)?;
     let snap = repo.snapshot(&tip)?;
     let ws = Layout::at(dir);
     let store_arc = repo.vfs().store();
     let mut store = store_arc.lock().unwrap();
-    worktree::materialize(&ws, &mut store, snap.root, None, &snap.protection, identity)
+    worktree::materialize(&ws, &mut store, snap.root, None, &snap.protection, identity, sparse)
 }
 
 /// Diff the checkout at `dir` against the base snapshot `tip`; if changed,
@@ -53,6 +62,7 @@ pub(crate) fn harvest_workspace(
     branch: &str,
     author: &str,
     message: &str,
+    sparse: &crate::sparse::Sparse,
 ) -> Result<HarvestResult> {
     let snap = repo.snapshot(&tip)?;
     let ws = Layout::at(dir);
@@ -61,14 +71,19 @@ pub(crate) fn harvest_workspace(
         let mut store = store_arc.lock().unwrap();
         let tracked: std::collections::BTreeSet<String> =
             worktree::tree_file_ids(&mut store, snap.root)?.into_keys().collect();
-        let d = worktree::diff_worktree(&ws, &mut store, Some(snap.root), &snap.protection)?;
+        let d = worktree::diff_worktree(&ws, &mut store, Some(snap.root), &snap.protection, sparse)?;
         (tracked, !(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
     };
     if !changed {
         return Ok(HarvestResult::Unchanged);
     }
     let files = worktree::read_worktree(&ws, &tracked)?;
-    match repo.snapshot_files(files, Some(tip), None, None, None, None, None, author, message) {
+    // The same `sparse` the caller used for the diff above is threaded into
+    // the commit carry (P24 final-review fix): the workspace's view was
+    // fixed at materialize time (or, for `sc work`, is always full), so the
+    // carry predicate must see that same view, not the host repo's current
+    // `.sc/sparse` — see `snapshot_files`'s doc comment.
+    match repo.snapshot_files(files, Some(tip), None, None, None, None, None, sparse, author, message) {
         Ok(id) => {
             refs::write_branch_tip(repo.layout(), branch, &id)?;
             Ok(HarvestResult::Committed(id))
@@ -214,7 +229,13 @@ impl Repo {
         let mut dirs = Vec::with_capacity(labels.len());
         for label in &labels {
             let dir = session_root.join(label);
-            let skipped = materialize_workspace(self, tip, &dir, opts.identity.as_ref())?;
+            let skipped = materialize_workspace(
+                self,
+                tip,
+                &dir,
+                opts.identity.as_ref(),
+                &crate::sparse::Sparse::default(),
+            )?;
             for path in &skipped {
                 eprintln!("workspace {label}: skipped (no key): {path}");
             }
@@ -244,7 +265,15 @@ impl Repo {
                     None
                 }
             };
-            let harvest = harvest_workspace(self, tip, &dir, &label, &opts.author, &message);
+            let harvest = harvest_workspace(
+                self,
+                tip,
+                &dir,
+                &label,
+                &opts.author,
+                &message,
+                &crate::sparse::Sparse::default(),
+            );
             outcomes.push(WorkspaceOutcome { label, agent_exit, harvest });
         }
 
@@ -304,12 +333,21 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        let skipped = materialize_workspace(&repo, tip, &dir, None).unwrap();
+        let skipped = materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default()).unwrap();
         assert!(skipped.is_empty());
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "base\n");
 
         std::fs::write(dir.join("a.txt"), "edited\n").unwrap();
-        let res = harvest_workspace(&repo, tip, &dir, "work-1", "test", "msg").unwrap();
+        let res = harvest_workspace(
+            &repo,
+            tip,
+            &dir,
+            "work-1",
+            "test",
+            "msg",
+            &crate::sparse::Sparse::default(),
+        )
+        .unwrap();
         let id = match res {
             HarvestResult::Committed(id) => id,
             other => panic!("expected Committed, got {other:?}"),
@@ -328,8 +366,17 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        materialize_workspace(&repo, tip, &dir, None).unwrap();
-        let res = harvest_workspace(&repo, tip, &dir, "work-1", "test", "msg").unwrap();
+        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default()).unwrap();
+        let res = harvest_workspace(
+            &repo,
+            tip,
+            &dir,
+            "work-1",
+            "test",
+            "msg",
+            &crate::sparse::Sparse::default(),
+        )
+        .unwrap();
         assert!(matches!(res, HarvestResult::Unchanged));
         assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
         drop(repo);
@@ -342,10 +389,19 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        materialize_workspace(&repo, tip, &dir, None).unwrap();
+        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default()).unwrap();
         // An AWS-style key id trips the P5 pattern rules.
         std::fs::write(dir.join("leak.txt"), "AKIAIOSFODNN7EXAMPLE\n").unwrap();
-        let res = harvest_workspace(&repo, tip, &dir, "work-1", "test", "msg").unwrap();
+        let res = harvest_workspace(
+            &repo,
+            tip,
+            &dir,
+            "work-1",
+            "test",
+            "msg",
+            &crate::sparse::Sparse::default(),
+        )
+        .unwrap();
         assert!(matches!(res, HarvestResult::Rejected(_)));
         assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
         drop(repo);
@@ -363,6 +419,48 @@ mod tests {
             with_secrets: false,
             session_root: Some(scratch.join("session")),
         }
+    }
+
+    #[test]
+    fn sc_work_full_agent_deletion_survives_host_sparse() {
+        // P24 final-review fix, Important 1: `sc work` agents always get a
+        // FULL checkout (`Sparse::default()`), regardless of the host repo's
+        // own sparse spec. A genuine deletion of an out-of-host-sparse path
+        // by such an agent must land as a real deletion, not be silently
+        // reverted because harvest read the host's narrow spec.
+        let (root, scratch) = setup("full-agent-deletion");
+        let repo = Repo::open(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("docs/x.txt"), "doc\n").unwrap();
+        repo.commit("test", "add src+docs").unwrap();
+
+        // Host narrows to src/ — docs/x.txt leaves the host's own disk, but
+        // `sc work` agents still get the full tree (contract preserved).
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        assert!(!root.join("docs/x.txt").exists());
+
+        let opts = work_opts(1, &["sh", "-c", "rm docs/x.txt"], &scratch);
+        let outcomes = repo.work(opts).unwrap();
+        let id = match outcomes[0].harvest.as_ref().unwrap() {
+            HarvestResult::Committed(id) => *id,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+
+        let snap = repo.snapshot(&id).unwrap();
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let ids = crate::worktree::tree_file_ids(&mut store, snap.root).unwrap();
+        assert!(
+            !ids.contains_key("docs/x.txt"),
+            "the agent's genuine deletion of an out-of-host-sparse file must land, \
+             not be silently reverted by the host's narrow spec"
+        );
+        assert!(ids.contains_key("src/a.txt"), "untouched in-sparse file still present");
+        drop(store);
+        drop(repo);
+        teardown(&root);
     }
 
     #[test]

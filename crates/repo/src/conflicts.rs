@@ -195,6 +195,16 @@ impl Repo {
         if !conflicts.iter().any(|p| p == path) {
             return Err(Error::InvalidArgument(format!("{path} is not currently conflicted")));
         }
+        // Gate on sparse (P24 Task 4) before writing anything: resolving a
+        // path outside the sparse view would materialize a file the user
+        // asked to exclude from disk. Inspection (`conflict_versions`) is
+        // DAG-derived and untouched by this — it still works for an
+        // out-of-sparse conflict, only the write-to-disk path is refused.
+        if !self.sparse_spec()?.matches(path) {
+            return Err(Error::InvalidArgument(format!(
+                "conflict in {path} is outside your sparse checkout; run `sc sparse set` to include it, then retry"
+            )));
+        }
 
         let versions = self.conflict_versions(path, identity)?;
         let chosen = match side {
@@ -442,6 +452,60 @@ mod tests {
         assert_eq!(versions.theirs, Side::Present(b"feature-edit\n".to_vec()));
 
         repo.rebase_abort().unwrap();
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_out_of_sparse_path_errors_widen() {
+        // P24 Task 4: `resolve_path` gates on sparse before writing anything
+        // to disk. Reachable in practice via a narrower spec being persisted
+        // out-of-band while a conflict from a wider view is still active
+        // (`Repo::set_sparse` itself refuses mid-conflict, so this exercises
+        // `resolve_path`'s own defensive gate directly, bypassing that
+        // guard the way an operator editing `.sc/sparse` by hand could).
+        // Inspection (`conflict_versions`) is DAG-derived and must still work.
+        let root = tmp_root("resolve-sparse-gate");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("a.txt"), b"theirs\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+        assert_eq!(repo.active_conflicts().unwrap(), vec!["a.txt".to_string()]);
+
+        // Narrow the spec out-of-band so a.txt now falls outside it.
+        crate::sparse::store(repo.layout(), &crate::sparse::Sparse::new(vec!["src/".into()]))
+            .unwrap();
+
+        // Inspection still works.
+        let versions = repo.conflict_versions("a.txt", None).unwrap();
+        assert_eq!(versions.ours, Side::Present(b"ours\n".to_vec()));
+        assert_eq!(versions.theirs, Side::Present(b"theirs\n".to_vec()));
+
+        // Resolving is refused with the widen hint.
+        let err = repo.resolve_path("a.txt", ResolveSide::Ours, None).unwrap_err();
+        match err {
+            Error::InvalidArgument(msg) => {
+                assert!(msg.contains("a.txt"), "message must name the path: {msg}");
+                assert!(
+                    msg.contains("sc sparse set"),
+                    "message must suggest widening the sparse set: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument widen hint, got {other:?}"),
+        }
+        // Still conflicted: resolution was refused, not silently applied.
+        assert_eq!(repo.active_conflicts().unwrap(), vec!["a.txt".to_string()]);
+
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
     }

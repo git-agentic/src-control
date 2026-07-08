@@ -378,6 +378,37 @@ enum Cmd {
         #[arg(long)]
         require: bool,
     },
+    /// Sparse-checkout operations.
+    Sparse {
+        #[command(subcommand)]
+        op: SparseOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum SparseOp {
+    /// Print the repo's current sparse-checkout prefixes.
+    Show {
+        /// Emit machine-readable JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the sparse-checkout prefixes and re-lay the working tree to match.
+    Set {
+        /// Path prefixes that stay materialized on disk (replaces any prior spec).
+        prefixes: Vec<String>,
+        /// Identity file for decrypting protected files newly brought into view
+        /// (default `--identity`/`SC_IDENTITY`/`~/.sc/identity`). Missing file →
+        /// protected files are simply skipped.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Disable sparse checkout and re-materialize the working tree in full.
+    Disable {
+        /// Identity file for decrypting protected files (same resolution as `set`).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -604,6 +635,54 @@ fn main() -> Result<()> {
         Cmd::Oplog => run_oplog(),
         Cmd::Sign { r#ref, identity } => run_sign(&r#ref, identity),
         Cmd::Verify { r#ref, require } => run_verify(r#ref, require),
+        Cmd::Sparse { op } => run_sparse(op),
+    }
+}
+
+fn run_sparse(op: SparseOp) -> Result<()> {
+    match op {
+        SparseOp::Show { json } => {
+            let repo = open_repo()?;
+            let spec = repo.sparse_spec()?;
+            if json {
+                print_line(
+                    &serde_json::json!({
+                        "full": spec.is_full(),
+                        "prefixes": spec.prefixes(),
+                    })
+                    .to_string(),
+                );
+                return Ok(());
+            }
+            if spec.is_full() {
+                print_line("sparse: disabled (full checkout)");
+            } else {
+                for p in spec.prefixes() {
+                    print_line(p);
+                }
+            }
+            Ok(())
+        }
+        SparseOp::Set { prefixes, identity } => {
+            let repo = open_repo()?;
+            let sk = resolve_identity_opt(identity)?;
+            let skipped = repo.set_sparse(&prefixes, sk.as_ref())?;
+            println!("sparse set: {} prefix(es)", prefixes.len());
+            for path in &skipped {
+                eprintln!("skipped (no key): {path}");
+            }
+            Ok(())
+        }
+        SparseOp::Disable { identity } => {
+            let repo = open_repo()?;
+            let sk = resolve_identity_opt(identity)?;
+            let skipped = repo.disable_sparse(sk.as_ref())?;
+            println!("sparse disabled (full checkout)");
+            for path in &skipped {
+                eprintln!("skipped (no key): {path}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1254,6 +1333,7 @@ fn run_status(json: bool) -> Result<()> {
     if json {
         let s = repo.status()?;
         let conflicts = conflicts_json(&repo)?;
+        let sparse = repo.sparse_spec()?;
         println!(
             "{}",
             serde_json::json!({
@@ -1265,6 +1345,7 @@ fn run_status(json: bool) -> Result<()> {
                 "pick_in_progress": repo.pick_in_progress(),
                 "rebase_in_progress": repo.rebase_in_progress(),
                 "rebase_resolved": repo.rebase_resolved()?,
+                "sparse": sparse.prefixes(),
             })
         );
         return Ok(());
@@ -1316,6 +1397,10 @@ fn run_status(json: bool) -> Result<()> {
         }
     }
     let s = repo.status()?;
+    let sparse = repo.sparse_spec()?;
+    if !sparse.prefixes().is_empty() {
+        println!("sparse: {}", sparse.prefixes().join(", "));
+    }
     if s.added.is_empty() && s.modified.is_empty() && s.deleted.is_empty() {
         if !repo.merge_in_progress() && !repo.pick_in_progress() && !repo.rebase_in_progress() {
             println!("clean (working tree matches HEAD)");

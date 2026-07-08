@@ -455,6 +455,7 @@ impl Repo {
                         Some(ours_root),
                         &protection,
                         identity,
+                        &self.sparse_spec()?,
                     )?;
                 }
                 refs::write_branch_tip(&self.layout, &head, &id)?;
@@ -509,6 +510,7 @@ impl Repo {
                     &conflict_prot,
                     ours_root,
                     identity,
+                    &paths,
                 )?;
                 // Markers are on disk; record pick state last (its PICK_HEAD
                 // write is the in-progress signal). The decided carried tree
@@ -566,6 +568,7 @@ impl Repo {
                 decided,
                 &snap.protection,
                 None,
+                &self.sparse_spec()?,
             )?;
         }
         crate::pick_state::clear(&self.layout)?;
@@ -672,6 +675,7 @@ impl Repo {
                     Some(ours_root),
                     &target_protection,
                     identity,
+                    &self.sparse_spec()?,
                 )?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &target_tip)?;
@@ -884,6 +888,7 @@ impl Repo {
                         &conflict_prot,
                         disk_root,
                         identity,
+                        &paths,
                     )?;
                     let remaining_after_current: Vec<ObjectId> = remaining.into_iter().collect();
                     let done = total.saturating_sub(remaining_after_current.len()).saturating_sub(1);
@@ -928,6 +933,7 @@ impl Repo {
                 Some(disk_root),
                 &acc_protection,
                 identity,
+                &self.sparse_spec()?,
             )?;
         }
         refs::write_branch_tip(&self.layout, &head, &acc_tip)?;
@@ -1133,6 +1139,7 @@ impl Repo {
                 decided,
                 &snap.protection,
                 None,
+                &self.sparse_spec()?,
             )?
         };
         crate::rebase_state::clear(&self.layout)?;

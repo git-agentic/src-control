@@ -59,6 +59,17 @@ pub struct WsSession {
     pub base_branch: String,
     /// The author recorded on any commit a later harvest produces.
     pub author: String,
+    /// The host repo's sparse-checkout prefixes AT FORK TIME (empty = full),
+    /// recorded so a later `sc ws harvest` diffs and commits against the view
+    /// each workspace was actually given — never the host's possibly-since-
+    /// changed live spec (P24 final-review fix, Critical 1). A workspace was
+    /// materialized under this exact spec (`materialize_workspace` in
+    /// `ws_fork`); if the host's `.sc/sparse` changes before harvest, the
+    /// workspace itself does not silently reinterpret what it was shown.
+    /// `#[serde(default)]` on the TOML side lets a pre-P24-final-review
+    /// manifest (no `sparse` key) parse as empty/full, matching that
+    /// manifest's actual behavior (sparse checkouts didn't exist yet).
+    pub sparse: Vec<String>,
     pub workspaces: Vec<WsEntry>,
 }
 
@@ -90,6 +101,11 @@ struct SessionToml {
     base_snapshot: String,
     base_branch: String,
     author: String,
+    // Absent in pre-P24-final-review manifests, defaults to empty (full
+    // checkout) — matches those manifests' actual pre-sparse-checkout
+    // behavior.
+    #[serde(default)]
+    sparse: Vec<String>,
     #[serde(default)]
     workspace: Vec<EntryToml>,
 }
@@ -100,6 +116,7 @@ impl From<&WsSession> for SessionToml {
             base_snapshot: s.base_snapshot.to_hex(),
             base_branch: s.base_branch.clone(),
             author: s.author.clone(),
+            sparse: s.sparse.clone(),
             workspace: s
                 .workspaces
                 .iter()
@@ -136,6 +153,7 @@ impl TryFrom<SessionToml> for WsSession {
             base_snapshot,
             base_branch: raw.base_branch,
             author: raw.author,
+            sparse: raw.sparse,
             workspaces,
         })
     }
@@ -191,6 +209,11 @@ impl Repo {
         }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let branch = refs::current_branch(self.layout())?;
+        // A durable `sc ws` workspace inherits the host repo's sparse view
+        // (P24 Task 4) — unlike `sc work`'s one-shot ephemeral agents, a
+        // durable session is closer to a second working tree for the same
+        // repo, so it should see the same narrowed checkout the user does.
+        let sparse = self.sparse_spec()?;
 
         let root = ws_dir(self.layout());
         // No manifest proves any .sc/ws content is crash residue from a
@@ -199,7 +222,9 @@ impl Repo {
         let mut workspaces = Vec::with_capacity(agents as usize);
         for i in 1..=agents {
             let dir = root.join(i.to_string());
-            if let Err(e) = crate::workspace::materialize_workspace(self, tip, &dir, identity) {
+            if let Err(e) =
+                crate::workspace::materialize_workspace(self, tip, &dir, identity, &sparse)
+            {
                 // Nothing announced yet (no manifest written) — tear down
                 // whatever partial checkouts exist so a failed fork leaves
                 // no residue under .sc/ws.
@@ -218,6 +243,7 @@ impl Repo {
             base_snapshot: tip,
             base_branch: branch,
             author: author.to_string(),
+            sparse: sparse.prefixes().to_vec(),
             workspaces,
         };
         write_manifest(self.layout(), &session)?;
@@ -250,9 +276,15 @@ impl Repo {
     pub fn ws_changed_for(&self, session: &WsSession, entry: &WsEntry) -> Result<bool> {
         let base = self.snapshot(&session.base_snapshot)?;
         let ws = Layout::at(&entry.dir);
+        // Sparse-aware (P24 Task 4). Uses the session's own FORK-TIME spec,
+        // not the host's current one (P24 final-review fix, Critical 1): the
+        // workspace was materialized under `session.sparse`, and a `sparse
+        // set`/`disable` on the host between fork and this check must not
+        // reinterpret an unmaterialized out-of-sparse path as a deletion.
+        let sparse = crate::sparse::Sparse::new(session.sparse.clone());
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
-        let d = worktree::diff_worktree(&ws, &mut store, Some(base.root), &base.protection)?;
+        let d = worktree::diff_worktree(&ws, &mut store, Some(base.root), &base.protection, &sparse)?;
         Ok(!(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
     }
 
@@ -570,6 +602,11 @@ impl Repo {
             // P13's contract is the session's base snapshot, not the
             // landing branch's current (possibly since-advanced) tip.
             let msg = format!("ws-{i} harvest");
+            // The session's fork-time spec, not the host's current one (P24
+            // final-review fix, Critical 1) — same reasoning as
+            // `ws_changed_for` above, now threaded into the commit carry too
+            // via `harvest_workspace` -> `snapshot_files`.
+            let fork_time_sparse = crate::sparse::Sparse::new(session.sparse.clone());
             match crate::workspace::harvest_workspace(
                 self,
                 session.base_snapshot,
@@ -577,6 +614,7 @@ impl Repo {
                 &branch,
                 author,
                 &msg,
+                &fork_time_sparse,
             )? {
                 crate::workspace::HarvestResult::Rejected(report) => {
                     // DESIGN DECISION (spec precision note, Task 5): a
@@ -776,6 +814,142 @@ mod tests {
             ),
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ws_fork_inherits_sparse() {
+        // P24 Task 4: a durable `sc ws` workspace inherits the host repo's
+        // sparse view — unlike `sc work`'s one-shot ephemeral agents, which
+        // stay full (unchanged, out of this task's scope).
+        let root = tmp_root("fork-sparse");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
+        std::fs::write(root.join("docs/x"), b"doc v1").unwrap();
+        repo.commit("t", "base").unwrap();
+
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        assert!(!root.join("docs/x").exists());
+
+        let session = repo.ws_fork(1, "t", None).unwrap();
+        let entry = &session.workspaces[0];
+        assert!(entry.dir.join("src/a.txt").exists(), "in-sparse file must materialize");
+        assert!(!entry.dir.join("docs/x").exists(), "out-of-sparse file must not materialize");
+
+        // Harvest carries the untouched out-of-sparse subtree verbatim.
+        std::fs::write(entry.dir.join("src/a.txt"), b"a v2").unwrap();
+        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            WsHarvestOutcome::Landed { index: 1, .. } => {}
+            other => panic!("expected Landed(1), got {other:?}"),
+        }
+        let tip = repo.head_tip().unwrap().unwrap();
+        let snap = repo.snapshot(&tip).unwrap();
+        let entries = {
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap()
+        };
+        assert!(entries.contains_key("docs/x"), "harvest must carry the out-of-sparse subtree");
+        let blob = entries.get("docs/x").map(|(id, _, _)| *id).unwrap();
+        let bytes = {
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            match s.get(&blob).unwrap() {
+                scl_core::Object::Blob(b) => b,
+                _ => panic!("expected blob"),
+            }
+        };
+        assert_eq!(&*bytes, b"doc v1", "carried content must be unchanged");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ws_harvest_uses_fork_time_sparse_not_ambient() {
+        // P24 final-review fix, Critical 1: a `sc ws` workspace is
+        // materialized under the host's sparse spec AT FORK TIME. If the
+        // host's spec changes before harvest (a legitimate P20 action — ws
+        // sessions span invocations by design), harvest must still diff and
+        // commit against the FORK-TIME view, not the host's new live one —
+        // otherwise the never-materialized `docs/` subtree reads as a user
+        // deletion and is silently dropped from the branch tip.
+        let root = tmp_root("harvest-fork-time-sparse");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
+        std::fs::write(root.join("docs/x.txt"), b"doc v1").unwrap();
+        repo.commit("t", "base").unwrap();
+
+        // 1. Narrow to src/ and fork — the workspace only ever sees src/.
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        let session = repo.ws_fork(1, "t", None).unwrap();
+        let entry = &session.workspaces[0];
+        assert!(entry.dir.join("src/a.txt").exists());
+        assert!(!entry.dir.join("docs/x.txt").exists());
+
+        // 2. Legitimately change the host spec before harvest: disable
+        // sparse entirely. This re-materializes docs/x.txt on the HOST's own
+        // working tree, but must not affect what the already-forked
+        // workspace is diffed/committed against.
+        repo.disable_sparse(None).unwrap();
+        assert!(root.join("docs/x.txt").exists(), "host disable re-lays its own tree");
+
+        // 3. Make an in-sparse edit in the workspace (the only kind of edit
+        // this workspace was ever capable of making).
+        std::fs::write(entry.dir.join("src/a.txt"), b"a v2").unwrap();
+
+        // 4. Harvest. The workspace's absent docs/x.txt must be carried
+        // (never materialized, not a user deletion), not committed as a
+        // deletion.
+        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            WsHarvestOutcome::Landed { index: 1, .. } => {}
+            other => panic!("expected Landed(1), got {other:?}"),
+        }
+
+        let tip = repo.head_tip().unwrap().unwrap();
+        let snap = repo.snapshot(&tip).unwrap();
+        let entries = {
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap()
+        };
+        assert!(
+            entries.contains_key("docs/x.txt"),
+            "docs/x.txt must SURVIVE the harvest — it was never given to the \
+             workspace, so its absence there is not a deletion"
+        );
+        let blob = entries.get("docs/x.txt").map(|(id, _, _)| *id).unwrap();
+        let bytes = {
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            match s.get(&blob).unwrap() {
+                scl_core::Object::Blob(b) => b,
+                _ => panic!("expected blob"),
+            }
+        };
+        assert_eq!(&*bytes, b"doc v1", "carried content must be byte-identical, unchanged");
+
+        // The in-sparse edit landed correctly too.
+        let a_blob = entries.get("src/a.txt").map(|(id, _, _)| *id).unwrap();
+        let a_bytes = {
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            match s.get(&a_blob).unwrap() {
+                scl_core::Object::Blob(b) => b,
+                _ => panic!("expected blob"),
+            }
+        };
+        assert_eq!(&*a_bytes, b"a v2", "the workspace's real edit must land");
+
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1402,6 +1576,7 @@ mod tests {
             base_snapshot: session.base_snapshot,
             base_branch: session.base_branch.clone(),
             author: session.author.clone(),
+            sparse: session.sparse.clone(),
             workspaces: vec![WsEntry { index: 1, dir: dir.clone(), live: true, landed_tip: None }],
         };
         write_manifest(repo.layout(), &crashed).unwrap();

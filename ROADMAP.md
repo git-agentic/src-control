@@ -255,22 +255,27 @@ across every phase.
   with no hand-edited markers, then a protected variant where both the
   base/ours/theirs view and the resolution decrypt under `--identity`).
   (ADR-0033.)
+- **Phase 24 — Sparse checkouts / sub-tree sharing.** `.sc/sparse` is a
+  local, uncommitted prefix spec (`sc sparse set <prefix…>`/`sc sparse
+  show`/`sc sparse disable`); an empty spec is full materialization. The
+  whole feature is one generalized predicate: `commit`'s existing
+  absent-path carry (the ADR-0025 P15 discipline) widens from "absent AND
+  still-protected-and-not-a-recipient" to "absent AND (that OR outside the
+  sparse set)," so an out-of-sparse subtree is carried forward
+  byte-identical while an in-sparse absence is a genuine deletion;
+  `materialize` filters both its write and old-root-removal loops the same
+  way, so `sc sparse set`/`disable` re-lay the working tree by narrowing or
+  widening on top of the same mechanism. A clean merge/pick/rebase change
+  to an out-of-sparse path lands in the CAS without materializing; a
+  CONFLICT there refuses with a widen hint instead of auto-materializing.
+  `sc ws` workspaces inherit the host's sparse view. Proven by
+  `demo/run_sparse_demo.sh` (three subtrees, one narrowed in, edited and
+  committed under sparse, then both `sc sparse disable` and an independent
+  full clone restore the other two byte-identical). (ADR-0034.)
 
 ## Active
 
-None — Phase 24 is next up.
-
-## Next horizon (P24)
-
-Decided 2026-07-08 (design: `docs/superpowers/specs/2026-07-08-roadmap-horizon-p21-p24-design.md`).
-Theme: invest in daily feel and scale once P22 closes out the trust story.
-
-| Phase | Goal | Demoable outcome | ADR |
-|-------|------|------------------|-----|
-| **P24 — Sparse checkouts / sub-tree sharing** | Monorepo-width working trees | work in one subtree with the rest absent from disk; commits carry absent subtrees byte-identically | [0034](docs/adr/0034-sparse-checkouts.md) |
-
-Ordering rationale: P23 before P24 (conflict UX pays off daily and sparse
-users will want it too).
+None — the P21–P24 horizon is complete; brainstorm the next horizon.
 
 ## Completed phases (usability-first ordering)
 
@@ -296,6 +301,7 @@ users will want it too).
 | **P21 — Hardening & consolidation** | Close the P16–P20 review tail before new capability work | policy ops refuse during in-progress merge/pick/rebase; a pruned git commit behind a stale mark self-heals on push; rebase/pick aborts report the protected-skip list; `sc ws list` names an undone landing truthfully; every existing demo stays green plus new pinned regression tests | [0031](docs/adr/0031-hardening-consolidation.md) |
 | **P22 — Signed commits & provenance** | Detect history rewriting; attribute commits to an identity | `sc keygen` v2 identities (X25519 + Ed25519 from one seed), `sc commit --sign`/`sc sign <ref>`, `sc log` four-state markers, `sc verify --require`; signatures ride existing packs with zero wire changes; proven by `demo/run_provenance_demo.sh` (rewrite attack caught in a clone while the original stays clean) | [0032](docs/adr/0032-signed-commits-provenance.md) |
 | **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts [<path>]` lists/shows base-ours-theirs (decrypted under `--identity` for protected paths); `sc resolve --ours\|--theirs <path>` writes clean content; proven by `demo/run_merge_ergonomics_demo.sh` (text + protected conflicts resolved end-to-end) | [0033](docs/adr/0033-merge-ergonomics.md) |
+| **P24 — Sparse checkouts / sub-tree sharing** | Materialize one subtree of a large repo, leave the rest on the CAS | `sc sparse set <prefix…>`/`show`/`disable`; `commit`'s absent-path carry widens to out-of-sparse paths (byte-identical carried subtrees); `materialize` filters both its write and removal loops; proven by `demo/run_sparse_demo.sh` (narrow, edit, commit, then disable/clone restore byte-identical) | [0034](docs/adr/0034-sparse-checkouts.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

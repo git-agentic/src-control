@@ -247,6 +247,16 @@ bash demo/run_merge_ergonomics_demo.sh        # sc conflicts/sc resolve proof (P
                                               # conflict and a protected (identity-decrypted)
                                               # conflict both resolved end-to-end with no
                                               # hand-edited markers
+cargo run --bin sc -- sparse set <prefix…> [--identity <key>]   # narrow the working tree to
+                                              # these path prefixes; re-lays disk now (P24)
+cargo run --bin sc -- sparse show [--json]    # list the active sparse prefixes ("disabled" if
+                                              # the spec is empty/absent) (P24)
+cargo run --bin sc -- sparse disable [--identity <key>]   # clear the spec and rematerialize
+                                              # every subtree in full (P24)
+bash demo/run_sparse_demo.sh                  # sparse checkout proof (P24): narrow to one of
+                                              # three subtrees, edit + commit under sparse, then
+                                              # sc sparse disable AND an independent full clone
+                                              # both restore the other two byte-identical
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -725,5 +735,61 @@ path list — a strict superset, no existing consumer broke. Whole-file
 resolution only — no hunk-level or `--union`/`--base` modes. Proven by
 `demo/run_merge_ergonomics_demo.sh`. See ADR-0033.
 
+**Phase 24 is built.** Sparse checkouts: `.sc/sparse` is a local,
+uncommitted prefix spec (`sc sparse set <prefix…>`/`sc sparse show`/`sc
+sparse disable`; empty/absent = full materialization, matching P7's
+`matching_prefix` path-boundary rule). The whole feature is one
+generalized carry predicate: `commit`'s existing absent-path carry
+(`crates/repo/src/repo.rs`, `snapshot_files`'s carry block — the ADR-0025
+P15 discipline) widens from "absent AND still-protected-and-not-a-
+recipient" to "absent AND (that OR outside the sparse set)," so a commit
+made while narrowed carries the untouched out-of-sparse subtree forward
+byte-identical, while an in-sparse absence stays a genuine deletion — the
+carried entry's perms byte is the *source* entry's own perms, not a
+hardcoded `PROTECTED`, so a carried plain out-of-sparse file doesn't
+acquire protection it never had. `materialize` (`crates/repo/src/
+worktree.rs`) filters both its write loop and its old-root removal loop by
+the spec; `sc sparse set`/`disable` re-lay the working tree on top of the
+same function (`old_root = Some(head_root)` narrows or widens against the
+current tree). `diff_worktree`/`diff_unified` treat an absent out-of-sparse
+path the same as an absent unauthorized-protected one: expected, not a
+deletion. A clean merge/pick/rebase change to an out-of-sparse path lands
+in the CAS without materializing; a CONFLICT there refuses up front
+(`Repo::materialize_conflict_state`, before any marker write) with a "run
+`sc sparse set` to include it" hint — `sc resolve` gates the same way,
+while `sc conflicts` still inspects freely since it never writes to disk.
+`sc sparse set`/`disable` refuse during an in-progress merge/pick/rebase.
+`sc ws` workspaces inherit the host repo's sparse view structurally
+(threaded into `materialize_workspace` at fork time, and — final-review
+fix — the fork-time spec is also PERSISTED in `session.toml` and reused,
+never re-read ambiently, so a `sparse set`/`disable` on the host between
+fork and harvest cannot reinterpret the workspace's never-materialized
+paths as deletions; harvest carries the untouched subtree via the same
+generalized predicate). A full-checkout `sc work` agent passes the same
+predicate `Sparse::default()`, so its genuine deletions of any path land
+instead of being carried against the host's spec. `sc status` shows the
+active spec. Sparse CHECKOUT only — every object stays in the CAS
+regardless of the spec, so `sc gc`'s reachability walk is unaffected;
+partial clone (never fetching out-of-prefix objects) is deferred.
+**Boundary:** when an IN-sparse conflict co-occurs with an OUT-of-sparse
+protected/I2 clean change in the same merge, that out-of-sparse plaintext
+is written to disk outside the sparse view during the conflict window AND
+PERSISTS ON DISK AFTER COMPLETION TOO — `materialize_conflict_state`'s
+sparse gate covers only its marker-write loop, not its
+`to_encrypt`/sidecar-decrypt write loops, and completion does not
+materialize. Only abort removes it (its `!sparse.matches` removal arm);
+completion's `read_worktree` re-lands the content in the CAS byte-correct
+(same as any other carried file) but never deletes the on-disk file — the
+plaintext stays on disk until the next materializing operation (`switch`,
+`sparse set`/`disable`, another merge) re-lays the tree. This is not data
+loss and not a new disclosure (the diff3 content-merge that produced the
+plaintext already required an authorized identity; the I2 case is
+pre-existing plaintext) —
+a bounded disk-hygiene boundary, follow-on to extending the sparse gate to
+the `to_encrypt`/sidecar writes too. Proven by `demo/run_sparse_demo.sh`.
+See ADR-0034.
+
 Remaining follow-ons: HTTP transport, streaming (>4 GiB) frames,
-operation objects in the CAS, and oplog entries for remote-tracking refs.
+operation objects in the CAS, oplog entries for remote-tracking refs, and
+extending the sparse gate to `materialize_conflict_state`'s
+`to_encrypt`/sidecar write loops (see the P24 boundary note above).

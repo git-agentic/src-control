@@ -73,4 +73,9 @@ impl Layout {
     pub fn signatures_path(&self) -> PathBuf {
         self.dot_sc.join("signatures")
     }
+    /// `.sc/sparse` — the sparse-checkout prefix spec (P24): one prefix per
+    /// line. Absent means full materialization (no sparseness).
+    pub fn sparse_path(&self) -> PathBuf {
+        self.dot_sc.join("sparse")
+    }
 }
