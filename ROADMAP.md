@@ -421,6 +421,21 @@ sparse checkouts → P24):
   remote writer (the stopped rebase has its moved-tip backstop;
   merge/pick completion does not). Pre-existing since P6/P12; flagged at
   the P21 final review as the one gap outside the policy-op class.
+- **Sparse-gate the conflict helper's non-marker writes (P24 boundary).**
+  `Repo::materialize_conflict_state` gates conflict *markers* against the
+  sparse spec but not its `to_encrypt`/sidecar write loops — so an
+  in-sparse conflict co-occurring with an out-of-sparse protected/I2 clean
+  change transiently writes that out-of-sparse plaintext to disk outside
+  the view, and it PERSISTS after completion until a later re-lay (only
+  abort cleans it). Not data loss (completion re-lands it in the CAS) and
+  not a disclosure (an authorized identity produced it), documented in
+  ADR-0034 — but the sparse view is briefly wider than advertised. Extend
+  the gate to those write loops.
+- **Sparse ergonomics (P24 final-review Minors).** A bogus/no-match
+  `sc sparse set <prefix>` empties the working tree with no warning
+  (recoverable via disable); a zero-arg `sc sparse set` silently equals
+  `disable`; blank lines in a hand-edited `.sc/sparse` want tolerant
+  parsing. Small usability hardening.
 
 ## How a phase gets built
 
