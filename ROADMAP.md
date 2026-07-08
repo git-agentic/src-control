@@ -212,6 +212,25 @@ across every phase.
   every existing demo staying green plus the pinned regression test for
   each closed finding — a pure-hardening phase ships no new demo script.
   (ADR-0031.)
+- **Phase 22 — Signed commits & provenance.** Optional Ed25519 commit
+  signatures as content-addressed objects (`TAG_SIGNATURE = 5`, bytes-only
+  in `core`), signing the domain-separated snapshot id
+  (`"sc-snapshot-sig-v1" || id`) so snapshot ids are untouched and
+  retroactive signing is natural. A unified identity v2 (`scl-id-…`) seeds
+  both the X25519 encryption key and the Ed25519 signing key via HKDF with
+  distinct info strings; v1 `scl-sk-` files keep encrypting but cannot
+  sign. Signatures ride existing packs with ZERO wire-protocol changes
+  (senders include indexed signatures for the transfer set; receivers
+  index `TAG_SIGNATURE` arrivals and dedup idempotently — a review-caught
+  Critical fixed retroactive signatures failing to propagate on refetch),
+  a gc-rooted `.sc/signatures` index prunes signatures of dead snapshots,
+  and git export drops them with a count. `sc verify [--require]` walks
+  all parents reporting four distinct states (trusted ✓ / untrusted ? /
+  INVALID ✗ / unsigned), `sc log` renders them, and trust policy rides
+  `recipients.toml [signing]`/`[signers]`. Signatures defend against
+  history rewriting, not trusted-signer misuse or code quality. Proven by
+  `demo/run_provenance_demo.sh` (a clone-rewrite attack `sc verify`
+  catches while the original stays clean). (ADR-0032.)
 
 ## Active
 
