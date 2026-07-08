@@ -215,9 +215,7 @@ across every phase.
 
 ## Active
 
-- **Phase 22 — Signed commits & provenance.** In build. Spec:
-  `docs/superpowers/specs/2026-07-08-p22-provenance-design.md`
-  (ADR-0032, Proposed → Accepted at completion).
+None — Phase 23 is next up.
 
 ## Next horizon (P23–P24)
 
@@ -254,6 +252,7 @@ users will want it too).
 | **P19 — History-editing polish** | `sc amend`, resumable rebase, pick abort, mainline picks | `sc rebase main` stops on conflict (not aborts), `sc rebase --continue` resumes and lands in ONE oplog record; `sc cherry-pick --abort` restores byte-identical; `sc amend -m` fixes the tip message; proven by the extended `demo/run_history_demo.sh` | [0029](docs/adr/0029-history-editing-polish.md) |
 | **P20 — Agent sessions + auto-merge** | Multi-invocation agent sessions with hands-off integration | `sc ws fork --agents N`, edit across separate invocations, `sc ws harvest` auto-merges clean results cumulatively and falls back to `work-<i>` on conflict; proven by `demo/run_ws_demo.sh` | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
 | **P21 — Hardening & consolidation** | Close the P16–P20 review tail before new capability work | policy ops refuse during in-progress merge/pick/rebase; a pruned git commit behind a stale mark self-heals on push; rebase/pick aborts report the protected-skip list; `sc ws list` names an undone landing truthfully; every existing demo stays green plus new pinned regression tests | [0031](docs/adr/0031-hardening-consolidation.md) |
+| **P22 — Signed commits & provenance** | Detect history rewriting; attribute commits to an identity | `sc keygen` v2 identities (X25519 + Ed25519 from one seed), `sc commit --sign`/`sc sign <ref>`, `sc log` four-state markers, `sc verify --require`; signatures ride existing packs with zero wire changes; proven by `demo/run_provenance_demo.sh` (rewrite attack caught in a clone while the original stays clean) | [0032](docs/adr/0032-signed-commits-provenance.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

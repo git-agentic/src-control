@@ -42,7 +42,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0029](0029-history-editing-polish.md) | History-editing polish — amend, resumable rebase, pick abort, merge replay | Accepted | 19 |
 | [0030](0030-agent-sessions-and-automerge.md) | Agent sessions and auto-merge of clean results | Accepted | 20 |
 | [0031](0031-hardening-consolidation.md) | Hardening & consolidation sweep — closing the P16–P20 review tail | Accepted | 21 |
-| [0032](0032-signed-commits-provenance.md) | Signed commits & provenance | Proposed | 22 |
+| [0032](0032-signed-commits-provenance.md) | Signed commits & provenance | Accepted | 22 |
 | [0033](0033-merge-ergonomics.md) | Merge ergonomics — conflict UX beyond markers | Proposed | 23 |
 | [0034](0034-sparse-checkouts.md) | Sparse checkouts / sub-tree sharing | Proposed | 24 |
 
