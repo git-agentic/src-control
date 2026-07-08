@@ -179,6 +179,32 @@ enum Cmd {
         #[arg(long)]
         identity: Option<PathBuf>,
     },
+    /// List conflicts for the in-progress operation, or show one path's versions.
+    Conflicts {
+        /// A path to show base/ours/theirs for; omit to list all conflicts.
+        path: Option<String>,
+        /// Identity for protected-path decryption.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve conflicted paths to one side without editing markers.
+    Resolve {
+        /// Take our side of the conflict.
+        #[arg(long, conflicts_with = "theirs")]
+        ours: bool,
+        /// Take their side of the conflict.
+        #[arg(long)]
+        theirs: bool,
+        /// Paths to resolve.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Identity for protected-path decryption.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
     /// Scan the working tree for plaintext secrets without committing.
     Scan,
     /// Decrypt authorized secrets, inject them, and run a command.
@@ -544,6 +570,8 @@ fn main() -> Result<()> {
         Cmd::Log { json } => run_log(json),
         Cmd::Branch { name } => run_branch(&name),
         Cmd::Switch { name, identity } => run_switch(&name, identity),
+        Cmd::Conflicts { path, identity, json } => run_conflicts(path, identity, json),
+        Cmd::Resolve { ours, theirs, paths, identity } => run_resolve(ours, theirs, paths, identity),
         Cmd::Scan => run_scan(),
         Cmd::Merge { branch, abort, author, identity } => {
             run_merge(branch, abort, &resolve_author(author), identity)
@@ -1225,6 +1253,7 @@ fn run_status(json: bool) -> Result<()> {
     let repo = open_repo()?;
     if json {
         let s = repo.status()?;
+        let conflicts = conflicts_json(&repo)?;
         println!(
             "{}",
             serde_json::json!({
@@ -1232,7 +1261,7 @@ fn run_status(json: bool) -> Result<()> {
                 "modified": s.modified,
                 "deleted": s.deleted,
                 "merge_in_progress": repo.merge_in_progress(),
-                "conflicts": repo.merge_conflicts()?,
+                "conflicts": conflicts,
                 "pick_in_progress": repo.pick_in_progress(),
                 "rebase_in_progress": repo.rebase_in_progress(),
                 "rebase_resolved": repo.rebase_resolved()?,
@@ -1242,18 +1271,21 @@ fn run_status(json: bool) -> Result<()> {
     }
     if repo.merge_in_progress() {
         println!("merge in progress; resolve and `sc commit` (or `sc merge --abort`):");
-        let conflicts = repo.merge_conflicts()?;
+        let conflicts = repo.active_conflicts()?;
         if conflicts.is_empty() {
             println!("  (all conflicts resolved — ready to `sc commit`)");
         } else {
-            for p in conflicts {
-                println!("  conflicted: {p}");
+            for p in &conflicts {
+                print_conflict_detail_line(&repo, p)?;
             }
         }
     }
     if repo.pick_in_progress() {
         if let Some(id) = repo.pick_head()? {
             println!("cherry-pick in progress: {}", id.short());
+        }
+        for p in &repo.active_conflicts()? {
+            print_conflict_detail_line(&repo, p)?;
         }
     }
     if repo.rebase_in_progress() {
@@ -1277,6 +1309,9 @@ fn run_status(json: bool) -> Result<()> {
                     done + 1,
                     total
                 );
+                for p in &repo.active_conflicts()? {
+                    print_conflict_detail_line(&repo, p)?;
+                }
             }
         }
     }
@@ -1441,6 +1476,130 @@ fn run_rebase(
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Lower-cased label for a [`scl_repo::ConflictKind`], shared by `sc
+/// conflicts` and the per-path detail lines in `sc status`.
+fn conflict_kind_label(kind: scl_repo::ConflictKind) -> &'static str {
+    match kind {
+        scl_repo::ConflictKind::Text => "text",
+        scl_repo::ConflictKind::Binary => "binary",
+        scl_repo::ConflictKind::Protected => "protected",
+    }
+}
+
+/// `  <path>  [<kind>]`, with a `(needs --identity)` note for protected
+/// paths. Shared by `sc conflicts`'s listing and `sc status`'s per-path
+/// detail under each in-progress banner.
+fn print_conflict_detail_line(repo: &scl_repo::Repo, path: &str) -> Result<()> {
+    let kind = repo.conflict_kind(path)?;
+    let note = if kind == scl_repo::ConflictKind::Protected { " (needs --identity)" } else { "" };
+    println!("  {path}  [{}]{}", conflict_kind_label(kind), note);
+    Ok(())
+}
+
+/// `[{path, kind}]` for the active op's conflicts (empty array when none is
+/// in progress). Shared by `sc status --json` and `sc conflicts --json`.
+fn conflicts_json(repo: &scl_repo::Repo) -> Result<serde_json::Value> {
+    let mut arr = Vec::new();
+    for p in repo.active_conflicts()? {
+        let kind = repo.conflict_kind(&p)?;
+        arr.push(serde_json::json!({"path": p, "kind": conflict_kind_label(kind)}));
+    }
+    Ok(serde_json::Value::Array(arr))
+}
+
+/// One `--- <label> ---` section of a conflicted path's base/ours/theirs
+/// view: the bytes as UTF-8, `<binary N bytes>` when they aren't, or
+/// `(absent)` for [`scl_repo::Side::Absent`].
+fn print_conflict_side(label: &str, side: &scl_repo::Side) {
+    println!("--- {label} ---");
+    match side {
+        scl_repo::Side::Absent => println!("(absent)"),
+        scl_repo::Side::Present(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+            }
+            Err(_) => println!("<binary {} bytes>", bytes.len()),
+        },
+    }
+}
+
+/// `sc conflicts [path] [--identity] [--json]`: list the in-progress op's
+/// conflicted paths, or show one path's base/ours/theirs.
+fn run_conflicts(path: Option<String>, identity: Option<PathBuf>, json: bool) -> Result<()> {
+    let repo = open_repo()?;
+    if repo.active_conflict_op()?.is_none() {
+        println!("no conflicts (no merge/pick/rebase in progress)");
+        return Ok(());
+    }
+    match path {
+        None => {
+            if json {
+                println!("{}", conflicts_json(&repo)?);
+            } else {
+                for p in repo.active_conflicts()? {
+                    print_conflict_detail_line(&repo, &p)?;
+                }
+            }
+            Ok(())
+        }
+        Some(path) => {
+            let sk = resolve_identity_opt(identity)?;
+            let versions = repo.conflict_versions(&path, sk.as_ref())?;
+            print_conflict_side("base", &versions.base);
+            print_conflict_side("ours", &versions.ours);
+            print_conflict_side("theirs", &versions.theirs);
+            Ok(())
+        }
+    }
+}
+
+/// `sc resolve --ours|--theirs <paths...>`: resolve conflicted paths to one
+/// side without editing markers. Continues past a bad path (reporting it)
+/// rather than aborting the whole batch, and exits 1 if any path failed —
+/// mirroring `run_merge`'s lock-release-before-exit discipline.
+fn run_resolve(ours: bool, theirs: bool, paths: Vec<String>, identity: Option<PathBuf>) -> Result<()> {
+    if !ours && !theirs {
+        anyhow::bail!("resolve: specify exactly one of --ours or --theirs");
+    }
+    let (side, label) =
+        if ours { (scl_repo::ResolveSide::Ours, "ours") } else { (scl_repo::ResolveSide::Theirs, "theirs") };
+    let repo = open_repo()?;
+    let sk = resolve_identity_opt(identity)?;
+    let mut any_failed = false;
+    for path in &paths {
+        match repo.resolve_path(path, side, sk.as_ref()) {
+            Ok(()) => println!("resolved {path} ({label})"),
+            Err(e) => {
+                eprintln!("error {path}: {e}");
+                any_failed = true;
+            }
+        }
+    }
+    if repo.active_conflicts()?.is_empty() {
+        match repo.active_conflict_op()? {
+            Some(scl_repo::ActiveOp::Merge) | Some(scl_repo::ActiveOp::Pick) => {
+                println!("all conflicts resolved — run 'sc commit'");
+            }
+            Some(scl_repo::ActiveOp::Rebase) => {
+                println!("all conflicts resolved — run 'sc rebase --continue'");
+            }
+            None => {}
+        }
+    }
+    if any_failed {
+        // Exit 1 so a scripted `sc resolve ... && sc commit` notices a
+        // partial failure. Drop the repo first (releases .sc/lock) —
+        // process::exit skips destructors and would otherwise leave a stale
+        // lock file, mirroring `run_merge`/`run_cherry_pick`/`run_rebase`.
+        drop(repo);
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Render one [`scl_repo::SigStatus`] into `sc log`'s human-readable

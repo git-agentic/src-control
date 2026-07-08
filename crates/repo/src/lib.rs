@@ -35,7 +35,7 @@ pub(crate) mod ws;
 pub mod workspace;
 pub mod worktree;
 
-pub use conflicts::{ActiveOp, ConflictKind, ConflictVersions, Side};
+pub use conflicts::{ActiveOp, ConflictKind, ConflictVersions, ResolveSide, Side};
 pub use error::{Error, Result};
 pub use gc::GcStats;
 pub use git_marks::MarksStore;
