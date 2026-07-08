@@ -314,7 +314,16 @@ across every phase.
 
 ## Active
 
-None — P25 done; P26 sc-native HTTP transport is next up.
+**Scale & reach (P25–P27), continued.** P25 shipped streaming pack
+transfer; this phase swaps in a second network transport on the same seam
+P12 opened for SSH.
+
+- **Phase 26 — sc-native HTTP transport (in progress).** Task 1: the
+  `sc+http://` URL form (`crates/repo/src/http_transport.rs`, `ScHttpUrl`)
+  and module skeleton the wire codec, client, and server tasks build on.
+  Later tasks in this phase wire the existing framed protocol (P12/P25)
+  over HTTP request/response bodies instead of raw stdio, so a repo is
+  reachable without spawning `ssh`.
 
 ## Completed phases (usability-first ordering)
 
