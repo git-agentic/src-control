@@ -1105,6 +1105,7 @@ fn run_status(json: bool) -> Result<()> {
                 "conflicts": repo.merge_conflicts()?,
                 "pick_in_progress": repo.pick_in_progress(),
                 "rebase_in_progress": repo.rebase_in_progress(),
+                "rebase_resolved": repo.rebase_resolved()?,
             })
         );
         return Ok(());
@@ -1127,12 +1128,26 @@ fn run_status(json: bool) -> Result<()> {
     }
     if repo.rebase_in_progress() {
         if let Some((conflicted, done, total)) = repo.rebase_progress()? {
-            println!(
-                "rebase in progress: stopped at {} ({} of {}); resolve conflicts then 'sc rebase --continue', or 'sc rebase --abort'",
-                conflicted.short(),
-                done + 1,
-                total
-            );
+            if repo.rebase_resolved()? {
+                // P21: the conflicted commit is already completed on disk —
+                // a prior `--continue` landed it but the fold over the
+                // remaining commits then errored (e.g. a later commit needs
+                // `--identity`). Nothing to resolve here; just re-run
+                // `--continue`, distinct from the "stopped at X" window
+                // below where conflict markers are still on disk.
+                println!(
+                    "rebase in progress: conflict resolved — run 'sc rebase --continue' ({} of {})",
+                    done + 1,
+                    total
+                );
+            } else {
+                println!(
+                    "rebase in progress: stopped at {} ({} of {}); resolve conflicts then 'sc rebase --continue', or 'sc rebase --abort'",
+                    conflicted.short(),
+                    done + 1,
+                    total
+                );
+            }
         }
     }
     let s = repo.status()?;
@@ -1202,8 +1217,11 @@ fn run_cherry_pick(
 ) -> Result<()> {
     let repo = open_repo()?;
     if abort {
-        repo.cherry_pick_abort()?;
+        let skipped = repo.cherry_pick_abort()?;
         println!("cherry-pick aborted; working tree restored");
+        for path in &skipped {
+            eprintln!("skipped (no key): {path}");
+        }
         return Ok(());
     }
     let refname =
@@ -1244,8 +1262,11 @@ fn run_rebase(
 ) -> Result<()> {
     let repo = open_repo()?;
     if abort {
-        repo.rebase_abort()?;
+        let skipped = repo.rebase_abort()?;
         println!("rebase aborted; working tree restored");
+        for path in &skipped {
+            eprintln!("skipped (no key): {path}");
+        }
         return Ok(());
     }
     // Soft-resolve like `run_merge`/`run_cherry_pick`: a missing identity file

@@ -1166,6 +1166,8 @@ mod tests {
             total: 1,
             author: "t".into(),
             resolved: false,
+            replayed: 0,
+            skipped: 0,
         };
         crate::rebase_state::write(repo.layout(), &st).unwrap();
         assert!(matches!(repo.ws_harvest(None, "t", None), Err(Error::RebaseInProgress)));

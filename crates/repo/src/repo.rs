@@ -776,6 +776,20 @@ impl Repo {
         }))
     }
 
+    /// Whether the stopped rebase's conflicted commit has already been
+    /// resolved and completed by a prior `sc rebase --continue`, but the
+    /// fold over the REMAINING commits then errored (e.g. a later commit
+    /// needs `--identity`) — `RebaseState::resolved` (P21). `false` when no
+    /// rebase is in progress or the conflicted commit is still unresolved.
+    /// Distinct from [`rebase_progress`][Repo::rebase_progress]'s "stopped at
+    /// commit X" window: in THIS window there is nothing left to resolve on
+    /// disk — the working tree already reflects the resolution — the user
+    /// just needs to re-run `--continue` (optionally with the identity the
+    /// later commit needs), not touch conflict markers.
+    pub fn rebase_resolved(&self) -> Result<bool> {
+        Ok(crate::rebase_state::read(&self.layout)?.is_some_and(|st| st.resolved))
+    }
+
     /// Merge `branch` into the current branch. Fast-forwards when possible;
     /// auto-commits a two-parent snapshot on a clean merge; on conflicts writes
     /// markers + merge state and returns `MergeConflicts`. If the current
@@ -3612,6 +3626,8 @@ mod tests {
             total: 2,
             author: "me".into(),
             resolved: false,
+            replayed: 0,
+            skipped: 0,
         };
         crate::rebase_state::write(&repo.layout, &st).unwrap();
         assert!(repo.rebase_in_progress());
@@ -3652,6 +3668,8 @@ mod tests {
             total: 2,
             author: "me".into(),
             resolved: false,
+            replayed: 0,
+            skipped: 0,
         };
         crate::rebase_state::write(&repo.layout, &st).unwrap();
         assert!(repo.rebase_in_progress());
@@ -3693,6 +3711,8 @@ mod tests {
             total: 2,
             author: "me".into(),
             resolved: false,
+            replayed: 0,
+            skipped: 0,
         };
         crate::rebase_state::write(&repo.layout, &st).unwrap();
         assert!(repo.rebase_in_progress());
@@ -3753,6 +3773,8 @@ mod tests {
                         total: 1,
                         author: "me".into(),
                         resolved: false,
+                        replayed: 0,
+                        skipped: 0,
                     },
                 )
                 .unwrap();
@@ -4070,6 +4092,8 @@ mod tests {
             total: 2,
             author: "me".into(),
             resolved: false,
+            replayed: 0,
+            skipped: 0,
         };
         crate::rebase_state::write(&repo.layout, &st).unwrap();
         assert!(matches!(repo.amend("me", None), Err(Error::RebaseInProgress)));

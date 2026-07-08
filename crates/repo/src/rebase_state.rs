@@ -55,6 +55,20 @@ pub struct RebaseState {
     /// `false` when absent from an on-disk file written before this field
     /// existed.
     pub resolved: bool,
+    /// Cumulative count of commits landed (clean, empty-with-registry-change,
+    /// or completed-from-conflict) across the WHOLE rebase so far, including
+    /// every prior stop's segment — NOT just the segment since the last stop.
+    /// Seeds `rebase_fold_and_finish`'s local counter on resume so the final
+    /// oplog record's "N replayed" reflects the entire operation, matching
+    /// the single-oplog-record collapse the rest of the resumable-rebase
+    /// design already relies on. Backward parse defaults to 0, like
+    /// `resolved`: a file written before this field existed predates any
+    /// completed segment, so 0 is the correct reading.
+    pub replayed: usize,
+    /// Cumulative count of genuinely no-op commits (tree, own-rules delta,
+    /// AND registry delta all empty) across the whole rebase so far. Same
+    /// seeding/backward-parse discipline as `replayed`.
+    pub skipped: usize,
 }
 
 fn state_path(layout: &Layout) -> std::path::PathBuf {
@@ -103,6 +117,8 @@ fn serialize(st: &RebaseState) -> String {
     out.push_str(&format!("total={}\n", st.total));
     out.push_str(&format!("author={}\n", st.author));
     out.push_str(&format!("resolved={}\n", st.resolved));
+    out.push_str(&format!("replayed={}\n", st.replayed));
+    out.push_str(&format!("skipped={}\n", st.skipped));
     for id in &st.remaining {
         out.push_str(&format!("{}\n", id.to_hex()));
     }
@@ -141,6 +157,23 @@ fn deserialize(text: &str) -> Result<RebaseState> {
         }
         _ => false,
     };
+    // `replayed=`/`skipped=` are optional on parse for the same reason as
+    // `resolved=` — a file written before P21 has no completed segment to
+    // count yet, so 0 is the correct default.
+    let replayed = match lines.peek() {
+        Some(line) if line.starts_with("replayed=") => {
+            let text = parse_kv(lines.next().unwrap(), "replayed")?;
+            text.parse::<usize>().map_err(|_| bad(format!("bad replayed: {text}")))?
+        }
+        _ => 0,
+    };
+    let skipped = match lines.peek() {
+        Some(line) if line.starts_with("skipped=") => {
+            let text = parse_kv(lines.next().unwrap(), "skipped")?;
+            text.parse::<usize>().map_err(|_| bad(format!("bad skipped: {text}")))?
+        }
+        _ => 0,
+    };
     let mut remaining = Vec::new();
     for line in lines {
         remaining.push(parse_id(line, "remaining")?);
@@ -155,6 +188,8 @@ fn deserialize(text: &str) -> Result<RebaseState> {
         total,
         author,
         resolved,
+        replayed,
+        skipped,
     })
 }
 
@@ -277,6 +312,8 @@ mod tests {
             total: 4,
             author: "me".into(),
             resolved: false,
+            replayed: 0,
+            skipped: 0,
         }
     }
 
@@ -387,6 +424,44 @@ mod tests {
         std::fs::write(state_path(&layout), text).unwrap();
         let read_back = read(&layout).unwrap().unwrap();
         assert!(!read_back.resolved, "must default to false when the field is absent");
+        assert_eq!(read_back.remaining, st.remaining, "remaining ids must still parse correctly");
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn counters_roundtrip() {
+        let layout = tmp_layout("counters");
+        let mut st = sample("counters");
+        st.replayed = 3;
+        st.skipped = 2;
+        write(&layout, &st).unwrap();
+        assert_eq!(read(&layout).unwrap(), Some(st));
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn counters_default_zero_when_absent_from_file() {
+        // Simulates a REBASE_STATE written before the `replayed`/`skipped`
+        // fields existed (P19-era file with only `resolved=`): no counter
+        // lines at all, remaining ids immediately follow `resolved=`.
+        let layout = tmp_layout("counters-absent");
+        let st = sample("counters-absent");
+        let mut text = String::new();
+        text.push_str(&format!("branch={}\n", st.branch));
+        text.push_str(&format!("original_tip={}\n", st.original_tip.to_hex()));
+        text.push_str(&format!("target={}\n", st.target));
+        text.push_str(&format!("acc_tip={}\n", st.acc_tip.to_hex()));
+        text.push_str(&format!("conflicted={}\n", st.conflicted.to_hex()));
+        text.push_str(&format!("total={}\n", st.total));
+        text.push_str(&format!("author={}\n", st.author));
+        text.push_str(&format!("resolved={}\n", st.resolved));
+        for id in &st.remaining {
+            text.push_str(&format!("{}\n", id.to_hex()));
+        }
+        std::fs::write(state_path(&layout), text).unwrap();
+        let read_back = read(&layout).unwrap().unwrap();
+        assert_eq!(read_back.replayed, 0, "must default to 0 when the field is absent");
+        assert_eq!(read_back.skipped, 0, "must default to 0 when the field is absent");
         assert_eq!(read_back.remaining, st.remaining, "remaining ids must still parse correctly");
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
