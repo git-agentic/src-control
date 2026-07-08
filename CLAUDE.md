@@ -339,7 +339,8 @@ existing `LocalTransport` (CAS, pack verification reused verbatim); the
 client spawns the user's `ssh` for `ssh://` URLs, overridable via `SC_SSH`
 (GIT_SSH pattern) — tests and `demo/run_ssh_remote_demo.sh` drive the full
 ssh:// code path through a shim with no sshd. Zero new dependencies. Accepted
-limitations: 4 GiB frame cap, repo paths with spaces unsupported over real
+limitations: 4 GiB frame cap (→ lifted in P25 — packs now stream in
+`CHUNK_SIZE` frames, ADR-0035), repo paths with spaces unsupported over real
 ssh, `sc` must be on the server's PATH. See ADR-0022.
 
 **Phase 13 is built.** Agent workspaces: `sc work --agents N -- <cmd>` forks
