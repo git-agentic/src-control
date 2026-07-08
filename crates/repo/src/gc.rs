@@ -18,7 +18,7 @@ use scl_core::{ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
-use crate::{merge_state, oplog, pick_state, reachable, rebase_state, refs, ws};
+use crate::{merge_state, oplog, pick_state, reachable, rebase_state, refs, signatures, ws};
 
 /// What a gc pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -27,6 +27,10 @@ pub struct GcStats {
     pub loose_pruned: usize,
     pub loose_kept: usize,
     pub packs_removed: usize,
+    /// Signature index entries dropped (P22) because their snapshot fell out
+    /// of the reachable set this pass; their signature objects fall through
+    /// to the ordinary loose-object prune, not counted here.
+    pub signatures_pruned: usize,
 }
 
 /// The full safe root set (snapshot ids): all branch tips + resolved HEAD +
@@ -107,6 +111,17 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     if let Some(tree) = rebase_state::read_decided_root(layout)? {
         reachable::walk_tree(store, tree, &mut reachable)?;
     }
+
+    // Signature index (P22): a SignatureObj is reachable from no tree/parent
+    // walk (it isn't referenced by any snapshot), so it needs its own root
+    // decision here, in the same window the merge/pick/rebase decided-root
+    // roots above use — after every other root source has contributed to
+    // `reachable`, but before packing. Entries whose snapshot survived above
+    // get their signature object rooted into `reachable`; entries whose
+    // snapshot didn't are dropped from the index, and their now-unrooted
+    // signature object falls through to the ordinary loose-object
+    // aging/pruning sweep below like any other unreachable object.
+    stats.signatures_pruned = signatures::gc_prune(layout, &mut reachable)?;
 
     // 1. Repack the entire reachable set into one fresh pack (skip if empty).
     let new_hash = if reachable.is_empty() {

@@ -68,4 +68,9 @@ impl Layout {
     pub fn oplog_path(&self) -> PathBuf {
         self.dot_sc.join("oplog")
     }
+    /// `.sc/signatures` — the append-only snapshot-signature index (P22):
+    /// one `<snapshot-hex> <sig-object-hex>` line per indexed signature.
+    pub fn signatures_path(&self) -> PathBuf {
+        self.dot_sc.join("signatures")
+    }
 }

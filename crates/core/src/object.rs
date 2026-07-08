@@ -15,6 +15,7 @@ const TAG_TREE: u8 = 1;
 const TAG_SNAPSHOT_LEGACY: u8 = 2; // pre-P16 encoding; refused with a clear error
 const TAG_SECRET: u8 = 3;
 const TAG_SNAPSHOT: u8 = 4;
+const TAG_SIGNATURE: u8 = 5;
 
 /// Perms-byte bit: this blob entry holds a `nonce‖ciphertext` envelope (an
 /// encrypted file), not plaintext. Set on protected-path entries (P7).
@@ -171,6 +172,24 @@ pub struct Secret {
     pub wrapped_keys: Vec<WrappedKey>,
 }
 
+/// A detached Ed25519 signature over a snapshot id (P22 provenance). `core`
+/// stays crypto-free: this struct is raw bytes only — nothing here knows how
+/// to produce or verify a signature. `crates/crypto` owns
+/// `sign_snapshot_id`/`verify_snapshot_sig`; `crates/repo` composes them with
+/// this object and its CAS storage. Content-addressed like any other object,
+/// so signing the same snapshot with the same key twice (Ed25519 signing is
+/// deterministic) always yields the same object id — a natural idempotency
+/// key for `sign_snapshot`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SignatureObj {
+    /// The snapshot this signature covers.
+    pub snapshot: ObjectId,
+    /// The signer's raw 32-byte Ed25519 verifying-key bytes.
+    pub signer: [u8; 32],
+    /// The raw 64-byte Ed25519 signature.
+    pub sig: [u8; 64],
+}
+
 /// Any object the store can hold. Blob bytes are `Arc`-shared so forking many
 /// worktrees off one snapshot never copies file content.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -179,6 +198,7 @@ pub enum Object {
     Tree(Tree),
     Snapshot(Snapshot),
     Secret(Secret),
+    Signature(SignatureObj),
 }
 
 impl Object {
@@ -200,6 +220,7 @@ impl Object {
             Object::Tree(_) => "tree",
             Object::Snapshot(_) => "snapshot",
             Object::Secret(_) => "secret",
+            Object::Signature(_) => "signature",
         }
     }
 
@@ -286,6 +307,12 @@ impl Object {
                     w.str(&k.recipient_id);
                     w.bytes(&k.wrapped_dek);
                 }
+            }
+            Object::Signature(s) => {
+                w.tag(TAG_SIGNATURE);
+                w.id(&s.snapshot);
+                w.raw(&s.signer); // fixed 32 bytes — no length prefix needed
+                w.raw(&s.sig); // fixed 64 bytes — no length prefix needed
             }
         }
         w.0
@@ -384,6 +411,18 @@ impl Object {
                     wrapped_keys.push(WrappedKey { recipient_id, wrapped_dek });
                 }
                 Object::Secret(Secret { name, nonce, ciphertext, wrapped_keys })
+            }
+            TAG_SIGNATURE => {
+                let snapshot = r.id()?;
+                let mut signer = [0u8; 32];
+                signer.copy_from_slice(r.take(32)?);
+                let mut sig = [0u8; 64];
+                sig.copy_from_slice(r.take(64)?);
+                // Strict decode: fixed-width fields only, no trailing bytes.
+                if r.remaining() != 0 {
+                    return Err(Error::Malformed("trailing bytes in signature object".into()));
+                }
+                Object::Signature(SignatureObj { snapshot, signer, sig })
             }
             t => return Err(Error::Malformed(format!("unknown object tag {t}"))),
         };
@@ -683,6 +722,57 @@ mod tests {
         let err = Object::decode(&[2u8, 0, 0]).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("pre-P16"), "unhelpful error: {msg}");
+    }
+
+    #[test]
+    fn signature_object_roundtrips() {
+        let sig_obj = Object::Signature(SignatureObj {
+            snapshot: ObjectId::from_bytes([3; 32]),
+            signer: [5; 32],
+            sig: [9; 64],
+        });
+        assert_eq!(sig_obj, Object::decode(&sig_obj.encode()).unwrap());
+        assert_eq!(sig_obj.kind_name(), "signature");
+    }
+
+    #[test]
+    fn signature_object_ids_are_content_addressed() {
+        // Same fields -> same id; a different signer or sig byte changes it.
+        let a = Object::Signature(SignatureObj {
+            snapshot: ObjectId::from_bytes([1; 32]),
+            signer: [2; 32],
+            sig: [3; 64],
+        });
+        let b = Object::Signature(SignatureObj {
+            snapshot: ObjectId::from_bytes([1; 32]),
+            signer: [2; 32],
+            sig: [3; 64],
+        });
+        assert_eq!(a.id(), b.id());
+        let c = Object::Signature(SignatureObj {
+            snapshot: ObjectId::from_bytes([1; 32]),
+            signer: [9; 32],
+            sig: [3; 64],
+        });
+        assert_ne!(a.id(), c.id());
+    }
+
+    #[test]
+    fn signature_decode_rejects_truncation() {
+        let sig_obj = Object::Signature(SignatureObj {
+            snapshot: ObjectId::from_bytes([3; 32]),
+            signer: [5; 32],
+            sig: [9; 64],
+        });
+        let bytes = sig_obj.encode();
+        // Chop off the last byte of the fixed-width sig field: too short to
+        // decode, must error rather than silently truncate the signature.
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(Object::decode(truncated).is_err());
+        // Trailing garbage past the fixed-width fields must also be rejected.
+        let mut extended = bytes.clone();
+        extended.push(0xff);
+        assert!(Object::decode(&extended).is_err());
     }
 
     #[test]
