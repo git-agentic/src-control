@@ -40,6 +40,14 @@ pub struct WsEntry {
     /// False once harvested or abandoned; the entry is kept (not removed)
     /// so `sc ws list` can still show what happened to it.
     pub live: bool,
+    /// Set only when this entry's resolution was `Landed` (or the
+    /// idempotent `UpToDate` no-op landing) — the tip it merged onto the
+    /// landing branch. `None` for a manual `ws_abandon`, an `Unchanged`
+    /// resolution, or a `FallbackBranch`. Lets `sc ws list` tell a true
+    /// landing apart from a plain abandon, and — by checking whether this
+    /// tip is still an ancestor of the landing branch — a landing that was
+    /// since undone (P21).
+    pub landed_tip: Option<ObjectId>,
 }
 
 /// The session manifest (`.sc/ws/session.toml`). Never stores key material.
@@ -71,6 +79,10 @@ struct EntryToml {
     index: u32,
     dir: String,
     live: bool,
+    // Backward-parse pattern (matches `rebase_state.rs`'s counters): absent
+    // in pre-P21 manifests, defaults to `None`.
+    #[serde(default)]
+    landed_tip: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -95,6 +107,7 @@ impl From<&WsSession> for SessionToml {
                     index: e.index,
                     dir: e.dir.display().to_string(),
                     live: e.live,
+                    landed_tip: e.landed_tip.map(|t| t.to_hex()),
                 })
                 .collect(),
         }
@@ -109,12 +122,16 @@ impl TryFrom<SessionToml> for WsSession {
         let workspaces = raw
             .workspace
             .into_iter()
-            .map(|e| WsEntry {
-                index: e.index,
-                dir: PathBuf::from(e.dir),
-                live: e.live,
+            .map(|e| {
+                let landed_tip = e
+                    .landed_tip
+                    .map(|t| {
+                        ObjectId::from_str(&t).map_err(|_| bad(format!("bad landed_tip: {t}")))
+                    })
+                    .transpose()?;
+                Ok(WsEntry { index: e.index, dir: PathBuf::from(e.dir), live: e.live, landed_tip })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(WsSession {
             base_snapshot,
             base_branch: raw.base_branch,
@@ -193,6 +210,7 @@ impl Repo {
                 index: i,
                 dir,
                 live: true,
+                landed_tip: None,
             });
         }
 
@@ -215,16 +233,74 @@ impl Repo {
     /// snapshot. Mirrors `harvest_workspace`'s diff check exactly (repeated,
     /// not extracted — `harvest_workspace` diffs against the harvest's own
     /// `tip` argument, not a manifest, and the two call sites have no shared
-    /// caller worth threading a helper through for five lines).
+    /// caller worth threading a helper through for five lines). Re-reads and
+    /// re-parses the manifest on every call; callers that already hold a
+    /// loaded `WsSession` (e.g. `sc ws list`'s and `ws_harvest`'s per-entry
+    /// loops) should call [`Self::ws_changed_for`] instead (P21).
     pub fn ws_changed(&self, entry: &WsEntry) -> Result<bool> {
         let session = read_manifest(self.layout())?
             .ok_or_else(|| Error::InvalidArgument("no workspace session open".into()))?;
+        self.ws_changed_for(&session, entry)
+    }
+
+    /// Like [`Self::ws_changed`], but takes an already-loaded `session`
+    /// instead of re-reading and re-parsing `session.toml` — a `sc ws list`
+    /// over N workspaces used to parse the manifest N times for one listing
+    /// (P21).
+    pub fn ws_changed_for(&self, session: &WsSession, entry: &WsEntry) -> Result<bool> {
         let base = self.snapshot(&session.base_snapshot)?;
         let ws = Layout::at(&entry.dir);
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
         let d = worktree::diff_worktree(&ws, &mut store, Some(base.root), &base.protection)?;
         Ok(!(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
+    }
+
+    /// A human-readable status for `sc ws list`: `"changed"`/`"unchanged"`
+    /// for a live entry, `"abandoned"` for a manual `ws_abandon` or a
+    /// resolution that never landed (`Unchanged`/`FallbackBranch`), and —
+    /// truthfully distinguishing the case that used to also print
+    /// "abandoned" — `"landed"` or `"landed (undone by sc undo)"` for a
+    /// resolved entry that landed a merge, depending on whether
+    /// `entry.landed_tip` is still an ancestor of `session.base_branch`'s
+    /// current tip (P21). Missing landing-branch tip (deleted/unborn) is
+    /// treated as undone.
+    ///
+    /// Known limitation: the manifest doesn't record which branch each
+    /// entry actually landed onto (`ws_harvest`'s `--into` can differ from
+    /// `base_branch`), so a workspace harvested with `--into <other>` is
+    /// ancestry-checked against `base_branch` regardless — it can
+    /// misreport "undone" for a landing that is intact on `<other>`. Out
+    /// of scope for this pass: storing a per-entry landing branch is a
+    /// manifest schema change beyond a label fix, and the common case
+    /// (default landing branch) is unaffected.
+    pub fn ws_status_label(&self, session: &WsSession, entry: &WsEntry) -> Result<String> {
+        if entry.live {
+            return Ok(if self.ws_changed_for(session, entry)? {
+                "changed".to_string()
+            } else {
+                "unchanged".to_string()
+            });
+        }
+        match entry.landed_tip {
+            None => Ok("abandoned".to_string()),
+            Some(landed_tip) => {
+                let current = refs::read_branch_tip(self.layout(), &session.base_branch)?;
+                let still_landed = match current {
+                    Some(tip) => {
+                        let store_arc = self.vfs().store();
+                        let mut store = store_arc.lock().unwrap();
+                        crate::merge::is_ancestor(&mut store, landed_tip, tip)?
+                    }
+                    None => false,
+                };
+                Ok(if still_landed {
+                    "landed".to_string()
+                } else {
+                    "landed (undone by sc undo)".to_string()
+                })
+            }
+        }
     }
 
     /// Abandon one workspace (`Some(index)`) or the whole session (`None`):
@@ -388,6 +464,20 @@ impl Repo {
     /// mid-harvest loses nothing: resolved workspaces are torn down and
     /// recorded, live ones are untouched. Once no live workspace remains,
     /// `.sc/ws/` is removed entirely (the session has ended).
+    ///
+    /// Landing is at-least-once, not exactly-once: a kill -9 between a
+    /// candidate branch landing (the ref-moving `merge_with_identity` call)
+    /// and `resolve_and_teardown`'s manifest rewrite leaves the workspace
+    /// still marked live, with its checkout dir and content untouched. The
+    /// next `sc ws harvest` re-runs that workspace through the full
+    /// pipeline, re-minting an IDENTICAL candidate commit (same parent,
+    /// tree, author, message — and timestamp, if retried within the same
+    /// wall-clock second), which is already reachable from the landing
+    /// branch. `merge_with_identity` then returns `Err(UpToDate)` instead of
+    /// minting a second merge commit, and that's resolved as an idempotent
+    /// no-op `Landed` at the existing tip, not an error — content-safe by
+    /// construction (no new commit, no duplicate content), not merely by
+    /// accident.
     pub fn ws_harvest(
         &self,
         into: Option<&str>,
@@ -433,7 +523,7 @@ impl Repo {
             .workspaces
             .iter()
             .filter(|e| e.live)
-            .map(|e| self.ws_changed(e))
+            .map(|e| self.ws_changed_for(&session, e))
             .collect::<Result<Vec<bool>>>()?
             .into_iter()
             .any(|changed| changed);
@@ -455,11 +545,11 @@ impl Repo {
                 .expect("index came from this session's own live list")
                 .dir
                 .clone();
-            let entry = WsEntry { index: i, dir: dir.clone(), live: true };
+            let entry = WsEntry { index: i, dir: dir.clone(), live: true, landed_tip: None };
 
             // Step 1: unchanged workspaces resolve with no branch created.
-            if !self.ws_changed(&entry)? {
-                resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+            if !self.ws_changed_for(&session, &entry)? {
+                resolve_and_teardown(self.layout(), &mut session, i, &dir, None)?;
                 outcomes.push(WsHarvestOutcome::Unchanged { index: i });
                 continue;
             }
@@ -505,7 +595,7 @@ impl Repo {
                     // own `tip` argument (session.base_snapshot, same value
                     // here) — so this arm is unreachable in practice, kept
                     // only so the match is exhaustive without a panic.
-                    resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                    resolve_and_teardown(self.layout(), &mut session, i, &dir, None)?;
                     outcomes.push(WsHarvestOutcome::Unchanged { index: i });
                 }
                 crate::workspace::HarvestResult::Committed(id) => {
@@ -522,7 +612,7 @@ impl Repo {
                                 // (merge_with_identity resolved by branch
                                 // name, not object id).
                                 refs::delete_branch(self.layout(), &branch)?;
-                                resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                                resolve_and_teardown(self.layout(), &mut session, i, &dir, Some(merged))?;
                                 outcomes.push(WsHarvestOutcome::Landed { index: i, merged_tip: merged });
                             }
                             Err(Error::UpToDate) => {
@@ -541,7 +631,13 @@ impl Repo {
                                 // a successful no-op resolution, not an
                                 // error.
                                 refs::delete_branch(self.layout(), &branch)?;
-                                resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                                resolve_and_teardown(
+                                    self.layout(),
+                                    &mut session,
+                                    i,
+                                    &dir,
+                                    Some(current_tip),
+                                )?;
                                 outcomes.push(WsHarvestOutcome::Landed {
                                     index: i,
                                     merged_tip: current_tip,
@@ -576,7 +672,7 @@ impl Repo {
                         }
                     } else {
                         // Keep the candidate branch for manual resolution.
-                        resolve_and_teardown(self.layout(), &mut session, i, &dir)?;
+                        resolve_and_teardown(self.layout(), &mut session, i, &dir, None)?;
                         outcomes.push(WsHarvestOutcome::FallbackBranch { index: i, branch });
                     }
                 }
@@ -594,15 +690,21 @@ impl Repo {
 /// Mark workspace `i` resolved (`live = false`), tear down its checkout dir,
 /// and persist the manifest — the shared tail of every non-`Rejected`
 /// `ws_harvest` outcome, so a crash right after this point has already
-/// recorded the resolution durably.
+/// recorded the resolution durably. `landed_tip` is `Some` only for a
+/// `Landed` (or idempotent `UpToDate` no-op landing) resolution — recorded
+/// so `sc ws list` can later tell a true landing apart from a plain abandon,
+/// and (via ancestry against the landing branch's current tip) a landing
+/// that was since undone (P21).
 fn resolve_and_teardown(
     layout: &Layout,
     session: &mut WsSession,
     index: u32,
     dir: &std::path::Path,
+    landed_tip: Option<ObjectId>,
 ) -> Result<()> {
     if let Some(entry) = session.workspaces.iter_mut().find(|e| e.index == index) {
         entry.live = false;
+        entry.landed_tip = landed_tip;
     }
     // Manifest first, then dir removal: a crash between the two leaves the
     // entry already recorded `live = false` with a dir that still happens to
@@ -1166,6 +1268,8 @@ mod tests {
             total: 1,
             author: "t".into(),
             resolved: false,
+            replayed: 0,
+            skipped: 0,
         };
         crate::rebase_state::write(repo.layout(), &st).unwrap();
         assert!(matches!(repo.ws_harvest(None, "t", None), Err(Error::RebaseInProgress)));
@@ -1223,8 +1327,28 @@ mod tests {
         assert!(!e1.live, "ws-1 landed and should be resolved");
         assert!(e2.live, "ws-2 was rejected and must stay live");
 
-        // No stray branch for the rejected workspace.
-        assert!(crate::refs::read_branch_tip(repo.layout(), "work-2").unwrap().is_none());
+        // Vocabulary (P21): a resolved entry that actually landed a merge
+        // reports "landed", not the generic "abandoned" a manual
+        // `ws_abandon` would show. ws-2 stayed live, so its label is the
+        // live changed/unchanged vocabulary — it still has the leaked file,
+        // so "changed".
+        assert_eq!(repo.ws_status_label(&after, e1).unwrap(), "landed");
+        assert_eq!(repo.ws_status_label(&after, e2).unwrap(), "changed");
+
+        // sc undo reverts ws-1's landing. The manifest still records ws-1
+        // as resolved (`live = false`) — the session stays open because
+        // ws-2 is still live — but ws-1's landed tip is no longer an
+        // ancestor of the landing branch's tip. `sc ws list` must say so
+        // truthfully instead of the misleading generic "abandoned".
+        repo.undo().unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "base\n");
+        let after_undo =
+            repo.ws_session().unwrap().expect("ws-2 still live keeps the session open");
+        let e1_after_undo = after_undo.workspaces.iter().find(|e| e.index == 1).unwrap();
+        assert_eq!(
+            repo.ws_status_label(&after_undo, e1_after_undo).unwrap(),
+            "landed (undone by sc undo)"
+        );
 
         // Fixing the file then re-harvesting completes and ends the session.
         std::fs::remove_file(e2.dir.join("leak.txt")).unwrap();
@@ -1278,7 +1402,7 @@ mod tests {
             base_snapshot: session.base_snapshot,
             base_branch: session.base_branch.clone(),
             author: session.author.clone(),
-            workspaces: vec![WsEntry { index: 1, dir: dir.clone(), live: true }],
+            workspaces: vec![WsEntry { index: 1, dir: dir.clone(), live: true, landed_tip: None }],
         };
         write_manifest(repo.layout(), &crashed).unwrap();
 

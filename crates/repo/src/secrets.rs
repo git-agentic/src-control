@@ -71,6 +71,19 @@ impl Repo {
 
     /// Seal `value` to `recipients` and register it under `name`.
     pub fn secret_add(&self, name: &str, value: &[u8], recipients: &[PublicKey]) -> Result<ObjectId> {
+        // P19-I1: policy ops that move the branch tip via `commit_registry`
+        // had no in-progress guard of their own, letting them silently
+        // discard a stopped merge/pick/rebase's pending resolution. Same
+        // guard trio as `commit`/`rewrap` (P21).
+        if crate::merge_state::in_progress(self.layout()) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(self.layout()) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(self.layout()) {
+            return Err(Error::RebaseInProgress);
+        }
         require_recipients(recipients)?;
         let secret = scl_crypto::seal(name, value, recipients);
         let id = {
@@ -85,6 +98,18 @@ impl Repo {
 
     /// Grant `new` access to `name` by re-wrapping the DEK with `authorized`.
     pub fn secret_grant(&self, name: &str, authorized: &SecretKey, new: &PublicKey) -> Result<ObjectId> {
+        // P21: `secret_grant` also moves the branch tip via `commit_registry`
+        // (confirmed by inspection per the P21 brief) — same guard trio as
+        // `secret_add`/`secret_rotate`.
+        if crate::merge_state::in_progress(self.layout()) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(self.layout()) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(self.layout()) {
+            return Err(Error::RebaseInProgress);
+        }
         let mut reg = self.registry()?;
         let sid = *reg.get(name).ok_or_else(|| Error::NoSuchSecret(name.to_string()))?;
         let secret = {
@@ -107,6 +132,18 @@ impl Repo {
 
     /// Revoke a recipient from `name` (metadata-only re-wrap).
     pub fn secret_revoke(&self, name: &str, recipient: &RecipientId) -> Result<ObjectId> {
+        // P21: `secret_revoke` also moves the branch tip via `commit_registry`
+        // (confirmed by inspection per the P21 brief) — same guard trio as
+        // `secret_add`/`secret_rotate`.
+        if crate::merge_state::in_progress(self.layout()) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(self.layout()) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(self.layout()) {
+            return Err(Error::RebaseInProgress);
+        }
         let mut reg = self.registry()?;
         let sid = *reg.get(name).ok_or_else(|| Error::NoSuchSecret(name.to_string()))?;
         let secret = {
@@ -150,6 +187,16 @@ impl Repo {
         recipients: &[PublicKey],
         identity: Option<&SecretKey>,
     ) -> Result<ObjectId> {
+        // P21: same in-progress guard as `secret_add` — see its comment.
+        if crate::merge_state::in_progress(self.layout()) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(self.layout()) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(self.layout()) {
+            return Err(Error::RebaseInProgress);
+        }
         require_recipients(recipients)?;
         let mut reg = self.registry()?;
         let sid = *reg.get(name).ok_or_else(|| Error::NoSuchSecret(name.to_string()))?;

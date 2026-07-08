@@ -453,7 +453,10 @@ today. Each git-backed network remote keeps a lazily-created bare mirror
 at `.sc/git-remotes/<name>/mirror.git`, beside (not replacing) P10's
 `marks` file in the same directory; deleting `mirror.git` is always safe
 (next op reconstructs it), deleting `marks` is not (it carries `git_oid
-↔ sc_id` identity). The spawned system `git` binary (`crates/gitio/src/
+↔ sc_id` identity) **→ self-heals in P21** (a mark whose git commit was
+pruned from the target — e.g. by `git gc` — is re-verified and
+re-synthesized on push/export instead of writing a broken parent chain;
+see below). The spawned system `git` binary (`crates/gitio/src/
 bridge.rs`) is transport-only: `sc fetch` runs `git fetch --prune` into
 the mirror, then P10's unchanged in-process import; `sc push` runs P10's
 unchanged export into the mirror, then `git push`, reusing the P9/P10
@@ -518,7 +521,10 @@ wrong-registry bug, closed by threading the same resolved parent
 needed a deletion baseline (the stop's `REBASE_DECIDED_ROOT`/
 `PICK_DECIDED_ROOT` as `old_root`, mirroring `merge_abort`'s pattern) —
 review caught that a full clean materialize (`old_root: None`) left
-stop-materialized theirs-side-only files as untracked residue. Proven by
+stop-materialized theirs-side-only files as untracked residue **→ closed
+in P21** (both now return, and the CLI prints, the protected-skip list
+`merge_abort` already reported, so an abort no longer silently drops it).
+Proven by
 the extended `demo/run_history_demo.sh`: an interrupted-and-resumed
 rebase asserting exactly one new oplog record, an aborted cherry-pick
 verified byte-identical by checksum, and an `sc amend` message fix with
@@ -531,7 +537,11 @@ fork --agents N [--identity <key>]` materializes N checkouts under
 status, author — never key material); the checkout dirs ARE the durable
 state, so `sc ws list`/`run` (P13 env/secret-injection parity,
 `SC_WORKSPACE`/`SC_WORKSPACE_DIR`) and `sc ws harvest`/`abandon` work
-across any number of later invocations, even a different day. `sc ws
+across any number of later invocations, even a different day **→ P21**
+(`sc ws list` now names a resolved-and-landed workspace `"landed"`, or
+`"landed (undone by sc undo)"` if its merge was since undone, instead of
+the generic `"abandoned"` a manual `ws_abandon` still shows; see below).
+`sc ws
 harvest [--into <branch>] [--identity <key>]` runs each live workspace
 through P13's `harvest_workspace` pipeline (`.scignore`, P5 scanner
 gate, protected re-encryption), then auto-merges the resulting candidate
@@ -570,6 +580,42 @@ invocation, edit workspaces in another, harvest in a third — two clean
 auto-merges land cumulatively, one conflict falls back to `work-<i>`,
 `sc undo` reverts the last landing, and session end leaves zero residue.
 See ADR-0030.
+
+**Phase 21 is built.** A hardening sweep closing the P16–P20 review tail,
+no new capability axis. Every commit-creating policy op —
+`protect`/`grant`/`revoke` (`protect_ops.rs`) and `secret add`/`secret
+rotate`/`secret grant`/`secret revoke` (`secrets.rs`, seven ops in all) —
+now opens with the same three-line `MergeInProgress`/`PickInProgress`/
+`RebaseInProgress` guard block `rewrap` and the ref-movers already used,
+closing the P19-I1 hazard (an unguarded policy op mid-stopped-rebase
+whose commit the completion machinery silently discarded). A review pass
+caught that `secret_grant` needed the same guard as `secret_revoke` —
+both call the shared `commit_registry` ref-mover — a Critical fixed
+same-day. Marks staleness self-heals at the only dangerous point of use:
+`GitTarget::has_object` verifies each mark-reused git commit still
+exists in the target before reuse, re-synthesizing (with a one-line
+stderr note) when it was pruned instead of writing a broken parent
+chain; the check is commit-scoped (not a tree/blob-closure walk) because
+`git gc`'s reachability pruning is atomic — a commit is never left
+dangling over a pruned tree — and heal convergence is proven to a stable
+fixed point, not just a one-shot recovery. Rebase/pick aborts now return
+and print the protected-skip list (`merge_abort` parity); `sc status`
+distinguishes the resolved-awaiting-`--continue` window from an
+unresolved conflict; multi-stop rebase oplog descriptions report
+cumulative replayed/skipped counts via two new backward-parsed
+`RebaseState` fields. The three verbatim conflict-materialization copies
+(merge's conflict arm, cherry-pick's, and the rebase fold's) collapse
+into one `pub(crate)` `Repo::materialize_conflict_state` helper under the
+P19 extraction discipline — existing conflict tests stay green with zero
+test edits. `sc ws list` gains `WsEntry.landed_tip` (backward-parsed,
+`None` for pre-P21 manifests) so a resolved workspace that actually
+landed a merge reports `"landed"` (or `"landed (undone by sc undo)"` if
+its merge is no longer an ancestor of the landing branch's tip) instead
+of the generic `"abandoned"` a manual `ws_abandon` still shows; the
+listing loop now loads the session manifest once instead of re-parsing
+it per workspace. Every closed finding's original repro is a pinned
+regression test; the phase's demoable outcome is every existing demo
+staying green, not a new demo script. See ADR-0031.
 
 Remaining follow-ons: HTTP transport, streaming (>4 GiB) frames,
 operation objects in the CAS, and oplog entries for remote-tracking refs.

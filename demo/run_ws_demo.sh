@@ -103,9 +103,14 @@ echo "sc log shows both landings on main ✔"
 
 test -f file-1.txt || fail "ws-1's landed file missing from main"
 test -f file-2.txt || fail "ws-2's landed file missing from main"
-for f in alpha.txt shared.txt file-1.txt file-2.txt; do
+# Recursive tree walk (P21): a fixed file list would silently stop covering
+# new files as the demo grows. Walk every file under the working tree,
+# excluding `.sc/` (object store, refs, and — during the fallback branch's
+# resolution below — legitimate in-progress MERGE_STATE bookkeeping live
+# there, not in the working tree).
+while IFS= read -r -d '' f; do
   grep -l "<<<<<<<" "$f" >/dev/null 2>&1 && fail "unexpected conflict marker in $f"
-done
+done < <(find "$repo" -path "$repo/.sc" -prune -o -type f -print0)
 echo "no conflict markers in the working tree ✔"
 
 echo

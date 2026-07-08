@@ -491,7 +491,6 @@ impl Repo {
                     wrapped: Default::default(),
                 };
                 let (carried, to_encrypt) = split_for_encryption(&files, &union_prot)?;
-                let conflict_root = self.vfs().write_tree_with_perms(&carried)?;
                 // Wraps for the conflict materialize: ours ∪ picked (a carried
                 // blob survives from one of the two sides, so their unioned
                 // maps cover every carried PROTECTED entry — the same
@@ -503,39 +502,14 @@ impl Repo {
                 }
                 let conflict_prot =
                     scl_core::Protection { prefixes: union_prefixes, wrapped };
-                {
-                    let store_arc = self.vfs().store();
-                    let mut store = store_arc.lock().unwrap();
-                    // Carried PROTECTED entries decrypt for `identity` where
-                    // its key matches; the rest are skipped (absent from
-                    // disk). The completion commit's decided-tree
-                    // carry-forward preserves skipped content.
-                    let _skipped = worktree::materialize(
-                        &self.layout,
-                        &mut store,
-                        conflict_root,
-                        Some(ours_root),
-                        &conflict_prot,
-                        identity,
-                    )?;
-                }
-                // Direct plaintext writes AFTER materialize: its deletion pass
-                // (ours-tracked paths absent from the carried-only tree) would
-                // otherwise remove what we just wrote.
-                for (path, bytes, _mode, _recipients) in &to_encrypt {
-                    let full = worktree::safe_join(&self.layout.root, path)?;
-                    if let Some(parent) = full.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(full, bytes)?;
-                }
-                for (rel, bytes) in &sidecars {
-                    let full = self.layout.root.join(rel);
-                    if let Some(parent) = full.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(full, bytes)?;
-                }
+                let conflict_root = self.materialize_conflict_state(
+                    &carried,
+                    &to_encrypt,
+                    &sidecars,
+                    &conflict_prot,
+                    ours_root,
+                    identity,
+                )?;
                 // Markers are on disk; record pick state last (its PICK_HEAD
                 // write is the in-progress signal). The decided carried tree
                 // (`conflict_root`) is persisted alongside so completion
@@ -564,7 +538,12 @@ impl Repo {
     /// unexpectedly absent (older pick state). No oplog record — no ref ever
     /// moved, so abort is its own inverse; nothing to undo. Errors
     /// [`Error::InvalidArgument`] if no cherry-pick is in progress.
-    pub fn cherry_pick_abort(&self) -> Result<()> {
+    ///
+    /// Returns the protected paths that could not be restored (P21): no
+    /// identity is available at abort time, so protected files in the
+    /// restored tree are skipped (left absent) rather than decrypted —
+    /// mirrors [`crate::repo::Repo::merge_abort`]'s contract exactly.
+    pub fn cherry_pick_abort(&self) -> Result<Vec<String>> {
         if !crate::pick_state::in_progress(&self.layout) {
             return Err(Error::InvalidArgument(
                 "no cherry-pick in progress — nothing to abort".into(),
@@ -575,13 +554,22 @@ impl Repo {
         }
         let decided = crate::pick_state::read_decided_root(&self.layout)?;
         let ours_tip = self.head_tip()?;
+        let mut skipped = Vec::new();
         if let Some(tip) = ours_tip {
             let snap = self.snapshot(&tip)?;
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
-            worktree::materialize(&self.layout, &mut store, snap.root, decided, &snap.protection, None)?;
+            skipped = worktree::materialize(
+                &self.layout,
+                &mut store,
+                snap.root,
+                decided,
+                &snap.protection,
+                None,
+            )?;
         }
-        crate::pick_state::clear(&self.layout)
+        crate::pick_state::clear(&self.layout)?;
+        Ok(skipped)
     }
 
     /// Replay the current branch's commits onto `target`'s tip (rebase).
@@ -732,7 +720,9 @@ impl Repo {
         range.reverse();
         let total = range.len();
 
-        self.rebase_fold_and_finish(head, ours_tip, target, target_tip, range, total, author, identity)
+        self.rebase_fold_and_finish(
+            head, ours_tip, target, target_tip, range, total, author, identity, (0, 0),
+        )
     }
 
     /// Shared fold + completion tail for [`rebase`][Repo::rebase] and
@@ -769,6 +759,7 @@ impl Repo {
         total: usize,
         author: &str,
         identity: Option<&scl_crypto::SecretKey>,
+        counters_seed: (usize, usize),
     ) -> Result<RebaseResult> {
         let original_root = self.snapshot(&original_tip)?.root;
         let acc_snap = self.snapshot(&acc_tip)?;
@@ -778,8 +769,14 @@ impl Repo {
         let mut acc_root = acc_snap.root;
         let mut acc_protection = acc_snap.protection;
         let mut acc_secrets = acc_snap.secrets;
-        let mut replayed = 0usize;
-        let mut skipped = 0usize;
+        // Seeded from the rebase's cumulative counts so far (0,0 on the
+        // first pass; the persisted `RebaseState.replayed`/`.skipped` — plus
+        // the just-completed conflicted commit, see `rebase_continue` — on a
+        // resumed fold), so a rebase that stops N times still reports ONE
+        // cumulative "M replayed, K skipped" at final completion instead of
+        // resetting to the last segment's counts.
+        let mut replayed = counters_seed.0;
+        let mut skipped = counters_seed.1;
         let mut remaining: std::collections::VecDeque<ObjectId> = range.into();
 
         while let Some(commit) = remaining.pop_front() {
@@ -874,42 +871,20 @@ impl Repo {
                         wrapped: Default::default(),
                     };
                     let (carried, to_encrypt) = split_for_encryption(&files, &union_prot)?;
-                    let conflict_root = self.vfs().write_tree_with_perms(&carried)?;
                     let mut wrapped = acc_protection.wrapped.clone();
                     for (id, wks) in &commit_snap.protection.wrapped {
                         let entry = wrapped.entry(*id).or_default();
                         *entry = crate::protect::union_wraps(entry, wks);
                     }
                     let conflict_prot = scl_core::Protection { prefixes: union_prefixes, wrapped };
-                    {
-                        let store_arc = self.vfs().store();
-                        let mut store = store_arc.lock().unwrap();
-                        let _skipped = worktree::materialize(
-                            &self.layout,
-                            &mut store,
-                            conflict_root,
-                            Some(disk_root),
-                            &conflict_prot,
-                            identity,
-                        )?;
-                    }
-                    // Direct plaintext writes AFTER materialize: its deletion
-                    // pass (disk-tracked paths absent from the carried-only
-                    // tree) would otherwise remove what we just wrote.
-                    for (path, bytes, _mode, _recipients) in &to_encrypt {
-                        let full = worktree::safe_join(&self.layout.root, path)?;
-                        if let Some(parent) = full.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::write(full, bytes)?;
-                    }
-                    for (rel, bytes) in &sidecars {
-                        let full = self.layout.root.join(rel);
-                        if let Some(parent) = full.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::write(full, bytes)?;
-                    }
+                    let conflict_root = self.materialize_conflict_state(
+                        &carried,
+                        &to_encrypt,
+                        &sidecars,
+                        &conflict_prot,
+                        disk_root,
+                        identity,
+                    )?;
                     let remaining_after_current: Vec<ObjectId> = remaining.into_iter().collect();
                     let done = total.saturating_sub(remaining_after_current.len()).saturating_sub(1);
                     // Decided root, then conflicts, then REBASE_STATE last —
@@ -930,6 +905,8 @@ impl Repo {
                             total,
                             author: author.to_string(),
                             resolved: false,
+                            replayed,
+                            skipped,
                         },
                     )?;
                     return Ok(RebaseResult::Stopped { conflicted: commit, paths, done, total });
@@ -966,6 +943,25 @@ impl Repo {
         // where the operation is actually done — the ref has moved and the
         // oplog record is written. A no-op (removes nothing) on `rebase`'s
         // own first pass, where no state exists yet.
+        //
+        // Crash-window discipline (P21): the three writes above/below are
+        // ordered ref-write -> oplog -> state-clear, same as `cherry_pick`'s
+        // clean-completion tail. A crash between the ref write and the oplog
+        // record is invisible to `--continue`/`--abort` (both key off
+        // `REBASE_STATE`, still present) and simply re-lands on the next
+        // `--continue` attempt with the branch already at `acc_tip` — a
+        // harmless idempotent re-write, since `write_branch_tip` is a plain
+        // overwrite. A crash between the oplog record and this clear leaves
+        // `REBASE_STATE` present with `resolved` state that DID land (the ref
+        // already moved to the final `acc_tip`): the next `--continue` sees
+        // `remaining` empty, so `assemble_completion_snapshot`/the fold below
+        // are no-ops over an empty range, and this same tail runs again,
+        // producing a SECOND oplog record for a no-op operation. That
+        // duplicate is recoverable (both records describe the same before ->
+        // after transition; `sc undo` of the second is a no-op ref-write,
+        // `sc undo` again reaches the real undo point) rather than corrupting
+        // state — documented here rather than closed, matching this
+        // function's existing crash-discipline comments elsewhere.
         crate::rebase_state::clear(&self.layout)?;
         Ok(RebaseResult::Rebased { new_tip: acc_tip, replayed, skipped })
     }
@@ -1029,14 +1025,17 @@ impl Repo {
                 &st.original_tip.to_hex()[..8],
             )));
         }
-        let new_tip = if st.resolved {
+        let (new_tip, counters_seed) = if st.resolved {
             // A previous `--continue` already completed `st.conflicted` into
             // `st.acc_tip` but the resumed fold errored before finishing (or
             // stopping on a new conflict, which would have overwritten this
             // state already). Re-running `assemble_completion_snapshot` here
             // would double-apply the resolved commit — skip straight to the
-            // fold.
-            st.acc_tip
+            // fold. `st.replayed`/`.skipped` already counted `st.conflicted`
+            // (the write below, on the ORIGINAL `--continue` attempt that set
+            // `resolved = true`, incremented `replayed` for it) — no further
+            // adjustment needed.
+            (st.acc_tip, (st.replayed, st.skipped))
         } else {
             let decided = crate::rebase_state::read_decided_root(&self.layout)?;
             let completed_msg = self.snapshot(&st.conflicted)?.message;
@@ -1066,12 +1065,23 @@ impl Repo {
             // reads `decided_root`/`conflicted`/`remaining` from this same
             // state, all still valid: `conflicted` is now purely historical
             // (its completion already landed in `acc_tip`) and `--abort`
-            // restores to `original_tip` regardless.
+            // restores to `original_tip` regardless. Completing `conflicted`
+            // lands it as a new snapshot, so it counts toward the cumulative
+            // `replayed` total — incremented here, once, at the same moment
+            // `resolved` flips true, so a later retry (which skips straight
+            // to the fold above) reads the already-incremented value instead
+            // of double-counting it.
+            let replayed = st.replayed + 1;
             crate::rebase_state::write(
                 &self.layout,
-                &crate::rebase_state::RebaseState { acc_tip: new_tip, resolved: true, ..st.clone() },
+                &crate::rebase_state::RebaseState {
+                    acc_tip: new_tip,
+                    resolved: true,
+                    replayed,
+                    ..st.clone()
+                },
             )?;
-            new_tip
+            (new_tip, (replayed, st.skipped))
         };
         self.rebase_fold_and_finish(
             st.branch,
@@ -1082,6 +1092,7 @@ impl Repo {
             st.total,
             author,
             identity,
+            counters_seed,
         )
     }
 
@@ -1089,7 +1100,12 @@ impl Repo {
     /// re-materialize the untouched original tip — no oplog record, since no
     /// ref ever moved. Errors [`Error::InvalidArgument`] if no rebase is in
     /// progress.
-    pub fn rebase_abort(&self) -> Result<()> {
+    ///
+    /// Returns the protected paths that could not be restored (P21): no
+    /// identity is available at abort time, so protected files in the
+    /// restored tree are skipped (left absent) rather than decrypted —
+    /// mirrors [`crate::repo::Repo::merge_abort`]'s contract exactly.
+    pub fn rebase_abort(&self) -> Result<Vec<String>> {
         let Some(st) = crate::rebase_state::read(&self.layout)? else {
             return Err(Error::InvalidArgument("no rebase in progress — nothing to abort".into()));
         };
@@ -1107,7 +1123,7 @@ impl Repo {
         // where the decided root is unexpectedly absent.
         let decided = crate::rebase_state::read_decided_root(&self.layout)?;
         let snap = self.snapshot(&st.original_tip)?;
-        {
+        let skipped = {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
             worktree::materialize(
@@ -1117,9 +1133,10 @@ impl Repo {
                 decided,
                 &snap.protection,
                 None,
-            )?;
-        }
-        crate::rebase_state::clear(&self.layout)
+            )?
+        };
+        crate::rebase_state::clear(&self.layout)?;
+        Ok(skipped)
     }
 }
 
@@ -3149,7 +3166,10 @@ mod tests {
         let outcome = repo.rebase_continue("me", None).unwrap();
         let new_tip = match outcome {
             RebaseResult::Rebased { new_tip, replayed, .. } => {
-                assert_eq!(replayed, 1, "only the tail commit replays in this fold segment");
+                // P21: cumulative across the whole rebase, not just this
+                // fold segment — the completed conflicted commit (feature_a)
+                // plus the tail commit that replays cleanly after it.
+                assert_eq!(replayed, 2, "cumulative: the completed conflict + the clean tail commit");
                 new_tip
             }
             other => panic!("expected Rebased, got {other:?}"),
@@ -3294,6 +3314,181 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "resolved-B\n");
 
         assert_eq!(repo.oplog().unwrap().len(), ops_before + 1, "exactly one oplog record");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn multi_stop_rebase_oplog_reports_cumulative_counts() {
+        // P21: the P19 ledger repro (`rebase_multi_stop_resumes_twice`) stops
+        // twice, landing commit A's completion at the first `--continue` and
+        // commit B's completion at the second. Before P21, each fold segment
+        // seeded its `replayed`/`skipped` locals at 0, so the FINAL oplog
+        // record only reported the last segment's count ("0 replayed" — the
+        // second `--continue` completes B via `assemble_completion_snapshot`
+        // directly, then folds over an EMPTY remaining range). The record
+        // must instead report the cumulative count across the whole
+        // operation: both A and B landed, so "2 replayed".
+        let root = tmp_root("rebase-multi-stop-cumulative");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f.txt"), b"orig\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("f.txt"), b"main-edit\n").unwrap();
+        repo.commit("me", "main edits f").unwrap();
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("f.txt"), b"feat-A\n").unwrap();
+        repo.commit("me", "feature A").unwrap();
+        std::fs::write(root.join("f.txt"), b"feat-B\n").unwrap();
+        repo.commit("me", "feature B").unwrap();
+
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        assert!(matches!(outcome, RebaseResult::Stopped { .. }), "expected first stop");
+
+        std::fs::write(root.join("f.txt"), b"resolved-A\n").unwrap();
+        let outcome = repo.rebase_continue("me", None).unwrap();
+        assert!(matches!(outcome, RebaseResult::Stopped { .. }), "expected second stop");
+
+        std::fs::write(root.join("f.txt"), b"resolved-B\n").unwrap();
+        let outcome = repo.rebase_continue("me", None).unwrap();
+        match outcome {
+            RebaseResult::Rebased { replayed, skipped, .. } => {
+                assert_eq!((replayed, skipped), (2, 0), "both A and B must count cumulatively");
+            }
+            other => panic!("expected Rebased, got {other:?}"),
+        }
+
+        let last = repo.oplog().unwrap().into_iter().next_back().unwrap();
+        assert!(
+            last.desc.contains("2 replayed"),
+            "oplog record must report the cumulative count, not just the last segment: {}",
+            last.desc
+        );
+        assert!(!last.desc.contains("0 replayed"), "must not report the last segment alone: {}", last.desc);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn status_distinguishes_resolved_awaiting_continue() {
+        // P21: reuses `rebase_continue_error_preserves_state_and_retry_succeeds`'s
+        // setup — commit A plain-conflicts with main, commit B diverges a
+        // PROTECTED path's content from main and needs `--identity`. After
+        // resolving A and calling `--continue` WITHOUT an identity, A
+        // completes (advancing `RebaseState::resolved` to true) but the fold
+        // then errors on B. In that window, the repo-level accessor must
+        // report `resolved == true` — nothing left to resolve on disk, the
+        // caller just needs to retry `--continue` — distinct from the
+        // initial "stopped, markers on disk" window where it must be false.
+        let root = tmp_root("rebase-status-resolved-window");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        repo.commit("me", "main edits x and secret").unwrap();
+
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nFEATURE\nc\n").unwrap();
+        repo.commit("me", "feature edits x (conflicts)").unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
+        repo.commit("me", "feature edits secret (protected divergence)").unwrap();
+
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        assert!(matches!(outcome, RebaseResult::Stopped { .. }));
+        assert!(!repo.rebase_resolved().unwrap(), "stopped, not yet resolved: markers still on disk");
+
+        std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
+        let err = repo.rebase_continue("me", None).unwrap_err();
+        assert!(matches!(err, Error::ProtectedMergeNeedsIdentity(_) | Error::NotAuthorized(_)));
+        assert!(
+            repo.rebase_resolved().unwrap(),
+            "A completed before B's fold errored — the resolved window must be visible"
+        );
+
+        let outcome = repo.rebase_continue("me", Some(&alice_sk)).unwrap();
+        assert!(matches!(outcome, RebaseResult::Rebased { .. }));
+        assert!(!repo.rebase_resolved().unwrap(), "no rebase in progress once completed");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn aborts_surface_protected_skip_list() {
+        // P21: both `cherry_pick_abort` and `rebase_abort` re-materialize the
+        // pre-op tip with NO identity (abort time has none available) — a
+        // protected file in that tip must be reported skipped, not silently
+        // dropped, mirroring `Repo::merge_abort`'s existing contract. Each
+        // scenario stops on a PLAIN conflict (x.txt) unrelated to the
+        // protected path (secret/a.txt), which is untouched on both sides —
+        // so the stop/abort exercises pure restore-without-identity, not the
+        // content-divergent-protected-merge path (which aborts atomically
+        // with no state to abort in the first place).
+
+        // -- cherry-pick --
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let root = tmp_root("abort-skip-list-pick");
+        let repo = Repo::init(&root).unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"top secret").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nWORK\nc\n").unwrap();
+        repo.commit("me", "work edits x").unwrap();
+
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(_)), "got {err:?}");
+
+        let skipped = repo.cherry_pick_abort().unwrap();
+        assert_eq!(skipped, vec!["secret/a.txt".to_string()], "no identity at abort: must be skipped");
+        assert!(!root.join("secret/a.txt").exists(), "skipped means absent, not stale plaintext");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+
+        // -- rebase --
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let root = tmp_root("abort-skip-list-rebase");
+        let repo = Repo::init(&root).unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"top secret").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+
+        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nFEATURE\nc\n").unwrap();
+        repo.commit("me", "feature edits x").unwrap();
+
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        assert!(matches!(outcome, RebaseResult::Stopped { .. }));
+
+        let skipped = repo.rebase_abort().unwrap();
+        assert_eq!(skipped, vec!["secret/a.txt".to_string()], "no identity at abort: must be skipped");
+        assert!(!root.join("secret/a.txt").exists(), "skipped means absent, not stale plaintext");
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();

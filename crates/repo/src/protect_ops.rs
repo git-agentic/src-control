@@ -34,6 +34,19 @@ impl Repo {
         _identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<ObjectId> {
         use scl_core::ProtectPrefix;
+        // `protect`'s first write is a policy-only commit_snapshot, which
+        // (unlike `commit`) has no in-progress guard of its own — the P19-I1
+        // hazard: an unguarded policy op moving the branch tip out from under
+        // a stopped merge/pick/rebase (P21).
+        if crate::merge_state::in_progress(self.layout()) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(self.layout()) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(self.layout()) {
+            return Err(Error::RebaseInProgress);
+        }
         crate::secrets::require_recipients(recipients)?;
         // Load the tip's protection, add/replace the rule, and persist it as a
         // policy-only commit (same root) so `commit` below sees the new prefix.
@@ -115,6 +128,16 @@ impl Repo {
         authorized: &scl_crypto::SecretKey,
         new: &scl_crypto::PublicKey,
     ) -> Result<ObjectId> {
+        // P21: same in-progress guard as `protect` — see its comment.
+        if crate::merge_state::in_progress(self.layout()) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(self.layout()) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(self.layout()) {
+            return Err(Error::RebaseInProgress);
+        }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let snap = self.snapshot(&tip)?;
         let (root, secrets, mut protection) = (snap.root, snap.secrets, snap.protection);
@@ -172,6 +195,16 @@ impl Repo {
     /// such prefix. Does not rotate content (a prior holder kept any plaintext
     /// already checked out — see the secrets-revoke rationale in ADR-0008).
     pub fn revoke(&self, prefix: &str, recipient_id: &scl_crypto::RecipientId) -> Result<ObjectId> {
+        // P21: same in-progress guard as `protect` — see its comment.
+        if crate::merge_state::in_progress(self.layout()) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(self.layout()) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(self.layout()) {
+            return Err(Error::RebaseInProgress);
+        }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let snap = self.snapshot(&tip)?;
         let (root, secrets, mut protection) = (snap.root, snap.secrets, snap.protection);

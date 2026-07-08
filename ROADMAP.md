@@ -189,31 +189,49 @@ across every phase.
   `demo/run_ws_demo.sh` (fork/edit/harvest across separate invocations:
   two cumulative clean auto-merges, one conflict fallback, an `sc undo`
   of a landing, zero residue at session end). (ADR-0030.)
+- **Phase 21 — Hardening & consolidation.** Closes the P16–P20 review
+  tail with no new capability axis. Every commit-creating policy op
+  (`protect`/`grant`/`revoke`/`secret add`/`secret rotate`/`secret
+  grant`/`secret revoke`) now refuses up front during an in-progress
+  merge/pick/rebase, closing the P19-I1 hazard (a review-caught Critical
+  found `secret_grant` also needed the guard, alongside `secret_revoke`).
+  Marks staleness self-heals at export/push: a mark whose git commit was
+  pruned (`git gc` on the target) is re-verified via `GitTarget::
+  has_object` and re-synthesized instead of producing a broken parent
+  chain, with heal convergence proven to a stable fixed point (a third
+  export reports zero stale and zero new marks). `sc rebase --abort`/`sc
+  cherry-pick --abort` return and print the protected-skip list
+  (`merge_abort` parity); `sc status` distinguishes the resolved-
+  awaiting-`--continue` window; multi-stop rebase oplog descriptions
+  report cumulative replayed/skipped counts. The three verbatim
+  conflict-materialization copies (merge/pick/rebase-fold) collapse into
+  one `Repo` helper with zero test edits. `sc ws list` names a landed-
+  then-undone workspace truthfully (`"landed (undone by sc undo)"`)
+  instead of the misleading generic `"abandoned"`, and no longer
+  re-parses the session manifest once per listed workspace. Proven by
+  every existing demo staying green plus the pinned regression test for
+  each closed finding — a pure-hardening phase ships no new demo script.
+  (ADR-0031.)
 
 ## Active
 
-None — Phase 21 is next up; see the next-horizon table below. A phase
-becomes Active when its focused brainstorm → spec cycle starts.
+None — Phase 22 is next up.
 
-## Next horizon (P21–P24)
+## Next horizon (P22–P24)
 
 Decided 2026-07-08 (design: `docs/superpowers/specs/2026-07-08-roadmap-horizon-p21-p24-design.md`).
-Theme: consolidate, then complete the trust story, then invest in daily
-feel and scale — P16–P20's final reviews left a pooled debt tail
-(including one live-demonstrated hazard), and shipped claims should not
-carry known hazards into new work.
+Theme: complete the trust story, then invest in daily feel and scale —
+P21 closes the P16–P20 review tail before more surface accretes.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
-| **P21 — Hardening & consolidation** | Close the P16–P20 review tail | policy-op guards, marks recovery, abort/status minors, conflict-materialize extraction; every closed finding's repro pinned as a test; all demos green | [0031](docs/adr/0031-hardening-consolidation.md) |
 | **P22 — Signed commits & provenance** | Integrity attribution | sign commits; tamper with a clone's history; `sc verify` catches it; untrusted signers visibly flagged | [0032](docs/adr/0032-signed-commits-provenance.md) |
 | **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts` + `sc resolve --ours/--theirs` end-to-end on a conflicted merge | [0033](docs/adr/0033-merge-ergonomics.md) |
 | **P24 — Sparse checkouts / sub-tree sharing** | Monorepo-width working trees | work in one subtree with the rest absent from disk; commits carry absent subtrees byte-identically | [0034](docs/adr/0034-sparse-checkouts.md) |
 
-Ordering rationale: P21 first (compounding hours-scale debt, one live
-hazard); P22 before P23/P24 (provenance is the last unbuilt security
-pillar — settle it before more surface accretes); P23 before P24 (conflict
-UX pays off daily and sparse users will want it too).
+Ordering rationale: P22 before P23/P24 (provenance is the last unbuilt
+security pillar — settle it before more surface accretes); P23 before P24
+(conflict UX pays off daily and sparse users will want it too).
 
 ## Completed phases (usability-first ordering)
 
@@ -236,6 +254,7 @@ UX pays off daily and sparse users will want it too).
 | **P18 — Network Git remotes** | fetch/push against hosted Git | `sc clone git@github.com:…` / push visible on github.com; proven hermetically by `demo/run_network_git_demo.sh` | [0028](docs/adr/0028-network-git-remotes.md) |
 | **P19 — History-editing polish** | `sc amend`, resumable rebase, pick abort, mainline picks | `sc rebase main` stops on conflict (not aborts), `sc rebase --continue` resumes and lands in ONE oplog record; `sc cherry-pick --abort` restores byte-identical; `sc amend -m` fixes the tip message; proven by the extended `demo/run_history_demo.sh` | [0029](docs/adr/0029-history-editing-polish.md) |
 | **P20 — Agent sessions + auto-merge** | Multi-invocation agent sessions with hands-off integration | `sc ws fork --agents N`, edit across separate invocations, `sc ws harvest` auto-merges clean results cumulatively and falls back to `work-<i>` on conflict; proven by `demo/run_ws_demo.sh` | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
+| **P21 — Hardening & consolidation** | Close the P16–P20 review tail before new capability work | policy ops refuse during in-progress merge/pick/rebase; a pruned git commit behind a stale mark self-heals on push; rebase/pick aborts report the protected-skip list; `sc ws list` names an undone landing truthfully; every existing demo stays green plus new pinned regression tests | [0031](docs/adr/0031-hardening-consolidation.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

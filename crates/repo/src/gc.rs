@@ -383,6 +383,8 @@ mod tests {
             total: 3,
             author: "t".into(),
             resolved: false,
+            replayed: 0,
+            skipped: 0,
         };
         crate::rebase_state::write(repo.layout(), &st).unwrap();
         crate::rebase_state::write_decided_root(repo.layout(), decided_tree).unwrap();

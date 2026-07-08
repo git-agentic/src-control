@@ -103,6 +103,17 @@ impl GitTarget {
         Ok(())
     }
 
+    /// True if `id` names an object that actually exists in this repo. Used to
+    /// verify a reused mark before trusting it — `git gc` in the target can
+    /// prune a commit a stale mark still names.
+    ///
+    /// Note: verifies the commit object itself, not its tree/blob closure.
+    /// Sufficient under git-gc's reachability-atomic pruning; a commit with a
+    /// corrupted tree is out of scope.
+    pub(crate) fn has_object(&self, id: gix::ObjectId) -> bool {
+        self.repo.has_object(id)
+    }
+
     /// Write a blob, returning its Git oid.
     pub(crate) fn write_blob(&self, bytes: &[u8]) -> Result<gix::ObjectId> {
         Ok(self.repo.write_blob(bytes).context("writing git blob")?.detach())
@@ -297,6 +308,10 @@ pub struct ExportReport {
     /// Commits written *this call* as `(git_oid_hex, sc_id)`, for the caller to
     /// persist into the marks map. Excludes reused (already-known) commits.
     pub new_marks: Vec<(String, ObjectId)>,
+    /// Marks whose git commit no longer exists in the target (e.g. pruned by a
+    /// `git gc` run there). Those sc-ids were re-synthesized instead of reused
+    /// — they also appear in `new_marks` with fresh oids.
+    pub stale_marks: usize,
 }
 
 /// Read-only pre-flight scan of the DAG rooted at `tip`: collect the paths of
@@ -374,11 +389,20 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
 
     let mut commit_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
     // Seed with commits already on the target (marks map): these are reused, not
-    // rewritten. A bad hex here is a corrupt marks file — surface it.
+    // rewritten. A bad hex here is a corrupt marks file — surface it. Verify each
+    // still EXISTS there before reuse: `git gc` in the target can prune commits a
+    // stale mark still names, and blindly reusing a pruned oid writes a broken
+    // parent chain (P21 follow-on, ADR-0031). A missing one is treated as
+    // unknown — the walk below re-synthesizes it — and counted.
+    let mut stale_marks = 0usize;
     for (sc_id, git_hex) in opts.known_git_commits {
         let g = gix::ObjectId::from_hex(git_hex.as_bytes())
             .with_context(|| format!("bad git oid in marks for {sc_id}"))?;
-        commit_memo.insert(*sc_id, g);
+        if target.has_object(g) {
+            commit_memo.insert(*sc_id, g);
+        } else {
+            stale_marks += 1;
+        }
     }
     let mut new_marks: Vec<(String, ObjectId)> = Vec::new();
     let mut tree_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
@@ -426,6 +450,7 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
         protected_blobs_as_ciphertext: protected,
         secrets_dropped,
         new_marks,
+        stale_marks,
     })
 }
 
@@ -767,6 +792,111 @@ mod tests {
         let rep2 = export_branch(&mut store, tip, &opts2).unwrap();
         assert!(rep2.new_marks.is_empty());
         assert_eq!(rep2.git_commit, rep1.git_commit); // same tip oid
+
+        std::fs::remove_dir_all(&gsrc).unwrap();
+        std::fs::remove_dir_all(&dst).unwrap();
+    }
+
+    #[test]
+    fn stale_mark_mid_chain_resynthesizes_with_valid_parents() {
+        use crate::{import_history, ImportReport};
+        use scl_core::StoreConfig;
+        use std::collections::HashMap;
+
+        // Build a 3-commit sc history A→B→C by importing from a throwaway git repo.
+        // Corrupt the mark for the MIDDLE commit B; verify the re-synthesized B has
+        // a valid parent chain (C's parent = B', B's parent = A), following the
+        // stale_mark_is_skipped_so_pruned_parent_is_reimported pattern from import.rs.
+        let gsrc = std::env::temp_dir().join(format!("scl-exp-stale-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gsrc);
+        std::fs::create_dir_all(&gsrc).unwrap();
+        git(&gsrc, &["init", "-q", "-b", "main"]);
+        std::fs::write(gsrc.join("a"), b"1").unwrap();
+        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "A"]);
+        std::fs::write(gsrc.join("a"), b"2").unwrap();
+        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "B"]);
+        std::fs::write(gsrc.join("a"), b"3").unwrap();
+        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "C"]);
+
+        let mut store = Store::new(StoreConfig::default());
+        let ImportReport { tip: sc_c, .. } = import_history(&mut store, &gsrc, "main", &HashMap::new()).unwrap();
+
+        // Export once and recover marks by message.
+        let dst = std::env::temp_dir().join(format!("scl-exp-stale-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+        let empty: HashMap<ObjectId, String> = HashMap::new();
+        let opts = ExportOptions {
+            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty,
+        };
+        let rep1 = export_branch(&mut store, sc_c, &opts).unwrap();
+        assert_eq!(rep1.new_marks.len(), 3);
+
+        // Recover sc ids for A, B, C and their git oids by message.
+        let mut marks_by_msg: HashMap<String, (ObjectId, String)> = HashMap::new();
+        for (git_hex, sc_id) in &rep1.new_marks {
+            let snap = store.get_snapshot(sc_id).unwrap();
+            marks_by_msg.insert(snap.message, (*sc_id, git_hex.clone()));
+        }
+        let (sc_a, git_a) = marks_by_msg.get("A").expect("mark for A").clone();
+        let (sc_b, _git_b) = marks_by_msg.get("B").expect("mark for B").clone();
+
+        // Corrupt the mark for B (the middle commit). Don't provide C's mark so
+        // it gets re-synthesized too (C's parent changes when B is re-synthesized).
+        let mut stale: HashMap<ObjectId, String> = HashMap::new();
+        stale.insert(sc_a, git_a.clone());
+        stale.insert(sc_b, "a".repeat(40)); // valid hex but nonexistent oid
+
+        // Re-export with the stale mark for B: must report stale_marks == 1,
+        // re-synthesize B and C (C's parent changes), and leave a valid, unbroken parent chain.
+        let opts2 = ExportOptions {
+            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &stale,
+        };
+        let rep2 = export_branch(&mut store, sc_c, &opts2).unwrap();
+        assert_eq!(rep2.stale_marks, 1, "exactly one stale mark (B) should be detected");
+        assert_eq!(rep2.new_marks.len(), 2, "B and C should be re-synthesized (C's parent changed)");
+        // Find B and C in new_marks; both should be present.
+        let has_b = rep2.new_marks.iter().any(|(_, sc_id)| *sc_id == sc_b);
+        let has_c = rep2.new_marks.iter().any(|(_, sc_id)| *sc_id == sc_c);
+        assert!(has_b, "B should be in new_marks");
+        assert!(has_c, "C should be in new_marks");
+
+        // Walk the Git history from the ref to prove the parent chain is valid.
+        let out = git(&dst, &["--git-dir", dst.to_str().unwrap(), "log", "--format=%H %s", "refs/heads/main"]);
+        let log = String::from_utf8(out.stdout).unwrap();
+        let mut log_lines: Vec<&str> = log.lines().collect();
+        log_lines.reverse(); // root-to-tip order
+        assert_eq!(log_lines.len(), 3, "history should have 3 commits");
+        assert!(log_lines[0].ends_with(" A"), "commit 0 should be A");
+        assert!(log_lines[1].ends_with(" B"), "commit 1 should be B");
+        assert!(log_lines[2].ends_with(" C"), "commit 2 should be C");
+
+        // Verify each commit's parent is correct by parsing git log output.
+        let out = git(&dst, &["--git-dir", dst.to_str().unwrap(), "log", "--format=%H %P", "refs/heads/main"]);
+        let log = String::from_utf8(out.stdout).unwrap();
+        let mut commits: Vec<(&str, &str)> = log.lines().map(|l| {
+            let parts: Vec<&str> = l.split_whitespace().collect();
+            (parts[0], if parts.len() > 1 { parts[1] } else { "" })
+        }).collect();
+        commits.reverse(); // root-to-tip order
+        assert_eq!(commits[1].1, commits[0].0, "B's parent should be A");
+        assert_eq!(commits[2].1, commits[1].0, "C's parent should be B");
+        // A is root, so parent should be empty.
+        assert_eq!(commits[0].1, "", "A (root) should have no parent");
+
+        // Third export: use healed marks (original A + new B,C marks from rep2).
+        let mut healed: HashMap<ObjectId, String> = HashMap::new();
+        healed.insert(sc_a, git_a);
+        // Extract new marks for B and C from rep2.
+        for (git_hex, sc_id) in &rep2.new_marks {
+            healed.insert(*sc_id, git_hex.clone());
+        }
+
+        let opts3 = ExportOptions {
+            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &healed,
+        };
+        let rep3 = export_branch(&mut store, sc_c, &opts3).unwrap();
+        assert_eq!(rep3.stale_marks, 0, "no stale marks after healing");
+        assert!(rep3.new_marks.is_empty(), "no new marks after healing (all reused)");
 
         std::fs::remove_dir_all(&gsrc).unwrap();
         std::fs::remove_dir_all(&dst).unwrap();
