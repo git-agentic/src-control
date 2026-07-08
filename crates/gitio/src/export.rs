@@ -103,6 +103,13 @@ impl GitTarget {
         Ok(())
     }
 
+    /// True if `id` names an object that actually exists in this repo. Used to
+    /// verify a reused mark before trusting it — `git gc` in the target can
+    /// prune a commit a stale mark still names.
+    pub(crate) fn has_object(&self, id: gix::ObjectId) -> bool {
+        self.repo.has_object(id)
+    }
+
     /// Write a blob, returning its Git oid.
     pub(crate) fn write_blob(&self, bytes: &[u8]) -> Result<gix::ObjectId> {
         Ok(self.repo.write_blob(bytes).context("writing git blob")?.detach())
@@ -297,6 +304,10 @@ pub struct ExportReport {
     /// Commits written *this call* as `(git_oid_hex, sc_id)`, for the caller to
     /// persist into the marks map. Excludes reused (already-known) commits.
     pub new_marks: Vec<(String, ObjectId)>,
+    /// Marks whose git commit no longer exists in the target (e.g. pruned by a
+    /// `git gc` run there). Those sc-ids were re-synthesized instead of reused
+    /// — they also appear in `new_marks` with fresh oids.
+    pub stale_marks: usize,
 }
 
 /// Read-only pre-flight scan of the DAG rooted at `tip`: collect the paths of
@@ -374,11 +385,20 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
 
     let mut commit_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
     // Seed with commits already on the target (marks map): these are reused, not
-    // rewritten. A bad hex here is a corrupt marks file — surface it.
+    // rewritten. A bad hex here is a corrupt marks file — surface it. Verify each
+    // still EXISTS there before reuse: `git gc` in the target can prune commits a
+    // stale mark still names, and blindly reusing a pruned oid writes a broken
+    // parent chain (P21 follow-on, ADR-0031). A missing one is treated as
+    // unknown — the walk below re-synthesizes it — and counted.
+    let mut stale_marks = 0usize;
     for (sc_id, git_hex) in opts.known_git_commits {
         let g = gix::ObjectId::from_hex(git_hex.as_bytes())
             .with_context(|| format!("bad git oid in marks for {sc_id}"))?;
-        commit_memo.insert(*sc_id, g);
+        if target.has_object(g) {
+            commit_memo.insert(*sc_id, g);
+        } else {
+            stale_marks += 1;
+        }
     }
     let mut new_marks: Vec<(String, ObjectId)> = Vec::new();
     let mut tree_memo: HashMap<ObjectId, gix::ObjectId> = HashMap::new();
@@ -426,6 +446,7 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
         protected_blobs_as_ciphertext: protected,
         secrets_dropped,
         new_marks,
+        stale_marks,
     })
 }
 
@@ -767,6 +788,59 @@ mod tests {
         let rep2 = export_branch(&mut store, tip, &opts2).unwrap();
         assert!(rep2.new_marks.is_empty());
         assert_eq!(rep2.git_commit, rep1.git_commit); // same tip oid
+
+        std::fs::remove_dir_all(&gsrc).unwrap();
+        std::fs::remove_dir_all(&dst).unwrap();
+    }
+
+    #[test]
+    fn stale_mark_is_reverified_and_resynthesized() {
+        use crate::{import_history, ImportReport};
+        use scl_core::StoreConfig;
+        use std::collections::HashMap;
+
+        // Build a 1-commit sc history by importing from a throwaway git repo.
+        let gsrc = std::env::temp_dir().join(format!("scl-exp-stale-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gsrc);
+        std::fs::create_dir_all(&gsrc).unwrap();
+        git(&gsrc, &["init", "-q", "-b", "main"]);
+        std::fs::write(gsrc.join("a"), b"1").unwrap();
+        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "c1"]);
+
+        let mut store = Store::new(StoreConfig::default());
+        let ImportReport { tip, .. } = import_history(&mut store, &gsrc, "main", &HashMap::new()).unwrap();
+
+        // Export once to a bare target and capture the real mark.
+        let dst = std::env::temp_dir().join(format!("scl-exp-stale-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+        let empty: HashMap<ObjectId, String> = HashMap::new();
+        let opts = ExportOptions {
+            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty,
+        };
+        let rep1 = export_branch(&mut store, tip, &opts).unwrap();
+        assert_eq!(rep1.new_marks.len(), 1);
+
+        // Corrupt the mark: swap in a valid-hex oid that does NOT exist in the target.
+        let mut stale: HashMap<ObjectId, String> = HashMap::new();
+        stale.insert(tip, "a".repeat(40));
+
+        // Re-export with the stale mark: must not error, must report stale_marks == 1,
+        // must re-synthesize (new_marks contains the sc id again), and must leave a
+        // valid, unbroken history at the ref.
+        let opts2 = ExportOptions {
+            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &stale,
+        };
+        let rep2 = export_branch(&mut store, tip, &opts2).unwrap();
+        assert_eq!(rep2.stale_marks, 1);
+        assert_eq!(rep2.new_marks.len(), 1);
+        assert_eq!(rep2.new_marks[0].1, tip);
+
+        let out = git(&dst, &["--git-dir", dst.to_str().unwrap(), "log", "--format=%H", "-1", "refs/heads/main"]);
+        let logged = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert_eq!(logged, rep2.git_commit, "ref must point at a real, readable commit");
+        // The synthesized commit must be readable and well-formed (no broken parent chain).
+        let cat = git(&dst, &["--git-dir", dst.to_str().unwrap(), "cat-file", "-p", &rep2.git_commit]);
+        assert!(cat.status.success(), "resynthesized commit must be readable: {cat:?}");
 
         std::fs::remove_dir_all(&gsrc).unwrap();
         std::fs::remove_dir_all(&dst).unwrap();

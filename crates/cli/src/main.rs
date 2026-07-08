@@ -2096,6 +2096,12 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
             report.protected_blobs_as_ciphertext, report.secrets_dropped
         );
     }
+    if report.stale_marks > 0 {
+        eprintln!(
+            "  note: {} mark(s) referenced git commit(s) pruned from the target; re-synthesized with fresh ids",
+            report.stale_marks
+        );
+    }
     if scl_gitio::bridge::is_network_git_url(&url) {
         println!("pushed {remote} -> network ({url})");
     }
@@ -2196,6 +2202,12 @@ fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) ->
         eprintln!(
             "  warning: {} protected file(s) exported as ciphertext; {} secret(s) dropped (Git cannot enforce confidentiality)",
             report.protected_blobs_as_ciphertext, report.secrets_dropped
+        );
+    }
+    if report.stale_marks > 0 {
+        eprintln!(
+            "  note: {} mark(s) referenced git commit(s) pruned from the target; re-synthesized with fresh ids",
+            report.stale_marks
         );
     }
     Ok(())
