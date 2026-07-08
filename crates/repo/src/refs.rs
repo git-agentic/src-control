@@ -101,6 +101,25 @@ fn is_unsafe_ref_component(s: &str) -> bool {
         || s.split('/').any(|c| c.is_empty() || c == "..")
 }
 
+/// Remove a branch ref file (P20, `sc ws harvest`'s candidate-branch cleanup
+/// after a clean landing). Refuses to delete the branch `HEAD` currently
+/// names — that would leave `HEAD` dangling — and errors `NoSuchBranch` if
+/// the ref is already absent.
+pub fn delete_branch(layout: &Layout, name: &str) -> Result<()> {
+    if current_branch(layout)? == name {
+        return Err(Error::InvalidArgument(format!(
+            "refusing to delete the current branch: {name}"
+        )));
+    }
+    match std::fs::remove_file(layout.ref_path(name)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::NoSuchBranch(name.to_string()))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `(branch, tip)` for every `refs/heads/*`. Skips temp files and unreadable
 /// names; a malformed ref body is an error.
 pub fn list_heads(layout: &Layout) -> Result<Vec<(String, ObjectId)>> {
@@ -261,6 +280,28 @@ mod tests {
 
         let remotes = list_remote_tips(&layout).unwrap();
         assert_eq!(remotes, vec![("origin".to_string(), "main".to_string(), c)]);
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn delete_branch_removes_ref_refuses_current_and_errors_on_absent() {
+        let layout = tmp_layout("delete-branch");
+        write_head(&layout, "main").unwrap();
+        let id = ObjectId::of(b"snap");
+        write_branch_tip(&layout, "main", &id).unwrap();
+        write_branch_tip(&layout, "work-1", &id).unwrap();
+
+        // Non-current branch: deletes cleanly.
+        delete_branch(&layout, "work-1").unwrap();
+        assert_eq!(read_branch_tip(&layout, "work-1").unwrap(), None);
+
+        // Already-absent branch: NoSuchBranch.
+        assert!(matches!(delete_branch(&layout, "work-1"), Err(Error::NoSuchBranch(_))));
+
+        // Current branch: refused.
+        assert!(matches!(delete_branch(&layout, "main"), Err(Error::InvalidArgument(_))));
+        assert_eq!(read_branch_tip(&layout, "main").unwrap(), Some(id));
+
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 

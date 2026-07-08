@@ -203,6 +203,12 @@ enum Cmd {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Manage a durable `sc ws` session: workspaces forked from HEAD that
+    /// survive the process exiting (unlike `sc work`'s one-shot session).
+    Ws {
+        #[command(subcommand)]
+        op: WsOp,
+    },
     /// Clone a repo (local path or `ssh://` URL) into a new directory.
     Clone {
         src: String,
@@ -326,6 +332,65 @@ enum EscrowOp {
     Remove { id_or_name: String },
     /// List the configured escrow keys.
     Show,
+}
+
+#[derive(Subcommand)]
+enum WsOp {
+    /// Fork N durable workspaces from HEAD under `.sc/ws/<i>/`.
+    Fork {
+        /// Number of workspaces to fork.
+        #[arg(long, default_value_t = 2)]
+        agents: u32,
+        /// Identity file to decrypt protected paths at checkout (default
+        /// ~/.sc/identity or $SC_IDENTITY; optional — unmatched protected
+        /// paths are just skipped).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Author recorded on any commit a later harvest produces (default
+        /// $SC_AUTHOR, then the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// List the open session's workspaces (changed/unchanged vs base).
+    List,
+    /// Run a command in one workspace checkout.
+    Run {
+        /// Workspace index to run in.
+        index: u32,
+        /// Decrypt and inject registered secrets into the command's environment
+        /// (requires --identity to be set).
+        #[arg(long)]
+        with_secrets: bool,
+        /// Identity for --with-secrets decryption.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// The command to run; `--` separates it from flags.
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Abandon one workspace (by index) or the whole session.
+    Abandon {
+        /// Workspace index to abandon. Omit to abandon the whole session.
+        index: Option<u32>,
+    },
+    /// Read-only conflict probe + cumulative auto-merge of every live
+    /// workspace onto the landing branch (default: the session's base
+    /// branch). Conflicted/rejected workspaces fall back to a `work-<i>`
+    /// branch for manual resolution and keep the session open.
+    Harvest {
+        /// Landing branch; must be the currently-checked-out branch
+        /// (default: the session's base branch).
+        #[arg(long)]
+        into: Option<String>,
+        /// Identity key to decrypt protected paths that diverged in content
+        /// on both sides (ciphertext-id fast paths need no identity at all).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+        /// Author recorded on any landing commit (default $SC_AUTHOR, then
+        /// the OS username).
+        #[arg(long)]
+        author: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -458,6 +523,7 @@ fn main() -> Result<()> {
         Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
             run_work(agents, name, budget_mb, with_secrets, identity, author, cmd)
         }
+        Cmd::Ws { op } => run_ws(op),
         Cmd::Clone { src, dst, git } => run_clone(src, dst, git),
         Cmd::Serve { stdio, path } => run_serve(stdio, path),
         Cmd::Remote { op } => run_remote(op),
@@ -1561,6 +1627,96 @@ fn run_work(
     // destructors — same reasoning as run_run).
     drop(repo);
     std::process::exit(if failed { 1 } else { 0 });
+}
+
+/// `sc ws`: durable agent-workspace session (fork/list/abandon/run).
+fn run_ws(op: WsOp) -> Result<()> {
+    let repo = open_repo()?;
+    match op {
+        WsOp::Fork { agents, identity, author } => {
+            let sk = resolve_identity_opt(identity)?;
+            let session = repo.ws_fork(agents, &resolve_author(author), sk.as_ref())?;
+            println!(
+                "forked {} workspace(s) from branch {} @ {}",
+                session.workspaces.len(),
+                session.base_branch,
+                session.base_snapshot.short()
+            );
+            for entry in &session.workspaces {
+                println!("  {:<3} {}", entry.index, entry.dir.display());
+            }
+        }
+        WsOp::List => match repo.ws_session()? {
+            None => println!("no workspace session open"),
+            Some(session) => {
+                println!(
+                    "session base: branch {} @ {}",
+                    session.base_branch,
+                    session.base_snapshot.short()
+                );
+                println!("index  status     dir");
+                for entry in &session.workspaces {
+                    let status = if !entry.live {
+                        "abandoned".to_string()
+                    } else if repo.ws_changed(entry)? {
+                        "changed".to_string()
+                    } else {
+                        "unchanged".to_string()
+                    };
+                    println!("{:<6} {:<10} {}", entry.index, status, entry.dir.display());
+                }
+            }
+        },
+        WsOp::Run { index, with_secrets, identity, cmd } => {
+            // Resolve identity: --with-secrets requires it (hard error);
+            // otherwise it's optional and only decrypts protected paths.
+            let sk = if with_secrets {
+                Some(load_identity(identity)?)
+            } else {
+                resolve_identity_opt(identity)?
+            };
+            let code = repo.ws_run(index, &cmd, with_secrets, sk.as_ref())?;
+            // Drop the repo before process::exit to ensure the RepoLock's Drop
+            // runs and releases .sc/lock (process::exit skips destructors).
+            drop(repo);
+            std::process::exit(code);
+        }
+        WsOp::Abandon { index } => {
+            let remaining = repo.ws_abandon(index)?;
+            match index {
+                Some(i) => println!("abandoned workspace {i}; {remaining} still live"),
+                None => println!("abandoned the session ({remaining} workspace(s) remain)"),
+            }
+        }
+        WsOp::Harvest { into, identity, author } => {
+            let sk = resolve_identity_opt(identity)?;
+            let outcomes = repo.ws_harvest(into.as_deref(), &resolve_author(author), sk.as_ref())?;
+            let mut failed = false;
+            for o in &outcomes {
+                match o {
+                    scl_repo::WsHarvestOutcome::Landed { index, merged_tip } => {
+                        println!("{index:<3} landed @ {}", merged_tip.short());
+                    }
+                    scl_repo::WsHarvestOutcome::FallbackBranch { index, branch } => {
+                        failed = true;
+                        println!("{index:<3} fallback: branch {branch} — resolve with `sc merge {branch}`");
+                    }
+                    scl_repo::WsHarvestOutcome::Unchanged { index } => {
+                        println!("{index:<3} unchanged");
+                    }
+                    scl_repo::WsHarvestOutcome::Rejected { index, report } => {
+                        failed = true;
+                        println!("{index:<3} REJECTED by secret scanner: {report} — fix and re-run `sc ws harvest`");
+                    }
+                }
+            }
+            // Drop before exit so the RepoLock's Drop runs (process::exit
+            // skips destructors — same reasoning as run_run/run_work).
+            drop(repo);
+            std::process::exit(if failed { 1 } else { 0 });
+        }
+    }
+    Ok(())
 }
 
 fn load_identity(flag: Option<PathBuf>) -> Result<scl_crypto::SecretKey> {

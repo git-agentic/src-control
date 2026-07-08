@@ -18,7 +18,7 @@ use scl_core::{ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
-use crate::{merge_state, oplog, pick_state, reachable, rebase_state, refs};
+use crate::{merge_state, oplog, pick_state, reachable, rebase_state, refs, ws};
 
 /// What a gc pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,8 +36,10 @@ pub struct GcStats {
 /// referenced by the (already-trimmed) oplog — undo/redo must never dangle a
 /// snapshot it can still restore to + a stopped rebase's accumulated fold
 /// tip (`acc_tip` — the last landed snapshot; a `--continue` folds onward
-/// from it). An in-progress merge's, pick's, or rebase's decided carried
-/// tree is a TREE root and is added separately in [`run`].
+/// from it) + an open `sc ws` session's base snapshot (workspaces are
+/// forked from it and may still need to be harvested). An in-progress
+/// merge's, pick's, or rebase's decided carried tree is a TREE root and is
+/// added separately in [`run`].
 fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     let mut set: BTreeSet<ObjectId> = BTreeSet::new();
     for (_, id) in refs::list_heads(layout)? {
@@ -57,6 +59,9 @@ fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     }
     if let Some(st) = rebase_state::read(layout)? {
         set.insert(st.acc_tip);
+    }
+    if let Some(s) = ws::read_manifest(layout)? {
+        set.insert(s.base_snapshot);
     }
     for id in oplog::referenced_ids(layout)? {
         set.insert(id);

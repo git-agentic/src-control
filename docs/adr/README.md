@@ -40,7 +40,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0027](0027-bulk-rewrap-and-multi-escrow.md) | Bulk re-wrap and multiple escrow keys | Accepted | 17 |
 | [0028](0028-network-git-remotes.md) | Network Git remotes (GitHub over https/ssh) | Accepted | 18 |
 | [0029](0029-history-editing-polish.md) | History-editing polish — amend, resumable rebase, pick abort, merge replay | Accepted | 19 |
-| [0030](0030-agent-sessions-and-automerge.md) | Agent sessions and auto-merge of clean results | Proposed | 20 |
+| [0030](0030-agent-sessions-and-automerge.md) | Agent sessions and auto-merge of clean results | Accepted | 20 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

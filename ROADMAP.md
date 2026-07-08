@@ -161,29 +161,38 @@ across every phase.
   `demo/run_history_demo.sh` (stop/resolve/`--continue`/undo, an aborted
   pick verified byte-identical by checksum, and an `sc amend` message fix
   with history length unchanged). (ADR-0029.)
+- **Phase 20 — Agent sessions + auto-merge.** `sc ws fork --agents N
+  [--identity <key>]` materializes N durable checkouts under
+  `.sc/ws/<i>/` and persists a manifest, surviving across any number of
+  `sc` invocations (unlike P13's one-shot `sc work`); `sc ws list`/`run`
+  mirror P13's env + secret-injection surface; `sc ws abandon [<i>]`
+  drops one or all workspaces with no oplog record. `sc ws harvest
+  [--into <branch>] [--identity <key>]` runs each live workspace through
+  P13's `harvest_workspace` pipeline, then auto-merges each candidate
+  onto the landing branch (default the session's base branch — must be
+  the currently-checked-out branch, since the reused merge machinery is
+  head-centric) via a read-only conflict probe (`would_merge_cleanly`,
+  composing `three_way` + `merge_secrets`) that guarantees no conflict
+  markers land unattended: clean merges (including ff) land immediately
+  and cumulatively, one oplog record per landing; anything
+  conflicted — including protected divergences lacking `--identity` —
+  falls back to a collision-suffixed `work-<i>` branch, landing branch
+  untouched. A scanner-rejected workspace stays live so the offending
+  file can be fixed in place and re-harvested, rather than being
+  terminal as in P13. Harvest is a ref-mover guarded by the P19
+  merge/pick/rebase-in-progress family; a dirty-tree preflight runs
+  before any candidate branch is minted, since there is no CLI command
+  to delete a stray one. The session ends (`.sc/ws/` removed, zero
+  residue) once no live workspace remains; a crash mid-session leaves
+  dirs + manifest intact for the next invocation to resume, and gc roots
+  the session's base snapshot gated on manifest presence. Proven by
+  `demo/run_ws_demo.sh` (fork/edit/harvest across separate invocations:
+  two cumulative clean auto-merges, one conflict fallback, an `sc undo`
+  of a landing, zero residue at session end). (ADR-0030.)
 
 ## Active
 
-None — Phase 20 is next up.
-
-## Next horizon (P20)
-
-Decided 2026-07-07 (design: `docs/superpowers/specs/2026-07-07-roadmap-horizon-p16-p20-design.md`).
-Theme: finish the confidentiality story end to end before pushing for
-adoption — P16 closed the ADR-0025 boundary (a prefix-rule revoke is now
-durable across merges of pre-revoke branches), P17 closed the practical
-cutover at org scale (one `sc rewrap` after an escrow/recipient change),
-and the arc continues toward adoption.
-
-| Phase | Goal | Demoable outcome | ADR |
-|-------|------|------------------|-----|
-| **P20 — Agent sessions + auto-merge** | Durable `sc ws` sessions; clean results land unattended | fork workspaces, return in a later invocation, harvest; clean results auto-merge to an integration branch | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
-
-Ordering rationale: P16+P17 are one story (durable revoke, then practical
-cutover); P18 is the adoption unlock and follows the security arc; P19
-lands before P20 because agent sessions multiply branches and the human
-integrating them wants `--continue`/`--abort`/amend in hand — and P19
-must follow P16 so the rule-merge semantics replay honors are settled.
+None — the P16–P20 horizon is complete; brainstorm the next horizon.
 
 ## Completed phases (usability-first ordering)
 
@@ -205,6 +214,7 @@ must follow P16 so the rule-merge semantics replay honors are settled.
 | **P17 — Bulk re-wrap + multiple escrow keys** | org-scale recipient/escrow cutover | change escrow, one `sc rewrap`, every entry re-sealed; R1 wraps stripped; proven by `demo/run_rewrap_demo.sh` | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
 | **P18 — Network Git remotes** | fetch/push against hosted Git | `sc clone git@github.com:…` / push visible on github.com; proven hermetically by `demo/run_network_git_demo.sh` | [0028](docs/adr/0028-network-git-remotes.md) |
 | **P19 — History-editing polish** | `sc amend`, resumable rebase, pick abort, mainline picks | `sc rebase main` stops on conflict (not aborts), `sc rebase --continue` resumes and lands in ONE oplog record; `sc cherry-pick --abort` restores byte-identical; `sc amend -m` fixes the tip message; proven by the extended `demo/run_history_demo.sh` | [0029](docs/adr/0029-history-editing-polish.md) |
+| **P20 — Agent sessions + auto-merge** | Multi-invocation agent sessions with hands-off integration | `sc ws fork --agents N`, edit across separate invocations, `sc ws harvest` auto-merges clean results cumulatively and falls back to `work-<i>` on conflict; proven by `demo/run_ws_demo.sh` | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

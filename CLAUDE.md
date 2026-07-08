@@ -164,6 +164,19 @@ cargo run --bin sc -- work --agents 3 -- <cmd>   # fork agent workspaces, run <c
                                                  # (--with-secrets --identity <key> injects
                                                  # decrypted secrets into each agent env)
 bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
+cargo run --bin sc -- ws fork --agents N [--identity <key>]  # durable multi-invocation
+                                              # session: materializes N checkouts under
+                                              # .sc/ws/<i>/ and persists a manifest (P20)
+cargo run --bin sc -- ws list                 # open session's workspaces, changed/unchanged
+cargo run --bin sc -- ws run <i> [--with-secrets --identity <key>] -- <cmd>   # run <cmd> in
+                                              # workspace i (SC_WORKSPACE/SC_WORKSPACE_DIR set)
+cargo run --bin sc -- ws harvest [--into <branch>] [--identity <key>]   # probe + auto-merge
+                                              # every live workspace onto the landing branch
+                                              # (default the session's base branch, which must
+                                              # be checked out); clean lands cumulatively,
+                                              # conflicts fall back to work-<i>
+cargo run --bin sc -- ws abandon [<i>]        # drop one workspace or the whole session
+bash demo/run_ws_demo.sh                      # multi-invocation session + auto-merge proof (P20)
 cargo run --bin sc -- cherry-pick <ref> [--identity <key>]   # replay one commit onto the
                                               # current branch (--identity as above)
 cargo run --bin sc -- cherry-pick <ref> --mainline <N>       # replay a merge commit relative
@@ -297,10 +310,13 @@ temp checkout with P7-aware decryption, runs the agent commands concurrently
 injects decrypted secrets via the `sc run` path), and harvests each changed
 workspace through the full commit pipeline (`.scignore`, P5 scanner gate,
 protected-path re-encryption) to a flat `work-<i>` branch — integration is
-plain `sc merge`. HEAD, the current branch, and the user's working tree are
-never touched; a failed agent's partial work is still harvested; teardown
-leaves zero residue outside `.sc/`. Branch names are flat because the ref
-grammar reserves `name/branch` for remote-tracking refs. See ADR-0023.
+plain `sc merge` **→ multi-invocation sessions in P20** (durable
+checkout-backed sessions that survive across process boundaries, with
+auto-merge replacing the manual `sc merge` step; see below). HEAD, the
+current branch, and the user's working tree are never touched; a failed
+agent's partial work is still harvested; teardown leaves zero residue
+outside `.sc/`. Branch names are flat because the ref grammar reserves
+`name/branch` for remote-tracking refs. See ADR-0023.
 
 **Phase 14 is built.** History editing: `sc cherry-pick <ref>` and `sc rebase
 <target>` are both replay, composed from P4's `three_way_files` with base =
@@ -508,6 +524,52 @@ rebase asserting exactly one new oplog record, an aborted cherry-pick
 verified byte-identical by checksum, and an `sc amend` message fix with
 history length unchanged. See ADR-0029.
 
+**Phase 20 is built.** Agent sessions outlive a single process. `sc ws
+fork --agents N [--identity <key>]` materializes N checkouts under
+`.sc/ws/<i>/` (P7-aware, as P13) and atomically writes
+`.sc/ws/session.toml` (base snapshot, base branch, workspace dirs +
+status, author — never key material); the checkout dirs ARE the durable
+state, so `sc ws list`/`run` (P13 env/secret-injection parity,
+`SC_WORKSPACE`/`SC_WORKSPACE_DIR`) and `sc ws harvest`/`abandon` work
+across any number of later invocations, even a different day. `sc ws
+harvest [--into <branch>] [--identity <key>]` runs each live workspace
+through P13's `harvest_workspace` pipeline (`.scignore`, P5 scanner
+gate, protected re-encryption), then auto-merges the resulting candidate
+onto the landing branch — default the session's base branch, `--into`
+overrides — via a read-only conflict probe (`would_merge_cleanly`,
+composing `three_way` + `merge_secrets` with input assembly
+byte-identical to `merge_with_identity`) that guarantees no conflict
+markers land unattended: clean merges (including ff) land immediately,
+one oplog record per landing, cumulatively (a later workspace's merge
+sees every earlier landing already folded in); anything conflicted —
+including protected divergences lacking `--identity` — falls back to a
+collision-suffixed `work-<i>` branch exactly as P13 does, landing branch
+untouched. The landing branch must be the currently-checked-out branch
+(default or `--into`): the merge machinery `ws_harvest` reuses whole is
+head-centric, and harvest refuses with a `sc switch` hint otherwise,
+rather than re-deriving a headless merge variant. A scanner-Rejected
+workspace stays LIVE, not terminal: no candidate branch was ever
+created, so the offending file can be fixed in place in the same
+checkout dir and re-harvested — P13 treated rejection as terminal for
+its one-shot session, but a durable session can do better. Harvest is a
+ref-mover and joins the P19 merge/pick/rebase-in-progress guard family;
+a dirty-tree preflight runs before any candidate branch is minted (there
+is no CLI command to delete a stray branch, so the class is eliminated
+rather than guarded against after the fact). `resolve_and_teardown`
+writes the manifest before removing the workspace dir, so a crash
+between the two never leaves a `live = true` entry pointing at a
+directory that no longer exists. A crash-recovery re-harvest that
+re-mints an already-landed candidate (same parent/tree/author/message at
+the same wall-clock second) resolves `Err(UpToDate)` as an idempotent
+no-op `Landed`, not an error. A probe/merge disagreement (a bug, not a
+normal conflict) bails loudly stating conflict markers ARE on disk with
+a merge now in progress, resolvable via markers + `sc commit`. `sc work`
+(P13) is unchanged; teardown leaves `.sc/ws/` gone once every workspace
+is harvested or abandoned. Proven by `demo/run_ws_demo.sh`: fork in one
+invocation, edit workspaces in another, harvest in a third — two clean
+auto-merges land cumulatively, one conflict falls back to `work-<i>`,
+`sc undo` reverts the last landing, and session end leaves zero residue.
+See ADR-0030.
+
 Remaining follow-ons: HTTP transport, streaming (>4 GiB) frames,
-interactive workspace sessions, auto-merge of clean workspace results,
 operation objects in the CAS, and oplog entries for remote-tracking refs.
