@@ -192,28 +192,25 @@ across every phase.
 
 ## Active
 
-None — Phase 21 is next up; see the next-horizon table below. A phase
-becomes Active when its focused brainstorm → spec cycle starts.
+- **Phase 21 — Hardening & consolidation.** In build. Spec:
+  `docs/superpowers/specs/2026-07-08-p21-hardening-design.md`
+  (ADR-0031, Proposed → Accepted at completion).
 
-## Next horizon (P21–P24)
+## Next horizon (P22–P24)
 
 Decided 2026-07-08 (design: `docs/superpowers/specs/2026-07-08-roadmap-horizon-p21-p24-design.md`).
-Theme: consolidate, then complete the trust story, then invest in daily
-feel and scale — P16–P20's final reviews left a pooled debt tail
-(including one live-demonstrated hazard), and shipped claims should not
-carry known hazards into new work.
+Theme: complete the trust story, then invest in daily feel and scale —
+P21 closes the P16–P20 review tail before more surface accretes.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
-| **P21 — Hardening & consolidation** | Close the P16–P20 review tail | policy-op guards, marks recovery, abort/status minors, conflict-materialize extraction; every closed finding's repro pinned as a test; all demos green | [0031](docs/adr/0031-hardening-consolidation.md) |
 | **P22 — Signed commits & provenance** | Integrity attribution | sign commits; tamper with a clone's history; `sc verify` catches it; untrusted signers visibly flagged | [0032](docs/adr/0032-signed-commits-provenance.md) |
 | **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts` + `sc resolve --ours/--theirs` end-to-end on a conflicted merge | [0033](docs/adr/0033-merge-ergonomics.md) |
 | **P24 — Sparse checkouts / sub-tree sharing** | Monorepo-width working trees | work in one subtree with the rest absent from disk; commits carry absent subtrees byte-identically | [0034](docs/adr/0034-sparse-checkouts.md) |
 
-Ordering rationale: P21 first (compounding hours-scale debt, one live
-hazard); P22 before P23/P24 (provenance is the last unbuilt security
-pillar — settle it before more surface accretes); P23 before P24 (conflict
-UX pays off daily and sparse users will want it too).
+Ordering rationale: P22 before P23/P24 (provenance is the last unbuilt
+security pillar — settle it before more surface accretes); P23 before P24
+(conflict UX pays off daily and sparse users will want it too).
 
 ## Completed phases (usability-first ordering)
 

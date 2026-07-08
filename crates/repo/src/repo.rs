@@ -3710,6 +3710,151 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[test]
+    fn policy_ops_refused_during_in_progress_states() {
+        // P21 Task 1: `protect`/`grant`/`revoke` (path-protection) and
+        // `secret_add`/`secret_rotate` are policy-only ref-moving ops with no
+        // in-progress guard of their own — the same P19-I1 hazard class as
+        // the unguarded `switch`/`undo` findings, just on a different set of
+        // callers. Each must refuse up front, before any work, while a
+        // merge/pick/rebase is stopped mid-fold.
+        let root = tmp_root("policy-guards");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+
+        // Every op needs a real prefix/secret to exist so the guard is what's
+        // actually hit, not an earlier `NotProtected`/`NoSuchSecret` error.
+        repo.protect("vault/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.secret_add("K", b"v", std::slice::from_ref(&alice_pk)).unwrap();
+        let recipient = alice_pk.recipient_id();
+
+        // (state name, setup fn, teardown fn) — each policy op is exercised
+        // against all three, asserting the exact typed error per state.
+        let states: [(&str, fn(&Layout), fn(&Layout)); 3] = [
+            ("merge", |layout| {
+                crate::merge_state::write(layout, &ObjectId::of(b"theirs"), &[], None).unwrap();
+            }, |layout| crate::merge_state::clear(layout).unwrap()),
+            ("pick", |layout| {
+                crate::pick_state::write(layout, &ObjectId::of(b"picked"), &[], None, None).unwrap();
+            }, |layout| crate::pick_state::clear(layout).unwrap()),
+            ("rebase", |layout| {
+                crate::rebase_state::write(
+                    layout,
+                    &crate::rebase_state::RebaseState {
+                        branch: "main".into(),
+                        original_tip: ObjectId::of(b"orig"),
+                        target: "feature".into(),
+                        acc_tip: ObjectId::of(b"acc"),
+                        conflicted: ObjectId::of(b"conflicted"),
+                        remaining: vec![],
+                        total: 1,
+                        author: "me".into(),
+                        resolved: false,
+                    },
+                )
+                .unwrap();
+            }, |layout| crate::rebase_state::clear(layout).unwrap()),
+        ];
+
+        for (state_name, write_state, clear_state) in states {
+            write_state(&repo.layout);
+
+            macro_rules! assert_refused {
+                ($result:expr, $op:literal) => {
+                    let err = $result.unwrap_err();
+                    match state_name {
+                        "merge" => assert!(
+                            matches!(err, Error::MergeInProgress),
+                            "{} must refuse with MergeInProgress during merge, got {err:?}",
+                            $op
+                        ),
+                        "pick" => assert!(
+                            matches!(err, Error::PickInProgress),
+                            "{} must refuse with PickInProgress during pick, got {err:?}",
+                            $op
+                        ),
+                        "rebase" => assert!(
+                            matches!(err, Error::RebaseInProgress),
+                            "{} must refuse with RebaseInProgress during rebase, got {err:?}",
+                            $op
+                        ),
+                        _ => unreachable!(),
+                    }
+                };
+            }
+
+            assert_refused!(repo.protect("vault/", std::slice::from_ref(&alice_pk), None), "protect");
+            assert_refused!(repo.grant("vault/", &alice_sk, &alice_pk), "grant");
+            assert_refused!(repo.revoke("vault/", &recipient), "revoke");
+            assert_refused!(repo.secret_add("K2", b"v2", std::slice::from_ref(&alice_pk)), "secret_add");
+            assert_refused!(
+                repo.secret_rotate("K", Some(b"v3"), std::slice::from_ref(&alice_pk), None),
+                "secret_rotate"
+            );
+
+            clear_state(&repo.layout);
+        }
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn secret_add_refused_during_stopped_rebase_p19_i1_repro() {
+        // P19-I1, pinned end to end: a REAL stopped rebase (not a hand-written
+        // state file) must refuse `secret_add`, not silently move the branch
+        // tip out from under it. Setup mirrors
+        // `rebase_stops_on_conflict_and_continue_completes` (replay.rs).
+        let root = tmp_root("secret-add-rebase-i1");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("x.txt"), b"a\nB\nc\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nZ\nc\n").unwrap();
+        repo.commit("me", "feature edits x").unwrap();
+        let original_feature_tip = repo.head_tip().unwrap().unwrap();
+
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let _ = alice_sk;
+
+        // Stop on conflict.
+        let outcome = repo.rebase("main", "me", None).unwrap();
+        assert!(matches!(outcome, crate::replay::RebaseResult::Stopped { .. }));
+        assert_eq!(repo.head_tip().unwrap(), Some(original_feature_tip));
+        assert!(repo.rebase_in_progress());
+
+        // The hazard: secret_add must refuse, not force a registry commit
+        // over the stopped rebase's branch tip.
+        let err = repo.secret_add("DB_URL", b"v", std::slice::from_ref(&alice_pk)).unwrap_err();
+        assert!(matches!(err, Error::RebaseInProgress), "expected RebaseInProgress, got {err:?}");
+
+        // State untouched: still in progress, tip unmoved, registry doesn't
+        // carry the refused secret.
+        assert!(repo.rebase_in_progress());
+        assert_eq!(repo.head_tip().unwrap(), Some(original_feature_tip));
+        assert!(!repo.registry().unwrap().contains_key("DB_URL"));
+
+        // Resolve and continue: completes normally, and the refused secret is
+        // still absent from the completed tip's registry (it was never
+        // written anywhere, not even discarded state).
+        std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
+        let outcome = repo.rebase_continue("me", None).unwrap();
+        assert!(matches!(outcome, crate::replay::RebaseResult::Rebased { .. }));
+        assert!(!repo.rebase_in_progress());
+        assert!(!repo.registry().unwrap().contains_key("DB_URL"), "refused secret must not resurface");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Regression: after a clone, an incremental fetch must send only the new
     /// delta — not the full history. Under the old bug, `transfer_objects`
     /// derived `haves` from the remote's tips (the objects being fetched), so
