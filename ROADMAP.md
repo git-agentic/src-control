@@ -275,7 +275,21 @@ across every phase.
 
 ## Active
 
-None — the P21–P24 horizon is complete; brainstorm the next horizon.
+**Scale & reach (P25–P27).** The P21–P24 horizon closed out hardening,
+provenance, merge ergonomics, and sparse checkouts; this horizon targets
+throughput and reach at scale: streaming pack transfer so `push`/`fetch`/
+`clone` don't hold a whole pack in RAM, then the follow-on work it unblocks.
+
+- **Phase 25 — Streaming pack transfer (in progress).** Task 1: an
+  incremental `PackWriter` (`crates/core/src/pack.rs`) that appends objects
+  one at a time to any `Write`, accumulating only the (small) index in RAM,
+  producing byte-identical output to `build_pack` for the same object
+  sequence; and a streaming `parse_pack_reader` that yields verified
+  `(id, Object)` pairs from a `Read` without holding the whole pack body,
+  peak RAM bounded to one object. `build_pack`/`parse_pack` stay intact —
+  this is additive, not a replacement. Later tasks in this phase wire the
+  writer/reader into the transport and CLI paths that currently buffer a
+  whole pack (push/fetch/clone) so large-repo transfer has bounded memory.
 
 ## Completed phases (usability-first ordering)
 
