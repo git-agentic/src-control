@@ -360,6 +360,13 @@ sparse checkouts → P24):
   limitation across different Git repos).
 - **Richer trust models** beyond trusted-key lists (delegation, expiry) —
   P22 ships the key-list model.
+- **In-progress guard for the RECEIVING repo on push.**
+  `LocalTransport::update_ref` moves a branch tip with only a CAS/ff gate
+  and no in-progress check on the receiving side — a push into a repo
+  with a stopped merge/pick reproduces the P19-I1 discard shape via a
+  remote writer (the stopped rebase has its moved-tip backstop;
+  merge/pick completion does not). Pre-existing since P6/P12; flagged at
+  the P21 final review as the one gap outside the policy-op class.
 
 ## How a phase gets built
 
