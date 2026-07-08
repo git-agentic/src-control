@@ -789,7 +789,59 @@ a bounded disk-hygiene boundary, follow-on to extending the sparse gate to
 the `to_encrypt`/sidecar writes too. Proven by `demo/run_sparse_demo.sh`.
 See ADR-0034.
 
-Remaining follow-ons: HTTP transport, streaming (>4 GiB) frames,
-operation objects in the CAS, oplog entries for remote-tracking refs, and
-extending the sparse gate to `materialize_conflict_state`'s
-`to_encrypt`/sidecar write loops (see the P24 boundary note above).
+**Phase 25 is built.** Streaming pack transfer: `push`/`fetch`/`clone`
+over ssh:// no longer hold a whole pack in RAM on the server or the wire.
+`crates/core/src/pack.rs` gained an incremental `PackWriter` (appends
+objects one at a time to any `Write`, accumulating only the small index in
+RAM, byte-identical to `build_pack` for the same object sequence — pinned
+by `pack_writer_matches_build_pack_byte_for_byte`) and a streaming
+`parse_pack_reader` (verifies each record's BLAKE3 hash off a `Read`
+without holding the whole pack body; terminates cleanly on a
+record-boundary EOF since the pack format carries no object count).
+`crates/repo/src/wire.rs` frames a pack as `ST_PACK_CHUNK`/`ST_PACK_END`
+opcodes under the **unchanged** `u32` frame header
+(`write_pack_stream`/`read_pack_stream`); `CHUNK_SIZE` defaults to 1 MiB,
+overridable per-process via `SC_PACK_CHUNK` (`wire::pack_chunk_size()`) for
+tuning or forcing many-chunk transfers in tests/demos. **`PROTOCOL_VERSION`
+bumped 1 → 2 and v1 is dropped outright** — there is one pack encoding
+(always chunked), and a version mismatch is rejected cleanly at the
+`Hello` handshake in both directions; this is a breaking wire change but
+acceptable pre-deployment (no old `sc serve` peers in the field). The
+sender (`LocalTransport::build_pack_tempfile`) streams objects one at a
+time into a temp pack file instead of collecting a
+`Vec<(ObjectId, Vec<u8>)>`; the receiver (`ingest_pack_file`) does a
+two-pass atomic-after-verify ingest — pass 1 re-reads the spilled file
+verifying every record's hash and writing nothing, pass 2 re-reads it
+again writing each verified object into the store — so a corrupt or
+truncated pack never partially lands, and a hostile per-record length
+prefix can only allocate as much as the attacker already transferred
+on disk, not an unbounded amount off a live socket. `TempPackGuard`
+(`.sc/tmp/`, a new scratch dir — see `Layout::tmp_dir`) is an RAII type
+that removes the temp pack file on success or any error alike. Chunk
+framing is scoped to the wire boundary only: `LocalTransport` still
+passes raw pack bytes end to end, matching the spec's wire-path-only
+scope. No new user command — streaming is entirely transparent to every
+existing `push`/`fetch`/`clone` invocation; the ssh demo
+(`demo/run_ssh_remote_demo.sh`) now streams by construction, and
+`demo/run_streaming_demo.sh` forces `SC_PACK_CHUNK=4096` to prove a ~1 MiB
+signed blob crosses 250+ chunk frames with the clone byte-for-byte
+identical to the origin (object set, working tree, `sc log`) and `sc
+verify --require` clean in the clone (proving the signature rode the
+chunked stream), with zero `.sc/tmp` residue on either end across two
+independent runs. **Known boundary (documented, not closed):** the
+headline promised bounded RAM on both sides, but that holds for the
+server and the wire only — the ssh **client's** own application layer,
+`crates/repo/src/sync.rs`, was not rewired onto this machinery:
+`transfer_objects` (shared by `fetch`/`clone_url`) still destreams the
+whole incoming pack into a `Vec<u8>` before calling non-streaming
+`parse_pack`, and `Repo::push` still assembles the entire outgoing pack
+into a `Vec<(ObjectId, Vec<u8>)>` before calling `build_pack`. The
+machinery to close this already exists (`build_pack_tempfile`/
+`ingest_pack_file`/`TempPackGuard`); routing `sync.rs`'s client-side
+fetch/push through it is a stated follow-on. See ADR-0035.
+
+Remaining follow-ons: HTTP transport, bounding the ssh client's own
+`sync.rs` fetch/push RAM (the P25 boundary note above), operation objects
+in the CAS, oplog entries for remote-tracking refs, and extending the
+sparse gate to `materialize_conflict_state`'s `to_encrypt`/sidecar write
+loops (see the P24 boundary note above).

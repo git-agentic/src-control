@@ -45,7 +45,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0032](0032-signed-commits-provenance.md) | Signed commits & provenance | Accepted | 22 |
 | [0033](0033-merge-ergonomics.md) | Merge ergonomics — conflict UX beyond markers | Accepted | 23 |
 | [0034](0034-sparse-checkouts.md) | Sparse checkouts / sub-tree sharing | Accepted | 24 |
-| [0035](0035-streaming-transfer.md) | Streaming pack transfer (bounded-RAM, >4 GiB) | Proposed | 25 |
+| [0035](0035-streaming-transfer.md) | Streaming pack transfer (bounded-RAM, >4 GiB) | Accepted | 25 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
