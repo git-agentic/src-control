@@ -491,7 +491,6 @@ impl Repo {
                     wrapped: Default::default(),
                 };
                 let (carried, to_encrypt) = split_for_encryption(&files, &union_prot)?;
-                let conflict_root = self.vfs().write_tree_with_perms(&carried)?;
                 // Wraps for the conflict materialize: ours ∪ picked (a carried
                 // blob survives from one of the two sides, so their unioned
                 // maps cover every carried PROTECTED entry — the same
@@ -503,39 +502,14 @@ impl Repo {
                 }
                 let conflict_prot =
                     scl_core::Protection { prefixes: union_prefixes, wrapped };
-                {
-                    let store_arc = self.vfs().store();
-                    let mut store = store_arc.lock().unwrap();
-                    // Carried PROTECTED entries decrypt for `identity` where
-                    // its key matches; the rest are skipped (absent from
-                    // disk). The completion commit's decided-tree
-                    // carry-forward preserves skipped content.
-                    let _skipped = worktree::materialize(
-                        &self.layout,
-                        &mut store,
-                        conflict_root,
-                        Some(ours_root),
-                        &conflict_prot,
-                        identity,
-                    )?;
-                }
-                // Direct plaintext writes AFTER materialize: its deletion pass
-                // (ours-tracked paths absent from the carried-only tree) would
-                // otherwise remove what we just wrote.
-                for (path, bytes, _mode, _recipients) in &to_encrypt {
-                    let full = worktree::safe_join(&self.layout.root, path)?;
-                    if let Some(parent) = full.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(full, bytes)?;
-                }
-                for (rel, bytes) in &sidecars {
-                    let full = self.layout.root.join(rel);
-                    if let Some(parent) = full.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(full, bytes)?;
-                }
+                let conflict_root = self.materialize_conflict_state(
+                    &carried,
+                    &to_encrypt,
+                    &sidecars,
+                    &conflict_prot,
+                    ours_root,
+                    identity,
+                )?;
                 // Markers are on disk; record pick state last (its PICK_HEAD
                 // write is the in-progress signal). The decided carried tree
                 // (`conflict_root`) is persisted alongside so completion
@@ -897,42 +871,20 @@ impl Repo {
                         wrapped: Default::default(),
                     };
                     let (carried, to_encrypt) = split_for_encryption(&files, &union_prot)?;
-                    let conflict_root = self.vfs().write_tree_with_perms(&carried)?;
                     let mut wrapped = acc_protection.wrapped.clone();
                     for (id, wks) in &commit_snap.protection.wrapped {
                         let entry = wrapped.entry(*id).or_default();
                         *entry = crate::protect::union_wraps(entry, wks);
                     }
                     let conflict_prot = scl_core::Protection { prefixes: union_prefixes, wrapped };
-                    {
-                        let store_arc = self.vfs().store();
-                        let mut store = store_arc.lock().unwrap();
-                        let _skipped = worktree::materialize(
-                            &self.layout,
-                            &mut store,
-                            conflict_root,
-                            Some(disk_root),
-                            &conflict_prot,
-                            identity,
-                        )?;
-                    }
-                    // Direct plaintext writes AFTER materialize: its deletion
-                    // pass (disk-tracked paths absent from the carried-only
-                    // tree) would otherwise remove what we just wrote.
-                    for (path, bytes, _mode, _recipients) in &to_encrypt {
-                        let full = worktree::safe_join(&self.layout.root, path)?;
-                        if let Some(parent) = full.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::write(full, bytes)?;
-                    }
-                    for (rel, bytes) in &sidecars {
-                        let full = self.layout.root.join(rel);
-                        if let Some(parent) = full.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        std::fs::write(full, bytes)?;
-                    }
+                    let conflict_root = self.materialize_conflict_state(
+                        &carried,
+                        &to_encrypt,
+                        &sidecars,
+                        &conflict_prot,
+                        disk_root,
+                        identity,
+                    )?;
                     let remaining_after_current: Vec<ObjectId> = remaining.into_iter().collect();
                     let done = total.saturating_sub(remaining_after_current.len()).saturating_sub(1);
                     // Decided root, then conflicts, then REBASE_STATE last —

@@ -975,45 +975,18 @@ impl Repo {
             // theirs-only rule (the I2 case): they land back on disk as the
             // plaintext the user already had, and the completion commit
             // encrypts them under the union rule.
-            let conflict_root = self.vfs.write_tree_with_perms(&carried)?;
             let conflict_prot = scl_core::Protection {
                 prefixes: union_prefixes,
                 wrapped: merge_result.wrapped_carry.clone(),
             };
-            {
-                let store_arc = self.vfs.store();
-                let mut store = store_arc.lock().unwrap();
-                // Carried PROTECTED entries decrypt for `identity` where its
-                // key matches; the rest are skipped (absent from disk). The
-                // completion commit's both-parents carry-forward preserves
-                // skipped content, so nothing is lost by not surfacing the
-                // list here (the Err return can't carry it).
-                let _skipped = worktree::materialize(
-                    &self.layout,
-                    &mut store,
-                    conflict_root,
-                    Some(ours_root),
-                    &conflict_prot,
-                    identity,
-                )?;
-            }
-            // Direct plaintext writes AFTER materialize: its deletion pass
-            // (ours-tracked paths absent from the carried-only tree) would
-            // otherwise remove what we just wrote.
-            for (path, bytes, _mode, _recipients) in &to_encrypt {
-                let full = worktree::safe_join(&self.layout.root, path)?;
-                if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(full, bytes)?;
-            }
-            for (rel, bytes) in &merge_result.sidecars {
-                let full = self.layout.root.join(rel);
-                if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(full, bytes)?;
-            }
+            let conflict_root = self.materialize_conflict_state(
+                &carried,
+                &to_encrypt,
+                &merge_result.sidecars,
+                &conflict_prot,
+                ours_root,
+                identity,
+            )?;
             // Conflict markers are on disk; record merge state last (its
             // MERGE_HEAD write is the in-progress signal). A crash in this
             // window leaves marked files but NO merge state — re-running
@@ -1101,6 +1074,72 @@ impl Repo {
             &[(head.clone(), before, Some(id))],
         )?;
         Ok((id, skipped))
+    }
+
+    /// Shared write sequence for a conflicted merge/replay's decided working
+    /// set (P21): write the carried (already CAS-safe: surviving ciphertext +
+    /// plain files) entries to a fresh CAS tree, materialize that tree into
+    /// the working dir (deleting anything `old_root` tracked but the new tree
+    /// doesn't, decrypting what `identity` can), then write the plaintext
+    /// `to_encrypt` entries and `sidecars` straight to disk. Plaintext must
+    /// NEVER transit the CAS, so this ordering matters: the direct writes
+    /// happen AFTER materialize, whose deletion pass (old-tracked paths
+    /// absent from the carried-only tree) would otherwise remove what they
+    /// just wrote.
+    ///
+    /// Shared by `merge_with_identity`'s conflict arm, `cherry_pick`'s
+    /// Conflicts arm, and the rebase fold's stop arm (P15 Tasks 6/7/8) — all
+    /// three assemble `conflict_prot`'s wrap map differently (the merge path
+    /// already has a precomputed `wrapped_carry` from `three_way`; the replay
+    /// paths union `ours`'/`theirs`' wrap maps by hand, since
+    /// `three_way_files`'s `Conflicts` outcome doesn't expose one) and
+    /// persist different in-progress state afterward (`merge_state` vs
+    /// `pick_state` vs `rebase_state`, with different return types), so only
+    /// this write sequence — genuinely identical across all three — is
+    /// extracted. Returns the CAS `conflict_root` so the caller can persist
+    /// it as decided-root state.
+    pub(crate) fn materialize_conflict_state(
+        &self,
+        carried: &[(String, Vec<u8>, scl_core::FileMode, u8)],
+        to_encrypt: &[(String, Vec<u8>, scl_core::FileMode, Vec<[u8; 32]>)],
+        sidecars: &[(String, Vec<u8>)],
+        conflict_prot: &scl_core::Protection,
+        old_root: ObjectId,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<ObjectId> {
+        let conflict_root = self.vfs.write_tree_with_perms(carried)?;
+        {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            // Carried PROTECTED entries decrypt for `identity` where its key
+            // matches; the rest are skipped (absent from disk). The
+            // completion commit's decided-tree carry-forward preserves
+            // skipped content, so nothing is lost by not surfacing the list
+            // here (the `Err`/`Stopped` return can't carry it).
+            let _skipped = worktree::materialize(
+                &self.layout,
+                &mut store,
+                conflict_root,
+                Some(old_root),
+                conflict_prot,
+                identity,
+            )?;
+        }
+        for (path, bytes, _mode, _recipients) in to_encrypt {
+            let full = worktree::safe_join(&self.layout.root, path)?;
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(full, bytes)?;
+        }
+        for (rel, bytes) in sidecars {
+            let full = self.layout.root.join(rel);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(full, bytes)?;
+        }
+        Ok(conflict_root)
     }
 
     /// Abandon an in-progress merge: restore the working tree to the current tip
