@@ -1,6 +1,6 @@
 # ADR-0036: sc-native HTTP transport
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-08
 - **Phase:** 26
 - **Builds on:** ADR-0022 (SSH stdio wire protocol), ADR-0035 (streaming pack transfer), ADR-0028 (network Git remotes — owns http(s):// routing)
@@ -43,6 +43,69 @@ sc-native-ssh routing stay untouched; `open_transport` gains an
   bytes; the P25 chunk stream is the wire's own framing — no HTTP
   chunked-transfer-encoding.
 
+## Refinements discovered during the build
+
+- **URL form:** `sc+http://host[:port]/repo`, port defaulting to
+  `DEFAULT_PORT = 8730`, parsed by `ScHttpUrl::parse`
+  (`crates/repo/src/http_transport.rs:150`) — mirrors `SshUrl::parse`'s
+  error style (`Error::InvalidArgument`, named URL in the message) and
+  additionally rejects a host/path containing `\r`/`\n` (`http_transport.rs:176`),
+  a CRLF-injection guard against `write_client_opening` interpolating
+  unescaped text into the request line/header.
+- **Opening codec** is four small, pure `Read`/`Write` functions —
+  `write_client_opening`, `read_client_opening`, `write_status`,
+  `read_status` (`http_transport.rs:59`, `:68`, `:97`, `:110`) — all routed
+  through one shared `read_bounded_opening` helper (`http_transport.rs:34`)
+  that reads byte-by-byte up to the `\r\n\r\n` terminator and errors out
+  once the accumulator crosses `MAX_OPENING_BYTES = 8 * 1024`
+  (`http_transport.rs:24`), a check-before-read bound rather than a
+  fixed-size buffer read.
+- **Client `HttpTransport::connect`** (`http_transport.rs:207`): opens a
+  `TcpStream`, writes the client opening, then reads and maps the status
+  line — `200` proceeds, `404` → `Error::NotARepo`, anything else →
+  `Error::Protocol` — **before** the `WireClient::handshake` call, so a
+  non-repo or malformed-response server can never be mistaken for a
+  HELLO-handshake failure. The stream is split via `try_clone` into
+  independent read/write halves, and the status line is read through the
+  *same* `BufReader` that goes on to become the `WireClient`'s reader
+  (`http_transport.rs:224`–`235`) rather than a throwaway clone — `BufReader`
+  can pull more than one byte per syscall, so reading the status through a
+  disposable reader risked silently swallowing the first wire-protocol
+  frame byte(s) if the server ever raced ahead. `open_transport`
+  (`crates/repo/src/stdio_transport.rs:324`) routes `sc+http://` to this
+  path above the existing local-path fallback; `ssh://` and P18's
+  `http(s)://` git-bridge routing are untouched.
+- **Server** `serve_http`/`serve_http_listener`
+  (`http_transport.rs:297`, `:317`): thread-per-connection —
+  `TcpListener::incoming()` spawns one `std::thread` per accepted socket,
+  each running `handle_http_connection` (`http_transport.rs:344`)
+  end-to-end and isolated (a panic or error inside one connection is
+  caught/logged to stderr and never takes down the accept loop or other
+  connections). `.sc/` missing at `root` → `404` with no wire handshake
+  attempted; a malformed/oversized opening → best-effort `400`. A
+  `set_read_timeout(OPENING_READ_TIMEOUT = 30s)` guards the opening read
+  against slow-loris stalls (byte-bounded by `MAX_OPENING_BYTES` but not
+  time-bounded on its own) and is explicitly cleared
+  (`http_transport.rs:376`) right after writing the `200` status and
+  before handing off to `wire::serve`, so a legitimate large streamed pack
+  transfer is never cut off mid-stream by the same timeout that guards the
+  opening. Each connection's thread opens `LocalTransport` fresh
+  (`wire::serve` inside `handle_http_connection`) — no store or lock is
+  shared across threads in this module; concurrency safety rides entirely
+  on the pre-existing `.sc/` single-writer `RepoLock` that `commit`/`push`
+  already acquire per-root. CLI surface: `sc serve --http <addr> <path>`
+  (`crates/cli/src/main.rs:274`, dispatch `:628`, handler `:2415`),
+  mutually exclusive with `--stdio`.
+- **No double-framing, confirmed in the server path too:** after the `200`
+  status line, `handle_http_connection` hands the raw, unwrapped
+  `TcpStream`/`BufReader` pair straight to `wire::serve` — the P25 chunk
+  stream and P22 signature objects ride the socket with no HTTP
+  `Transfer-Encoding` wrapper on either end; `demo/run_http_remote_demo.sh`
+  exercises this with `SC_PACK_CHUNK=4096` over a ~1 MiB blob and a signed
+  commit that verifies clean in the clone.
+- **Zero new dependencies**: the whole module is `std::net`/`std::io` —
+  confirmed by an empty `git diff main -- '*Cargo.toml'` at phase close.
+
 ## Consequences
 
 - `sc+http://` clone/fetch/push work with no ssh account, over a plain TCP
@@ -57,6 +120,19 @@ sc-native-ssh routing stay untouched; `open_transport` gains an
   connection model.
 - Zero new dependencies; the wire protocol, streaming, and version-2
   handshake are unchanged.
+- **Unbounded thread-per-connection** (accepted design consequence, not
+  yet closed): `serve_http_listener` spawns one OS thread per accepted
+  socket with no pool, cap, or backpressure — a connection-churn client
+  can exhaust server threads/fds. Follow-on: a bounded connection pool.
+- **No idle-transfer watchdog**: `OPENING_READ_TIMEOUT` is cleared once
+  `wire::serve` takes over, so a client that completes the opening and
+  then stalls mid-transfer holds its thread indefinitely — there is no
+  timeout covering the post-opening phase. Follow-on: an idle-transfer
+  watchdog distinct from the opening-read timeout.
+- **No accept-loop backoff**: a sustained `EMFILE`/`ENFILE` (fd
+  exhaustion) makes `listener.incoming()` yield errors back-to-back with
+  no delay between retries, hot-spinning the accept loop instead of
+  backing off. Follow-on: bounded backoff on repeated accept errors.
 
 ## Alternatives considered
 

@@ -257,6 +257,20 @@ bash demo/run_sparse_demo.sh                  # sparse checkout proof (P24): nar
                                               # three subtrees, edit + commit under sparse, then
                                               # sc sparse disable AND an independent full clone
                                               # both restore the other two byte-identical
+bash demo/run_streaming_demo.sh               # streaming pack transfer proof (P25): a forced
+                                              # SC_PACK_CHUNK=4096 crosses a ~1 MiB signed blob
+                                              # in 250+ chunk frames, byte-for-byte clone, zero
+                                              # .sc/tmp residue on either end
+cargo run --bin sc -- serve --http <addr> <path>   # sc-native wire protocol over TCP
+                                              # (P26); e.g. `sc serve --http 127.0.0.1:8730 .`;
+                                              # exactly one of --stdio/--http is required
+cargo run --bin sc -- clone sc+http://host[:port]/repo <dst>   # clone over sc+http:// (P26;
+                                              # port defaults to 8730); sc remote add/fetch/push
+                                              # accept the same sc+http:// URL form
+bash demo/run_http_remote_demo.sh             # sc-native HTTP transport proof (P26): real
+                                              # loopback TCP (no shim, unlike ssh://), clone +
+                                              # push + fetch over sc+http://, a signed ~1 MiB
+                                              # blob byte-for-byte, zero .sc/tmp residue
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -855,7 +869,72 @@ attacker-controlled frame-length header before any chunk boundary is
 enforced (pre-existing P12 behavior, deliberately deferred as a
 hostile-peer hardening item, not a client-buffering issue). See ADR-0035.
 
-Remaining follow-ons: HTTP transport, operation objects in the CAS, oplog
-entries for remote-tracking refs, and extending the sparse gate to
+**Phase 26 is built.** A second sc-native network transport alongside P12's
+ssh://: `sc+http://host[:port]/repo` (port default `DEFAULT_PORT = 8730`),
+parsed by `ScHttpUrl::parse` (`crates/repo/src/http_transport.rs`) —
+mirrors `SshUrl::parse`'s error style and additionally rejects a host/path
+containing `\r`/`\n` (a CRLF-injection guard, since the opening writer
+interpolates them unescaped into the request line/header). The opening
+codec is four small, pure `Read`/`Write` functions
+(`write_client_opening`/`read_client_opening`/`write_status`/
+`read_status`), all routed through one shared `read_bounded_opening`
+helper that reads byte-by-byte up to `\r\n\r\n` and errors out once the
+accumulator crosses `MAX_OPENING_BYTES` (8 KiB) — a check-before-read
+bound, not a fixed-size buffer read, so an unterminated/hostile opening
+cannot force unbounded allocation. **Client** `HttpTransport::connect`:
+opens a `TcpStream`, writes the opening, then reads and maps the status
+line — `200` proceeds, `404` → `Error::NotARepo`, anything else → a clear
+protocol error — *before* the `WireClient` handshake begins, so a
+non-repo/malformed-response server is never mistaken for a HELLO failure;
+the socket is `try_clone()`-split into read/write halves and the status
+line is read through the *same* `BufReader` that becomes the `WireClient`'s
+reader (not a throwaway clone), since `BufReader` can pull more than one
+byte per syscall and a disposable reader risked swallowing the first
+wire-protocol frame byte(s). `open_transport` routes `sc+http://` to this
+path above the local-path fallback; `ssh://` and P18's `http(s)://`
+git-bridge routing are untouched. **Server** `sc serve --http <addr>
+<path>`: a `TcpListener`, thread-per-connection — each accepted socket runs
+on its own thread via `handle_http_connection`, isolated (a per-connection
+error/panic is logged to stderr and never takes down the accept loop or
+other connections); `.sc/` missing at `path` → `404` with no wire
+handshake attempted; a malformed/oversized opening → best-effort `400`. A
+30s read timeout guards the opening read against slow-loris stalls
+(byte-bounded by `MAX_OPENING_BYTES` but not time-bounded on its own) and
+is cleared right after writing the `200` status, before handing off to
+`wire::serve` — a legitimate large streamed pack transfer must not be cut
+off mid-stream by the same timeout that guards the opening. Each
+connection's thread opens `LocalTransport` fresh — no store or lock is
+shared across threads in this module; concurrency safety rides entirely on
+the pre-existing `.sc/` single-writer `RepoLock` `commit`/`push` already
+acquire per-root. **No double-framing:** after the `200` status, the raw
+`TcpStream` goes straight to `wire::serve` — the P25 chunk stream and P22
+signatures ride the socket with no HTTP `Transfer-Encoding` wrapper on
+either end. Zero new dependencies (`std::net`/`std::io` only — confirmed
+by an empty `git diff main -- '*Cargo.toml'`). Proven by
+`demo/run_http_remote_demo.sh`: real loopback TCP (no shim needed, unlike
+the ssh demo), a ~1 MiB signed blob crosses `sc+http://` clone with
+`SC_PACK_CHUNK=4096` forcing many chunk frames, object set/working
+tree/`sc log` byte-for-byte identical to the origin, `sc verify --require`
+clean in the clone, a push from a second clone lands and a third clone's
+fetch sees it, zero `.sc/tmp` residue on either end — run twice.
+**Standing boundaries, stated plainly (same class as the ssh transport,
+plus one new one):** plaintext only, **no TLS** (`sc+https://` deferred to
+a TLS-dep phase or a fronting reverse proxy); **no authentication** (`sc
+serve --http` is unauthenticated, as `--stdio` delegates auth to ssh —
+production auth + TLS means fronting with a reverse proxy; this is the
+reach primitive, not a hosted-git competitor); **not HTTP-proxy/CDN safe**
+(a strict proxy won't tunnel the post-opening raw protocol, the accepted
+cost of the persistent-connection model). **Accepted design consequences,
+not yet closed (deferred, see ROADMAP):** `serve_http_listener` is
+unbounded thread-per-connection with no pool/backpressure; the opening
+timeout is cleared once `wire::serve` takes over, so a client that stalls
+mid-transfer holds its thread indefinitely (no idle-transfer watchdog
+yet); the accept loop has no backoff on sustained fd exhaustion. See
+ADR-0036.
+
+Remaining follow-ons: operation objects in the CAS, oplog entries for
+remote-tracking refs, extending the sparse gate to
 `materialize_conflict_state`'s `to_encrypt`/sidecar write loops (see the
-P24 boundary note above).
+P24 boundary note above), and the three P26 `sc serve --http` hardening
+items named above (connection pool/backpressure, idle-transfer watchdog,
+accept-loop backoff).
