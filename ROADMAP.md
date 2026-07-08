@@ -234,16 +234,17 @@ across every phase.
 
 ## Active
 
-None — Phase 23 is next up.
+- **Phase 23 — Merge ergonomics.** In build. Spec:
+  `docs/superpowers/specs/2026-07-08-p23-merge-ergonomics-design.md`
+  (ADR-0033, Proposed → Accepted at completion).
 
-## Next horizon (P23–P24)
+## Next horizon (P24)
 
 Decided 2026-07-08 (design: `docs/superpowers/specs/2026-07-08-roadmap-horizon-p21-p24-design.md`).
 Theme: invest in daily feel and scale once P22 closes out the trust story.
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
-| **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts` + `sc resolve --ours/--theirs` end-to-end on a conflicted merge | [0033](docs/adr/0033-merge-ergonomics.md) |
 | **P24 — Sparse checkouts / sub-tree sharing** | Monorepo-width working trees | work in one subtree with the rest absent from disk; commits carry absent subtrees byte-identically | [0034](docs/adr/0034-sparse-checkouts.md) |
 
 Ordering rationale: P23 before P24 (conflict UX pays off daily and sparse
