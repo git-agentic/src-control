@@ -11,8 +11,14 @@ use scl_core::ObjectId;
 use crate::error::{Error, Result};
 
 /// Protocol version spoken by this build. Bumped only on incompatible changes;
-/// both sides exchange it in `HELLO` before any repo access.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// both sides exchange it in `HELLO` before any repo access. Bumped 1 -> 2 in
+/// P25: the single-frame pack encoding (`PutPack(Vec<u8>)` request payload,
+/// whole-pack `GetPack` response body) is dropped in favor of the chunked
+/// pack sub-stream (`write_pack_stream`/`read_pack_stream`), so a v1 peer and
+/// a v2 peer can no longer usefully talk to each other — the version check
+/// in `serve`/`WireClient::handshake` refuses the mismatch before either
+/// side touches a pack verb.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // Request opcodes (one per Transport verb, plus session control).
 const OP_HELLO: u8 = 0x01;
@@ -35,13 +41,30 @@ const ST_ERR: u8 = 1;
 // never have to guess which "namespace" a leading byte belongs to — though
 // each frame stream (requests, responses, pack sub-stream) is only ever
 // interpreted in its own context.
-const ST_PACK_CHUNK: u8 = 0x20;
-const ST_PACK_END: u8 = 0x21;
+pub(crate) const ST_PACK_CHUNK: u8 = 0x20;
+pub(crate) const ST_PACK_END: u8 = 0x21;
 
 /// Chunk size `write_pack_stream` callers use by default in production: 1 MiB.
 /// Bounds peak RAM on both ends of a streamed pack transfer. Additive,
 /// unversioned wire addition (P25) — does not change `PROTOCOL_VERSION`.
 pub const CHUNK_SIZE: usize = 1 << 20;
+
+/// The chunk size a `write_pack_stream` caller on THIS process should
+/// actually use: an `SC_PACK_CHUNK` (bytes, must parse as a nonzero `usize`)
+/// override if set, else [`CHUNK_SIZE`]. Read fresh at each stream start —
+/// the same pattern `stdio_transport::ssh_command` uses for `SC_SSH` — so
+/// both a unit test and `demo/run_ssh_remote_demo.sh` can force many small
+/// chunk frames without needing a multi-megabyte fixture to prove the
+/// streaming path is real. Both ends of a transfer (the server's `GetPack`
+/// sender, the client's `PutPack` sender) call this, so setting the var
+/// before either side starts affects the whole round trip.
+pub fn pack_chunk_size() -> usize {
+    std::env::var("SC_PACK_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(CHUNK_SIZE)
+}
 
 // Wire error codes. Typed errors that sync logic relies on get their own code;
 // everything else degrades to EC_OTHER and surfaces as `Error::Remote(msg)`.
@@ -64,7 +87,12 @@ pub enum Request {
     PutObject { id: ObjectId, bytes: Vec<u8> },
     UpdateRef { branch: String, id: ObjectId, expected_old: Option<ObjectId> },
     GetPack { wants: Vec<ObjectId>, haves: Vec<ObjectId> },
-    PutPack(Vec<u8>),
+    /// Marker only (P25) — the pack body is no longer embedded in this
+    /// request's frame. Immediately after this request frame, the sender
+    /// streams the pack as `ST_PACK_CHUNK`/`ST_PACK_END` frames
+    /// (`write_pack_stream`); the receiver destreams them
+    /// (`read_pack_stream`) before replying.
+    PutPack,
 }
 
 // --- field encoding helpers (length-prefixed, matching core's canonical style) ---
@@ -183,10 +211,7 @@ impl Request {
                 put_ids(&mut out, wants);
                 put_ids(&mut out, haves);
             }
-            Request::PutPack(pack) => {
-                out.push(OP_PUT_PACK);
-                put_bytes(&mut out, pack);
-            }
+            Request::PutPack => out.push(OP_PUT_PACK),
         }
         out
     }
@@ -213,7 +238,7 @@ impl Request {
                 Request::UpdateRef { branch, id, expected_old }
             }
             OP_GET_PACK => Request::GetPack { wants: c.ids()?, haves: c.ids()? },
-            OP_PUT_PACK => Request::PutPack(c.bytes()?),
+            OP_PUT_PACK => Request::PutPack,
             op => return Err(Error::Protocol(format!("unknown opcode 0x{op:02x}"))),
         };
         c.done()?;
@@ -281,7 +306,11 @@ fn read_frame_inner(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
 /// is `chunk_size` (one buffer, reused per chunk). `chunk_size` is a
 /// parameter so tests can force a tiny value; production callers pass
 /// [`CHUNK_SIZE`].
-pub fn write_pack_stream(w: &mut impl Write, src: &mut impl Read, chunk_size: usize) -> Result<()> {
+pub fn write_pack_stream(
+    w: &mut impl Write,
+    src: &mut (impl Read + ?Sized),
+    chunk_size: usize,
+) -> Result<()> {
     let mut buf = vec![0u8; chunk_size];
     loop {
         let n = read_up_to(src, &mut buf)?;
@@ -300,7 +329,7 @@ pub fn write_pack_stream(w: &mut impl Write, src: &mut impl Read, chunk_size: us
 /// hits EOF, returning the number of bytes filled. Unlike `read_exact`, a
 /// short read at EOF is not an error — it's how the last, possibly-ragged
 /// chunk is detected.
-fn read_up_to(src: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
+fn read_up_to(src: &mut (impl Read + ?Sized), buf: &mut [u8]) -> Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         let n = src.read(&mut buf[filled..])?;
@@ -318,7 +347,7 @@ fn read_up_to(src: &mut impl Read, buf: &mut [u8]) -> Result<usize> {
 /// Returns the total number of bytes streamed. Any frame that is neither a
 /// well-formed chunk nor the end marker — including EOF before `ST_PACK_END`
 /// — is `Err(Error::Protocol(_))`.
-pub fn read_pack_stream(r: &mut impl Read, sink: &mut impl Write) -> Result<u64> {
+pub fn read_pack_stream(r: &mut impl Read, sink: &mut (impl Write + ?Sized)) -> Result<u64> {
     let mut total: u64 = 0;
     loop {
         let frame = read_frame_opt(r)?
@@ -531,35 +560,95 @@ pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> R
                 return Ok(());
             }
         };
-        let result: Result<Vec<u8>> = match req {
+
+        // GetPack and PutPack (P25) can't go through the generic
+        // "compute a body, write_ok/write_err it" dispatch below: neither
+        // side may ever hold the whole pack in one buffer. Both are handled
+        // here, inline, writing their own response frame(s) — including,
+        // for GetPack's success case, the chunk-stream frames that follow
+        // the initial (empty-body) OK frame.
+        match req {
             Request::Bye => return Ok(()),
-            Request::Hello { .. } => Err(Error::Protocol("unexpected HELLO mid-session".into())),
-            Request::ListRefs => transport.list_refs().map(|refs| refs_body(&refs)),
-            Request::HeadBranch => transport.head_branch().map(|s| str_body(&s)),
-            Request::HasObject(id) => transport.has_object(&id).map(bool_body),
-            Request::GetObject(id) => transport.get_object(&id),
-            Request::PutObject { id, bytes } => {
-                transport.put_object(&id, &bytes).map(|()| Vec::new())
-            }
-            Request::UpdateRef { branch, id, expected_old } => {
-                transport.update_ref(&branch, &id, expected_old.as_ref()).map(|()| Vec::new())
-            }
             Request::GetPack { wants, haves } => {
-                let mut pack = Vec::new();
-                transport.get_pack(&wants, &haves, &mut pack).map(|()| pack)
+                match transport.build_pack_tempfile(&wants, &haves) {
+                    Ok(guard) => {
+                        // Building the temp pack file (bounded RAM: one
+                        // object at a time via PackWriter) fully succeeded
+                        // before any wire byte for this response was sent,
+                        // so an OK/ERR split here is still clean — no
+                        // partial stream can ever follow an ERR.
+                        write_ok(w, &[])?; // empty body: "stream follows"
+                        let mut f = std::fs::File::open(guard.path())?;
+                        write_pack_stream(w, &mut f, pack_chunk_size())?;
+                        // `guard` drops here — temp pack file removed.
+                    }
+                    Err(e) => {
+                        let (code, msg) = err_to_wire(&e);
+                        write_err(w, code, &msg)?;
+                    }
+                }
             }
-            Request::PutPack(pack) => {
-                transport.put_pack(&mut &pack[..]).map(|ids| ids_body(&ids))
+            Request::PutPack => {
+                match spill_pack_stream(r, transport.layout()) {
+                    Ok(guard) => {
+                        match transport.ingest_from(guard.path()) {
+                            Ok(ids) => write_ok(w, &ids_body(&ids))?,
+                            Err(e) => {
+                                let (code, msg) = err_to_wire(&e);
+                                write_err(w, code, &msg)?;
+                            }
+                        }
+                        // `guard` drops here — temp pack file removed,
+                        // whether ingestion succeeded or failed.
+                    }
+                    Err(e) => {
+                        let (code, msg) = err_to_wire(&e);
+                        write_err(w, code, &msg)?;
+                    }
+                }
             }
-        };
-        match result {
-            Ok(body) => write_ok(w, &body)?,
-            Err(e) => {
-                let (code, msg) = err_to_wire(&e);
-                write_err(w, code, &msg)?;
+            other => {
+                let result: Result<Vec<u8>> = match other {
+                    Request::Hello { .. } => {
+                        Err(Error::Protocol("unexpected HELLO mid-session".into()))
+                    }
+                    Request::ListRefs => transport.list_refs().map(|refs| refs_body(&refs)),
+                    Request::HeadBranch => transport.head_branch().map(|s| str_body(&s)),
+                    Request::HasObject(id) => transport.has_object(&id).map(bool_body),
+                    Request::GetObject(id) => transport.get_object(&id),
+                    Request::PutObject { id, bytes } => {
+                        transport.put_object(&id, &bytes).map(|()| Vec::new())
+                    }
+                    Request::UpdateRef { branch, id, expected_old } => transport
+                        .update_ref(&branch, &id, expected_old.as_ref())
+                        .map(|()| Vec::new()),
+                    Request::Bye | Request::GetPack { .. } | Request::PutPack => {
+                        unreachable!("handled above")
+                    }
+                };
+                match result {
+                    Ok(body) => write_ok(w, &body)?,
+                    Err(e) => {
+                        let (code, msg) = err_to_wire(&e);
+                        write_err(w, code, &msg)?;
+                    }
+                }
             }
         }
     }
+}
+
+/// Destream an incoming pack chunk stream (`ST_PACK_CHUNK`/`ST_PACK_END`
+/// frames immediately following a `PutPack` request frame) straight to a
+/// fresh temp pack file, bounded to one chunk in RAM at a time. The guard is
+/// created before any read, so a stream that errors partway (a malformed
+/// frame, a dropped connection) still leaves nothing behind — `Drop` removes
+/// whatever was written so far.
+fn spill_pack_stream(r: &mut impl Read, layout: &crate::layout::Layout) -> Result<crate::transport::TempPackGuard> {
+    let guard = crate::transport::TempPackGuard::new(layout)?;
+    let mut f = std::fs::File::create(guard.path())?;
+    read_pack_stream(r, &mut f)?;
+    Ok(guard)
 }
 
 #[cfg(test)]
@@ -611,7 +700,7 @@ mod tests {
             Request::UpdateRef { branch: "dev".into(), id: some_id(5), expected_old: Some(some_id(6)) },
             Request::GetPack { wants: vec![some_id(7)], haves: vec![some_id(8), some_id(9)] },
             Request::GetPack { wants: vec![], haves: vec![] },
-            Request::PutPack(b"packbytes".to_vec()),
+            Request::PutPack,
         ];
         for req in reqs {
             let bytes = req.encode();

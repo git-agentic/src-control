@@ -78,4 +78,11 @@ impl Layout {
     pub fn sparse_path(&self) -> PathBuf {
         self.dot_sc.join("sparse")
     }
+    /// `.sc/tmp` — scratch space for transient files (P25 streaming pack
+    /// transfer: spilled sender/receiver pack bodies). Never durable state —
+    /// safe to delete at any time; callers that write here are responsible
+    /// for their own RAII cleanup (see `transport::TempPackGuard`).
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.dot_sc.join("tmp")
+    }
 }
