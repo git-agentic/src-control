@@ -854,8 +854,8 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
         std::fs::write(&path, &seed_line)?;
     }
     println!("wrote identity: {} (0600)", path.display());
-    println!("encryption public key: {}", enc_pk.to_key_string());
-    println!("signing public key:    {}", sig_pk.to_key_string());
+    println!("public key:   {}", enc_pk.to_key_string());
+    println!("signing key:    {}", sig_pk.to_key_string());
     println!("recipient id: {}", enc_pk.recipient_id());
     println!("\nAdd to .sc/recipients.toml to grant/protect/seal to this identity:");
     println!("  [recipients]");
