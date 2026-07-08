@@ -117,6 +117,19 @@ pub fn write(
     Ok(())
 }
 
+/// Record the conflicted paths for the in-progress cherry-pick, rewriting
+/// ONLY `PICK_CONFLICTS` — `PICK_HEAD`, `PICK_DECIDED_ROOT`, and
+/// `PICK_MAINLINE_BASE` are untouched. Used by `Repo::resolve_path` to drop
+/// one path from the record without re-deriving (or disturbing) the other
+/// in-progress-pick fields.
+pub fn set_conflicts(layout: &Layout, paths: &[String]) -> Result<()> {
+    // An empty list must serialize to an empty file, not "\n" — `"\n".lines()`
+    // yields one empty-string element, not zero, which would make the last
+    // resolved path look like it's still conflicted (as `""`).
+    let text = if paths.is_empty() { String::new() } else { format!("{}\n", paths.join("\n")) };
+    atomic_write(&pick_conflicts_path(layout), text.as_bytes())
+}
+
 /// Clear all pick state (after a successful completion commit or `--abort`).
 pub fn clear(layout: &Layout) -> Result<()> {
     remove_if_exists(&pick_head_path(layout))?;

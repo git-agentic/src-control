@@ -2,6 +2,7 @@
 //! named branches, a git-like working tree, and commit/secret orchestration.
 
 pub mod diff3;
+pub(crate) mod conflicts;
 pub mod scanner;
 pub mod textdiff;
 pub mod scanner_patterns;
@@ -34,6 +35,7 @@ pub(crate) mod ws;
 pub mod workspace;
 pub mod worktree;
 
+pub use conflicts::{ActiveOp, ConflictKind, ConflictVersions, ResolveSide, Side};
 pub use error::{Error, Result};
 pub use gc::GcStats;
 pub use git_marks::MarksStore;

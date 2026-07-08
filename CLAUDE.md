@@ -118,6 +118,14 @@ cargo run --bin sc -- switch <name>          # switch branch + materialize worki
 cargo run --bin sc -- merge <ref> [--identity <key>]   # three-way merge (ff when possible; exits
                                              # 1 on conflicts; --identity only needed when a
                                              # protected path diverged in content on both sides)
+cargo run --bin sc -- conflicts [<path>] [--identity <key>] [--json]
+                                             # no path: lists conflicted paths + kind (text/
+                                             # binary/protected); with path: base/ours/theirs,
+                                             # decrypted under --identity for protected paths (P23)
+cargo run --bin sc -- resolve --ours|--theirs <path>... [--identity <key>]
+                                             # writes the chosen side's clean content, drops
+                                             # sidecars, clears the path from the active
+                                             # merge/pick/rebase conflict record (P23)
 cargo run --bin sc -- scan                   # preview the commit-time secret scan
 cargo run --bin sc -- clone <src> <dst>      # copy a repo (objects + refs)
 cargo run --bin sc -- protect <prefix> --to <recipient>   # encrypt matching paths (P7)
@@ -235,6 +243,10 @@ bash demo/run_provenance_demo.sh              # signed-history + rewrite-attack 
                                               # in the clone is caught by `sc verify --require`
                                               # while the original stays clean, bob's
                                               # retroactive `sc sign` shows ? until trusted
+bash demo/run_merge_ergonomics_demo.sh        # sc conflicts/sc resolve proof (P23): a text
+                                              # conflict and a protected (identity-decrypted)
+                                              # conflict both resolved end-to-end with no
+                                              # hand-edited markers
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -680,6 +692,38 @@ into a different branch position (a signature binds identity to a
 snapshot id, not to a branch position) — and `amend`/`rebase`/`merge`
 results start unsigned by design, since a new snapshot id is a new
 claim. See ADR-0032.
+
+**Phase 23 is built.** Merge ergonomics: `sc conflicts`/`sc resolve` resolve
+a conflicted merge/pick/stopped-rebase without hand-editing markers, on top
+of one new abstraction, `conflict_versions(path) -> {base, ours, theirs}`
+(`crates/repo/src/conflicts.rs`), that re-derives all three versions from
+the DAG for whichever op is active (merge: ours = tip, theirs = MERGE_HEAD,
+base = merge-base; pick: theirs = PICK_HEAD, base = its parent — or the
+persisted `PICK_MAINLINE_BASE` for a conflicted `--mainline` pick;
+rebase-stop: ours = the accumulated tip, theirs = the conflicted commit,
+base = its parent) rather than parsing marker text. Each side decrypts
+against *its own* snapshot's protection registry; the conflict kind
+(text/binary/protected) is classified from tree-entry perms alone, with no
+decryption needed. `sc conflicts [<path>] [--identity]` lists conflicted
+paths with their kind, or renders one path's `--- base/ours/theirs ---`
+sections (plaintext for protected paths, gated on `--identity`); `sc
+resolve --ours|--theirs <path…> [--identity]` writes the chosen side's
+content to the working file (or deletes it for an absent side), drops the
+`.theirs` sidecar this system may have written for a binary conflict — and
+only that sidecar, only when `{path}.theirs` isn't itself a tracked file
+(a review-caught data-loss bug in an earlier draft blind-unlinked
+`{path}.base`/`.ours`/`.theirs` unconditionally; the first two are never
+written and removing them was a pure footgun) — and clears the path from
+the active conflict record. Resolution only decrypts; it never
+re-encrypts, so plaintext still never enters the CAS before the unchanged
+`sc commit`/`sc rebase --continue` completion re-encrypts through the
+same helpers `commit` always used (encrypting only needs recipient public
+keys, so completion needs no `--identity` of its own). `sc status` gained
+the same per-path detail under every in-progress banner; `sc status
+--json`'s `"conflicts"` field is now `[{path, kind}]` instead of a bare
+path list — a strict superset, no existing consumer broke. Whole-file
+resolution only — no hunk-level or `--union`/`--base` modes. Proven by
+`demo/run_merge_ergonomics_demo.sh`. See ADR-0033.
 
 Remaining follow-ons: HTTP transport, streaming (>4 GiB) frames,
 operation objects in the CAS, and oplog entries for remote-tracking refs.

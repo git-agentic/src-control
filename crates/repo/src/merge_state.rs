@@ -82,6 +82,18 @@ pub fn write(
     Ok(())
 }
 
+/// Record the conflicted paths for the in-progress merge, rewriting ONLY
+/// `MERGE_CONFLICTS` — `MERGE_HEAD` and `MERGE_DECIDED_ROOT` are untouched.
+/// Used by `Repo::resolve_path` to drop one path from the record without
+/// re-deriving (or disturbing) the other in-progress-merge fields.
+pub fn set_conflicts(layout: &Layout, paths: &[String]) -> Result<()> {
+    // An empty list must serialize to an empty file, not "\n" — `"\n".lines()`
+    // yields one empty-string element, not zero, which would make the last
+    // resolved path look like it's still conflicted (as `""`).
+    let text = if paths.is_empty() { String::new() } else { format!("{}\n", paths.join("\n")) };
+    atomic_write(&merge_conflicts_path(layout), text.as_bytes())
+}
+
 /// Clear all merge state (after a successful merge commit or `--abort`).
 pub fn clear(layout: &Layout) -> Result<()> {
     remove_if_exists(&merge_head_path(layout))?;
