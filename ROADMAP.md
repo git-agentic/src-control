@@ -401,6 +401,13 @@ sparse checkouts → P24):
   limitation across different Git repos).
 - **Richer trust models** beyond trusted-key lists (delegation, expiry) —
   P22 ships the key-list model.
+- **Sidecar-cleanup footgun in `rebase_continue`.** `replay.rs:1059`'s
+  sidecar sweep blind-unlinks `{path}.theirs` with neither the
+  non-text-kind gate nor the tracked-path guard that P23 added to
+  `resolve_path` — so completing a stopped rebase can delete an untracked
+  user file named `foo.txt.theirs`. Pre-existing (predates P23); flagged
+  at the P23 final review as the twin of the resolve fix. Apply the same
+  two guards.
 - **In-progress guard for the RECEIVING repo on push.**
   `LocalTransport::update_ref` moves a branch tip with only a CAS/ff gate
   and no in-progress check on the receiving side — a push into a repo
