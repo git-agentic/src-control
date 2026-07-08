@@ -44,7 +44,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0031](0031-hardening-consolidation.md) | Hardening & consolidation sweep — closing the P16–P20 review tail | Accepted | 21 |
 | [0032](0032-signed-commits-provenance.md) | Signed commits & provenance | Accepted | 22 |
 | [0033](0033-merge-ergonomics.md) | Merge ergonomics — conflict UX beyond markers | Accepted | 23 |
-| [0034](0034-sparse-checkouts.md) | Sparse checkouts / sub-tree sharing | Proposed | 24 |
+| [0034](0034-sparse-checkouts.md) | Sparse checkouts / sub-tree sharing | Accepted | 24 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

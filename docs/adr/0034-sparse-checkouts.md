@@ -1,6 +1,6 @@
 # ADR-0034: Sparse checkouts / sub-tree sharing
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-08
 - **Phase:** 24
 - **Builds on:** ADR-0011 (working tree), ADR-0025 (absent-entry carry discipline), ADR-0003 (snapshot model)
@@ -51,6 +51,27 @@ versions). Protected and sparse are orthogonal — the carry composes.
   bounds checkout cost the way the budget bounds resident blobs.
 - gc is unchanged: all objects stay reachable (sparse is a disk view, not
   an object-set change).
+- **Boundary: a transient out-of-sparse plaintext write during a mixed
+  conflict.** `Repo::materialize_conflict_state` (`crates/repo/src/
+  repo.rs`) gates its own conflict *markers* against the sparse spec up
+  front — an out-of-sparse conflicted path refuses with a widen hint
+  before anything is written. But that gate only covers the marker-write
+  loop; the same function's `to_encrypt`/sidecar-decrypt write loops
+  (protected-content re-encryption inputs and `.theirs` sidecars for an
+  *in-sparse* conflict) are not sparse-scoped. When an IN-sparse conflict
+  co-occurs with an OUT-of-sparse protected/I2 clean change in the same
+  merge, that out-of-sparse plaintext is written to disk outside the
+  sparse view for the duration of the conflict window. This is **not data
+  loss** — completion's `read_worktree` re-lands the content in the CAS
+  the same as any other carried file, and abort removes the working-tree
+  state entirely — and **not a new disclosure**: the diff3 content-merge
+  that produces the plaintext already required an authorized identity, and
+  the I2 carried-plaintext case is pre-existing plaintext the sparse gate
+  never claimed to hide from disk. It is a bounded disk-hygiene boundary —
+  the sparse view is briefly wider than advertised during that one
+  conflict window — not a confidentiality or durability bug. Follow-on:
+  extend the sparse gate to the `to_encrypt`/sidecar write loops so the
+  view holds even mid-conflict.
 
 ## Alternatives considered
 
@@ -58,3 +79,70 @@ versions). Protected and sparse are orthogonal — the carry composes.
   not help tree width, punts on the carry discipline.
 - **Virtual filesystem (FUSE) materialization:** rejected for the same
   reasons as ADR-0005.
+
+## Refinements discovered during the build
+
+Every prior phase's Refinements section holds this one to the same bar:
+every claim below is checked against the shipped code, not the plan.
+
+1. **The whole feature is one generalized carry predicate.** `commit`'s
+   absent-path carry (`crates/repo/src/repo.rs`, `snapshot_files`'s carry
+   block) widened from "absent AND still-protected-and-not-a-recipient" to
+   "absent AND (that OR `!sparse.matches(path)`)" — a single `||` added to
+   an existing condition, no new code path. A review pass caught a
+   subtlety the design didn't call out: the carried entry's perms byte had
+   to change from a hardcoded `scl_core::PROTECTED` to the *source* entry's
+   own perms, because once a carried-plain out-of-sparse file could reach
+   that arm (previously only protected paths could), hardcoding
+   `PROTECTED` would silently mark a plain file protected on the next
+   materialize. Mutation-pinned by
+   `commit_carries_out_of_sparse_absent_path_verbatim`, which asserts both
+   the carried blob id *and* `perms & PROTECTED == 0`.
+2. **`materialize`'s dual-loop filter, and two self-caught reader bugs.**
+   `crates/repo/src/worktree.rs::materialize` filters both its write loop
+   (`if !sparse.matches(path) { continue; }`) and its `old_root` removal
+   loop (`if !target.contains_key(p) || !sparse.matches(p) { remove }`) —
+   the removal loop's sparse check is what makes `Repo::set_sparse`
+   narrowing prune files that are still tracked by the target tree but now
+   fall outside the spec. `Repo::set_sparse` calls `materialize` with
+   `old_root = Some(head_root)` — target and old root are the same commit,
+   so the write loop only re-touches files already on disk and the removal
+   loop does the narrowing. Before this landed, two HEAD-vs-disk readers
+   (`diff_worktree` and `diff_unified`) both misreported an out-of-sparse
+   path as a user deletion; both were caught and fixed in the same pass
+   (each now short-circuits `!sparse.matches(path)` to "expected absent,"
+   the same treatment an unauthorized protected file already got from P15).
+3. **The widen-error site, and what it does and doesn't cover.** A
+   CONFLICTED protected/text path outside the sparse view can't be shown
+   to the user (nowhere on disk to put markers without silently
+   materializing a path they asked to exclude). The gate lives at the very
+   top of `Repo::materialize_conflict_state` (`crates/repo/src/repo.rs`) —
+   it checks every path in the operation's own `conflicted_paths` list
+   against `sparse.matches` and returns `Error::InvalidArgument` with a
+   "run `sc sparse set` to include it" hint *before* `carried` is written
+   to the CAS, so no out-of-sparse marker is ever written, not even
+   transiently. `crates/repo/src/conflicts.rs::resolve_path` carries the
+   identical gate for `sc resolve`; `conflict_versions` deliberately does
+   NOT gate, since inspecting a conflict (`sc conflicts <path>`) doesn't
+   write to disk. A CLEAN out-of-sparse change never reaches either gate —
+   it resolves on tree ids inside `three_way`/replay and lands via the
+   ordinary `materialize` skip-write path, no markers involved at all. See
+   the Consequences section above for the one write path this gate does
+   *not* cover (`to_encrypt`/sidecar writes for an in-sparse conflict that
+   co-occurs with an out-of-sparse clean change).
+4. **`sc ws` inherits the host's sparse view, structurally, not by
+   convention.** `Repo::sparse_spec()` is read once in `ws_fork` and
+   threaded as a parameter into `workspace::materialize_workspace`
+   (`crates/repo/src/ws.rs` / `workspace.rs`) — a forked workspace's
+   checkout is sparse-filtered exactly like the host repo's own working
+   tree, and harvest carries the untouched out-of-sparse subtree forward
+   through the same generalized carry predicate as (1), pinned by
+   `ws_fork_inherits_sparse`. This is deliberately different from `sc
+   work`'s one-shot ephemeral agents, which stay full-checkout.
+5. **`set_sparse`/`disable_sparse` refuse mid-conflict.** Re-laying the
+   working tree while a merge/pick/rebase is in progress would either
+   destroy in-progress conflict markers or narrow away a path a
+   conflicted operation still needs on disk — both refuse with the same
+   `MergeInProgress`/`PickInProgress`/`RebaseInProgress` errors the P21
+   policy-op guards already use elsewhere, added in review before Task 4
+   landed rather than discovered after.

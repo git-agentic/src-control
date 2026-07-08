@@ -118,3 +118,21 @@ committing the sparse spec (it stays local per-clone); glob/negation
 patterns in the spec (prefixes only, matching `.scignore`'s subset
 philosophy); sparse-aware gc (all objects stay reachable — gc is
 unchanged).
+
+**Boundary (found during the build, not designed in): a transient
+out-of-sparse write during a mixed conflict.** `materialize_conflict_state`
+gates its own conflict *markers* against the sparse spec up front — an
+out-of-sparse conflicted path refuses with a widen hint before anything is
+written. That gate covers only the marker-write loop; the same function's
+`to_encrypt`/sidecar-decrypt write loops (protected-content re-encryption
+inputs and `.theirs` sidecars for an *in-sparse* conflict) are not
+sparse-scoped. So when an IN-sparse conflict co-occurs with an OUT-of-
+sparse protected/I2 clean change in the same merge, that out-of-sparse
+plaintext is written to disk outside the sparse view for the duration of
+the conflict window. Not data loss (completion's `read_worktree` re-lands
+it in the CAS same as any other carried file; abort removes it) and not a
+new disclosure (the diff3 content-merge that produced the plaintext
+already required an authorized identity; the I2 case is pre-existing
+plaintext) — a bounded disk-hygiene boundary, out of scope for this phase.
+Follow-on: extend the sparse gate to the `to_encrypt`/sidecar write loops.
+See ADR-0034's Consequences section and CLAUDE.md's Phase 24 paragraph.
