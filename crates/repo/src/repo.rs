@@ -124,7 +124,7 @@ impl Repo {
 
     /// Paths tracked by HEAD (empty when the branch is unborn). `.scignore`
     /// rules never hide these — same model as git.
-    fn tracked_paths(&self) -> Result<std::collections::BTreeSet<String>> {
+    pub(crate) fn tracked_paths(&self) -> Result<std::collections::BTreeSet<String>> {
         self.tracked_paths_at(self.head_tip()?)
     }
 

@@ -175,8 +175,10 @@ impl Repo {
 
     /// Resolve one conflicted path to `side`: write that side's content to
     /// the working file (or delete the file if the side is `Absent`),
-    /// remove any `.theirs`/`.base`/`.ours` sidecar, and drop `path` from
-    /// the active op's conflict record. Protected paths need `identity`
+    /// remove the `.theirs` sidecar this system may have written for a
+    /// binary conflict (only if `{path}.theirs` isn't itself a tracked file
+    /// — see below), and drop `path` from the active op's conflict record.
+    /// Protected paths need `identity`
     /// (decrypt only — this never re-encrypts; completion's commit path does
     /// that). Errors if `path` is not currently conflicted or no op is in
     /// progress.
@@ -215,11 +217,18 @@ impl Repo {
             },
         }
 
-        // Drop any leftover sidecars this path may have (only `.theirs` is
-        // currently written by a binary conflict, but `.base`/`.ours` are
-        // cleaned up defensively — harmless if never written).
-        for ext in ["theirs", "base", "ours"] {
-            let sidecar = safe_join(&self.layout.root, &format!("{path}.{ext}"))?;
+        // Drop the `.theirs` sidecar this system may have written for a
+        // binary conflict — the only sidecar extension ever written (`.base`
+        // and `.ours` are never produced, so removing them was both dead
+        // code and a footgun: a repo can legitimately track a real file
+        // named `foo.txt.base`/`foo.txt.ours`, and blind-unlinking it would
+        // silently destroy user data). Even for `.theirs`, only remove it
+        // when it is NOT a tracked path — a genuine sidecar is untracked
+        // scratch by construction, so a tracked `{path}.theirs` must be a
+        // user's real file and is left alone.
+        let theirs_sidecar_path = format!("{path}.theirs");
+        if !self.tracked_paths()?.contains(&theirs_sidecar_path) {
+            let sidecar = safe_join(&self.layout.root, &theirs_sidecar_path)?;
             match std::fs::remove_file(&sidecar) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -675,6 +684,46 @@ mod tests {
         repo.resolve_path("bin.dat", ResolveSide::Ours, None).unwrap();
         assert!(!root.join("bin.dat.theirs").exists(), "sidecar must be removed on resolve");
         assert_eq!(std::fs::read(root.join("bin.dat")).unwrap(), vec![1u8, 159, 146, 150]);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// P23 review fix: `resolve_path` used to unconditionally `remove_file`
+    /// `{path}.theirs`/`.base`/`.ours` sidecars. `.base`/`.ours` are never
+    /// written by this system, and even `.theirs` is only a genuine sidecar
+    /// when untracked — a repo can track a real file named `a.txt.theirs`,
+    /// and resolving a conflict on `a.txt` must never delete it.
+    #[test]
+    fn resolve_does_not_delete_a_real_tracked_sidecar_named_file() {
+        let root = tmp_root("resolve-real-sidecar");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base\n").unwrap();
+        std::fs::write(root.join("a.txt.theirs"), b"real tracked content\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("a.txt"), b"theirs\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+
+        repo.resolve_path("a.txt", ResolveSide::Ours, None).unwrap();
+
+        assert!(
+            root.join("a.txt.theirs").exists(),
+            "a real tracked file named a.txt.theirs must survive resolving a.txt's conflict"
+        );
+        assert_eq!(
+            std::fs::read(root.join("a.txt.theirs")).unwrap(),
+            b"real tracked content\n",
+            "tracked sidecar-named file content must be untouched"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
