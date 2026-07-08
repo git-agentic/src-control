@@ -3,6 +3,7 @@
 //! SSH/HTTP transports.
 
 use std::cell::RefCell;
+use std::io::{Read, Write};
 use std::str::FromStr;
 
 use scl_core::{Object, ObjectId, Store};
@@ -34,13 +35,15 @@ pub trait Transport {
     fn update_ref(&self, branch: &str, id: &ObjectId, expected_old: Option<&ObjectId>)
         -> Result<()>;
 
-    /// Build a pack of every object reachable from `wants` but not already
-    /// implied by `haves` (the receiver's closure). Returns `.pack` bytes.
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>>;
+    /// Stream a pack of every object reachable from `wants` but not already
+    /// implied by `haves` (the receiver's closure) into `out`. An
+    /// implementation may buffer internally before writing.
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()>;
 
-    /// Receive a pack: verify every record (BLAKE3) and write each object into
-    /// the store. Returns the contained ids. Refs are the caller's job.
-    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>>;
+    /// Ingest a pack read from `src`: verify every record (BLAKE3) and write
+    /// each object into the store. Returns the contained ids. Refs are the
+    /// caller's job.
+    fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>>;
 }
 
 /// Transport over a remote `.sc/` directory on the local filesystem.
@@ -131,7 +134,7 @@ impl Transport for LocalTransport {
         crate::refs::write_branch_tip(&self.layout, branch, id)
     }
 
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>> {
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
         use std::collections::BTreeSet;
         let mut store = self.store.borrow_mut();
         // Reachable-from-wants minus reachable-from-haves, computed on this
@@ -183,7 +186,8 @@ impl Transport for LocalTransport {
             .map(|id| Ok((id, store.get(&id)?.encode())))
             .collect::<Result<Vec<_>>>()?;
         let (pack, _idx) = scl_core::pack::build_pack(&send)?;
-        Ok(pack)
+        out.write_all(&pack)?;
+        Ok(())
     }
 
     /// Receive a pack: verify every record (BLAKE3) and write each object into the store.
@@ -208,11 +212,13 @@ impl Transport for LocalTransport {
     /// Treat any `Err` return as "the pack was not fully applied". Do **not** update refs on
     /// failure. Any partially-written objects are unreferenced and will be reclaimed by `sc gc`.
     /// Retrying is safe because content-addressed `put` is idempotent.
-    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>> {
+    fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
         let mut store = self.store.borrow_mut();
         let mut ids = Vec::new();
         // parse_pack verifies every record's hash before we write anything.
-        for (id, obj) in scl_core::pack::parse_pack(pack)? {
+        for (id, obj) in scl_core::pack::parse_pack(&buf)? {
             let got = store.put(obj)?;
             // Defense in depth: parse_pack already verified each record's hash; this guards
             // against a future change that weakens that.
@@ -357,7 +363,8 @@ mod tests {
 
         let t = LocalTransport::open(&src_root).unwrap();
         // Want c2, already have c1: the pack must omit c1's objects but include c2.
-        let pack = t.get_pack(&[c2], &[c1]).unwrap();
+        let mut pack = Vec::new();
+        t.get_pack(&[c2], &[c1], &mut pack).unwrap();
         let ids: Vec<_> = scl_core::pack::parse_pack(&pack).unwrap().into_iter().map(|(id, _)| id).collect();
         assert!(ids.contains(&c2));
         assert!(!ids.contains(&c1));
@@ -365,7 +372,7 @@ mod tests {
         // put_pack into a fresh empty remote writes + returns the ids.
         let _ = crate::repo::Repo::init(&dst_root).unwrap();
         let t2 = LocalTransport::open(&dst_root).unwrap();
-        let written = t2.put_pack(&pack).unwrap();
+        let written = t2.put_pack(&mut &pack[..]).unwrap();
         assert!(written.contains(&c2));
         assert!(t2.has_object(&c2).unwrap());
 
@@ -373,7 +380,7 @@ mod tests {
         let mut bad = pack.clone();
         let n = bad.len() - 1;
         bad[n] ^= 0xFF;
-        assert!(t2.put_pack(&bad).is_err());
+        assert!(t2.put_pack(&mut &bad[..]).is_err());
 
         std::fs::remove_dir_all(&src_root).unwrap();
         std::fs::remove_dir_all(&dst_root).unwrap();

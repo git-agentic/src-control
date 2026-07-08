@@ -4316,7 +4316,8 @@ mod tests {
         // Build the delta pack: remote only sends what local doesn't have.
         use crate::transport::Transport as _;
         let transport = crate::transport::LocalTransport::open(&remote_root).unwrap();
-        let pack = transport.get_pack(&[c2], &haves).unwrap();
+        let mut pack = Vec::new();
+        transport.get_pack(&[c2], &haves, &mut pack).unwrap();
         let entries: Vec<scl_core::ObjectId> = scl_core::pack::parse_pack(&pack)
             .unwrap()
             .into_iter()

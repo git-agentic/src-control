@@ -82,11 +82,17 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
         })?;
         Ok(())
     }
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>> {
-        self.call(Request::GetPack { wants: wants.to_vec(), haves: haves.to_vec() })
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
+        // Still single-frame internally (Task 3 is a behavior-preserving
+        // reshape; streaming lands in Task 4).
+        let pack = self.call(Request::GetPack { wants: wants.to_vec(), haves: haves.to_vec() })?;
+        out.write_all(&pack)?;
+        Ok(())
     }
-    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>> {
-        wire::decode_ids_body(&self.call(Request::PutPack(pack.to_vec()))?)
+    fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        wire::decode_ids_body(&self.call(Request::PutPack(buf))?)
     }
 }
 
@@ -170,11 +176,11 @@ impl Transport for StdioTransport {
     ) -> Result<()> {
         self.client.update_ref(branch, id, expected_old)
     }
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId]) -> Result<Vec<u8>> {
-        self.client.get_pack(wants, haves)
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
+        self.client.get_pack(wants, haves, out)
     }
-    fn put_pack(&self, pack: &[u8]) -> Result<Vec<ObjectId>> {
-        self.client.put_pack(pack)
+    fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
+        self.client.put_pack(src)
     }
 }
 
@@ -355,7 +361,8 @@ mod tests {
         assert!(client.put_object(&id, b"tampered").is_err());
 
         // pack roundtrip: everything reachable from the tip, no haves
-        let pack = client.get_pack(&[tip], &[]).unwrap();
+        let mut pack = Vec::new();
+        client.get_pack(&[tip], &[], &mut pack).unwrap();
         assert!(!scl_core::pack::parse_pack(&pack).unwrap().is_empty());
 
         // CAS semantics survive the wire (mirrors transport.rs::update_ref_is_compare_and_swap)
@@ -425,7 +432,7 @@ mod tests {
                 match wire::Request::decode(&f).unwrap() {
                     wire::Request::UpdateRef { .. } => return, // die without replying
                     wire::Request::PutPack(p) => {
-                        let ids = t.put_pack(&p).unwrap();
+                        let ids = t.put_pack(&mut &p[..]).unwrap();
                         wire::write_ok(&mut server_write, &wire::ids_body(&ids)).unwrap();
                     }
                     other => panic!("unexpected request {other:?}"),
@@ -437,7 +444,7 @@ mod tests {
         // "Push": transfer a pack, then try to advance the ref.
         let blob = Object::blob(b"new object".to_vec());
         let (pack, _idx) = scl_core::pack::build_pack(&[(blob.id(), blob.encode())]).unwrap();
-        client.put_pack(&pack).unwrap();
+        client.put_pack(&mut &pack[..]).unwrap();
         let err = client.update_ref("main", &blob.id(), Some(&tip)).unwrap_err();
         assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
         drop(client);

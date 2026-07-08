@@ -192,7 +192,7 @@ impl Repo {
             }
             if !send.is_empty() {
                 let (pack, _idx) = scl_core::pack::build_pack(&send)?;
-                transport.put_pack(&pack)?;
+                transport.put_pack(&mut &pack[..])?;
             }
         }
         transport.update_ref(&branch, &local_tip, expected_old.as_ref())?;
@@ -240,7 +240,8 @@ fn transfer_objects(
     tips: &[ObjectId],
     haves: &[ObjectId],
 ) -> Result<()> {
-    let pack = transport.get_pack(tips, haves)?;
+    let mut pack = Vec::new();
+    transport.get_pack(tips, haves, &mut pack)?;
     // parse_pack verifies every record; write each object into the local store.
     let mut written = Vec::new();
     for (id, obj) in scl_core::pack::parse_pack(&pack)? {

@@ -544,8 +544,13 @@ pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> R
             Request::UpdateRef { branch, id, expected_old } => {
                 transport.update_ref(&branch, &id, expected_old.as_ref()).map(|()| Vec::new())
             }
-            Request::GetPack { wants, haves } => transport.get_pack(&wants, &haves),
-            Request::PutPack(pack) => transport.put_pack(&pack).map(|ids| ids_body(&ids)),
+            Request::GetPack { wants, haves } => {
+                let mut pack = Vec::new();
+                transport.get_pack(&wants, &haves, &mut pack).map(|()| pack)
+            }
+            Request::PutPack(pack) => {
+                transport.put_pack(&mut &pack[..]).map(|ids| ids_body(&ids))
+            }
         };
         match result {
             Ok(body) => write_ok(w, &body)?,
