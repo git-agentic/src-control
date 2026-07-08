@@ -231,12 +231,34 @@ across every phase.
   history rewriting, not trusted-signer misuse or code quality. Proven by
   `demo/run_provenance_demo.sh` (a clone-rewrite attack `sc verify`
   catches while the original stays clean). (ADR-0032.)
+- **Phase 23 — Merge ergonomics.** One `conflict_versions(path) -> {base,
+  ours, theirs}` re-derives the three versions straight from the DAG for
+  whichever op is active (merge/pick/rebase-stop) rather than requiring a
+  caller to hand-parse marker text; each side decrypts against its own
+  snapshot's protection registry, and the conflict kind (text/binary/
+  protected) is classified from tree-entry perms with no decryption
+  needed. `sc conflicts [<path>] [--identity]` lists conflicted paths with
+  their kind, or shows one path's base/ours/theirs (plaintext for
+  protected paths under `--identity`); `sc resolve --ours|--theirs
+  <path…> [--identity]` writes the chosen side to the working file, drops
+  the `.theirs` sidecar this system may have written (only when it's not
+  itself a tracked file — the earlier three-name blind-unlink was a
+  reviewer-caught data-loss risk), and clears the path from the active
+  conflict record; resolution only decrypts, never re-encrypts, so
+  plaintext still never enters the CAS until the unchanged `sc commit`/
+  `sc rebase --continue` completion re-encrypts through the same helpers
+  `commit` always used. `sc status` gains the same per-path detail under
+  every in-progress banner (merge, pick, stopped rebase), and `sc status
+  --json`'s `"conflicts"` field is now `[{path, kind}]` instead of a bare
+  path list — a strict superset, no existing consumer broke. Proven by
+  `demo/run_merge_ergonomics_demo.sh` (a text conflict resolved end-to-end
+  with no hand-edited markers, then a protected variant where both the
+  base/ours/theirs view and the resolution decrypt under `--identity`).
+  (ADR-0033.)
 
 ## Active
 
-- **Phase 23 — Merge ergonomics.** In build. Spec:
-  `docs/superpowers/specs/2026-07-08-p23-merge-ergonomics-design.md`
-  (ADR-0033, Proposed → Accepted at completion).
+None — Phase 24 is next up.
 
 ## Next horizon (P24)
 
@@ -273,6 +295,7 @@ users will want it too).
 | **P20 — Agent sessions + auto-merge** | Multi-invocation agent sessions with hands-off integration | `sc ws fork --agents N`, edit across separate invocations, `sc ws harvest` auto-merges clean results cumulatively and falls back to `work-<i>` on conflict; proven by `demo/run_ws_demo.sh` | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
 | **P21 — Hardening & consolidation** | Close the P16–P20 review tail before new capability work | policy ops refuse during in-progress merge/pick/rebase; a pruned git commit behind a stale mark self-heals on push; rebase/pick aborts report the protected-skip list; `sc ws list` names an undone landing truthfully; every existing demo stays green plus new pinned regression tests | [0031](docs/adr/0031-hardening-consolidation.md) |
 | **P22 — Signed commits & provenance** | Detect history rewriting; attribute commits to an identity | `sc keygen` v2 identities (X25519 + Ed25519 from one seed), `sc commit --sign`/`sc sign <ref>`, `sc log` four-state markers, `sc verify --require`; signatures ride existing packs with zero wire changes; proven by `demo/run_provenance_demo.sh` (rewrite attack caught in a clone while the original stays clean) | [0032](docs/adr/0032-signed-commits-provenance.md) |
+| **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts [<path>]` lists/shows base-ours-theirs (decrypted under `--identity` for protected paths); `sc resolve --ours\|--theirs <path>` writes clean content; proven by `demo/run_merge_ergonomics_demo.sh` (text + protected conflicts resolved end-to-end) | [0033](docs/adr/0033-merge-ergonomics.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
