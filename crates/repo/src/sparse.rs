@@ -101,6 +101,92 @@ impl Repo {
     pub fn sparse_spec(&self) -> Result<Sparse> {
         load(self.layout())
     }
+
+    /// Set the sparse-checkout spec to `prefixes` and re-lay the working tree
+    /// to match: persists the new spec, then materializes HEAD's tree against
+    /// it with `old_root = Some(head_root)` — target and old root are the same
+    /// commit, so the write loop only re-touches files already on disk, and
+    /// the removal loop's narrowing check (`materialize`'s `!sparse.matches`
+    /// arm) prunes any file that's on disk today but falls outside the new
+    /// spec. An unborn HEAD has no working tree to re-lay; the spec is still
+    /// persisted so it takes effect on the first commit/checkout.
+    ///
+    /// Refuses (same as [`Repo::switch_with_identity`]) when the working tree
+    /// has uncommitted modifications or deletions: `materialize`'s write loop
+    /// rewrites every in-sparse target entry from HEAD's blob unconditionally,
+    /// and narrowing additionally removes newly-excluded files from disk —
+    /// either would silently clobber uncommitted edits.
+    ///
+    /// Returns the protected paths skipped (no matching key) for the same
+    /// reason [`Repo::switch_with_identity`] does — sparse narrowing can
+    /// newly bring a protected path into view that `identity` can't decrypt.
+    pub fn set_sparse(
+        &self,
+        prefixes: &[String],
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<Vec<String>> {
+        let dirty = self.status()?;
+        if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
+            return Err(crate::error::Error::InvalidArgument(
+                "working tree has uncommitted changes; commit before changing the sparse spec"
+                    .into(),
+            ));
+        }
+        let spec = Sparse::new(prefixes.to_vec());
+        store(self.layout(), &spec)?;
+        let Some(tip) = self.head_tip()? else {
+            return Ok(Vec::new());
+        };
+        let snap = self.snapshot(&tip)?;
+        let store_arc = self.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        crate::worktree::materialize(
+            self.layout(),
+            &mut s,
+            snap.root,
+            Some(snap.root),
+            &snap.protection,
+            identity,
+            &spec,
+        )
+    }
+
+    /// Disable sparse checkout: clear the persisted spec and re-materialize
+    /// HEAD's tree in full, restoring every previously-excluded file to disk.
+    /// An unborn HEAD has no working tree to re-lay; the spec is still
+    /// cleared.
+    ///
+    /// Refuses on a dirty working tree, same as [`Repo::set_sparse`] and for
+    /// the same reason (the write loop rewrites every in-sparse target entry
+    /// unconditionally).
+    pub fn disable_sparse(
+        &self,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<Vec<String>> {
+        let dirty = self.status()?;
+        if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
+            return Err(crate::error::Error::InvalidArgument(
+                "working tree has uncommitted changes; commit before changing the sparse spec"
+                    .into(),
+            ));
+        }
+        clear(self.layout())?;
+        let Some(tip) = self.head_tip()? else {
+            return Ok(Vec::new());
+        };
+        let snap = self.snapshot(&tip)?;
+        let store_arc = self.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        crate::worktree::materialize(
+            self.layout(),
+            &mut s,
+            snap.root,
+            Some(snap.root),
+            &snap.protection,
+            identity,
+            &Sparse::default(),
+        )
+    }
 }
 
 #[cfg(test)]

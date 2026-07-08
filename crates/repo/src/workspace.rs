@@ -39,7 +39,20 @@ pub(crate) fn materialize_workspace(
     let ws = Layout::at(dir);
     let store_arc = repo.vfs().store();
     let mut store = store_arc.lock().unwrap();
-    worktree::materialize(&ws, &mut store, snap.root, None, &snap.protection, identity)
+    // Full materialization regardless of the primary repo's sparse spec: an
+    // agent workspace is a separate ephemeral checkout (P13), not the user's
+    // real working tree, and needs the complete content to work with — the
+    // primary sparse view is a convenience for that one tree, not a policy
+    // that should silently narrow what an agent can see.
+    worktree::materialize(
+        &ws,
+        &mut store,
+        snap.root,
+        None,
+        &snap.protection,
+        identity,
+        &crate::sparse::Sparse::default(),
+    )
 }
 
 /// Diff the checkout at `dir` against the base snapshot `tip`; if changed,
@@ -61,7 +74,13 @@ pub(crate) fn harvest_workspace(
         let mut store = store_arc.lock().unwrap();
         let tracked: std::collections::BTreeSet<String> =
             worktree::tree_file_ids(&mut store, snap.root)?.into_keys().collect();
-        let d = worktree::diff_worktree(&ws, &mut store, Some(snap.root), &snap.protection)?;
+        let d = worktree::diff_worktree(
+            &ws,
+            &mut store,
+            Some(snap.root),
+            &snap.protection,
+            &crate::sparse::Sparse::default(),
+        )?;
         (tracked, !(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
     };
     if !changed {

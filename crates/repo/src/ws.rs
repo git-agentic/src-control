@@ -252,7 +252,13 @@ impl Repo {
         let ws = Layout::at(&entry.dir);
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
-        let d = worktree::diff_worktree(&ws, &mut store, Some(base.root), &base.protection)?;
+        let d = worktree::diff_worktree(
+            &ws,
+            &mut store,
+            Some(base.root),
+            &base.protection,
+            &crate::sparse::Sparse::default(),
+        )?;
         Ok(!(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
     }
 

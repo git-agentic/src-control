@@ -393,6 +393,22 @@ enum SparseOp {
         #[arg(long)]
         json: bool,
     },
+    /// Set the sparse-checkout prefixes and re-lay the working tree to match.
+    Set {
+        /// Path prefixes that stay materialized on disk (replaces any prior spec).
+        prefixes: Vec<String>,
+        /// Identity file for decrypting protected files newly brought into view
+        /// (default `--identity`/`SC_IDENTITY`/`~/.sc/identity`). Missing file →
+        /// protected files are simply skipped.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Disable sparse checkout and re-materialize the working tree in full.
+    Disable {
+        /// Identity file for decrypting protected files (same resolution as `set`).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -644,6 +660,26 @@ fn run_sparse(op: SparseOp) -> Result<()> {
                 for p in spec.prefixes() {
                     print_line(p);
                 }
+            }
+            Ok(())
+        }
+        SparseOp::Set { prefixes, identity } => {
+            let repo = open_repo()?;
+            let sk = resolve_identity_opt(identity)?;
+            let skipped = repo.set_sparse(&prefixes, sk.as_ref())?;
+            println!("sparse set: {} prefix(es)", prefixes.len());
+            for path in &skipped {
+                eprintln!("skipped (no key): {path}");
+            }
+            Ok(())
+        }
+        SparseOp::Disable { identity } => {
+            let repo = open_repo()?;
+            let sk = resolve_identity_opt(identity)?;
+            let skipped = repo.disable_sparse(sk.as_ref())?;
+            println!("sparse disabled (full checkout)");
+            for path in &skipped {
+                eprintln!("skipped (no key): {path}");
             }
             Ok(())
         }

@@ -687,7 +687,7 @@ impl Repo {
         };
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
-        worktree::diff_worktree(&self.layout, &mut store, head_root, &protection)
+        worktree::diff_worktree(&self.layout, &mut store, head_root, &protection, &self.sparse_spec()?)
     }
 
     /// Line-level unified diff of the working tree against HEAD (`sc diff`).
@@ -697,9 +697,14 @@ impl Repo {
     /// the same rules as [`Repo::status`]: absent-on-disk is clean (skipped
     /// checkout, not a deletion), an on-disk edit is detected by convergent
     /// re-encryption — but the content is never shown (it would be ciphertext
-    /// vs plaintext noise at best, a leak at worst).
+    /// vs plaintext noise at best, a leak at worst). A HEAD path outside the
+    /// sparse spec is absent on disk by design (see `materialize`), so it
+    /// gets the same "absent is clean, not a deletion" treatment — otherwise
+    /// `sc diff` right after `sc sparse set` would render the whole
+    /// out-of-sparse subtree as deleted.
     pub fn diff_unified(&self) -> Result<String> {
         use scl_core::PROTECTED;
+        let sparse = self.sparse_spec()?;
         let head_root = self.head_tip()?.map(|t| self.snapshot(&t)).transpose()?.map(|s| s.root);
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
@@ -737,6 +742,10 @@ impl Repo {
                     }
                 }
                 Some((blob_id, _mode, _perms)) => {
+                    if disk.is_none() && !sparse.matches(path) {
+                        // Out-of-sparse: expected-absent, not a deletion.
+                        continue;
+                    }
                     let old = match store.get(blob_id)? {
                         Object::Blob(b) => b,
                         _ => continue,
@@ -880,6 +889,7 @@ impl Repo {
                     None,
                     &theirs_protection,
                     identity,
+                    &self.sparse_spec()?,
                 )?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
@@ -914,6 +924,7 @@ impl Repo {
                     Some(ours_root),
                     &theirs_protection,
                     identity,
+                    &self.sparse_spec()?,
                 )?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
@@ -1077,6 +1088,7 @@ impl Repo {
                 Some(ours_root),
                 &merged_protection,
                 identity,
+                &self.sparse_spec()?,
             )?
         };
 
@@ -1147,6 +1159,7 @@ impl Repo {
                 Some(old_root),
                 conflict_prot,
                 identity,
+                &self.sparse_spec()?,
             )?;
         }
         for (path, bytes, _mode, _recipients) in to_encrypt {
@@ -1203,6 +1216,7 @@ impl Repo {
                 Some(theirs_root),
                 &ours_protection,
                 None,
+                &self.sparse_spec()?,
             )?;
         }
         crate::merge_state::clear(&self.layout)?;
@@ -1318,6 +1332,7 @@ impl Repo {
                 old_root,
                 &target_protection,
                 identity,
+                &self.sparse_spec()?,
             )?
         };
         refs::write_head(&self.layout, name)?;
@@ -4388,6 +4403,157 @@ mod tests {
             crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "keys/a.txt")
                 .unwrap();
         assert_eq!(&pt[..], b"rotated-secret-key");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn set_sparse_materializes_only_the_subset() {
+        let root = tmp_root("sparse-set");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+
+        assert!(root.join("src/a.txt").exists(), "in-sparse file must stay materialized");
+        assert!(!root.join("docs/b.txt").exists(), "out-of-sparse file must be pruned from disk");
+        assert!(repo.layout().sparse_path().exists(), "sparse spec must persist");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn disable_sparse_rematerializes_fully() {
+        let root = tmp_root("sparse-disable");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        assert!(!root.join("docs/b.txt").exists());
+
+        repo.disable_sparse(None).unwrap();
+
+        assert!(root.join("src/a.txt").exists());
+        assert!(root.join("docs/b.txt").exists(), "disable must restore the full tree");
+        assert!(!repo.layout().sparse_path().exists(), "sparse spec must be cleared");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn switch_honors_persisted_sparse() {
+        let root = tmp_root("sparse-switch");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        assert!(!root.join("docs/b.txt").exists());
+
+        repo.branch("other").unwrap();
+        repo.switch("other").unwrap();
+        assert!(root.join("src/a.txt").exists());
+        assert!(!root.join("docs/b.txt").exists(), "spec persists across switch away");
+
+        repo.switch("main").unwrap();
+        assert!(root.join("src/a.txt").exists());
+        assert!(!root.join("docs/b.txt").exists(), "spec persists across switch back");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sparse_roundtrip_commit_then_full_clone_sees_all() {
+        let root = tmp_root("sparse-roundtrip");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"original").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        assert!(!root.join("docs/b.txt").exists());
+
+        // Edit an in-sparse file and commit while sparse (docs/b.txt is
+        // carried verbatim by the P24 Task 2 carry generalization).
+        std::fs::write(root.join("src/a.txt"), b"edited").unwrap();
+        repo.commit("me", "edit under sparse").unwrap();
+
+        // A full checkout (disable) must see the out-of-sparse subtree
+        // byte-identical to what was last on disk before sparse narrowed it.
+        repo.disable_sparse(None).unwrap();
+        assert!(root.join("docs/b.txt").exists());
+        assert_eq!(std::fs::read(root.join("docs/b.txt")).unwrap(), b"original");
+        assert_eq!(std::fs::read(root.join("src/a.txt")).unwrap(), b"edited");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sparse_out_of_view_file_is_clean_not_deleted_in_status_and_diff() {
+        // Regression coverage for the gap the advisor caught: diff_unified is
+        // an independent HEAD-vs-disk reader from diff_worktree/status, and
+        // must not report an out-of-sparse path as a deletion either.
+        let root = tmp_root("sparse-diff");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"b").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        assert!(!root.join("docs/b.txt").exists());
+
+        let st = repo.status().unwrap();
+        assert!(st.deleted.is_empty(), "out-of-sparse path must not read as deleted: {:?}", st);
+
+        let diff = repo.diff_unified().unwrap();
+        assert!(!diff.contains("docs/b.txt"), "sc diff must not show the out-of-sparse path: {diff}");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn set_sparse_and_disable_sparse_refuse_a_dirty_working_tree() {
+        let root = tmp_root("sparse-dirty-guard");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"a").unwrap();
+        repo.commit("me", "base").unwrap();
+
+        // Uncommitted edit to a tracked file must block set_sparse...
+        std::fs::write(root.join("src/a.txt"), b"dirty edit").unwrap();
+        assert!(matches!(
+            repo.set_sparse(&["src/".to_string()], None),
+            Err(Error::InvalidArgument(_))
+        ));
+        // ...and it must not have persisted the spec or touched the file.
+        assert!(!repo.layout().sparse_path().exists());
+        assert_eq!(std::fs::read(root.join("src/a.txt")).unwrap(), b"dirty edit");
+
+        // Clean up the dirty state, set sparse, then dirty again to check disable_sparse.
+        repo.commit("me", "commit the edit").unwrap();
+        repo.set_sparse(&["src/".to_string()], None).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"dirty again").unwrap();
+        assert!(matches!(repo.disable_sparse(None), Err(Error::InvalidArgument(_))));
+        assert!(repo.layout().sparse_path().exists(), "disable must not have cleared the spec");
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();

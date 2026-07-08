@@ -101,7 +101,18 @@ impl Repo {
             let head_snap = store.get_snapshot(&head_tip)?;
             let head_root = head_snap.root;
             let head_protection = head_snap.protection;
-            worktree::materialize(&dst_repo.layout, &mut store, head_root, None, &head_protection, None)?;
+            // Clone doesn't transfer `.sc/sparse` (out of P24 scope — sparse
+            // config is local, like `.scignore`), so a fresh clone always
+            // starts full: `Sparse::default()` here, not `dst_repo.sparse_spec()`.
+            worktree::materialize(
+                &dst_repo.layout,
+                &mut store,
+                head_root,
+                None,
+                &head_protection,
+                None,
+                &crate::sparse::Sparse::default(),
+            )?;
         }
         Ok(dst_repo)
     }

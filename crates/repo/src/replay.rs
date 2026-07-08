@@ -455,6 +455,7 @@ impl Repo {
                         Some(ours_root),
                         &protection,
                         identity,
+                        &self.sparse_spec()?,
                     )?;
                 }
                 refs::write_branch_tip(&self.layout, &head, &id)?;
@@ -566,6 +567,7 @@ impl Repo {
                 decided,
                 &snap.protection,
                 None,
+                &self.sparse_spec()?,
             )?;
         }
         crate::pick_state::clear(&self.layout)?;
@@ -672,6 +674,7 @@ impl Repo {
                     Some(ours_root),
                     &target_protection,
                     identity,
+                    &self.sparse_spec()?,
                 )?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &target_tip)?;
@@ -928,6 +931,7 @@ impl Repo {
                 Some(disk_root),
                 &acc_protection,
                 identity,
+                &self.sparse_spec()?,
             )?;
         }
         refs::write_branch_tip(&self.layout, &head, &acc_tip)?;
@@ -1133,6 +1137,7 @@ impl Repo {
                 decided,
                 &snap.protection,
                 None,
+                &self.sparse_spec()?,
             )?
         };
         crate::rebase_state::clear(&self.layout)?;

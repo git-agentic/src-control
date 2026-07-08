@@ -8,6 +8,7 @@ use scl_core::{EntryKind, FileMode, Object, ObjectId, Protection, Store, Tree, P
 use crate::error::Result;
 use crate::ignore::Ignore;
 use crate::layout::Layout;
+use crate::sparse::Sparse;
 
 /// Read all working-tree files (skipping `.sc/`) as `(relpath, bytes, mode)`.
 ///
@@ -186,6 +187,13 @@ pub struct Diff {
 ///   to the stored one: equal => CLEAN, different => MODIFIED (a genuine edit).
 ///
 /// Non-protected paths use the usual plaintext-blob-id comparison.
+///
+/// Sparse-aware: a HEAD path outside `sparse` is never materialized (see
+/// `materialize`), so it's also expected-absent — same "absent => CLEAN, not
+/// a user deletion" treatment as an unauthorized protected file. Without this,
+/// `sc status`/the dirty-tree checks in `switch`/`merge`/`rebase` would read
+/// every out-of-sparse path as a deletion and permanently block those
+/// operations once a sparse spec is set.
 pub fn diff_worktree(
     layout: &Layout,
     store: &mut Store,
@@ -194,6 +202,7 @@ pub fn diff_worktree(
     // signal; the policy is taken explicitly so callers thread it consistently and
     // a future richer diff (e.g. prefix-aware reporting) needs no signature change.
     _protection: &Protection,
+    sparse: &Sparse,
 ) -> Result<Diff> {
     let head = match head_root {
         Some(root) => tree_file_entries_with_perms(store, root)?,
@@ -221,6 +230,11 @@ pub fn diff_worktree(
     }
     for (p, (_hid, _mode, perms)) in &head {
         if !wt.contains_key(p) {
+            // A path outside the sparse spec is expected-absent, exactly like
+            // an unauthorized protected file — not a user deletion.
+            if !sparse.matches(p) {
+                continue;
+            }
             // A PROTECTED HEAD path absent on disk is the expected state for an
             // unauthorized/skipped checkout — clean, not a user deletion.
             if perms & PROTECTED != 0 {
@@ -250,12 +264,19 @@ pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
 
 /// Materialize a snapshot's file tree into the working dir.
 ///
+/// `sparse` filters the disk view: a target entry outside `sparse` is never
+/// written (the CAS tree still has it — this only governs the disk copy), and
+/// the old-root removal pass also drops an on-disk file that's now outside
+/// `sparse` even if the target tree still tracks it (the sparse-narrowing
+/// case — see `Repo::set_sparse`). A full (empty) `Sparse` matches everything,
+/// so this is a no-op filter for every caller that isn't sparse-aware yet.
+///
 /// For `PROTECTED` entries, decrypts with `identity` if it can unwrap the
 /// blob's DEK from `protection.wrapped`; otherwise **skips** the file (neither
 /// writes nor deletes it) and records its path in the returned `skipped` list.
 /// Non-protected entries are written verbatim. Working files tracked by
-/// `old_root` but absent from the target tree are deleted regardless of
-/// protection status.
+/// `old_root` but absent from the target tree (or now outside `sparse`) are
+/// deleted regardless of protection status.
 pub fn materialize(
     layout: &Layout,
     store: &mut Store,
@@ -263,11 +284,12 @@ pub fn materialize(
     old_root: Option<ObjectId>,
     protection: &Protection,
     identity: Option<&scl_crypto::SecretKey>,
+    sparse: &Sparse,
 ) -> Result<Vec<String>> {
     let target = tree_file_entries_with_perms(store, target_root)?;
     if let Some(old) = old_root {
         for p in tree_file_ids(store, old)?.keys() {
-            if !target.contains_key(p) {
+            if !target.contains_key(p) || !sparse.matches(p) {
                 let full = safe_join(&layout.root, p)?;
                 let _ = std::fs::remove_file(full);
             }
@@ -275,6 +297,9 @@ pub fn materialize(
     }
     let mut skipped = Vec::new();
     for (path, (blob_id, _mode, perms)) in &target {
+        if !sparse.matches(path) {
+            continue;
+        }
         let full = safe_join(&layout.root, path)?;
         let bytes = match store.get(blob_id)? {
             Object::Blob(b) => b,
@@ -400,7 +425,7 @@ mod tests {
         let vault = layout.root.join("vault");
         std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let result = materialize(&layout, &mut store, root_tree, None, &Default::default(), None);
+        let result = materialize(&layout, &mut store, root_tree, None, &Default::default(), None, &Sparse::default());
 
         // Restore perms before asserting so cleanup always works.
         std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -427,7 +452,7 @@ mod tests {
             }])))
             .unwrap();
 
-        let err = materialize(&layout, &mut store, evil_tree, None, &Default::default(), None)
+        let err = materialize(&layout, &mut store, evil_tree, None, &Default::default(), None, &Sparse::default())
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::BadRef(_)), "got {err:?}");
         // Nothing was written outside the repo root: the sibling "<root>.." path
@@ -448,7 +473,7 @@ mod tests {
             }))
             .unwrap();
         let snap_root = store.get_snapshot(&snap).unwrap().root;
-        assert!(materialize(&layout, &mut store, snap_root, None, &Default::default(), None).is_err());
+        assert!(materialize(&layout, &mut store, snap_root, None, &Default::default(), None, &Sparse::default()).is_err());
 
         drop(store);
         std::fs::remove_dir_all(&layout.root).unwrap();
