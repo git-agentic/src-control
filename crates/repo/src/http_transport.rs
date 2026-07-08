@@ -1,11 +1,16 @@
-//! sc-native HTTP transport (P26): `sc+http://` URL parsing + module
-//! skeleton. The wire codec (Task 2), client [`Transport`](crate::transport::Transport)
-//! impl (Task 3), and server (Task 4) land in later P26 tasks; this module
-//! currently holds only [`ScHttpUrl`], the seam those tasks build on.
+//! sc-native HTTP transport (P26): `sc+http://` URL parsing (Task 1), the
+//! opening codec (Task 2), and the client [`HttpTransport`] + `sc+http://`
+//! routing in `open_transport` (Task 3). The server (`sc serve --http`)
+//! lands in Task 4.
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
+use std::net::TcpStream;
+
+use scl_core::ObjectId;
 
 use crate::error::{Error, Result};
+use crate::stdio_transport::WireClient;
+use crate::transport::Transport;
 
 /// Default port for `sc+http://` URLs when the authority omits one.
 pub const DEFAULT_PORT: u16 = 8730;
@@ -160,12 +165,117 @@ impl ScHttpUrl {
             return Err(Error::InvalidArgument(format!("sc+http url has empty host: {url}")));
         }
         let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
+        // CARRY-IN from the Task 2 review: `write_client_opening` interpolates
+        // host/path into the request line/header with no CRLF escaping — a
+        // host or path containing '\r'/'\n' could inject extra header lines
+        // or a bogus request line into the opening. `ScHttpUrl` values come
+        // from local remote config (lower risk than reading them off the
+        // wire), but reject them here too, cheaply, at parse time rather than
+        // trusting every future caller of `write_client_opening` to check.
+        if host.contains(['\r', '\n']) || path.contains(['\r', '\n']) {
+            return Err(Error::InvalidArgument(format!(
+                "sc+http url host/path must not contain CR or LF: {url}"
+            )));
+        }
         Ok(ScHttpUrl { host: host.to_string(), port, path })
     }
 
     /// `host:port`, for `TcpStream::connect`.
     pub fn authority(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+}
+
+/// A [`Transport`] that speaks the wire protocol over a `TcpStream`
+/// established via the HTTP opening: connect, write the client opening line,
+/// read+map the status BEFORE any wire-protocol byte crosses the socket,
+/// then hand the (split) stream to the same [`WireClient`] `StdioTransport`
+/// uses over a child process's stdio.
+#[derive(Debug)]
+pub struct HttpTransport {
+    client: WireClient<BufReader<TcpStream>, TcpStream>,
+}
+
+impl HttpTransport {
+    /// Connect to `url`, perform the HTTP opening, and hand off to
+    /// `WireClient::handshake`. The status line is read and mapped BEFORE
+    /// the wire-protocol handshake begins: 200 proceeds, 404 means the
+    /// server-side path isn't a repo ([`Error::NotARepo`]), anything else is
+    /// a clearly-named [`Error::Protocol`] — none of these are wire-protocol
+    /// errors, so they must not be mistaken for a `HELLO` failure.
+    pub fn connect(url: &ScHttpUrl) -> Result<HttpTransport> {
+        let mut stream = TcpStream::connect(url.authority())
+            .map_err(|e| Error::ConnectionLost(format!("sc+http connect to {url:?}: {e}")))?;
+        write_client_opening(&mut stream, &url.host, &url.path)?;
+
+        // Split the stream into independent read/write halves up front —
+        // `try_clone` duplicates the socket handle (both `r` and `w` refer
+        // to the same TCP connection, matching StdioTransport's separate
+        // ChildStdout/ChildStdin), mirroring the read-half construction the
+        // brief specifies. The status line is read through this SAME
+        // `BufReader` that goes on to become the WireClient's `r`, not a
+        // throwaway clone: `BufReader::read` can pull more than one byte
+        // from the kernel into its internal buffer per call, so a separate,
+        // later-dropped reader could silently swallow the first
+        // wire-protocol frame byte(s) if the server ever raced ahead of the
+        // status line. Reusing one buffer means anything it over-reads stays
+        // available for the handshake that follows.
+        let mut r = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?,
+        );
+        let w = stream;
+
+        // Status mapping happens BEFORE the wire-protocol handshake: 200
+        // proceeds, 404 means the server-side path isn't a repo, anything
+        // else is a clearly-named protocol error — none of these are
+        // HELLO-handshake failures, so they must not be reported as one.
+        let status = read_status(&mut r)?;
+        match status {
+            200 => {}
+            404 => return Err(Error::NotARepo),
+            other => {
+                return Err(Error::Protocol(format!(
+                    "sc+http server returned unexpected status {other}"
+                )))
+            }
+        }
+
+        let client = WireClient::handshake(r, w)?;
+        Ok(HttpTransport { client })
+    }
+}
+
+impl Transport for HttpTransport {
+    fn list_refs(&self) -> Result<Vec<(String, ObjectId)>> {
+        self.client.list_refs()
+    }
+    fn head_branch(&self) -> Result<String> {
+        self.client.head_branch()
+    }
+    fn has_object(&self, id: &ObjectId) -> Result<bool> {
+        self.client.has_object(id)
+    }
+    fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        self.client.get_object(id)
+    }
+    fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
+        self.client.put_object(id, bytes)
+    }
+    fn update_ref(
+        &self,
+        branch: &str,
+        id: &ObjectId,
+        expected_old: Option<&ObjectId>,
+    ) -> Result<()> {
+        self.client.update_ref(branch, id, expected_old)
+    }
+    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
+        self.client.get_pack(wants, haves, out)
+    }
+    fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
+        self.client.put_pack(src)
     }
 }
 
@@ -267,4 +377,137 @@ mod tests {
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
     }
+
+    #[test]
+    fn parse_rejects_crlf_in_host_or_path() {
+        // CARRY-IN from the Task 2 review: `write_client_opening` has no CRLF
+        // escaping, so a host/path smuggling '\r'/'\n' could inject extra
+        // header lines or a bogus request line into the opening. Guard at
+        // parse time, with no colon in the crafted host so the CRLF check —
+        // not an incidental bad-port parse failure — is provably what fires.
+        let err = ScHttpUrl::parse("sc+http://good\rhost/repo").unwrap_err();
+        match err {
+            Error::InvalidArgument(msg) => assert!(msg.contains("CR or LF"), "got: {msg}"),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        let err = ScHttpUrl::parse("sc+http://host/re\rpo").unwrap_err();
+        match err {
+            Error::InvalidArgument(msg) => assert!(msg.contains("CR or LF"), "got: {msg}"),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    // ── HttpTransport client end-to-end (Task 3): a loopback TCP server
+    // thread stands in for Task 4's `sc serve --http`, since the CLI/server
+    // side lands in a later task. ──
+
+    /// Spin a `TcpListener` on an OS-assigned loopback port; on the single
+    /// connection it accepts, read the client opening, reply with `code`,
+    /// and — only for 200 — hand the connection to `wire::serve` against
+    /// `root`. Returns the bound port and the server thread's join handle.
+    fn spawn_loopback_server(
+        root: std::path::PathBuf,
+        code: u16,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (sock, _addr) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut sock = sock;
+            let _target = read_client_opening(&mut reader).unwrap();
+            write_status(&mut sock, code).unwrap();
+            if code == 200 {
+                crate::wire::serve(&root, &mut reader, &mut sock).unwrap();
+            }
+        });
+        (port, handle)
+    }
+
+    fn tmp_repo(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("scl-http-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::repo::Repo::init(&root).unwrap();
+        root
+    }
+
+    /// P26 Task 3 correctness heart, end-to-end: a real loopback TCP server
+    /// (standing in for Task 4's HTTP server) serves the wire protocol after
+    /// the HTTP opening; the client dials it via `Repo::clone_url` (the exact
+    /// fn `sc clone` calls), which routes through `open_transport`'s new
+    /// `sc+http://` arm into `HttpTransport::connect`. Forces a tiny
+    /// `SC_PACK_CHUNK` so the pack transfer streams many chunks over the
+    /// real TCP socket, not one frame.
+    #[test]
+    fn client_clones_over_loopback_http() {
+        let _env_guard = PACK_CHUNK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SC_PACK_CHUNK", "37");
+
+        let src_root = tmp_repo("clone-src");
+        for i in 0..5 {
+            std::fs::write(
+                src_root.join(format!("f{i}.txt")),
+                format!("payload number {i} — filler filler filler filler").repeat(20),
+            )
+            .unwrap();
+        }
+        let src = crate::repo::Repo::open(&src_root).unwrap();
+        let tip = src.commit("t", "many files").unwrap();
+
+        let (port, server) = spawn_loopback_server(src_root.clone(), 200);
+
+        let dst_root =
+            std::env::temp_dir().join(format!("scl-http-clone-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst_root);
+        let url = format!("sc+http://127.0.0.1:{port}/repo");
+        let dst = crate::repo::Repo::clone_url(&url, &dst_root).unwrap();
+
+        std::env::remove_var("SC_PACK_CHUNK");
+        server.join().unwrap();
+
+        assert_eq!(dst.head_tip().unwrap(), Some(tip));
+        // Same object set: every object reachable from src's tip is present
+        // in dst too (mirrors the sync.rs ssh-transport tests' assertion
+        // style — content-addressed ids make "same tip" + "has every
+        // reachable object" the correctness bar, not a byte-for-byte store
+        // dump).
+        {
+            let store_arc = src.vfs().store();
+            let mut src_store = store_arc.lock().unwrap();
+            let reachable = crate::reachable::reachable_objects(&mut *src_store, &[tip]).unwrap();
+            let dst_store_arc = dst.vfs().store();
+            let mut dst_store = dst_store_arc.lock().unwrap();
+            for id in &reachable {
+                assert!(dst_store.get(id).is_ok(), "dst missing reachable object {id}");
+            }
+        }
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// A server that answers 404 (the path isn't a repo) must be mapped to
+    /// `Error::NotARepo` BEFORE any wire-protocol handshake — the server
+    /// thread here never calls `wire::serve` at all, so a client that tried
+    /// to handshake anyway would hang forever waiting for a HELLO reply that
+    /// never comes.
+    #[test]
+    fn connect_maps_404_to_not_a_repo_before_handshake() {
+        let root = tmp_repo("404");
+        let (port, server) = spawn_loopback_server(root.clone(), 404);
+
+        let url = ScHttpUrl::parse(&format!("sc+http://127.0.0.1:{port}/nope")).unwrap();
+        let err = HttpTransport::connect(&url).unwrap_err();
+        assert!(matches!(err, Error::NotARepo), "got {err:?}");
+
+        server.join().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // SC_PACK_CHUNK env mutation races other tests that also transfer packs
+    // — mirrors `stdio_transport::tests::PACK_CHUNK_ENV_LOCK`.
+    static PACK_CHUNK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
