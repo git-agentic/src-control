@@ -261,12 +261,17 @@ enum Cmd {
         #[arg(long)]
         git: bool,
     },
-    /// Serve a repo over stdin/stdout to a remote `sc` client (invoked by
-    /// `ssh` for ssh:// remotes; not intended for interactive use).
+    /// Serve a repo to a remote `sc` client, either over stdin/stdout
+    /// (invoked by `ssh` for ssh:// remotes) or over TCP (`sc+http://`
+    /// remotes, P26). Exactly one of `--stdio`/`--http` is required.
     Serve {
-        /// Speak the wire protocol on stdin/stdout (required; the only mode).
+        /// Speak the wire protocol on stdin/stdout.
         #[arg(long)]
         stdio: bool,
+        /// Listen on this address (e.g. `0.0.0.0:8730`) and speak the wire
+        /// protocol to each `sc+http://` client over TCP, thread-per-connection.
+        #[arg(long)]
+        http: Option<String>,
         /// Repo root to serve (the directory containing `.sc/`).
         path: PathBuf,
     },
@@ -620,7 +625,7 @@ fn main() -> Result<()> {
         }
         Cmd::Ws { op } => run_ws(op),
         Cmd::Clone { src, dst, git } => run_clone(src, dst, git),
-        Cmd::Serve { stdio, path } => run_serve(stdio, path),
+        Cmd::Serve { stdio, http, path } => run_serve(stdio, http, path),
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
         Cmd::Push { remote, include_encrypted } => run_push(&remote, include_encrypted),
@@ -2403,11 +2408,17 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Serve a repo over the wire protocol on stdin/stdout. Invoked as the
-/// remote-side command by `ssh` for `ssh://` remotes.
-fn run_serve(stdio: bool, path: PathBuf) -> Result<()> {
+/// Serve a repo over the wire protocol: either on stdin/stdout (invoked as
+/// the remote-side command by `ssh` for `ssh://` remotes), or over TCP for
+/// `sc+http://` clients (P26, `--http <addr>`; blocks until the listener is
+/// dropped, e.g. by process termination). Exactly one mode is required.
+fn run_serve(stdio: bool, http: Option<String>, path: PathBuf) -> Result<()> {
+    if let Some(addr) = http {
+        scl_repo::http_transport::serve_http(&addr, &path)?;
+        return Ok(());
+    }
     if !stdio {
-        anyhow::bail!("sc serve requires --stdio (the only supported mode)");
+        anyhow::bail!("sc serve requires --stdio or --http <addr>");
     }
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();

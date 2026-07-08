@@ -4,7 +4,8 @@
 //! lands in Task 4.
 
 use std::io::{BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 use scl_core::ObjectId;
 
@@ -279,6 +280,105 @@ impl Transport for HttpTransport {
     }
 }
 
+/// Bound on how long an accepted connection may take to send its HTTP
+/// opening (request line + headers + blank line) before the server gives up
+/// on it. Guards the slow-loris case the Task 2 review flagged:
+/// `read_client_opening` bounds the opening in BYTES (`MAX_OPENING_BYTES`)
+/// but not in TIME, so a peer that trickles in under the byte cap and then
+/// stalls would otherwise hold a server thread (and its socket) forever.
+/// Applied only around the opening read — see [`serve_http_listener`] for
+/// where it's cleared before a legitimate large pack transfer begins.
+const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bind `addr`, serve the single repo at `root` to `sc+http://` clients
+/// until the listener is dropped or the process exits. Thin wrapper around
+/// [`serve_http_listener`] — see that function for the accept-loop
+/// behavior; this just does the binding.
+pub fn serve_http(addr: &str, root: &std::path::Path) -> Result<()> {
+    let listener = TcpListener::bind(addr)
+        .map_err(|e| Error::ConnectionLost(format!("sc+http bind {addr}: {e}")))?;
+    serve_http_listener(listener, root)
+}
+
+/// Accept-loop core, factored out of [`serve_http`] so tests can bind
+/// `127.0.0.1:0`, read back the OS-assigned port via `local_addr()`, and
+/// hand the already-bound listener in here directly.
+///
+/// Thread-per-connection: each accepted stream is handled on its own thread
+/// so one slow or misbehaving client cannot block others. The `.sc/`
+/// single-writer lock inside the commit/push path already serializes
+/// concurrent pushes; concurrent read-only fetches need no extra guard
+/// here.
+///
+/// Runs until the listener is dropped/closed (`incoming()` yields `None`)
+/// or a fatal accept-level error occurs; a per-connection error (bad
+/// opening, a `wire::serve` failure, a dropped socket) is logged to stderr
+/// and the loop continues — it must never take down the whole server.
+pub fn serve_http_listener(listener: TcpListener, root: &std::path::Path) -> Result<()> {
+    for incoming in listener.incoming() {
+        let stream = match incoming {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("sc serve --http: accept error: {e}");
+                continue;
+            }
+        };
+        let root = root.to_path_buf();
+        std::thread::spawn(move || {
+            if let Err(e) = handle_http_connection(stream, &root) {
+                eprintln!("sc serve --http: connection error: {e}");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Handle one accepted connection end to end: bounded-time opening read →
+/// validate `root` is a repo → status line → `wire::serve`.
+///
+/// The read timeout is set BEFORE `read_client_opening` (closing the
+/// slow-loris gap: the opening is bounded in bytes but not time) and
+/// cleared again AFTER the 200 status is written and BEFORE handing off to
+/// `wire::serve` — a legitimate large pack transfer must not be cut off
+/// mid-stream by the same timeout that guards the opening.
+fn handle_http_connection(mut stream: TcpStream, root: &std::path::Path) -> Result<()> {
+    stream
+        .set_read_timeout(Some(OPENING_READ_TIMEOUT))
+        .map_err(|e| Error::ConnectionLost(format!("sc+http set_read_timeout: {e}")))?;
+
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?,
+    );
+
+    let target = match read_client_opening(&mut reader) {
+        Ok(t) => t,
+        Err(_) => {
+            // Malformed/slow-loris opening: best-effort 400, then close.
+            let _ = write_status(&mut stream, 400);
+            return Ok(());
+        }
+    };
+    let _ = target; // the request-target isn't used to route (one repo per listener)
+
+    if !root.join(".sc").is_dir() {
+        write_status(&mut stream, 404)?;
+        return Ok(());
+    }
+
+    write_status(&mut stream, 200)?;
+
+    // Clear the opening's read timeout before the wire protocol begins: a
+    // real streamed pack transfer can legitimately take longer than
+    // `OPENING_READ_TIMEOUT` and must not be timed out mid-transfer.
+    stream
+        .set_read_timeout(None)
+        .map_err(|e| Error::ConnectionLost(format!("sc+http clear read_timeout: {e}")))?;
+
+    crate::wire::serve(root, &mut reader, &mut stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,4 +610,147 @@ mod tests {
     // SC_PACK_CHUNK env mutation races other tests that also transfer packs
     // — mirrors `stdio_transport::tests::PACK_CHUNK_ENV_LOCK`.
     static PACK_CHUNK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ── Task 4: the real server (`serve_http_listener`), not the loopback
+    // stand-in above. ──
+
+    /// Bind `serve_http_listener` on an OS-assigned loopback port in a
+    /// background thread and return the port plus the join handle. The
+    /// listener runs until the test process exits (there's no clean
+    /// shutdown hook — matches the brief's "until the listener is dropped"
+    /// contract, which for a `for stream in listener.incoming()` loop means
+    /// the listener living for the process lifetime once handed off to a
+    /// thread that owns it).
+    fn spawn_real_http_server(root: std::path::PathBuf) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            serve_http_listener(listener, &root).unwrap();
+        });
+        port
+    }
+
+    /// End-to-end proof of `serve_http`/`serve_http_listener`, covering all
+    /// four scenarios the Task 4 brief calls out: (a) clone lands
+    /// byte-identical, (b) a push from a second repo lands and a later
+    /// fetch sees it, (c) a signed commit (P22) verifies clean in the
+    /// clone, (d) a server whose root lacks `.sc/` answers `NotARepo`.
+    /// Forces a tiny `SC_PACK_CHUNK` so real TCP pack transfer streams many
+    /// chunks, not one frame.
+    #[test]
+    fn real_server_clone_push_fetch_sign_and_404() {
+        let _env_guard = PACK_CHUNK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SC_PACK_CHUNK", "37");
+
+        // --- (d) a root without `.sc/` answers NotARepo, no handshake. ---
+        let bare_dir = std::env::temp_dir()
+            .join(format!("scl-http-bare-{}", std::process::id()))
+            .join("nested"); // nested dir with no .sc/ anywhere useful
+        std::fs::create_dir_all(&bare_dir).unwrap();
+        let bare_port = spawn_real_http_server(bare_dir.clone());
+        let url = ScHttpUrl::parse(&format!("sc+http://127.0.0.1:{bare_port}/nope")).unwrap();
+        let err = HttpTransport::connect(&url).unwrap_err();
+        assert!(matches!(err, Error::NotARepo), "got {err:?}");
+
+        // --- (a) clone lands byte-identical over the real server. ---
+        //
+        // `src` is opened (and its RepoLock held) only inside tight scopes
+        // below, never across a network call: `serve_http_listener`'s
+        // server thread opens the SAME root via `LocalTransport` for every
+        // connection, and a push's `update_ref` transiently acquires that
+        // same root's `RepoLock` (`transport.rs`'s single-writer discipline)
+        // — holding `src` open across that call would self-deadlock/collide
+        // with our own in-process lock, since `RepoLock` is exclusive
+        // per-root regardless of which handle in this process asked first.
+        let src_root = tmp_repo("real-clone-src");
+        for i in 0..5 {
+            std::fs::write(
+                src_root.join(format!("f{i}.txt")),
+                format!("payload number {i} — filler filler filler filler").repeat(20),
+            )
+            .unwrap();
+        }
+        let tip1 = {
+            let src = crate::repo::Repo::open(&src_root).unwrap();
+            src.commit("t", "initial").unwrap()
+        };
+
+        let port = spawn_real_http_server(src_root.clone());
+        let clone_url = format!("sc+http://127.0.0.1:{port}/repo");
+
+        let dst_root =
+            std::env::temp_dir().join(format!("scl-http-real-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst_root);
+        let dst = crate::repo::Repo::clone_url(&clone_url, &dst_root).unwrap();
+        assert_eq!(dst.head_tip().unwrap(), Some(tip1));
+        {
+            let src = crate::repo::Repo::open(&src_root).unwrap();
+            let store_arc = src.vfs().store();
+            let mut src_store = store_arc.lock().unwrap();
+            let reachable = crate::reachable::reachable_objects(&mut *src_store, &[tip1]).unwrap();
+            drop(src_store);
+            drop(src);
+            let dst_store_arc = dst.vfs().store();
+            let mut dst_store = dst_store_arc.lock().unwrap();
+            for id in &reachable {
+                assert!(dst_store.get(id).is_ok(), "dst missing reachable object {id}");
+            }
+        }
+
+        // --- (b) push from a second (third) repo lands, a later fetch sees it. ---
+        let third_root =
+            std::env::temp_dir().join(format!("scl-http-real-third-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&third_root);
+        let third = crate::repo::Repo::clone_url(&clone_url, &third_root).unwrap();
+        std::fs::write(third_root.join("from_third.txt"), b"pushed over http").unwrap();
+        let pushed_tip = third.commit("t", "pushed commit").unwrap();
+        // `clone_url` already recorded "origin" -> clone_url in third's config.
+        third.push("origin").unwrap();
+        drop(third);
+
+        // src's own history (read directly, not via the server) now has the
+        // pushed commit as its tip.
+        {
+            let src = crate::repo::Repo::open(&src_root).unwrap();
+            assert_eq!(src.head_tip().unwrap(), Some(pushed_tip));
+        }
+
+        // dst fetches from src (over the same real server) and sees it;
+        // `clone_url` already recorded "origin" -> clone_url in dst's config.
+        let fetched = dst.fetch("origin").unwrap();
+        assert!(
+            fetched.iter().any(|(_, id)| *id == pushed_tip),
+            "fetch over http didn't see the pushed tip"
+        );
+        drop(dst);
+
+        // --- (c) a signed commit (P22) verifies clean in the clone. ---
+        let (_seed, identity) = scl_crypto::generate_identity_v2();
+        let signed_tip = {
+            let src = crate::repo::Repo::open(&src_root).unwrap();
+            let signed_tip = src.commit("t", "signed commit").unwrap();
+            src.sign_snapshot(signed_tip, &identity).unwrap();
+            signed_tip
+        };
+
+        let signed_dst_root =
+            std::env::temp_dir().join(format!("scl-http-real-signed-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&signed_dst_root);
+        let signed_dst = crate::repo::Repo::clone_url(&clone_url, &signed_dst_root).unwrap();
+        assert_eq!(signed_dst.head_tip().unwrap(), Some(signed_tip));
+
+        let signer = identity.signing.as_ref().unwrap().public().to_bytes();
+        let mut trust = std::collections::HashMap::new();
+        trust.insert(signer, "alice".to_string());
+        let status = signed_dst.sig_status(&signed_tip, &trust).unwrap();
+        assert_eq!(status, crate::signatures::SigStatus::Trusted("alice".to_string()));
+
+        std::env::remove_var("SC_PACK_CHUNK");
+        drop(signed_dst);
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        let _ = std::fs::remove_dir_all(&third_root);
+        let _ = std::fs::remove_dir_all(&signed_dst_root);
+        let _ = std::fs::remove_dir_all(bare_dir.parent().unwrap());
+    }
 }
