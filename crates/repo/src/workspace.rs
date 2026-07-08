@@ -78,7 +78,12 @@ pub(crate) fn harvest_workspace(
         return Ok(HarvestResult::Unchanged);
     }
     let files = worktree::read_worktree(&ws, &tracked)?;
-    match repo.snapshot_files(files, Some(tip), None, None, None, None, None, author, message) {
+    // The same `sparse` the caller used for the diff above is threaded into
+    // the commit carry (P24 final-review fix): the workspace's view was
+    // fixed at materialize time (or, for `sc work`, is always full), so the
+    // carry predicate must see that same view, not the host repo's current
+    // `.sc/sparse` — see `snapshot_files`'s doc comment.
+    match repo.snapshot_files(files, Some(tip), None, None, None, None, None, sparse, author, message) {
         Ok(id) => {
             refs::write_branch_tip(repo.layout(), branch, &id)?;
             Ok(HarvestResult::Committed(id))
@@ -414,6 +419,48 @@ mod tests {
             with_secrets: false,
             session_root: Some(scratch.join("session")),
         }
+    }
+
+    #[test]
+    fn sc_work_full_agent_deletion_survives_host_sparse() {
+        // P24 final-review fix, Important 1: `sc work` agents always get a
+        // FULL checkout (`Sparse::default()`), regardless of the host repo's
+        // own sparse spec. A genuine deletion of an out-of-host-sparse path
+        // by such an agent must land as a real deletion, not be silently
+        // reverted because harvest read the host's narrow spec.
+        let (root, scratch) = setup("full-agent-deletion");
+        let repo = Repo::open(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("docs/x.txt"), "doc\n").unwrap();
+        repo.commit("test", "add src+docs").unwrap();
+
+        // Host narrows to src/ — docs/x.txt leaves the host's own disk, but
+        // `sc work` agents still get the full tree (contract preserved).
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        assert!(!root.join("docs/x.txt").exists());
+
+        let opts = work_opts(1, &["sh", "-c", "rm docs/x.txt"], &scratch);
+        let outcomes = repo.work(opts).unwrap();
+        let id = match outcomes[0].harvest.as_ref().unwrap() {
+            HarvestResult::Committed(id) => *id,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+
+        let snap = repo.snapshot(&id).unwrap();
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let ids = crate::worktree::tree_file_ids(&mut store, snap.root).unwrap();
+        assert!(
+            !ids.contains_key("docs/x.txt"),
+            "the agent's genuine deletion of an out-of-host-sparse file must land, \
+             not be silently reverted by the host's narrow spec"
+        );
+        assert!(ids.contains_key("src/a.txt"), "untouched in-sparse file still present");
+        drop(store);
+        drop(repo);
+        teardown(&root);
     }
 
     #[test]

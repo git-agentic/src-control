@@ -185,6 +185,7 @@ impl Repo {
             decided_root,
             pick_registry_base,
             None,
+            &self.sparse_spec()?,
             author,
             message,
         )
@@ -224,6 +225,20 @@ impl Repo {
     /// the TIP's OWN parents instead of `[tip]`, replacing rather than
     /// extending history. Every other caller passes `None`, keeping the
     /// original `tip` (+ `merge_head`) derivation.
+    /// `sparse` (P24 final-review fix, Critical 1 / Important 1) is the
+    /// carry predicate's sparse view, now an explicit input instead of an
+    /// ambient `self.sparse_spec()?` read: the host-repo callers (`commit`,
+    /// `amend`, `assemble_completion_snapshot`) pass the live host spec —
+    /// correct there, since the working tree they read reflects it — but
+    /// `sc ws harvest` must pass the WORKSPACE'S OWN fork-time spec (the
+    /// checkout was materialized under it, possibly a spec ago) and `sc
+    /// work` must pass `Sparse::default()` (its checkouts are always full,
+    /// so a genuine out-of-sparse deletion must land, not be carried as if
+    /// merely unmaterialized). Reading the host's live spec ambiently here
+    /// previously conflated "the view this working tree was actually given"
+    /// with "the view the host repo happens to have right now" — the two
+    /// diverge exactly when a `sc ws` session outlives a `sparse set/disable`
+    /// on the host, or when the caller is `sc work` at all.
     pub(crate) fn snapshot_files(
         &self,
         files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
@@ -233,6 +248,7 @@ impl Repo {
         decided_root: Option<ObjectId>,
         pick_registry_base: Option<ObjectId>,
         parents_override: Option<Vec<ObjectId>>,
+        sparse: &crate::sparse::Sparse,
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
@@ -371,14 +387,13 @@ impl Repo {
         // now carried iff it is still-protected-and-not-a-recipient (as
         // before) OR it falls outside the current sparse spec
         // (`!sparse.matches(path)`); when neither holds, absence is a genuine
-        // deletion. `sparse_spec()` is loaded once, up front, so every path
-        // in the loop below is checked against the same spec. This landing
-        // is dormant today: Task 3 (materialize filtering) doesn't exist yet,
-        // so with no directly-written `.sc/sparse` file every path matches
-        // and the OR term is always false — behavior is unchanged from P15
-        // until a sparse spec exists.
+        // deletion. `sparse` is the caller-supplied spec (see the doc comment
+        // on `snapshot_files` for why it must not be read ambiently here), so
+        // every path in the loop below is checked against the same spec.
+        // This landing is dormant when `sparse` is full: with no narrowing in
+        // effect every path matches and the OR term is always false —
+        // behavior is unchanged from P15 for a full checkout.
         {
-            let sparse = self.sparse_spec()?;
             let mut on_disk: std::collections::BTreeSet<String> =
                 all.iter().map(|(p, _, _, _)| p.clone()).collect();
             let store_arc = self.vfs.store();
@@ -526,6 +541,7 @@ impl Repo {
                     decided_root,
                     pick_registry_base,
                     None,
+                    &self.sparse_spec()?,
                     author,
                     message,
                 )?
@@ -594,6 +610,7 @@ impl Repo {
             None,
             None,
             Some(tip_snap.parents.clone()),
+            &self.sparse_spec()?,
             author,
             &msg,
         )?;

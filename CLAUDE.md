@@ -760,20 +760,31 @@ in the CAS without materializing; a CONFLICT there refuses up front
 while `sc conflicts` still inspects freely since it never writes to disk.
 `sc sparse set`/`disable` refuse during an in-progress merge/pick/rebase.
 `sc ws` workspaces inherit the host repo's sparse view structurally
-(threaded into `materialize_workspace`; harvest carries the untouched
-subtree via the same generalized predicate). `sc status` shows the active
-spec. Sparse CHECKOUT only — every object stays in the CAS regardless of
-the spec, so `sc gc`'s reachability walk is unaffected; partial clone
-(never fetching out-of-prefix objects) is deferred. **Boundary:** when an
-IN-sparse conflict co-occurs with an OUT-of-sparse protected/I2 clean
-change in the same merge, that out-of-sparse plaintext is *transiently*
-written to disk outside the sparse view for the duration of the conflict
-window — `materialize_conflict_state`'s sparse gate covers only its
-marker-write loop, not its `to_encrypt`/sidecar-decrypt write loops. This
-is not data loss (completion's `read_worktree` re-lands the content in the
-CAS same as any other carried file; abort removes it) and not a new
-disclosure (the diff3 content-merge that produced the plaintext already
-required an authorized identity; the I2 case is pre-existing plaintext) —
+(threaded into `materialize_workspace` at fork time, and — final-review
+fix — the fork-time spec is also PERSISTED in `session.toml` and reused,
+never re-read ambiently, so a `sparse set`/`disable` on the host between
+fork and harvest cannot reinterpret the workspace's never-materialized
+paths as deletions; harvest carries the untouched subtree via the same
+generalized predicate). A full-checkout `sc work` agent passes the same
+predicate `Sparse::default()`, so its genuine deletions of any path land
+instead of being carried against the host's spec. `sc status` shows the
+active spec. Sparse CHECKOUT only — every object stays in the CAS
+regardless of the spec, so `sc gc`'s reachability walk is unaffected;
+partial clone (never fetching out-of-prefix objects) is deferred.
+**Boundary:** when an IN-sparse conflict co-occurs with an OUT-of-sparse
+protected/I2 clean change in the same merge, that out-of-sparse plaintext
+is written to disk outside the sparse view during the conflict window AND
+PERSISTS ON DISK AFTER COMPLETION TOO — `materialize_conflict_state`'s
+sparse gate covers only its marker-write loop, not its
+`to_encrypt`/sidecar-decrypt write loops, and completion does not
+materialize. Only abort removes it (its `!sparse.matches` removal arm);
+completion's `read_worktree` re-lands the content in the CAS byte-correct
+(same as any other carried file) but never deletes the on-disk file — the
+plaintext stays on disk until the next materializing operation (`switch`,
+`sparse set`/`disable`, another merge) re-lays the tree. This is not data
+loss and not a new disclosure (the diff3 content-merge that produced the
+plaintext already required an authorized identity; the I2 case is
+pre-existing plaintext) —
 a bounded disk-hygiene boundary, follow-on to extending the sparse gate to
 the `to_encrypt`/sidecar writes too. Proven by `demo/run_sparse_demo.sh`.
 See ADR-0034.

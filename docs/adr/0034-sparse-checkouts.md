@@ -41,7 +41,10 @@ precedent); a CONFLICT there is reported with a "widen your sparse set to
 resolve `<path>`" message rather than auto-materializing (and `sc resolve`
 errors the same way, while `sc conflicts` still inspects via DAG-derived
 versions). Protected and sparse are orthogonal — the carry composes.
-`sc ws` workspaces inherit the host's `.sc/sparse`.
+`sc ws` workspaces inherit the host's `.sc/sparse` at fork time; the
+fork-time spec is persisted in `session.toml` and reused for that
+workspace's diff/harvest regardless of later host spec changes (final-
+review fix — see Consequences).
 
 ## Consequences
 
@@ -51,27 +54,35 @@ versions). Protected and sparse are orthogonal — the carry composes.
   bounds checkout cost the way the budget bounds resident blobs.
 - gc is unchanged: all objects stay reachable (sparse is a disk view, not
   an object-set change).
-- **Boundary: a transient out-of-sparse plaintext write during a mixed
-  conflict.** `Repo::materialize_conflict_state` (`crates/repo/src/
-  repo.rs`) gates its own conflict *markers* against the sparse spec up
-  front — an out-of-sparse conflicted path refuses with a widen hint
-  before anything is written. But that gate only covers the marker-write
-  loop; the same function's `to_encrypt`/sidecar-decrypt write loops
-  (protected-content re-encryption inputs and `.theirs` sidecars for an
-  *in-sparse* conflict) are not sparse-scoped. When an IN-sparse conflict
-  co-occurs with an OUT-of-sparse protected/I2 clean change in the same
-  merge, that out-of-sparse plaintext is written to disk outside the
-  sparse view for the duration of the conflict window. This is **not data
-  loss** — completion's `read_worktree` re-lands the content in the CAS
-  the same as any other carried file, and abort removes the working-tree
-  state entirely — and **not a new disclosure**: the diff3 content-merge
-  that produces the plaintext already required an authorized identity, and
-  the I2 carried-plaintext case is pre-existing plaintext the sparse gate
-  never claimed to hide from disk. It is a bounded disk-hygiene boundary —
-  the sparse view is briefly wider than advertised during that one
-  conflict window — not a confidentiality or durability bug. Follow-on:
-  extend the sparse gate to the `to_encrypt`/sidecar write loops so the
-  view holds even mid-conflict.
+- **Boundary: an out-of-sparse plaintext write during a mixed conflict
+  that OUTLIVES the conflict window.** `Repo::materialize_conflict_state`
+  (`crates/repo/src/repo.rs`) gates its own conflict *markers* against the
+  sparse spec up front — an out-of-sparse conflicted path refuses with a
+  widen hint before anything is written. But that gate only covers the
+  marker-write loop; the same function's `to_encrypt`/sidecar-decrypt
+  write loops (protected-content re-encryption inputs and `.theirs`
+  sidecars for an *in-sparse* conflict) are not sparse-scoped. When an
+  IN-sparse conflict co-occurs with an OUT-of-sparse protected/I2 clean
+  change in the same merge, that out-of-sparse plaintext is written to
+  disk outside the sparse view — and, verified by final-review testing,
+  it **persists on disk after completion too**, not just during the
+  conflict window: only `abort` removes it (its `!sparse.matches` removal
+  arm runs on abort); completion's `read_worktree` re-lands the content in
+  the CAS byte-correct, the same as any other carried file, but `commit`
+  does not materialize, so it never deletes the on-disk file. The
+  plaintext stays on disk until the next materializing operation (`switch`,
+  `sparse set`/`disable`, another merge) re-lays the tree — there is no
+  completion-time sweep. This is **not data loss** — the content lands in
+  the CAS byte-correct either way — and **not a new disclosure**: the
+  diff3 content-merge that produces the plaintext already required an
+  authorized identity, and the I2 carried-plaintext case is pre-existing
+  plaintext the sparse gate never claimed to hide from disk. It is a
+  bounded disk-hygiene boundary — the sparse view stays wider than
+  advertised, with no signal, until something else re-lays the tree — not
+  a confidentiality or durability bug. Follow-on: extend the sparse gate
+  to the `to_encrypt`/sidecar write loops so the view holds even
+  mid-conflict (which would also close the post-completion persistence,
+  since there would be nothing out-of-sparse to persist).
 
 ## Alternatives considered
 
@@ -131,14 +142,32 @@ every claim below is checked against the shipped code, not the plan.
    *not* cover (`to_encrypt`/sidecar writes for an in-sparse conflict that
    co-occurs with an out-of-sparse clean change).
 4. **`sc ws` inherits the host's sparse view, structurally, not by
-   convention.** `Repo::sparse_spec()` is read once in `ws_fork` and
+   convention — and, after a final-review fix, durably against later host
+   spec changes.** `Repo::sparse_spec()` is read once in `ws_fork` and
    threaded as a parameter into `workspace::materialize_workspace`
    (`crates/repo/src/ws.rs` / `workspace.rs`) — a forked workspace's
    checkout is sparse-filtered exactly like the host repo's own working
-   tree, and harvest carries the untouched out-of-sparse subtree forward
-   through the same generalized carry predicate as (1), pinned by
-   `ws_fork_inherits_sparse`. This is deliberately different from `sc
-   work`'s one-shot ephemeral agents, which stay full-checkout.
+   tree, pinned by `ws_fork_inherits_sparse`. The original build left one
+   gap, found in final review: `ws_harvest` re-read the host's *current*
+   `.sc/sparse` at harvest time rather than the spec the workspace was
+   actually materialized under, so a legitimate `sparse set`/`disable` on
+   the host between fork and harvest made the never-materialized subtree
+   read as a user deletion and silently drop it from the branch tip
+   (`snapshot_files`'s carry predicate saw the wrong spec). The fix
+   persists the fork-time prefixes in `WsSession`/`session.toml` and
+   threads *that* recorded spec into `ws_changed_for` and `ws_harvest`'s
+   call into `harvest_workspace` (which now also passes it on into
+   `snapshot_files`, which takes the carry's sparse view as an explicit
+   parameter instead of reading `self.sparse_spec()` ambiently) — so
+   harvest always diffs and commits against the view the workspace was
+   actually given, pinned by
+   `ws_harvest_uses_fork_time_sparse_not_ambient`. The same
+   parameterization closed a companion gap in `sc work`'s one-shot
+   ephemeral agents, which stay full-checkout (`Sparse::default()`): before
+   the fix, a host sparse spec made `snapshot_files` read the *host's*
+   narrow view during harvest and silently revert an agent's genuine
+   deletion of an out-of-sparse path, pinned by
+   `sc_work_full_agent_deletion_survives_host_sparse`.
 5. **`set_sparse`/`disable_sparse` refuse mid-conflict.** Re-laying the
    working tree while a merge/pick/rebase is in progress would either
    destroy in-progress conflict markers or narrow away a path a
