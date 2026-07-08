@@ -217,22 +217,33 @@ impl Repo {
             },
         }
 
-        // Drop the `.theirs` sidecar this system may have written for a
-        // binary conflict — the only sidecar extension ever written (`.base`
-        // and `.ours` are never produced, so removing them was both dead
-        // code and a footgun: a repo can legitimately track a real file
-        // named `foo.txt.base`/`foo.txt.ours`, and blind-unlinking it would
-        // silently destroy user data). Even for `.theirs`, only remove it
-        // when it is NOT a tracked path — a genuine sidecar is untracked
-        // scratch by construction, so a tracked `{path}.theirs` must be a
-        // user's real file and is left alone.
-        let theirs_sidecar_path = format!("{path}.theirs");
-        if !self.tracked_paths()?.contains(&theirs_sidecar_path) {
-            let sidecar = safe_join(&self.layout.root, &theirs_sidecar_path)?;
-            match std::fs::remove_file(&sidecar) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+        // Drop the `.theirs` sidecar this system may have written — the only
+        // sidecar extension ever written (`.base` and `.ours` are never
+        // produced, so removing them was both dead code and a footgun: a
+        // repo can legitimately track a real file named
+        // `foo.txt.base`/`foo.txt.ours`, and blind-unlinking it would
+        // silently destroy user data). `.theirs` is written only for
+        // BINARY/PROTECTED-with-binary-content conflicts (merge.rs writes
+        // `{path}.theirs` in the binary-conflict arm) — a TEXT conflict
+        // never writes one, so a `.theirs`-named file sitting untracked next
+        // to a text conflict is not this system's scratch, it's the user's;
+        // removing it there would silently and unrecoverably delete
+        // untracked data. So only consider removal when the conflict kind is
+        // NOT Text (`!= Text`, not `== Binary`: a protected binary conflict
+        // still writes a plaintext `.theirs` sidecar and classifies as
+        // Protected, so it must still be cleaned up). And even then, only
+        // remove it when it is NOT a tracked path — a genuine sidecar is
+        // untracked scratch by construction, so a tracked `{path}.theirs`
+        // must be a user's real file and is left alone.
+        if self.conflict_kind(path)? != ConflictKind::Text {
+            let theirs_sidecar_path = format!("{path}.theirs");
+            if !self.tracked_paths()?.contains(&theirs_sidecar_path) {
+                let sidecar = safe_join(&self.layout.root, &theirs_sidecar_path)?;
+                match std::fs::remove_file(&sidecar) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
 
@@ -723,6 +734,53 @@ mod tests {
             std::fs::read(root.join("a.txt.theirs")).unwrap(),
             b"real tracked content\n",
             "tracked sidecar-named file content must be untouched"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// P23 final-review fix: for a TEXT conflict this system never writes a
+    /// `.theirs` sidecar (only BINARY/PROTECTED-binary conflicts do), so an
+    /// untracked file that merely happens to be named `file.txt.theirs`
+    /// (e.g. a user's scratch file) is not this system's residue. Resolving
+    /// a TEXT conflict on `file.txt` must leave it alone.
+    #[test]
+    fn resolve_text_conflict_preserves_untracked_theirs_named_file() {
+        let root = tmp_root("resolve-text-preserves-untracked-theirs");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("file.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("file.txt"), b"theirs\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.merge("feature", "me").unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+        assert_eq!(
+            repo.conflict_kind("file.txt").unwrap(),
+            ConflictKind::Text,
+            "test setup: this must be a text conflict"
+        );
+
+        // An untracked scratch file that happens to share the sidecar name.
+        std::fs::write(root.join("file.txt.theirs"), b"user scratch content\n").unwrap();
+
+        repo.resolve_path("file.txt", ResolveSide::Ours, None).unwrap();
+
+        assert!(
+            root.join("file.txt.theirs").exists(),
+            "untracked file.txt.theirs must survive resolving a TEXT conflict on file.txt"
+        );
+        assert_eq!(
+            std::fs::read(root.join("file.txt.theirs")).unwrap(),
+            b"user scratch content\n",
+            "untracked sidecar-named file content must be untouched"
         );
 
         drop(repo);
