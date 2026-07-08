@@ -308,6 +308,62 @@ mod tests {
     }
 
     #[test]
+    fn retroactive_signature_propagates_on_refetch() {
+        // The Task 3 review scenario: a signature added to a snapshot AFTER
+        // the receiver's last sync must still show up on the receiver's next
+        // fetch. The original `get_pack` sender-side extension folded
+        // `indexed_signature_ids_for` into `have_set` by snapshot
+        // reachability alone, wrongly assuming "have the snapshot" implies
+        // "have every signature ever indexed for it" — that silently
+        // defeated ADR-0032's promised retroactive signing on the most
+        // common sync path (repeat fetch). This proves the fix.
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-retrosig-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-retrosig-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&a_root);
+        let _ = std::fs::remove_dir_all(&b_root);
+        std::fs::create_dir_all(&a_root).unwrap();
+
+        // A commits, unsigned.
+        let a = Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f1"), b"one").unwrap();
+        let snap = a.commit("t", "c1").unwrap();
+
+        // B clones — the commit is unsigned at clone time.
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let signer = identity.signing.as_ref().unwrap().public().to_bytes();
+        let mut trust = std::collections::HashMap::new();
+        trust.insert(signer, "alice".to_string());
+        assert_eq!(b.sig_status(&snap, &trust).unwrap(), SigStatus::Unsigned);
+
+        // A signs the OLD commit retroactively. B already has `snap` (same
+        // object id, already reachable from its cloned branch tip) — this is
+        // exactly the case the buggy have-side extension mishandled.
+        a.sign_snapshot(snap, &identity).unwrap();
+        drop(a);
+
+        // B fetches again: the retroactive signature must propagate even
+        // though B already had the snapshot itself.
+        b.fetch("origin").unwrap();
+        assert_eq!(
+            b.sig_status(&snap, &trust).unwrap(),
+            SigStatus::Trusted("alice".to_string()),
+            "retroactive signature must propagate on refetch even though the receiver already \
+             had the signed snapshot"
+        );
+        assert_eq!(
+            b.signatures_for(&snap).unwrap().len(),
+            1,
+            "B's index must list the retroactively-fetched signature"
+        );
+
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        std::fs::remove_dir_all(&b_root).unwrap();
+    }
+
+    #[test]
     fn signatures_ride_ssh_transport() {
         // The wire-protocol pipe harness `WireClient` <-> `wire::serve` IS
         // the ssh code path minus the ssh process spawn (StdioTransport
