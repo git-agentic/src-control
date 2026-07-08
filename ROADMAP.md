@@ -192,7 +192,28 @@ across every phase.
 
 ## Active
 
-None — the P16–P20 horizon is complete; brainstorm the next horizon.
+None — Phase 21 is next up; see the next-horizon table below. A phase
+becomes Active when its focused brainstorm → spec cycle starts.
+
+## Next horizon (P21–P24)
+
+Decided 2026-07-08 (design: `docs/superpowers/specs/2026-07-08-roadmap-horizon-p21-p24-design.md`).
+Theme: consolidate, then complete the trust story, then invest in daily
+feel and scale — P16–P20's final reviews left a pooled debt tail
+(including one live-demonstrated hazard), and shipped claims should not
+carry known hazards into new work.
+
+| Phase | Goal | Demoable outcome | ADR |
+|-------|------|------------------|-----|
+| **P21 — Hardening & consolidation** | Close the P16–P20 review tail | policy-op guards, marks recovery, abort/status minors, conflict-materialize extraction; every closed finding's repro pinned as a test; all demos green | [0031](docs/adr/0031-hardening-consolidation.md) |
+| **P22 — Signed commits & provenance** | Integrity attribution | sign commits; tamper with a clone's history; `sc verify` catches it; untrusted signers visibly flagged | [0032](docs/adr/0032-signed-commits-provenance.md) |
+| **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts` + `sc resolve --ours/--theirs` end-to-end on a conflicted merge | [0033](docs/adr/0033-merge-ergonomics.md) |
+| **P24 — Sparse checkouts / sub-tree sharing** | Monorepo-width working trees | work in one subtree with the rest absent from disk; commits carry absent subtrees byte-identically | [0034](docs/adr/0034-sparse-checkouts.md) |
+
+Ordering rationale: P21 first (compounding hours-scale debt, one live
+hazard); P22 before P23/P24 (provenance is the last unbuilt security
+pillar — settle it before more surface accretes); P23 before P24 (conflict
+UX pays off daily and sparse users will want it too).
 
 ## Completed phases (usability-first ordering)
 
@@ -301,11 +322,12 @@ These apply across phases rather than to one:
 
 ## Deferred
 
-Tracked but out of scope for this roadmap horizon (several former entries
-graduated into P16–P20 above: revocation tombstones → P16, bulk re-wrap +
-multiple escrow keys → P17, network Git remotes → P18, amend/`--continue`/
-`--abort`/merge-commit replay → P19, interactive sessions + auto-merge →
-P20):
+Tracked but out of scope for this roadmap horizon (former entries have
+graduated twice over: revocation tombstones → P16, bulk re-wrap + escrow
+keys → P17, network Git remotes → P18, history-editing polish → P19,
+sessions + auto-merge → P20; and now policy-op guards + marks recovery +
+abort/status minors → P21, signed commits → P22, merge ergonomics → P23,
+sparse checkouts → P24):
 
 - **HTTP transport** (sc-native). P12 shipped the sc-native SSH transport;
   an HTTP equivalent is a later transport swap on the same seam.
@@ -313,32 +335,12 @@ P20):
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
-- **In-progress guards for the remaining policy ops.** P17's final review
-  found (and fixed for `rewrap`) that a policy commit landed mid-merge/pick
-  gets its wraps unioned back by the completion — `grant`/`revoke`/`secret
-  add/rotate` share this pre-existing gap and should gain the same
-  `MergeInProgress`/`PickInProgress`/`RebaseInProgress` guards `rewrap`
-  and the ref-movers use. Escalated by P19's final review: an unguarded
-  `secret add` mid-stopped-rebase moved the tip and (pre-fix) had its
-  commit silently discarded by `--continue` — `rebase_continue` now
-  refuses on a moved tip as a backstop, but guarding the ops themselves
-  is the durable fix.
-- **Rebase/pick abort ergonomics (P19 minors):** aborts silently discard
-  the protected-skip list `merge_abort` reports; `sc status` shows stale
-  "resolve conflicts" text in the resolved-but-not-continued window; the
-  ref-write→state-clear crash window can duplicate an oplog record
-  (recoverable; wants a comment). Conflict-materialization block now
-  exists in 3 copies (merge/pick/rebase) — extraction candidate.
-- **Marks-map staleness recovery.** A rejected non-ff push (or any P10-era
-  flow) followed by a `git gc` inside the git repo/mirror can leave marks
-  pointing at pruned git objects — a pre-existing P10 staleness class with
-  a new P18 trigger (mirror `git gc`). Wants a documented recovery path
-  (re-fetch rebuilds, or a marks-verify subcommand). Flagged at the P18
-  final review.
-- **Sub-tree / partial sharing** and sparse checkouts.
-- **Merge ergonomics**: richer conflict resolution UX beyond P4's
-  detection/representation.
-- **Signed commits / provenance** as a first-class governance feature.
+- **Named/multiple concurrent ws sessions** (P20 ships one unnamed
+  session per repo) and workspace re-fork/refresh from a newer tip.
+- **Network-Git same-remote edge cases** (ADR-0018's re-synthesis
+  limitation across different Git repos).
+- **Richer trust models** beyond trusted-key lists (delegation, expiry) —
+  P22 ships the key-list model.
 
 ## How a phase gets built
 
