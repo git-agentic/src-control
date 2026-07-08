@@ -1675,16 +1675,10 @@ fn run_ws(op: WsOp) -> Result<()> {
                     session.base_branch,
                     session.base_snapshot.short()
                 );
-                println!("index  status     dir");
+                println!("index  status                       dir");
                 for entry in &session.workspaces {
-                    let status = if !entry.live {
-                        "abandoned".to_string()
-                    } else if repo.ws_changed(entry)? {
-                        "changed".to_string()
-                    } else {
-                        "unchanged".to_string()
-                    };
-                    println!("{:<6} {:<10} {}", entry.index, status, entry.dir.display());
+                    let status = repo.ws_status_label(&session, entry)?;
+                    println!("{:<6} {:<28} {}", entry.index, status, entry.dir.display());
                 }
             }
         },
