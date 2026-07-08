@@ -3420,7 +3420,20 @@ mod tests {
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
         std::fs::write(root.join("docs/b.txt"), b"b v1").unwrap();
-        repo.commit("me", "base").unwrap();
+        let c1 = repo.commit("me", "base").unwrap();
+
+        // Capture docs/b.txt's blob id and perms from the base commit.
+        let snap1 = repo.snapshot(&c1).unwrap();
+        let blob1_base = {
+            let entries = {
+                let a = repo.vfs_handle().store();
+                let mut s = a.lock().unwrap();
+                worktree::tree_file_entries_with_perms(&mut s, snap1.root).unwrap()
+            };
+            let (id, _mode, perms) = entries.get("docs/b.txt").copied().unwrap();
+            assert_eq!(perms & scl_core::PROTECTED, 0, "docs/b.txt must be plain (PROTECTED) in base");
+            id
+        };
 
         crate::sparse::store(repo.layout(), &crate::sparse::Sparse::new(vec!["src/".into()]))
             .unwrap();
@@ -3435,6 +3448,9 @@ mod tests {
             worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
         };
         assert!(entries.contains_key("docs/b.txt"), "out-of-sparse absent path must be carried");
+        let (blob1_carried, _mode, perms_carried) = entries.get("docs/b.txt").copied().unwrap();
+        assert_eq!(blob1_carried, blob1_base, "carried blob id must match base commit byte-identically");
+        assert_eq!(perms_carried & scl_core::PROTECTED, 0, "carried plain file must not acquire PROTECTED");
         let a_bytes = {
             let a = repo.vfs_handle().store();
             let mut s = a.lock().unwrap();
