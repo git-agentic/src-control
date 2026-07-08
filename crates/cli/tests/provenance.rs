@@ -332,3 +332,48 @@ fn log_output_survives_a_closed_reader_pipe() {
 
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// `sc verify` must tolerate its reader closing the pipe early too — same
+/// `sc verify | grep -q INVALID` idiom under `set -o pipefail`. Before this
+/// fix, `run_verify`'s per-commit and summary lines used raw `println!`,
+/// which panics on `BrokenPipe` when the reader (e.g. `head -1`) stops
+/// reading after the first line, turning what should be a clean exit into a
+/// pipefail-propagated failure — silently masking the flagship provenance
+/// command's tampering signal. Regression test for the P22 final-review fix.
+#[test]
+fn verify_output_survives_a_closed_reader_pipe() {
+    let root = tmp("verify-brokenpipe");
+    let repo = root.join("work");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(sc(&repo, &["init"]).status.success());
+    // Enough commits that verify's per-commit sig_status I/O has room to run
+    // while the reader is still consuming — and closing after only the
+    // first line.
+    for i in 0..20 {
+        std::fs::write(repo.join("f.txt"), format!("v{i}\n")).unwrap();
+        assert!(sc(&repo, &["commit", "-m", &format!("c{i}")]).status.success());
+    }
+
+    let sc_bin = env!("CARGO_BIN_EXE_sc");
+    // `head -1` reads exactly one line and closes its end of the pipe,
+    // forcing `sc verify`'s next write (of the remaining 19 commits) to hit
+    // a closed reader.
+    let script = format!("set -euo pipefail; \"{sc_bin}\" verify | head -1 >/dev/null");
+    let out = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .current_dir(&repo)
+        .output()
+        .expect("bash runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "sc verify | head -1 under pipefail must exit cleanly, not propagate a broken-pipe panic: stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("Broken pipe") && !stderr.contains("panicked"),
+        "sc verify must not panic on BrokenPipe: stderr={stderr}"
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+}

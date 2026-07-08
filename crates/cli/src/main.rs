@@ -1667,12 +1667,12 @@ fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
                 "unsigned".to_string()
             }
         };
-        println!("{} {label}", id.short());
+        print_line(&format!("{} {label}", id.short()));
     }
-    println!(
+    print_line(&format!(
         "\nsummary: {trusted} trusted, {untrusted} untrusted, {invalid} invalid, {unsigned} unsigned ({} commit(s))",
         history.len()
-    );
+    ));
 
     if require && (untrusted + invalid + unsigned) > 0 {
         // Drop the repo (releases .sc/lock) before process::exit, which skips
