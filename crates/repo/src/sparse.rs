@@ -17,7 +17,7 @@
 //! set`/`disable` (Task 3) and checkout/commit integration (Task 2) build on
 //! top of this.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::repo::Repo;
 
@@ -125,6 +125,15 @@ impl Repo {
         prefixes: &[String],
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<Vec<String>> {
+        if crate::merge_state::in_progress(&self.layout) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
+        }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
             return Err(crate::error::Error::InvalidArgument(
@@ -163,6 +172,15 @@ impl Repo {
         &self,
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<Vec<String>> {
+        if crate::merge_state::in_progress(&self.layout) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(&self.layout) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(&self.layout) {
+            return Err(Error::RebaseInProgress);
+        }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
             return Err(crate::error::Error::InvalidArgument(
@@ -257,5 +275,114 @@ mod tests {
         clear(&layout).unwrap();
 
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn sparse_set_refused_during_in_progress() {
+        use crate::repo::Repo;
+        use scl_core::ObjectId;
+
+        // Test that set_sparse refuses during merge, pick, and rebase.
+        let root = std::env::temp_dir().join(format!("scl-sparse-in-progress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = Repo::init(&root).unwrap();
+
+        // Create an initial commit so HEAD exists.
+        std::fs::write(root.join("a.txt"), b"content").unwrap();
+        repo.commit("test_author", "initial commit").unwrap();
+
+        // Record original sparse spec (should be empty/full).
+        let orig_spec = repo.sparse_spec().unwrap();
+        assert!(orig_spec.is_full(), "initial spec should be full");
+
+        // Helper to test refusal for a given state.
+        macro_rules! test_refused_during_state {
+            ($name:ident, $write_fn:expr, $clear_fn:expr, $err_type:path) => {
+                // Write state.
+                $write_fn(&repo.layout);
+
+                // set_sparse should be refused with the expected error.
+                let result = repo.set_sparse(&["src/".into()], None);
+                assert!(
+                    matches!(result, Err($err_type)),
+                    "set_sparse during {} should be refused with {:?}, got {:?}",
+                    stringify!($name),
+                    stringify!($err_type),
+                    result
+                );
+
+                // Sparse spec should be unchanged.
+                assert_eq!(
+                    repo.sparse_spec().unwrap(),
+                    orig_spec,
+                    "sparse spec should not change during refused {}",
+                    stringify!($name)
+                );
+
+                // Also test disable_sparse is refused.
+                let result = repo.disable_sparse(None);
+                assert!(
+                    matches!(result, Err($err_type)),
+                    "disable_sparse during {} should be refused with {:?}, got {:?}",
+                    stringify!($name),
+                    stringify!($err_type),
+                    result
+                );
+
+                // Clear state.
+                $clear_fn(&repo.layout);
+            };
+        }
+
+        // Test merge in progress.
+        test_refused_during_state!(
+            merge,
+            |layout: &Layout| {
+                crate::merge_state::write(layout, &ObjectId::of(b"theirs"), &[], None).unwrap();
+            },
+            |layout: &Layout| {
+                crate::merge_state::clear(layout).unwrap();
+            },
+            Error::MergeInProgress
+        );
+
+        // Test pick in progress.
+        test_refused_during_state!(
+            pick,
+            |layout: &Layout| {
+                crate::pick_state::write(layout, &ObjectId::of(b"picked"), &[], None, None).unwrap();
+            },
+            |layout: &Layout| {
+                crate::pick_state::clear(layout).unwrap();
+            },
+            Error::PickInProgress
+        );
+
+        // Test rebase in progress.
+        test_refused_during_state!(
+            rebase,
+            |layout: &Layout| {
+                let state = crate::rebase_state::RebaseState {
+                    branch: "main".into(),
+                    original_tip: ObjectId::of(b"orig"),
+                    target: "feature".into(),
+                    acc_tip: ObjectId::of(b"acc"),
+                    conflicted: ObjectId::of(b"conflicted"),
+                    remaining: vec![],
+                    total: 1,
+                    author: "test_author".into(),
+                    resolved: false,
+                    replayed: 0,
+                    skipped: 0,
+                };
+                crate::rebase_state::write(layout, &state).unwrap();
+            },
+            |layout: &Layout| {
+                crate::rebase_state::clear(layout).unwrap();
+            },
+            Error::RebaseInProgress
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
