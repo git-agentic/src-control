@@ -46,8 +46,11 @@ export SC_SSH="$W/fake_ssh" SC_BIN="$SC"
 # --- Force many chunk frames: SC_PACK_CHUNK overrides wire::pack_chunk_size()
 #     for THIS process (and anything it execs, including the ssh shim's `sc
 #     serve --stdio`, which inherits the environment) — a ~1 MiB blob over a
-#     4 KiB chunk crosses roughly 250+ ST_PACK_CHUNK frames instead of one. ---
-export SC_PACK_CHUNK=4096
+#     4 KiB chunk crosses roughly 250+ ST_PACK_CHUNK frames instead of one.
+#     Default to 4096 but respect an outer override
+#     (SC_PACK_CHUNK=64 bash demo/run_streaming_demo.sh), so the knob is real. ---
+: "${SC_PACK_CHUNK:=4096}"
+export SC_PACK_CHUNK
 
 echo "=== setup: keygen v2 for alice (trusted signer) ==="
 alice_out=$("$SC" keygen --out "$KEY")
@@ -121,7 +124,7 @@ run_one_clone() {
 }
 
 echo
-echo "=== 2: clone over ssh:// with SC_PACK_CHUNK=4096 (many-chunk transfer) ==="
+echo "=== 2: clone over ssh:// with SC_PACK_CHUNK=$SC_PACK_CHUNK (many-chunk transfer) ==="
 run_one_clone "$W/B1" "B1 (first clone)"
 
 echo
@@ -129,7 +132,7 @@ echo "=== 3: run again into a fresh destination — repeatable, not a one-shot f
 run_one_clone "$W/B2" "B2 (second clone)"
 
 echo
-echo "RESULT: streaming pack transfer over ssh:// with a forced 4 KiB chunk size —"
+echo "RESULT: streaming pack transfer over ssh:// with a forced $SC_PACK_CHUNK-byte chunk size —"
 echo "object set, working tree, and history byte-for-byte across two independent"
 echo "clones, a signed commit verifies clean after riding the chunked stream, and"
 echo "zero .sc/tmp residue on either end both times."

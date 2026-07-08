@@ -299,11 +299,18 @@ across every phase.
   byte-for-byte identical to the origin, and `sc verify --require` is clean
   in the clone, proving the signature rode the chunked stream — run twice
   into fresh destinations, zero `.sc/tmp` residue on either end both
-  times). **Known boundary:** the server and the wire are bounded to one
-  chunk/record of RAM, but the ssh CLIENT's own fetch/push call sites
-  (`crates/repo/src/sync.rs::transfer_objects`/`push`) still buffer a whole
-  pack into a `Vec<u8>` — closing that is a stated follow-on (see
-  Deferred). (ADR-0035.)
+  times). **The client is bounded too (closed in the P25 final-review
+  fix):** `crates/repo/src/sync.rs::transfer_objects` (the fetch/clone
+  ingestion path) now spills `get_pack`'s output into a guarded temp file
+  and ingests it via the same `ingest_pack_file` two-pass bounded machinery
+  the server and wire use, peak RAM one object; `Repo::push` now collects
+  only ids, then streams the outgoing pack to a guarded temp file one
+  object at a time via a shared `write_ids_to_temp_pack` helper (also used
+  by `LocalTransport::build_pack_tempfile`) before handing an opened `File`
+  to `transport.put_pack`. Both temp files are removed on success and every
+  error (`TempPackGuard`), pinned by
+  `fetch_client_ingests_via_tempfile_zero_residue` and
+  `push_client_builds_via_tempfile_zero_residue`. (ADR-0035.)
 
 ## Active
 
@@ -334,7 +341,7 @@ None — P25 done; P26 sc-native HTTP transport is next up.
 | **P22 — Signed commits & provenance** | Detect history rewriting; attribute commits to an identity | `sc keygen` v2 identities (X25519 + Ed25519 from one seed), `sc commit --sign`/`sc sign <ref>`, `sc log` four-state markers, `sc verify --require`; signatures ride existing packs with zero wire changes; proven by `demo/run_provenance_demo.sh` (rewrite attack caught in a clone while the original stays clean) | [0032](docs/adr/0032-signed-commits-provenance.md) |
 | **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts [<path>]` lists/shows base-ours-theirs (decrypted under `--identity` for protected paths); `sc resolve --ours\|--theirs <path>` writes clean content; proven by `demo/run_merge_ergonomics_demo.sh` (text + protected conflicts resolved end-to-end) | [0033](docs/adr/0033-merge-ergonomics.md) |
 | **P24 — Sparse checkouts / sub-tree sharing** | Materialize one subtree of a large repo, leave the rest on the CAS | `sc sparse set <prefix…>`/`show`/`disable`; `commit`'s absent-path carry widens to out-of-sparse paths (byte-identical carried subtrees); `materialize` filters both its write and removal loops; proven by `demo/run_sparse_demo.sh` (narrow, edit, commit, then disable/clone restore byte-identical) | [0034](docs/adr/0034-sparse-checkouts.md) |
-| **P25 — Streaming pack transfer (bounded-RAM, >4 GiB)** | `push`/`fetch`/`clone` over ssh:// don't hold a whole pack in RAM on the server or the wire | `PackWriter`/`parse_pack_reader` (bounded-RAM pack build/parse); `ST_PACK_CHUNK`/`ST_PACK_END` chunk framing (`SC_PACK_CHUNK`-tunable); `PROTOCOL_VERSION` 2, v1 dropped; two-pass atomic-after-verify ingest + `TempPackGuard`; proven by `demo/run_streaming_demo.sh` (forced 4 KiB chunks, byte-for-byte clone, signature rides the stream, zero temp residue); known boundary: the ssh client's own `sync.rs` fetch/push call sites still buffer a whole pack | [0035](docs/adr/0035-streaming-transfer.md) |
+| **P25 — Streaming pack transfer (bounded-RAM, >4 GiB)** | `push`/`fetch`/`clone` over ssh:// don't hold a whole pack in RAM anywhere — server, wire, or client | `PackWriter`/`parse_pack_reader` (bounded-RAM pack build/parse); `ST_PACK_CHUNK`/`ST_PACK_END` chunk framing (`SC_PACK_CHUNK`-tunable); `PROTOCOL_VERSION` 2, v1 dropped; two-pass atomic-after-verify ingest + `TempPackGuard`; the ssh client's own `sync.rs` fetch/push call sites route through the same `ingest_pack_file`/`write_ids_to_temp_pack` machinery (final-review fix); proven by `demo/run_streaming_demo.sh` (forced 4 KiB chunks, byte-for-byte clone, signature rides the stream, zero temp residue) | [0035](docs/adr/0035-streaming-transfer.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -431,17 +438,6 @@ sparse checkouts → P24, and streaming (>4 GiB) wire frames → P25):
 - **HTTP transport** (sc-native). P12 shipped the sc-native SSH transport
   and P25 made the wire itself stream in bounded chunks; an HTTP
   equivalent is the next transport swap on the same seam (P26).
-- **Bound the ssh client's own fetch/push RAM (P25 boundary).**
-  `crates/repo/src/sync.rs::transfer_objects` (shared by `fetch`/
-  `clone_url`) still destreams the whole incoming pack into a `Vec<u8>`
-  before calling (non-streaming) `parse_pack`, and `Repo::push` still
-  assembles the entire outgoing pack into a `Vec<(ObjectId, Vec<u8>)>`
-  before calling `build_pack` — the server and the wire are genuinely
-  bounded to one chunk/record of RAM (P25), but the client application
-  layer above `LocalTransport` is not. The machinery to close this already
-  exists (`build_pack_tempfile`/`ingest_pack_file`/`TempPackGuard`);
-  route `sync.rs`'s client-side call sites through it. Documented in
-  ADR-0035 Consequences.
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.

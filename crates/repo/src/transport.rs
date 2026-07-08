@@ -120,17 +120,7 @@ impl LocalTransport {
         let ids: Vec<ObjectId> =
             want_set.into_iter().filter(|id| !have_set.contains(id)).collect();
 
-        let guard = TempPackGuard::new(&self.layout)?;
-        {
-            let mut f = std::fs::File::create(guard.path())?;
-            let mut writer = scl_core::pack::PackWriter::new(&mut f, ids.len() as u32)?;
-            for id in &ids {
-                let bytes = store.get(id)?.encode();
-                writer.write_object(id, &bytes)?;
-            }
-            writer.finish()?; // .idx discarded — transfer needs the .pack body only
-        }
-        Ok(guard)
+        write_ids_to_temp_pack(&self.layout, &mut store, &ids)
     }
 
     /// Bounded pack receiver (P25): ingest an already-on-disk pack file
@@ -179,6 +169,33 @@ impl Drop for TempPackGuard {
         // first write) is a no-op `remove_file` failure, not a bug.
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Write the objects named by `ids` (already fully resolved — no reachability
+/// or have-set filtering here, that's the caller's job) into a fresh guarded
+/// temp pack file via `PackWriter`, one object at a time. Peak RAM is one
+/// object's encoded + compressed bytes. Shared by
+/// [`LocalTransport::build_pack_tempfile`] (the remote-side sender, which
+/// resolves `ids` via reachability) and `Repo::push` (P25's client-side
+/// sender, which resolves `ids` via a local reachability walk filtered by
+/// `Transport::has_object`) — one ids-to-temp-pack-file implementation, not
+/// two.
+pub(crate) fn write_ids_to_temp_pack(
+    layout: &Layout,
+    store: &mut Store,
+    ids: &[ObjectId],
+) -> Result<TempPackGuard> {
+    let guard = TempPackGuard::new(layout)?;
+    {
+        let mut f = std::fs::File::create(guard.path())?;
+        let mut writer = scl_core::pack::PackWriter::new(&mut f, ids.len() as u32)?;
+        for id in ids {
+            let bytes = store.get(id)?.encode();
+            writer.write_object(id, &bytes)?;
+        }
+        writer.finish()?; // .idx discarded — transfer needs the .pack body only
+    }
+    Ok(guard)
 }
 
 /// Ingest a pack **file** into `store`, atomically after verification

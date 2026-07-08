@@ -58,27 +58,45 @@ in the field).
   interop with a P12-vintage peer.
 - The in-process local path still buffers (out of scope) — a local clone
   of a >4 GiB repo is unaffected by this phase.
-- **Boundary: the headline "bounded RAM on both sides" holds for the
-  server and the wire, NOT for the client application layer.** The build
-  went further than this ADR's original scope on the `LocalTransport`
-  plumbing itself — `LocalTransport::build_pack_tempfile`/`ingest_pack_file`
-  (`crates/repo/src/transport.rs`) stream one object/one record at a time
-  through a temp pack file for BOTH `get_pack` and `put_pack`, and
-  `wire::serve` (`crates/repo/src/wire.rs`) uses the same temp-file spill on
-  the server end of an ssh connection, so a malicious or oversized transfer
-  cannot balloon server-side RAM. But the CLIENT-side caller one layer up,
-  `crates/repo/src/sync.rs`, was not rewired to this machinery:
-  `transfer_objects` (shared by `fetch` and `clone_url`) still does
-  `let mut pack = Vec::new(); transport.get_pack(..., &mut pack)`, destreaming
-  the whole pack into a `Vec<u8>` before handing it to (non-streaming)
-  `parse_pack`; `Repo::push` still assembles `send: Vec<(ObjectId, Vec<u8>)>`
-  entirely in RAM before calling `build_pack`. So today: the wire itself
-  streams in `CHUNK_SIZE` frames either direction, and the server-side
-  temp-file dance is genuinely bounded, but the ssh **client's** own memory
-  footprint for a fetch/clone/push is still ~one pack's worth. Follow-on:
-  route `sync.rs`'s client-side fetch/push through `build_pack_tempfile`/
-  `ingest_pack_file` (or equivalent streaming glue) so the client layer gets
-  the same bound the server and wire already have.
+- **The client application layer is bounded too (closed in the P25
+  final-review fix — the headline "bounded RAM on both sides" now holds
+  end to end, not just server+wire).** The initial build bounded
+  `LocalTransport::build_pack_tempfile`/`ingest_pack_file`
+  (`crates/repo/src/transport.rs`, one object/one record at a time through
+  a temp pack file for both `get_pack` and `put_pack`) and `wire::serve`'s
+  server-side temp-file spill, but left the CLIENT-side caller one layer
+  up, `crates/repo/src/sync.rs`, buffering a whole pack — the exact
+  unbounded-RAM shape the spec explicitly chose *not* to ship, and the
+  dominant large-pack scenario (cloning a huge repo) puts the receiving end
+  on the client. The final-review fix rewired both client call sites onto
+  the same machinery, with no wire/protocol/format change: `transfer_objects`
+  (shared by `fetch` and `clone_url`) now spills `transport.get_pack`'s
+  output into a `TempPackGuard`-held temp file and ingests it via
+  `ingest_pack_file` directly — the exact two-pass atomic-after-verify
+  contract the server already used, peak RAM one object; `Repo::push` now
+  collects only the missing ids (32 bytes each) and streams them to a
+  guarded temp file one object at a time via a new shared helper,
+  `transport::write_ids_to_temp_pack` (extracted out of
+  `build_pack_tempfile`'s inner loop so `LocalTransport`'s remote-side
+  sender and `Repo::push`'s client-side sender share one
+  ids-to-temp-pack-file implementation, not two), then hands an opened
+  `File` reader to `transport.put_pack`. Both temp files are removed on
+  success and on every error path (`TempPackGuard`'s `Drop`), pinned by
+  `fetch_client_ingests_via_tempfile_zero_residue` and
+  `push_client_builds_via_tempfile_zero_residue`
+  (`crates/repo/src/sync.rs`). One accepted side effect: `transfer_objects`
+  is shared by local-path clone/fetch too, so the rewire adds a temp-file
+  spill for local transfers as well — harmless (`.sc/tmp` is repo-owned,
+  guard-cleaned scratch) and arguably an improvement. **What remains
+  unbounded, named honestly:** the in-process `LocalTransport` path inside
+  a single process still resolves each object through the normal `Store`
+  API rather than a chunked stream (out of this ADR's scope — a local
+  clone of a >4 GiB repo on the same machine is unaffected), and the wire's
+  `read_frame_inner` still allocates up to 4 GiB off an attacker-controlled
+  frame-length header before any chunk boundary is enforced (pre-existing
+  P12 behavior, deliberately left deferred — see Alternatives and the
+  Minor findings in the P25 final review; not a client-buffering issue,
+  a hostile-peer framing hardening item).
 
 ## Alternatives considered
 
@@ -173,11 +191,12 @@ every claim below is checked against the shipped code, not the plan.
    call (used by a local-path clone/fetch/push) never touches the chunk
    opcodes at all, matching the spec's "wire path only" scope from Context
    above.
-7. **The boundary this ADR's Consequences section states plainly: the
-   client application layer (`crates/repo/src/sync.rs`) is not bounded.**
-   See the Consequences entry above for the exact functions
-   (`transfer_objects`, `push`) and the follow-on. This was caught in
-   final review, not planned — the spec's headline promised bounded RAM on
-   both sides, and the server/wire genuinely deliver that, but the ssh
-   client's own fetch/push call sites were never rewired off the
-   pre-P25 `Vec<u8>` + `build_pack`/`parse_pack` path.
+7. **The client-buffering boundary flagged in final review is now closed —
+   see the Consequences entry above for the exact rewire
+   (`transfer_objects`, `Repo::push`, the shared `write_ids_to_temp_pack`
+   helper) and the two new pins.** The initial build's server/wire were
+   genuinely bounded, but the ssh client's own fetch/push call sites were
+   never rewired off the pre-P25 `Vec<u8>` + `build_pack`/`parse_pack`
+   path — caught in final review, not planned, and fixed before merge
+   because the machinery to close it (`build_pack_tempfile`/
+   `ingest_pack_file`/`TempPackGuard`) already existed on the same branch.

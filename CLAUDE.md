@@ -829,20 +829,33 @@ signed blob crosses 250+ chunk frames with the clone byte-for-byte
 identical to the origin (object set, working tree, `sc log`) and `sc
 verify --require` clean in the clone (proving the signature rode the
 chunked stream), with zero `.sc/tmp` residue on either end across two
-independent runs. **Known boundary (documented, not closed):** the
-headline promised bounded RAM on both sides, but that holds for the
-server and the wire only — the ssh **client's** own application layer,
-`crates/repo/src/sync.rs`, was not rewired onto this machinery:
-`transfer_objects` (shared by `fetch`/`clone_url`) still destreams the
-whole incoming pack into a `Vec<u8>` before calling non-streaming
-`parse_pack`, and `Repo::push` still assembles the entire outgoing pack
-into a `Vec<(ObjectId, Vec<u8>)>` before calling `build_pack`. The
-machinery to close this already exists (`build_pack_tempfile`/
-`ingest_pack_file`/`TempPackGuard`); routing `sync.rs`'s client-side
-fetch/push through it is a stated follow-on. See ADR-0035.
+independent runs. **The client is bounded too (closed in the P25
+final-review fix — the headline "bounded RAM on both sides" now holds end
+to end, not just server+wire):** `crates/repo/src/sync.rs`'s
+`transfer_objects` (shared by `fetch`/`clone_url`) no longer destreams the
+whole incoming pack into a `Vec<u8>` — it spills `transport.get_pack`'s
+output into a `TempPackGuard`-held temp file and ingests it via
+`ingest_pack_file` directly (the same two-pass atomic-after-verify contract
+the server already used), peak RAM one object. `Repo::push` no longer
+assembles the entire outgoing pack into a `Vec<(ObjectId, Vec<u8>)>` — it
+collects only the missing ids and streams them one at a time to a guarded
+temp file via a new shared helper, `transport::write_ids_to_temp_pack`
+(extracted out of `build_pack_tempfile`'s inner loop so `LocalTransport`'s
+remote-side sender and `Repo::push`'s client-side sender share one
+ids-to-temp-pack-file implementation), then hands an opened `File` to
+`transport.put_pack`. Both temp files are removed on success and every
+error path, pinned by `fetch_client_ingests_via_tempfile_zero_residue` and
+`push_client_builds_via_tempfile_zero_residue`. One accepted side effect:
+a local-path clone/fetch now also spills through a temp file (harmless —
+`.sc/tmp` is repo-owned, guard-cleaned scratch). **What remains
+unbounded, named honestly:** the in-process `LocalTransport` path within a
+single process (a local clone of a >4 GiB repo on the same machine) and
+the wire's `read_frame_inner`, which still allocates up to 4 GiB off an
+attacker-controlled frame-length header before any chunk boundary is
+enforced (pre-existing P12 behavior, deliberately deferred as a
+hostile-peer hardening item, not a client-buffering issue). See ADR-0035.
 
-Remaining follow-ons: HTTP transport, bounding the ssh client's own
-`sync.rs` fetch/push RAM (the P25 boundary note above), operation objects
-in the CAS, oplog entries for remote-tracking refs, and extending the
-sparse gate to `materialize_conflict_state`'s `to_encrypt`/sidecar write
-loops (see the P24 boundary note above).
+Remaining follow-ons: HTTP transport, operation objects in the CAS, oplog
+entries for remote-tracking refs, and extending the sparse gate to
+`materialize_conflict_state`'s `to_encrypt`/sidecar write loops (see the
+P24 boundary note above).
