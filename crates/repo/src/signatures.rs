@@ -123,6 +123,20 @@ pub(crate) fn gc_prune(layout: &Layout, reachable: &mut BTreeSet<ObjectId>) -> R
 /// the local store (e.g. by a pull/fetch/clone transfer), detect which of
 /// them are `TAG_SIGNATURE` objects and index them. Returns how many were
 /// indexed.
+///
+/// # `NotFound` is a hard error here
+///
+/// Every caller of this function (`LocalTransport::put_pack`,
+/// `sync::transfer_objects`) passes ids it *just wrote* to `store` in the
+/// same call — "ids just written" is this seam's contract, not "ids that
+/// might exist". A `NotFound` therefore means the caller passed an id that
+/// was never actually stored: a genuine bug (e.g. a future caller reusing
+/// this function with a stale/unrelated id list), not a benign gap. An
+/// earlier draft silently skipped `NotFound` as "not our concern here";
+/// that would mask exactly this class of bug at the seam meant to catch it,
+/// so it now propagates like any other store error. Callers with a looser
+/// contract (ids that may or may not resolve) should filter before calling,
+/// not rely on this function to do it silently.
 pub(crate) fn index_incoming(
     layout: &Layout,
     store: &mut scl_core::Store,
@@ -130,16 +144,45 @@ pub(crate) fn index_incoming(
 ) -> Result<usize> {
     let mut count = 0;
     for id in ids {
-        match store.get(id) {
-            Ok(Object::Signature(sig)) => {
+        match store.get(id)? {
+            Object::Signature(sig) => {
                 append_index(layout, sig.snapshot, *id)?;
                 count += 1;
             }
-            Ok(_) => {}
-            Err(scl_core::Error::NotFound(_)) => {} // id wasn't a locally-resolvable object; not our concern here
-            Err(e) => return Err(e.into()),
+            _ => {}
         }
     }
+    Ok(count)
+}
+
+/// Full-store rebuild of the signature index (Task 3): scan every object the
+/// store can resolve (loose + packed — `Store::all_ids`, not a reachability
+/// walk, since a `SignatureObj` is a leaf no tree/snapshot references), keep
+/// the ones that are `Object::Signature` whose `snapshot` also resolves
+/// locally, and atomically rewrite the index to exactly that set (not an
+/// append — stale entries from a half-written prior index are dropped too).
+///
+/// Used by the local clone path: clone's initial transfer is a wholesale
+/// copy of every object the sender's `get_pack` chose to include (which, via
+/// the sender seam below, already includes every indexed signature for the
+/// cloned snapshots). Rebuilding by scanning the freshly-copied store is
+/// simpler and no less correct than threading the transfer's exact id list
+/// through to `index_incoming` — it doesn't depend on the transfer call site
+/// bookkeeping the right ids, only on the objects actually landing on disk.
+/// O(store), which is fine for a one-shot clone of a store that size.
+pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
+    let mut entries: Vec<(ObjectId, ObjectId)> = Vec::new();
+    for id in store.all_ids()? {
+        if let Object::Signature(sig) = store.get(&id)? {
+            if store.contains(&sig.snapshot) {
+                entries.push((sig.snapshot, id));
+            }
+        }
+    }
+    entries.sort();
+    entries.dedup();
+    let count = entries.len();
+    write_index(layout, &entries)?;
     Ok(count)
 }
 
@@ -416,6 +459,132 @@ mod tests {
             !repo.store().lock().unwrap().contains(&dead_sig_id),
             "dead signature object must be pruned"
         );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn index_incoming_indexes_signatures_and_ignores_other_kinds() {
+        let root = tmp_root("incoming-ok");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+
+        // Build a signature object without going through `sign_snapshot` (so
+        // it is NOT yet indexed), plus an ordinary blob id, and hand both to
+        // `index_incoming` as "just written" — mirroring what a real
+        // transfer seam passes (a mixed batch of every object kind).
+        let signing = identity.signing.as_ref().unwrap();
+        let sig = scl_crypto::sign_snapshot_id(signing, snap.as_bytes());
+        let sig_obj = SignatureObj { snapshot: snap, signer: signing.public().to_bytes(), sig };
+        let (sig_id, blob_id) = {
+            let arc = repo.store();
+            let mut s = arc.lock().unwrap();
+            let sig_id = s.put(Object::Signature(sig_obj)).unwrap();
+            let blob_id = s.put(Object::blob(b"not a signature".to_vec())).unwrap();
+            (sig_id, blob_id)
+        };
+        assert!(repo.signatures_for(&snap).unwrap().is_empty(), "not indexed yet");
+
+        let count = {
+            let arc = repo.store();
+            let mut s = arc.lock().unwrap();
+            index_incoming(repo.layout(), &mut s, &[sig_id, blob_id]).unwrap()
+        };
+        assert_eq!(count, 1, "only the signature object counts, the blob is skipped silently");
+        assert_eq!(repo.signatures_for(&snap).unwrap().len(), 1);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn index_incoming_errors_on_notfound_id_rather_than_skipping() {
+        // The seam's contract is "ids just written" — a NotFound id means the
+        // caller broke that contract, which must surface as a hard error, not
+        // be silently swallowed (see the doc comment on `index_incoming`).
+        let root = tmp_root("incoming-notfound");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        repo.commit("t", "c1").unwrap();
+
+        let phantom = ObjectId::of(b"never actually stored");
+        let err = {
+            let arc = repo.store();
+            let mut s = arc.lock().unwrap();
+            index_incoming(repo.layout(), &mut s, &[phantom]).unwrap_err()
+        };
+        assert!(
+            matches!(err, Error::Core(scl_core::Error::NotFound(id)) if id == phantom),
+            "got {err:?}"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn reindex_rebuilds_from_a_full_store_scan() {
+        let root = tmp_root("reindex");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let sig_id = repo.sign_snapshot(snap, &identity).unwrap();
+
+        // Simulate "clone landed the objects but the index file never made
+        // the trip" (e.g. it lives outside the CAS on purpose): wipe the
+        // index file, then reindex from the store contents alone.
+        std::fs::remove_file(repo.layout().signatures_path()).unwrap();
+        assert!(repo.signatures_for(&snap).unwrap().is_empty(), "index wiped");
+
+        let count = {
+            let arc = repo.store();
+            let mut s = arc.lock().unwrap();
+            reindex(repo.layout(), &mut s).unwrap()
+        };
+        assert_eq!(count, 1);
+        let sigs = repo.signatures_for(&snap).unwrap();
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].snapshot, snap);
+        assert!(repo.store().lock().unwrap().contains(&sig_id));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn reindex_drops_entries_whose_snapshot_is_gone() {
+        // A signature object can outlive its snapshot in the store transiently
+        // (e.g. mid-transfer); reindex must not manufacture an index entry for
+        // a snapshot the local store cannot resolve.
+        let root = tmp_root("reindex-orphan");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        repo.sign_snapshot(snap, &identity).unwrap();
+
+        let phantom_snap = ObjectId::of(b"a snapshot id nobody stored");
+        let signing = identity.signing.as_ref().unwrap();
+        let orphan_sig = scl_crypto::sign_snapshot_id(signing, phantom_snap.as_bytes());
+        let orphan_obj =
+            SignatureObj { snapshot: phantom_snap, signer: signing.public().to_bytes(), sig: orphan_sig };
+        {
+            let arc = repo.store();
+            let mut s = arc.lock().unwrap();
+            s.put(Object::Signature(orphan_obj)).unwrap();
+        }
+
+        let count = {
+            let arc = repo.store();
+            let mut s = arc.lock().unwrap();
+            reindex(repo.layout(), &mut s).unwrap()
+        };
+        assert_eq!(count, 1, "only the real snapshot's signature is kept");
+        assert!(repo.signatures_for(&snap).unwrap().len() == 1);
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();

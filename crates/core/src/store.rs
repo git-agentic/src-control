@@ -522,6 +522,38 @@ impl Store {
         self.pack_index.contains_key(id)
     }
 
+    /// Every object id currently resolvable from a loaded pack index.
+    /// Companion to [`Store::list_loose`] — together they enumerate every
+    /// object the persistent backend can resolve without a network fetch.
+    pub fn packed_ids(&self) -> Vec<ObjectId> {
+        self.pack_index.keys().copied().collect()
+    }
+
+    /// Every object id currently held in RAM: not evictable (trees,
+    /// snapshots, secrets, signatures — always resident) plus any blob not
+    /// yet evicted, in EITHER backend. This is the only enumeration that
+    /// finds objects in an ephemeral (in-memory-only, no `persistent_dir`)
+    /// store — `list_loose`/`packed_ids` are both empty there by
+    /// definition. Also covers spilled blobs, which still answer `contains`
+    /// via rehydration.
+    pub fn resident_ids(&self) -> Vec<ObjectId> {
+        self.resident.keys().copied().chain(self.spilled.keys().copied()).collect()
+    }
+
+    /// Every object id resolvable in this store: RAM-resident, loose
+    /// (sharded or legacy flat), and packed, deduped. A full-store
+    /// enumeration is O(store) — callers that only need reachable-from-roots
+    /// should prefer `reachable::reachable_objects` instead; this is for
+    /// callers that deliberately need objects a graph walk cannot find (e.g.
+    /// P22 signature objects, which are leaves referenced by no
+    /// tree/snapshot).
+    pub fn all_ids(&self) -> Result<Vec<ObjectId>> {
+        let mut set: std::collections::BTreeSet<ObjectId> = self.resident_ids().into_iter().collect();
+        set.extend(self.list_loose()?);
+        set.extend(self.packed_ids());
+        Ok(set.into_iter().collect())
+    }
+
     /// Hashes (file stems) of currently-loaded packs.
     pub fn pack_hashes(&self) -> Vec<String> {
         let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -790,6 +822,27 @@ mod tests {
         assert_eq!(s2.get(&a).unwrap().encode(), Object::blob(b"packed-a".to_vec()).encode());
         assert!(s2.contains(&b));
         drop((s, s2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn all_ids_covers_both_loose_and_packed() {
+        let dir = temp_objects_dir("allids");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Store::open_persistent(&dir, 1 << 20).unwrap();
+        let loose = s.put(Object::blob(b"stays-loose".to_vec())).unwrap();
+        let packed = s.put(Object::blob(b"gets-packed".to_vec())).unwrap();
+        s.write_pack(&[packed]).unwrap();
+        s.delete(&packed).unwrap(); // loose copy gone; only the pack has it now
+
+        let ids = s.all_ids().unwrap();
+        assert!(ids.contains(&loose), "loose object must be enumerated");
+        assert!(ids.contains(&packed), "packed object must be enumerated");
+        // No duplicates even though write_pack momentarily has both copies.
+        let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+
+        drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

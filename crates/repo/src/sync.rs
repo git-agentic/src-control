@@ -68,7 +68,17 @@ impl Repo {
             let store_arc = dst_repo.vfs.store();
             let mut store = store_arc.lock().unwrap();
             // Fresh clone dst has no local refs yet → no haves → full transfer.
-            transfer_objects(transport.as_ref(), &mut store, &tips, &[])?;
+            transfer_objects(&dst_repo.layout, transport.as_ref(), &mut store, &tips, &[])?;
+            // Clone-specific belt-and-suspenders (P22 Task 3): the transfer
+            // above already indexes every signature object it wrote via
+            // `index_incoming`, but a fresh clone is a wholesale copy of the
+            // whole reachable set — cheap and simplest to instead trust a
+            // full post-copy scan of what actually landed on disk, rather
+            // than depending on the transfer call site's exact bookkeeping.
+            // Idempotent: `reindex` rewrites the index from scratch, so
+            // running it after `index_incoming` already populated entries
+            // is a no-op on top of a no-op, not a double-count.
+            crate::signatures::reindex(&dst_repo.layout, &mut store)?;
         }
 
         // Copy branches + HEAD, and seed origin/* remote-tracking refs so
@@ -110,7 +120,7 @@ impl Repo {
             let mut store = store_arc.lock().unwrap();
             // Derive haves from local refs before the mutable borrow for transfer.
             let haves = local_have_tips(&self.layout, &store)?;
-            transfer_objects(transport.as_ref(), &mut store, &tips, &haves)?;
+            transfer_objects(&self.layout, transport.as_ref(), &mut store, &tips, &haves)?;
         }
         for (branch, tip) in &remote_refs {
             refs::write_remote_tip(&self.layout, remote, branch, tip)?;
@@ -154,8 +164,17 @@ impl Repo {
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
+            let reachable = reachable::reachable_objects(&mut *store, &[local_tip])?;
+            // Sender seam (P22 Task 3): unlike `fetch`/`clone`, `push` builds
+            // its outgoing set directly from a local reachability walk
+            // rather than calling `Transport::get_pack` — so the
+            // `get_pack`-side signature extension in `LocalTransport` never
+            // runs for a push. Extend the reachable set here the same way:
+            // every indexed signature covering a snapshot already in it.
+            let snaps: Vec<ObjectId> = reachable.iter().copied().collect();
+            let sig_ids = crate::signatures::indexed_signature_ids_for(&self.layout, &snaps)?;
             let mut send: Vec<(ObjectId, Vec<u8>)> = Vec::new();
-            for id in reachable::reachable_objects(&mut *store, &[local_tip])? {
+            for id in reachable.into_iter().chain(sig_ids) {
                 if !transport.has_object(&id)? {
                     send.push((id, store.get(&id)?.encode()));
                 }
@@ -195,7 +214,16 @@ pub(crate) fn local_have_tips(layout: &Layout, store: &Store) -> Result<Vec<Obje
 /// omit them from the pack; `parse_pack` verifies each record. Callers hold the
 /// store lock across this call, so it must not acquire any other lock. Shared by
 /// `clone_to` and `fetch`.
+///
+/// Receiver seam (P22 Task 3): this is the client-side ingestion path for
+/// BOTH `fetch` and `clone_url` (over local paths and ssh:// alike — this
+/// function is transport-agnostic) — unlike a push, which lands via
+/// `Transport::put_pack` on the remote, a pull writes straight into `store`
+/// here, so `index_incoming` on exactly the ids this call just wrote is the
+/// matching seam. `clone_url` additionally runs a full `signatures::reindex`
+/// once its transfer is complete (see there for why the belt-and-suspenders).
 fn transfer_objects(
+    layout: &Layout,
     transport: &dyn Transport,
     store: &mut Store,
     tips: &[ObjectId],
@@ -203,18 +231,135 @@ fn transfer_objects(
 ) -> Result<()> {
     let pack = transport.get_pack(tips, haves)?;
     // parse_pack verifies every record; write each object into the local store.
+    let mut written = Vec::new();
     for (id, obj) in scl_core::pack::parse_pack(&pack)? {
         let got = store.put(obj)?;
         if got != id {
             return Err(Error::CorruptObject(id));
         }
+        written.push(id);
     }
+    crate::signatures::index_incoming(layout, store, &written)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use crate::repo::Repo;
+    use crate::signatures::SigStatus;
+    use crate::sync::transfer_objects;
+
+    #[test]
+    fn signatures_ride_fetch_push_and_clone_local() {
+        // A: the "server" repo — one signed commit to start.
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-sigxfer-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-sigxfer-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&a_root);
+        let _ = std::fs::remove_dir_all(&b_root);
+        std::fs::create_dir_all(&a_root).unwrap();
+
+        let a = Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f1"), b"one").unwrap();
+        let snap1 = a.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        a.sign_snapshot(snap1, &identity).unwrap();
+        let signer = identity.signing.as_ref().unwrap().public().to_bytes();
+        let mut trust = std::collections::HashMap::new();
+        trust.insert(signer, "alice".to_string());
+
+        // clone: B pulls A wholesale. The signature must exist AND be
+        // indexed at B (not just present as a dangling CAS object) — that
+        // is what makes sig_status resolve to Trusted rather than Unsigned.
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        assert_eq!(b.sig_status(&snap1, &trust).unwrap(), SigStatus::Trusted("alice".to_string()));
+
+        // fetch: A gets a second signed commit; B fetches and must pick up
+        // the new signature via `transfer_objects`'s `index_incoming` call
+        // (not the clone-only `reindex` path, which only runs on clone_url).
+        std::fs::write(a_root.join("f2"), b"two").unwrap();
+        let snap2 = a.commit("t", "c2").unwrap();
+        a.sign_snapshot(snap2, &identity).unwrap();
+        // `push` below opens its OWN `LocalTransport` onto A's `.sc/`, which
+        // takes A's repo lock for `update_ref` — drop this handle first so
+        // it isn't held twice from the same process (RepoLock isn't
+        // reentrant); reopened after the push to check A's final state.
+        drop(a);
+        b.fetch("origin").unwrap();
+        assert_eq!(b.sig_status(&snap2, &trust).unwrap(), SigStatus::Trusted("alice".to_string()));
+
+        // push: bring B's local branch up to snap2 (fetch only advanced the
+        // remote-tracking ref, not the local branch — fast-forward merge),
+        // then add and sign a third commit on top and push it back to A.
+        b.merge("origin/main", "t").unwrap();
+        std::fs::write(b_root.join("f3"), b"three").unwrap();
+        let snap3 = b.commit("t", "c3").unwrap();
+        b.sign_snapshot(snap3, &identity).unwrap();
+        b.push("origin").unwrap();
+        // A's receiver seam is `LocalTransport::put_pack` — verify A's index
+        // picked up the pushed signature via `index_incoming` there.
+        let a = Repo::open(&a_root).unwrap();
+        assert_eq!(a.sig_status(&snap3, &trust).unwrap(), SigStatus::Trusted("alice".to_string()));
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        std::fs::remove_dir_all(&b_root).unwrap();
+    }
+
+    #[test]
+    fn signatures_ride_ssh_transport() {
+        // The wire-protocol pipe harness `WireClient` <-> `wire::serve` IS
+        // the ssh code path minus the ssh process spawn (StdioTransport
+        // shells out to `ssh … sc serve --stdio`, which just runs
+        // `wire::serve` on the far end) — mirrors
+        // `stdio_transport::tests::wire_client_satisfies_the_transport_contract`.
+        // Driving `transfer_objects` (the exact fn `fetch`/`clone_url` call)
+        // against that client proves the put_pack/get_pack seams cover the
+        // wire, not just `LocalTransport`.
+        use crate::stdio_transport::WireClient;
+        use crate::wire;
+
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-sigssh-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-sigssh-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(&src_root).unwrap();
+
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("a.txt"), b"one").unwrap();
+        let tip = src.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        src.sign_snapshot(tip, &identity).unwrap();
+        let signer = identity.signing.as_ref().unwrap().public().to_bytes();
+        let mut trust = std::collections::HashMap::new();
+        trust.insert(signer, "alice".to_string());
+
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server_root = src_root.clone();
+        let server =
+            std::thread::spawn(move || wire::serve(&server_root, &mut server_read, &mut server_write));
+        let client = WireClient::handshake(client_read, client_write).unwrap();
+
+        let dst = Repo::init(&dst_root).unwrap();
+        {
+            let store_arc = dst.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            transfer_objects(&dst.layout, &client, &mut store, &[tip], &[]).unwrap();
+        }
+        client.bye().unwrap();
+        drop(client);
+        server.join().unwrap().unwrap();
+
+        assert_eq!(dst.sig_status(&tip, &trust).unwrap(), SigStatus::Trusted("alice".to_string()));
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
 
     #[test]
     fn clone_url_with_plain_path_matches_clone_to() {

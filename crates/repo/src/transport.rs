@@ -136,11 +136,27 @@ impl Transport for LocalTransport {
         let mut store = self.store.borrow_mut();
         // Reachable-from-wants minus reachable-from-haves, computed on this
         // (the remote) store. `haves` the remote doesn't have are skipped.
-        let want_set = crate::reachable::reachable_objects(&mut *store, wants)?;
+        let mut want_set = crate::reachable::reachable_objects(&mut *store, wants)?;
+        // Sender seam (P22 Task 3): a SignatureObj is a leaf referenced by no
+        // tree/snapshot, so the reachability walk above can never find it —
+        // extend the want set with every indexed signature covering a
+        // snapshot already in it. `indexed_signature_ids_for` only matches
+        // ids that are actual index keys (snapshot ids), so handing it the
+        // whole (mixed blob/tree/snapshot) want_set is safe: non-snapshot
+        // ids simply match nothing.
+        let want_snaps: Vec<ObjectId> = want_set.iter().copied().collect();
+        want_set.extend(crate::signatures::indexed_signature_ids_for(&self.layout, &want_snaps)?);
+
         let mut have_set: BTreeSet<ObjectId> = BTreeSet::new();
         for h in haves {
             if store.contains(h) {
-                have_set.extend(crate::reachable::reachable_objects(&mut *store, &[*h])?);
+                let reach = crate::reachable::reachable_objects(&mut *store, &[*h])?;
+                // Mirror the want-side extension so a signature the receiver
+                // already has (because it already has the snapshot) is not
+                // resent every time.
+                let reach_snaps: Vec<ObjectId> = reach.iter().copied().collect();
+                have_set.extend(crate::signatures::indexed_signature_ids_for(&self.layout, &reach_snaps)?);
+                have_set.extend(reach);
             }
         }
         let send: Vec<(ObjectId, Vec<u8>)> = want_set
@@ -187,6 +203,11 @@ impl Transport for LocalTransport {
             }
             ids.push(id);
         }
+        // Receiver seam (P22 Task 3): every id above was just written to
+        // this store, so `index_incoming`'s "ids just written" contract
+        // holds. `sc serve --stdio` dispatches onto this same
+        // `LocalTransport`, so an ssh push indexes automatically too.
+        crate::signatures::index_incoming(&self.layout, &mut store, &ids)?;
         Ok(ids)
     }
 }
