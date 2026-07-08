@@ -4,6 +4,7 @@
 - **Date:** 2026-07-08
 - **Phase:** 21
 - **Builds on:** ADR-0017 (P17 rewrap guards), ADR-0018/0028 (marks map), ADR-0029 (rebase state), ADR-0030 (ws sessions)
+- **Spec:** `docs/superpowers/specs/2026-07-08-p21-hardening-design.md`
 
 ## Context
 
@@ -26,9 +27,13 @@ One consolidation phase, no new capability axis:
 - Policy ops join the `MergeInProgress`/`PickInProgress`/
   `RebaseInProgress` guard family (same three-line pattern as rewrap and
   the ref-movers), each with a refusal test.
-- Marks staleness gets a typed error naming the recovery (`sc fetch`
-  rebuilds the mirror and re-syncs marks) instead of surfacing raw
-  object-missing failures.
+- Marks staleness self-heals at the only dangerous point of use: export/
+  push verifies each mark-reused git commit exists in the target before
+  reuse, re-synthesizing (with a one-line stderr note) when `git gc`
+  pruned it — a stale mark can otherwise produce a broken parent chain in
+  the target repo. The fetch direction is already harmless. A
+  `sc marks verify` subcommand was rejected: self-heal beats a tool the
+  user must know to run.
 - Rebase/pick aborts return and print the protected-skip list
   (merge_abort parity); status text distinguishes the resolved-awaiting-
   continue window; multi-stop rebase oplog descriptions report cumulative
