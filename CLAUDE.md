@@ -904,9 +904,16 @@ is cleared right after writing the `200` status, before handing off to
 `wire::serve` — a legitimate large streamed pack transfer must not be cut
 off mid-stream by the same timeout that guards the opening. Each
 connection's thread opens `LocalTransport` fresh — no store or lock is
-shared across threads in this module; concurrency safety rides entirely on
-the pre-existing `.sc/` single-writer `RepoLock` `commit`/`push` already
-acquire per-root. **No double-framing:** after the `200` status, the raw
+shared across threads in this module. Concurrency safety is layered: the
+pre-existing `.sc/` single-writer `RepoLock` serializes ref updates (the
+push's actual commit point), while object writes (`put_object`/`put_pack`)
+are lock-free and safe via content-addressed idempotency plus
+thread-unique temp sibling names in `atomic_write_durable`
+(`crates/core/src/fsutil.rs`, pid + a process-global counter, matching
+`TempPackGuard`'s discipline) — a final-review fix, since thread-per-
+connection put multiple writers in one process for the first time and the
+old pid-only temp name let two threads landing an overlapping object race
+on the identical temp sibling. **No double-framing:** after the `200` status, the raw
 `TcpStream` goes straight to `wire::serve` — the P25 chunk stream and P22
 signatures ride the socket with no HTTP `Transfer-Encoding` wrapper on
 either end. Zero new dependencies (`std::net`/`std::io` only — confirmed

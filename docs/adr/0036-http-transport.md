@@ -34,7 +34,11 @@ sc-native-ssh routing stay untouched; `open_transport` gains an
   per server (like `--stdio`), thread-per-connection. Each connection:
   minimal-parse `POST /<repo> HTTP/1.1` + headers, reply `200`/`404`/`400`,
   then hand the raw `TcpStream` to `wire::serve()`. The `.sc/`
-  single-writer lock serializes pushes; concurrent fetches are read-only.
+  single-writer `RepoLock` serializes ref updates (`update_ref`, the push's
+  commit point); object writes (`put_object`/`put_pack`) are lock-free and
+  safe under concurrency via content-addressed idempotency plus
+  thread-unique temp names (P26 final-review fix, `crates/core/src/
+  fsutil.rs`) — concurrent fetches are read-only regardless.
 - **Client** (`sc+http://` arm): connect a `TcpStream`, write the opening,
   map the status (`404`→NotARepo, non-200→clear error) BEFORE the wire
   handshake, then run `WireClient` verbatim. P25 client temp-spill
@@ -91,11 +95,22 @@ sc-native-ssh routing stay untouched; `open_transport` gains an
   transfer is never cut off mid-stream by the same timeout that guards the
   opening. Each connection's thread opens `LocalTransport` fresh
   (`wire::serve` inside `handle_http_connection`) — no store or lock is
-  shared across threads in this module; concurrency safety rides entirely
-  on the pre-existing `.sc/` single-writer `RepoLock` that `commit`/`push`
-  already acquire per-root. CLI surface: `sc serve --http <addr> <path>`
-  (`crates/cli/src/main.rs:274`, dispatch `:628`, handler `:2415`),
-  mutually exclusive with `--stdio`.
+  shared across threads in this module. Concurrency safety is layered, not
+  a single lock: the pre-existing `.sc/` single-writer `RepoLock` serializes
+  ref updates (acquired inside `LocalTransport::update_ref`,
+  `transport.rs:321` — the actual push commit point), while object writes
+  (`put_object`/`put_pack`) run with NO lock and instead rely on
+  content-addressed idempotency (two writers of the same object id produce
+  byte-identical content, so either write is correct) plus thread-unique
+  temp sibling names in `atomic_write_durable` (`crates/core/src/
+  fsutil.rs` — a process+counter suffix, matching `TempPackGuard`'s
+  discipline) so two threads in one process racing to land an overlapping
+  object never collide on the same temp path (P26 final-review fix; under
+  `--stdio`'s process-per-connection model this was accidentally safe
+  because distinct pids never shared a temp name — thread-per-connection
+  put two writers in one pid for the first time). CLI surface: `sc serve
+  --http <addr> <path>` (`crates/cli/src/main.rs:274`, dispatch `:628`,
+  handler `:2415`), mutually exclusive with `--stdio`.
 - **No double-framing, confirmed in the server path too:** after the `200`
   status line, `handle_http_connection` hands the raw, unwrapped
   `TcpStream`/`BufReader` pair straight to `wire::serve` — the P25 chunk
@@ -120,6 +135,17 @@ sc-native-ssh routing stay untouched; `open_transport` gains an
   connection model.
 - Zero new dependencies; the wire protocol, streaming, and version-2
   handshake are unchanged.
+- **Final-review fix — object-write concurrency correctness, not just the
+  `RepoLock`:** thread-per-connection put multiple writers in one process
+  for the first time (`--stdio` never did), exposing a same-process
+  temp-file-name collision in `atomic_write_durable`'s old pid-only temp
+  name — two threads landing an overlapping new object could race on the
+  identical `<obj>.<pid>.tmp` sibling, and the losing rename got `ENOENT`
+  (no corruption, retryable, but an opaque transient push failure).
+  Closed by making the temp name thread-unique (pid + a process-global
+  counter, matching `TempPackGuard`), pinned by
+  `concurrent_writers_same_target_dont_collide` in
+  `crates/core/src/fsutil.rs`.
 - **Unbounded thread-per-connection** (accepted design consequence, not
   yet closed): `serve_http_listener` spawns one OS thread per accepted
   socket with no pool, cap, or backpressure — a connection-churn client
