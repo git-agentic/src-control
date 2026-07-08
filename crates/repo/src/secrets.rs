@@ -98,6 +98,18 @@ impl Repo {
 
     /// Grant `new` access to `name` by re-wrapping the DEK with `authorized`.
     pub fn secret_grant(&self, name: &str, authorized: &SecretKey, new: &PublicKey) -> Result<ObjectId> {
+        // P21: `secret_grant` also moves the branch tip via `commit_registry`
+        // (confirmed by inspection per the P21 brief) — same guard trio as
+        // `secret_add`/`secret_rotate`.
+        if crate::merge_state::in_progress(self.layout()) {
+            return Err(Error::MergeInProgress);
+        }
+        if crate::pick_state::in_progress(self.layout()) {
+            return Err(Error::PickInProgress);
+        }
+        if crate::rebase_state::in_progress(self.layout()) {
+            return Err(Error::RebaseInProgress);
+        }
         let mut reg = self.registry()?;
         let sid = *reg.get(name).ok_or_else(|| Error::NoSuchSecret(name.to_string()))?;
         let secret = {

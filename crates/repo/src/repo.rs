@@ -3790,6 +3790,7 @@ mod tests {
             assert_refused!(repo.grant("vault/", &alice_sk, &alice_pk), "grant");
             assert_refused!(repo.revoke("vault/", &recipient), "revoke");
             assert_refused!(repo.secret_add("K2", b"v2", std::slice::from_ref(&alice_pk)), "secret_add");
+            assert_refused!(repo.secret_grant("K", &alice_sk, &alice_pk), "secret_grant");
             assert_refused!(
                 repo.secret_rotate("K", Some(b"v3"), std::slice::from_ref(&alice_pk), None),
                 "secret_rotate"
