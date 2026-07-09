@@ -8,6 +8,7 @@ pub mod textdiff;
 pub mod scanner_patterns;
 pub mod error;
 pub mod gc;
+pub mod http_transport;
 pub mod ignore;
 pub mod git_marks;
 pub mod layout;
@@ -40,6 +41,7 @@ pub use conflicts::{ActiveOp, ConflictKind, ConflictVersions, ResolveSide, Side}
 pub use error::{Error, Result};
 pub use gc::GcStats;
 pub use git_marks::MarksStore;
+pub use http_transport::ScHttpUrl;
 pub use oplog::{OpRecord, UndoOutcome};
 pub use protect_ops::PrefixRecipient;
 pub use remote::{RemoteConfig, RemoteKind};

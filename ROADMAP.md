@@ -311,10 +311,36 @@ across every phase.
   error (`TempPackGuard`), pinned by
   `fetch_client_ingests_via_tempfile_zero_residue` and
   `push_client_builds_via_tempfile_zero_residue`. (ADR-0035.)
+- **Phase 26 — sc-native HTTP transport.** A second network transport on
+  the same seam P12 opened for SSH: `sc+http://host[:port]/repo` (port
+  default 8730, `ScHttpUrl::parse`), a minimal hand-rolled HTTP/1.1
+  opening (`write_client_opening`/`read_client_opening`/`write_status`/
+  `read_status`, all bounded by `MAX_OPENING_BYTES` = 8 KiB against an
+  unterminated/hostile opening), and `sc serve --http <addr> <path>` — a
+  `TcpListener`, thread-per-connection, each connection handled end to end
+  by `handle_http_connection` and isolated from the accept loop. The
+  client (`HttpTransport::connect`) reads and maps the status line — `200`
+  proceeds, `404` → `Error::NotARepo`, anything else → a clear protocol
+  error — *before* the `WireClient` handshake, reusing the same
+  `BufReader` for both so no over-read byte is lost; after the opening,
+  the P25 chunk stream and P22 signatures ride the raw `TcpStream` with no
+  HTTP framing on top. Zero new dependencies (`std::net` only — confirmed
+  by an empty `git diff main -- '*Cargo.toml'`). Proven by
+  `demo/run_http_remote_demo.sh`: a real loopback `sc serve --http`
+  process (no shim, unlike ssh:// — this is genuine TCP), a ~1 MiB signed
+  blob crosses `sc+http://` clone with `SC_PACK_CHUNK=4096` forcing many
+  chunk frames, object set/working tree/`sc log` byte-for-byte identical
+  to the origin, `sc verify --require` clean in the clone, a push from a
+  second clone lands and a third clone's fetch sees it, and zero
+  `.sc/tmp` residue on either end — run twice. Same standing boundaries as
+  the ssh transport plus one new one: **plaintext only, no TLS**
+  (`sc+https://` deferred), **no authentication** (front with a reverse
+  proxy for production), and **not HTTP-proxy/CDN safe** (a strict proxy
+  won't tunnel the post-opening raw protocol). (ADR-0036.)
 
 ## Active
 
-None — P25 done; P26 sc-native HTTP transport is next up.
+None — P26 done; P27 partial clone (the horizon capstone) is next up.
 
 ## Completed phases (usability-first ordering)
 
@@ -342,6 +368,7 @@ None — P25 done; P26 sc-native HTTP transport is next up.
 | **P23 — Merge ergonomics** | Resolve conflicts without hand-editing markers | `sc conflicts [<path>]` lists/shows base-ours-theirs (decrypted under `--identity` for protected paths); `sc resolve --ours\|--theirs <path>` writes clean content; proven by `demo/run_merge_ergonomics_demo.sh` (text + protected conflicts resolved end-to-end) | [0033](docs/adr/0033-merge-ergonomics.md) |
 | **P24 — Sparse checkouts / sub-tree sharing** | Materialize one subtree of a large repo, leave the rest on the CAS | `sc sparse set <prefix…>`/`show`/`disable`; `commit`'s absent-path carry widens to out-of-sparse paths (byte-identical carried subtrees); `materialize` filters both its write and removal loops; proven by `demo/run_sparse_demo.sh` (narrow, edit, commit, then disable/clone restore byte-identical) | [0034](docs/adr/0034-sparse-checkouts.md) |
 | **P25 — Streaming pack transfer (bounded-RAM, >4 GiB)** | `push`/`fetch`/`clone` over ssh:// don't hold a whole pack in RAM anywhere — server, wire, or client | `PackWriter`/`parse_pack_reader` (bounded-RAM pack build/parse); `ST_PACK_CHUNK`/`ST_PACK_END` chunk framing (`SC_PACK_CHUNK`-tunable); `PROTOCOL_VERSION` 2, v1 dropped; two-pass atomic-after-verify ingest + `TempPackGuard`; the ssh client's own `sync.rs` fetch/push call sites route through the same `ingest_pack_file`/`write_ids_to_temp_pack` machinery (final-review fix); proven by `demo/run_streaming_demo.sh` (forced 4 KiB chunks, byte-for-byte clone, signature rides the stream, zero temp residue) | [0035](docs/adr/0035-streaming-transfer.md) |
+| **P26 — sc-native HTTP transport** | Reach a repo over plain TCP with no ssh account | `sc serve --http <addr> <path>`; `sc clone sc+http://host[:port]/repo`; thread-per-connection server, opening-status mapped before the wire handshake, P25 chunk stream + P22 signatures ride the raw socket with no HTTP framing; proven by `demo/run_http_remote_demo.sh` (real loopback TCP, no shim; clone/push/fetch byte-for-byte, signed commit verifies clean, zero `.sc/tmp` residue) | [0036](docs/adr/0036-http-transport.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -433,11 +460,22 @@ graduated twice over: revocation tombstones → P16, bulk re-wrap + escrow
 keys → P17, network Git remotes → P18, history-editing polish → P19,
 sessions + auto-merge → P20; and now policy-op guards + marks recovery +
 abort/status minors → P21, signed commits → P22, merge ergonomics → P23,
-sparse checkouts → P24, and streaming (>4 GiB) wire frames → P25):
+sparse checkouts → P24, streaming (>4 GiB) wire frames → P25, and
+sc-native HTTP transport → P26):
 
-- **HTTP transport** (sc-native). P12 shipped the sc-native SSH transport
-  and P25 made the wire itself stream in bounded chunks; an HTTP
-  equivalent is the next transport swap on the same seam (P26).
+- **Unbounded thread-per-connection in `sc serve --http` (P26).**
+  `serve_http_listener` spawns one OS thread per accepted socket with no
+  pool, cap, or backpressure — a connection-churn client can exhaust
+  server threads/fds. A bounded connection pool is the follow-on.
+- **No idle-transfer watchdog in `sc serve --http` (P26).** The
+  opening-read timeout is cleared once `wire::serve` takes over, so a
+  client that completes the opening and then stalls mid-transfer holds
+  its thread indefinitely. An idle-transfer watchdog distinct from the
+  opening-read timeout is the follow-on.
+- **No accept-loop backoff in `sc serve --http` (P26).** A sustained
+  `EMFILE`/`ENFILE` (fd exhaustion) makes the accept loop hot-spin on
+  back-to-back errors instead of backing off. Bounded backoff on repeated
+  accept errors is the follow-on.
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
