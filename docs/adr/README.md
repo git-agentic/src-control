@@ -49,7 +49,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0036](0036-http-transport.md) | sc-native HTTP transport (`sc+http://`) | Accepted | 26 |
 | [0037](0037-partial-clone.md) | Partial clone (promisor store + prefix-scoped fetch) | Accepted | 27 |
 | [0038](0038-agent-session-transcripts.md) | Agent session transcripts as CAS objects | Proposed | future (candidate) |
-| [0039](0039-security-hardening-sweep.md) | Security hardening sweep (audit fix-now items) | Proposed | 28 |
+| [0039](0039-security-hardening-sweep.md) | Security hardening sweep (audit fix-now items) | Accepted | 28 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

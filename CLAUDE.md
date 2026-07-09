@@ -1082,16 +1082,54 @@ backfill docs/` shrinks the gap count and makes docs/ genuinely readable,
 and `sc gc` succeeds and preserves everything — run twice, zero residue.
 No new dependencies; `PROTOCOL_VERSION` 3. See ADR-0037.
 
+**Phase 28 is built.** A security hardening sweep closing a 2026-07-09
+audit's four fix-now findings — security-only, no new feature axis, no new
+dependency. Ref-name validation: `refs::write_branch_tip`/`read_branch_tip`
+now call the existing strict `validate_branch_name` (rejects empty,
+`.`/`..`, leading-dot, `/`, `\`, whitespace, control) — the one choke point
+every local-branch write reaches (CLI, the wire `UpdateRef` arm, undo, ws)
+— closing a hostile-wire-client ref-traversal/oplog-corruption gap;
+`is_unsafe_ref_component` (the distinct, `/`-permitting validator guarding
+remote-tracking `write_remote_tip`) is separately upgraded to also reject
+whitespace/control, closing the same class of gap via a hostile git
+remote's branch name — two validators, kept distinct on purpose. DoS caps:
+a single `MAX_OBJECT_SIZE` constant (256 MiB, `crates/core`) anchors every
+untrusted-length guard — the wire frame length (`read_frame_inner`, before
+alloc), the pack-record compressed length (`parse_pack_reader`, before
+alloc), and the zstd decompressed output via a decode-WITH-LIMIT reader
+(never decode-then-check, so a decompression bomb never fully
+materializes); the four object-decode count sites (tree entries, snapshot
+parents, snapshot secrets, signature wrapped-keys) switch from a raw
+length read to the existing `Reader::count()` guard. `sc protect` equality
+nudge: `looks_like_low_entropy_secret`, a filename-only heuristic
+deliberately distinct from the P5 content scanner, prints one stderr
+warning steering a governed low-entropy secret basename (`.env`/`*.key`/
+`*credentials*`…) toward `sc secret`, citing ADR-0014 — warning-only,
+`sc protect` still proceeds. Secret env-var confidentiality: the threat
+model is tightened to "authorized local process context, NOT strong
+isolation," and a compile-time pin locks in that `scl_crypto::open`'s
+`Zeroizing<Vec<u8>>` plaintext rides unchanged through to the unavoidable
+`OsString` child-env hand-off. **Two accepted boundaries, unchanged by
+design:** convergent encryption stays equality-confirmable (ADR-0014 —
+randomized protected mode is deferred, not a bug); the secret's child-env
+copy is fundamental and un-zeroizable (fd/stdin injection is deferred, not
+a bug) — the parent's own decrypted buffer is what gets zeroized. Every
+prior demo stays green plus new pinned regression tests across all four
+fixes. See ADR-0039.
+
 Remaining follow-ons: operation objects in the CAS, oplog entries for
 remote-tracking refs, extending the sparse gate to
 `materialize_conflict_state`'s `to_encrypt`/sidecar write loops (see the
 P24 boundary note above), the three P26 `sc serve --http` hardening items
 named above (connection pool/backpressure, idle-transfer watchdog,
-accept-loop backoff), and the three P27 items named above (transparent
+accept-loop backoff), the three P27 items named above (transparent
 lazy-fetch as a deferred alternative to explicit `sc backfill`, per-case
 gap-tolerant merge/rebase/`ws harvest`/`sc work` instead of blanket
 refusal, and blob-size/object-count clone filters alongside the
-prefix-only filter shipped here).
+prefix-only filter shipped here), and the three P28 items named above
+(randomized protected mode for equality-hiding, fd/stdin secret injection
+as an alternative to env vars, and a `--max-object-size` operator config
+knob).
 
 ## Agent skills
 
