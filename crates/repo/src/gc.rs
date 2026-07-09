@@ -18,7 +18,7 @@ use scl_core::{ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
-use crate::{merge_state, oplog, pick_state, reachable, rebase_state, refs, signatures, ws};
+use crate::{merge_state, oplog, pick_state, promisor, reachable, rebase_state, refs, signatures, ws};
 
 /// What a gc pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -87,7 +87,21 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     oplog::trim_older_than(layout, cutoff)?;
 
     let roots = roots(layout)?;
-    let mut reachable: BTreeSet<ObjectId> = reachable::reachable_objects(store, &roots)?;
+    // Gap-tolerant reachability on a partial clone (P27 Task 5): when
+    // `.sc/promisor` is present, walk with the filtered reachability walk and
+    // keep only `.included` — an out-of-filter child is recorded in `.gaps`
+    // by id and never `get()`'d, so a genuinely-missing out-of-filter object
+    // (the whole premise of a partial clone) can never surface as a `gc`
+    // error, and a gap is never treated as unreachable garbage either (it's
+    // simply not in `reachable` at all, so the loose-object sweep below never
+    // considers it — it was never fetched, so it's never `store.list_loose`d
+    // in the first place). A full clone (`promisor::load` returns `None`)
+    // takes the unfiltered path, unchanged.
+    let filter = promisor::load(layout)?;
+    let mut reachable: BTreeSet<ObjectId> = match &filter {
+        Some(p) => reachable::reachable_objects_filtered(store, &roots, Some(p))?.included,
+        None => reachable::reachable_objects(store, &roots)?,
+    };
     // An in-progress merge's or cherry-pick's decided carried tree
     // (MERGE_DECIDED_ROOT / PICK_DECIDED_ROOT) is a TREE root, not a
     // snapshot: its tree nodes are freshly written by the conflict path and
@@ -534,6 +548,109 @@ mod tests {
         assert!(last.refs.iter().any(|(_, _, after)| *after == Some(fresh_snap)));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Build a repo at `root` with `src/a.txt` and `docs/b.txt` in separate
+    /// subtrees, one commit. Returns `(repo, src blob id, docs blob id)`.
+    fn tmp_repo_with_src_and_docs(root: &std::path::Path) -> (crate::repo::Repo, ObjectId, ObjectId) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        let repo = crate::repo::Repo::init(root).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"src-one").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"docs-one").unwrap();
+        let tip = repo.commit("t", "c1").unwrap();
+        let store_arc = repo.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        let snap = s.get_snapshot(&tip).unwrap();
+        let root_tree = s.get_tree(&snap.root).unwrap();
+        let src_tree = s.get_tree(&root_tree.get("src").unwrap().id).unwrap();
+        let docs_tree = s.get_tree(&root_tree.get("docs").unwrap().id).unwrap();
+        let src_blob_id = src_tree.get("a.txt").unwrap().id;
+        let docs_blob_id = docs_tree.get("b.txt").unwrap().id;
+        drop(s);
+        (repo, src_blob_id, docs_blob_id)
+    }
+
+    /// P27 Task 5: gc on a partial clone must not error trying to walk the
+    /// out-of-filter `docs/` gap (never `get()`'d, so a partial clone's
+    /// genuinely-absent gap objects can't surface as `NotFound`), must
+    /// preserve every in-filter `src/` object, and must still prune a
+    /// genuinely-unreachable PRESENT loose object (gc still works).
+    #[test]
+    fn gc_on_partial_clone_preserves_and_doesnt_error() {
+        let src_root = tmp_root("partial-src");
+        let dst_root = tmp_root("partial-dst");
+        let (src, src_blob_id, docs_blob_id) = tmp_repo_with_src_and_docs(&src_root);
+
+        let dst = crate::repo::Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        // The out-of-filter docs/ objects were never transferred at all —
+        // gc must not try to `get()` them (they'd raise NotFound).
+        {
+            let arc = dst.vfs().store();
+            let s = arc.lock().unwrap();
+            assert!(s.contains(&src_blob_id), "in-filter src/ blob present before gc");
+            assert!(!s.contains(&docs_blob_id), "out-of-filter docs/ blob was never fetched");
+        }
+
+        // A genuinely-unreachable PRESENT loose object on the partial clone:
+        // gc must still prune it.
+        let dangling = {
+            let arc = dst.vfs().store();
+            let mut s = arc.lock().unwrap();
+            s.put(scl_core::Object::blob(b"dangling-on-partial".to_vec())).unwrap()
+        };
+
+        let stats = dst.gc(Duration::from_secs(0)).unwrap();
+        assert!(stats.loose_pruned >= 1, "the dangling object must still be pruned: {stats:?}");
+
+        let arc = dst.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(s.contains(&src_blob_id), "in-filter src/ blob survives gc");
+        assert!(!s.contains(&docs_blob_id), "out-of-filter docs/ blob stays absent, not an error");
+        assert!(!s.contains(&dangling), "the genuinely-unreachable object is pruned");
+        drop(s);
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// A healthy partial clone's filtered gc walk reaches every in-filter
+    /// present object (a cheap proxy for "a partial clone should never have
+    /// an in-filter object missing — if one is, that's corruption, which
+    /// `reachable_objects_filtered` already surfaces as a hard `Err` per its
+    /// own `in_filter_absent_is_an_error` test").
+    #[test]
+    fn gc_in_filter_missing_object_still_errors_or_is_absent() {
+        let src_root = tmp_root("partial-src-2");
+        let dst_root = tmp_root("partial-dst-2");
+        let (src, src_blob_id, _docs_blob_id) = tmp_repo_with_src_and_docs(&src_root);
+
+        let dst = crate::repo::Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        // Healthy case: gc succeeds and the in-filter object is still there.
+        dst.gc(Duration::from_secs(0)).unwrap();
+        let arc = dst.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(s.contains(&src_blob_id), "in-filter object reached and kept by the filtered gc walk");
+        drop(s);
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
     }
 
     #[test]

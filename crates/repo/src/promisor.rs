@@ -88,6 +88,14 @@ impl Promisor {
     }
 }
 
+/// Build the "outside this partial clone's fetch filter" error for `path`
+/// (P27 Task 5) — one shared error so the sparse-widen preflight
+/// (`set_sparse`/`disable_sparse`) and the merge/pick out-of-filter guard
+/// speak with one voice, both pointing at `sc backfill`.
+pub fn partial_gap_hint(path: &str) -> Error {
+    Error::GapOutsideFilter(path.to_string())
+}
+
 /// Load the repo's promisor marker. An absent `.sc/promisor` file reads as
 /// `None` — a full clone, not an empty filter.
 pub fn load(layout: &Layout) -> Result<Option<Promisor>> {
@@ -133,6 +141,24 @@ impl Repo {
     /// `load`). `None` means this is a full clone.
     pub fn promisor(&self) -> Result<Option<Promisor>> {
         load(self.layout())
+    }
+
+    /// The out-of-filter gap count for `sc verify`'s partial-clone report
+    /// (P27 Task 5): walks the filtered reachability from `tips` and returns
+    /// the number of gaps recorded (ids referenced by an in-filter parent
+    /// tree but never fetched) — `None` if this is a full clone (no
+    /// `.sc/promisor`), so a partial clone's expected gaps are never mistaken
+    /// for missing/corrupt objects. An in-filter object that's genuinely
+    /// absent still surfaces as an `Err` from the underlying walk (real
+    /// corruption), not folded into this count.
+    pub fn partial_gap_count(&self, tips: &[scl_core::ObjectId]) -> Result<Option<usize>> {
+        let Some(p) = self.promisor()? else {
+            return Ok(None);
+        };
+        let store_arc = self.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let r = crate::reachable::reachable_objects_filtered(&mut *store, tips, Some(&p))?;
+        Ok(Some(r.gaps.len()))
     }
 }
 

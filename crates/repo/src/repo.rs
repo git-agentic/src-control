@@ -413,6 +413,21 @@ impl Repo {
         // per-blob byte-carry below (the existing P24 mechanism) must stay
         // exactly as it was to avoid any behavior change for that case.
         let partial = self.promisor()?.is_some();
+        // Merge/pick completion guard (P27 Task 5, T5-I4): `graft_out_of_sparse`
+        // below only splices out-of-filter subtrees back in for a plain
+        // single-tip commit (`decided_root.is_none() && merge_head.is_none()`).
+        // A merge (`merge_head: Some`) or a CONFLICTED pick/rebase completion
+        // (`decided_root: Some`) builds `all`/`root` purely from in-filter
+        // content on a partial clone — with no graft to follow, that would
+        // silently DROP every out-of-filter subtree from the new snapshot.
+        // Refuse loudly instead of ever letting that happen; a clean
+        // (non-conflicted) pick/rebase fold still has `decided_root: None`
+        // and keeps using the single-tip graft path, unaffected.
+        if partial && (decided_root.is_some() || merge_head.is_some()) {
+            return Err(crate::promisor::partial_gap_hint(
+                "<merge/pick completion across this partial clone's fetch filter>",
+            ));
+        }
         {
             let mut on_disk: std::collections::BTreeSet<String> =
                 all.iter().map(|(p, _, _, _)| p.clone()).collect();
@@ -796,7 +811,11 @@ impl Repo {
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         let head = match head_root {
-            Some(root) => worktree::tree_file_entries_with_perms(&mut store, root)?,
+            // Sparse-aware flattener (P27 Task 5, T5-I3): mirrors
+            // `diff_worktree`'s fix — never touches a gapped out-of-filter
+            // object on a partial clone; identical to the old unfiltered
+            // walk whenever `sparse` is full.
+            Some(root) => worktree::tree_file_entries_with_perms_sparse(&mut store, root, &sparse)?,
             None => BTreeMap::new(),
         };
         let tracked: std::collections::BTreeSet<String> = head.keys().cloned().collect();
@@ -1024,6 +1043,22 @@ impl Repo {
                 )?;
                 return Ok((theirs, skipped));
             }
+        }
+
+        // Merge/pick completion guard (P27 Task 5, T5-I4): a real three-way
+        // merge flattens BOTH sides' full trees (`crate::merge::three_way`);
+        // on a partial clone that would touch out-of-filter content this
+        // clone never fetched. `three_way`'s unfiltered walk already fails
+        // with a raw `NotFound` there today — refuse explicitly and loudly
+        // here instead, before ever calling it, so the failure names the
+        // real cause (a partial clone) and points at `sc backfill` rather
+        // than surfacing as a confusing corruption-shaped error. Only the
+        // fast-forward/adopt paths above (which never rebuild a tree, only
+        // gap-tolerant `materialize`) are exempt.
+        if self.promisor()?.is_some() {
+            return Err(crate::promisor::partial_gap_hint(
+                "<merge across this partial clone's fetch filter>",
+            ));
         }
 
         // Real three-way merge.
@@ -4793,5 +4828,163 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ── P27 Task 5: gap-tolerant status/diff, verify, export, and the
+    // merge/pick out-of-filter guard on a partial clone. ──
+
+    fn tmp_repo_with_src_and_docs_partial(tag: &str) -> (Repo, std::path::PathBuf, Repo, std::path::PathBuf) {
+        let src_root = tmp_root(&format!("{tag}-src"));
+        let dst_root = tmp_root(&format!("{tag}-dst"));
+        std::fs::create_dir_all(src_root.join("src")).unwrap();
+        std::fs::create_dir_all(src_root.join("docs")).unwrap();
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("src/a.txt"), b"src-one").unwrap();
+        std::fs::write(src_root.join("docs/b.txt"), b"docs-one").unwrap();
+        src.commit("t", "c1").unwrap();
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+        (src, src_root, dst, dst_root)
+    }
+
+    #[test]
+    fn status_and_diff_succeed_on_fresh_partial_clone_no_spurious_deletions() {
+        // T5-I3 (P27 Task 5, mandatory reassignment from the Task 4 review):
+        // `status`/`diff_unified` used to flatten HEAD's FULL tree via the
+        // unfiltered walker, which `NotFound`s on the out-of-filter `docs/`
+        // gap a partial clone never fetched. Both must now succeed and
+        // report no spurious deletion for the gapped path.
+        let (src, src_root, dst, dst_root) = tmp_repo_with_src_and_docs_partial("status-diff-partial");
+
+        let st = dst.status().unwrap();
+        assert!(st.deleted.is_empty(), "out-of-filter docs/ must not read as deleted: {st:?}");
+        assert!(st.modified.is_empty());
+        assert!(st.added.is_empty());
+
+        let diff = dst.diff_unified().unwrap();
+        assert!(diff.is_empty(), "a clean partial-clone checkout must diff empty: {diff}");
+        assert!(!diff.contains("docs/b.txt"));
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn verify_reports_partial_not_corrupt() {
+        let (src, src_root, dst, dst_root) = tmp_repo_with_src_and_docs_partial("verify-partial");
+
+        let tip = dst.head_tip().unwrap().unwrap();
+        let gaps = dst.partial_gap_count(&[tip]).unwrap();
+        assert!(gaps.is_some(), "a partial clone must report Some gap count");
+        assert!(gaps.unwrap() >= 1, "the out-of-filter docs/ subtree must show up as a gap");
+
+        // A full clone reports no partial-clone gap count at all.
+        let full_gaps = src.partial_gap_count(&[src.head_tip().unwrap().unwrap()]).unwrap();
+        assert_eq!(full_gaps, None, "a full clone is not partial");
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn merge_refuses_on_partial_clone_instead_of_silently_dropping_gaps() {
+        // T5-I4 (mandatory reassignment): a two-parent merge completion on a
+        // partial clone would silently DROP out-of-filter subtrees (the
+        // Task 4 graft is single-tip-scoped). Refuse loudly instead of
+        // relying on an incidental NotFound from deep inside `three_way`.
+        let (src, src_root, dst, dst_root) = tmp_repo_with_src_and_docs_partial("merge-guard-partial");
+
+        // Fork a second branch off the initial commit, then diverge both
+        // sides so `merge` needs a genuine (non-FF) three-way, not just an
+        // adopt/fast-forward (both of which stay gap-tolerant via
+        // `materialize` and don't need this guard). `switch` between them
+        // (exercising its own P27 Task 5 fix to `materialize`'s old-root
+        // walk, below).
+        dst.branch("feature").unwrap();
+        dst.switch("feature").unwrap();
+        std::fs::write(dst_root.join("src/a.txt"), b"feature-side-edit").unwrap();
+        dst.commit("t", "feature edit").unwrap();
+
+        dst.switch("main").unwrap();
+        std::fs::write(dst_root.join("src/a.txt"), b"main-side-edit").unwrap();
+        dst.commit("t", "main edit").unwrap();
+
+        let err = dst.merge_with_identity("feature", "t", None).unwrap_err();
+        assert!(
+            matches!(err, Error::GapOutsideFilter(_)),
+            "expected the explicit gap-outside-filter refusal, got {err:?}"
+        );
+        assert!(err.to_string().contains("backfill"));
+        assert!(!dst.merge_in_progress(), "the refusal must be a preflight, not a conflict state");
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// P27 Task 5 fix: `switch`'s old-root removal walk used to be
+    /// unconditionally unfiltered, so switching branches on ANY partial
+    /// clone with a genuine out-of-filter gap elsewhere in the tree
+    /// `NotFound`ed — even with no merge/sparse narrowing involved at all.
+    #[test]
+    fn switch_succeeds_on_partial_clone_with_a_real_gap() {
+        let (src, src_root, dst, dst_root) = tmp_repo_with_src_and_docs_partial("switch-partial-gap");
+
+        dst.branch("feature").unwrap();
+        dst.switch("feature").unwrap();
+        std::fs::write(dst_root.join("src/a.txt"), b"on-feature").unwrap();
+        dst.commit("t", "feature edit").unwrap();
+
+        // Switching back to main (a different tree, same out-of-filter gap)
+        // must succeed and must not touch the never-fetched docs/ subtree.
+        dst.switch("main").unwrap();
+        assert_eq!(std::fs::read(dst_root.join("src/a.txt")).unwrap(), b"src-one");
+        assert!(!dst_root.join("docs/b.txt").exists());
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_files_refuses_merge_head_completion_on_partial_clone() {
+        // Defense-in-depth: `snapshot_files`'s own guard fires even if a
+        // MERGE_HEAD/decided-root state is present without having gone
+        // through `merge_with_identity`'s upfront refusal (mirrors how
+        // `gc`'s tests write merge_state directly).
+        let (src, src_root, dst, dst_root) = tmp_repo_with_src_and_docs_partial("snapshot-files-guard");
+        let tip = dst.head_tip().unwrap().unwrap();
+
+        let err = dst
+            .snapshot_files(
+                Vec::new(),
+                Some(tip),
+                Some(tip),
+                None,
+                None,
+                None,
+                None,
+                &dst.sparse_spec().unwrap(),
+                "t",
+                "msg",
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::GapOutsideFilter(_)), "got {err:?}");
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
     }
 }

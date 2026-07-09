@@ -44,6 +44,8 @@ pub enum Error {
     ProtectedMergeNeedsIdentity(String),
     #[error("{0} sits under a path this partial clone never fetched; cannot commit content there — run `sc backfill` to fetch that subtree first")]
     GappedPathContent(String),
+    #[error("{0} lies outside this partial clone's fetch filter; run `sc backfill {0}` to fetch it first")]
+    GapOutsideFilter(String),
     #[error("already up to date")]
     UpToDate,
     #[error("{0}")]

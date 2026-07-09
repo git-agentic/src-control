@@ -389,6 +389,19 @@ pub struct Diff {
 /// `sc status`/the dirty-tree checks in `switch`/`merge`/`rebase` would read
 /// every out-of-sparse path as a deletion and permanently block those
 /// operations once a sparse spec is set.
+///
+/// Gap-tolerant on a partial clone (P27 Task 5, T5-I3): flattens HEAD's tree
+/// with [`tree_file_entries_with_perms_sparse`] instead of the unfiltered
+/// walker, mirroring `materialize`'s existing choice. On a full (non-partial)
+/// repo this is byte-for-byte identical to the old unfiltered walk whenever
+/// `sparse` is full (the sparse-aware flattener falls back to the unfiltered
+/// one in that case) — the only behavior change is that an out-of-`sparse`
+/// path is now never fetched from the store at all, instead of being fetched
+/// and then filtered out by the loop below. On a partial clone, `sparse` is
+/// always a subset of the promisor filter (enforced by `set_sparse`/
+/// `disable_sparse`'s preflight), so this walk never touches a gapped
+/// out-of-filter object — an out-of-filter path was never materialized to
+/// disk either, so it's expected-absent, not a deletion.
 pub fn diff_worktree(
     layout: &Layout,
     store: &mut Store,
@@ -400,7 +413,7 @@ pub fn diff_worktree(
     sparse: &Sparse,
 ) -> Result<Diff> {
     let head = match head_root {
-        Some(root) => tree_file_entries_with_perms(store, root)?,
+        Some(root) => tree_file_entries_with_perms_sparse(store, root, sparse)?,
         None => BTreeMap::new(),
     };
     let tracked: BTreeSet<String> = head.keys().cloned().collect();
@@ -472,6 +485,15 @@ pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
 /// Non-protected entries are written verbatim. Working files tracked by
 /// `old_root` but absent from the target tree (or now outside `sparse`) are
 /// deleted regardless of protection status.
+///
+/// Gap-tolerant on a partial clone (P27 Task 5): both the target walk and
+/// the old-root removal walk are bounded so neither ever `store.get`s an
+/// out-of-filter (never-fetched) object — the old-root walk is bounded by
+/// the promisor filter specifically (not by the possibly-narrower `sparse`),
+/// since `sparse`-narrowing is exactly the case that needs to enumerate
+/// paths `sparse` no longer matches. This closes the crash a bare
+/// `set_sparse`/`disable_sparse` narrowing (or a `switch`) used to hit on
+/// any partial clone with a genuine out-of-filter gap elsewhere in the tree.
 pub fn materialize(
     layout: &Layout,
     store: &mut Store,
@@ -483,14 +505,26 @@ pub fn materialize(
 ) -> Result<Vec<String>> {
     // Gap-tolerant when sparse is active (P27 Task 4): a promisor-filtered
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
-    // walk here would `NotFound` on them. `old_root`'s walk stays
-    // unfiltered below — clone (the case that hits this) always passes
-    // `old_root: None`; widening a partial clone's sparse view beyond its
-    // promisor filter via `old_root` remains a documented boundary, not
-    // fixed by this task.
+    // walk here would `NotFound` on them.
     let target = tree_file_entries_with_perms_sparse(store, target_root, sparse)?;
     if let Some(old) = old_root {
-        for p in tree_file_ids(store, old)?.keys() {
+        // The old-root removal walk (P27 Task 5 fix): bounded by the
+        // promisor filter, not by `sparse` itself. `old` is enumerated to
+        // find paths that WERE materialized and might now need removing —
+        // `sparse` (the NEW, possibly narrower spec) can't be the descend
+        // bound here, since narrowing is exactly the case that needs to
+        // enumerate paths `sparse` no longer matches. On a partial clone,
+        // the promisor filter is the widest boundary that's guaranteed
+        // present in the CAS; anything outside it was never fetched and so
+        // was never materialized either — nothing to remove there, and
+        // walking it would `NotFound`. A full (non-partial) repo keeps the
+        // old unfiltered walk exactly (`Sparse::default()` falls back to
+        // `tree_file_ids` inside `tree_file_ids_sparse`).
+        let old_walk_bound = match crate::promisor::load(layout)? {
+            Some(p) => Sparse::new(p.prefixes().to_vec()),
+            None => Sparse::default(),
+        };
+        for p in tree_file_ids_sparse(store, old, &old_walk_bound)?.keys() {
             if !target.contains_key(p) || !sparse.matches(p) {
                 let full = safe_join(&layout.root, p)?;
                 let _ = std::fs::remove_file(full);

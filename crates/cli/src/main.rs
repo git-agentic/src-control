@@ -1937,6 +1937,17 @@ fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
         history.len()
     ));
 
+    // Partial-clone gap report (P27 Task 5): out-of-filter objects are
+    // EXPECTED to be absent on a partial clone, never missing/corrupt — print
+    // a count instead of treating them as a verify failure.
+    if let Some(gaps) = repo.partial_gap_count(&[tip])? {
+        let prefixes = repo
+            .promisor()?
+            .map(|p| p.prefixes().join(", "))
+            .unwrap_or_default();
+        print_line(&format!("partial: {gaps} object(s) outside filter [{prefixes}]"));
+    }
+
     if require && (untrusted + invalid + unsigned) > 0 {
         // Drop the repo (releases .sc/lock) before process::exit, which skips
         // destructors and would otherwise leave a stale lock file — same
@@ -2789,6 +2800,17 @@ fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
 
 fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) -> Result<()> {
     let repo = open_repo()?;
+    // Refuse up front on a partial clone (P27 Task 5): export walks the FULL
+    // unfiltered tree/blob closure to synthesize Git objects, which would
+    // `NotFound` on every out-of-filter gap. Rather than surfacing that as a
+    // confusing corruption-shaped error, refuse loudly and point at backfill.
+    if repo.promisor()?.is_some() {
+        anyhow::bail!(
+            "refusing to export: this is a partial clone (.sc/promisor present) and export \
+             needs the full object closure; run `sc backfill <prefix>...` to widen to a full \
+             clone first"
+        );
+    }
     let branch = scl_repo::refs::current_branch(repo.layout())?;
     let tip = repo
         .head_tip()?
