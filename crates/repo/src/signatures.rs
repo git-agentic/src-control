@@ -78,7 +78,7 @@ fn write_index(layout: &Layout, entries: &[(ObjectId, ObjectId)]) -> Result<()> 
 
 /// Append one `(snapshot, sig_id)` entry, deduping against an identical
 /// existing entry.
-fn append_index(layout: &Layout, snapshot: ObjectId, sig_id: ObjectId) -> Result<()> {
+pub(crate) fn append_index(layout: &Layout, snapshot: ObjectId, sig_id: ObjectId) -> Result<()> {
     let mut entries = read_index(layout)?;
     if entries.iter().any(|(s, g)| *s == snapshot && *g == sig_id) {
         return Ok(());
@@ -204,6 +204,44 @@ pub(crate) fn indexed_signature_ids_for(
     Ok(out.into_iter().collect())
 }
 
+/// Shared four-state precedence over an already-loaded signature list,
+/// parameterized on `verify` so both [`Repo::sig_status`] (snapshot domain)
+/// and `Repo::transcript_sig_status` (transcript domain, in
+/// `transcripts.rs`) apply the identical precedence rule without
+/// duplicating it. See [`SigStatus`] for the precedence itself.
+pub(crate) fn status_from(
+    sigs: &[SignatureObj],
+    target: &ObjectId,
+    trusted: &std::collections::HashMap<[u8; 32], String>,
+    verify: impl Fn(&[u8; 32], &[u8; 32], &[u8; 64]) -> bool,
+) -> SigStatus {
+    if sigs.is_empty() {
+        return SigStatus::Unsigned;
+    }
+    let mut trusted_name: Option<String> = None;
+    let mut untrusted_signer: Option<[u8; 32]> = None;
+    for s in sigs {
+        let valid = verify(&s.signer, target.as_bytes(), &s.sig);
+        if !valid {
+            // Precedence: any invalid signature wins immediately, never
+            // masked by a valid/trusted one found earlier or later.
+            return SigStatus::Invalid;
+        }
+        match trusted.get(&s.signer) {
+            Some(name) if trusted_name.is_none() => trusted_name = Some(name.clone()),
+            None if untrusted_signer.is_none() => untrusted_signer = Some(s.signer),
+            _ => {}
+        }
+    }
+    if let Some(name) = trusted_name {
+        return SigStatus::Trusted(name);
+    }
+    if let Some(signer) = untrusted_signer {
+        return SigStatus::Untrusted(signer);
+    }
+    unreachable!("sigs is non-empty and every signature is valid, so one of the two branches above must have set a value")
+}
+
 impl Repo {
     /// Sign `snapshot` with `identity`'s signing half: build the
     /// [`SignatureObj`], put it in the CAS, and append it to the
@@ -272,31 +310,7 @@ impl Repo {
         trusted: &std::collections::HashMap<[u8; 32], String>,
     ) -> Result<SigStatus> {
         let sigs = self.signatures_for(snapshot)?;
-        if sigs.is_empty() {
-            return Ok(SigStatus::Unsigned);
-        }
-        let mut trusted_name: Option<String> = None;
-        let mut untrusted_signer: Option<[u8; 32]> = None;
-        for s in &sigs {
-            let valid = scl_crypto::verify_snapshot_sig(&s.signer, snapshot.as_bytes(), &s.sig);
-            if !valid {
-                // Precedence: any invalid signature wins immediately, never
-                // masked by a valid/trusted one found earlier or later.
-                return Ok(SigStatus::Invalid);
-            }
-            match trusted.get(&s.signer) {
-                Some(name) if trusted_name.is_none() => trusted_name = Some(name.clone()),
-                None if untrusted_signer.is_none() => untrusted_signer = Some(s.signer),
-                _ => {}
-            }
-        }
-        if let Some(name) = trusted_name {
-            return Ok(SigStatus::Trusted(name));
-        }
-        if let Some(signer) = untrusted_signer {
-            return Ok(SigStatus::Untrusted(signer));
-        }
-        unreachable!("sigs is non-empty and every signature is valid, so one of the two branches above must have set a value")
+        Ok(status_from(&sigs, snapshot, trusted, scl_crypto::verify_snapshot_sig))
     }
 }
 

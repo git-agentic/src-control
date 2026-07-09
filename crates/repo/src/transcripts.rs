@@ -21,11 +21,12 @@
 
 use std::collections::BTreeSet;
 
-use scl_core::{Object, ObjectId, Transcript};
+use scl_core::{Object, ObjectId, Secret, SignatureObj, Transcript};
 
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::repo::Repo;
+use crate::signatures::SigStatus;
 
 /// Parse one `<snapshot-hex> <transcript-hex>` index line. Returns `None`
 /// for a malformed line (wrong field count or bad hex) rather than erroring
@@ -254,6 +255,79 @@ impl Repo {
         }
         Ok(out)
     }
+
+    /// Decrypt a transcript's body with `identity`. Builds a [`Secret`] from
+    /// the transcript's envelope fields and reuses `scl_crypto::open`
+    /// VERBATIM — zero new crypto. `name` is set to the transcript's own
+    /// `session` field: `attach_transcript` sealed the body via
+    /// `scl_crypto::seal(session, body, recipients)`, and `seal`/`open` bind
+    /// `name` into the AEAD associated data, so `open` only authenticates
+    /// against the exact `session` string the body was originally sealed
+    /// under (an empty/placeholder name fails authentication, not just
+    /// convention). Returns a `Zeroizing` buffer so the plaintext body is
+    /// zeroed on drop.
+    pub fn open_transcript(
+        &self,
+        tid: &ObjectId,
+        identity: &scl_crypto::SecretKey,
+    ) -> Result<scl_crypto::Zeroizing<Vec<u8>>> {
+        let obj = {
+            let arc = self.store_arc();
+            let o = arc.lock().unwrap().get(tid)?;
+            o
+        };
+        let t = match obj {
+            Object::Transcript(t) => t,
+            _ => return Err(Error::InvalidArgument(format!("{tid} is not a transcript"))),
+        };
+        let secret = Secret {
+            name: t.session,
+            nonce: t.nonce,
+            ciphertext: t.ciphertext,
+            wrapped_keys: t.wrapped_keys,
+        };
+        Ok(scl_crypto::open(&secret, identity)?)
+    }
+
+    /// Sign a transcript id under the transcript domain
+    /// (`scl_crypto::sign_transcript_id`); store the resulting
+    /// [`SignatureObj`] and index it in the SHARED `.sc/signatures` index
+    /// (keyed by the signed target id — a transcript id here, a snapshot id
+    /// for `sign_snapshot`). Errors with [`Error::InvalidArgument`] if
+    /// `identity` has no signing half (a v1 identity), mirroring
+    /// `sign_snapshot`.
+    pub fn sign_transcript(&self, tid: ObjectId, identity: &scl_crypto::Identity) -> Result<ObjectId> {
+        let signing = identity.signing.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "identity has no signing half (v1 identity); signing requires a v2 (scl-id-) \
+                 identity"
+                    .into(),
+            )
+        })?;
+        let signer = signing.public().to_bytes();
+        let sig = scl_crypto::sign_transcript_id(signing, tid.as_bytes());
+        let sig_obj = SignatureObj { snapshot: tid, signer, sig };
+        let id = {
+            let arc = self.store_arc();
+            let i = arc.lock().unwrap().put(Object::Signature(sig_obj))?;
+            i
+        };
+        crate::signatures::append_index(self.layout(), tid, id)?;
+        Ok(id)
+    }
+
+    /// Four-state verification of a transcript's signatures — mirrors
+    /// `Repo::sig_status` but verifies under the TRANSCRIPT domain
+    /// (`scl_crypto::verify_transcript_sig`), sharing the same precedence
+    /// logic via `signatures::status_from`.
+    pub fn transcript_sig_status(
+        &self,
+        tid: &ObjectId,
+        trusted: &std::collections::HashMap<[u8; 32], String>,
+    ) -> Result<SigStatus> {
+        let sigs = self.signatures_for(tid)?;
+        Ok(crate::signatures::status_from(&sigs, tid, trusted, scl_crypto::verify_transcript_sig))
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +370,33 @@ mod tests {
             _ => panic!("not a transcript"),
         }
         drop(store);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn open_recovers_body_and_sign_status_is_trusted() {
+        let root = tmp_root("open");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, id) = scl_crypto::generate_identity_v2();
+        let body = b"USER: hi\nAGENT: hello";
+        let tid = repo.attach_transcript(snap, "a", "s", body, &[id.enc.public()]).unwrap();
+
+        // decrypt round-trips
+        let got = repo.open_transcript(&tid, &id.enc).unwrap();
+        assert_eq!(got.as_slice(), body);
+
+        // sign + verify four-state
+        repo.sign_transcript(tid, &id).unwrap();
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(id.signing.as_ref().unwrap().public().to_bytes(), "me".to_string());
+        assert_eq!(
+            repo.transcript_sig_status(&tid, &trusted).unwrap(),
+            crate::signatures::SigStatus::Trusted("me".into())
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
