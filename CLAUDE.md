@@ -1089,3 +1089,26 @@ lazy-fetch as a deferred alternative to explicit `sc backfill`, per-case
 gap-tolerant merge/rebase/`ws harvest`/`sc work` instead of blanket
 refusal, and blob-size/object-count clone filters alongside the
 prefix-only filter shipped here).
+
+## Agent skills
+
+Per-repo configuration for the engineering skills (triage, to-tickets,
+to-spec, qa, diagnosing-bugs, improve-codebase-architecture, tdd, …).
+
+### Issue tracker
+
+Issues are tracked as **GitHub Issues** on `git-agentic/src-control` via the
+`gh` CLI; external PRs are NOT a triage surface. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary — `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, `wontfix` (each role's label string equals its name). See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+**Single-context.** No `CONTEXT.md` yet — domain language lives in
+`CLAUDE.md`/`ARCHITECTURE.md`, decisions in the one root `docs/adr/`. See
+`docs/agents/domain.md`.
