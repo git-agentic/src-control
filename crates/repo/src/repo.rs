@@ -498,6 +498,29 @@ impl Repo {
                 let mut store = store_arc.lock().unwrap();
                 let parent_root = store.get_snapshot(&t)?.root;
                 root = worktree::graft_out_of_sparse(&mut store, root, parent_root, sparse, "")?;
+                // C1 fix (P27 Task 4 review): the graft above spliced
+                // out-of-filter subtrees back in BY ID, so any PROTECTED
+                // blob living only under a grafted subtree never went
+                // through the encrypt-or-carry loops above and is absent
+                // from `fresh_wrapped`. Left alone, the `reuse_prior_wraps`
+                // rebuild below (which only REFRESHES ids already present
+                // in `fresh_wrapped`, never adds new ones) would silently
+                // drop those blobs' wrapped DEKs from the new snapshot —
+                // permanently, since this becomes the new tip's
+                // `protection.wrapped` and every later push/merge/clone
+                // builds on top of it, leaving no identity able to decrypt
+                // the grafted ciphertext ever again. `protection.wrapped`
+                // here is still the tip's own full map (`prior` is taken
+                // below, after this point) and already carries every wrap
+                // the tip itself could offer; union in any entry
+                // `fresh_wrapped` doesn't already know about. Convergent
+                // encryption keeps a blob's id stable regardless of who
+                // grafted it, so reusing the prior wrap bytes verbatim is
+                // correct, not just convenient — no re-encryption, no key
+                // material touched.
+                for (id, wks) in &protection.wrapped {
+                    fresh_wrapped.entry(*id).or_insert_with(|| wks.clone());
+                }
             }
         }
 

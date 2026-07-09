@@ -42,6 +42,8 @@ pub enum Error {
     PickConflicts(usize),
     #[error("protected path {0} changed on both sides; re-run with --identity <key> to merge its content")]
     ProtectedMergeNeedsIdentity(String),
+    #[error("{0} sits under a path this partial clone never fetched; cannot commit content there — run `sc backfill` to fetch that subtree first")]
+    GappedPathContent(String),
     #[error("already up to date")]
     UpToDate,
     #[error("{0}")]

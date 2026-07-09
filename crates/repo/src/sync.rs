@@ -178,7 +178,25 @@ impl Repo {
     /// metadata that the filtered want-walk touches along the way to the
     /// genuinely-new blobs — wasteful, not incorrect: `ingest_pack_file`'s
     /// underlying `put` is idempotent on content-addressed ids.
+    ///
+    /// `tips` (the `wants`) must be snapshot ids the ORIGIN can resolve
+    /// (I2, P27 Task 4 review): `get_pack`'s tip walk runs against the
+    /// origin's own object graph, so a want it has never seen is a hard
+    /// error there, not an empty result. Local branch heads are the wrong
+    /// source once ANY commit has been made locally after the clone (or
+    /// after the last `fetch`) without being pushed — the origin has never
+    /// seen that snapshot id. The out-of-filter subtree ids being backfilled
+    /// are unchanged since clone time regardless (this clone never touched
+    /// them), so any tip the origin is known to have already reaches them;
+    /// `refs/remotes/origin/*` is exactly that — written by
+    /// `clone_url_filtered` at clone time and kept current by `fetch` — so
+    /// backfill uses those remote-tracking tips instead of local heads.
     pub fn backfill(&self, prefixes: &[String]) -> Result<()> {
+        if prefixes.is_empty() {
+            return Err(Error::InvalidArgument(
+                "backfill requires at least one prefix".into(),
+            ));
+        }
         let mut promisor = crate::promisor::load(&self.layout)?.ok_or_else(|| {
             Error::InvalidArgument(
                 "not a partial clone (.sc/promisor absent); nothing to backfill".into(),
@@ -186,7 +204,17 @@ impl Repo {
         })?;
         let transport = open_transport(&promisor.origin)?;
 
-        let tips: Vec<ObjectId> = refs::list_heads(&self.layout)?.into_iter().map(|(_, id)| id).collect();
+        let tips: Vec<ObjectId> = refs::list_remote_tips(&self.layout)?
+            .into_iter()
+            .filter(|(remote, _, _)| remote == "origin")
+            .map(|(_, _, id)| id)
+            .collect();
+        if tips.is_empty() {
+            return Err(Error::InvalidArgument(
+                "no refs/remotes/origin/* tracking refs recorded; run `sc fetch origin` first"
+                    .into(),
+            ));
+        }
 
         {
             let store_arc = self.vfs.store();
@@ -855,6 +883,137 @@ mod tests {
     }
 
     #[test]
+    fn partial_commit_preserves_out_of_filter_protected_wraps() {
+        // C1 (P27 Task 4 review, Critical): a commit on a partial clone that
+        // only touches in-filter paths must not strip the wrapped DEKs of
+        // out-of-filter PROTECTED files — the graft carries the docs/
+        // subtree forward by id, so its ciphertext blob never went through
+        // the encrypt-or-carry loop that feeds `fresh_wrapped`, and the old
+        // (pre-fix) `reuse_prior_wraps` rebuild silently dropped its wraps.
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-pcwrap-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-pcwrap-dst-{pid}"));
+        let full_root = std::env::temp_dir().join(format!("scl-pcwrap-full-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        let _ = std::fs::remove_dir_all(&full_root);
+
+        std::fs::create_dir_all(src_root.join("src")).unwrap();
+        std::fs::create_dir_all(src_root.join("docs")).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("src/a.txt"), b"src-one").unwrap();
+        src.protect("docs/", std::slice::from_ref(&alice_pk), None).unwrap();
+        std::fs::write(src_root.join("docs/secret.txt"), b"docs-secret").unwrap();
+        src.commit("t", "c1").unwrap();
+
+        let docs_blob_id = {
+            let store_arc = src.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            let tip = src.head_tip().unwrap().unwrap();
+            let snap = store.get_snapshot(&tip).unwrap();
+            let root_tree = store.get_tree(&snap.root).unwrap();
+            let docs_tree_id = root_tree.get("docs").unwrap().id;
+            let docs_tree = store.get_tree(&docs_tree_id).unwrap();
+            let id = docs_tree.get("secret.txt").unwrap().id;
+            assert!(
+                snap.protection.wrapped.contains_key(&id),
+                "docs/secret.txt must be wrapped at the src tip"
+            );
+            id
+        };
+        drop(src);
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        std::fs::write(dst_root.join("src/a.txt"), b"src-two").unwrap();
+        let new_tip = dst.commit("t", "c2").unwrap();
+
+        {
+            let store_arc = dst.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            let new_snap = store.get_snapshot(&new_tip).unwrap();
+            assert!(
+                new_snap.protection.wrapped.contains_key(&docs_blob_id),
+                "C1: new snapshot must still carry the out-of-filter docs/ ciphertext's wrapped DEK"
+            );
+            assert!(
+                crate::protect::matching_prefix(&new_snap.protection, "docs/secret.txt").is_some(),
+                "C1: the docs/ protection rule must survive a partial commit"
+            );
+        }
+
+        dst.push("origin").unwrap();
+
+        let full = Repo::clone_url(src_root.to_str().unwrap(), &full_root).unwrap();
+        assert_eq!(full.head_tip().unwrap(), Some(new_tip));
+        let branch = crate::refs::current_branch(full.layout()).unwrap();
+        let skipped = full.switch_with_identity(&branch, Some(&alice_sk)).unwrap();
+        assert!(
+            skipped.is_empty(),
+            "alice's identity must decrypt docs/secret.txt after push + full clone, skipped: {skipped:?}"
+        );
+        assert_eq!(
+            std::fs::read(full_root.join("docs/secret.txt")).unwrap(),
+            b"docs-secret",
+            "C1: a full clone must still be able to decrypt docs/secret.txt under alice's identity"
+        );
+
+        drop(dst);
+        drop(full);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+        std::fs::remove_dir_all(&full_root).unwrap();
+    }
+
+    #[test]
+    fn partial_commit_refuses_content_under_gapped_path() {
+        // I1 (P27 Task 4 review, Important): `read_worktree` scans the whole
+        // disk tree with no regard for the sparse/filter spec, so a file
+        // written under a gapped (never-fetched) subtree is picked up into
+        // the built tree — the id-only graft must not silently discard it
+        // by overwriting that subtree wholesale with the parent's untouched
+        // id. It must refuse loudly instead.
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-gapwrite-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-gapwrite-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+
+        let (src, _tip, _docs_blob_id, _docs_tree_id) = tmp_repo_with_src_and_docs(&src_root);
+        drop(src);
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        // docs/ was never materialized on this partial clone (it's gapped),
+        // but nothing stops a caller from writing there directly.
+        std::fs::create_dir_all(dst_root.join("docs")).unwrap();
+        std::fs::write(dst_root.join("docs/b.txt"), b"clobbered-by-mistake").unwrap();
+
+        let err = dst.commit("t", "oops").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("docs") && msg.contains("backfill"),
+            "I1: committing content under a gapped path must refuse clearly and point at \
+             `sc backfill`, got: {msg}"
+        );
+
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
     fn backfill_makes_out_of_filter_present() {
         let pid = std::process::id();
         let src_root = std::env::temp_dir().join(format!("scl-backfill-src-{pid}"));
@@ -887,6 +1046,88 @@ mod tests {
 
         let promisor = dst.promisor().unwrap().unwrap();
         assert_eq!(promisor.prefixes(), &["src/".to_string(), "docs/".to_string()]);
+
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn backfill_after_local_commit_works() {
+        // I2 (P27 Task 4 review, Important): backfill's `wants` must be
+        // tips the ORIGIN can resolve. A local commit made after the clone
+        // (never pushed) produces a snapshot id the origin has never seen —
+        // using local branch heads as `wants` (the pre-fix behavior) makes
+        // `get_pack`'s tip walk fail on the origin. The out-of-filter
+        // subtree being backfilled is unchanged since clone time, so any
+        // tip the origin is known to have (recorded in
+        // `refs/remotes/origin/*`) already reaches it.
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-backfilllocal-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-backfilllocal-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+
+        let (src, _tip, docs_blob_id, _docs_tree_id) = tmp_repo_with_src_and_docs(&src_root);
+        drop(src);
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        // Edit + commit locally — do NOT push. The origin has never seen
+        // this new snapshot id.
+        std::fs::write(dst_root.join("src/a.txt"), b"src-local-edit").unwrap();
+        dst.commit("t", "local-only").unwrap();
+
+        {
+            let store_arc = dst.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(!store.contains(&docs_blob_id), "docs/ must be gapped before backfill");
+        }
+
+        dst.backfill(&["docs/".to_string()]).unwrap();
+
+        {
+            let store_arc = dst.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(
+                store.contains(&docs_blob_id),
+                "I2: docs/ blob must be present after backfill, even after a local unpushed commit"
+            );
+        }
+
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn backfill_requires_at_least_one_prefix() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-backfillarity-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-backfillarity-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+
+        let (src, _tip, _docs_blob_id, _docs_tree_id) = tmp_repo_with_src_and_docs(&src_root);
+        drop(src);
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        let err = dst.backfill(&[]).unwrap_err();
+        assert!(
+            err.to_string().contains("at least one prefix"),
+            "backfill with zero prefixes must error, got: {err}"
+        );
 
         drop(dst);
         std::fs::remove_dir_all(&src_root).unwrap();

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use scl_core::{EntryKind, FileMode, Object, ObjectId, Protection, Store, Tree, PROTECTED};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ignore::Ignore;
 use crate::layout::Layout;
 use crate::sparse::Sparse;
@@ -188,7 +188,11 @@ fn walk_entries_with_perms_sparse(
 /// protected content. An ancestor directory that must be descended through
 /// to reach a deeper in-sparse prefix (`should_descend`) recurses instead
 /// of being grafted whole, so any genuinely in-sparse content beneath it
-/// keeps coming from the built side.
+/// keeps coming from the built side. Returns `Err(GappedPathContent)` (I1,
+/// P27 Task 4 review) instead of grafting when the built side already has
+/// an entry at a fully out-of-sparse path — `read_worktree` doesn't respect
+/// the sparse spec, so content written under a gapped subtree would
+/// otherwise be silently discarded by the id-only graft.
 ///
 /// Scope: single-parent (non-merge) commits only — `snapshot_files` only
 /// calls this when `decided_root`/`merge_head` are both absent. Grafting a
@@ -223,7 +227,17 @@ pub(crate) fn graft_out_of_sparse(
         }
         if !sparse.should_descend(&path) {
             // Fully out-of-sparse: graft the parent's entry verbatim, by id
-            // only — never loaded.
+            // only — never loaded. But `read_worktree` scans the whole disk
+            // tree with no regard for the sparse spec (it only honors
+            // `.scignore`), so if the built side already has an entry here,
+            // someone wrote content under a path this partial clone never
+            // fetched. Overwriting it wholesale with the parent's untouched
+            // id (the pre-fix behavior) would silently DISCARD that content
+            // (I1) — there's no way to fold it into a subtree we don't have
+            // on this clone. Refuse loudly instead.
+            if by_name.contains_key(&pe.name) {
+                return Err(Error::GappedPathContent(path));
+            }
             by_name.insert(pe.name.clone(), pe);
             continue;
         }
