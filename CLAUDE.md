@@ -238,6 +238,24 @@ cargo run --bin sc -- verify [<ref>] [--require]   # walk history (all parents, 
                                               # status (trusted ✓ / untrusted ? / INVALID ✗ /
                                               # unsigned); --require exits 1 unless every
                                               # commit is trusted (P22)
+cargo run --bin sc -- transcript attach <ref> <file> [--agent <name>] [--sign] [--identity <key>]
+                                              # seal an agent-session transcript (P30) and attach
+                                              # it to <ref>'s tip; body sealed to the full
+                                              # [recipients] set + escrow — plaintext never enters
+                                              # the CAS (keyless clone gets ciphertext only);
+                                              # --sign attests the transcript id (opt-in)
+cargo run --bin sc -- transcript show <ref> [--identity <key>]   # decrypt + print a tip's
+                                              # transcripts (needs --identity)
+cargo run --bin sc -- transcript list [<ref>] [--json]   # list transcripts (never decrypts)
+cargo run --bin sc -- transcript sign <ref> [--identity <key>]   # retroactively sign a tip's
+                                              # transcript(s) (P30)
+cargo run --bin sc -- ws harvest --transcript <path> [--sign] [--identity <key>]   # attach the
+                                              # file to each harvested workspace's landed snapshot
+                                              # (P30; landing status prints before the attach)
+bash demo/run_transcript_demo.sh              # session-transcript proof (P30): attach --sign,
+                                              # clone rides the pack, keyless clone = ciphertext,
+                                              # identity decrypts byte-exact, sc log marker, gc
+                                              # prunes a transcript with its dead snapshot
 bash demo/run_provenance_demo.sh              # signed-history + rewrite-attack proof (P22):
                                               # alice signs, clone verifies clean, `sc amend`
                                               # in the clone is caught by `sc verify --require`
