@@ -261,9 +261,22 @@ bash demo/run_streaming_demo.sh               # streaming pack transfer proof (P
                                               # SC_PACK_CHUNK=4096 crosses a ~1 MiB signed blob
                                               # in 250+ chunk frames, byte-for-byte clone, zero
                                               # .sc/tmp residue on either end
-cargo run --bin sc -- serve --http <addr> <path>   # sc-native wire protocol over TCP
-                                              # (P26); e.g. `sc serve --http 127.0.0.1:8730 .`;
-                                              # exactly one of --stdio/--http is required
+cargo run --bin sc -- serve --http <addr> <path> [--read-only] [--allow-public]
+                                              # sc-native wire protocol over TCP (P26); e.g.
+                                              # `sc serve --http 127.0.0.1:8730 .`; exactly one
+                                              # of --stdio/--http is required; a non-loopback
+                                              # <addr> is refused unless --read-only,
+                                              # --allow-public, or a configured serve token
+                                              # justifies it (P29)
+cargo run --bin sc -- serve token add --label <name> --scope ro|rw   # mint an
+                                              # sct-<hex> bearer token in .sc/serve-tokens.toml;
+                                              # raw value prints once on stdout (P29)
+cargo run --bin sc -- serve token remove <label>   # drop a token by label (P29)
+cargo run --bin sc -- serve token list [--json]    # list token labels + scopes, never the
+                                              # raw value (P29)
+                                              # client: SC_HTTP_TOKEN=<raw> sc clone/fetch/push
+                                              # sc+http://... presents the bearer on every
+                                              # connection once any token is configured (P29)
 cargo run --bin sc -- clone sc+http://host[:port]/repo <dst>   # clone over sc+http:// (P26;
                                               # port defaults to 8730); sc remote add/fetch/push
                                               # accept the same sc+http:// URL form
@@ -295,6 +308,13 @@ bash demo/run_partial_clone_demo.sh           # partial clone proof (P27): sc cl
                                               # edit AND byte-identical docs/lib); sc backfill
                                               # docs/ shrinks the gap count; sc gc succeeds and
                                               # preserves everything; run twice
+bash demo/run_http_auth_demo.sh               # sc+http access-control proof (P29): a no-token
+                                              # clone is rejected with an authentication error,
+                                              # an ro-token clone reads but its push is rejected
+                                              # read-only, an rw-token push lands and a later
+                                              # ro-token clone sees it, an unjustified 0.0.0.0
+                                              # bind is refused while --allow-public opens it
+                                              # deliberately, zero .sc/tmp residue anywhere
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -1125,6 +1145,30 @@ allocation on the client before validating any entry, the same class
 `Reader::count()` already closed for object decoding — is closed by the
 same guard, `Cur::count()`, applied to `wire::decode_refs_body`. See
 ADR-0039.
+
+**Phase 29 is built.** `sc serve --http` gains three composed access-control
+gates, closing the security horizon's remaining unauthenticated-server
+High — security-only, no new dependency, no TLS. A fail-closed non-loopback
+bind: refused unless justified by `--read-only`, `--allow-public`, or ≥1
+token in `.sc/serve-tokens.toml`; loopback always binds. Opt-in bearer auth
+at the HTTP opening: once ≥1 token is configured, a valid `Authorization:
+Bearer` is required on every connection including loopback (`401` before the
+`200`/wire handoff), verified by a constant-time `BLAKE3` compare against
+`sct-<hex>` (256-bit) tokens stored as `{label, hash, scope}` — the raw
+token prints once and is never persisted; the client presents it via
+`SC_HTTP_TOKEN`. Per-connection read-only enforcement: `--read-only` (a
+floor an `rw` token cannot elevate) or an `ro`-scope token routes the
+connection into `wire::serve_with_policy`, which rejects
+`PutObject`/`PutPack`/`UpdateRef` before any store write via a new
+`EC_READONLY`. A review fix closed a fail-open: a non-loopback bind
+justified only by tokens now fails closed (`401`, not an open server) if its
+last token is removed while running. **Accepted boundaries:** no TLS — a
+bearer token crosses the wire in plaintext, so a public deployment must
+front with a TLS reverse proxy (`sc+https://` deferred); loopback with no
+tokens configured stays unauthenticated by design, for local-dev ergonomics.
+Wire-unchanged but for `EC_READONLY`; `PROTOCOL_VERSION` stays 3; ssh
+`--stdio` is untouched. Proven by `demo/run_http_auth_demo.sh`. See
+ADR-0040.
 
 Remaining follow-ons: operation objects in the CAS, oplog entries for
 remote-tracking refs, extending the sparse gate to

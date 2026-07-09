@@ -1,6 +1,6 @@
 # ADR-0040: sc+http access control
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-09
 - **Phase:** 29
 - **Builds on:** ADR-0036 (P26 sc-native HTTP transport), ADR-0002 (BLAKE3),
@@ -57,6 +57,9 @@ the `Authorization` header. `wire::serve` stays a thin wrapper delegating to
   server, entered explicitly by the operator.
 - `sc serve token add/remove/list` join `sc keygen`/`sc secret` as local-config commands;
   rotation is add-new + remove-old (no expiry metadata in the MVP).
+- The build closed one review-found fail-open: a non-loopback bind justified only by
+  configured tokens now fails closed (`401` on every connection, not an open server) if its
+  last token is removed while the server is still running.
 
 ## Alternatives considered
 
