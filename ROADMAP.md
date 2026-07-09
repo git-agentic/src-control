@@ -340,7 +340,16 @@ across every phase.
 
 ## Active
 
-None — P26 done; P27 partial clone (the horizon capstone) is next up.
+**Scale & reach (P25–P27), continued.** P26 shipped the HTTP transport;
+this phase is the P25–P27 horizon's capstone — a repo can bound network
+transfer to a subset of paths instead of always fetching everything.
+
+- **Phase 27 — Partial clone (in progress).** Task 1: the `.sc/promisor`
+  durable marker (`crates/repo/src/promisor.rs`, `Promisor`) recording a
+  partial clone's fetch-filter prefixes + promisor origin, plus the
+  ancestor-aware `should_descend` predicate the filtered tree walk (Task 2)
+  builds on. Later tasks wire the filter into fetch/clone, on-demand
+  backfill, and gap-tolerant `gc`. See ADR-0037.
 
 ## Completed phases (usability-first ordering)
 

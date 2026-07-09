@@ -85,4 +85,10 @@ impl Layout {
     pub fn tmp_dir(&self) -> PathBuf {
         self.dot_sc.join("tmp")
     }
+    /// `.sc/promisor` — the partial-clone marker (P27): line 1 `origin
+    /// <url>`, then one fetch-filter prefix per line. Absent means a full
+    /// clone (every object was fetched, nothing is a promised gap).
+    pub fn promisor_path(&self) -> PathBuf {
+        self.dot_sc.join("promisor")
+    }
 }
