@@ -121,6 +121,141 @@ pub fn tree_file_entries_with_perms(
     Ok(out)
 }
 
+/// Gap-tolerant variant of [`tree_file_entries_with_perms`] for a partial
+/// clone (P27 Task 4): descends only where `sparse.should_descend` says to,
+/// mirroring `promisor`'s filtered reachability walk. A full (`is_full`)
+/// spec behaves identically to the unfiltered walk. This exists because the
+/// unfiltered walk calls `store.get_tree`/`store.get` on every entry in the
+/// tree regardless of the sparse spec — correct when every object is
+/// guaranteed present (P24's stated invariant: "every object stays in the
+/// CAS regardless of the spec"), but a promisor-filtered clone breaks that
+/// guarantee for out-of-filter subtrees, which were never fetched at all.
+/// `materialize` is the only caller today; other flatteners
+/// (`tree_file_ids`, `tree_file_entries_with_perms` itself) are used by
+/// commit/merge/diff paths that are out of this task's scope and still
+/// assume full CAS presence (a documented boundary, not a Task 4 fix).
+pub(crate) fn tree_file_entries_with_perms_sparse(
+    store: &mut Store,
+    root: ObjectId,
+    sparse: &Sparse,
+) -> Result<BTreeMap<String, (ObjectId, FileMode, u8)>> {
+    if sparse.is_full() {
+        return tree_file_entries_with_perms(store, root);
+    }
+    let mut out = BTreeMap::new();
+    walk_entries_with_perms_sparse(store, root, String::new(), sparse, &mut out)?;
+    Ok(out)
+}
+
+fn walk_entries_with_perms_sparse(
+    store: &mut Store,
+    tree_id: ObjectId,
+    prefix: String,
+    sparse: &Sparse,
+    out: &mut BTreeMap<String, (ObjectId, FileMode, u8)>,
+) -> Result<()> {
+    let tree: Tree = store.get_tree(&tree_id)?;
+    for e in tree.entries {
+        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        match e.kind {
+            EntryKind::Blob => {
+                if sparse.matches(&path) {
+                    out.insert(path, (e.id, e.mode, e.perms));
+                }
+            }
+            EntryKind::Tree => {
+                if sparse.should_descend(&path) {
+                    walk_entries_with_perms_sparse(store, e.id, path, sparse, out)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Splice `parent_id`'s out-of-sparse subtrees/entries back into `built_id`
+/// by id, never reading the content of anything that lies outside `sparse`
+/// (P27 Task 4). `commit` on a partial clone builds `built_id` purely from
+/// in-sparse content (the promisor filter never fetched the rest, so it
+/// can't be flattened to bytes and re-put — see `snapshot_files`'s carry
+/// block), which on its own would silently DROP every out-of-sparse
+/// subtree from the new root. This walks `parent_id`'s tree entries and,
+/// for each one that lies outside `sparse`, grafts the parent's own
+/// `TreeEntry` (its id, unchanged) into the built tree instead of
+/// descending into it — a whole out-of-sparse subtree is carried forward
+/// as one structural-sharing id copy, the id-level analogue of the
+/// per-blob byte-carry `snapshot_files` already does for in-sparse
+/// protected content. An ancestor directory that must be descended through
+/// to reach a deeper in-sparse prefix (`should_descend`) recurses instead
+/// of being grafted whole, so any genuinely in-sparse content beneath it
+/// keeps coming from the built side.
+///
+/// Scope: single-parent (non-merge) commits only — `snapshot_files` only
+/// calls this when `decided_root`/`merge_head` are both absent. Grafting a
+/// TWO-parent (merge/pick) result against a partial clone's gaps is a
+/// documented boundary, not solved here (mirrors the pre-existing P24
+/// sparse+merge boundary notes).
+pub(crate) fn graft_out_of_sparse(
+    store: &mut Store,
+    built_id: ObjectId,
+    parent_id: ObjectId,
+    sparse: &Sparse,
+    prefix: &str,
+) -> Result<ObjectId> {
+    if built_id == parent_id {
+        // Nothing under this subtree changed at all — already identical,
+        // no need to read either side.
+        return Ok(built_id);
+    }
+    let built_tree: Tree = store.get_tree(&built_id)?;
+    let parent_tree: Tree = store.get_tree(&parent_id)?;
+
+    let mut by_name: BTreeMap<String, scl_core::TreeEntry> =
+        built_tree.entries.into_iter().map(|e| (e.name.clone(), e)).collect();
+
+    for pe in parent_tree.entries {
+        let path = if prefix.is_empty() { pe.name.clone() } else { format!("{prefix}/{}", pe.name) };
+        if sparse.matches(&path) {
+            // In-sparse: the built side already reflects the working tree's
+            // current state (including a genuine deletion) — parent's entry
+            // must not resurrect it.
+            continue;
+        }
+        if !sparse.should_descend(&path) {
+            // Fully out-of-sparse: graft the parent's entry verbatim, by id
+            // only — never loaded.
+            by_name.insert(pe.name.clone(), pe);
+            continue;
+        }
+        // An ancestor directory: some deeper prefix is in-sparse, so recurse
+        // rather than grafting the whole thing whole.
+        if pe.kind != EntryKind::Tree {
+            // A file sitting where the sparse spec expects a descendable
+            // directory (a genuinely malformed/unexpected shape) — leave
+            // whatever the built side already decided.
+            continue;
+        }
+        let child_built_id = match by_name.get(&pe.name) {
+            Some(be) if be.kind == EntryKind::Tree => be.id,
+            _ => store.put(Object::Tree(Tree::default()))?,
+        };
+        let merged_child = graft_out_of_sparse(store, child_built_id, pe.id, sparse, &path)?;
+        by_name.insert(
+            pe.name.clone(),
+            scl_core::TreeEntry {
+                name: pe.name,
+                kind: EntryKind::Tree,
+                id: merged_child,
+                mode: pe.mode,
+                perms: 0,
+            },
+        );
+    }
+
+    let tree = Object::Tree(Tree::new(by_name.into_values().collect()));
+    Ok(store.put(tree)?)
+}
+
 fn walk_entries_with_perms(
     store: &mut Store,
     tree_id: ObjectId,
@@ -145,6 +280,52 @@ pub fn tree_file_ids(store: &mut Store, root: ObjectId) -> Result<BTreeMap<Strin
     let mut out = BTreeMap::new();
     walk_tree(store, root, String::new(), &mut out)?;
     Ok(out)
+}
+
+/// Gap-tolerant variant of [`tree_file_ids`] for a partial clone (P27 Task
+/// 4), mirroring [`tree_file_entries_with_perms_sparse`]: descends only
+/// where `sparse.should_descend` says to, so it never `store.get`s a
+/// never-fetched out-of-filter subtree. A full spec behaves identically to
+/// the unfiltered walk. Used by `Repo::tracked_paths_at` — an out-of-sparse
+/// path can never be "tracked" in a way that matters to `.scignore`
+/// filtering, since it is never materialized on disk in the first place.
+pub(crate) fn tree_file_ids_sparse(
+    store: &mut Store,
+    root: ObjectId,
+    sparse: &Sparse,
+) -> Result<BTreeMap<String, ObjectId>> {
+    if sparse.is_full() {
+        return tree_file_ids(store, root);
+    }
+    let mut out = BTreeMap::new();
+    walk_tree_sparse(store, root, String::new(), sparse, &mut out)?;
+    Ok(out)
+}
+
+fn walk_tree_sparse(
+    store: &mut Store,
+    tree_id: ObjectId,
+    prefix: String,
+    sparse: &Sparse,
+    out: &mut BTreeMap<String, ObjectId>,
+) -> Result<()> {
+    let tree: Tree = store.get_tree(&tree_id)?;
+    for e in tree.entries {
+        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        match e.kind {
+            EntryKind::Blob => {
+                if sparse.matches(&path) {
+                    out.insert(path, e.id);
+                }
+            }
+            EntryKind::Tree => {
+                if sparse.should_descend(&path) {
+                    walk_tree_sparse(store, e.id, path, sparse, out)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn walk_tree(
@@ -286,7 +467,14 @@ pub fn materialize(
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
 ) -> Result<Vec<String>> {
-    let target = tree_file_entries_with_perms(store, target_root)?;
+    // Gap-tolerant when sparse is active (P27 Task 4): a promisor-filtered
+    // clone never fetched out-of-filter subtrees at all, so an unfiltered
+    // walk here would `NotFound` on them. `old_root`'s walk stays
+    // unfiltered below — clone (the case that hits this) always passes
+    // `old_root: None`; widening a partial clone's sparse view beyond its
+    // promisor filter via `old_root` remains a documented boundary, not
+    // fixed by this task.
+    let target = tree_file_entries_with_perms_sparse(store, target_root, sparse)?;
     if let Some(old) = old_root {
         for p in tree_file_ids(store, old)?.keys() {
             if !target.contains_key(p) || !sparse.matches(p) {

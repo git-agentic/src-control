@@ -260,6 +260,12 @@ enum Cmd {
         /// sc-native remote (ADR-0022/ADR-0028).
         #[arg(long)]
         git: bool,
+        /// Partial clone (P27): only fetch objects under this path prefix
+        /// (repeatable). Writes `.sc/promisor` + `.sc/sparse`; missing
+        /// objects can later be pulled in with `sc backfill`. Not supported
+        /// over a git-bridge remote.
+        #[arg(long)]
+        filter: Vec<String>,
     },
     /// Serve a repo to a remote `sc` client, either over stdin/stdout
     /// (invoked by `ssh` for ssh:// remotes) or over TCP (`sc+http://`
@@ -387,6 +393,13 @@ enum Cmd {
     Sparse {
         #[command(subcommand)]
         op: SparseOp,
+    },
+    /// Widen a partial clone: fetch objects under these prefixes from the
+    /// promisor origin and widen `.sc/promisor` to include them. Errors if
+    /// this repo is not a partial clone.
+    Backfill {
+        /// Path prefixes to backfill (repeatable).
+        prefixes: Vec<String>,
     },
 }
 
@@ -624,7 +637,7 @@ fn main() -> Result<()> {
             run_work(agents, name, budget_mb, with_secrets, identity, author, cmd)
         }
         Cmd::Ws { op } => run_ws(op),
-        Cmd::Clone { src, dst, git } => run_clone(src, dst, git),
+        Cmd::Clone { src, dst, git, filter } => run_clone(src, dst, git, filter),
         Cmd::Serve { stdio, http, path } => run_serve(stdio, http, path),
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
@@ -641,6 +654,7 @@ fn main() -> Result<()> {
         Cmd::Sign { r#ref, identity } => run_sign(&r#ref, identity),
         Cmd::Verify { r#ref, require } => run_verify(r#ref, require),
         Cmd::Sparse { op } => run_sparse(op),
+        Cmd::Backfill { prefixes } => run_backfill(prefixes),
     }
 }
 
@@ -2359,7 +2373,7 @@ fn resolve_ids_to_pubkeys(
     Ok(out)
 }
 
-fn run_clone(src: String, dst: PathBuf, git: bool) -> Result<()> {
+fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>) -> Result<()> {
     // Auto-detect unambiguous git URL forms (https/http, scp-style, file://):
     // those can never be sc-native, so no flag is needed. Bare `ssh://` is
     // ambiguous — it means an sc-native remote (ADR-0022) unless `--git`
@@ -2367,11 +2381,35 @@ fn run_clone(src: String, dst: PathBuf, git: bool) -> Result<()> {
     let git_shaped =
         scl_gitio::bridge::is_network_git_url(&src) && !src.starts_with("ssh://");
     if git || git_shaped {
+        if !filter.is_empty() {
+            anyhow::bail!("partial clone is not supported over git remotes");
+        }
         return run_clone_git(&src, &dst);
     }
-    let repo = scl_repo::Repo::clone_url(&src, &dst)?;
+    let filter_opt = (!filter.is_empty()).then_some(filter.as_slice());
+    let repo = scl_repo::Repo::clone_url_filtered(&src, &dst, filter_opt)?;
     let n = repo.branches()?.len();
-    println!("cloned {} into {} ({} branch(es))", src, dst.display(), n);
+    if filter_opt.is_some() {
+        println!(
+            "cloned {} into {} ({} branch(es), partial: {})",
+            src,
+            dst.display(),
+            n,
+            filter.join(", ")
+        );
+    } else {
+        println!("cloned {} into {} ({} branch(es))", src, dst.display(), n);
+    }
+    Ok(())
+}
+
+/// Widen a partial clone: fetch objects under `prefixes` from the promisor
+/// origin and widen `.sc/promisor`. Errors if this repo is not a partial
+/// clone.
+fn run_backfill(prefixes: Vec<String>) -> Result<()> {
+    let repo = open_repo()?;
+    repo.backfill(&prefixes)?;
+    println!("backfilled {} prefix(es)", prefixes.len());
     Ok(())
 }
 
@@ -3134,7 +3172,7 @@ mod tests {
         // Route through run_clone WITHOUT --git: file:// is an unambiguous
         // git URL form, so auto-detect must pick the mirror-bridge path.
         let dst = root.join("cloned");
-        run_clone(format!("file://{}", hub.display()), dst.clone(), false).unwrap();
+        run_clone(format!("file://{}", hub.display()), dst.clone(), false, Vec::new()).unwrap();
         let repo = scl_repo::Repo::open(&dst).unwrap();
         assert_eq!(scl_repo::refs::current_branch(repo.layout()).unwrap(), "trunk",
             "local branch must adopt the remote default name");
@@ -3160,6 +3198,7 @@ mod tests {
             "ssh://testhost/srv/repo".to_string(),
             root.join("cloned-ssh"),
             false,
+            Vec::new(),
         )
         .unwrap_err();
         std::env::remove_var("SC_SSH");

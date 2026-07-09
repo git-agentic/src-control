@@ -143,7 +143,17 @@ impl Repo {
                 let root = self.snapshot(&tip)?.root;
                 let store_arc = self.vfs.store();
                 let mut store = store_arc.lock().unwrap();
-                Ok(worktree::tree_file_ids(&mut store, root)?.into_keys().collect())
+                // Partial clone (P27 Task 4): gap-tolerant when this repo
+                // never fetched every subtree — an out-of-sparse path is
+                // never materialized on disk in the first place, so it
+                // being absent from the tracked set here has no effect on
+                // `.scignore` filtering either way.
+                let ids = if self.promisor()?.is_some() {
+                    worktree::tree_file_ids_sparse(&mut store, root, &self.sparse_spec()?)?
+                } else {
+                    worktree::tree_file_ids(&mut store, root)?
+                };
+                Ok(ids.into_keys().collect())
             }
         }
     }
@@ -393,6 +403,16 @@ impl Repo {
         // This landing is dormant when `sparse` is full: with no narrowing in
         // effect every path matches and the OR term is always false —
         // behavior is unchanged from P15 for a full checkout.
+        // Partial clone (P27 Task 4): a promisor-filtered clone never
+        // fetched out-of-filter subtrees at all, so the unfiltered
+        // enumeration below would `NotFound` on them (it calls
+        // `store.get_tree`/`store.get` on every entry regardless of
+        // `sparse`). Route through the gap-tolerant sparse-scoped
+        // flattener instead — but ONLY on a partial clone: a full clone
+        // with an active sparse spec still has every object, and its
+        // per-blob byte-carry below (the existing P24 mechanism) must stay
+        // exactly as it was to avoid any behavior change for that case.
+        let partial = self.promisor()?.is_some();
         {
             let mut on_disk: std::collections::BTreeSet<String> =
                 all.iter().map(|(p, _, _, _)| p.clone()).collect();
@@ -405,13 +425,21 @@ impl Repo {
                 Vec::new();
             let mut decided_paths: std::collections::BTreeSet<String> = Default::default();
             if let Some(dr) = decided_root {
-                let decided = worktree::tree_file_entries_with_perms(&mut store, dr)?;
+                let decided = if partial {
+                    worktree::tree_file_entries_with_perms_sparse(&mut store, dr, sparse)?
+                } else {
+                    worktree::tree_file_entries_with_perms(&mut store, dr)?
+                };
                 decided_paths = decided.keys().cloned().collect();
                 sources.push(decided);
             }
             for parent in tip.into_iter().chain(merge_head.into_iter()) {
                 let parent_root = store.get_snapshot(&parent)?.root;
-                let mut entries = worktree::tree_file_entries_with_perms(&mut store, parent_root)?;
+                let mut entries = if partial {
+                    worktree::tree_file_entries_with_perms_sparse(&mut store, parent_root, sparse)?
+                } else {
+                    worktree::tree_file_entries_with_perms(&mut store, parent_root)?
+                };
                 entries.retain(|p, _| !decided_paths.contains(p));
                 sources.push(entries);
             }
@@ -452,7 +480,26 @@ impl Repo {
             }
         }
 
-        let root = self.vfs.write_tree_with_perms(&all)?;
+        let mut root = self.vfs.write_tree_with_perms(&all)?;
+
+        // Partial-clone graft (P27 Task 4): the enumeration above already
+        // steered clear of out-of-filter content, but `write_tree_with_perms`
+        // still only knows about `all` — on a partial clone that means the
+        // freshly-built root is MISSING every out-of-sparse subtree entirely
+        // (there was never a byte-carried entry for it to include). Splice
+        // those subtrees back in by id from the tip's own root tree, never
+        // reading their content (`graft_out_of_sparse`; see its doc comment
+        // for the id-only walk). Scoped to a plain single-tip commit —
+        // `decided_root`/`merge_head` both absent — matching the carry
+        // block's own documented merge/pick boundary above.
+        if partial && decided_root.is_none() && merge_head.is_none() {
+            if let Some(t) = tip {
+                let store_arc = self.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                let parent_root = store.get_snapshot(&t)?.root;
+                root = worktree::graft_out_of_sparse(&mut store, root, parent_root, sparse, "")?;
+            }
+        }
 
         // Rebuild policy.wrapped from only this commit's protected blobs, dropping
         // any stale entries. Crucially, reuse the prior wrap bytes for an unchanged

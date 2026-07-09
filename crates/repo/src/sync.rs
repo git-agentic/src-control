@@ -49,35 +49,61 @@ impl Repo {
     }
 
     /// Clone the repo at `src_url` (local path or `ssh://…`) into a fresh repo
-    /// at `dst`. Transfers all objects reachable from src's branches, copies
+    /// at `dst`. Full (unfiltered) clone — thin wrapper over
+    /// [`Repo::clone_url_filtered`] with `filter = None`, so every existing
+    /// caller/behavior is unchanged (no `.sc/promisor`, no `.sc/sparse`).
+    pub fn clone_url(src_url: &str, dst: impl AsRef<Path>) -> Result<Repo> {
+        Self::clone_url_filtered(src_url, dst, None)
+    }
+
+    /// Clone the repo at `src_url` (local path or `ssh://…`) into a fresh repo
+    /// at `dst`. Transfers objects reachable from src's branches, copies
     /// refs + HEAD, seeds `origin/*` remote-tracking refs, records
     /// `origin = src_url`, and materializes HEAD into the dst working tree.
     ///
+    /// `filter`: `None` is a full clone (unchanged behavior). `Some(prefixes)`
+    /// is a partial clone (P27): the transfer only pulls objects matching
+    /// `prefixes` (Task 3's prefix-scoped `get_pack`), and — before the final
+    /// materialize — this writes `.sc/promisor` (the durable fetch-filter
+    /// marker: `origin = src_url` + `prefixes`, so `Repo::backfill` later
+    /// knows where and what to widen from) AND `.sc/sparse` (the same
+    /// prefixes), so the initial checkout only lays out in-filter paths.
+    /// Writing `.sc/sparse` first is load-bearing, not cosmetic: the final
+    /// `worktree::materialize` call below would otherwise try to read the
+    /// gapped (never-transferred) out-of-filter blobs and fail with
+    /// `NotFound` — the sparse spec is what tells `materialize` to skip them.
+    ///
     /// On `Err`, `dst` may be left with a partially-initialized `.sc/`; the
     /// caller should remove it before retrying.
-    pub fn clone_url(src_url: &str, dst: impl AsRef<Path>) -> Result<Repo> {
+    pub fn clone_url_filtered(
+        src_url: &str,
+        dst: impl AsRef<Path>,
+        filter: Option<&[String]>,
+    ) -> Result<Repo> {
         let transport = open_transport(src_url)?;
         let remote_refs = transport.list_refs()?;
         let head_branch = transport.head_branch()?;
 
         let dst_repo = Repo::init(dst.as_ref())?;
 
-        // Transfer every object reachable from the remote's branch tips.
+        // Transfer every (in-filter, when filtered) object reachable from
+        // the remote's branch tips.
         let tips: Vec<ObjectId> = remote_refs.iter().map(|(_, id)| *id).collect();
         {
             let store_arc = dst_repo.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            // Fresh clone dst has no local refs yet → no haves → full transfer.
-            transfer_objects(&dst_repo.layout, transport.as_ref(), &mut store, &tips, &[], None)?;
+            // Fresh clone dst has no local refs yet → no haves → full transfer
+            // (of whatever `filter` scopes it to).
+            transfer_objects(&dst_repo.layout, transport.as_ref(), &mut store, &tips, &[], filter)?;
             // Clone-specific belt-and-suspenders (P22 Task 3): the transfer
             // above already indexes every signature object it wrote via
             // `index_incoming`, but a fresh clone is a wholesale copy of the
-            // whole reachable set — cheap and simplest to instead trust a
-            // full post-copy scan of what actually landed on disk, rather
-            // than depending on the transfer call site's exact bookkeeping.
-            // Idempotent: `reindex` rewrites the index from scratch, so
-            // running it after `index_incoming` already populated entries
-            // is a no-op on top of a no-op, not a double-count.
+            // whole (in-filter) reachable set — cheap and simplest to instead
+            // trust a full post-copy scan of what actually landed on disk,
+            // rather than depending on the transfer call site's exact
+            // bookkeeping. Idempotent: `reindex` rewrites the index from
+            // scratch, so running it after `index_incoming` already populated
+            // entries is a no-op on top of a no-op, not a double-count.
             crate::signatures::reindex(&dst_repo.layout, &mut store)?;
         }
 
@@ -92,6 +118,24 @@ impl Repo {
         // Record origin.
         dst_repo.remote_add("origin", src_url)?;
 
+        // Partial clone: persist the durable fetch-filter marker + a matching
+        // sparse spec BEFORE the final materialize (see doc comment above for
+        // why the ordering matters). A full clone keeps the pre-P27 behavior
+        // exactly: no `.sc/promisor`, and `Sparse::default()` (full
+        // materialization) rather than `dst_repo.sparse_spec()` — clone still
+        // doesn't transfer a pre-existing `.sc/sparse` from the source (out
+        // of P24 scope, sparse config is local like `.scignore`).
+        let sparse_spec = match filter {
+            Some(prefixes) => {
+                let promisor = crate::promisor::Promisor::new(src_url, prefixes.to_vec());
+                crate::promisor::store(&dst_repo.layout, &promisor)?;
+                let sparse = crate::sparse::Sparse::new(prefixes.to_vec());
+                crate::sparse::store(&dst_repo.layout, &sparse)?;
+                sparse
+            }
+            None => crate::sparse::Sparse::default(),
+        };
+
         // Materialize HEAD into the working tree. No identity is available at
         // clone time, so PROTECTED files are skipped (ciphertext stays in objects
         // but plaintext is not written to disk — correct for unauthorized clones).
@@ -101,9 +145,6 @@ impl Repo {
             let head_snap = store.get_snapshot(&head_tip)?;
             let head_root = head_snap.root;
             let head_protection = head_snap.protection;
-            // Clone doesn't transfer `.sc/sparse` (out of P24 scope — sparse
-            // config is local, like `.scignore`), so a fresh clone always
-            // starts full: `Sparse::default()` here, not `dst_repo.sparse_spec()`.
             worktree::materialize(
                 &dst_repo.layout,
                 &mut store,
@@ -111,10 +152,51 @@ impl Repo {
                 None,
                 &head_protection,
                 None,
-                &crate::sparse::Sparse::default(),
+                &sparse_spec,
             )?;
         }
         Ok(dst_repo)
+    }
+
+    /// Backfill: widen a partial clone by fetching every object matching
+    /// `prefixes` that the current `.sc/promisor` filter excluded, from the
+    /// promisor's recorded origin. Errors if this repo is not a partial
+    /// clone (`.sc/promisor` absent — nothing to backfill).
+    ///
+    /// `haves` is deliberately empty, not "every locally-present object id"
+    /// (an earlier read of this task assumed the latter — see the P27 Task 4
+    /// report for the full reasoning). `Transport::get_pack`'s `haves`
+    /// contract (`build_pack_tempfile`) treats each have as a *tip*: it
+    /// computes that tip's FULL unfiltered reachable set on the origin and
+    /// subtracts it from the want set. A partial clone's local branch tip
+    /// does NOT have a complete closure (that is the entire premise of a
+    /// promisor filter), so passing it as a have would make the origin
+    /// subtract objects we don't actually hold — silently returning an empty
+    /// (or incomplete) pack. Passing non-snapshot ids as haves fails outright
+    /// (`get_pack`'s tip walk expects `Object::Snapshot`). So this fetch
+    /// conservatively re-sends the small already-present snapshot/tree
+    /// metadata that the filtered want-walk touches along the way to the
+    /// genuinely-new blobs — wasteful, not incorrect: `ingest_pack_file`'s
+    /// underlying `put` is idempotent on content-addressed ids.
+    pub fn backfill(&self, prefixes: &[String]) -> Result<()> {
+        let mut promisor = crate::promisor::load(&self.layout)?.ok_or_else(|| {
+            Error::InvalidArgument(
+                "not a partial clone (.sc/promisor absent); nothing to backfill".into(),
+            )
+        })?;
+        let transport = open_transport(&promisor.origin)?;
+
+        let tips: Vec<ObjectId> = refs::list_heads(&self.layout)?.into_iter().map(|(_, id)| id).collect();
+
+        {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            transfer_objects(&self.layout, transport.as_ref(), &mut store, &tips, &[], Some(prefixes))?;
+        }
+
+        promisor.widen(prefixes);
+        crate::promisor::store(&self.layout, &promisor)?;
+        Ok(())
     }
 
     /// Fetch objects + branch tips from `remote` into remote-tracking refs
@@ -188,7 +270,27 @@ impl Repo {
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            let reachable = reachable::reachable_objects(&mut *store, &[local_tip])?;
+            // Partial-clone push (P27 Task 4): an unfiltered reachability
+            // walk would descend into any gapped (never-fetched)
+            // out-of-filter subtree and NotFound on the missing tree/blob
+            // object. When this repo is a partial clone, walk with its
+            // promisor filter instead — this sends exactly the (possibly
+            // newly-committed) in-filter objects; the origin already has
+            // every out-of-filter object untouched (a P24/P15 carry-by-id
+            // commit never wrote to them), so a full clone of the origin
+            // still sees the intact gapped subtree after the push lands.
+            let promisor = self.promisor()?;
+            let reachable = match &promisor {
+                Some(p) => {
+                    reachable::reachable_objects_filtered(
+                        &mut *store,
+                        &[local_tip],
+                        Some(p as &dyn reachable::PrefixFilter),
+                    )?
+                    .included
+                }
+                None => reachable::reachable_objects(&mut *store, &[local_tip])?,
+            };
             // Sender seam (P22 Task 3): unlike `fetch`/`clone`, `push` builds
             // its outgoing set directly from a local reachability walk
             // rather than calling `Transport::get_pack` — so the
@@ -284,6 +386,7 @@ mod tests {
     use crate::repo::Repo;
     use crate::signatures::SigStatus;
     use crate::sync::transfer_objects;
+    use scl_core::ObjectId;
 
     #[test]
     fn signatures_ride_fetch_push_and_clone_local() {
@@ -604,5 +707,286 @@ mod tests {
 
         std::fs::remove_dir_all(&src).unwrap();
         std::fs::remove_dir_all(&dst).unwrap();
+    }
+
+    // ── P27 Task 4: `sc clone --filter` + `.sc/promisor` + `sc backfill` +
+    // partial-clone push round-trip. ──
+
+    /// Build a repo at `root` with `src/a.txt` and `docs/b.txt`, each in
+    /// their own subtree, and one commit. Returns (repo, tip, docs blob id,
+    /// docs subTREE id — the root's `docs` entry id, comparable without
+    /// ever loading the tree itself, which is what a partial-clone
+    /// verification needs since that tree may be gapped on the dst side).
+    fn tmp_repo_with_src_and_docs(root: &std::path::Path) -> (Repo, ObjectId, ObjectId, ObjectId) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        let repo = Repo::init(root).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"src-one").unwrap();
+        std::fs::write(root.join("docs/b.txt"), b"docs-one").unwrap();
+        let tip = repo.commit("t", "c1").unwrap();
+
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let snap = store.get_snapshot(&tip).unwrap();
+        let root_tree = store.get_tree(&snap.root).unwrap();
+        let docs_tree_id = root_tree.get("docs").unwrap().id;
+        let docs_tree = store.get_tree(&docs_tree_id).unwrap();
+        let docs_blob_id = docs_tree.get("b.txt").unwrap().id;
+        drop(store);
+        (repo, tip, docs_blob_id, docs_tree_id)
+    }
+
+    #[test]
+    fn partial_clone_omits_out_of_filter_objects() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-pclone-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-pclone-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+
+        let (src, tip, docs_blob_id, _docs_tree_id) = tmp_repo_with_src_and_docs(&src_root);
+        let src_blob_id = {
+            let store_arc = src.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            let snap = store.get_snapshot(&tip).unwrap();
+            let root_tree = store.get_tree(&snap.root).unwrap();
+            let src_tree_id = root_tree.get("src").unwrap().id;
+            let src_tree = store.get_tree(&src_tree_id).unwrap();
+            src_tree.get("a.txt").unwrap().id
+        };
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        {
+            let store_arc = dst.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(store.contains(&src_blob_id), "in-filter src/ blob must be present");
+            assert!(!store.contains(&docs_blob_id), "out-of-filter docs/ blob must NOT be present");
+        }
+
+        let promisor = dst.promisor().unwrap().expect(".sc/promisor must exist after a filtered clone");
+        assert_eq!(promisor.origin, src_root.to_str().unwrap());
+        assert_eq!(promisor.prefixes(), &["src/".to_string()]);
+
+        let sparse = dst.sparse_spec().unwrap();
+        assert_eq!(sparse.prefixes(), &["src/".to_string()]);
+
+        // The working tree only materialized the in-filter subtree.
+        assert!(dst_root.join("src/a.txt").exists());
+        assert!(!dst_root.join("docs/b.txt").exists());
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn partial_clone_commit_and_push_round_trips() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-pcpush-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-pcpush-dst-{pid}"));
+        let full_root = std::env::temp_dir().join(format!("scl-pcpush-full-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        let _ = std::fs::remove_dir_all(&full_root);
+
+        let (src, _tip, _docs_blob_id, docs_tree_id) = tmp_repo_with_src_and_docs(&src_root);
+        drop(src);
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        // Edit the in-filter file and commit. The docs/ subtree is carried
+        // forward by id (P27 Task 4's `graft_out_of_sparse`, built on P24/P15
+        // carry-by-id discipline) without ever reading the gapped docs/
+        // object — this repo's store never held (and still doesn't hold) the
+        // docs/ tree or blob object at all.
+        std::fs::write(dst_root.join("src/a.txt"), b"src-two").unwrap();
+        let new_tip = dst.commit("t", "c2").unwrap();
+
+        // The new snapshot's root tree must still reference the ORIGINAL
+        // docs/ subtree id byte-identically — the commit never touched the
+        // gap. Compared at the root-entry level only (never loading the docs
+        // tree itself, which stays gapped on this partial clone).
+        {
+            let store_arc = dst.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            let new_snap = store.get_snapshot(&new_tip).unwrap();
+            let new_root_tree = store.get_tree(&new_snap.root).unwrap();
+            let new_docs_entry_id = new_root_tree.get("docs").unwrap().id;
+            assert_eq!(
+                new_docs_entry_id, docs_tree_id,
+                "the grafted docs/ entry must reference the original subtree id byte-identically"
+            );
+            assert!(
+                !store.contains(&docs_tree_id),
+                "the docs/ subtree must still be a gap after commit — carry-by-id must never \
+                 have read (and thus never re-put) it"
+            );
+        }
+
+        // Push back to origin — this must not NotFound on the gapped docs/
+        // subtree (the P27 Task 4 push fix: a filtered reachability walk
+        // when this repo is a partial clone).
+        dst.push("origin").unwrap();
+
+        // A full clone of the origin sees the src/ edit AND the intact docs/.
+        let full = Repo::clone_url(src_root.to_str().unwrap(), &full_root).unwrap();
+        assert_eq!(full.head_tip().unwrap(), Some(new_tip));
+        assert_eq!(std::fs::read(full_root.join("src/a.txt")).unwrap(), b"src-two");
+        assert_eq!(std::fs::read(full_root.join("docs/b.txt")).unwrap(), b"docs-one");
+
+        drop(dst);
+        drop(full);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+        std::fs::remove_dir_all(&full_root).unwrap();
+    }
+
+    #[test]
+    fn backfill_makes_out_of_filter_present() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-backfill-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-backfill-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+
+        let (src, _tip, docs_blob_id, _docs_tree_id) = tmp_repo_with_src_and_docs(&src_root);
+        drop(src);
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+        {
+            let store_arc = dst.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(!store.contains(&docs_blob_id), "docs/ must be gapped before backfill");
+        }
+
+        dst.backfill(&["docs/".to_string()]).unwrap();
+
+        {
+            let store_arc = dst.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(store.contains(&docs_blob_id), "docs/ blob must be present after backfill");
+        }
+
+        let promisor = dst.promisor().unwrap().unwrap();
+        assert_eq!(promisor.prefixes(), &["src/".to_string(), "docs/".to_string()]);
+
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn backfill_on_full_clone_errors() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-backfillfull-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-backfillfull-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(&src_root).unwrap();
+
+        let repo = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("a.txt"), b"one").unwrap();
+        repo.commit("t", "c1").unwrap();
+        drop(repo);
+
+        let dst = Repo::clone_url(src_root.to_str().unwrap(), &dst_root).unwrap();
+        assert!(dst.promisor().unwrap().is_none(), "a full clone must have no .sc/promisor");
+
+        let err = dst.backfill(&["docs/".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a partial clone"),
+            "backfill on a full clone must error clearly, got: {msg}"
+        );
+
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// Loopback `sc+http://` server standing in for `sc serve --http`
+    /// (mirrors `http_transport::tests::spawn_loopback_server`, duplicated
+    /// here rather than exposed `pub(crate)` across modules for one test).
+    fn spawn_backfill_http_server(
+        root: std::path::PathBuf,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || loop {
+            let (sock, _addr) = match listener.accept() {
+                Ok(x) => x,
+                Err(_) => return,
+            };
+            let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+            let mut sock = sock;
+            let _target = match crate::http_transport::read_client_opening(&mut reader) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            crate::http_transport::write_status(&mut sock, 200).unwrap();
+            if crate::wire::serve(&root, &mut reader, &mut sock).is_err() {
+                return;
+            }
+        });
+        (port, handle)
+    }
+
+    /// Partial clone + backfill driven over the real `sc+http://` loopback
+    /// transport (P26), not just a local path — proves Task 3's filtered
+    /// `get_pack` and this task's `.sc/promisor`/backfill wiring both work
+    /// over the wire, not only `LocalTransport`.
+    #[test]
+    fn partial_clone_and_backfill_over_http_loopback() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-pclonehttp-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-pclonehttp-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+
+        let (src, _tip, docs_blob_id, _docs_tree_id) = tmp_repo_with_src_and_docs(&src_root);
+
+        let (port, server) = spawn_backfill_http_server(src_root.clone());
+        let url = format!("sc+http://127.0.0.1:{port}/repo");
+
+        let dst = Repo::clone_url_filtered(&url, &dst_root, Some(&["src/".to_string()])).unwrap();
+        {
+            let store_arc = dst.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(!store.contains(&docs_blob_id), "docs/ must be gapped over http too");
+        }
+
+        dst.backfill(&["docs/".to_string()]).unwrap();
+        {
+            let store_arc = dst.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(store.contains(&docs_blob_id), "docs/ must be backfilled over http too");
+        }
+
+        drop(dst);
+        drop(src);
+        // The loopback server loops accepting connections until one of the
+        // per-connection calls errors (e.g. EOF on shutdown) — dropping the
+        // repos above doesn't stop it, so just detach rather than join.
+        drop(server);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
     }
 }

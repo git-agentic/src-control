@@ -54,6 +54,24 @@ impl Sparse {
     pub fn prefixes(&self) -> &[String] {
         &self.prefixes
     }
+
+    /// Should a tree walk descend into `path`? True if `path` is itself
+    /// in-spec, or some spec prefix lies strictly *under* `path` (an
+    /// ancestor the walk must pass through to reach in-spec content deeper
+    /// in the tree). A full (empty) spec always descends. Mirrors
+    /// [`crate::promisor::Promisor::should_descend`] exactly — added for
+    /// P27 Task 4 so a gap-tolerant tree walk (`materialize` on a partial
+    /// clone) can prune out-of-sparse subtrees without ever calling
+    /// `store.get` on an object a promisor filter never fetched.
+    pub fn should_descend(&self, path: &str) -> bool {
+        self.is_full()
+            || path.is_empty()
+            || self.matches(path)
+            || self
+                .prefixes
+                .iter()
+                .any(|p| p.trim_end_matches('/').starts_with(&format!("{path}/")))
+    }
 }
 
 /// Remove a file, treating "already absent" as success but propagating any
