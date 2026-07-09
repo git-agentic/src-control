@@ -89,11 +89,23 @@ impl Promisor {
 }
 
 /// Build the "outside this partial clone's fetch filter" error for `path`
-/// (P27 Task 5) — one shared error so the sparse-widen preflight
-/// (`set_sparse`/`disable_sparse`) and the merge/pick out-of-filter guard
-/// speak with one voice, both pointing at `sc backfill`.
+/// (P27 Task 5) — used by the sparse-widen preflight
+/// (`set_sparse`/`disable_sparse`), where `path` is a real prefix `sc
+/// backfill <path>` can act on directly.
 pub fn partial_gap_hint(path: &str) -> Error {
     Error::GapOutsideFilter(path.to_string())
+}
+
+/// Build the "this operation isn't supported on a partial clone at all"
+/// error (P27 Task 5 review fix): merge, cherry-pick/rebase replay, `sc ws
+/// harvest`, and `sc work` all need the FULL tree of whatever they touch,
+/// not just one path — `partial_gap_hint`'s `sc backfill <path>` phrasing
+/// was misleading there (there's no single path to name), and feeding it a
+/// free-text sentence in place of a path produced a garbled, non-actionable
+/// message (`sc backfill <merge across this partial clone's fetch
+/// filter>`). `op` is a short operation name, e.g. `"merge"`.
+pub fn partial_clone_unsupported(op: &str) -> Error {
+    Error::PartialCloneUnsupported(op.to_string())
 }
 
 /// Load the repo's promisor marker. An absent `.sc/promisor` file reads as

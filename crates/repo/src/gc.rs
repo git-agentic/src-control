@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use scl_core::{ObjectId, Store};
+use scl_core::{Object, ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
@@ -99,7 +99,37 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     // takes the unfiltered path, unchanged.
     let filter = promisor::load(layout)?;
     let mut reachable: BTreeSet<ObjectId> = match &filter {
-        Some(p) => reachable::reachable_objects_filtered(store, &roots, Some(p))?.included,
+        Some(p) => {
+            let r = reachable::reachable_objects_filtered(store, &roots, Some(p))?;
+            let mut included = r.included;
+            // P27 Task 5 review Critical fix (gc defense-in-depth): a gap id
+            // means "referenced by an in-filter parent tree but never
+            // fetched" — the filtered walk deliberately never `get()`s it,
+            // so it's normally absent locally. But gc must not treat "gap"
+            // as license to prune an object that IS present locally for any
+            // reason (belt-and-suspenders alongside the Task 5 commit-side
+            // refusal above, which closes the one known way such an object
+            // could be created; this is the backstop for any path that
+            // doesn't yet route through that guard). Walk every PRESENT gap
+            // id in, unfiltered, so it — and anything it in turn references
+            // — becomes part of `reachable` and survives the sweep below:
+            // gc is structurally incapable of pruning a present, reachable
+            // object, not just accidentally sparing it.
+            for gap in &r.gaps {
+                if included.contains(gap) || !store.contains(gap) {
+                    continue;
+                }
+                match store.get(gap)? {
+                    Object::Tree(_) => {
+                        reachable::walk_tree(store, *gap, &mut included)?;
+                    }
+                    _ => {
+                        included.insert(*gap);
+                    }
+                }
+            }
+            included
+        }
         None => reachable::reachable_objects(store, &roots)?,
     };
     // An in-progress merge's or cherry-pick's decided carried tree
@@ -645,6 +675,84 @@ mod tests {
         let arc = dst.vfs().store();
         let s = arc.lock().unwrap();
         assert!(s.contains(&src_blob_id), "in-filter object reached and kept by the filtered gc walk");
+        drop(s);
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// P27 Task 5 review CRITICAL fix, defense-in-depth half: even though
+    /// the commit-side guard (`partial_commit_refuses_out_of_filter_new_path`
+    /// in `repo.rs`) now closes the one known way to land out-of-filter
+    /// content locally, gc itself must be structurally incapable of pruning
+    /// a gap id that turns out to be present — not merely "currently
+    /// nothing produces this state". The filtered walk (`reachable.rs`)
+    /// records a GAP only at the point it stops descending — for a whole
+    /// out-of-filter subtree like `docs/`, that's the `docs` TREE id
+    /// itself, not any blob further inside it (the walk never reaches far
+    /// enough to see those). So seeding the test state means copying BOTH
+    /// the `docs` tree object AND its `b.txt` blob — verbatim, by content,
+    /// from the source repo that actually has them — directly into the
+    /// partial clone's store (bypassing the commit path entirely, per the
+    /// task's fallback instruction), reproducing "this object is present
+    /// locally for whatever reason" without needing a way to actually
+    /// commit it. `sc gc --prune-expire 0` must not prune either.
+    #[test]
+    fn gc_never_prunes_present_reachable_out_of_filter_object() {
+        let src_root = tmp_root("partial-src-present-gap");
+        let dst_root = tmp_root("partial-dst-present-gap");
+        let (src, src_blob_id, docs_blob_id) = tmp_repo_with_src_and_docs(&src_root);
+
+        let (docs_tree_id, docs_tree_obj, docs_blob_obj) = {
+            let arc = src.vfs().store();
+            let mut s = arc.lock().unwrap();
+            let tip = src.head_tip().unwrap().unwrap();
+            let snap = s.get_snapshot(&tip).unwrap();
+            let root_tree = s.get_tree(&snap.root).unwrap();
+            let docs_entry = root_tree.get("docs").unwrap();
+            let docs_tree: scl_core::Tree = s.get_tree(&docs_entry.id).unwrap();
+            let docs_blob = s.get(&docs_blob_id).unwrap();
+            (docs_entry.id, scl_core::Object::Tree(docs_tree), docs_blob)
+        };
+
+        let dst = crate::repo::Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        {
+            let arc = dst.vfs().store();
+            let mut s = arc.lock().unwrap();
+            assert!(!s.contains(&docs_tree_id), "out-of-filter docs/ tree starts absent");
+            assert!(!s.contains(&docs_blob_id), "out-of-filter docs/ blob starts absent");
+            // Directly seed the store with the gap's own content, copied
+            // verbatim from the source — content addressing guarantees the
+            // ids match what the tip's own (in-filter) root tree already
+            // references as a gap.
+            let tid = s.put(docs_tree_obj).unwrap();
+            let bid = s.put(docs_blob_obj).unwrap();
+            assert_eq!(tid, docs_tree_id, "seeded tree must match the gap's own id");
+            assert_eq!(bid, docs_blob_id, "seeded blob must match its own id");
+        }
+
+        let stats = dst.gc(Duration::from_secs(0)).unwrap();
+        let _ = stats;
+
+        let arc = dst.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(s.contains(&src_blob_id), "in-filter src/ blob survives gc");
+        assert!(
+            s.contains(&docs_tree_id),
+            "a PRESENT reachable out-of-filter tree must survive gc, not be pruned as a gap"
+        );
+        assert!(
+            s.contains(&docs_blob_id),
+            "a PRESENT reachable out-of-filter blob must survive gc, not be pruned as a gap"
+        );
         drop(s);
 
         drop(src);

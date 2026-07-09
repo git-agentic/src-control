@@ -443,6 +443,18 @@ impl Repo {
         theirs: ObjectId,
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<bool> {
+        // Partial-clone merge guard (P27 Task 5 review Important fix): this
+        // probe calls `three_way` directly, bypassing
+        // `merge_with_identity`'s own partial-clone refusal — a partial
+        // clone landed here at the raw corruption-shaped `NotFound` the
+        // guard exists to eliminate. Refuse loudly with the same dedicated
+        // error `merge_with_identity` uses, before ever touching
+        // `three_way`; propagated via `?` at the call site in `ws_harvest`,
+        // this is a hard `Err`, never silently folded into the "not clean"
+        // fallback path.
+        if self.promisor()?.is_some() {
+            return Err(crate::promisor::partial_clone_unsupported("ws harvest"));
+        }
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
         if crate::merge::is_ancestor(&mut store, theirs, ours)? {
@@ -524,6 +536,19 @@ impl Repo {
         }
         if crate::rebase_state::in_progress(&self.layout) {
             return Err(Error::RebaseInProgress);
+        }
+        // Partial-clone guard (P27 Task 5 review Important fix), at the top
+        // of the whole operation — mirroring `merge_with_identity`'s and
+        // `sc work`'s own top-level refusals rather than relying solely on
+        // `would_merge_cleanly`'s inner guard: `harvest_workspace` itself
+        // (`workspace.rs`) computes its tracked-path set via the UNFILTERED
+        // `tree_file_ids`, which `NotFound`s on an out-of-filter gap before
+        // a landing ever reaches the merge probe. Refusing here, before any
+        // `harvest_workspace` call, turns that into the same loud typed
+        // error every other partial-clone-unsupported operation gives,
+        // instead of a raw corruption-shaped `NotFound`.
+        if self.promisor()?.is_some() {
+            return Err(crate::promisor::partial_clone_unsupported("ws harvest"));
         }
 
         let mut session = read_manifest(self.layout())?
@@ -1602,5 +1627,44 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// P27 Task 5 review Important fix: `would_merge_cleanly` used to call
+    /// `three_way` directly, bypassing `merge_with_identity`'s own
+    /// partial-clone refusal — so a `sc ws harvest` landing on a partial
+    /// clone would hit the raw corruption-shaped `NotFound` that guard
+    /// family exists to eliminate, instead of a loud typed error.
+    #[test]
+    fn harvest_refuses_on_partial_clone_instead_of_raw_notfound() {
+        let src_root = tmp_root("harvest-partial-src");
+        let dst_root = tmp_root("harvest-partial-dst");
+        std::fs::create_dir_all(src_root.join("src")).unwrap();
+        std::fs::create_dir_all(src_root.join("docs")).unwrap();
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("src/a.txt"), b"src-one").unwrap();
+        std::fs::write(src_root.join("docs/b.txt"), b"docs-one").unwrap();
+        src.commit("t", "c1").unwrap();
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        let session = dst.ws_fork(1, "t", None).unwrap();
+        std::fs::write(session.workspaces[0].dir.join("src/a.txt"), "edited\n").unwrap();
+
+        let err = dst.ws_harvest(None, "t", None).unwrap_err();
+        assert!(
+            matches!(err, Error::PartialCloneUnsupported(_)),
+            "expected the explicit partial-clone-unsupported refusal, got {err:?}"
+        );
+        assert!(err.to_string().contains("not supported on a partial clone"));
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
     }
 }

@@ -46,6 +46,18 @@ pub enum Error {
     GappedPathContent(String),
     #[error("{0} lies outside this partial clone's fetch filter; run `sc backfill {0}` to fetch it first")]
     GapOutsideFilter(String),
+    /// A dedicated, non-path-shaped refusal for an operation that isn't
+    /// supported on a partial clone at all (merge, cherry-pick/rebase
+    /// replay, `sc ws harvest`, `sc work`) — distinct from
+    /// [`Error::GapOutsideFilter`], whose `{0}` is a real path fed into `sc
+    /// backfill <path>`. Feeding these guards' free-text operation
+    /// descriptions through `GapOutsideFilter` produced a garbled,
+    /// non-actionable message (P27 Task 5 review); this variant's `{0}` is
+    /// just the operation name and the message never implies a bare
+    /// `sc backfill` with no prefix would fix it — these operations need a
+    /// full clone (or a full backfill of every prefix), not one path.
+    #[error("{0} is not supported on a partial clone; backfill to a full clone first")]
+    PartialCloneUnsupported(String),
     #[error("already up to date")]
     UpToDate,
     #[error("{0}")]

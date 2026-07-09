@@ -412,7 +412,8 @@ impl Repo {
         // with an active sparse spec still has every object, and its
         // per-blob byte-carry below (the existing P24 mechanism) must stay
         // exactly as it was to avoid any behavior change for that case.
-        let partial = self.promisor()?.is_some();
+        let promisor = self.promisor()?;
+        let partial = promisor.is_some();
         // Merge/pick completion guard (P27 Task 5, T5-I4): `graft_out_of_sparse`
         // below only splices out-of-filter subtrees back in for a plain
         // single-tip commit (`decided_root.is_none() && merge_head.is_none()`).
@@ -424,8 +425,8 @@ impl Repo {
         // (non-conflicted) pick/rebase fold still has `decided_root: None`
         // and keeps using the single-tip graft path, unaffected.
         if partial && (decided_root.is_some() || merge_head.is_some()) {
-            return Err(crate::promisor::partial_gap_hint(
-                "<merge/pick completion across this partial clone's fetch filter>",
+            return Err(crate::promisor::partial_clone_unsupported(
+                "merge/pick completion",
             ));
         }
         {
@@ -512,7 +513,10 @@ impl Repo {
                 let store_arc = self.vfs.store();
                 let mut store = store_arc.lock().unwrap();
                 let parent_root = store.get_snapshot(&t)?.root;
-                root = worktree::graft_out_of_sparse(&mut store, root, parent_root, sparse, "")?;
+                let p = promisor
+                    .as_ref()
+                    .expect("partial implies promisor().is_some()");
+                root = worktree::graft_out_of_sparse(&mut store, root, parent_root, sparse, p, "")?;
                 // C1 fix (P27 Task 4 review): the graft above spliced
                 // out-of-filter subtrees back in BY ID, so any PROTECTED
                 // blob living only under a grafted subtree never went
@@ -1056,9 +1060,7 @@ impl Repo {
         // fast-forward/adopt paths above (which never rebuild a tree, only
         // gap-tolerant `materialize`) are exempt.
         if self.promisor()?.is_some() {
-            return Err(crate::promisor::partial_gap_hint(
-                "<merge across this partial clone's fetch filter>",
-            ));
+            return Err(crate::promisor::partial_clone_unsupported("merge"));
         }
 
         // Real three-way merge.
@@ -4920,10 +4922,11 @@ mod tests {
 
         let err = dst.merge_with_identity("feature", "t", None).unwrap_err();
         assert!(
-            matches!(err, Error::GapOutsideFilter(_)),
-            "expected the explicit gap-outside-filter refusal, got {err:?}"
+            matches!(err, Error::PartialCloneUnsupported(_)),
+            "expected the explicit partial-clone-unsupported refusal, got {err:?}"
         );
         assert!(err.to_string().contains("backfill"));
+        assert!(err.to_string().contains("not supported on a partial clone"));
         assert!(!dst.merge_in_progress(), "the refusal must be a preflight, not a conflict state");
 
         drop(src);
@@ -4980,7 +4983,37 @@ mod tests {
                 "msg",
             )
             .unwrap_err();
-        assert!(matches!(err, Error::GapOutsideFilter(_)), "got {err:?}");
+        assert!(matches!(err, Error::PartialCloneUnsupported(_)), "got {err:?}");
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn partial_commit_refuses_out_of_filter_new_path() {
+        // P27 Task 5 review CRITICAL repro: a brand-new file at a fully
+        // out-of-filter path (a name the parent tree has NO entry for at
+        // all — not even a gapped one) used to sail straight through
+        // `graft_out_of_sparse`'s I1 check, which only fires when the
+        // parent tree already has a same-name entry. That let the commit
+        // succeed and land content in the new root that this partial clone
+        // never fetched and the origin never had — unrecoverable once `sc
+        // gc` classified it as a gap and pruned it. Must now refuse loudly
+        // instead.
+        let (src, src_root, dst, dst_root) =
+            tmp_repo_with_src_and_docs_partial("commit-refuses-new-out-of-filter");
+
+        std::fs::create_dir_all(dst_root.join("tools")).unwrap();
+        std::fs::write(dst_root.join("tools/z.txt"), b"brand-new-out-of-filter").unwrap();
+
+        let err = dst.commit("t", "add tools/z.txt").unwrap_err();
+        assert!(
+            matches!(err, Error::GappedPathContent(ref p) if p.contains("tools")),
+            "expected a GappedPathContent refusal naming tools/, got {err:?}"
+        );
+        assert!(err.to_string().contains("backfill"));
 
         drop(src);
         drop(dst);

@@ -177,8 +177,8 @@ pub(crate) fn replay_commit(
     // and rebase's fold, which both replay through this function — pointing
     // at `sc backfill` rather than a confusing corruption-shaped error.
     if repo.promisor()?.is_some() {
-        return Err(crate::promisor::partial_gap_hint(
-            "<cherry-pick/rebase replay across this partial clone's fetch filter>",
+        return Err(crate::promisor::partial_clone_unsupported(
+            "cherry-pick/rebase replay",
         ));
     }
 

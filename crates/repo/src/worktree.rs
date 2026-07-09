@@ -204,6 +204,7 @@ pub(crate) fn graft_out_of_sparse(
     built_id: ObjectId,
     parent_id: ObjectId,
     sparse: &Sparse,
+    promisor: &crate::promisor::Promisor,
     prefix: &str,
 ) -> Result<ObjectId> {
     if built_id == parent_id {
@@ -213,6 +214,31 @@ pub(crate) fn graft_out_of_sparse(
     }
     let built_tree: Tree = store.get_tree(&built_id)?;
     let parent_tree: Tree = store.get_tree(&parent_id)?;
+    let parent_names: BTreeSet<String> =
+        parent_tree.entries.iter().map(|e| e.name.clone()).collect();
+    // P27 Task 5 review Critical fix: a built-side entry whose name the
+    // parent tree has NO entry for at all (so the loop below never visits
+    // it) can still sit at a fully out-of-filter path — e.g. a brand-new
+    // top-level directory this partial clone never fetched anything under.
+    // The I1 check inside the loop below only fires when the parent
+    // already has a same-name entry there; this closes that gap by
+    // scanning the built side for any survivor once up front, against the
+    // PROMISOR filter (not `sparse` — `sparse` can be narrower than the
+    // fetch filter, but never wider, since `set_sparse`/`disable_sparse`
+    // refuse widening past it; the filter is the actual "was this ever
+    // fetched?" authority). Refuse loudly rather than let it land in the
+    // new root, where `sc gc` would classify it as an unreachable gap and
+    // prune it — even though it's genuinely reachable and the origin never
+    // had it (P27 Task 5 review Critical).
+    for e in &built_tree.entries {
+        if parent_names.contains(&e.name) {
+            continue;
+        }
+        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        if !promisor.should_descend(&path) {
+            return Err(Error::GappedPathContent(path));
+        }
+    }
 
     let mut by_name: BTreeMap<String, scl_core::TreeEntry> =
         built_tree.entries.into_iter().map(|e| (e.name.clone(), e)).collect();
@@ -253,7 +279,8 @@ pub(crate) fn graft_out_of_sparse(
             Some(be) if be.kind == EntryKind::Tree => be.id,
             _ => store.put(Object::Tree(Tree::default()))?,
         };
-        let merged_child = graft_out_of_sparse(store, child_built_id, pe.id, sparse, &path)?;
+        let merged_child =
+            graft_out_of_sparse(store, child_built_id, pe.id, sparse, promisor, &path)?;
         by_name.insert(
             pe.name.clone(),
             scl_core::TreeEntry {
