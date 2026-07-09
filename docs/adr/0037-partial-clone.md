@@ -163,7 +163,7 @@ must be descended through to reach a deeper in-filter prefix recurses
 instead of being grafted whole (`worktree.rs:270-283`), so genuinely
 in-filter content underneath it still comes from the built side.
 
-Once the graft exists, `push`'s reachability walk (`repo.rs:301-321`) *is*
+Once the graft exists, `push`'s reachability walk (`sync.rs:301-321`) *is*
 filter-aware and *does* send only the client's new in-filter objects — that
 part of the original claim holds, and is the reason a full re-clone of the
 origin after a partial-clone push sees the edit AND intact
