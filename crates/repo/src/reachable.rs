@@ -2,7 +2,7 @@
 //! snapshot tips. Parameterized by an `ObjectSource` so it walks either the
 //! local `Store` (push) or a remote `Transport` (clone/fetch). Reused by P8 gc.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use scl_core::{EntryKind, Object, ObjectId, Store};
 
@@ -82,7 +82,12 @@ impl PrefixFilter for crate::promisor::Promisor {
 /// The result of a filtered reachability walk: `included` are the object ids
 /// actually fetched/kept; `gaps` are ids referenced by an included parent
 /// tree but excluded by the filter — never `get()`'d, so they may be absent
-/// on a partial-clone source without error.
+/// on a partial-clone source without error. `included` and `gaps` are
+/// disjoint by construction: content addressing can dedup one id to two
+/// different paths (a byte-identical subtree reachable at both an in-filter
+/// and an out-of-filter path), so an id that is in-filter anywhere always
+/// wins and is scrubbed out of `gaps` before returning — `gaps` means
+/// "referenced but never held," never "held AND gapped."
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Reachable {
     pub included: BTreeSet<ObjectId>,
@@ -126,6 +131,10 @@ pub fn reachable_objects_filtered(
         }
         walk_tree_filtered(src, snap.root, &mut included, &mut gaps, filter)?;
     }
+    // A byte-identical subtree can be gapped at one path and included at
+    // another (same id, different filter verdict per path) — included
+    // always wins. See the disjointness note on `Reachable`.
+    gaps.retain(|id| !included.contains(id));
     Ok(Reachable { included, gaps })
 }
 
@@ -143,6 +152,20 @@ pub fn reachable_objects_filtered(
 /// never passed to `src.get()`. An in-filter id that's absent on `src` WILL
 /// be `get()`'d and surfaces as a genuine error — that is the correct,
 /// desired corruption signal.
+///
+/// Expansion dedup is filter-mode-dependent. With `filter = None`, a
+/// bare-id gate on `included` is correct and cheapest: verdicts don't
+/// depend on path, so a shared subtree only ever needs expanding once.
+/// Under a filter, verdicts ARE per-path (`should_descend`/`matches` take
+/// `child_path`), but content addressing can still dedup a byte-identical
+/// subtree to one id reachable at two different paths with two different
+/// verdicts. Gating expansion on bare id there would expand the shared
+/// subtree only at whichever path is popped first, silently dropping any
+/// in-filter content that's ONLY reachable via a second, later path (the
+/// first path's out-of-filter verdict wins by accident of traversal
+/// order). So under a filter, expansion is gated on the `(id, path)` pair
+/// instead — `included` still dedups by bare id for the *result*, since an
+/// id counts as held once regardless of how many paths reach it.
 fn walk_tree_filtered(
     src: &mut impl ObjectSource,
     root: ObjectId,
@@ -151,8 +174,13 @@ fn walk_tree_filtered(
     filter: Option<&dyn PrefixFilter>,
 ) -> Result<()> {
     let mut stack: Vec<(ObjectId, String)> = Vec::new();
+    // (id, path) pairs already pushed for expansion, under a filter only.
+    let mut expanded: HashSet<(ObjectId, String)> = HashSet::new();
     if included.insert(root) {
         stack.push((root, String::new()));
+        if filter.is_some() {
+            expanded.insert((root, String::new()));
+        }
     }
     while let Some((tree_id, path)) = stack.pop() {
         let tree = match src.get(&tree_id)? {
@@ -186,7 +214,8 @@ fn walk_tree_filtered(
                     }
                     Some(f) => {
                         if f.should_descend(&child_path) {
-                            if included.insert(e.id) {
+                            included.insert(e.id);
+                            if expanded.insert((e.id, child_path.clone())) {
                                 stack.push((e.id, child_path));
                             }
                         } else {
@@ -336,7 +365,7 @@ mod tests {
             ])
             .unwrap();
         let arc = repo.store();
-        let (src_tree_id, app_tree_id, x_blob_id, other_tree_id) = {
+        let (src_tree_id, app_tree_id, x_blob_id, other_tree_id, y_blob_id) = {
             let mut s = arc.lock().unwrap();
             let root_tree = match Store::get(&mut s, &root).unwrap() {
                 Object::Tree(t) => t,
@@ -354,7 +383,12 @@ mod tests {
                 _ => panic!("expected tree"),
             };
             let x_blob_id = app_tree.entries[0].id;
-            (src_tree_id, app_tree_id, x_blob_id, other_tree_id)
+            let other_tree = match Store::get(&mut s, &other_tree_id).unwrap() {
+                Object::Tree(t) => t,
+                _ => panic!("expected tree"),
+            };
+            let y_blob_id = other_tree.entries[0].id;
+            (src_tree_id, app_tree_id, x_blob_id, other_tree_id, y_blob_id)
         };
         let snap_id = {
             let mut s = arc.lock().unwrap();
@@ -381,6 +415,10 @@ mod tests {
 
         assert!(!r.included.contains(&other_tree_id));
         assert!(r.gaps.contains(&other_tree_id));
+        // MINOR: the out-of-filter sibling blob under the excluded "other"
+        // tree must not be included either — only "other"'s tree id (a gap)
+        // is recorded, not its child contents (never walked).
+        assert!(!r.included.contains(&y_blob_id));
     }
 
     #[test]
@@ -391,6 +429,112 @@ mod tests {
         let filtered = reachable_objects_filtered(&mut *s, &[snap_id], None).unwrap();
         assert_eq!(filtered.included, unfiltered);
         assert!(filtered.gaps.is_empty());
+    }
+
+    /// The reviewer's exact repro for the CRITICAL: `a/x/f.txt`, `a/y/g.txt`,
+    /// `b/x/f.txt`, `b/y/g.txt` where trees `a` and `b` are byte-identical
+    /// (same entries -> same id). Filter `["a/x/", "b/y/"]` means the shared
+    /// tree must expand at BOTH paths: at "a" only "x" is in-filter, at "b"
+    /// only "y" is. A bare-id expansion gate expands the shared tree once
+    /// (whichever of "a"/"b" is popped first) and silently drops the
+    /// in-filter content that's only reachable via the other path. This
+    /// test fails on that old bare-id gate (verified by temporarily
+    /// reverting the gate) and passes with the (id, path) gate.
+    #[test]
+    fn deduped_tree_included_under_each_path() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let root = repo
+            .write_tree(&[
+                ("a/x/f.txt".into(), b"F".to_vec(), scl_core::FileMode::FILE),
+                ("a/y/g.txt".into(), b"G".to_vec(), scl_core::FileMode::FILE),
+                ("b/x/f.txt".into(), b"F".to_vec(), scl_core::FileMode::FILE),
+                ("b/y/g.txt".into(), b"G".to_vec(), scl_core::FileMode::FILE),
+            ])
+            .unwrap();
+        let arc = repo.store();
+        let (a_tree_id, b_tree_id, ax_tree_id, by_tree_id, f_blob_id, g_blob_id) = {
+            let mut s = arc.lock().unwrap();
+            let root_tree = match Store::get(&mut s, &root).unwrap() {
+                Object::Tree(t) => t,
+                _ => panic!("expected tree"),
+            };
+            let a_tree_id = root_tree.entries.iter().find(|e| e.name == "a").unwrap().id;
+            let b_tree_id = root_tree.entries.iter().find(|e| e.name == "b").unwrap().id;
+            // Content addressing: identical entries under "a" and "b" mean
+            // the two subtrees hash to the same id.
+            assert_eq!(a_tree_id, b_tree_id, "test setup assumption: a and b subtrees must share an id");
+            let a_tree = match Store::get(&mut s, &a_tree_id).unwrap() {
+                Object::Tree(t) => t,
+                _ => panic!("expected tree"),
+            };
+            let ax_tree_id = a_tree.entries.iter().find(|e| e.name == "x").unwrap().id;
+            let ay_tree_id = a_tree.entries.iter().find(|e| e.name == "y").unwrap().id;
+            // "x" and "y" under a/b are also identical to each other's
+            // counterpart across a and b (same single-file content), but we
+            // just need distinct ids for x vs y here.
+            let by_tree_id = ay_tree_id;
+            let ax_tree = match Store::get(&mut s, &ax_tree_id).unwrap() {
+                Object::Tree(t) => t,
+                _ => panic!("expected tree"),
+            };
+            let f_blob_id = ax_tree.entries[0].id;
+            let ay_tree = match Store::get(&mut s, &ay_tree_id).unwrap() {
+                Object::Tree(t) => t,
+                _ => panic!("expected tree"),
+            };
+            let g_blob_id = ay_tree.entries[0].id;
+            (a_tree_id, b_tree_id, ax_tree_id, by_tree_id, f_blob_id, g_blob_id)
+        };
+        assert_eq!(a_tree_id, b_tree_id);
+        let snap_id = {
+            let mut s = arc.lock().unwrap();
+            s.put(Object::Snapshot(scl_core::Snapshot {
+                root,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 0,
+                message: "c".into(),
+                secrets: BTreeMap::new(),
+                protection: Default::default(),
+            }))
+            .unwrap()
+        };
+
+        let filter = crate::promisor::Promisor::new("origin", vec!["a/x/".into(), "b/y/".into()]);
+        let mut s = arc.lock().unwrap();
+        let r = reachable_objects_filtered(&mut *s, &[snap_id], Some(&filter)).unwrap();
+
+        // In-filter content at BOTH paths must be included: a/x's f.txt and
+        // b/y's g.txt.
+        assert!(r.included.contains(&ax_tree_id), "a/x tree must be included");
+        assert!(r.included.contains(&f_blob_id), "a/x/f.txt blob must be included");
+        assert!(r.included.contains(&by_tree_id), "b/y tree must be included");
+        assert!(r.included.contains(&g_blob_id), "b/y/g.txt blob must be included");
+
+        // Disjointness: nothing that's included may also linger in gaps.
+        assert!(!r.gaps.contains(&ax_tree_id));
+        assert!(!r.gaps.contains(&f_blob_id));
+        assert!(!r.gaps.contains(&by_tree_id));
+        assert!(!r.gaps.contains(&g_blob_id));
+    }
+
+    /// The IMPORTANT: an out-of-filter child must never be fetched from the
+    /// source, so a partial-clone source that's genuinely missing
+    /// out-of-filter objects does not error.
+    #[test]
+    fn gap_object_is_never_fetched() {
+        let (arc, snap_id, _root, _src_tree_id, _src_blob_id, docs_tree_id, docs_blob_id) = two_subtree_repo();
+        {
+            let mut s = arc.lock().unwrap();
+            s.delete(&docs_tree_id).unwrap();
+            s.delete(&docs_blob_id).unwrap();
+        }
+        let filter = crate::promisor::Promisor::new("origin", vec!["src/".into()]);
+        let mut s = arc.lock().unwrap();
+        let r = reachable_objects_filtered(&mut *s, &[snap_id], Some(&filter)).unwrap();
+        assert!(r.gaps.contains(&docs_tree_id));
+        assert!(!r.included.contains(&docs_tree_id));
+        assert!(!r.included.contains(&docs_blob_id));
     }
 
     #[test]
