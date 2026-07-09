@@ -55,21 +55,43 @@ fn read_bounded_opening(r: &mut impl Read) -> Result<Vec<u8>> {
     }
 }
 
-/// CLIENT: write `POST <path> HTTP/1.1\r\nHost: <host>\r\nUser-Agent: sc/2\r\n\r\n`.
-pub(crate) fn write_client_opening(w: &mut impl Write, host: &str, path: &str) -> Result<()> {
-    write!(w, "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: sc/2\r\n\r\n")
-        .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))
+/// A parsed client HTTP opening: the request-target and an optional
+/// `Authorization: Bearer` token. Only the bearer header is extracted (P29);
+/// all other headers are ignored.
+#[derive(Debug)]
+pub(crate) struct ClientOpening {
+    pub target: String,
+    pub bearer: Option<String>,
+}
+
+/// CLIENT: write `POST <path> HTTP/1.1\r\nHost: <host>\r\nUser-Agent: sc/2\r\n\r\n`,
+/// plus an `Authorization: Bearer` header when a token is supplied.
+pub(crate) fn write_client_opening(
+    w: &mut impl Write,
+    host: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> Result<()> {
+    write!(w, "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: sc/2\r\n")
+        .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))?;
+    if let Some(tok) = bearer {
+        write!(w, "Authorization: Bearer {tok}\r\n")
+            .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))?;
+    }
+    write!(w, "\r\n").map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))
 }
 
 /// SERVER: read the request line + headers up to the blank line (bounded by
-/// [`MAX_OPENING_BYTES`]). Returns the request-target (the `<path>`). Errors
-/// (→ the caller sends 400) on: a bad request line, no `\r\n\r\n` within the
-/// cap, or non-HTTP bytes.
-pub(crate) fn read_client_opening(r: &mut impl Read) -> Result<String> {
+/// [`MAX_OPENING_BYTES`]). Returns the request-target and the bearer token if
+/// an `Authorization: Bearer <token>` header (case-insensitive name) is
+/// present. Errors (→ the caller sends 400) on: a bad request line, no
+/// `\r\n\r\n` within the cap, or non-HTTP bytes.
+pub(crate) fn read_client_opening(r: &mut impl Read) -> Result<ClientOpening> {
     let buf = read_bounded_opening(r)?;
     let text = String::from_utf8_lossy(&buf);
-    let request_line = text
-        .split("\r\n")
+    let mut lines = text.split("\r\n");
+
+    let request_line = lines
         .next()
         .ok_or_else(|| Error::InvalidArgument("empty HTTP request line".to_string()))?;
     let mut parts = request_line.split(' ');
@@ -89,16 +111,30 @@ pub(crate) fn read_client_opening(r: &mut impl Read) -> Result<String> {
             "bad HTTP request line (missing HTTP/ version): {request_line}"
         )));
     }
-    Ok(target.to_string())
+
+    let mut bearer = None;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("authorization") {
+                let v = value.trim();
+                if let Some(tok) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")) {
+                    bearer = Some(tok.trim().to_string());
+                }
+            }
+        }
+    }
+
+    Ok(ClientOpening { target: target.to_string(), bearer })
 }
 
 /// SERVER: write `HTTP/1.1 <code> <reason>\r\nContent-Length: 0\r\n\r\n`.
-/// Supports 200 OK / 404 Not Found / 400 Bad Request.
+/// Supports 200 OK / 404 Not Found / 400 Bad Request / 401 Unauthorized.
 pub(crate) fn write_status(w: &mut impl Write, code: u16) -> Result<()> {
     let reason = match code {
         200 => "OK",
         404 => "Not Found",
         400 => "Bad Request",
+        401 => "Unauthorized",
         _ => return Err(Error::InvalidArgument(format!("unsupported HTTP status code: {code}"))),
     };
     write!(w, "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n\r\n")
@@ -207,7 +243,7 @@ impl HttpTransport {
     pub fn connect(url: &ScHttpUrl) -> Result<HttpTransport> {
         let mut stream = TcpStream::connect(url.authority())
             .map_err(|e| Error::ConnectionLost(format!("sc+http connect to {url:?}: {e}")))?;
-        write_client_opening(&mut stream, &url.host, &url.path)?;
+        write_client_opening(&mut stream, &url.host, &url.path, None)?;
 
         // Split the stream into independent read/write halves up front —
         // `try_clone` duplicates the socket handle (both `r` and `w` refer
@@ -358,15 +394,18 @@ fn handle_http_connection(mut stream: TcpStream, root: &std::path::Path) -> Resu
             .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?,
     );
 
-    let target = match read_client_opening(&mut reader) {
-        Ok(t) => t,
+    let opening = match read_client_opening(&mut reader) {
+        Ok(o) => o,
         Err(_) => {
             // Malformed/slow-loris opening: best-effort 400, then close.
             let _ = write_status(&mut stream, 400);
             return Ok(());
         }
     };
-    let _ = target; // the request-target isn't used to route (one repo per listener)
+    // The request-target isn't used to route (one repo per listener).
+    // `opening.bearer` is consumed by Task 4's access-control check.
+    let _ = &opening.target;
+    let _ = &opening.bearer;
 
     if !root.join(".sc").is_dir() {
         write_status(&mut stream, 404)?;
@@ -429,9 +468,43 @@ mod tests {
     #[test]
     fn client_opening_round_trips() {
         let mut buf = Vec::new();
-        write_client_opening(&mut buf, "h", "/repo").unwrap();
-        let target = read_client_opening(&mut &buf[..]).unwrap();
-        assert_eq!(target, "/repo");
+        write_client_opening(&mut buf, "h", "/repo", None).unwrap();
+        let opening = read_client_opening(&mut &buf[..]).unwrap();
+        assert_eq!(opening.target, "/repo");
+    }
+
+    #[test]
+    fn opening_parses_bearer_case_insensitively() {
+        let mut buf = Vec::new();
+        write_client_opening(&mut buf, "h", "/repo", Some("sct-abc")).unwrap();
+        let opening = read_client_opening(&mut &buf[..]).unwrap();
+        assert_eq!(opening.target, "/repo");
+        assert_eq!(opening.bearer.as_deref(), Some("sct-abc"));
+    }
+
+    #[test]
+    fn opening_without_auth_has_no_bearer() {
+        let mut buf = Vec::new();
+        write_client_opening(&mut buf, "h", "/repo", None).unwrap();
+        let opening = read_client_opening(&mut &buf[..]).unwrap();
+        assert_eq!(opening.target, "/repo");
+        assert_eq!(opening.bearer, None);
+    }
+
+    #[test]
+    fn opening_parses_lowercase_authorization_header() {
+        // Servers must accept a client that lowercases the header name.
+        let raw = "POST /r HTTP/1.1\r\nHost: h\r\nauthorization: Bearer sct-xyz\r\n\r\n";
+        let opening = read_client_opening(&mut raw.as_bytes()).unwrap();
+        assert_eq!(opening.bearer.as_deref(), Some("sct-xyz"));
+    }
+
+    #[test]
+    fn write_status_supports_401() {
+        let mut buf = Vec::new();
+        write_status(&mut buf, 401).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
     }
 
     #[test]
@@ -457,7 +530,7 @@ mod tests {
 
     #[test]
     fn status_round_trips() {
-        for code in [200u16, 404, 400] {
+        for code in [200u16, 404, 400, 401] {
             let mut buf = Vec::new();
             write_status(&mut buf, code).unwrap();
             let got = read_status(&mut &buf[..]).unwrap();
@@ -521,7 +594,7 @@ mod tests {
             let (sock, _addr) = listener.accept().unwrap();
             let mut reader = BufReader::new(sock.try_clone().unwrap());
             let mut sock = sock;
-            let _target = read_client_opening(&mut reader).unwrap();
+            let _opening = read_client_opening(&mut reader).unwrap();
             write_status(&mut sock, code).unwrap();
             if code == 200 {
                 crate::wire::serve(&root, &mut reader, &mut sock).unwrap();
