@@ -1,9 +1,8 @@
 # ADR-0038: Agent session transcripts as CAS objects
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-09
-- **Phase:** P30 (candidate — after P29 sc+http access control closes the security horizon;
-  slot decided in the brainstorm, D7)
+- **Phase:** 30
 - **Builds on:** ADR-0002 (content addressing), ADR-0008/0010 (envelope
   encryption), ADR-0017 (secret scanner), ADR-0023/0030 (agent
   workspaces/sessions), ADR-0032 (side-metadata CAS-object pattern)

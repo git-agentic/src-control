@@ -395,10 +395,18 @@ impl Repo {
             // runs for a push. Extend the reachable set here the same way:
             // every indexed signature covering a snapshot already in it.
             let snaps: Vec<ObjectId> = reachable.iter().copied().collect();
-            let sig_ids = crate::signatures::indexed_signature_ids_for(&self.layout, &snaps)?;
             // Sender seam (P30 Task 4): same push-side extension, for
             // indexed transcripts covering a snapshot already reachable.
+            // Computed BEFORE the signature lookup below for the same
+            // reason as the `get_pack` side in `transport.rs`: a
+            // transcript's own signature is keyed by the transcript's id,
+            // not the snapshot's, so it only surfaces if the transcript
+            // ids are folded into the signature query too (review-caught
+            // alongside the `get_pack` fix — same omission, same shape).
             let transcript_ids = crate::transcripts::indexed_transcript_ids_for(&self.layout, &snaps)?;
+            let sig_targets: Vec<ObjectId> =
+                snaps.iter().chain(transcript_ids.iter()).copied().collect();
+            let sig_ids = crate::signatures::indexed_signature_ids_for(&self.layout, &sig_targets)?;
             let mut send_ids: Vec<ObjectId> = Vec::new();
             for id in reachable.into_iter().chain(sig_ids).chain(transcript_ids) {
                 if !transport.has_object(&id)? {
@@ -653,6 +661,52 @@ mod tests {
         // The original identity CAN open it in dst — ciphertext rode intact.
         let opened = b.open_transcript(&tid, &identity.enc).unwrap();
         assert_eq!(opened.as_slice(), body);
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        std::fs::remove_dir_all(&b_root).unwrap();
+    }
+
+    #[test]
+    fn signed_transcript_signature_rides_the_pack() {
+        // Review-caught Critical (P30 final review): the sender's over-send
+        // queried `indexed_signature_ids_for` over snapshot ids alone, so a
+        // signature keyed by a TRANSCRIPT's own id (not its snapshot's) was
+        // never pulled into the transfer set — a `sc transcript attach
+        // --sign` rode the pack as an object but landed `Unsigned` on the
+        // far side, silently dropping provenance. Pins the fix: a signed
+        // transcript's signature must survive clone, matching
+        // `retroactive_signature_propagates_on_refetch`'s discipline for
+        // plain snapshot signatures.
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-transsig-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-transsig-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&a_root);
+        let _ = std::fs::remove_dir_all(&b_root);
+        std::fs::create_dir_all(&a_root).unwrap();
+
+        let a = Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f1"), b"one").unwrap();
+        let snap = a.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let body = b"USER: do the thing\nAGENT: done";
+        let tid = a.attach_transcript(snap, "claude-code", "s1", body, &[identity.enc.public()]).unwrap();
+        a.sign_transcript(tid, &identity).unwrap();
+
+        let trust: std::collections::HashMap<[u8; 32], String> = std::collections::HashMap::new();
+        assert_ne!(
+            a.transcript_sig_status(&tid, &trust).unwrap(),
+            SigStatus::Unsigned,
+            "sanity: the transcript must be signed in the origin before cloning"
+        );
+
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        assert_ne!(
+            b.transcript_sig_status(&tid, &trust).unwrap(),
+            SigStatus::Unsigned,
+            "a signed transcript's signature must ride the pack, not just the transcript object"
+        );
 
         drop(a);
         drop(b);

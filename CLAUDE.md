@@ -1170,6 +1170,60 @@ Wire-unchanged but for `EC_READONLY`; `PROTOCOL_VERSION` stays 3; ssh
 `--stdio` is untouched. Proven by `demo/run_http_auth_demo.sh`. See
 ADR-0040.
 
+**Phase 30 is built.** Agent session transcripts: a sealed provenance
+record for an agent's session can now attach to a commit. `Transcript {
+snapshot, agent, session, nonce, ciphertext, wrapped_keys }` is a
+bytes-only `TAG_TRANSCRIPT` object in `crates/core` — the crypto
+quarantine holds — whose body is ALWAYS sealed via `scl_crypto::seal`
+(a fresh random DEK wrapped per recipient, `TAG_SECRET` shape) before it
+ever reaches the CAS, so a keyless clone gets ciphertext only; `open`
+reuses `scl_crypto::open` verbatim. A one-to-many `.sc/transcripts` index
+(snapshot → transcript ids) means `amend`/`rebase`/`merge` start a fresh
+snapshot with none attached — there is no carry-forward of stale
+provenance to reason about. Signing is opt-in: `--sign` at attach or a
+standalone `sc transcript sign <ref>` signs under a
+`"sc-transcript-sig-v1"` domain, sharing P22's `SignatureObj` type and the
+SAME `.sc/signatures` index (no second index, no format change) and the
+same four-state trust precedence. Transfer needed zero wire changes —
+transcripts ride the existing pack: the sender over-sends every indexed
+transcript covering a transfer-relevant snapshot into the want-set
+(has-gated, never subtracted from what the receiver already has) and the
+receiver reindexes idempotently, adopting the P22 refetch-fix discipline
+verbatim. **A final-review Critical found the same discipline had a gap
+of its own:** a transcript's own signature is keyed by the transcript's
+id, not its snapshot's, but the sender's signature over-send queried
+`indexed_signature_ids_for` over snapshot ids alone — so a `sc transcript
+attach --sign` rode the pack correctly as an object but landed
+`Unsigned` on the far side, silently dropping its provenance on every
+clone/fetch/push. Fixed at both sender seams
+(`LocalTransport::build_pack_tempfile`'s `get_pack` path and
+`Repo::push`) by folding the transcript ids into the signature query
+before extending `want_set`, pinned by
+`signed_transcript_signature_rides_the_pack`. `sc gc` roots live
+transcript ids into `reachable` BEFORE `signatures::gc_prune` runs — the
+same ordering P22's own signature index needed — so a signed
+transcript's signature survives exactly when the transcript itself does;
+a transcript whose only snapshot goes unreachable (e.g. its branch is
+deleted) is pruned along with it, while a still-reachable transcript
+survives the same gc, repacked like any other object. `sc export --to
+<git-repo>` drops transcripts outright (no Git-native form exists) and
+reports a `transcripts_dropped` count. Surface: `sc transcript
+attach/show/list/sign`, `sc ws harvest --transcript <path> [--sign]
+[--identity <key>]` (one transcript per landed workspace), and an
+index-only `sc log` presence marker (`transcript: N` / `transcript: N
+✓`) that never decrypts. **Accepted boundaries:** the body is opaque —
+no schema, agent-agnostic; sealed-by-default, so a keyless clone always
+gets ciphertext with no plaintext escape hatch; no access-lifecycle
+(rewrap/grant/revoke) and no deletion in the MVP — a transcript is sealed
+once, to the attach-time recipient set, permanently, until its snapshot
+becomes unreachable. Proven by `demo/run_transcript_demo.sh`: attach +
+sign, a plain `sc clone` carrying the transcript (object AND its
+signature, post-fix), a wrong-identity `sc transcript show` failing
+closed on ciphertext while the right identity decrypts the exact body
+bytes, the `sc log` marker, and `sc gc` pruning a deleted branch's
+transcript while the still-reachable one from earlier survives — run
+twice, zero residue. No new dependency. See ADR-0038.
+
 Remaining follow-ons: operation objects in the CAS, oplog entries for
 remote-tracking refs, extending the sparse gate to
 `materialize_conflict_state`'s `to_encrypt`/sidecar write loops (see the
@@ -1192,7 +1246,18 @@ receiver's cap silently rejects; `Repo::worktree_paths` doing a
 paths-only walk instead of loading every file's full bytes; and
 extracting a shared `path_under_prefix(path, prefix)` helper so
 `run_protect`'s `/`-boundary filter and `protect.rs::matching_prefix`
-stop duplicating the same rule).
+stop duplicating the same rule), and the P30 items — `--transcript auto`
+probing, `sc transcript drop` + a resurrection tombstone, transcript
+access lifecycle (rewrap/grant/revoke), a `--no-transcripts` transfer
+knob, `sc export --transcripts=entire`, per-turn live checkpointing, and
+the P30 final-review follow-ons (threading `--transcript`/`--sign`
+through `Repo::ws_harvest` itself instead of the current CLI-side
+post-harvest seam; `sc transcript list` with no `<ref>` walking the full
+DAG rather than only the first-parent mainline; a
+`transcripts_ride_ssh_transport` wire-harness test twin; and the
+now-stale `SignatureObj.snapshot` doc comment, which still describes the
+field as always a snapshot id though signing a transcript stores a
+transcript id there instead).
 
 ## Agent skills
 
