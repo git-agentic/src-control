@@ -2488,7 +2488,12 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
 /// dropped, e.g. by process termination). Exactly one mode is required.
 fn run_serve(stdio: bool, http: Option<String>, path: PathBuf) -> Result<()> {
     if let Some(addr) = http {
-        scl_repo::http_transport::serve_http(&addr, &path)?;
+        // CLI flags for --read-only/--allow-public land in a later P29
+        // task; this call site just adopts the new required arguments with
+        // today's (pre-P29) defaults so the fail-closed bind gate still
+        // applies (a token-configured repo, or an explicit future flag,
+        // will be able to justify a non-loopback bind).
+        scl_repo::http_transport::serve_http(&addr, &path, false, false)?;
         return Ok(());
     }
     if !stdio {
