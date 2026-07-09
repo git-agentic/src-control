@@ -241,9 +241,27 @@ impl HttpTransport {
     /// a clearly-named [`Error::Protocol`] — none of these are wire-protocol
     /// errors, so they must not be mistaken for a `HELLO` failure.
     pub fn connect(url: &ScHttpUrl) -> Result<HttpTransport> {
+        let token = std::env::var("SC_HTTP_TOKEN").ok().filter(|s| !s.is_empty());
+        Self::connect_with_token(url, token.as_deref())
+    }
+
+    /// Connect presenting an explicit bearer `token` (or none). `connect`
+    /// reads the token from `SC_HTTP_TOKEN`; this split keeps the env read
+    /// out of the socket logic and testable without mutating process env
+    /// (`std::env::set_var` is process-global and racy under parallel
+    /// tests).
+    pub fn connect_with_token(url: &ScHttpUrl, token: Option<&str>) -> Result<HttpTransport> {
+        if let Some(t) = token {
+            if t.contains(['\r', '\n']) {
+                return Err(Error::InvalidArgument(
+                    "SC_HTTP_TOKEN must not contain CR or LF".to_string(),
+                ));
+            }
+        }
+
         let mut stream = TcpStream::connect(url.authority())
             .map_err(|e| Error::ConnectionLost(format!("sc+http connect to {url:?}: {e}")))?;
-        write_client_opening(&mut stream, &url.host, &url.path, None)?;
+        write_client_opening(&mut stream, &url.host, &url.path, token)?;
 
         // Split the stream into independent read/write halves up front —
         // `try_clone` duplicates the socket handle (both `r` and `w` refer
@@ -265,12 +283,20 @@ impl HttpTransport {
         let w = stream;
 
         // Status mapping happens BEFORE the wire-protocol handshake: 200
-        // proceeds, 404 means the server-side path isn't a repo, anything
-        // else is a clearly-named protocol error — none of these are
-        // HELLO-handshake failures, so they must not be reported as one.
+        // proceeds, 401 means the server rejected the bearer (or required
+        // one and got none), 404 means the server-side path isn't a repo,
+        // anything else is a clearly-named protocol error — none of these
+        // are HELLO-handshake failures, so they must not be reported as one.
         let status = read_status(&mut r)?;
         match status {
             200 => {}
+            401 => {
+                return Err(Error::Remote(
+                    "sc+http authentication required or token rejected; set SC_HTTP_TOKEN to a \
+                     valid token (sc serve token add on the server)"
+                        .to_string(),
+                ))
+            }
             404 => return Err(Error::NotARepo),
             other => {
                 return Err(Error::Protocol(format!(
@@ -1147,6 +1173,36 @@ mod tests {
 
         assert_eq!(connect_raw_status(port, None), 401);
         assert_eq!(connect_raw_status(port, Some("sct-not-a-real-token")), 401);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 5: client-side `SC_HTTP_TOKEN` support (`connect_with_token`). ──
+
+    /// `HttpTransport::connect_with_token` presents the given bearer and maps
+    /// a missing/invalid one to a 401 → a clear authentication `Error`
+    /// (rather than a wire-handshake failure). Drives `connect_with_token`
+    /// directly with an explicit token instead of mutating the process-global
+    /// `SC_HTTP_TOKEN` env var, which would be racy under parallel tests.
+    #[test]
+    fn client_presents_sc_http_token_and_maps_401() {
+        let root = tmp_repo("client-token");
+        let layout = crate::layout::Layout::at(&root);
+        let rw_raw = crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
+
+        let port = spawn_real_http_server_policy(root.clone(), false);
+        let url = ScHttpUrl { host: "127.0.0.1".to_string(), port, path: "/repo".to_string() };
+
+        // A valid rw token is accepted and the wire protocol proceeds.
+        let transport = HttpTransport::connect_with_token(&url, Some(&rw_raw)).unwrap();
+        transport.list_refs().unwrap();
+
+        // No token at all, once tokens are configured, is rejected with a
+        // clear authentication error (not `NotARepo`, not a generic
+        // handshake failure).
+        let err = HttpTransport::connect_with_token(&url, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("authentication"), "expected an authentication error, got: {msg}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
