@@ -16,6 +16,7 @@ const TAG_SNAPSHOT_LEGACY: u8 = 2; // pre-P16 encoding; refused with a clear err
 const TAG_SECRET: u8 = 3;
 const TAG_SNAPSHOT: u8 = 4;
 const TAG_SIGNATURE: u8 = 5;
+const TAG_TRANSCRIPT: u8 = 6;
 
 /// Perms-byte bit: this blob entry holds a `nonce‖ciphertext` envelope (an
 /// encrypted file), not plaintext. Set on protected-path entries (P7).
@@ -190,6 +191,20 @@ pub struct SignatureObj {
     pub sig: [u8; 64],
 }
 
+/// A sealed agent-session transcript (P30): the session that motivated
+/// `snapshot`, encrypted like a `Secret` (fresh random DEK, wrapped per
+/// recipient) so plaintext never enters the CAS. `agent`/`session` are
+/// opaque metadata labels; the body is opaque bytes (no schema).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transcript {
+    pub snapshot: ObjectId,
+    pub agent: String,
+    pub session: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub wrapped_keys: Vec<WrappedKey>,
+}
+
 /// Any object the store can hold. Blob bytes are `Arc`-shared so forking many
 /// worktrees off one snapshot never copies file content.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -199,6 +214,7 @@ pub enum Object {
     Snapshot(Snapshot),
     Secret(Secret),
     Signature(SignatureObj),
+    Transcript(Transcript),
 }
 
 impl Object {
@@ -221,6 +237,7 @@ impl Object {
             Object::Snapshot(_) => "snapshot",
             Object::Secret(_) => "secret",
             Object::Signature(_) => "signature",
+            Object::Transcript(_) => "transcript",
         }
     }
 
@@ -313,6 +330,19 @@ impl Object {
                 w.id(&s.snapshot);
                 w.raw(&s.signer); // fixed 32 bytes — no length prefix needed
                 w.raw(&s.sig); // fixed 64 bytes — no length prefix needed
+            }
+            Object::Transcript(t) => {
+                w.tag(TAG_TRANSCRIPT);
+                w.id(&t.snapshot);
+                w.str(&t.agent);
+                w.str(&t.session);
+                w.bytes(&t.nonce);
+                w.bytes(&t.ciphertext);
+                w.u32(t.wrapped_keys.len() as u32);
+                for wk in &t.wrapped_keys {
+                    w.str(&wk.recipient_id);
+                    w.bytes(&wk.wrapped_dek);
+                }
             }
         }
         w.0
@@ -423,6 +453,21 @@ impl Object {
                     return Err(Error::Malformed("trailing bytes in signature object".into()));
                 }
                 Object::Signature(SignatureObj { snapshot, signer, sig })
+            }
+            TAG_TRANSCRIPT => {
+                let snapshot = r.id()?;
+                let agent = r.str()?;
+                let session = r.str()?;
+                let nonce = r.bytes()?;
+                let ciphertext = r.bytes()?;
+                let nk = r.count()?;
+                let mut wrapped_keys = Vec::with_capacity(nk);
+                for _ in 0..nk {
+                    let recipient_id = r.str()?;
+                    let wrapped_dek = r.bytes()?;
+                    wrapped_keys.push(WrappedKey { recipient_id, wrapped_dek });
+                }
+                Object::Transcript(Transcript { snapshot, agent, session, nonce, ciphertext, wrapped_keys })
             }
             t => return Err(Error::Malformed(format!("unknown object tag {t}"))),
         };
@@ -821,6 +866,38 @@ mod tests {
         secret.extend_from_slice(&0u32.to_be_bytes()); // ciphertext len
         secret.extend_from_slice(&HUGE.to_be_bytes()); // wrapped_keys count
         assert!(matches!(Object::decode(&secret), Err(Error::Malformed(_))), "secret wrapped_keys");
+    }
+
+    #[test]
+    fn transcript_round_trips_and_id_is_stable() {
+        let t = Transcript {
+            snapshot: ObjectId::of(b"snap"),
+            agent: "claude-code".into(),
+            session: "sess-42".into(),
+            nonce: vec![1, 2, 3],
+            ciphertext: vec![9, 8, 7, 6],
+            wrapped_keys: vec![WrappedKey { recipient_id: "rid".into(), wrapped_dek: vec![4, 5] }],
+        };
+        let obj = Object::Transcript(t.clone());
+        let bytes = obj.encode();
+        let back = Object::decode(&bytes).unwrap();
+        assert_eq!(back, obj);
+        // id-stability: same content encodes byte-identically → same id.
+        assert_eq!(ObjectId::of(&bytes), ObjectId::of(&Object::Transcript(t).encode()));
+    }
+
+    #[test]
+    fn transcript_decode_rejects_fabricated_wrap_count() {
+        // TAG_TRANSCRIPT(6) + snapshot(32) + agent str(0) + session str(0)
+        // + nonce bytes(0) + ciphertext bytes(0) + wrap-count = 0xFFFF_FFFF, no wraps.
+        let mut buf = vec![6u8];
+        buf.extend_from_slice(&[0u8; 32]);
+        buf.extend_from_slice(&0u32.to_be_bytes()); // agent len
+        buf.extend_from_slice(&0u32.to_be_bytes()); // session len
+        buf.extend_from_slice(&0u32.to_be_bytes()); // nonce len
+        buf.extend_from_slice(&0u32.to_be_bytes()); // ciphertext len
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // wrap count
+        assert!(matches!(Object::decode(&buf), Err(Error::Malformed(_))));
     }
 
     #[test]

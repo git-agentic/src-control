@@ -26,6 +26,6 @@ pub use error::{Error, Result};
 pub use id::ObjectId;
 pub use object::{
     EntryKind, FileMode, Object, ProtectPrefix, Protection, RecipientEntry, RecipientState,
-    Secret, SignatureObj, Snapshot, Tree, TreeEntry, WrappedKey, PROTECTED,
+    Secret, SignatureObj, Snapshot, Transcript, Tree, TreeEntry, WrappedKey, PROTECTED,
 };
 pub use store::{Backend, SpillPolicy, Store, StoreConfig, StoreStats};
