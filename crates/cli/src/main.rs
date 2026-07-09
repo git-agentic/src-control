@@ -2863,6 +2863,12 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
             report.signatures_dropped
         );
     }
+    if report.transcripts_dropped > 0 {
+        eprintln!(
+            "  warning: {} session transcript(s) dropped (Git has no native equivalent for sc's sealed transcripts)",
+            report.transcripts_dropped
+        );
+    }
     if report.stale_marks > 0 {
         eprintln!(
             "  note: {} mark(s) referenced git commit(s) pruned from the target; re-synthesized with fresh ids",
@@ -3030,6 +3036,12 @@ fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) ->
         eprintln!(
             "  warning: {} snapshot signature(s) dropped (Git has no native equivalent for sc's detached signatures)",
             report.signatures_dropped
+        );
+    }
+    if report.transcripts_dropped > 0 {
+        eprintln!(
+            "  warning: {} session transcript(s) dropped (Git has no native equivalent for sc's sealed transcripts)",
+            report.transcripts_dropped
         );
     }
     if report.stale_marks > 0 {

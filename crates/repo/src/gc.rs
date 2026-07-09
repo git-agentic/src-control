@@ -18,7 +18,7 @@ use scl_core::{Object, ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
-use crate::{merge_state, oplog, pick_state, promisor, reachable, rebase_state, refs, signatures, ws};
+use crate::{merge_state, oplog, pick_state, promisor, reachable, rebase_state, refs, signatures, transcripts, ws};
 
 /// What a gc pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,6 +31,10 @@ pub struct GcStats {
     /// of the reachable set this pass; their signature objects fall through
     /// to the ordinary loose-object prune, not counted here.
     pub signatures_pruned: usize,
+    /// Transcript index entries dropped (P30) because their snapshot fell
+    /// out of the reachable set this pass; their transcript objects fall
+    /// through to the ordinary loose-object prune, not counted here.
+    pub transcripts_pruned: usize,
 }
 
 /// The full safe root set (snapshot ids): all branch tips + resolved HEAD +
@@ -165,6 +169,19 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     if let Some(tree) = rebase_state::read_decided_root(layout)? {
         reachable::walk_tree(store, tree, &mut reachable)?;
     }
+
+    // Transcript index (P30): a Transcript is likewise reachable from no
+    // tree/parent walk, so it needs its own root decision — same window as
+    // the merge/pick/rebase decided-root roots above. This MUST run BEFORE
+    // `signatures::gc_prune` below: a transcript's own signature lives in
+    // the SHARED `.sc/signatures` index keyed by the transcript's own id
+    // (not the snapshot's), so rooting a live transcript's id into
+    // `reachable` here is what keeps that transcript's signature entry
+    // alive when `signatures::gc_prune` runs next. Entries whose snapshot
+    // didn't survive are dropped from the index, and their now-unrooted
+    // transcript object falls through to the ordinary loose-object
+    // aging/pruning sweep below like any other unreachable object.
+    stats.transcripts_pruned = transcripts::gc_prune(layout, &mut reachable)?;
 
     // Signature index (P22): a SignatureObj is reachable from no tree/parent
     // walk (it isn't referenced by any snapshot), so it needs its own root
@@ -587,6 +604,97 @@ mod tests {
         let last = crate::oplog::last(repo.layout()).unwrap().unwrap();
         assert!(last.refs.iter().any(|(_, _, after)| *after == Some(fresh_snap)));
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn transcripts_survive_or_prune_with_gc_ordering() {
+        // P30 Task 4 pin: a signed transcript on a LIVE snapshot survives gc
+        // (transcript object + `.sc/transcripts` entry + its OWN signature
+        // in `.sc/signatures`, keyed by the transcript id, all kept — the
+        // load-bearing proof that `transcripts::gc_prune` running BEFORE
+        // `signatures::gc_prune` is what keeps that signature alive); a
+        // transcript whose snapshot is gc'd-away is pruned along with its
+        // index entry and its signature.
+        let root = tmp_root("transcripts");
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base").unwrap();
+        let base = repo.commit("t", "base").unwrap();
+
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+
+        // Live: attached to `base`, which stays reachable via the branch tip
+        // for the whole test.
+        let live_tid =
+            repo.attach_transcript(base, "a", "s-live", b"live transcript body", &[identity.enc.public()]).unwrap();
+        repo.sign_transcript(live_tid, &identity).unwrap();
+
+        // Dead: committed on top of `base`, then the branch tip is rewound
+        // directly (bypassing undo/oplog, mirroring
+        // `gc_trims_old_oplog_records_and_releases_roots`) so no inverse
+        // record protects it.
+        std::fs::write(root.join("a.txt"), b"old").unwrap();
+        let dead_snap = repo.commit("t", "dead snap").unwrap();
+        let dead_tid = repo
+            .attach_transcript(dead_snap, "a", "s-dead", b"dead transcript body", &[identity.enc.public()])
+            .unwrap();
+        repo.sign_transcript(dead_tid, &identity).unwrap();
+        refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
+
+        // A second rewound commit becomes the newest oplog record, so
+        // `dead_snap`'s own record is not the newest and is eligible for
+        // trimming (the oplog always keeps its newest record regardless of
+        // cutoff).
+        std::fs::write(root.join("a.txt"), b"fresh").unwrap();
+        repo.commit("t", "fresh snap").unwrap();
+        refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
+
+        // Backdate dead_snap's oplog record so grace=0 actually trims it —
+        // same-second test runs otherwise never look "old enough" (mirrors
+        // `gc_trims_old_oplog_records_and_releases_roots` exactly).
+        let all = crate::oplog::read_all(repo.layout()).unwrap();
+        let dead_rec = all
+            .iter()
+            .find(|r| r.refs.iter().any(|(_, _, after)| *after == Some(dead_snap)))
+            .expect("dead_snap's commit record must exist");
+        let raw = std::fs::read_to_string(repo.layout().oplog_path()).unwrap();
+        let block_start = raw.find(&format!("op {}\n", dead_rec.seq)).expect("dead_rec's block must be present");
+        let block_end = block_start + raw[block_start..].find("end\n").expect("block has an end line") + "end\n".len();
+        let old_ts_line = format!("ts {}\n", dead_rec.ts);
+        let block = &raw[block_start..block_end];
+        assert!(block.contains(&old_ts_line), "dead record's ts line must be present in its own block");
+        let patched_block = block.replacen(&old_ts_line, "ts 100\n", 1);
+        let raw = format!("{}{}{}", &raw[..block_start], patched_block, &raw[block_end..]);
+        std::fs::write(repo.layout().oplog_path(), raw).unwrap();
+
+        let stats = repo.gc(Duration::from_secs(0)).unwrap();
+        assert_eq!(stats.transcripts_pruned, 1, "dead_snap's transcript index entry is dropped");
+
+        let arc = repo.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(s.contains(&live_tid), "live transcript object survives gc");
+        assert!(!s.contains(&dead_tid), "dead transcript object is pruned");
+        drop(s);
+
+        let idx = transcripts::load(repo.layout()).unwrap();
+        assert!(idx.iter().any(|(snap, t)| *snap == base && *t == live_tid), "live entry stays indexed");
+        assert!(!idx.iter().any(|(_, t)| *t == dead_tid), "dead entry is dropped from the index");
+
+        // gc ordering, the load-bearing assertion: the live transcript's OWN
+        // signature (keyed by the transcript id, in the SHARED
+        // `.sc/signatures` index) survives only because `transcripts::gc_prune`
+        // rooted `live_tid` into `reachable` before `signatures::gc_prune` ran.
+        assert_eq!(
+            repo.signatures_for(&live_tid).unwrap().len(),
+            1,
+            "live transcript's own signature survives gc (gc ordering)"
+        );
+        assert!(
+            repo.signatures_for(&dead_tid).unwrap().is_empty(),
+            "dead transcript's own signature is pruned along with it"
+        );
+
+        drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

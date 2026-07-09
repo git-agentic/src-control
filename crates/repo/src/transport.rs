@@ -150,6 +150,13 @@ impl LocalTransport {
         // `have_set`.
         let all_snaps: Vec<ObjectId> = want_set.iter().chain(have_set.iter()).copied().collect();
         want_set.extend(crate::signatures::indexed_signature_ids_for(&self.layout, &all_snaps)?);
+        // Sender seam (P30 Task 4, mirroring the signature over-send
+        // verbatim): a Transcript is likewise a leaf referenced by no
+        // tree/snapshot, so it has to be pulled in explicitly via the
+        // `.sc/transcripts` index. Over-send every indexed transcript
+        // covering any transfer-relevant snapshot; never subtract any of
+        // them from `have_set` — the has-gated filter below still applies.
+        want_set.extend(crate::transcripts::indexed_transcript_ids_for(&self.layout, &all_snaps)?);
 
         let ids: Vec<ObjectId> =
             want_set.into_iter().filter(|id| !have_set.contains(id)).collect();
@@ -299,6 +306,9 @@ pub(crate) fn ingest_pack_file(
     // Receiver seam (P22 Task 3): every id above was just written to this
     // store, so `index_incoming`'s "ids just written" contract holds.
     crate::signatures::index_incoming(layout, store, &ids)?;
+    // Receiver seam (P30 Task 4): same "ids just written" contract, for
+    // Transcript objects.
+    crate::transcripts::index_incoming(layout, store, &ids)?;
     Ok(ids)
 }
 
