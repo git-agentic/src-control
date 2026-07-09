@@ -5,10 +5,10 @@
 //! this file only exercises the CLI surface: flag validation and that the
 //! spawned `sc serve --http` process actually answers on the socket.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 fn sc(dir: &Path, args: &[&str]) -> Output {
@@ -24,6 +24,63 @@ fn tmp(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Spawn `sc serve --http 127.0.0.1:0 <extra…> <path>` and return the child
+/// plus the OS-assigned `host:port` it reports on its first stdout line
+/// (`listening on <addr>`). Binding port 0 lets the OS pick a free port, so
+/// two parallel http-serving tests — and anything else already on the
+/// machine or left over in CI — can never collide on a fixed port. Reading
+/// the announce line is also the readiness signal: `serve_http` prints it
+/// only after `TcpListener::bind` returns, so the socket is bound and
+/// backlog-accepting connections by the time we get the address. A child
+/// that fails to bind exits without printing, closing stdout — the `n == 0`
+/// EOF path surfaces that as a clear panic instead of hanging.
+fn spawn_http_server(root: &Path, extra: &[&str]) -> (Child, String) {
+    let mut args = vec!["serve", "--http", "127.0.0.1:0"];
+    args.extend_from_slice(extra);
+    args.push(root.to_str().unwrap());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sc"))
+        .args(&args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn sc serve --http");
+    let stdout = child.stdout.take().expect("child stdout is piped");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .expect("read serve startup line");
+    if n == 0 {
+        let status = child.wait().ok();
+        panic!("sc serve --http exited before announcing a bound address: {status:?}");
+    }
+    let addr = line
+        .trim()
+        .strip_prefix("listening on ")
+        .unwrap_or_else(|| panic!("unexpected serve startup line: {line:?}"))
+        .to_string();
+    (child, addr)
+}
+
+/// Send a malformed opening and assert the server answers `HTTP/1.1 400`.
+/// Reads the response to EOF (the server writes the status then closes the
+/// connection) rather than a single `read()`: a lone `read` returns as soon
+/// as ANY bytes arrive, so under load it can split off just `HTTP/1.1 `
+/// before `400 Bad Request` is in the buffer — the true cause of this
+/// suite's historical flake, independent of the port.
+fn assert_malformed_opening_gets_400(mut stream: TcpStream) {
+    stream.write_all(b"not an http request\r\n\r\n").unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).unwrap();
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(
+        resp.starts_with("HTTP/1.1 400"),
+        "expected 400, got: {resp}"
+    );
 }
 
 /// `sc serve` with neither `--stdio` nor `--http` must bail with a message
@@ -44,8 +101,9 @@ fn serve_without_a_mode_bails() {
 /// `sc serve --http <addr> <path>` actually listens and answers the HTTP
 /// opening/status handshake — a smoke test of the CLI wiring onto
 /// `serve_http`, not a re-proof of `wire::serve` correctness (covered
-/// in-crate). Polls a fixed high port with a short retry loop for process
-/// startup, then confirms the process is killed cleanly afterward.
+/// in-crate). Binds an OS-assigned port (`127.0.0.1:0`) and reads it back
+/// from the child's startup announce, then confirms the process is killed
+/// cleanly afterward.
 #[test]
 fn serve_http_cli_answers_on_socket() {
     let root = tmp("cli-answers");
@@ -55,50 +113,13 @@ fn serve_http_cli_answers_on_socket() {
         .status
         .success());
 
-    // Fixed high port: avoids needing the child to report back an
-    // OS-assigned one over a channel this test doesn't otherwise need. Its
-    // range is disjoint from the other http-serving test's so the two never
-    // collide within one `cargo test` binary run (a full OS-assigned-port
-    // de-flake is a ROADMAP-Deferred follow-on).
-    let port = 18100u16 + (std::process::id() % 600) as u16;
-    let addr = format!("127.0.0.1:{port}");
-
-    let mut child: Child = Command::new(env!("CARGO_BIN_EXE_sc"))
-        .args(["serve", "--http", &addr, root.to_str().unwrap()])
-        .spawn()
-        .expect("spawn sc serve --http");
-
-    // Retry-connect: give the child a generous (~10s) window to bind — under a
-    // full parallel `cargo test` run the spawned server competes for the
-    // machine, so a 1s wait is too tight and flakes. Bail fast with a clear
-    // message if the child exits first (e.g. a port conflict).
-    let mut stream = None;
-    for _ in 0..250 {
-        if let Ok(s) = TcpStream::connect(&addr) {
-            stream = Some(s);
-            break;
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("sc serve --http exited before binding {addr}: {status}");
-        }
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    let mut stream = stream.expect("sc serve --http bound and accepted a connection");
+    let (mut child, addr) = spawn_http_server(&root, &[]);
+    let stream = TcpStream::connect(&addr).expect("connect to the bound server");
 
     // A malformed opening must get a prompt 400, proving the CLI-spawned
     // server is really running `handle_http_connection`, not just accepting
     // and hanging.
-    stream.write_all(b"not an http request\r\n\r\n").unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert!(
-        resp.starts_with("HTTP/1.1 400"),
-        "expected 400, got: {resp}"
-    );
+    assert_malformed_opening_gets_400(stream);
 
     let _ = child.kill();
     let _ = child.wait();
@@ -184,50 +205,15 @@ fn serve_http_read_only_flag_flows_through() {
     let root = tmp("cli-read-only");
     assert!(sc(&root, &["init"]).status.success());
 
-    // Disjoint port range from `serve_http_cli_answers_on_socket` so the two
-    // http-serving tests never collide within one `cargo test` binary run.
-    let port = 18800u16 + (std::process::id() % 600) as u16;
-    let addr = format!("127.0.0.1:{port}");
-
-    let mut child: Child = Command::new(env!("CARGO_BIN_EXE_sc"))
-        .args([
-            "serve",
-            "--http",
-            &addr,
-            "--read-only",
-            root.to_str().unwrap(),
-        ])
-        .spawn()
-        .expect("spawn sc serve --http --read-only");
-
-    // ~10s bind window with a fast-fail on child exit — see the sibling test.
-    let mut stream = None;
-    for _ in 0..250 {
-        if let Ok(s) = TcpStream::connect(&addr) {
-            stream = Some(s);
-            break;
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("sc serve --http --read-only exited before binding {addr}: {status}");
-        }
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    let mut stream = stream.expect("sc serve --http --read-only bound and accepted a connection");
+    // OS-assigned port (see `spawn_http_server`) — no fixed-port collision
+    // with the sibling http-serving test or anything else on the machine.
+    let (mut child, addr) = spawn_http_server(&root, &["--read-only"]);
+    let stream = TcpStream::connect(&addr).expect("connect to the bound read-only server");
 
     // A malformed opening still gets a prompt 400 — proves the process is
     // really running the http server with the new flags parsed, not just
     // hanging or erroring out on argument parsing.
-    stream.write_all(b"not an http request\r\n\r\n").unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert!(
-        resp.starts_with("HTTP/1.1 400"),
-        "expected 400, got: {resp}"
-    );
+    assert_malformed_opening_gets_400(stream);
 
     let _ = child.kill();
     let _ = child.wait();

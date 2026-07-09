@@ -173,7 +173,13 @@ mod tests {
         let hub = root.join("hub.git");
         run_git(
             std::path::Path::new("."),
-            &["init", "--bare", hub.to_str().unwrap()],
+            // `-b main` pins the hub's default branch regardless of the
+            // machine's `init.defaultBranch`. Without it, a runner defaulting
+            // to `master` (CI's ubuntu image does) leaves the hub's HEAD
+            // dangling once only `main` is pushed, so `ls-remote --symref
+            // HEAD` shows no symref and `remote_default_branch` fails — a
+            // CI-only flake masked on dev machines configured to `main`.
+            &["init", "--bare", "-b", "main", hub.to_str().unwrap()],
         )
         .unwrap();
         let url = format!("file://{}", hub.display());
@@ -194,7 +200,13 @@ mod tests {
         let hub = root.join("hub.git");
         run_git(
             std::path::Path::new("."),
-            &["init", "--bare", hub.to_str().unwrap()],
+            // `-b main` pins the hub's default branch regardless of the
+            // machine's `init.defaultBranch`. Without it, a runner defaulting
+            // to `master` (CI's ubuntu image does) leaves the hub's HEAD
+            // dangling once only `main` is pushed, so `ls-remote --symref
+            // HEAD` shows no symref and `remote_default_branch` fails — a
+            // CI-only flake masked on dev machines configured to `main`.
+            &["init", "--bare", "-b", "main", hub.to_str().unwrap()],
         )
         .unwrap();
         // Seed the hub with one commit via a scratch worktree.
@@ -236,9 +248,21 @@ mod tests {
         // Write a second commit into the MIRROR's head (simulating P10 export),
         // push it up, and see it on the hub.
         let seed2 = root.join("seed2");
+        // `-b main` checks out the mirror's `main` explicitly. The mirror
+        // (created by production `ensure_mirror`, deliberately not pinned)
+        // keeps a HEAD following the machine default, so a plain clone under
+        // a `master`-defaulting runner would land seed2 on an unborn
+        // `master` and the `push origin main` below would have no `main` to
+        // push — the same CI-only class as the hub `-b main` above.
         run_git(
             std::path::Path::new("."),
-            &["clone", mirror.to_str().unwrap(), seed2.to_str().unwrap()],
+            &[
+                "clone",
+                "-b",
+                "main",
+                mirror.to_str().unwrap(),
+                seed2.to_str().unwrap(),
+            ],
         )
         .unwrap();
         std::fs::write(seed2.join("b.txt"), "world").unwrap();

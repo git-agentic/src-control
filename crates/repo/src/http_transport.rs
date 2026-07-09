@@ -461,6 +461,17 @@ pub fn serve_http(
     let mandatory_auth = auth_is_mandatory(addr, read_only, allow_public);
     let listener = TcpListener::bind(addr)
         .map_err(|e| Error::ConnectionLost(format!("sc+http bind {addr}: {e}")))?;
+    // Announce the actually-bound address on stdout, then flush. stdout is
+    // free in `--http` mode (the wire protocol rides the TCP socket, never
+    // stdout — unlike `--stdio`), so this is a safe place to report the
+    // resolved port. This gives real users startup feedback AND lets a
+    // caller that binds `:0` (an OS-assigned port) learn which port it got —
+    // the CLI http tests rely on exactly this to avoid fixed-port collisions.
+    let bound = listener
+        .local_addr()
+        .map_err(|e| Error::ConnectionLost(format!("sc+http local_addr: {e}")))?;
+    println!("listening on {bound}");
+    std::io::Write::flush(&mut std::io::stdout()).ok();
     serve_http_listener(listener, root, read_only, mandatory_auth)
 }
 
