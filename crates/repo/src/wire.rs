@@ -437,7 +437,7 @@ pub fn read_pack_stream(r: &mut impl Read, sink: &mut (impl Write + ?Sized)) -> 
                 sink.write_all(rest)?;
                 total += rest.len() as u64;
             }
-            Some((&ST_PACK_END, rest)) if rest.is_empty() => return Ok(total),
+            Some((&ST_PACK_END, [])) => return Ok(total),
             _ => return Err(Error::Protocol("unexpected frame in pack stream".into())),
         }
     }

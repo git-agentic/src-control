@@ -20,10 +20,10 @@ pub fn is_network_git_url(url: &str) -> bool {
         return true;
     }
     // scp-style: user@host:path — an '@' and a ':' before any '/'.
-    match (url.find('@'), url.find(':'), url.find('/')) {
-        (Some(a), Some(c), slash) if a < c && slash.is_none_or(|s| c < s) => true,
-        _ => false,
-    }
+    matches!(
+        (url.find('@'), url.find(':'), url.find('/')),
+        (Some(a), Some(c), slash) if a < c && slash.is_none_or(|s| c < s)
+    )
 }
 
 fn git_program() -> String {

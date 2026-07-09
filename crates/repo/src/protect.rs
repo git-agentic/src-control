@@ -334,7 +334,7 @@ mod tests {
         let wa = scl_crypto::wrap_dek_for(&dek, &pk_a);
         let wa_dup = scl_crypto::wrap_dek_for(&dek, &pk_a);
         let wb = scl_crypto::wrap_dek_for(&dek, &pk_b);
-        let u = union_wraps(&[wa.clone()], &[wa_dup, wb.clone()]);
+        let u = union_wraps(std::slice::from_ref(&wa), &[wa_dup, wb.clone()]);
         assert_eq!(u.len(), 2);
         // Dedup keeps a's wrap for pk_a (first occurrence wins).
         let kept_a = u
@@ -348,7 +348,7 @@ mod tests {
         // surviving bytes order-dependent by design) must union to identical
         // output regardless of argument order, so the snapshot encoding is
         // deterministic.
-        let ab = union_wraps(&[wa.clone()], &[wb.clone()]);
+        let ab = union_wraps(std::slice::from_ref(&wa), std::slice::from_ref(&wb));
         let ba = union_wraps(&[wb], &[wa]);
         assert_eq!(ab, ba);
         // And the output is sorted by recipient_id.
