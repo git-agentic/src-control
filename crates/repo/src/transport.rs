@@ -487,6 +487,30 @@ mod tests {
     }
 
     #[test]
+    fn wire_update_ref_rejects_traversal() {
+        // LocalTransport::update_ref is the choke point the wire UpdateRef
+        // arm (wire.rs) reaches on the server side, so driving it directly
+        // here exercises the same code path a hostile ssh/http client's
+        // UpdateRef request would hit.
+        let layout = tmp_remote("wire-update-ref");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let id = Object::blob(b"hello".to_vec()).id();
+
+        assert!(matches!(
+            t.update_ref("../../escape", &id, None),
+            Err(Error::BadRef(_))
+        ));
+        assert!(matches!(t.update_ref("has space", &id, None), Err(Error::BadRef(_))));
+
+        // No ref file was created anywhere, including outside refs/heads/.
+        assert_eq!(t.list_refs().unwrap(), Vec::new());
+        assert!(!layout.root.join("escape").exists());
+        assert!(!layout.root.parent().unwrap().join("escape").exists());
+
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
     fn transport_reads_object_larger_than_one_mib() {
         // A blob > 1 MiB would BudgetExceed under the old 1 MiB budget.
         let layout = tmp_remote("large");

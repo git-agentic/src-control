@@ -376,8 +376,17 @@ across every phase.
 
 ## Active
 
-None — the P25–P27 scale-&-reach horizon is complete; brainstorm the next
-horizon.
+**Phase 28 — Security hardening sweep.** The P25–P27 scale-&-reach horizon
+surfaced a wire attack surface (a hostile `UpdateRef` over ssh/http) that
+never got a dedicated closing pass. Task 1: ref-name validation at the
+write/read boundary — `write_branch_tip`/`read_branch_tip` (the choke point
+every local-branch write reaches, including the wire `UpdateRef` arm) now
+call the existing strict `validate_branch_name`; `is_unsafe_ref_component`
+(the separate, `/`-permitting remote-tracking validator) is upgraded to also
+reject whitespace/control, closing an oplog-corruption gap via a hostile git
+remote's branch name. Follow-on: P29 access control.
+
+
 
 ## Completed phases (usability-first ordering)
 

@@ -6,6 +6,11 @@ use scl_core::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::layout::Layout;
+// Smaller diff than moving the function: repo.rs's strict, single-component
+// `validate_branch_name` (rejects `/`, unlike this module's own
+// `is_unsafe_ref_component`) is the right guard for local branch writes —
+// `Repo::branch`'s existing calls to it become redundant belt-and-suspenders.
+pub(crate) use crate::repo::validate_branch_name;
 
 const HEAD_PREFIX: &str = "ref: refs/heads/";
 
@@ -25,6 +30,7 @@ pub fn current_branch(layout: &Layout) -> Result<String> {
 
 /// The tip snapshot of `branch`, or `None` if the branch is unborn.
 pub fn read_branch_tip(layout: &Layout, branch: &str) -> Result<Option<ObjectId>> {
+    validate_branch_name(branch)?;
     let path = layout.ref_path(branch);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
@@ -40,6 +46,7 @@ pub fn read_branch_tip(layout: &Layout, branch: &str) -> Result<Option<ObjectId>
 
 /// Point `branch` at `id` (atomic).
 pub fn write_branch_tip(layout: &Layout, branch: &str, id: &ObjectId) -> Result<()> {
+    validate_branch_name(branch)?;
     std::fs::create_dir_all(layout.refs_heads_dir())?;
     atomic_write(&layout.ref_path(branch), format!("{}\n", id.to_hex()).as_bytes())
 }
@@ -88,17 +95,22 @@ pub fn resolve_tip(layout: &Layout, name: &str) -> Result<Option<ObjectId>> {
 }
 
 /// Whether a `<remote>/<branch>` path component could escape or corrupt
-/// `refs/remotes/`: empty, dot-prefixed, backslash-bearing, or containing an
-/// empty or `..` sub-component. The empty sub-component check rejects an
-/// absolute component (leading `/`, e.g. `"/etc/passwd"`), a trailing `/`, and
-/// `//` — all of which would otherwise let `Path::join` discard the
-/// `.sc/refs/remotes/` prefix. (A single-component `remote` splits to just
-/// itself; a legit nested branch like `feature/x` still passes.)
+/// `refs/remotes/`: empty, dot-prefixed, backslash-bearing, whitespace/control
+/// bearing, or containing an empty or `..` sub-component. The empty
+/// sub-component check rejects an absolute component (leading `/`, e.g.
+/// `"/etc/passwd"`), a trailing `/`, and `//` — all of which would otherwise
+/// let `Path::join` discard the `.sc/refs/remotes/` prefix. (A
+/// single-component `remote` splits to just itself; a legit nested branch
+/// like `feature/x` still passes — `/` itself is deliberately allowed here,
+/// unlike `validate_branch_name`.) Whitespace/control is rejected too: a
+/// hostile git remote's branch name lands here via `sc fetch`, and the oplog
+/// is space-delimited, so a name like `"has space"` would corrupt it.
 fn is_unsafe_ref_component(s: &str) -> bool {
     s.is_empty()
         || s.starts_with('.')
         || s.contains('\\')
         || s.split('/').any(|c| c.is_empty() || c == "..")
+        || s.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Remove a branch ref file (P20, `sc ws harvest`'s candidate-branch cleanup
@@ -302,6 +314,57 @@ mod tests {
         assert!(matches!(delete_branch(&layout, "main"), Err(Error::InvalidArgument(_))));
         assert_eq!(read_branch_tip(&layout, "main").unwrap(), Some(id));
 
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn write_branch_tip_rejects_unsafe_names() {
+        let layout = tmp_layout("write-branch-unsafe");
+        let id = ObjectId::of(b"snap");
+        for bad in ["../evil", "a/b", "has space", "ctrl\u{7}", ".hidden", ""] {
+            assert!(
+                matches!(write_branch_tip(&layout, bad, &id), Err(Error::BadRef(_))),
+                "expected BadRef for {bad:?}"
+            );
+        }
+        // No file was written under refs/heads/ for any of the rejected names.
+        assert_eq!(list_heads(&layout).unwrap(), Vec::new());
+
+        // A legit name still succeeds.
+        write_branch_tip(&layout, "feature", &id).unwrap();
+        assert_eq!(read_branch_tip(&layout, "feature").unwrap(), Some(id));
+
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn read_branch_tip_rejects_unsafe_names() {
+        let layout = tmp_layout("read-branch-unsafe");
+        assert!(matches!(
+            read_branch_tip(&layout, "../etc/passwd"),
+            Err(Error::BadRef(_))
+        ));
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn is_unsafe_ref_component_rejects_whitespace_and_control() {
+        assert!(is_unsafe_ref_component("has space"));
+        assert!(is_unsafe_ref_component("...\u{9}..."));
+        assert!(is_unsafe_ref_component("ctrl\u{7}"));
+        // Nested `/` is still allowed for remote-tracking branches.
+        assert!(!is_unsafe_ref_component("origin"));
+        assert!(!is_unsafe_ref_component("feature/x"));
+    }
+
+    #[test]
+    fn remote_tracking_write_rejects_whitespace_branch() {
+        let layout = tmp_layout("remote-tracking-whitespace");
+        let id = ObjectId::of(b"snap");
+        assert!(matches!(
+            write_remote_tip(&layout, "origin", "bad name", &id),
+            Err(Error::BadRef(_))
+        ));
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
