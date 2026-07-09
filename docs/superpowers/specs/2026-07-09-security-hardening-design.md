@@ -156,19 +156,27 @@ parent zeroize) / defer (fd injection).**
 - **Deferred:** file-descriptor / stdin secret injection for commands that support it —
   a real alternative to env vars, its own effort.
 
-## Build sequencing (for the phase)
+## Build sequencing — two phases (decided 2026-07-09)
 
-**Fix-now, independent, small — can land together:**
+This spec is decision-complete; it builds as **two phases**, sweep first (each via
+the project's brainstorm → plan → subagent-driven build loop; ADR firmed at build).
+
+**Phase 28 — Security hardening sweep (ADR-0039).** The four small, independent,
+fix-now items — P21's shape: security-only, no new feature axis, demoable outcome =
+each concrete-bug repro becomes a pinned regression test while every existing demo
+stays green.
 - Decision 2 (ref-name validation) — one validator at the ref boundary + the
   remote-tracking guard upgrade.
 - Decision 3 (DoS caps) — one constant, three size caps, one zstd bound, four
   `count()` swaps.
 - Decision 4 (protect nudge + docs) and Decision 5 (env-var docs + parent zeroize).
 
-**Design-then-fix, larger — its own build unit:**
-- Decision 1 (sc+http access control) — the `--read-only` flag + fail-closed bind
-  posture are small; the bearer-token auth (opening parse extension, `.sc/serve-tokens.toml`,
-  scope gate, `sc serve token` CLI) is the substantive piece.
+**Phase 29 — sc+http access control (ADR-0040, its own build unit).** Decision 1 —
+the `--read-only` flag + fail-closed bind posture are small; the bearer-token auth
+(opening-parse extension, `.sc/serve-tokens.toml`, scope gate, `sc serve token` CLI)
+is the substantive piece. Independent of P28 (they touch disjoint code), so P28's
+sweep does not block it — sweep goes first only because it is smaller and closes the
+concrete-bug Highs (ref-traversal, DoS) sooner.
 
 ## Out of scope / deferred follow-ons
 
