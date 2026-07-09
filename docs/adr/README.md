@@ -47,6 +47,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0034](0034-sparse-checkouts.md) | Sparse checkouts / sub-tree sharing | Accepted | 24 |
 | [0035](0035-streaming-transfer.md) | Streaming pack transfer (bounded-RAM, >4 GiB) | Accepted | 25 |
 | [0036](0036-http-transport.md) | sc-native HTTP transport (`sc+http://`) | Accepted | 26 |
+| [0037](0037-partial-clone.md) | Partial clone (promisor store + prefix-scoped fetch) | Proposed | 27 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
