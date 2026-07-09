@@ -2606,7 +2606,7 @@ fn run_escrow(op: EscrowOp) -> Result<()> {
         EscrowOp::Add { key_or_name } => {
             let pk = resolve_pubkey(&key_or_name)?;
             let mut keys = load_escrows(&path)?;
-            keys = append_escrow(keys, &[pk.clone()]);
+            keys = append_escrow(keys, std::slice::from_ref(&pk));
             write_escrow_keys(&path, keys.clone())?;
             println!(
                 "escrow key added: {} ({} total)",

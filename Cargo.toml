@@ -18,18 +18,15 @@ categories = ["development-tools", "command-line-utilities"]
 # crate sets `publish.workspace = true` to inherit this.
 publish = false
 
-# Accepted clippy lints for the MVP, applied workspace-wide (each crate opts in
-# with `[lints] workspace = true`). These are deliberate design or cosmetic
-# choices in reviewed code, not defects; tightening them is a ROADMAP-Deferred
-# follow-on. CI runs `clippy --all-targets -D warnings`, so this list is the
-# single source of truth for what's intentionally allowed.
+# Clippy lints intentionally allowed workspace-wide (each crate opts in with
+# `[lints] workspace = true`). Kept deliberately small: two structural lints that
+# are design choices, and one pedantic markdown lint that misfires on prose doc
+# comments. Everything else clippy flags is fixed at the source. CI runs
+# `clippy --all-targets -D warnings`, so this list is the single source of truth.
 [workspace.lints.clippy]
 type_complexity = "allow"       # deliberate: crypto wrap/protection map types
 too_many_arguments = "allow"    # deliberate: commit/snapshot-assembly fns
-doc_lazy_continuation = "allow" # cosmetic: doc-comment list continuation style
-redundant_guards = "allow"      # stylistic match-guard preference
-match_like_matches_macro = "allow"
-cloned_ref_to_slice_refs = "allow"
+doc_lazy_continuation = "allow" # pedantic markdown lint on prose doc comments
 
 [profile.release]
 lto = true

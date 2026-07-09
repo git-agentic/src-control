@@ -2966,11 +2966,12 @@ mod tests {
         std::fs::write(root.join("base.txt"), b"base\n").unwrap();
         repo.commit("me", "base").unwrap();
         let (_sk, pk) = scl_crypto::generate_keypair();
-        repo.secret_add("TOKEN", b"v0", &[pk.clone()]).unwrap();
+        repo.secret_add("TOKEN", b"v0", std::slice::from_ref(&pk))
+            .unwrap();
         repo.branch("feature").unwrap();
 
         // main rotates TOKEN one way...
-        repo.secret_rotate("TOKEN", Some(b"main-v"), &[pk.clone()], None)
+        repo.secret_rotate("TOKEN", Some(b"main-v"), std::slice::from_ref(&pk), None)
             .unwrap();
         // ...feature rotates it differently.
         repo.switch("feature").unwrap();
