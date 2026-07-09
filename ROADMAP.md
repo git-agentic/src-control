@@ -337,10 +337,47 @@ across every phase.
   (`sc+https://` deferred), **no authentication** (front with a reverse
   proxy for production), and **not HTTP-proxy/CDN safe** (a strict proxy
   won't tunnel the post-opening raw protocol). (ADR-0036.)
+- **Phase 27 — Partial clone.** The P25–P27 scale-&-reach horizon's
+  capstone: `sc clone --filter <prefix…> <src> <dst>` fetches ONLY
+  objects reachable under the given prefixes — `.sc/promisor`
+  (`crates/repo/src/promisor.rs`) records the fetch-filter + promisor
+  origin, and `Promisor::should_descend` is the ancestor-aware predicate a
+  path-aware filtered reachability walk
+  (`reachable_objects_filtered` → `Reachable { included, gaps }`,
+  `crates/repo/src/reachable.rs`) needs to descend through an out-of-filter
+  ancestor directory to reach deeper in-filter content, while pruning
+  everything genuinely out of filter (recorded in `gaps` by id, never
+  fetched — the reason a partial-clone source missing an out-of-filter
+  object never errors). One walk serves both `get_pack`'s want-side filter
+  (`PROTOCOL_VERSION` 2→3) and the client's own gap-tolerant `gc`/`sc
+  verify` (`partial: N object(s) outside filter`, exit 0). Building a new
+  commit on a partial clone needed real new machinery, not free
+  composition: `worktree::graft_out_of_sparse` splices the tip's
+  out-of-filter subtrees back into a freshly built root by id (never
+  reading their content), closing two review-caught Criticals along the
+  way — protected-blob wraps carried forward so decryption access isn't
+  silently lost, and content under a never-fetched path refused outright
+  (`Error::GappedPathContent`) rather than silently dropped. `sc backfill
+  <prefix…>` widens the filter from the promisor origin on demand, offline
+  everywhere else (explicit backfill, not transparent lazy-fetch — a
+  deliberate MVP choice to keep network I/O out of every read path).
+  **Coarse but honest limitation:** merge, cherry-pick/rebase replay, `sc
+  ws harvest`, and `sc work` are refused entirely on a partial clone
+  (`Error::PartialCloneUnsupported`) — backfill to a full clone first, not
+  a per-case gap-tolerant reimplementation. `sc export` refuses too (Git
+  needs full trees). Proven by `demo/run_partial_clone_demo.sh`: a
+  `--filter src/` clone holds fewer objects than a full clone (both by
+  object-store count and `sc verify`'s gap report), docs/lib/ are never
+  fetched or materialized, a src/ edit committed and pushed from the
+  partial clone lands cleanly (an independent full re-clone sees the edit
+  AND byte-identical docs/lib), `sc backfill docs/` shrinks the gap count
+  and makes docs/ genuinely readable, and `sc gc` on the partial clone
+  succeeds and preserves everything — run twice, zero residue. (ADR-0037.)
 
 ## Active
 
-None — P26 done; P27 partial clone (the horizon capstone) is next up.
+None — the P25–P27 scale-&-reach horizon is complete; brainstorm the next
+horizon.
 
 ## Completed phases (usability-first ordering)
 
@@ -369,6 +406,7 @@ None — P26 done; P27 partial clone (the horizon capstone) is next up.
 | **P24 — Sparse checkouts / sub-tree sharing** | Materialize one subtree of a large repo, leave the rest on the CAS | `sc sparse set <prefix…>`/`show`/`disable`; `commit`'s absent-path carry widens to out-of-sparse paths (byte-identical carried subtrees); `materialize` filters both its write and removal loops; proven by `demo/run_sparse_demo.sh` (narrow, edit, commit, then disable/clone restore byte-identical) | [0034](docs/adr/0034-sparse-checkouts.md) |
 | **P25 — Streaming pack transfer (bounded-RAM, >4 GiB)** | `push`/`fetch`/`clone` over ssh:// don't hold a whole pack in RAM anywhere — server, wire, or client | `PackWriter`/`parse_pack_reader` (bounded-RAM pack build/parse); `ST_PACK_CHUNK`/`ST_PACK_END` chunk framing (`SC_PACK_CHUNK`-tunable); `PROTOCOL_VERSION` 2, v1 dropped; two-pass atomic-after-verify ingest + `TempPackGuard`; the ssh client's own `sync.rs` fetch/push call sites route through the same `ingest_pack_file`/`write_ids_to_temp_pack` machinery (final-review fix); proven by `demo/run_streaming_demo.sh` (forced 4 KiB chunks, byte-for-byte clone, signature rides the stream, zero temp residue) | [0035](docs/adr/0035-streaming-transfer.md) |
 | **P26 — sc-native HTTP transport** | Reach a repo over plain TCP with no ssh account | `sc serve --http <addr> <path>`; `sc clone sc+http://host[:port]/repo`; thread-per-connection server, opening-status mapped before the wire handshake, P25 chunk stream + P22 signatures ride the raw socket with no HTTP framing; proven by `demo/run_http_remote_demo.sh` (real loopback TCP, no shim; clone/push/fetch byte-for-byte, signed commit verifies clean, zero `.sc/tmp` residue) | [0036](docs/adr/0036-http-transport.md) |
+| **P27 — Partial clone** | Bound network transfer to a subset of paths, not the whole repo | `sc clone --filter <prefix…> <src> <dst>` fetches only in-filter objects (`.sc/promisor` + filtered reachability walk); `sc backfill <prefix…>` widens on demand; `sc gc`/`sc verify` are gap-tolerant; merge/rebase/`ws harvest`/`sc work`/`sc export` refuse on a partial clone; proven by `demo/run_partial_clone_demo.sh` (fewer objects fetched, push composes after a partial-clone commit, backfill shrinks the gap count, gc preserves everything, run twice) | [0037](docs/adr/0037-partial-clone.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -460,8 +498,9 @@ graduated twice over: revocation tombstones → P16, bulk re-wrap + escrow
 keys → P17, network Git remotes → P18, history-editing polish → P19,
 sessions + auto-merge → P20; and now policy-op guards + marks recovery +
 abort/status minors → P21, signed commits → P22, merge ergonomics → P23,
-sparse checkouts → P24, streaming (>4 GiB) wire frames → P25, and
-sc-native HTTP transport → P26):
+sparse checkouts → P24, streaming (>4 GiB) wire frames → P25, sc-native
+HTTP transport → P26, and partial clone → P27 — this closes the P25–P27
+scale-&-reach horizon):
 
 - **Unbounded thread-per-connection in `sc serve --http` (P26).**
   `serve_http_listener` spawns one OS thread per accepted socket with no
@@ -514,6 +553,23 @@ sc-native HTTP transport → P26):
   (recoverable via disable); a zero-arg `sc sparse set` silently equals
   `disable`; blank lines in a hand-edited `.sc/sparse` want tolerant
   parsing. Small usability hardening.
+- **Transparent lazy-fetch for partial clones (P27).** `sc backfill` is
+  explicit-only by design (ADR-0037's "no network in read paths" choice);
+  the identical filtered-walk/gap infra could instead dial the promisor
+  origin automatically on any gap, matching git's promisor default. Real
+  scope/risk (offline breakage, surprise latency, fetch-during-gc), so it
+  stays deferred, not accidentally missing.
+- **Per-case gap-tolerant merge/rebase/ws-harvest/sc-work on a partial
+  clone (P27).** These are refused entirely today
+  (`Error::PartialCloneUnsupported`) rather than gap-tolerantly
+  reimplemented — a deliberate MVP coarsening, not a technical ceiling.
+  Threading gap-tolerance through `three_way`/replay/`ws::harvest`
+  individually is the follow-on if the "backfill to a full clone first"
+  workaround proves too coarse in practice.
+- **Blob-size/object-count clone filters (P27).** `sc clone --filter` is
+  prefix-only, matching the sparse path-boundary machinery already built;
+  git's `--filter=blob:limit` size-based filtering is a separate axis,
+  deferred.
 
 ## How a phase gets built
 

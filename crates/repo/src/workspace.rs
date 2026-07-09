@@ -183,6 +183,18 @@ impl Repo {
         if opts.cmd.is_empty() {
             return Err(Error::InvalidArgument("empty agent command".into()));
         }
+        // Partial-clone guard (P27 Task 5 review Important fix): `sc work`
+        // always materializes each workspace with `Sparse::default()` (full
+        // materialization) by design — an agent needs the complete tree,
+        // never silently narrowed to the host's sparse view (see
+        // `materialize_workspace`'s doc comment). On a partial clone "the
+        // complete tree" includes out-of-filter content this clone never
+        // fetched, so that materialize call would hit the raw
+        // corruption-shaped `NotFound` this guard family exists to
+        // eliminate. Refuse loudly up front instead.
+        if self.promisor()?.is_some() {
+            return Err(crate::promisor::partial_clone_unsupported("sc work"));
+        }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let labels: Vec<String> =
             (1..=opts.agents).map(|i| format!("{}-{i}", opts.base_name)).collect();
@@ -697,5 +709,51 @@ mod tests {
         drop(repo);
         let _ = &scratch; // scratch unused here
         teardown(&root);
+    }
+
+    /// P27 Task 5 review Important fix: `sc work` always materializes each
+    /// workspace with `Sparse::default()` (full materialization) by design
+    /// — an agent needs the complete tree. On a partial clone "the complete
+    /// tree" includes out-of-filter content this clone never fetched, so
+    /// that materialize call used to hit the raw corruption-shaped
+    /// `NotFound` this guard family exists to eliminate. Must refuse loudly
+    /// up front instead.
+    #[test]
+    fn work_refuses_on_partial_clone_instead_of_raw_notfound() {
+        let base = std::env::temp_dir()
+            .join(format!("sc-work-partial-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src_root = base.join("src");
+        let dst_root = base.join("dst");
+        let scratch = base.join("scratch");
+        std::fs::create_dir_all(src_root.join("src")).unwrap();
+        std::fs::create_dir_all(src_root.join("docs")).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("src/a.txt"), b"src-one").unwrap();
+        std::fs::write(src_root.join("docs/b.txt"), b"docs-one").unwrap();
+        src.commit("t", "c1").unwrap();
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        let opts = work_opts(1, &["true"], &scratch);
+        let err = dst.work(opts).unwrap_err();
+        assert!(
+            matches!(err, Error::PartialCloneUnsupported(_)),
+            "expected the explicit partial-clone-unsupported refusal, got {err:?}"
+        );
+        assert!(err.to_string().contains("not supported on a partial clone"));
+        // Refused before anything was spawned or materialized: no session
+        // residue.
+        assert!(!scratch.join("session").exists());
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

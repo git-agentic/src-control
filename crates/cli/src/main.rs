@@ -260,6 +260,12 @@ enum Cmd {
         /// sc-native remote (ADR-0022/ADR-0028).
         #[arg(long)]
         git: bool,
+        /// Partial clone (P27): only fetch objects under this path prefix
+        /// (repeatable). Writes `.sc/promisor` + `.sc/sparse`; missing
+        /// objects can later be pulled in with `sc backfill`. Not supported
+        /// over a git-bridge remote.
+        #[arg(long)]
+        filter: Vec<String>,
     },
     /// Serve a repo to a remote `sc` client, either over stdin/stdout
     /// (invoked by `ssh` for ssh:// remotes) or over TCP (`sc+http://`
@@ -387,6 +393,21 @@ enum Cmd {
     Sparse {
         #[command(subcommand)]
         op: SparseOp,
+    },
+    /// Widen a partial clone: fetch objects under these prefixes from the
+    /// promisor origin and widen `.sc/promisor` to include them. Errors if
+    /// this repo is not a partial clone.
+    Backfill {
+        /// Path prefixes to backfill (repeatable).
+        prefixes: Vec<String>,
+        /// Fetch EVERY remaining out-of-filter object (no prefix
+        /// restriction) and, once the object closure is verified complete,
+        /// remove `.sc/promisor` — this repo becomes a genuine full clone
+        /// and merge/pick/rebase/`ws harvest`/`sc work`/export/sparse
+        /// disable all work again. Mutually exclusive with `prefixes`
+        /// (P27 final review I2).
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -624,7 +645,7 @@ fn main() -> Result<()> {
             run_work(agents, name, budget_mb, with_secrets, identity, author, cmd)
         }
         Cmd::Ws { op } => run_ws(op),
-        Cmd::Clone { src, dst, git } => run_clone(src, dst, git),
+        Cmd::Clone { src, dst, git, filter } => run_clone(src, dst, git, filter),
         Cmd::Serve { stdio, http, path } => run_serve(stdio, http, path),
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
@@ -641,6 +662,7 @@ fn main() -> Result<()> {
         Cmd::Sign { r#ref, identity } => run_sign(&r#ref, identity),
         Cmd::Verify { r#ref, require } => run_verify(r#ref, require),
         Cmd::Sparse { op } => run_sparse(op),
+        Cmd::Backfill { prefixes, all } => run_backfill(prefixes, all),
     }
 }
 
@@ -1923,6 +1945,17 @@ fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
         history.len()
     ));
 
+    // Partial-clone gap report (P27 Task 5): out-of-filter objects are
+    // EXPECTED to be absent on a partial clone, never missing/corrupt — print
+    // a count instead of treating them as a verify failure.
+    if let Some(gaps) = repo.partial_gap_count(&[tip])? {
+        let prefixes = repo
+            .promisor()?
+            .map(|p| p.prefixes().join(", "))
+            .unwrap_or_default();
+        print_line(&format!("partial: {gaps} object(s) outside filter [{prefixes}]"));
+    }
+
     if require && (untrusted + invalid + unsigned) > 0 {
         // Drop the repo (releases .sc/lock) before process::exit, which skips
         // destructors and would otherwise leave a stale lock file — same
@@ -2359,7 +2392,7 @@ fn resolve_ids_to_pubkeys(
     Ok(out)
 }
 
-fn run_clone(src: String, dst: PathBuf, git: bool) -> Result<()> {
+fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>) -> Result<()> {
     // Auto-detect unambiguous git URL forms (https/http, scp-style, file://):
     // those can never be sc-native, so no flag is needed. Bare `ssh://` is
     // ambiguous — it means an sc-native remote (ADR-0022) unless `--git`
@@ -2367,11 +2400,44 @@ fn run_clone(src: String, dst: PathBuf, git: bool) -> Result<()> {
     let git_shaped =
         scl_gitio::bridge::is_network_git_url(&src) && !src.starts_with("ssh://");
     if git || git_shaped {
+        if !filter.is_empty() {
+            anyhow::bail!("partial clone is not supported over git remotes");
+        }
         return run_clone_git(&src, &dst);
     }
-    let repo = scl_repo::Repo::clone_url(&src, &dst)?;
+    let filter_opt = (!filter.is_empty()).then_some(filter.as_slice());
+    let repo = scl_repo::Repo::clone_url_filtered(&src, &dst, filter_opt)?;
     let n = repo.branches()?.len();
-    println!("cloned {} into {} ({} branch(es))", src, dst.display(), n);
+    if filter_opt.is_some() {
+        println!(
+            "cloned {} into {} ({} branch(es), partial: {})",
+            src,
+            dst.display(),
+            n,
+            filter.join(", ")
+        );
+    } else {
+        println!("cloned {} into {} ({} branch(es))", src, dst.display(), n);
+    }
+    Ok(())
+}
+
+/// Widen a partial clone: fetch objects under `prefixes` from the promisor
+/// origin and widen `.sc/promisor`. Errors if this repo is not a partial
+/// clone. `--all` ignores `prefixes` and instead fetches every remaining
+/// object, then removes `.sc/promisor` entirely (P27 final review I2).
+fn run_backfill(prefixes: Vec<String>, all: bool) -> Result<()> {
+    let repo = open_repo()?;
+    if all {
+        if !prefixes.is_empty() {
+            anyhow::bail!("--all fetches every remaining object; pass either --all or explicit prefixes, not both");
+        }
+        repo.backfill_all()?;
+        println!("backfilled every remaining object; this is now a full clone (.sc/promisor removed)");
+        return Ok(());
+    }
+    repo.backfill(&prefixes)?;
+    println!("backfilled {} prefix(es)", prefixes.len());
     Ok(())
 }
 
@@ -2751,6 +2817,17 @@ fn run_revoke(prefix: String, recipient_id: String) -> Result<()> {
 
 fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) -> Result<()> {
     let repo = open_repo()?;
+    // Refuse up front on a partial clone (P27 Task 5): export walks the FULL
+    // unfiltered tree/blob closure to synthesize Git objects, which would
+    // `NotFound` on every out-of-filter gap. Rather than surfacing that as a
+    // confusing corruption-shaped error, refuse loudly and point at backfill.
+    if repo.promisor()?.is_some() {
+        anyhow::bail!(
+            "refusing to export: this is a partial clone (.sc/promisor present) and export \
+             needs the full object closure; run `sc backfill --all` to convert to a full \
+             clone first"
+        );
+    }
     let branch = scl_repo::refs::current_branch(repo.layout())?;
     let tip = repo
         .head_tip()?
@@ -3134,7 +3211,7 @@ mod tests {
         // Route through run_clone WITHOUT --git: file:// is an unambiguous
         // git URL form, so auto-detect must pick the mirror-bridge path.
         let dst = root.join("cloned");
-        run_clone(format!("file://{}", hub.display()), dst.clone(), false).unwrap();
+        run_clone(format!("file://{}", hub.display()), dst.clone(), false, Vec::new()).unwrap();
         let repo = scl_repo::Repo::open(&dst).unwrap();
         assert_eq!(scl_repo::refs::current_branch(repo.layout()).unwrap(), "trunk",
             "local branch must adopt the remote default name");
@@ -3160,6 +3237,7 @@ mod tests {
             "ssh://testhost/srv/repo".to_string(),
             root.join("cloned-ssh"),
             false,
+            Vec::new(),
         )
         .unwrap_err();
         std::env::remove_var("SC_SSH");

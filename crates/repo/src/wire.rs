@@ -17,8 +17,12 @@ use crate::error::{Error, Result};
 /// pack sub-stream (`write_pack_stream`/`read_pack_stream`), so a v1 peer and
 /// a v2 peer can no longer usefully talk to each other — the version check
 /// in `serve`/`WireClient::handshake` refuses the mismatch before either
-/// side touches a pack verb.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// side touches a pack verb. Bumped 2 -> 3 in P27: `Request::GetPack` gains a
+/// `filter: Vec<String>` field (empty = no filter, full transfer) — a v2
+/// peer's decoder doesn't know to read that trailing field, so the versions
+/// are wire-incompatible for `GetPack` even though every other verb's
+/// encoding is unchanged.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // Request opcodes (one per Transport verb, plus session control).
 const OP_HELLO: u8 = 0x01;
@@ -86,7 +90,9 @@ pub enum Request {
     GetObject(ObjectId),
     PutObject { id: ObjectId, bytes: Vec<u8> },
     UpdateRef { branch: String, id: ObjectId, expected_old: Option<ObjectId> },
-    GetPack { wants: Vec<ObjectId>, haves: Vec<ObjectId> },
+    /// `filter`: partial-clone prefix list (P27 Task 3), empty = no filter
+    /// (full transfer, matching pre-P27 behavior byte-for-byte).
+    GetPack { wants: Vec<ObjectId>, haves: Vec<ObjectId>, filter: Vec<String> },
     /// Marker only (P25) — the pack body is no longer embedded in this
     /// request's frame. Immediately after this request frame, the sender
     /// streams the pack as `ST_PACK_CHUNK`/`ST_PACK_END` frames
@@ -119,6 +125,16 @@ fn put_ids(out: &mut Vec<u8>, ids: &[ObjectId]) {
     put_u32(out, ids.len() as u32);
     for id in ids {
         put_id(out, id);
+    }
+}
+
+/// `u32` count + each string (P27 Task 3's `GetPack.filter` field). Empty
+/// slice encodes as a bare `0` count, matching how an absent/None filter
+/// round-trips.
+fn put_strs(out: &mut Vec<u8>, strs: &[String]) {
+    put_u32(out, strs.len() as u32);
+    for s in strs {
+        put_str(out, s);
     }
 }
 
@@ -158,6 +174,10 @@ impl<'a> Cur<'a> {
     }
     fn str(&mut self) -> Result<String> {
         String::from_utf8(self.bytes()?).map_err(|_| Error::Protocol("non-utf8 string".into()))
+    }
+    fn strs(&mut self) -> Result<Vec<String>> {
+        let n = self.u32()? as usize;
+        (0..n).map(|_| self.str()).collect()
     }
     /// The whole frame must be consumed — trailing bytes mean a codec mismatch.
     fn done(&self) -> Result<()> {
@@ -206,10 +226,11 @@ impl Request {
                     None => out.push(0),
                 }
             }
-            Request::GetPack { wants, haves } => {
+            Request::GetPack { wants, haves, filter } => {
                 out.push(OP_GET_PACK);
                 put_ids(&mut out, wants);
                 put_ids(&mut out, haves);
+                put_strs(&mut out, filter);
             }
             Request::PutPack => out.push(OP_PUT_PACK),
         }
@@ -237,7 +258,7 @@ impl Request {
                 };
                 Request::UpdateRef { branch, id, expected_old }
             }
-            OP_GET_PACK => Request::GetPack { wants: c.ids()?, haves: c.ids()? },
+            OP_GET_PACK => Request::GetPack { wants: c.ids()?, haves: c.ids()?, filter: c.strs()? },
             OP_PUT_PACK => Request::PutPack,
             op => return Err(Error::Protocol(format!("unknown opcode 0x{op:02x}"))),
         };
@@ -569,8 +590,9 @@ pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> R
         // the initial (empty-body) OK frame.
         match req {
             Request::Bye => return Ok(()),
-            Request::GetPack { wants, haves } => {
-                match transport.build_pack_tempfile(&wants, &haves) {
+            Request::GetPack { wants, haves, filter } => {
+                let filter_opt = if filter.is_empty() { None } else { Some(filter.as_slice()) };
+                match transport.build_pack_tempfile(&wants, &haves, filter_opt) {
                     Ok(guard) => {
                         // Building the temp pack file (bounded RAM: one
                         // object at a time via PackWriter) fully succeeded
@@ -698,8 +720,17 @@ mod tests {
             Request::PutObject { id: some_id(3), bytes: b"payload".to_vec() },
             Request::UpdateRef { branch: "main".into(), id: some_id(4), expected_old: None },
             Request::UpdateRef { branch: "dev".into(), id: some_id(5), expected_old: Some(some_id(6)) },
-            Request::GetPack { wants: vec![some_id(7)], haves: vec![some_id(8), some_id(9)] },
-            Request::GetPack { wants: vec![], haves: vec![] },
+            Request::GetPack {
+                wants: vec![some_id(7)],
+                haves: vec![some_id(8), some_id(9)],
+                filter: vec![],
+            },
+            Request::GetPack {
+                wants: vec![some_id(7)],
+                haves: vec![],
+                filter: vec!["src/".to_string(), "docs/".to_string()],
+            },
+            Request::GetPack { wants: vec![], haves: vec![], filter: vec![] },
             Request::PutPack,
         ];
         for req in reqs {

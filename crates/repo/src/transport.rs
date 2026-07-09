@@ -39,7 +39,22 @@ pub trait Transport {
     /// Stream a pack of every object reachable from `wants` but not already
     /// implied by `haves` (the receiver's closure) into `out`. An
     /// implementation may buffer internally before writing.
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()>;
+    ///
+    /// `filter`, when `Some`, narrows the sender's `wants`-side walk to the
+    /// given path prefixes (P27 Task 3) — the wire form of a partial clone's
+    /// `.sc/promisor` prefix list, matched with the same `/`-boundary
+    /// discipline as `Promisor::matches`/`should_descend`. The `haves`-side
+    /// walk is always unfiltered (the receiver's full closure is excluded
+    /// regardless of filter, since a filter only narrows what's sent, never
+    /// widens what's assumed already held). `filter = None` reproduces the
+    /// pre-P27 full-transfer behavior byte-for-byte.
+    fn get_pack(
+        &self,
+        wants: &[ObjectId],
+        haves: &[ObjectId],
+        filter: Option<&[String]>,
+        out: &mut dyn Write,
+    ) -> Result<()>;
 
     /// Ingest a pack read from `src`: verify every record (BLAKE3) and write
     /// each object into the store. Returns the contained ids. Refs are the
@@ -87,16 +102,35 @@ impl LocalTransport {
     /// Shared by `Transport::get_pack` (one bounded copy into `out`) and
     /// `wire::serve`'s `GetPack` handling (one `write_pack_stream` straight
     /// off this same file — no second spill).
+    ///
+    /// `filter` (P27 Task 3), when `Some`, narrows only the `wants`-side walk
+    /// via `reachable_objects_filtered` — the `.included` set becomes the
+    /// pack's object set instead of the unfiltered `reachable_objects`
+    /// result. The `haves`-side walk is always the full unfiltered
+    /// reachability of each have tip: haves describe what the receiver
+    /// already holds, and a filter never widens that assumption, so
+    /// excluding "everything the client has" must stay exact regardless of
+    /// whether the sender is also narrowing what it sends.
     pub(crate) fn build_pack_tempfile(
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
+        filter: Option<&[String]>,
     ) -> Result<TempPackGuard> {
         use std::collections::BTreeSet;
         let mut store = self.store.borrow_mut();
         // Reachable-from-wants minus reachable-from-haves, computed on this
         // (the remote) store. `haves` the remote doesn't have are skipped.
-        let mut want_set = crate::reachable::reachable_objects(&mut *store, wants)?;
+        let promisor_filter = filter.map(|prefixes| crate::promisor::Promisor::new(String::new(), prefixes.to_vec()));
+        let mut want_set = match &promisor_filter {
+            Some(pf) => crate::reachable::reachable_objects_filtered(
+                &mut *store,
+                wants,
+                Some(pf as &dyn crate::reachable::PrefixFilter),
+            )?
+            .included,
+            None => crate::reachable::reachable_objects(&mut *store, wants)?,
+        };
 
         let mut have_set: BTreeSet<ObjectId> = BTreeSet::new();
         for h in haves {
@@ -342,8 +376,14 @@ impl Transport for LocalTransport {
     /// this method — it calls `build_pack_tempfile` itself and streams the
     /// same temp file straight onto the wire in `ST_PACK_CHUNK` frames, so
     /// there is exactly one spill either way, never two.
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
-        let guard = self.build_pack_tempfile(wants, haves)?;
+    fn get_pack(
+        &self,
+        wants: &[ObjectId],
+        haves: &[ObjectId],
+        filter: Option<&[String]>,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        let guard = self.build_pack_tempfile(wants, haves, filter)?;
         let mut f = std::fs::File::open(guard.path())?;
         std::io::copy(&mut f, out)?;
         Ok(())
@@ -505,7 +545,7 @@ mod tests {
         let t = LocalTransport::open(&src_root).unwrap();
         // Want c2, already have c1: the pack must omit c1's objects but include c2.
         let mut pack = Vec::new();
-        t.get_pack(&[c2], &[c1], &mut pack).unwrap();
+        t.get_pack(&[c2], &[c1], None, &mut pack).unwrap();
         let ids: Vec<_> = scl_core::pack::parse_pack(&pack).unwrap().into_iter().map(|(id, _)| id).collect();
         assert!(ids.contains(&c2));
         assert!(!ids.contains(&c1));
@@ -522,6 +562,87 @@ mod tests {
         let n = bad.len() - 1;
         bad[n] ^= 0xFF;
         assert!(t2.put_pack(&mut &bad[..]).is_err());
+
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// P27 Task 3: a `get_pack` with `filter = Some(["src/"])` must send only
+    /// the in-filter subtree — the `docs/b` blob must never reach the
+    /// receiving store, while the root tree and snapshot (structure, not
+    /// content) always transfer so the receiver's tree stays well-formed.
+    #[test]
+    fn filtered_get_pack_excludes_out_of_prefix() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-xport-filt-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-xport-filtdst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(&src_root).unwrap();
+        std::fs::create_dir_all(&dst_root).unwrap();
+
+        let remote_repo = crate::repo::Repo::init(&src_root).unwrap();
+        std::fs::create_dir_all(src_root.join("src")).unwrap();
+        std::fs::create_dir_all(src_root.join("docs")).unwrap();
+        std::fs::write(src_root.join("src/a"), b"src-a").unwrap();
+        std::fs::write(src_root.join("docs/b"), b"docs-b").unwrap();
+        let tip = remote_repo.commit("t", "c1").unwrap();
+        let src_a_id = Object::blob(b"src-a".to_vec()).id();
+        let docs_b_id = Object::blob(b"docs-b".to_vec()).id();
+
+        let t = LocalTransport::open(&src_root).unwrap();
+        let root_id = match Object::decode(&t.get_object(&tip).unwrap()).unwrap() {
+            Object::Snapshot(s) => s.root,
+            other => panic!("expected snapshot, got {other:?}"),
+        };
+        let mut pack = Vec::new();
+        t.get_pack(&[tip], &[], Some(&["src/".to_string()]), &mut pack).unwrap();
+
+        let _ = crate::repo::Repo::init(&dst_root).unwrap();
+        let t2 = LocalTransport::open(&dst_root).unwrap();
+        t2.put_pack(&mut &pack[..]).unwrap();
+
+        assert!(t2.has_object(&tip).unwrap(), "snapshot must transfer");
+        assert!(t2.has_object(&root_id).unwrap(), "root tree must transfer");
+        assert!(t2.has_object(&src_a_id).unwrap(), "in-filter blob must transfer");
+        assert!(!t2.has_object(&docs_b_id).unwrap(), "out-of-filter blob must NOT transfer");
+
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// `filter = None` must still transfer everything reachable — the P27
+    /// filter parameter must not disturb the pre-P27 full-transfer path.
+    #[test]
+    fn full_get_pack_unchanged() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-xport-full-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-xport-fulldst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(&src_root).unwrap();
+        std::fs::create_dir_all(&dst_root).unwrap();
+
+        let remote_repo = crate::repo::Repo::init(&src_root).unwrap();
+        std::fs::create_dir_all(src_root.join("src")).unwrap();
+        std::fs::create_dir_all(src_root.join("docs")).unwrap();
+        std::fs::write(src_root.join("src/a"), b"src-a").unwrap();
+        std::fs::write(src_root.join("docs/b"), b"docs-b").unwrap();
+        let tip = remote_repo.commit("t", "c1").unwrap();
+        let src_a_id = Object::blob(b"src-a".to_vec()).id();
+        let docs_b_id = Object::blob(b"docs-b".to_vec()).id();
+
+        let t = LocalTransport::open(&src_root).unwrap();
+        let mut pack = Vec::new();
+        t.get_pack(&[tip], &[], None, &mut pack).unwrap();
+
+        let _ = crate::repo::Repo::init(&dst_root).unwrap();
+        let t2 = LocalTransport::open(&dst_root).unwrap();
+        t2.put_pack(&mut &pack[..]).unwrap();
+
+        assert!(t2.has_object(&tip).unwrap());
+        assert!(t2.has_object(&src_a_id).unwrap());
+        assert!(t2.has_object(&docs_b_id).unwrap(), "unfiltered transfer must still include everything");
 
         std::fs::remove_dir_all(&src_root).unwrap();
         std::fs::remove_dir_all(&dst_root).unwrap();

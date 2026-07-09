@@ -54,6 +54,24 @@ impl Sparse {
     pub fn prefixes(&self) -> &[String] {
         &self.prefixes
     }
+
+    /// Should a tree walk descend into `path`? True if `path` is itself
+    /// in-spec, or some spec prefix lies strictly *under* `path` (an
+    /// ancestor the walk must pass through to reach in-spec content deeper
+    /// in the tree). A full (empty) spec always descends. Mirrors
+    /// [`crate::promisor::Promisor::should_descend`] exactly — added for
+    /// P27 Task 4 so a gap-tolerant tree walk (`materialize` on a partial
+    /// clone) can prune out-of-sparse subtrees without ever calling
+    /// `store.get` on an object a promisor filter never fetched.
+    pub fn should_descend(&self, path: &str) -> bool {
+        self.is_full()
+            || path.is_empty()
+            || self.matches(path)
+            || self
+                .prefixes
+                .iter()
+                .any(|p| p.trim_end_matches('/').starts_with(&format!("{path}/")))
+    }
 }
 
 /// Remove a file, treating "already absent" as success but propagating any
@@ -134,6 +152,20 @@ impl Repo {
         if crate::rebase_state::in_progress(&self.layout) {
             return Err(Error::RebaseInProgress);
         }
+        // Gap error on sparse-widen (P27 Task 5): a partial clone never
+        // fetched anything outside its promisor filter, so narrowing the
+        // sparse view to a prefix that isn't itself covered by the filter
+        // would materialize a path this clone has no object closure for.
+        // Preflight — before any disk write (the spec file or the working
+        // tree) — so a refused widen leaves nothing partially written.
+        if let Some(promisor) = self.promisor()? {
+            for p in prefixes {
+                let bare = p.trim_end_matches('/');
+                if !promisor.matches(bare) {
+                    return Err(crate::promisor::partial_gap_hint(p));
+                }
+            }
+        }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
             return Err(crate::error::Error::InvalidArgument(
@@ -180,6 +212,20 @@ impl Repo {
         }
         if crate::rebase_state::in_progress(&self.layout) {
             return Err(Error::RebaseInProgress);
+        }
+        // Gap error on sparse-widen (P27 Task 5): disabling sparse means full
+        // materialization, which by definition reaches beyond a partial
+        // clone's fetch filter (unless the filter happens to cover the
+        // entire tree, which this clone has no way to know without asking
+        // the origin). Refuse up front, before any disk write, pointing at
+        // backfill — same preflight discipline as `set_sparse` above.
+        if let Some(promisor) = self.promisor()? {
+            return Err(Error::InvalidArgument(format!(
+                "cannot disable sparse checkout (full materialization) on a partial clone: \
+                 only [{}] was fetched; run `sc backfill --all` to convert to a full clone \
+                 first, or `sc sparse set` to a prefix within it",
+                promisor.prefixes().join(", ")
+            )));
         }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
@@ -384,5 +430,130 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// P27 Task 5: widening a partial clone's sparse spec beyond its
+    /// promisor filter must be refused, before touching disk, naming the
+    /// offending prefix and pointing at `sc backfill`.
+    #[test]
+    fn set_sparse_widen_beyond_partial_errors_with_backfill_hint() {
+        let src_root = std::env::temp_dir()
+            .join(format!("scl-sparse-widen-src-{}", std::process::id()));
+        let dst_root = std::env::temp_dir()
+            .join(format!("scl-sparse-widen-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(src_root.join("src")).unwrap();
+        std::fs::create_dir_all(src_root.join("docs")).unwrap();
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(src_root.join("docs/b.txt"), b"b").unwrap();
+        src.commit("t", "c1").unwrap();
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        let before = dst.sparse_spec().unwrap();
+        assert_eq!(before.prefixes(), &["src/".to_string()]);
+
+        let err = dst.set_sparse(&["docs/".to_string()], None).unwrap_err();
+        assert!(
+            matches!(err, Error::GapOutsideFilter(ref p) if p.contains("docs/")),
+            "expected a gap error naming docs/, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("backfill"), "error must hint at `sc backfill`: {msg}");
+
+        // No partial write: the spec is unchanged.
+        assert_eq!(dst.sparse_spec().unwrap(), before);
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// `sc sparse disable` (full materialization) is always refused on a
+    /// partial clone: nothing short of a full backfill can cover the whole
+    /// tree. Preflight — before any disk write.
+    #[test]
+    fn disable_sparse_on_partial_clone_errors_with_backfill_hint() {
+        let src_root = std::env::temp_dir()
+            .join(format!("scl-sparse-disable-src-{}", std::process::id()));
+        let dst_root = std::env::temp_dir()
+            .join(format!("scl-sparse-disable-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(src_root.join("src")).unwrap();
+        std::fs::create_dir_all(src_root.join("docs")).unwrap();
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("src/a.txt"), b"a").unwrap();
+        std::fs::write(src_root.join("docs/b.txt"), b"b").unwrap();
+        src.commit("t", "c1").unwrap();
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        let before = dst.sparse_spec().unwrap();
+
+        let err = dst.disable_sparse(None).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "expected a clear refusal, got {err:?}");
+        assert!(err.to_string().contains("backfill"), "error must hint at `sc backfill`: {err}");
+
+        // No partial write: the spec is unchanged, and nothing outside the
+        // filter got materialized to disk.
+        assert_eq!(dst.sparse_spec().unwrap(), before);
+        assert!(!dst_root.join("docs/b.txt").exists());
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// A narrower-but-still-in-filter widen (e.g. into a subdirectory of the
+    /// promisor's own prefix) must NOT be refused.
+    #[test]
+    fn set_sparse_within_filter_is_allowed_on_partial_clone() {
+        let src_root = std::env::temp_dir()
+            .join(format!("scl-sparse-within-src-{}", std::process::id()));
+        let dst_root = std::env::temp_dir()
+            .join(format!("scl-sparse-within-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(src_root.join("src/app")).unwrap();
+        std::fs::create_dir_all(src_root.join("docs")).unwrap();
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("src/app/a.txt"), b"a").unwrap();
+        std::fs::write(src_root.join("docs/b.txt"), b"b").unwrap();
+        src.commit("t", "c1").unwrap();
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        // A real out-of-filter gap (docs/) exists elsewhere in the tree —
+        // narrowing further within the filter must not touch it (P27 Task 5
+        // fix to `materialize`'s old-root walk).
+        dst.set_sparse(&["src/app/".to_string()], None).unwrap();
+        assert_eq!(dst.sparse_spec().unwrap().prefixes(), &["src/app/".to_string()]);
+        assert!(!dst_root.join("docs/b.txt").exists());
+        assert!(dst_root.join("src/app/a.txt").exists());
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
     }
 }

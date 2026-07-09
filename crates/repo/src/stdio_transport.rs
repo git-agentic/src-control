@@ -91,11 +91,22 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
     /// regression test) still calls `parse_pack` on `out` unchanged. Doesn't
     /// use `self.call` — that helper only reads one response frame, and this
     /// needs to keep reading off the same connection afterward.
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
+    fn get_pack(
+        &self,
+        wants: &[ObjectId],
+        haves: &[ObjectId],
+        filter: Option<&[String]>,
+        out: &mut dyn Write,
+    ) -> Result<()> {
         let mut rw = self.rw.borrow_mut();
         wire::write_frame(
             &mut rw.1,
-            &Request::GetPack { wants: wants.to_vec(), haves: haves.to_vec() }.encode(),
+            &Request::GetPack {
+                wants: wants.to_vec(),
+                haves: haves.to_vec(),
+                filter: filter.map(|f| f.to_vec()).unwrap_or_default(),
+            }
+            .encode(),
         )?;
         let frame = wire::read_frame(&mut rw.0)?;
         wire::parse_response(frame)?; // Ok(empty body) means "stream follows"; Err propagates typed
@@ -196,8 +207,14 @@ impl Transport for StdioTransport {
     ) -> Result<()> {
         self.client.update_ref(branch, id, expected_old)
     }
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
-        self.client.get_pack(wants, haves, out)
+    fn get_pack(
+        &self,
+        wants: &[ObjectId],
+        haves: &[ObjectId],
+        filter: Option<&[String]>,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        self.client.get_pack(wants, haves, filter, out)
     }
     fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
         self.client.put_pack(src)
@@ -386,12 +403,44 @@ mod tests {
 
         // pack roundtrip: everything reachable from the tip, no haves
         let mut pack = Vec::new();
-        client.get_pack(&[tip], &[], &mut pack).unwrap();
+        client.get_pack(&[tip], &[], None, &mut pack).unwrap();
         assert!(!scl_core::pack::parse_pack(&pack).unwrap().is_empty());
 
         // CAS semantics survive the wire (mirrors transport.rs::update_ref_is_compare_and_swap)
         let c2 = Object::blob(b"c2".to_vec()).id();
         assert!(matches!(client.update_ref("main", &c2, None), Err(Error::NonFastForward)));
+
+        client.bye().unwrap();
+        drop(client);
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// P27 Task 3: the `GetPack.filter` wire field round-trips end-to-end —
+    /// a client requesting `filter=Some(["src/"])` over the actual wire
+    /// protocol (not just direct `LocalTransport` calls, as
+    /// `transport::tests::filtered_get_pack_excludes_out_of_prefix` covers)
+    /// gets back a pack missing the out-of-filter blob.
+    #[test]
+    fn filtered_get_pack_over_wire() {
+        let root = tmp_repo("filtered");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src/a"), b"src-a").unwrap();
+        std::fs::write(root.join("docs/b"), b"docs-b").unwrap();
+        let tip = crate::repo::Repo::open(&root).unwrap().commit("t", "c1").unwrap();
+        let src_a_id = Object::blob(b"src-a".to_vec()).id();
+        let docs_b_id = Object::blob(b"docs-b".to_vec()).id();
+
+        let (client, server) = connect(root.clone());
+
+        let mut pack = Vec::new();
+        client.get_pack(&[tip], &[], Some(&["src/".to_string()]), &mut pack).unwrap();
+        let ids: Vec<_> =
+            scl_core::pack::parse_pack(&pack).unwrap().into_iter().map(|(id, _)| id).collect();
+        assert!(ids.contains(&tip), "snapshot must transfer");
+        assert!(ids.contains(&src_a_id), "in-filter blob must transfer");
+        assert!(!ids.contains(&docs_b_id), "out-of-filter blob must NOT transfer over the wire");
 
         client.bye().unwrap();
         drop(client);
@@ -417,17 +466,17 @@ mod tests {
     }
 
     #[test]
-    fn handshake_rejects_v1_peer() {
-        // Hand-rolled "old server" that answers HELLO with the retired v1
-        // (P25 bumped PROTOCOL_VERSION 1 -> 2 and dropped the single-frame
-        // pack encoding v1 spoke, so a v1 peer must be refused just as
-        // cleanly as a too-new one).
+    fn handshake_rejects_v2_peer() {
+        // Hand-rolled "old server" that answers HELLO with the retired v2
+        // (P27 bumped PROTOCOL_VERSION 2 -> 3: `GetPack` gained a `filter`
+        // field a v2 decoder doesn't know to read, so a v2 peer must be
+        // refused just as cleanly as a too-new one).
         let (client_read, mut server_write) = std::io::pipe().unwrap();
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let server = std::thread::spawn(move || {
             let f = wire::read_frame(&mut server_read).unwrap();
             assert!(matches!(wire::Request::decode(&f).unwrap(), wire::Request::Hello { .. }));
-            wire::write_ok(&mut server_write, &wire::u32_body(1)).unwrap();
+            wire::write_ok(&mut server_write, &wire::u32_body(2)).unwrap();
         });
         let err = WireClient::handshake(client_read, client_write).unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
@@ -537,7 +586,7 @@ mod tests {
 
         wire::write_frame(
             &mut client_write,
-            &Request::GetPack { wants: vec![tip], haves: vec![] }.encode(),
+            &Request::GetPack { wants: vec![tip], haves: vec![], filter: vec![] }.encode(),
         )
         .unwrap();
         // Empty OK body: "a chunk stream follows".

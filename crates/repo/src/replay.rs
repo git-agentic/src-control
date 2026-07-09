@@ -169,6 +169,19 @@ pub(crate) fn replay_commit(
             ),
         ));
     }
+    // Merge/pick completion guard (P27 Task 5, T5-I4): `three_way_files`
+    // below flattens the full base/onto/theirs trees; on a partial clone
+    // that would touch content this clone never fetched (out-of-filter),
+    // silently surfacing as a raw `NotFound` from deep inside the flatten.
+    // Refuse explicitly here instead — one choke point for both cherry-pick
+    // and rebase's fold, which both replay through this function — pointing
+    // at `sc backfill` rather than a confusing corruption-shaped error.
+    if repo.promisor()?.is_some() {
+        return Err(crate::promisor::partial_clone_unsupported(
+            "cherry-pick/rebase replay",
+        ));
+    }
+
     let (onto_root, onto_prot) = onto;
     let base_snap = match base_override.or_else(|| snap.parents.first().copied()) {
         Some(p) => Some(repo.snapshot(&p)?),
