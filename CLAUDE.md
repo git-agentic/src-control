@@ -309,6 +309,9 @@ loading identities. `Snapshot` carries a `secrets: BTreeMap<String, ObjectId>`
 side registry (separate from the file tree) so secrets are env vars, not files
 — `checkout` never materializes them. An authorized context decrypts the value
 in memory and injects it into a child process environment via `run_with_secret`.
+That injection is an authorized local process context, NOT strong isolation:
+the decrypted secret is observable by same-user processes, crash dumps, and
+shell wrappers through the child environment (P28).
 
 The persistent store and standalone `sc secret add`/`sc run` across invocations
 are now built (persistent-store branch). Do not weaken Phase 1 or Phase 2

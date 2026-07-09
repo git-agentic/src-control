@@ -52,6 +52,14 @@ decryption-on-checkout wire it into the CLI.
   time comparisons must be done with vetted crates and reviewed carefully.
 - The Phase 1 invariant that **plaintext never touches disk except via checkout**
   extends to secrets: decrypted values go to process environment/memory only.
+- Injecting a decrypted secret into a child process's environment is an
+  **authorized LOCAL PROCESS context, NOT strong isolation**: the decrypted
+  secret is observable by same-user processes, crash dumps, and shell
+  wrappers through the child environment. The parent's intermediate
+  decryption buffer is `Zeroizing` (best-effort, zeroed on drop), but the
+  `OsString`/child-env copy handed to the spawned process is fundamental to
+  env-var injection and cannot be zeroized — the kernel owns that copy once
+  the child is spawned. This is a stated boundary, not a defect (P28).
 
 ## Alternatives considered
 

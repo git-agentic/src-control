@@ -208,6 +208,10 @@ enum Cmd {
     /// Scan the working tree for plaintext secrets without committing.
     Scan,
     /// Decrypt authorized secrets, inject them, and run a command.
+    ///
+    /// Injected secrets are visible to the child and any same-user process,
+    /// crash dump, or shell wrapper — an authorized local-process boundary,
+    /// not isolation.
     Run {
         /// Identity file (default ~/.sc/identity or $SC_IDENTITY).
         #[arg(long)]
