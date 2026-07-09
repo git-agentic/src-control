@@ -403,22 +403,41 @@ across every phase.
   Every prior demo stays green plus new pinned regression tests; no new
   dependency. (ADR-0039.)
 
+- **Phase 29 — sc+http access control.** The second, larger half of the
+  security horizon: P26 shipped `sc serve --http` unauthenticated and
+  unrestricted, the audit's remaining High. P29 closes it with three
+  composed gates, dep-free throughout. A fail-closed non-loopback bind:
+  refused unless justified by `--read-only`, `--allow-public`, or ≥1
+  configured serve token; loopback always binds. Bearer-token auth at the
+  HTTP opening: once `.sc/serve-tokens.toml` holds ≥1 token, a valid
+  `Authorization: Bearer` is required on every connection, loopback
+  included — `read_client_opening` returns the presented token,
+  `handle_http_connection` constant-time-compares `BLAKE3(presented)`
+  against stored hashes and writes `401` before the `200`/wire handoff on a
+  miss; `sc serve token add/remove/list` mint/drop/list `sct-<hex>`
+  (256-bit) tokens as `{label, hash, scope}`, the raw value printed once and
+  never persisted, presented by the client via `SC_HTTP_TOKEN`. Per-connection
+  read-only enforcement: `--read-only` (a floor an `rw` token cannot
+  elevate) or a matched `ro`-scope token routes the connection into
+  `wire::serve_with_policy`, which rejects `PutObject`/`PutPack`/`UpdateRef`
+  before any store write via a new `EC_READONLY` wire error. A review fix
+  closed a fail-open: a non-loopback bind justified only by tokens now fails
+  closed (`401`, not an open server) if its last token is removed while
+  running. The wire format is unchanged but for the new error code, so the
+  ssh path stays untouched; `PROTOCOL_VERSION` stays 3; no new dependency,
+  no TLS. Proven by `demo/run_http_auth_demo.sh`: a no-token clone is
+  rejected with an authentication error, an ro-token clone reads but its
+  push is rejected read-only, an rw-token push lands and a later ro-token
+  clone sees it, an unjustified `0.0.0.0` bind is refused while
+  `--allow-public` opens it deliberately, and zero `.sc/tmp` residue is left
+  anywhere — the P26/ssh/streaming demos stay green unchanged. Closes the
+  security horizon (P28 + P29). (ADR-0040.)
+
 ## Active
 
-**Phase 29 — sc+http access control** (ADR-0040, Proposed; spec
-`docs/superpowers/specs/2026-07-09-p29-sc-http-access-control-design.md`).
-The second, larger half of the security horizon: P26's `sc serve --http` is
-unauthenticated and unrestricted. P29 adds three composed gates — a
-fail-closed non-loopback bind (refused unless `--read-only`,
-`--allow-public`, or ≥1 configured token), dep-free bearer-token auth at the
-HTTP opening (`Authorization: Bearer`, constant-time `BLAKE3` compare, `401`
-before the wire handoff; `sct-` tokens in `.sc/serve-tokens.toml` as
-`{label, hash, scope}`; `SC_HTTP_TOKEN` client env; `sc serve token
-add/remove/list`), and per-connection read-only enforcement
-(`wire::serve_with_policy` rejects `PutObject`/`PutPack`/`UpdateRef` before
-any store write via a new `EC_READONLY`). No TLS, no new dependency; the wire
-format is unchanged but for the new error code, so the ssh path is untouched.
-Closes the audit's remaining unauthenticated-server High.
+**None.** The security horizon (P28 + P29) is complete; the next horizon
+(agent/workspace depth, anchored by P30 session transcripts, ADR-0038) is
+next up.
 
 ## Completed phases (usability-first ordering)
 
@@ -449,6 +468,7 @@ Closes the audit's remaining unauthenticated-server High.
 | **P26 — sc-native HTTP transport** | Reach a repo over plain TCP with no ssh account | `sc serve --http <addr> <path>`; `sc clone sc+http://host[:port]/repo`; thread-per-connection server, opening-status mapped before the wire handshake, P25 chunk stream + P22 signatures ride the raw socket with no HTTP framing; proven by `demo/run_http_remote_demo.sh` (real loopback TCP, no shim; clone/push/fetch byte-for-byte, signed commit verifies clean, zero `.sc/tmp` residue) | [0036](docs/adr/0036-http-transport.md) |
 | **P27 — Partial clone** | Bound network transfer to a subset of paths, not the whole repo | `sc clone --filter <prefix…> <src> <dst>` fetches only in-filter objects (`.sc/promisor` + filtered reachability walk); `sc backfill <prefix…>` widens on demand; `sc gc`/`sc verify` are gap-tolerant; merge/rebase/`ws harvest`/`sc work`/`sc export` refuse on a partial clone; proven by `demo/run_partial_clone_demo.sh` (fewer objects fetched, push composes after a partial-clone commit, backfill shrinks the gap count, gc preserves everything, run twice) | [0037](docs/adr/0037-partial-clone.md) |
 | **P28 — Security hardening sweep** | Close the audit's concrete-bug Highs + surface the accepted Mediums | strict ref-name validation at the write/read boundary (hostile wire `UpdateRef` + git-remote branch names rejected); `MAX_OBJECT_SIZE` caps every untrusted frame/pack-record/zstd-output length; `sc protect` nudges low-entropy secret filenames toward `sc secret`; secret env-var boundary documented as authorized-local-process-context + plaintext stays `Zeroizing`; every prior demo green + new pinned regression tests, no new dependency | [0039](docs/adr/0039-security-hardening-sweep.md) |
+| **P29 — sc+http access control** | Close the audit's remaining unauthenticated-server High | fail-closed non-loopback bind; `sc serve token add/remove/list` + `SC_HTTP_TOKEN` bearer auth at the HTTP opening (constant-time `BLAKE3` compare, `401` before the wire handoff); `--read-only`/`ro`-scope tokens reject mutating verbs before any store write via `EC_READONLY`; proven by `demo/run_http_auth_demo.sh` | [0040](docs/adr/0040-sc-http-access-control.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -641,6 +661,24 @@ scale-&-reach horizon):
   file's full bytes; and extracting a shared `path_under_prefix(path,
   prefix)` helper so `run_protect`'s `/`-boundary filter and
   `protect.rs::matching_prefix` stop duplicating the same rule.
+- **Per-path/per-ref ACLs (P29).** `sc serve --http` access control is
+  all-or-nothing per connection (`ro`/`rw`); scoping a token to specific
+  path prefixes or refs is beyond the MVP. Deferred.
+- **Token expiry/rotation metadata (P29).** `sct-` tokens have no expiry
+  field; rotation today is add-new + remove-old with no automation or
+  reminder. Deferred.
+- **`sc+https://` / TLS (P29).** `sc serve --http` is plaintext-only; a
+  bearer token crosses the wire in cleartext, so a public deployment must
+  front with a TLS reverse proxy today. A first-party TLS dependency is
+  deferred, against the P25/P26 dep-free grain.
+- **`serve_http_cli_answers_on_socket` fixed-port flake (P29).** This test
+  binds a fixed loopback port and can flake under concurrent `cargo test`
+  load when another test or process holds it briefly. Move it to a
+  `127.0.0.1:0` OS-assigned port like the rest of the P26/P29 socket tests.
+- **`404`-before-auth repo-presence oracle (P29).** `handle_http_connection`
+  checks `.sc/` presence before the bearer-auth gate, so an unauthenticated
+  client can distinguish "repo here, need a token" (401) from "no repo here"
+  (404) — a minor information leak, not a read/write bypass. Deferred.
 
 ## How a phase gets built
 

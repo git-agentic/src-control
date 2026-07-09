@@ -91,4 +91,11 @@ impl Layout {
     pub fn promisor_path(&self) -> PathBuf {
         self.dot_sc.join("promisor")
     }
+    /// `.sc/serve-tokens.toml` — server access-control tokens (P29): each entry is
+    /// `{label, hash = BLAKE3(raw token), scope}`. Presence of ≥1 entry turns on
+    /// bearer auth for `sc serve --http`. Distinct from `recipients.toml`
+    /// (encryption/signing trust); this is server access control.
+    pub fn serve_tokens_path(&self) -> PathBuf {
+        self.dot_sc.join("serve-tokens.toml")
+    }
 }

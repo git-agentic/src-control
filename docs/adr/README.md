@@ -50,7 +50,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0037](0037-partial-clone.md) | Partial clone (promisor store + prefix-scoped fetch) | Accepted | 27 |
 | [0038](0038-agent-session-transcripts.md) | Agent session transcripts as CAS objects | Proposed | P30 (candidate) |
 | [0039](0039-security-hardening-sweep.md) | Security hardening sweep (audit fix-now items) | Accepted | 28 |
-| [0040](0040-sc-http-access-control.md) | sc+http access control (read-only, fail-closed bind, bearer tokens) | Proposed | 29 |
+| [0040](0040-sc-http-access-control.md) | sc+http access control (read-only, fail-closed bind, bearer tokens) | Accepted | 29 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

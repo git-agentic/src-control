@@ -273,8 +273,15 @@ enum Cmd {
     },
     /// Serve a repo to a remote `sc` client, either over stdin/stdout
     /// (invoked by `ssh` for ssh:// remotes) or over TCP (`sc+http://`
-    /// remotes, P26). Exactly one of `--stdio`/`--http` is required.
+    /// remotes, P26), or manage `.sc/serve-tokens.toml` access tokens
+    /// (P29). Exactly one of `--stdio`/`--http` is required unless a
+    /// `token` subcommand is given.
+    #[command(args_conflicts_with_subcommands = true)]
     Serve {
+        /// Manage `.sc/serve-tokens.toml` access tokens (`sc serve token
+        /// add/remove/list`).
+        #[command(subcommand)]
+        sub: Option<ServeSub>,
         /// Speak the wire protocol on stdin/stdout.
         #[arg(long)]
         stdio: bool,
@@ -282,8 +289,18 @@ enum Cmd {
         /// protocol to each `sc+http://` client over TCP, thread-per-connection.
         #[arg(long)]
         http: Option<String>,
-        /// Repo root to serve (the directory containing `.sc/`).
-        path: PathBuf,
+        /// Reject all mutating verbs (server-wide read-only floor),
+        /// regardless of any token's own scope.
+        #[arg(long)]
+        read_only: bool,
+        /// Permit a non-loopback bind with no configured access tokens
+        /// (open public read/write). Without this or `--read-only` or a
+        /// configured token, binding a non-loopback address is refused.
+        #[arg(long)]
+        allow_public: bool,
+        /// Repo root to serve (the directory containing `.sc/`). Required
+        /// unless a `token` subcommand is used.
+        path: Option<PathBuf>,
     },
     /// Manage remotes.
     Remote {
@@ -530,6 +547,40 @@ enum RemoteOp {
     List,
 }
 
+/// Top-level `sc serve` subcommand namespace, distinct from the plain
+/// `--stdio`/`--http` serving mode. Currently only `token` (its own nested
+/// subcommand group), so `sc serve token add/remove/list` parses as a
+/// two-level subcommand path rather than flattening `add`/`remove`/`list`
+/// directly under `sc serve`.
+#[derive(Subcommand)]
+enum ServeSub {
+    /// Manage `.sc/serve-tokens.toml` access tokens.
+    Token {
+        #[command(subcommand)]
+        op: ServeTokenOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServeTokenOp {
+    /// Generate a token, print the raw value ONCE (to stdout), and store
+    /// only its hash + scope in `.sc/serve-tokens.toml`.
+    Add {
+        #[arg(long)]
+        label: String,
+        /// Access scope: `ro` (read-only) or `rw` (read-write).
+        #[arg(long)]
+        scope: String,
+    },
+    /// Remove a token by label.
+    Remove { label: String },
+    /// List token labels + scopes (never the token value itself).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum SecretOp {
     /// Seal a value (read from --value or stdin) to named recipients.
@@ -654,7 +705,13 @@ fn main() -> Result<()> {
         }
         Cmd::Ws { op } => run_ws(op),
         Cmd::Clone { src, dst, git, filter } => run_clone(src, dst, git, filter),
-        Cmd::Serve { stdio, http, path } => run_serve(stdio, http, path),
+        Cmd::Serve { sub, stdio, http, read_only, allow_public, path } => match sub {
+            Some(ServeSub::Token { op }) => run_serve_token(op),
+            None => {
+                let path = path.ok_or_else(|| anyhow::anyhow!("sc serve requires a <path>"))?;
+                run_serve(stdio, http, read_only, allow_public, path)
+            }
+        },
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
         Cmd::Push { remote, include_encrypted } => run_push(&remote, include_encrypted),
@@ -2486,18 +2543,82 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
 /// the remote-side command by `ssh` for `ssh://` remotes), or over TCP for
 /// `sc+http://` clients (P26, `--http <addr>`; blocks until the listener is
 /// dropped, e.g. by process termination). Exactly one mode is required.
-fn run_serve(stdio: bool, http: Option<String>, path: PathBuf) -> Result<()> {
-    if let Some(addr) = http {
-        scl_repo::http_transport::serve_http(&addr, &path)?;
-        return Ok(());
+/// `--read-only`/`--allow-public` are `--http`-only (P29): `--stdio`
+/// delegates auth/access entirely to ssh, so combining them is refused
+/// rather than silently ignored.
+fn run_serve(
+    stdio: bool,
+    http: Option<String>,
+    read_only: bool,
+    allow_public: bool,
+    path: PathBuf,
+) -> Result<()> {
+    match (stdio, http) {
+        (true, None) => {
+            if read_only || allow_public {
+                anyhow::bail!("--read-only/--allow-public apply only to --http, not --stdio");
+            }
+            let mut stdin = std::io::stdin().lock();
+            let mut stdout = std::io::stdout().lock();
+            scl_repo::wire::serve(&path, &mut stdin, &mut stdout)?;
+            Ok(())
+        }
+        (false, Some(addr)) => {
+            scl_repo::http_transport::serve_http(&addr, &path, read_only, allow_public)?;
+            Ok(())
+        }
+        (true, Some(_)) => anyhow::bail!("sc serve accepts only one of --stdio or --http"),
+        (false, None) => anyhow::bail!("sc serve requires --stdio or --http <addr>"),
     }
-    if !stdio {
-        anyhow::bail!("sc serve requires --stdio or --http <addr>");
+}
+
+/// Manage `.sc/serve-tokens.toml` access tokens for `sc serve --http`
+/// (P29). Operates on the repo rooted at the current directory (`sc serve
+/// token` is meant to be run from inside the repo being served, matching
+/// every other `.sc/`-scoped CLI command).
+fn run_serve_token(op: ServeTokenOp) -> Result<()> {
+    let repo = open_repo()?;
+    let layout = repo.layout();
+    match op {
+        ServeTokenOp::Add { label, scope } => {
+            let scope = match scope.as_str() {
+                "ro" => scl_repo::serve_tokens::Scope::Ro,
+                "rw" => scl_repo::serve_tokens::Scope::Rw,
+                other => anyhow::bail!("scope must be 'ro' or 'rw', got {other}"),
+            };
+            let raw = scl_repo::serve_tokens::add(layout, &label, scope)?;
+            println!("{raw}");
+            eprintln!(
+                "token '{label}' ({scope:?}) added — store this value now; it is not recoverable"
+            );
+            Ok(())
+        }
+        ServeTokenOp::Remove { label } => {
+            scl_repo::serve_tokens::remove(layout, &label)?;
+            eprintln!("removed serve token '{label}'");
+            Ok(())
+        }
+        ServeTokenOp::List { json } => {
+            let tokens = scl_repo::serve_tokens::load(layout)?;
+            if json {
+                let v: Vec<_> = tokens
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "label": t.label,
+                            "scope": format!("{:?}", t.scope).to_lowercase(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                for t in tokens {
+                    println!("{}  {}", t.label, format!("{:?}", t.scope).to_lowercase());
+                }
+            }
+            Ok(())
+        }
     }
-    let mut stdin = std::io::stdin().lock();
-    let mut stdout = std::io::stdout().lock();
-    scl_repo::wire::serve(&path, &mut stdin, &mut stdout)?;
-    Ok(())
 }
 
 /// The local git path P10's import/export machinery should operate on for

@@ -96,6 +96,10 @@ pub enum Error {
     Crypto(#[from] scl_crypto::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The server rejected a mutating verb because the connection is read-only
+    /// (`--read-only` or an `ro`-scope token). P29.
+    #[error("server is read-only")]
+    ReadOnly,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

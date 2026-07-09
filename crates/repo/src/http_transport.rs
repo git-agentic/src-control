@@ -55,21 +55,43 @@ fn read_bounded_opening(r: &mut impl Read) -> Result<Vec<u8>> {
     }
 }
 
-/// CLIENT: write `POST <path> HTTP/1.1\r\nHost: <host>\r\nUser-Agent: sc/2\r\n\r\n`.
-pub(crate) fn write_client_opening(w: &mut impl Write, host: &str, path: &str) -> Result<()> {
-    write!(w, "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: sc/2\r\n\r\n")
-        .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))
+/// A parsed client HTTP opening: the request-target and an optional
+/// `Authorization: Bearer` token. Only the bearer header is extracted (P29);
+/// all other headers are ignored.
+#[derive(Debug)]
+pub(crate) struct ClientOpening {
+    pub target: String,
+    pub bearer: Option<String>,
+}
+
+/// CLIENT: write `POST <path> HTTP/1.1\r\nHost: <host>\r\nUser-Agent: sc/2\r\n\r\n`,
+/// plus an `Authorization: Bearer` header when a token is supplied.
+pub(crate) fn write_client_opening(
+    w: &mut impl Write,
+    host: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> Result<()> {
+    write!(w, "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: sc/2\r\n")
+        .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))?;
+    if let Some(tok) = bearer {
+        write!(w, "Authorization: Bearer {tok}\r\n")
+            .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))?;
+    }
+    write!(w, "\r\n").map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))
 }
 
 /// SERVER: read the request line + headers up to the blank line (bounded by
-/// [`MAX_OPENING_BYTES`]). Returns the request-target (the `<path>`). Errors
-/// (→ the caller sends 400) on: a bad request line, no `\r\n\r\n` within the
-/// cap, or non-HTTP bytes.
-pub(crate) fn read_client_opening(r: &mut impl Read) -> Result<String> {
+/// [`MAX_OPENING_BYTES`]). Returns the request-target and the bearer token if
+/// an `Authorization: Bearer <token>` header (case-insensitive name) is
+/// present. Errors (→ the caller sends 400) on: a bad request line, no
+/// `\r\n\r\n` within the cap, or non-HTTP bytes.
+pub(crate) fn read_client_opening(r: &mut impl Read) -> Result<ClientOpening> {
     let buf = read_bounded_opening(r)?;
     let text = String::from_utf8_lossy(&buf);
-    let request_line = text
-        .split("\r\n")
+    let mut lines = text.split("\r\n");
+
+    let request_line = lines
         .next()
         .ok_or_else(|| Error::InvalidArgument("empty HTTP request line".to_string()))?;
     let mut parts = request_line.split(' ');
@@ -89,16 +111,30 @@ pub(crate) fn read_client_opening(r: &mut impl Read) -> Result<String> {
             "bad HTTP request line (missing HTTP/ version): {request_line}"
         )));
     }
-    Ok(target.to_string())
+
+    let mut bearer = None;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("authorization") {
+                let v = value.trim();
+                if let Some(tok) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")) {
+                    bearer = Some(tok.trim().to_string());
+                }
+            }
+        }
+    }
+
+    Ok(ClientOpening { target: target.to_string(), bearer })
 }
 
 /// SERVER: write `HTTP/1.1 <code> <reason>\r\nContent-Length: 0\r\n\r\n`.
-/// Supports 200 OK / 404 Not Found / 400 Bad Request.
+/// Supports 200 OK / 404 Not Found / 400 Bad Request / 401 Unauthorized.
 pub(crate) fn write_status(w: &mut impl Write, code: u16) -> Result<()> {
     let reason = match code {
         200 => "OK",
         404 => "Not Found",
         400 => "Bad Request",
+        401 => "Unauthorized",
         _ => return Err(Error::InvalidArgument(format!("unsupported HTTP status code: {code}"))),
     };
     write!(w, "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n\r\n")
@@ -205,9 +241,27 @@ impl HttpTransport {
     /// a clearly-named [`Error::Protocol`] — none of these are wire-protocol
     /// errors, so they must not be mistaken for a `HELLO` failure.
     pub fn connect(url: &ScHttpUrl) -> Result<HttpTransport> {
+        let token = std::env::var("SC_HTTP_TOKEN").ok().filter(|s| !s.is_empty());
+        Self::connect_with_token(url, token.as_deref())
+    }
+
+    /// Connect presenting an explicit bearer `token` (or none). `connect`
+    /// reads the token from `SC_HTTP_TOKEN`; this split keeps the env read
+    /// out of the socket logic and testable without mutating process env
+    /// (`std::env::set_var` is process-global and racy under parallel
+    /// tests).
+    pub fn connect_with_token(url: &ScHttpUrl, token: Option<&str>) -> Result<HttpTransport> {
+        if let Some(t) = token {
+            if t.contains(['\r', '\n']) {
+                return Err(Error::InvalidArgument(
+                    "SC_HTTP_TOKEN must not contain CR or LF".to_string(),
+                ));
+            }
+        }
+
         let mut stream = TcpStream::connect(url.authority())
             .map_err(|e| Error::ConnectionLost(format!("sc+http connect to {url:?}: {e}")))?;
-        write_client_opening(&mut stream, &url.host, &url.path)?;
+        write_client_opening(&mut stream, &url.host, &url.path, token)?;
 
         // Split the stream into independent read/write halves up front —
         // `try_clone` duplicates the socket handle (both `r` and `w` refer
@@ -229,12 +283,20 @@ impl HttpTransport {
         let w = stream;
 
         // Status mapping happens BEFORE the wire-protocol handshake: 200
-        // proceeds, 404 means the server-side path isn't a repo, anything
-        // else is a clearly-named protocol error — none of these are
-        // HELLO-handshake failures, so they must not be reported as one.
+        // proceeds, 401 means the server rejected the bearer (or required
+        // one and got none), 404 means the server-side path isn't a repo,
+        // anything else is a clearly-named protocol error — none of these
+        // are HELLO-handshake failures, so they must not be reported as one.
         let status = read_status(&mut r)?;
         match status {
             200 => {}
+            401 => {
+                return Err(Error::Remote(
+                    "sc+http authentication required or token rejected; set SC_HTTP_TOKEN to a \
+                     valid token (sc serve token add on the server)"
+                        .to_string(),
+                ))
+            }
             404 => return Err(Error::NotARepo),
             other => {
                 return Err(Error::Protocol(format!(
@@ -296,14 +358,80 @@ impl Transport for HttpTransport {
 /// where it's cleared before a legitimate large pack transfer begins.
 const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Is `host` a loopback address (always safe to bind)? IPv4 `127.0.0.0/8`,
+/// IPv6 `::1`, or the literal `localhost`. Everything else (`0.0.0.0`, a LAN
+/// IP, `::`) is non-loopback and subject to the fail-closed bind gate in
+/// [`bind_is_allowed`].
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// The fail-closed bind decision (P29): a non-loopback `addr` is allowed
+/// only if justified by `--read-only`, `--allow-public`, or ≥1 configured
+/// serve token; loopback always binds. Factored out of [`serve_http`] so
+/// tests can exercise the decision without binding a public port.
+fn bind_is_allowed(
+    addr: &str,
+    root: &std::path::Path,
+    read_only: bool,
+    allow_public: bool,
+) -> Result<bool> {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    // Strip optional [..] brackets around an IPv6 literal.
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if is_loopback_host(host) {
+        return Ok(true);
+    }
+    if read_only || allow_public {
+        return Ok(true);
+    }
+    let tokens_configured =
+        !crate::serve_tokens::load(&crate::layout::Layout::at(root))?.is_empty();
+    Ok(tokens_configured)
+}
+
+/// Is a valid bearer token MANDATORY on every connection for a server bound to
+/// `addr` under these flags? True exactly when the bind is non-loopback and its
+/// ONLY possible justification was configured tokens (not `--read-only`, not
+/// `--allow-public`). In that state an empty token set at connection time means
+/// the operator removed the sole justification out from under a public server —
+/// the handler must then fail closed (reject) rather than serve open. Loopback,
+/// `--read-only` (public read-mirror), and `--allow-public` (deliberately open)
+/// all keep their standing posture when tokens vanish, so this is false for them.
+fn auth_is_mandatory(addr: &str, read_only: bool, allow_public: bool) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    !is_loopback_host(host) && !read_only && !allow_public
+}
+
 /// Bind `addr`, serve the single repo at `root` to `sc+http://` clients
 /// until the listener is dropped or the process exits. Thin wrapper around
 /// [`serve_http_listener`] — see that function for the accept-loop
 /// behavior; this just does the binding.
-pub fn serve_http(addr: &str, root: &std::path::Path) -> Result<()> {
+///
+/// Fail-closed bind gate (P29): a non-loopback `addr` is refused up front
+/// unless justified by `read_only`, `allow_public`, or ≥1 configured serve
+/// token (see [`bind_is_allowed`]) — an unauthenticated server must not
+/// silently listen on a public interface.
+pub fn serve_http(addr: &str, root: &std::path::Path, read_only: bool, allow_public: bool) -> Result<()> {
+    if !bind_is_allowed(addr, root, read_only, allow_public)? {
+        return Err(Error::InvalidArgument(format!(
+            "refusing to bind non-loopback address {addr} without --read-only, \
+             --allow-public, or a configured serve token (sc serve token add); \
+             use 127.0.0.1 for local-only serving"
+        )));
+    }
+    let mandatory_auth = auth_is_mandatory(addr, read_only, allow_public);
     let listener = TcpListener::bind(addr)
         .map_err(|e| Error::ConnectionLost(format!("sc+http bind {addr}: {e}")))?;
-    serve_http_listener(listener, root)
+    serve_http_listener(listener, root, read_only, mandatory_auth)
 }
 
 /// Accept-loop core, factored out of [`serve_http`] so tests can bind
@@ -320,7 +448,12 @@ pub fn serve_http(addr: &str, root: &std::path::Path) -> Result<()> {
 /// or a fatal accept-level error occurs; a per-connection error (bad
 /// opening, a `wire::serve` failure, a dropped socket) is logged to stderr
 /// and the loop continues — it must never take down the whole server.
-pub fn serve_http_listener(listener: TcpListener, root: &std::path::Path) -> Result<()> {
+pub fn serve_http_listener(
+    listener: TcpListener,
+    root: &std::path::Path,
+    read_only: bool,
+    mandatory_auth: bool,
+) -> Result<()> {
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
@@ -331,7 +464,7 @@ pub fn serve_http_listener(listener: TcpListener, root: &std::path::Path) -> Res
         };
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            if let Err(e) = handle_http_connection(stream, &root) {
+            if let Err(e) = handle_http_connection(stream, &root, read_only, mandatory_auth) {
                 eprintln!("sc serve --http: connection error: {e}");
             }
         });
@@ -347,7 +480,12 @@ pub fn serve_http_listener(listener: TcpListener, root: &std::path::Path) -> Res
 /// cleared again AFTER the 200 status is written and BEFORE handing off to
 /// `wire::serve` — a legitimate large pack transfer must not be cut off
 /// mid-stream by the same timeout that guards the opening.
-fn handle_http_connection(mut stream: TcpStream, root: &std::path::Path) -> Result<()> {
+fn handle_http_connection(
+    mut stream: TcpStream,
+    root: &std::path::Path,
+    server_read_only: bool,
+    mandatory_auth: bool,
+) -> Result<()> {
     stream
         .set_read_timeout(Some(OPENING_READ_TIMEOUT))
         .map_err(|e| Error::ConnectionLost(format!("sc+http set_read_timeout: {e}")))?;
@@ -358,20 +496,57 @@ fn handle_http_connection(mut stream: TcpStream, root: &std::path::Path) -> Resu
             .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?,
     );
 
-    let target = match read_client_opening(&mut reader) {
-        Ok(t) => t,
+    let opening = match read_client_opening(&mut reader) {
+        Ok(o) => o,
         Err(_) => {
             // Malformed/slow-loris opening: best-effort 400, then close.
             let _ = write_status(&mut stream, 400);
             return Ok(());
         }
     };
-    let _ = target; // the request-target isn't used to route (one repo per listener)
+    // The request-target isn't used to route (one repo per listener).
+    let _ = &opening.target;
 
     if !root.join(".sc").is_dir() {
         write_status(&mut stream, 404)?;
         return Ok(());
     }
+
+    // Auth gate (P29): if ≥1 token is configured, a valid bearer is
+    // REQUIRED on every connection, loopback included — the bind gate only
+    // decides whether the port may be opened at all, not who may use it
+    // once it is. No tokens configured means auth is off entirely (today's
+    // pre-P29 behavior). A matched token's scope sets this connection's
+    // read-only flag; `--read-only` below is a floor an `rw` token cannot
+    // elevate.
+    let tokens = crate::serve_tokens::load(&crate::layout::Layout::at(root))?;
+    let token_read_only = if tokens.is_empty() {
+        if mandatory_auth {
+            // The public bind's sole justification (tokens) was removed while
+            // running — fail closed, do NOT serve an open unauthenticated server.
+            eprintln!(
+                "sc serve --http: refusing connection — this non-loopback server was \
+                 justified only by tokens, but none are configured (re-add a token, or \
+                 restart with --read-only / --allow-public)"
+            );
+            write_status(&mut stream, 401)?;
+            return Ok(());
+        }
+        false // loopback, or --read-only / --allow-public public bind: proceed unauthenticated
+    } else {
+        match opening
+            .bearer
+            .as_deref()
+            .and_then(|t| crate::serve_tokens::verify(&tokens, t))
+        {
+            Some(crate::serve_tokens::Scope::Ro) => true,
+            Some(crate::serve_tokens::Scope::Rw) => false,
+            None => {
+                write_status(&mut stream, 401)?;
+                return Ok(());
+            }
+        }
+    };
 
     write_status(&mut stream, 200)?;
 
@@ -382,7 +557,8 @@ fn handle_http_connection(mut stream: TcpStream, root: &std::path::Path) -> Resu
         .set_read_timeout(None)
         .map_err(|e| Error::ConnectionLost(format!("sc+http clear read_timeout: {e}")))?;
 
-    crate::wire::serve(root, &mut reader, &mut stream)
+    let read_only = server_read_only || token_read_only;
+    crate::wire::serve_with_policy(root, &mut reader, &mut stream, read_only)
 }
 
 #[cfg(test)]
@@ -429,9 +605,43 @@ mod tests {
     #[test]
     fn client_opening_round_trips() {
         let mut buf = Vec::new();
-        write_client_opening(&mut buf, "h", "/repo").unwrap();
-        let target = read_client_opening(&mut &buf[..]).unwrap();
-        assert_eq!(target, "/repo");
+        write_client_opening(&mut buf, "h", "/repo", None).unwrap();
+        let opening = read_client_opening(&mut &buf[..]).unwrap();
+        assert_eq!(opening.target, "/repo");
+    }
+
+    #[test]
+    fn opening_parses_bearer_case_insensitively() {
+        let mut buf = Vec::new();
+        write_client_opening(&mut buf, "h", "/repo", Some("sct-abc")).unwrap();
+        let opening = read_client_opening(&mut &buf[..]).unwrap();
+        assert_eq!(opening.target, "/repo");
+        assert_eq!(opening.bearer.as_deref(), Some("sct-abc"));
+    }
+
+    #[test]
+    fn opening_without_auth_has_no_bearer() {
+        let mut buf = Vec::new();
+        write_client_opening(&mut buf, "h", "/repo", None).unwrap();
+        let opening = read_client_opening(&mut &buf[..]).unwrap();
+        assert_eq!(opening.target, "/repo");
+        assert_eq!(opening.bearer, None);
+    }
+
+    #[test]
+    fn opening_parses_lowercase_authorization_header() {
+        // Servers must accept a client that lowercases the header name.
+        let raw = "POST /r HTTP/1.1\r\nHost: h\r\nauthorization: Bearer sct-xyz\r\n\r\n";
+        let opening = read_client_opening(&mut raw.as_bytes()).unwrap();
+        assert_eq!(opening.bearer.as_deref(), Some("sct-xyz"));
+    }
+
+    #[test]
+    fn write_status_supports_401() {
+        let mut buf = Vec::new();
+        write_status(&mut buf, 401).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
     }
 
     #[test]
@@ -457,7 +667,7 @@ mod tests {
 
     #[test]
     fn status_round_trips() {
-        for code in [200u16, 404, 400] {
+        for code in [200u16, 404, 400, 401] {
             let mut buf = Vec::new();
             write_status(&mut buf, code).unwrap();
             let got = read_status(&mut &buf[..]).unwrap();
@@ -521,7 +731,7 @@ mod tests {
             let (sock, _addr) = listener.accept().unwrap();
             let mut reader = BufReader::new(sock.try_clone().unwrap());
             let mut sock = sock;
-            let _target = read_client_opening(&mut reader).unwrap();
+            let _opening = read_client_opening(&mut reader).unwrap();
             write_status(&mut sock, code).unwrap();
             if code == 200 {
                 crate::wire::serve(&root, &mut reader, &mut sock).unwrap();
@@ -628,10 +838,22 @@ mod tests {
     /// the listener living for the process lifetime once handed off to a
     /// thread that owns it).
     fn spawn_real_http_server(root: std::path::PathBuf) -> u16 {
+        spawn_real_http_server_policy(root, false)
+    }
+
+    fn spawn_real_http_server_policy(root: std::path::PathBuf, read_only: bool) -> u16 {
+        spawn_real_http_server_policy_auth(root, read_only, false)
+    }
+
+    fn spawn_real_http_server_policy_auth(
+        root: std::path::PathBuf,
+        read_only: bool,
+        mandatory_auth: bool,
+    ) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            serve_http_listener(listener, &root).unwrap();
+            serve_http_listener(listener, &root, read_only, mandatory_auth).unwrap();
         });
         port
     }
@@ -758,5 +980,230 @@ mod tests {
         let _ = std::fs::remove_dir_all(&third_root);
         let _ = std::fs::remove_dir_all(&signed_dst_root);
         let _ = std::fs::remove_dir_all(bare_dir.parent().unwrap());
+    }
+
+    // ── Task 4: loopback classifier + fail-closed bind gate + bearer auth
+    // gate + read-only threading. ──
+
+    #[test]
+    fn loopback_classification() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.5.6.7"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.1.9"));
+        assert!(!is_loopback_host("::"));
+    }
+
+    #[test]
+    fn bind_refuses_public_without_justification() {
+        let root = tmp_repo("bindgate");
+
+        // Non-loopback, no --read-only / --allow-public / tokens → refused,
+        // and refused *before* any bind is attempted (port 0 would always
+        // succeed to bind if we got that far).
+        let err = serve_http("0.0.0.0:0", &root, false, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "public bind refused: {err:?}");
+
+        // Justified by --read-only.
+        assert!(bind_is_allowed("0.0.0.0:0", &root, true, false).unwrap());
+        // Justified by --allow-public.
+        assert!(bind_is_allowed("0.0.0.0:0", &root, false, true).unwrap());
+        // Still refused with neither justification and no tokens yet.
+        assert!(!bind_is_allowed("0.0.0.0:0", &root, false, false).unwrap());
+
+        // Justified by a configured token.
+        crate::serve_tokens::add(
+            &crate::layout::Layout::at(&root),
+            "t",
+            crate::serve_tokens::Scope::Rw,
+        )
+        .unwrap();
+        assert!(bind_is_allowed("0.0.0.0:0", &root, false, false).unwrap());
+
+        // Loopback always allowed regardless of flags/tokens.
+        assert!(bind_is_allowed("127.0.0.1:0", &root, false, false).unwrap());
+        assert!(bind_is_allowed("[::1]:0", &root, false, false).unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Read the client opening + status line only, without proceeding to the
+    /// wire-protocol handshake — used to observe the auth gate's raw status
+    /// code (401 on a missing/invalid bearer) rather than a mapped `Error`.
+    fn connect_raw_status(port: u16, bearer: Option<&str>) -> u16 {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write_client_opening(&mut stream, "127.0.0.1", "/repo", bearer).unwrap();
+        let mut r = BufReader::new(stream.try_clone().unwrap());
+        read_status(&mut r).unwrap()
+    }
+
+    /// Full client connect presenting a bearer token, standing in for the
+    /// client-side token support `sc+http://` clients gain in Task 5 (this
+    /// task only needs to *drive* the auth matrix, not ship the CLI/env
+    /// plumbing) — mirrors `HttpTransport::connect` exactly except for the
+    /// `bearer` argument to `write_client_opening`.
+    fn connect_with_bearer(
+        port: u16,
+        bearer: Option<&str>,
+    ) -> Result<WireClient<BufReader<TcpStream>, TcpStream>> {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .map_err(|e| Error::ConnectionLost(format!("connect: {e}")))?;
+        write_client_opening(&mut stream, "127.0.0.1", "/repo", bearer)?;
+        let mut r = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| Error::ConnectionLost(format!("socket clone: {e}")))?,
+        );
+        let w = stream;
+        let status = read_status(&mut r)?;
+        if status != 200 {
+            return Err(Error::Protocol(format!("unexpected status {status}")));
+        }
+        WireClient::handshake(r, w)
+    }
+
+    /// The auth matrix, end to end over a real loopback server: no bearer
+    /// (and a garbage bearer) is rejected 401 even though the connection is
+    /// loopback; a matched `ro` token can read but a write is rejected
+    /// `Error::ReadOnly`; a matched `rw` token can write.
+    #[test]
+    fn tokens_configured_requires_bearer_and_scope_gates_writes() {
+        let root = tmp_repo("auth-matrix");
+        let layout = crate::layout::Layout::at(&root);
+        let ro_raw = crate::serve_tokens::add(&layout, "ro", crate::serve_tokens::Scope::Ro).unwrap();
+        let rw_raw = crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
+
+        let port = spawn_real_http_server_policy(root.clone(), false);
+
+        // No bearer at all → 401, even on loopback, once tokens exist.
+        assert_eq!(connect_raw_status(port, None), 401);
+        // A bearer that matches no token → 401.
+        assert_eq!(connect_raw_status(port, Some("sct-not-a-real-token")), 401);
+
+        // ro token: handshake succeeds, reads work, a write is refused.
+        // `put_object` takes a canonically-encoded object (id = BLAKE3 of
+        // the encoding, not of the raw bytes) — build a real blob via
+        // `Object::blob(..).encode()`, matching how `Store::put` does it.
+        let ro_client = connect_with_bearer(port, Some(&ro_raw)).unwrap();
+        ro_client.list_refs().unwrap();
+        let obj = scl_core::object::Object::blob(b"hello from ro".to_vec());
+        let encoded = obj.encode();
+        let id = obj.id();
+        let err = ro_client.put_object(&id, &encoded).unwrap_err();
+        assert!(matches!(err, Error::ReadOnly), "ro token write refused: {err:?}");
+
+        // rw token: a write succeeds.
+        let rw_client = connect_with_bearer(port, Some(&rw_raw)).unwrap();
+        let obj2 = scl_core::object::Object::blob(b"hello from rw".to_vec());
+        let encoded2 = obj2.encode();
+        let id2 = obj2.id();
+        rw_client.put_object(&id2, &encoded2).unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `--read-only` is a server-wide floor an `rw` token cannot elevate.
+    #[test]
+    fn server_read_only_floors_rw_token() {
+        let root = tmp_repo("ro-floor");
+        let layout = crate::layout::Layout::at(&root);
+        let rw_raw = crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
+
+        let port = spawn_real_http_server_policy(root.clone(), true);
+
+        let client = connect_with_bearer(port, Some(&rw_raw)).unwrap();
+        let obj = scl_core::object::Object::blob(b"blocked by server read-only floor".to_vec());
+        let encoded = obj.encode();
+        let id = obj.id();
+        let err = client.put_object(&id, &encoded).unwrap_err();
+        assert!(matches!(err, Error::ReadOnly), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No tokens configured (pre-P29 default) → no auth gate at all; a
+    /// bearer-less connection proceeds exactly as before. This is the
+    /// backward-compatibility pin for the auth gate.
+    #[test]
+    fn no_tokens_configured_no_auth_required() {
+        let root = tmp_repo("no-tokens");
+        let port = spawn_real_http_server_policy(root.clone(), false);
+        let client = connect_with_bearer(port, None).unwrap();
+        client.list_refs().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Review fix: fail closed when a token-only public bind loses its
+    // last token while running (see `auth_is_mandatory`). ──
+
+    #[test]
+    fn auth_is_mandatory_matrix() {
+        // Non-loopback, no --read-only / --allow-public → tokens are the
+        // only possible justification, so auth is mandatory.
+        assert!(auth_is_mandatory("0.0.0.0:8730", false, false));
+        assert!(auth_is_mandatory("192.168.1.5:8730", false, false));
+
+        // Loopback: always false regardless of flags.
+        assert!(!auth_is_mandatory("127.0.0.1:8730", false, false));
+        assert!(!auth_is_mandatory("[::1]:8730", false, false));
+        assert!(!auth_is_mandatory("localhost:8730", false, false));
+
+        // Non-loopback but justified by --read-only or --allow-public: that
+        // justification stands on its own even with zero tokens, so not
+        // mandatory.
+        assert!(!auth_is_mandatory("0.0.0.0:8730", true, false));
+        assert!(!auth_is_mandatory("0.0.0.0:8730", false, true));
+    }
+
+    /// A non-loopback bind whose sole justification was tokens (mirrored
+    /// here by passing `mandatory_auth=true` directly, exactly what
+    /// `serve_http` would compute for such a bind) must reject every
+    /// connection with 401 once no tokens are configured — never fall
+    /// through to an open, unauthenticated server. Exercises the handler
+    /// path directly via a loopback bind (network exposure isn't the point
+    /// here; the fail-closed decision is).
+    #[test]
+    fn mandatory_auth_rejects_when_tokens_removed() {
+        let root = tmp_repo("mandatory-auth-no-tokens");
+        // Deliberately no tokens configured.
+        let port = spawn_real_http_server_policy_auth(root.clone(), false, true);
+
+        assert_eq!(connect_raw_status(port, None), 401);
+        assert_eq!(connect_raw_status(port, Some("sct-not-a-real-token")), 401);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 5: client-side `SC_HTTP_TOKEN` support (`connect_with_token`). ──
+
+    /// `HttpTransport::connect_with_token` presents the given bearer and maps
+    /// a missing/invalid one to a 401 → a clear authentication `Error`
+    /// (rather than a wire-handshake failure). Drives `connect_with_token`
+    /// directly with an explicit token instead of mutating the process-global
+    /// `SC_HTTP_TOKEN` env var, which would be racy under parallel tests.
+    #[test]
+    fn client_presents_sc_http_token_and_maps_401() {
+        let root = tmp_repo("client-token");
+        let layout = crate::layout::Layout::at(&root);
+        let rw_raw = crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
+
+        let port = spawn_real_http_server_policy(root.clone(), false);
+        let url = ScHttpUrl { host: "127.0.0.1".to_string(), port, path: "/repo".to_string() };
+
+        // A valid rw token is accepted and the wire protocol proceeds.
+        let transport = HttpTransport::connect_with_token(&url, Some(&rw_raw)).unwrap();
+        transport.list_refs().unwrap();
+
+        // No token at all, once tokens are configured, is rejected with a
+        // clear authentication error (not `NotARepo`, not a generic
+        // handshake failure).
+        let err = HttpTransport::connect_with_token(&url, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("authentication"), "expected an authentication error, got: {msg}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

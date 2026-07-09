@@ -28,6 +28,7 @@ pub mod replay;
 pub mod repo;
 pub mod rewrap;
 pub mod secrets;
+pub mod serve_tokens;
 pub mod signatures;
 pub mod sparse;
 pub mod stdio_transport;
