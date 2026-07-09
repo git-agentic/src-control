@@ -434,6 +434,67 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Session transcript operations (P30): attach a sealed agent-session
+    /// transcript to a commit, list/inspect them, and sign them.
+    Transcript {
+        #[command(subcommand)]
+        op: TranscriptOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum TranscriptOp {
+    /// Seal a transcript file and attach it to a ref's tip snapshot.
+    Attach {
+        /// Branch or remote-tracking ref whose tip snapshot the transcript
+        /// is attached to.
+        r#ref: String,
+        /// Path to the transcript body (plaintext on disk; sealed before
+        /// storage — the plaintext never enters the CAS).
+        file: PathBuf,
+        /// Agent name recorded on the transcript (default: "unknown").
+        #[arg(long)]
+        agent: Option<String>,
+        /// Sign the resulting transcript with your identity's signing key
+        /// (requires a v2 identity; see `sc keygen`).
+        #[arg(long)]
+        sign: bool,
+        /// Identity file (default ~/.sc/identity or $SC_IDENTITY). Used to
+        /// decrypt-recover recipients for sealing is not needed — recipients
+        /// come from `.sc/recipients.toml` — but is required when --sign is
+        /// given.
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Decrypt and print every transcript attached to a ref's tip snapshot.
+    Show {
+        /// Branch or remote-tracking ref whose tip snapshot's transcripts
+        /// are shown.
+        r#ref: String,
+        /// Identity able to decrypt the transcript(s) (required).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// List transcripts: for one ref's tip (with a signature status per
+    /// transcript), or across the whole history when no ref is given.
+    List {
+        /// Branch or remote-tracking ref to list transcripts for (default:
+        /// every commit in the current branch's history).
+        r#ref: Option<String>,
+        /// Emit machine-readable JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sign every transcript attached to a ref's tip snapshot.
+    Sign {
+        /// Branch or remote-tracking ref whose tip snapshot's transcripts
+        /// are signed.
+        r#ref: String,
+        /// Identity file (requires a v2 identity; default ~/.sc/identity or
+        /// $SC_IDENTITY).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -530,6 +591,14 @@ enum WsOp {
         /// the OS username).
         #[arg(long)]
         author: Option<String>,
+        /// Attach this transcript file to each workspace's landed snapshot
+        /// (P30). One transcript per landing.
+        #[arg(long)]
+        transcript: Option<PathBuf>,
+        /// Sign each attached transcript (requires a v2 identity via
+        /// --identity).
+        #[arg(long)]
+        sign: bool,
     },
 }
 
@@ -728,6 +797,7 @@ fn main() -> Result<()> {
         Cmd::Verify { r#ref, require } => run_verify(r#ref, require),
         Cmd::Sparse { op } => run_sparse(op),
         Cmd::Backfill { prefixes, all } => run_backfill(prefixes, all),
+        Cmd::Transcript { op } => run_transcript(op),
     }
 }
 
@@ -1808,6 +1878,55 @@ fn sig_status_json(status: &scl_repo::SigStatus) -> serde_json::Value {
     }
 }
 
+/// `sc log`'s per-commit transcript presence, precomputed for the WHOLE
+/// history in one index read (P30). `transcripts::load` is the on-disk
+/// `.sc/transcripts` index only — snapshot -> transcript id pairs — so this
+/// never opens the CAS to decrypt a body; only `sc transcript show` does
+/// that. `signed` is true when every transcript attached to the snapshot has
+/// a non-`Unsigned` status (checking a `SignatureObj`, not the transcript
+/// body, so this is still index/CAS-metadata-only, never a decrypt).
+struct TranscriptMarker {
+    count: usize,
+    signed: bool,
+}
+
+fn transcript_markers(
+    repo: &scl_repo::Repo,
+    trust: &std::collections::HashMap<[u8; 32], String>,
+) -> Result<std::collections::BTreeMap<scl_core::ObjectId, TranscriptMarker>> {
+    let index = scl_repo::transcripts::load(repo.layout())?;
+    let mut by_snapshot: std::collections::BTreeMap<scl_core::ObjectId, Vec<scl_core::ObjectId>> =
+        std::collections::BTreeMap::new();
+    for (snap, tid) in index {
+        by_snapshot.entry(snap).or_default().push(tid);
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for (snap, tids) in by_snapshot {
+        let mut signed = !tids.is_empty();
+        for tid in &tids {
+            if matches!(repo.transcript_sig_status(tid, trust)?, scl_repo::SigStatus::Unsigned) {
+                signed = false;
+            }
+        }
+        out.insert(snap, TranscriptMarker { count: tids.len(), signed });
+    }
+    Ok(out)
+}
+
+/// Render one snapshot's transcript marker for `sc log`'s human output
+/// (`None` when no transcript is attached).
+fn render_transcript_marker_line(
+    markers: &std::collections::BTreeMap<scl_core::ObjectId, TranscriptMarker>,
+    id: &scl_core::ObjectId,
+) -> Option<String> {
+    let m = markers.get(id)?;
+    if m.signed {
+        Some(format!("  transcript: {} \u{2713}", m.count))
+    } else {
+        Some(format!("  transcript: {}", m.count))
+    }
+}
+
 fn run_log(json: bool) -> Result<()> {
     let repo = open_repo()?;
     let entries = repo.log()?;
@@ -1823,9 +1942,15 @@ fn run_log(json: bool) -> Result<()> {
         .iter()
         .map(|(id, _)| repo.sig_status(id, &trust))
         .collect::<std::result::Result<_, _>>()?;
+    // Same precompute discipline for transcript presence (P30) — one index
+    // read for the whole history before any printing starts.
+    let markers = transcript_markers(&repo, &trust)?;
     if json {
         let mut arr = Vec::with_capacity(entries.len());
         for ((id, snap), status) in entries.iter().zip(&statuses) {
+            let transcript = markers.get(id).map(|m| {
+                serde_json::json!({"count": m.count, "signed": m.signed})
+            });
             arr.push(serde_json::json!({
                 "id": id.to_hex(),
                 "author": snap.author,
@@ -1833,6 +1958,7 @@ fn run_log(json: bool) -> Result<()> {
                 "message": snap.message,
                 "parents": snap.parents.iter().map(|p| p.to_hex()).collect::<Vec<_>>(),
                 "signature": sig_status_json(status),
+                "transcript": transcript,
             }));
         }
         print_line(&serde_json::Value::Array(arr).to_string());
@@ -1849,6 +1975,9 @@ fn run_log(json: bool) -> Result<()> {
             merge
         ));
         if let Some(line) = render_sig_status_line(status) {
+            print_line(&line);
+        }
+        if let Some(line) = render_transcript_marker_line(&markers, id) {
             print_line(&line);
         }
     }
@@ -2029,6 +2158,122 @@ fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Render one [`scl_repo::SigStatus`] into a short label for `sc transcript
+/// list`/`sc transcript attach`'s confirmation line — mirrors `sc verify`'s
+/// per-line labels.
+fn transcript_sig_label(status: &scl_repo::SigStatus) -> String {
+    match status {
+        scl_repo::SigStatus::Trusted(name) => format!("trusted: {name}"),
+        scl_repo::SigStatus::Untrusted(signer) => format!("untrusted: {}…", hex::encode(&signer[..4])),
+        scl_repo::SigStatus::Invalid => "INVALID".to_string(),
+        scl_repo::SigStatus::Unsigned => "unsigned".to_string(),
+    }
+}
+
+fn run_transcript(op: TranscriptOp) -> Result<()> {
+    let repo = open_repo()?;
+    match op {
+        TranscriptOp::Attach { r#ref, file, agent, sign, identity } => {
+            let tip = resolve_ref_tip(&repo, &r#ref)?;
+            let recipients_path = repo.layout().dot_sc.join("recipients.toml");
+            let recips = transcript_recipients(&recipients_path)?;
+            let body = std::fs::read(&file)
+                .with_context(|| format!("reading transcript file {}", file.display()))?;
+            let session_label = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("session")
+                .to_string();
+            let agent = agent.unwrap_or_else(|| "unknown".to_string());
+            let tid = repo.attach_transcript(tip, &agent, &session_label, &body, &recips)?;
+            if sign {
+                let ident = load_identity_full(identity)?;
+                repo.sign_transcript(tid, &ident)?;
+            }
+            println!("attached transcript {} to {}", tid.short(), tip.short());
+            Ok(())
+        }
+        TranscriptOp::Show { r#ref, identity } => {
+            let tip = resolve_ref_tip(&repo, &r#ref)?;
+            let sk = load_identity(identity)?;
+            let transcripts = repo.transcripts_for(&tip)?;
+            if transcripts.is_empty() {
+                println!("no transcripts attached to {}", tip.short());
+                return Ok(());
+            }
+            for (tid, t) in &transcripts {
+                println!("--- {} (agent: {}) ---", tid.short(), t.agent);
+                let body = repo.open_transcript(tid, &sk)?;
+                print!("{}", String::from_utf8_lossy(&body));
+                println!();
+            }
+            Ok(())
+        }
+        TranscriptOp::List { r#ref, json } => {
+            // Precompute, one index read, no decryption on this path (P22
+            // pipe-safety discipline reused verbatim for P30).
+            let trust = load_trust_map(&repo.layout().dot_sc.join("recipients.toml"))?;
+            let snapshots: Vec<scl_core::ObjectId> = match &r#ref {
+                Some(r) => vec![resolve_ref_tip(&repo, r)?],
+                None => {
+                    let entries = repo.log()?;
+                    entries.into_iter().map(|(id, _)| id).collect()
+                }
+            };
+            let mut rows = Vec::new();
+            for snap in &snapshots {
+                for (tid, t) in repo.transcripts_for(snap)? {
+                    let status = repo.transcript_sig_status(&tid, &trust)?;
+                    rows.push((*snap, tid, t.agent, status));
+                }
+            }
+            if json {
+                let arr: Vec<_> = rows
+                    .iter()
+                    .map(|(snap, tid, agent, status)| {
+                        serde_json::json!({
+                            "snapshot": snap.to_hex(),
+                            "transcript": tid.to_hex(),
+                            "agent": agent,
+                            "signature": sig_status_json(status),
+                        })
+                    })
+                    .collect();
+                print_line(&serde_json::Value::Array(arr).to_string());
+                return Ok(());
+            }
+            if rows.is_empty() {
+                print_line("no transcripts");
+                return Ok(());
+            }
+            for (snap, tid, agent, status) in &rows {
+                print_line(&format!(
+                    "{}  {}  agent={}  {}",
+                    snap.short(),
+                    tid.short(),
+                    agent,
+                    transcript_sig_label(status)
+                ));
+            }
+            Ok(())
+        }
+        TranscriptOp::Sign { r#ref, identity } => {
+            let tip = resolve_ref_tip(&repo, &r#ref)?;
+            let ident = load_identity_full(identity)?;
+            let transcripts = repo.transcripts_for(&tip)?;
+            if transcripts.is_empty() {
+                println!("no transcripts attached to {}", tip.short());
+                return Ok(());
+            }
+            for (tid, _) in &transcripts {
+                repo.sign_transcript(*tid, &ident)?;
+                println!("signed transcript {}", tid.short());
+            }
+            Ok(())
+        }
+    }
 }
 
 fn run_switch(name: &str, identity: Option<PathBuf>) -> Result<()> {
@@ -2331,9 +2576,47 @@ fn run_ws(op: WsOp) -> Result<()> {
                 None => println!("abandoned the session ({remaining} workspace(s) remain)"),
             }
         }
-        WsOp::Harvest { into, identity, author } => {
-            let sk = resolve_identity_opt(identity)?;
+        WsOp::Harvest { into, identity, author, transcript, sign } => {
+            let sk = resolve_identity_opt(identity.clone())?;
             let outcomes = repo.ws_harvest(into.as_deref(), &resolve_author(author), sk.as_ref())?;
+
+            // P30: attach the transcript file to each workspace's landed
+            // snapshot, one transcript per landing. Recipients are the same
+            // full-recipients + escrow pool `sc transcript attach` uses.
+            // This runs post-harvest (WsHarvestOutcome::Landed carries the
+            // landed snapshot id), the lower-churn seam — no ws_harvest
+            // signature change needed.
+            if let Some(file) = &transcript {
+                let recipients_path = repo.layout().dot_sc.join("recipients.toml");
+                let recips = transcript_recipients(&recipients_path)?;
+                let body = std::fs::read(file)
+                    .with_context(|| format!("reading transcript file {}", file.display()))?;
+                let session_label = file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("ws-harvest")
+                    .to_string();
+                let mut sig_identity: Option<scl_crypto::Identity> = None;
+                if sign {
+                    sig_identity = Some(load_identity_full(identity)?);
+                }
+                for o in &outcomes {
+                    if let scl_repo::WsHarvestOutcome::Landed { index, merged_tip } = o {
+                        let tid = repo.attach_transcript(
+                            *merged_tip,
+                            "sc-ws",
+                            &session_label,
+                            &body,
+                            &recips,
+                        )?;
+                        if let Some(ident) = &sig_identity {
+                            repo.sign_transcript(tid, ident)?;
+                        }
+                        println!("{index:<3} transcript attached: {}", tid.short());
+                    }
+                }
+            }
+
             let mut failed = false;
             for o in &outcomes {
                 match o {
@@ -2408,6 +2691,18 @@ fn resolve_identity_opt(flag: Option<PathBuf>) -> Result<Option<scl_crypto::Secr
         return Ok(None);
     }
     Ok(Some(load_identity_full(flag)?.enc))
+}
+
+/// The `[transcripts]` recipient set (P30): every recipient in
+/// `.sc/recipients.toml` plus the configured escrow keys, deduped. Used by
+/// `sc transcript attach` and `sc ws harvest --transcript` — a transcript is
+/// sealed to the whole recipient pool rather than a caller-chosen subset (no
+/// `--to` flag; keeping this minimal per the brief).
+fn transcript_recipients(recipients_path: &std::path::Path) -> Result<Vec<scl_crypto::PublicKey>> {
+    let dir = load_recipients(recipients_path)?;
+    let pks: Vec<scl_crypto::PublicKey> = dir.into_values().collect();
+    let escrows = load_escrows(recipients_path)?;
+    Ok(append_escrow(pks, &escrows))
 }
 
 /// Append every escrow key to a seal recipient set, deduped by recipient id.
