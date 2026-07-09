@@ -312,13 +312,31 @@ pub fn parse_pack_reader<R: Read>(
         r.read_exact(&mut len_bytes)
             .map_err(|e| Error::PackCorrupt(format!("truncated record length: {e}")))?;
         let len = u32::from_le_bytes(len_bytes) as usize;
+        if len > crate::MAX_OBJECT_SIZE {
+            return Err(Error::PackCorrupt(format!(
+                "record compressed_len {len} exceeds MAX_OBJECT_SIZE"
+            )));
+        }
 
         let mut payload = vec![0u8; len];
         r.read_exact(&mut payload)
             .map_err(|e| Error::PackCorrupt(format!("truncated record payload: {e}")))?;
 
-        let canonical = zstd::decode_all(std::io::Cursor::new(&payload))
+        // Bound the decompressed output too: a small compressed payload can
+        // still decompress to an enormous plaintext (a "zstd bomb"). Read at
+        // most MAX_OBJECT_SIZE + 1 bytes so we can detect and reject an
+        // over-cap output without ever materializing it in full.
+        let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(&payload))
             .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+        let mut canonical = Vec::new();
+        decoder
+            .by_ref()
+            .take(crate::MAX_OBJECT_SIZE as u64 + 1)
+            .read_to_end(&mut canonical)
+            .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+        if canonical.len() > crate::MAX_OBJECT_SIZE {
+            return Err(Error::PackCorrupt("zstd output exceeds MAX_OBJECT_SIZE".into()));
+        }
         let actual_id = ObjectId::of(&canonical);
         if actual_id != expected_id {
             return Err(Error::PackCorrupt(format!(
@@ -444,6 +462,48 @@ mod tests {
         }
         let err = writer.finish().unwrap_err();
         assert!(matches!(err, crate::error::Error::PackCorrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn pack_record_over_cap_rejected() {
+        // A well-formed header, then one record whose id is arbitrary and
+        // whose compressed_len claims MAX_OBJECT_SIZE + 1 — parse_pack_reader
+        // must reject this before `vec![0u8; len]` allocates a 256+ MiB
+        // buffer for a length that was never actually sent.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(PACK_MAGIC);
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 32]); // arbitrary id
+        let over = (crate::MAX_OBJECT_SIZE + 1) as u32;
+        buf.extend_from_slice(&over.to_le_bytes());
+        // No payload bytes follow — if the implementation allocated first it
+        // would then fail on read_exact anyway, but we want the cap check to
+        // fire first (see zstd_bomb_rejected for the case where a payload
+        // IS present but must still be rejected on the length check alone).
+        let err = parse_pack_reader(&buf[..], |_id, _obj| Ok(())).unwrap_err();
+        assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn zstd_bomb_rejected() {
+        // A small compressed payload that decompresses to well beyond
+        // MAX_OBJECT_SIZE. parse_pack_reader must bound the zstd output
+        // (decode-with-limit), not decode_all-then-check, or this test
+        // would itself OOM the test process.
+        let bomb_plain = vec![0u8; crate::MAX_OBJECT_SIZE + 1024];
+        let compressed =
+            zstd::encode_all(std::io::Cursor::new(&bomb_plain[..]), COMPRESSION_LEVEL).unwrap();
+        assert!(compressed.len() < bomb_plain.len() / 10, "expected the all-zero payload to compress small");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(PACK_MAGIC);
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 32]); // arbitrary id
+        buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&compressed);
+
+        let err = parse_pack_reader(&buf[..], |_id, _obj| Ok(())).unwrap_err();
+        assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
     }
 
     #[test]

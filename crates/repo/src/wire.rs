@@ -306,6 +306,11 @@ fn read_frame_inner(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
         filled += n;
     }
     let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > scl_core::MAX_OBJECT_SIZE {
+        return Err(Error::Protocol(format!(
+            "frame length {len} exceeds MAX_OBJECT_SIZE"
+        )));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)
         .map_err(|_| Error::Protocol(format!("EOF inside {len}-byte frame body")))?;
@@ -771,6 +776,19 @@ mod tests {
         // EOF mid-frame is a protocol error even for the server.
         let mut r3 = std::io::Cursor::new(vec![0, 0, 0, 9, b'x']);
         assert!(matches!(read_frame_opt(&mut r3), Err(crate::error::Error::Protocol(_))));
+    }
+
+    #[test]
+    fn frame_over_cap_rejected() {
+        // A frame header alone (no body) claiming a length past
+        // MAX_OBJECT_SIZE must be rejected before any allocation of the
+        // (fictitious) body — feeding only the 4-byte header proves this:
+        // if the implementation tried to `vec![0u8; len]` and then
+        // `read_exact`, it would hang/OOM here rather than erroring.
+        let over = (scl_core::MAX_OBJECT_SIZE + 1) as u32;
+        let mut r = std::io::Cursor::new(over.to_be_bytes().to_vec());
+        let err = read_frame_opt(&mut r).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Protocol(_)), "got {err:?}");
     }
 
     #[test]
