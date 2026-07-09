@@ -271,6 +271,24 @@ bash demo/run_http_remote_demo.sh             # sc-native HTTP transport proof (
                                               # loopback TCP (no shim, unlike ssh://), clone +
                                               # push + fetch over sc+http://, a signed ~1 MiB
                                               # blob byte-for-byte, zero .sc/tmp residue
+cargo run --bin sc -- clone --filter <prefix…> <src> <dst>   # partial clone (P27): fetch
+                                              # ONLY objects reachable under these path
+                                              # prefixes; writes .sc/promisor + .sc/sparse to
+                                              # the same prefixes; not supported over a
+                                              # git-bridge remote
+cargo run --bin sc -- backfill <prefix…>      # widen a partial clone: fetch objects under
+                                              # these prefixes from the promisor origin and
+                                              # widen .sc/promisor; errors if this repo isn't
+                                              # a partial clone (P27)
+bash demo/run_partial_clone_demo.sh           # partial clone proof (P27): sc clone --filter
+                                              # src/ fetches fewer objects than a full clone
+                                              # (object-store count + sc verify's gap report);
+                                              # docs/lib/ never fetched or materialized; a
+                                              # src/ edit committed+pushed from the partial
+                                              # clone lands cleanly (full re-clone sees the
+                                              # edit AND byte-identical docs/lib); sc backfill
+                                              # docs/ shrinks the gap count; sc gc succeeds and
+                                              # preserves everything; run twice
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -939,9 +957,92 @@ mid-transfer holds its thread indefinitely (no idle-transfer watchdog
 yet); the accept loop has no backoff on sustained fd exhaustion. See
 ADR-0036.
 
+**Phase 27 is built.** The P25–P27 scale-&-reach horizon's capstone:
+partial clone. `.sc/promisor` (`crates/repo/src/promisor.rs`, local,
+uncommitted) records a partial clone's fetch-filter prefixes + the
+promisor origin URL; its presence makes a gap expected, its absence means
+a full clone with unchanged behavior. `Promisor::matches` is "is this path
+itself in-filter" (the P24 `matching_prefix`/`Sparse::matches` boundary
+rule, reused verbatim); `Promisor::should_descend` is the load-bearing
+second predicate a tree walk needs — whether to descend into a directory
+at all, true for an in-filter path OR an ancestor of one (filter
+`["src/app/"]` must still walk through `src` to reach `src/app/`, even
+though `src` itself never matches). One path-aware walk,
+`reachable_objects_filtered` (`crates/repo/src/reachable.rs`) →
+`Reachable { included, gaps }`, serves both the server's `get_pack` filter
+(a new `GetPack.filter` wire field, `PROTOCOL_VERSION` 2→3 — a v2 peer is
+rejected at handshake) and the client's own gc/`sc verify`: a parent tree
+is always included, but an out-of-filter child's id lands in `gaps` and is
+**never `get()`'d**, which is exactly why a partial clone's absent
+out-of-filter objects never surface as errors. A review-caught CRITICAL
+fixed pre-merge: expansion dedup had to move from a bare-id gate to a
+per-`(id, path)` gate, because content addressing can dedup a
+byte-identical subtree to one id reachable at two paths with two different
+filter verdicts — a bare-id gate silently dropped whichever path lost the
+race. `sc clone --filter <prefix…> <src> <dst>` writes `.sc/promisor` and
+`.sc/sparse` to the same prefixes (partial ⊇ sparse — one filter, not two
+independent ones); `sc backfill <prefix…>` widens both the fetch from the
+promisor origin and the persisted `.sc/promisor` spec, explicitly and
+offline everywhere else — no lazy-fetch, no network dialed from inside a
+read path. **The original spec claimed "push composes for free via
+carry-by-id" — that was false, and this phase corrects the record.**
+Building a *new* commit on a partial clone needed real new machinery: the
+per-blob byte-carry P24/P15 already had only carries individual absent
+blobs, not an entire out-of-filter subtree the working-tree enumeration
+never walks in the first place — left alone, that would silently drop
+every out-of-filter subtree from the new snapshot. `worktree::
+graft_out_of_sparse` closes that gap by splicing the tip's out-of-filter
+subtrees back into the freshly built root **by id, never reading their
+content**, scoped to a plain single-tip commit (merge/pick completion on a
+partial clone is refused outright, not grafted). Only *after* the graft
+exists does push's already-filtered reachability walk send just the
+client's new in-filter objects while the origin's untouched out-of-filter
+objects stay intact — that half of the original claim holds, verified
+end to end by a full re-clone after a partial-clone push seeing the edit
+AND byte-identical docs/lib. Two review-caught Criticals landed on the
+graft: **(C1)** a grafted subtree's PROTECTED blobs never passed through
+the encrypt-or-carry loops that populate the new snapshot's wrap map, so
+their wrapped DEKs would be silently and *permanently* dropped from every
+snapshot built on top — fixed by unioning in every wrap the tip itself
+already had (a blanket, not narrowly-scoped, carry-forward — deterministic
+but not zero-cost, verified end to end: a full clone decrypts `docs/*`
+under the recipient key after a partial-clone-originated commit); **(a
+data-safety Critical)** `commit` now REFUSES (`Error::GappedPathContent`,
+with a `sc backfill` hint) rather than silently drops any content sitting
+under a path this clone never fetched — you cannot commit under an
+unfetched subtree, and a stray out-of-filter file on disk blocks even an
+otherwise-clean in-filter commit until removed. gc is gap-tolerant by
+construction (stops at a gap, never prunes/errors) with a defense-in-depth
+backstop: any gap id that happens to be present locally for any reason is
+still walked in and retained, so gc is structurally incapable of pruning a
+present reachable object. `sc verify` reports `partial: N object(s)
+outside filter [...]` — a count, never folded into the trust summary, exit
+0 for a healthy partial clone even under `--require`. `status`/`diff`
+needed zero new code: because partial ⊇ sparse, the existing P24
+out-of-sparse-is-expected diff tolerance already covers every out-of-filter
+path. **Boundaries, stated plainly:** no network in any read path (fetch
+is explicit — `sc clone --filter`/`sc backfill` only); `sc export` refuses
+unconditionally on a partial clone (Git needs full trees, no partial
+export exists); and, as a deliberate MVP coarsening rather than a
+per-case gap-tolerant reimplementation, **merge, cherry-pick/rebase
+replay, `sc ws harvest`, and `sc work` are all refused entirely** on a
+partial clone (`Error::PartialCloneUnsupported`) — backfill to a full
+clone first. Proven by `demo/run_partial_clone_demo.sh`: a `--filter src/`
+clone holds measurably fewer objects than a full clone (by both raw
+object-store count and `sc verify`'s gap report), docs/lib/ are never
+fetched or materialized, a src/ edit committed and pushed from the partial
+clone lands cleanly, `sc backfill docs/` shrinks the gap count and makes
+docs/ genuinely readable, and `sc gc` succeeds and preserves everything —
+run twice, zero residue. No new dependencies; `PROTOCOL_VERSION` 3. See
+ADR-0037.
+
 Remaining follow-ons: operation objects in the CAS, oplog entries for
 remote-tracking refs, extending the sparse gate to
 `materialize_conflict_state`'s `to_encrypt`/sidecar write loops (see the
-P24 boundary note above), and the three P26 `sc serve --http` hardening
-items named above (connection pool/backpressure, idle-transfer watchdog,
-accept-loop backoff).
+P24 boundary note above), the three P26 `sc serve --http` hardening items
+named above (connection pool/backpressure, idle-transfer watchdog,
+accept-loop backoff), and the three P27 items named above (transparent
+lazy-fetch as a deferred alternative to explicit `sc backfill`, per-case
+gap-tolerant merge/rebase/`ws harvest`/`sc work` instead of blanket
+refusal, and blob-size/object-count clone filters alongside the
+prefix-only filter shipped here).
