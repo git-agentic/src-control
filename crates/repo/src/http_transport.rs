@@ -371,6 +371,20 @@ fn bind_is_allowed(
     Ok(tokens_configured)
 }
 
+/// Is a valid bearer token MANDATORY on every connection for a server bound to
+/// `addr` under these flags? True exactly when the bind is non-loopback and its
+/// ONLY possible justification was configured tokens (not `--read-only`, not
+/// `--allow-public`). In that state an empty token set at connection time means
+/// the operator removed the sole justification out from under a public server —
+/// the handler must then fail closed (reject) rather than serve open. Loopback,
+/// `--read-only` (public read-mirror), and `--allow-public` (deliberately open)
+/// all keep their standing posture when tokens vanish, so this is false for them.
+fn auth_is_mandatory(addr: &str, read_only: bool, allow_public: bool) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    !is_loopback_host(host) && !read_only && !allow_public
+}
+
 /// Bind `addr`, serve the single repo at `root` to `sc+http://` clients
 /// until the listener is dropped or the process exits. Thin wrapper around
 /// [`serve_http_listener`] — see that function for the accept-loop
@@ -388,9 +402,10 @@ pub fn serve_http(addr: &str, root: &std::path::Path, read_only: bool, allow_pub
              use 127.0.0.1 for local-only serving"
         )));
     }
+    let mandatory_auth = auth_is_mandatory(addr, read_only, allow_public);
     let listener = TcpListener::bind(addr)
         .map_err(|e| Error::ConnectionLost(format!("sc+http bind {addr}: {e}")))?;
-    serve_http_listener(listener, root, read_only)
+    serve_http_listener(listener, root, read_only, mandatory_auth)
 }
 
 /// Accept-loop core, factored out of [`serve_http`] so tests can bind
@@ -411,6 +426,7 @@ pub fn serve_http_listener(
     listener: TcpListener,
     root: &std::path::Path,
     read_only: bool,
+    mandatory_auth: bool,
 ) -> Result<()> {
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -422,7 +438,7 @@ pub fn serve_http_listener(
         };
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            if let Err(e) = handle_http_connection(stream, &root, read_only) {
+            if let Err(e) = handle_http_connection(stream, &root, read_only, mandatory_auth) {
                 eprintln!("sc serve --http: connection error: {e}");
             }
         });
@@ -442,6 +458,7 @@ fn handle_http_connection(
     mut stream: TcpStream,
     root: &std::path::Path,
     server_read_only: bool,
+    mandatory_auth: bool,
 ) -> Result<()> {
     stream
         .set_read_timeout(Some(OPENING_READ_TIMEOUT))
@@ -478,7 +495,18 @@ fn handle_http_connection(
     // elevate.
     let tokens = crate::serve_tokens::load(&crate::layout::Layout::at(root))?;
     let token_read_only = if tokens.is_empty() {
-        false
+        if mandatory_auth {
+            // The public bind's sole justification (tokens) was removed while
+            // running — fail closed, do NOT serve an open unauthenticated server.
+            eprintln!(
+                "sc serve --http: refusing connection — this non-loopback server was \
+                 justified only by tokens, but none are configured (re-add a token, or \
+                 restart with --read-only / --allow-public)"
+            );
+            write_status(&mut stream, 401)?;
+            return Ok(());
+        }
+        false // loopback, or --read-only / --allow-public public bind: proceed unauthenticated
     } else {
         match opening
             .bearer
@@ -788,10 +816,18 @@ mod tests {
     }
 
     fn spawn_real_http_server_policy(root: std::path::PathBuf, read_only: bool) -> u16 {
+        spawn_real_http_server_policy_auth(root, read_only, false)
+    }
+
+    fn spawn_real_http_server_policy_auth(
+        root: std::path::PathBuf,
+        read_only: bool,
+        mandatory_auth: bool,
+    ) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            serve_http_listener(listener, &root, read_only).unwrap();
+            serve_http_listener(listener, &root, read_only, mandatory_auth).unwrap();
         });
         port
     }
@@ -1071,6 +1107,47 @@ mod tests {
         let port = spawn_real_http_server_policy(root.clone(), false);
         let client = connect_with_bearer(port, None).unwrap();
         client.list_refs().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Review fix: fail closed when a token-only public bind loses its
+    // last token while running (see `auth_is_mandatory`). ──
+
+    #[test]
+    fn auth_is_mandatory_matrix() {
+        // Non-loopback, no --read-only / --allow-public → tokens are the
+        // only possible justification, so auth is mandatory.
+        assert!(auth_is_mandatory("0.0.0.0:8730", false, false));
+        assert!(auth_is_mandatory("192.168.1.5:8730", false, false));
+
+        // Loopback: always false regardless of flags.
+        assert!(!auth_is_mandatory("127.0.0.1:8730", false, false));
+        assert!(!auth_is_mandatory("[::1]:8730", false, false));
+        assert!(!auth_is_mandatory("localhost:8730", false, false));
+
+        // Non-loopback but justified by --read-only or --allow-public: that
+        // justification stands on its own even with zero tokens, so not
+        // mandatory.
+        assert!(!auth_is_mandatory("0.0.0.0:8730", true, false));
+        assert!(!auth_is_mandatory("0.0.0.0:8730", false, true));
+    }
+
+    /// A non-loopback bind whose sole justification was tokens (mirrored
+    /// here by passing `mandatory_auth=true` directly, exactly what
+    /// `serve_http` would compute for such a bind) must reject every
+    /// connection with 401 once no tokens are configured — never fall
+    /// through to an open, unauthenticated server. Exercises the handler
+    /// path directly via a loopback bind (network exposure isn't the point
+    /// here; the fail-closed decision is).
+    #[test]
+    fn mandatory_auth_rejects_when_tokens_removed() {
+        let root = tmp_repo("mandatory-auth-no-tokens");
+        // Deliberately no tokens configured.
+        let port = spawn_real_http_server_policy_auth(root.clone(), false, true);
+
+        assert_eq!(connect_raw_status(port, None), 401);
+        assert_eq!(connect_raw_status(port, Some("sct-not-a-real-token")), 401);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
