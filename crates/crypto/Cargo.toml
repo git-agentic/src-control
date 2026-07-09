@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 scl-core = { path = "../core" }
 chacha20poly1305 = "0.10"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 hkdf = "0.12"
 sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
