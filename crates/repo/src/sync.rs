@@ -10,12 +10,12 @@ use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::reachable;
 use crate::refs;
-use crate::worktree;
-use crate::repo::validate_branch_name;
 use crate::remote::RemoteConfig;
+use crate::repo::validate_branch_name;
 use crate::repo::Repo;
 use crate::stdio_transport::open_transport;
 use crate::transport::Transport;
+use crate::worktree;
 
 impl Repo {
     /// Add a named remote to `.sc/config`. The name becomes a path component
@@ -94,7 +94,14 @@ impl Repo {
             let mut store = store_arc.lock().unwrap();
             // Fresh clone dst has no local refs yet → no haves → full transfer
             // (of whatever `filter` scopes it to).
-            transfer_objects(&dst_repo.layout, transport.as_ref(), &mut store, &tips, &[], filter)?;
+            transfer_objects(
+                &dst_repo.layout,
+                transport.as_ref(),
+                &mut store,
+                &tips,
+                &[],
+                filter,
+            )?;
             // Clone-specific belt-and-suspenders (P22 Task 3): the transfer
             // above already indexes every signature object it wrote via
             // `index_incoming`, but a fresh clone is a wholesale copy of the
@@ -222,7 +229,14 @@ impl Repo {
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            transfer_objects(&self.layout, transport.as_ref(), &mut store, &tips, &[], Some(prefixes))?;
+            transfer_objects(
+                &self.layout,
+                transport.as_ref(),
+                &mut store,
+                &tips,
+                &[],
+                Some(prefixes),
+            )?;
         }
 
         promisor.widen(prefixes);
@@ -275,7 +289,14 @@ impl Repo {
             let mut store = store_arc.lock().unwrap();
             // filter = None: fetch every remaining object, not just a
             // named prefix — this is the whole point of `--all`.
-            transfer_objects(&self.layout, transport.as_ref(), &mut store, &tips, &[], None)?;
+            transfer_objects(
+                &self.layout,
+                transport.as_ref(),
+                &mut store,
+                &tips,
+                &[],
+                None,
+            )?;
 
             // Verify closure completeness before ever touching the marker.
             // Walk from every local ref tip too (not just origin's), so a
@@ -300,7 +321,9 @@ impl Repo {
     /// (`refs/remotes/<remote>/<branch>`). Local branches are left untouched.
     pub fn fetch(&self, remote: &str) -> Result<Vec<(String, ObjectId)>> {
         let cfg = RemoteConfig::load(&self.layout)?;
-        let url = cfg.url(remote).ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
+        let url = cfg
+            .url(remote)
+            .ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
         let transport = open_transport(url)?;
         let remote_refs = transport.list_refs()?;
 
@@ -310,7 +333,14 @@ impl Repo {
             let mut store = store_arc.lock().unwrap();
             // Derive haves from local refs before the mutable borrow for transfer.
             let haves = local_have_tips(&self.layout, &store)?;
-            transfer_objects(&self.layout, transport.as_ref(), &mut store, &tips, &haves, None)?;
+            transfer_objects(
+                &self.layout,
+                transport.as_ref(),
+                &mut store,
+                &tips,
+                &haves,
+                None,
+            )?;
         }
         for (branch, tip) in &remote_refs {
             refs::write_remote_tip(&self.layout, remote, branch, tip)?;
@@ -323,7 +353,9 @@ impl Repo {
     /// reachable from the local tip.
     pub fn push(&self, remote: &str) -> Result<ObjectId> {
         let cfg = RemoteConfig::load(&self.layout)?;
-        let url = cfg.url(remote).ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
+        let url = cfg
+            .url(remote)
+            .ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
         let transport = open_transport(url)?;
         let branch = refs::current_branch(&self.layout)?;
         let local_tip = self.head_tip()?.ok_or(Error::Unborn)?;
@@ -403,7 +435,8 @@ impl Repo {
             // not the snapshot's, so it only surfaces if the transcript
             // ids are folded into the signature query too (review-caught
             // alongside the `get_pack` fix — same omission, same shape).
-            let transcript_ids = crate::transcripts::indexed_transcript_ids_for(&self.layout, &snaps)?;
+            let transcript_ids =
+                crate::transcripts::indexed_transcript_ids_for(&self.layout, &snaps)?;
             let sig_targets: Vec<ObjectId> =
                 snaps.iter().chain(transcript_ids.iter()).copied().collect();
             let sig_ids = crate::signatures::indexed_signature_ids_for(&self.layout, &sig_targets)?;
@@ -414,11 +447,8 @@ impl Repo {
                 }
             }
             if !send_ids.is_empty() {
-                let guard = crate::transport::write_ids_to_temp_pack(
-                    &self.layout,
-                    &mut store,
-                    &send_ids,
-                )?;
+                let guard =
+                    crate::transport::write_ids_to_temp_pack(&self.layout, &mut store, &send_ids)?;
                 let mut f = std::fs::File::open(guard.path())?;
                 transport.put_pack(&mut f)?;
             }
@@ -519,7 +549,10 @@ mod tests {
         // indexed at B (not just present as a dangling CAS object) — that
         // is what makes sig_status resolve to Trusted rather than Unsigned.
         let b = Repo::clone_to(&a_root, &b_root).unwrap();
-        assert_eq!(b.sig_status(&snap1, &trust).unwrap(), SigStatus::Trusted("alice".to_string()));
+        assert_eq!(
+            b.sig_status(&snap1, &trust).unwrap(),
+            SigStatus::Trusted("alice".to_string())
+        );
 
         // fetch: A gets a second signed commit; B fetches and must pick up
         // the new signature via `transfer_objects`'s `index_incoming` call
@@ -533,7 +566,10 @@ mod tests {
         // reentrant); reopened after the push to check A's final state.
         drop(a);
         b.fetch("origin").unwrap();
-        assert_eq!(b.sig_status(&snap2, &trust).unwrap(), SigStatus::Trusted("alice".to_string()));
+        assert_eq!(
+            b.sig_status(&snap2, &trust).unwrap(),
+            SigStatus::Trusted("alice".to_string())
+        );
 
         // push: bring B's local branch up to snap2 (fetch only advanced the
         // remote-tracking ref, not the local branch — fast-forward merge),
@@ -546,7 +582,10 @@ mod tests {
         // A's receiver seam is `LocalTransport::put_pack` — verify A's index
         // picked up the pushed signature via `index_incoming` there.
         let a = Repo::open(&a_root).unwrap();
-        assert_eq!(a.sig_status(&snap3, &trust).unwrap(), SigStatus::Trusted("alice".to_string()));
+        assert_eq!(
+            a.sig_status(&snap3, &trust).unwrap(),
+            SigStatus::Trusted("alice".to_string())
+        );
 
         drop(a);
         drop(b);
@@ -632,7 +671,9 @@ mod tests {
         let snap = a.commit("t", "c1").unwrap();
         let (_s, identity) = scl_crypto::generate_identity_v2();
         let body = b"USER: do the thing\nAGENT: done";
-        let tid = a.attach_transcript(snap, "claude-code", "s1", body, &[identity.enc.public()]).unwrap();
+        let tid = a
+            .attach_transcript(snap, "claude-code", "s1", body, &[identity.enc.public()])
+            .unwrap();
 
         let b = Repo::clone_to(&a_root, &b_root).unwrap();
 
@@ -643,7 +684,11 @@ mod tests {
         match &obj {
             scl_core::Object::Transcript(t) => {
                 assert_eq!(t.snapshot, snap);
-                assert_ne!(t.ciphertext.as_slice(), body, "plaintext must never ride the pack");
+                assert_ne!(
+                    t.ciphertext.as_slice(),
+                    body,
+                    "plaintext must never ride the pack"
+                );
             }
             _ => panic!("expected a transcript object at dst"),
         }
@@ -652,7 +697,11 @@ mod tests {
         // The index picked it up (belt-and-suspenders reindex on clone).
         let idx = crate::transcripts::load(b.layout()).unwrap();
         assert!(idx.iter().any(|(s, t)| *s == snap && *t == tid));
-        assert!(b.transcripts_for(&snap).unwrap().iter().any(|(t, _)| *t == tid));
+        assert!(b
+            .transcripts_for(&snap)
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t == tid));
 
         // A different identity cannot open it in dst.
         let (_s2, identity2) = scl_crypto::generate_identity_v2();
@@ -691,7 +740,9 @@ mod tests {
         let snap = a.commit("t", "c1").unwrap();
         let (_s, identity) = scl_crypto::generate_identity_v2();
         let body = b"USER: do the thing\nAGENT: done";
-        let tid = a.attach_transcript(snap, "claude-code", "s1", body, &[identity.enc.public()]).unwrap();
+        let tid = a
+            .attach_transcript(snap, "claude-code", "s1", body, &[identity.enc.public()])
+            .unwrap();
         a.sign_transcript(tid, &identity).unwrap();
 
         let trust: std::collections::HashMap<[u8; 32], String> = std::collections::HashMap::new();
@@ -740,14 +791,19 @@ mod tests {
         // A attaches a transcript to the OLD (already-cloned) commit.
         let (_s, identity) = scl_crypto::generate_identity_v2();
         let body = b"retroactive transcript body";
-        let tid = a.attach_transcript(snap, "claude-code", "s2", body, &[identity.enc.public()]).unwrap();
+        let tid = a
+            .attach_transcript(snap, "claude-code", "s2", body, &[identity.enc.public()])
+            .unwrap();
         drop(a);
 
         // B fetches again: the retroactive transcript must propagate even
         // though B already had the snapshot itself.
         b.fetch("origin").unwrap();
         let got = b.transcripts_for(&snap).unwrap();
-        assert!(got.iter().any(|(t, _)| *t == tid), "B's index must list the retroactively-fetched transcript");
+        assert!(
+            got.iter().any(|(t, _)| *t == tid),
+            "B's index must list the retroactively-fetched transcript"
+        );
         let opened = b.open_transcript(&tid, &identity.enc).unwrap();
         assert_eq!(opened.as_slice(), body);
 
@@ -788,8 +844,9 @@ mod tests {
         let (client_read, mut server_write) = std::io::pipe().unwrap();
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let server_root = src_root.clone();
-        let server =
-            std::thread::spawn(move || wire::serve(&server_root, &mut server_read, &mut server_write));
+        let server = std::thread::spawn(move || {
+            wire::serve(&server_root, &mut server_read, &mut server_write)
+        });
         let client = WireClient::handshake(client_read, client_write).unwrap();
 
         let dst = Repo::init(&dst_root).unwrap();
@@ -802,7 +859,10 @@ mod tests {
         drop(client);
         server.join().unwrap().unwrap();
 
-        assert_eq!(dst.sig_status(&tip, &trust).unwrap(), SigStatus::Trusted("alice".to_string()));
+        assert_eq!(
+            dst.sig_status(&tip, &trust).unwrap(),
+            SigStatus::Trusted("alice".to_string())
+        );
 
         drop(src);
         drop(dst);
@@ -853,8 +913,9 @@ mod tests {
         let (client_read, mut server_write) = std::io::pipe().unwrap();
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let server_root = src_root.clone();
-        let server =
-            std::thread::spawn(move || wire::serve(&server_root, &mut server_read, &mut server_write));
+        let server = std::thread::spawn(move || {
+            wire::serve(&server_root, &mut server_read, &mut server_write)
+        });
         let client = WireClient::handshake(client_read, client_write).unwrap();
 
         let dst = Repo::init(&dst_root).unwrap();
@@ -862,7 +923,10 @@ mod tests {
             let store_arc = dst.vfs().store();
             let mut store = store_arc.lock().unwrap();
             transfer_objects(dst.layout(), &client, &mut store, &[c2], &[], None).unwrap();
-            assert!(store.contains(&c1), "c1 must have landed (ancestor of the want)");
+            assert!(
+                store.contains(&c1),
+                "c1 must have landed (ancestor of the want)"
+            );
             assert!(store.contains(&c2), "c2 (the want) must have landed");
         }
         client.bye().unwrap();
@@ -920,8 +984,14 @@ mod tests {
         {
             let store_arc = remote_reopened.vfs().store();
             let store = store_arc.lock().unwrap();
-            assert!(store.contains(&seed), "pre-existing remote object must still be present");
-            assert!(store.contains(&c1), "pushed commit must have landed on the remote");
+            assert!(
+                store.contains(&seed),
+                "pre-existing remote object must still be present"
+            );
+            assert!(
+                store.contains(&c1),
+                "pushed commit must have landed on the remote"
+            );
         }
         assert_eq!(remote_reopened.head_tip().unwrap(), Some(c1));
 
@@ -1020,11 +1090,20 @@ mod tests {
         {
             let store_arc = dst.vfs().store();
             let store = store_arc.lock().unwrap();
-            assert!(store.contains(&src_blob_id), "in-filter src/ blob must be present");
-            assert!(!store.contains(&docs_blob_id), "out-of-filter docs/ blob must NOT be present");
+            assert!(
+                store.contains(&src_blob_id),
+                "in-filter src/ blob must be present"
+            );
+            assert!(
+                !store.contains(&docs_blob_id),
+                "out-of-filter docs/ blob must NOT be present"
+            );
         }
 
-        let promisor = dst.promisor().unwrap().expect(".sc/promisor must exist after a filtered clone");
+        let promisor = dst
+            .promisor()
+            .unwrap()
+            .expect(".sc/promisor must exist after a filtered clone");
         assert_eq!(promisor.origin, src_root.to_str().unwrap());
         assert_eq!(promisor.prefixes(), &["src/".to_string()]);
 
@@ -1098,8 +1177,14 @@ mod tests {
         // A full clone of the origin sees the src/ edit AND the intact docs/.
         let full = Repo::clone_url(src_root.to_str().unwrap(), &full_root).unwrap();
         assert_eq!(full.head_tip().unwrap(), Some(new_tip));
-        assert_eq!(std::fs::read(full_root.join("src/a.txt")).unwrap(), b"src-two");
-        assert_eq!(std::fs::read(full_root.join("docs/b.txt")).unwrap(), b"docs-one");
+        assert_eq!(
+            std::fs::read(full_root.join("src/a.txt")).unwrap(),
+            b"src-two"
+        );
+        assert_eq!(
+            std::fs::read(full_root.join("docs/b.txt")).unwrap(),
+            b"docs-one"
+        );
 
         drop(dst);
         drop(full);
@@ -1129,7 +1214,8 @@ mod tests {
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let src = Repo::init(&src_root).unwrap();
         std::fs::write(src_root.join("src/a.txt"), b"src-one").unwrap();
-        src.protect("docs/", std::slice::from_ref(&alice_pk), None).unwrap();
+        src.protect("docs/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::write(src_root.join("docs/secret.txt"), b"docs-secret").unwrap();
         src.commit("t", "c1").unwrap();
 
@@ -1259,7 +1345,10 @@ mod tests {
         {
             let store_arc = dst.vfs().store();
             let store = store_arc.lock().unwrap();
-            assert!(!store.contains(&docs_blob_id), "docs/ must be gapped before backfill");
+            assert!(
+                !store.contains(&docs_blob_id),
+                "docs/ must be gapped before backfill"
+            );
         }
 
         dst.backfill(&["docs/".to_string()]).unwrap();
@@ -1267,11 +1356,17 @@ mod tests {
         {
             let store_arc = dst.vfs().store();
             let store = store_arc.lock().unwrap();
-            assert!(store.contains(&docs_blob_id), "docs/ blob must be present after backfill");
+            assert!(
+                store.contains(&docs_blob_id),
+                "docs/ blob must be present after backfill"
+            );
         }
 
         let promisor = dst.promisor().unwrap().unwrap();
-        assert_eq!(promisor.prefixes(), &["src/".to_string(), "docs/".to_string()]);
+        assert_eq!(
+            promisor.prefixes(),
+            &["src/".to_string(), "docs/".to_string()]
+        );
 
         drop(dst);
         std::fs::remove_dir_all(&src_root).unwrap();
@@ -1312,7 +1407,10 @@ mod tests {
         {
             let store_arc = dst.vfs().store();
             let store = store_arc.lock().unwrap();
-            assert!(!store.contains(&docs_blob_id), "docs/ must be gapped before backfill");
+            assert!(
+                !store.contains(&docs_blob_id),
+                "docs/ must be gapped before backfill"
+            );
         }
 
         dst.backfill(&["docs/".to_string()]).unwrap();
@@ -1375,7 +1473,10 @@ mod tests {
         drop(repo);
 
         let dst = Repo::clone_url(src_root.to_str().unwrap(), &dst_root).unwrap();
-        assert!(dst.promisor().unwrap().is_none(), "a full clone must have no .sc/promisor");
+        assert!(
+            dst.promisor().unwrap().is_none(),
+            "a full clone must have no .sc/promisor"
+        );
 
         let err = dst.backfill(&["docs/".to_string()]).unwrap_err();
         let msg = err.to_string();
@@ -1412,11 +1513,17 @@ mod tests {
             Some(&["src/".to_string()]),
         )
         .unwrap();
-        assert!(dst.promisor().unwrap().is_some(), "must start as a partial clone");
+        assert!(
+            dst.promisor().unwrap().is_some(),
+            "must start as a partial clone"
+        );
         {
             let store_arc = dst.vfs().store();
             let store = store_arc.lock().unwrap();
-            assert!(!store.contains(&docs_blob_id), "docs/ must be gapped before backfill --all");
+            assert!(
+                !store.contains(&docs_blob_id),
+                "docs/ must be gapped before backfill --all"
+            );
         }
 
         dst.backfill_all().unwrap();
@@ -1428,7 +1535,10 @@ mod tests {
         {
             let store_arc = dst.vfs().store();
             let store = store_arc.lock().unwrap();
-            assert!(store.contains(&docs_blob_id), "docs/ blob must be present after backfill --all");
+            assert!(
+                store.contains(&docs_blob_id),
+                "docs/ blob must be present after backfill --all"
+            );
         }
 
         // `.sc/promisor` is gone, but `.sc/sparse` (a separate, P24
@@ -1436,7 +1546,10 @@ mod tests {
         // now that the object closure is genuinely complete, so `docs/`
         // materializes on disk.
         dst.disable_sparse(None).unwrap();
-        assert!(dst_root.join("docs/b.txt").exists(), "docs/ must materialize once sparse is disabled");
+        assert!(
+            dst_root.join("docs/b.txt").exists(),
+            "docs/ must materialize once sparse is disabled"
+        );
 
         // The escape hatch's whole point: a real merge that touches the
         // formerly out-of-filter `docs/` subtree now works, where it was
@@ -1484,9 +1597,7 @@ mod tests {
     /// Loopback `sc+http://` server standing in for `sc serve --http`
     /// (mirrors `http_transport::tests::spawn_loopback_server`, duplicated
     /// here rather than exposed `pub(crate)` across modules for one test).
-    fn spawn_backfill_http_server(
-        root: std::path::PathBuf,
-    ) -> (u16, std::thread::JoinHandle<()>) {
+    fn spawn_backfill_http_server(root: std::path::PathBuf) -> (u16, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || loop {
@@ -1529,14 +1640,20 @@ mod tests {
         {
             let store_arc = dst.vfs().store();
             let store = store_arc.lock().unwrap();
-            assert!(!store.contains(&docs_blob_id), "docs/ must be gapped over http too");
+            assert!(
+                !store.contains(&docs_blob_id),
+                "docs/ must be gapped over http too"
+            );
         }
 
         dst.backfill(&["docs/".to_string()]).unwrap();
         {
             let store_arc = dst.vfs().store();
             let store = store_arc.lock().unwrap();
-            assert!(store.contains(&docs_blob_id), "docs/ must be backfilled over http too");
+            assert!(
+                store.contains(&docs_blob_id),
+                "docs/ must be backfilled over http too"
+            );
         }
 
         drop(dst);

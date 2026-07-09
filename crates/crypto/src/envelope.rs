@@ -39,7 +39,13 @@ pub fn seal_with_rng<R: RngCore + CryptoRng>(
 
     let cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).expect("32-byte DEK");
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad: name.as_bytes() })
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: name.as_bytes(),
+            },
+        )
         .expect("aead encrypt is infallible for valid inputs");
 
     // Reborrow the RNG (`&mut *rng`) per recipient so the `&mut R` isn't moved on
@@ -49,7 +55,12 @@ pub fn seal_with_rng<R: RngCore + CryptoRng>(
         wrapped_keys.push(wrap_dek(dek.as_slice(), recipient, &mut *rng));
     }
 
-    Secret { name: name.to_string(), nonce: nonce.to_vec(), ciphertext, wrapped_keys }
+    Secret {
+        name: name.to_string(),
+        nonce: nonce.to_vec(),
+        ciphertext,
+        wrapped_keys,
+    }
 }
 
 /// Decrypt a secret using `identity`. Errors if the identity is not a recipient
@@ -73,7 +84,10 @@ pub fn open(secret: &Secret, identity: &SecretKey) -> Result<Zeroizing<Vec<u8>>>
     let plaintext = cipher
         .decrypt(
             XNonce::from_slice(&secret.nonce),
-            Payload { msg: &secret.ciphertext, aad: secret.name.as_bytes() },
+            Payload {
+                msg: &secret.ciphertext,
+                aad: secret.name.as_bytes(),
+            },
         )
         .map_err(|_| Error::Decrypt)?;
     Ok(Zeroizing::new(plaintext))
@@ -101,7 +115,8 @@ pub fn rewrap_for_with_rng<R: RngCore + CryptoRng>(
     let new_wk = wrap_dek(dek.as_slice(), new, rng);
 
     let mut out = secret.clone();
-    out.wrapped_keys.retain(|w| w.recipient_id != new_wk.recipient_id);
+    out.wrapped_keys
+        .retain(|w| w.recipient_id != new_wk.recipient_id);
     out.wrapped_keys.push(new_wk);
     Ok(out)
 }
@@ -110,7 +125,8 @@ pub fn rewrap_for_with_rng<R: RngCore + CryptoRng>(
 /// not rotate the value — see ADR-0008.
 pub fn revoke(secret: &Secret, recipient: &RecipientId) -> Secret {
     let mut out = secret.clone();
-    out.wrapped_keys.retain(|w| w.recipient_id != recipient.as_str());
+    out.wrapped_keys
+        .retain(|w| w.recipient_id != recipient.as_str());
     out
 }
 
@@ -128,13 +144,21 @@ pub fn encrypt_path(plaintext: &[u8]) -> (Vec<u8>, Zeroizing<[u8; DEK_LEN]>) {
     ikm.copy_from_slice(hash.as_bytes());
     let hk = Hkdf::<Sha256>::new(None, ikm.as_slice());
     let mut dek = Zeroizing::new([0u8; DEK_LEN]);
-    hk.expand(b"scl-path-dek-v1", dek.as_mut_slice()).expect("32-byte okm");
+    hk.expand(b"scl-path-dek-v1", dek.as_mut_slice())
+        .expect("32-byte okm");
     let mut nonce = [0u8; NONCE_LEN];
-    hk.expand(b"scl-path-nonce-v1", &mut nonce).expect("24-byte okm");
+    hk.expand(b"scl-path-nonce-v1", &mut nonce)
+        .expect("24-byte okm");
 
     let cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).expect("32-byte DEK");
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plaintext, aad: PATH_AAD })
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: PATH_AAD,
+            },
+        )
         .expect("aead encrypt is infallible for valid inputs");
 
     let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -151,7 +175,13 @@ pub fn decrypt_path(blob: &[u8], dek: &[u8; DEK_LEN]) -> Result<Zeroizing<Vec<u8
     let (nonce, ct) = blob.split_at(NONCE_LEN);
     let cipher = XChaCha20Poly1305::new_from_slice(dek).map_err(|_| Error::Decrypt)?;
     let pt = cipher
-        .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: PATH_AAD })
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ct,
+                aad: PATH_AAD,
+            },
+        )
         .map_err(|_| Error::Decrypt)?;
     Ok(Zeroizing::new(pt))
 }
@@ -164,7 +194,10 @@ pub fn wrap_dek_for(dek: &[u8; DEK_LEN], recipient: &PublicKey) -> WrappedKey {
 }
 
 /// Unwrap a DEK from a `WrappedKey` with `identity` (errors if not the recipient).
-pub fn unwrap_dek_with(wrapped: &WrappedKey, identity: &SecretKey) -> Result<Zeroizing<[u8; DEK_LEN]>> {
+pub fn unwrap_dek_with(
+    wrapped: &WrappedKey,
+    identity: &SecretKey,
+) -> Result<Zeroizing<[u8; DEK_LEN]>> {
     unwrap_dek(&wrapped.wrapped_dek, identity)
 }
 
@@ -175,7 +208,11 @@ fn wrap_dek<R: RngCore + CryptoRng>(dek: &[u8], recipient: &PublicKey, rng: &mut
     let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
     let shared = ephemeral.diffie_hellman(recipient.inner());
 
-    let wrap_key = derive_wrap_key(shared.as_bytes(), ephemeral_pub.as_bytes(), &recipient.to_bytes());
+    let wrap_key = derive_wrap_key(
+        shared.as_bytes(),
+        ephemeral_pub.as_bytes(),
+        &recipient.to_bytes(),
+    );
     let mut wrap_nonce = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut wrap_nonce);
 
@@ -189,14 +226,19 @@ fn wrap_dek<R: RngCore + CryptoRng>(dek: &[u8], recipient: &PublicKey, rng: &mut
     blob.extend_from_slice(&wrap_nonce);
     blob.extend_from_slice(&wrapped);
 
-    WrappedKey { recipient_id: recipient.recipient_id().to_string(), wrapped_dek: blob }
+    WrappedKey {
+        recipient_id: recipient.recipient_id().to_string(),
+        wrapped_dek: blob,
+    }
 }
 
 fn unwrap_dek(blob: &[u8], identity: &SecretKey) -> Result<Zeroizing<[u8; DEK_LEN]>> {
     if blob.len() < EPK_LEN + NONCE_LEN {
         return Err(Error::Decrypt);
     }
-    let ephemeral_pub_bytes: [u8; 32] = blob[..EPK_LEN].try_into().expect("32-byte slice after length check");
+    let ephemeral_pub_bytes: [u8; 32] = blob[..EPK_LEN]
+        .try_into()
+        .expect("32-byte slice after length check");
     let wrap_nonce = &blob[EPK_LEN..EPK_LEN + NONCE_LEN];
     let wrapped = &blob[EPK_LEN + NONCE_LEN..];
 
@@ -206,9 +248,14 @@ fn unwrap_dek(blob: &[u8], identity: &SecretKey) -> Result<Zeroizing<[u8; DEK_LE
     // would buy nothing here.
     let ephemeral_pub = x25519_dalek::PublicKey::from(ephemeral_pub_bytes);
     let shared = identity.inner().diffie_hellman(&ephemeral_pub);
-    let wrap_key = derive_wrap_key(shared.as_bytes(), &ephemeral_pub_bytes, &identity.public().to_bytes());
+    let wrap_key = derive_wrap_key(
+        shared.as_bytes(),
+        &ephemeral_pub_bytes,
+        &identity.public().to_bytes(),
+    );
 
-    let cipher = XChaCha20Poly1305::new_from_slice(wrap_key.as_slice()).map_err(|_| Error::Decrypt)?;
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(wrap_key.as_slice()).map_err(|_| Error::Decrypt)?;
     // Wrap the decrypted DEK so the cleartext key is zeroized on drop.
     let dek_vec = Zeroizing::new(
         cipher
@@ -221,13 +268,18 @@ fn unwrap_dek(blob: &[u8], identity: &SecretKey) -> Result<Zeroizing<[u8; DEK_LE
 
 /// HKDF-SHA256 over the ECDH shared secret, salted with both public keys, so the
 /// wrapping key is bound to this specific ephemeral↔recipient pair.
-fn derive_wrap_key(shared: &[u8], ephemeral_pub: &[u8; 32], recipient_pub: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+fn derive_wrap_key(
+    shared: &[u8],
+    ephemeral_pub: &[u8; 32],
+    recipient_pub: &[u8; 32],
+) -> Zeroizing<[u8; 32]> {
     let mut salt = Vec::with_capacity(64);
     salt.extend_from_slice(ephemeral_pub);
     salt.extend_from_slice(recipient_pub);
     let hk = Hkdf::<Sha256>::new(Some(&salt), shared);
     let mut okm = Zeroizing::new([0u8; 32]);
-    hk.expand(HKDF_INFO, okm.as_mut_slice()).expect("32-byte HKDF output");
+    hk.expand(HKDF_INFO, okm.as_mut_slice())
+        .expect("32-byte HKDF output");
     okm
 }
 
@@ -294,7 +346,10 @@ mod tests {
         assert!(matches!(open(&secret, &sk_b), Err(Error::NotARecipient)));
 
         let granted = rewrap_for_with_rng(&secret, &sk_a, &pk_b, &mut rng(4)).unwrap();
-        assert_eq!(granted.ciphertext, secret.ciphertext, "value must not be rotated");
+        assert_eq!(
+            granted.ciphertext, secret.ciphertext,
+            "value must not be rotated"
+        );
         assert_eq!(&open(&granted, &sk_b).unwrap()[..], b"v");
         assert_eq!(&open(&granted, &sk_a).unwrap()[..], b"v");
     }
@@ -314,7 +369,10 @@ mod tests {
         let pt = b"the database password is hunter2";
         let (blob1, dek1) = encrypt_path(pt);
         let (blob2, _dek2) = encrypt_path(pt);
-        assert_eq!(blob1, blob2, "same plaintext -> identical bytes (convergent)");
+        assert_eq!(
+            blob1, blob2,
+            "same plaintext -> identical bytes (convergent)"
+        );
         let out = decrypt_path(&blob1, &dek1).unwrap();
         assert_eq!(&out[..], pt);
         let (blob3, _) = encrypt_path(b"different");

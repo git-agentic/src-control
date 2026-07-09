@@ -22,7 +22,9 @@ impl MarksStore {
             || remote.contains('/')
             || remote.contains('\\')
         {
-            return Err(Error::BadRef(format!("invalid remote name for marks: {remote:?}")));
+            return Err(Error::BadRef(format!(
+                "invalid remote name for marks: {remote:?}"
+            )));
         }
         let path = layout.dot_sc.join("git-remotes").join(remote).join("marks");
         Ok(MarksStore { path })
@@ -59,7 +61,10 @@ impl MarksStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         let mut buf = String::new();
         for (k, v) in pairs {
             buf.push_str(k);
@@ -91,7 +96,8 @@ mod tests {
         assert_eq!(m.load().unwrap(), Vec::<(String, String)>::new()); // missing => empty
 
         m.append(&[("git1".into(), "sc1".into())]).unwrap();
-        m.append(&[("git2".into(), "sc2".into()), ("git3".into(), "sc3".into())]).unwrap();
+        m.append(&[("git2".into(), "sc2".into()), ("git3".into(), "sc3".into())])
+            .unwrap();
 
         let loaded = m.load().unwrap();
         assert_eq!(
@@ -111,9 +117,18 @@ mod tests {
     #[test]
     fn hostile_remote_name_is_rejected() {
         let layout = tmp_layout("hostile");
-        assert!(matches!(MarksStore::open(&layout, "../evil"), Err(Error::BadRef(_))));
-        assert!(matches!(MarksStore::open(&layout, ""), Err(Error::BadRef(_))));
-        assert!(matches!(MarksStore::open(&layout, ".hidden"), Err(Error::BadRef(_))));
+        assert!(matches!(
+            MarksStore::open(&layout, "../evil"),
+            Err(Error::BadRef(_))
+        ));
+        assert!(matches!(
+            MarksStore::open(&layout, ""),
+            Err(Error::BadRef(_))
+        ));
+        assert!(matches!(
+            MarksStore::open(&layout, ".hidden"),
+            Err(Error::BadRef(_))
+        ));
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 }

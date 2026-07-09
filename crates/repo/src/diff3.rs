@@ -179,7 +179,8 @@ fn cluster_hunks(all: &[(Side, Hunk)]) -> Vec<Vec<usize>> {
     }
 
     // Bucket indices by their representative, preserving discovery order.
-    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
     for i in 0..n {
         let r = find(&mut parent, i);
         groups.entry(r).or_default().push(i);

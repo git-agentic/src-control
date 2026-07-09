@@ -5,7 +5,31 @@ members = ["crates/core", "crates/vfs", "crates/gitio", "crates/crypto", "crates
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+rust-version = "1.96.1"
+license = "Apache-2.0"
+authors = ["Toni Bergholm <toni@git-agentic.com>"]
+description = "A next-gen version control system: snapshot-and-tag model, per-file permissions, native committed secrets, and in-memory clones."
+repository = "https://github.com/git-agentic/src-control"
+homepage = "https://github.com/git-agentic/src-control"
+readme = "README.md"
+keywords = ["version-control", "vcs", "secrets", "encryption", "agents"]
+categories = ["development-tools", "command-line-utilities"]
+# Pre-1.0, pre-audit crypto: nothing publishes to crates.io by accident. Each
+# crate sets `publish.workspace = true` to inherit this.
+publish = false
+
+# Accepted clippy lints for the MVP, applied workspace-wide (each crate opts in
+# with `[lints] workspace = true`). These are deliberate design or cosmetic
+# choices in reviewed code, not defects; tightening them is a ROADMAP-Deferred
+# follow-on. CI runs `clippy --all-targets -D warnings`, so this list is the
+# single source of truth for what's intentionally allowed.
+[workspace.lints.clippy]
+type_complexity = "allow"       # deliberate: crypto wrap/protection map types
+too_many_arguments = "allow"    # deliberate: commit/snapshot-assembly fns
+doc_lazy_continuation = "allow" # cosmetic: doc-comment list continuation style
+redundant_guards = "allow"      # stylistic match-guard preference
+match_like_matches_macro = "allow"
+cloned_ref_to_slice_refs = "allow"
 
 [profile.release]
 lto = true

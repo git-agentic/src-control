@@ -14,8 +14,10 @@ fn git(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .args(args)
         .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e")
-        .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@e")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@e")
         .output()
         .expect("git runs")
 }
@@ -39,14 +41,27 @@ fn fetch_from_git_imports_history_into_tracking_ref() {
     let screpo = root.join("work");
     std::fs::create_dir_all(&screpo).unwrap();
     assert!(sc(&screpo, &["init"]).status.success());
-    assert!(sc(&screpo, &["remote", "add", "hub", gitrepo.to_str().unwrap(), "--git"]).status.success());
+    assert!(sc(
+        &screpo,
+        &["remote", "add", "hub", gitrepo.to_str().unwrap(), "--git"]
+    )
+    .status
+    .success());
 
     let out = sc(&screpo, &["fetch", "hub"]);
-    assert!(out.status.success(), "fetch failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "fetch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Integrate via existing merge, then the content is present.
     let m = sc(&screpo, &["merge", "hub/main"]);
-    assert!(m.status.success(), "merge failed: {}", String::from_utf8_lossy(&m.stderr));
+    assert!(
+        m.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&m.stderr)
+    );
     assert_eq!(std::fs::read(screpo.join("hello.txt")).unwrap(), b"world");
 
     std::fs::remove_dir_all(&root).unwrap();
@@ -65,15 +80,26 @@ fn gc_after_git_fetch_retains_fetched_snapshots() {
     let screpo = root.join("work");
     std::fs::create_dir_all(&screpo).unwrap();
     sc(&screpo, &["init"]);
-    sc(&screpo, &["remote", "add", "hub", gitrepo.to_str().unwrap(), "--git"]);
+    sc(
+        &screpo,
+        &["remote", "add", "hub", gitrepo.to_str().unwrap(), "--git"],
+    );
     sc(&screpo, &["fetch", "hub"]);
 
     // gc with no local merge: the remote-tracking ref must keep the snapshot alive.
     let g = sc(&screpo, &["gc", "--prune-expire", "0s"]);
-    assert!(g.status.success(), "gc failed: {}", String::from_utf8_lossy(&g.stderr));
+    assert!(
+        g.status.success(),
+        "gc failed: {}",
+        String::from_utf8_lossy(&g.stderr)
+    );
     // Merge still works => the fetched objects survived gc.
     let m = sc(&screpo, &["merge", "hub/main"]);
-    assert!(m.status.success(), "merge after gc failed: {}", String::from_utf8_lossy(&m.stderr));
+    assert!(
+        m.status.success(),
+        "merge after gc failed: {}",
+        String::from_utf8_lossy(&m.stderr)
+    );
     assert_eq!(std::fs::read(screpo.join("keep.txt")).unwrap(), b"data");
 
     std::fs::remove_dir_all(&root).unwrap();
@@ -95,14 +121,24 @@ fn push_to_git_roundtrips_and_reuses_marks() {
     let bare = root.join("target.git");
     git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
 
-    sc(&screpo, &["remote", "add", "hub", bare.to_str().unwrap(), "--git"]);
+    sc(
+        &screpo,
+        &["remote", "add", "hub", bare.to_str().unwrap(), "--git"],
+    );
     let p = sc(&screpo, &["push", "hub"]);
-    assert!(p.status.success(), "push failed: {}", String::from_utf8_lossy(&p.stderr));
+    assert!(
+        p.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&p.stderr)
+    );
 
     // git log reads back two commits with our messages.
     let log = git(&bare, &["log", "--format=%s", "main"]);
     let subjects = String::from_utf8_lossy(&log.stdout);
-    assert!(subjects.contains("c2") && subjects.contains("c1"), "git log: {subjects}");
+    assert!(
+        subjects.contains("c2") && subjects.contains("c1"),
+        "git log: {subjects}"
+    );
 
     // A second push with no new commits is a clean no-op (marks => already there).
     let p2 = sc(&screpo, &["push", "hub"]);
@@ -112,7 +148,10 @@ fn push_to_git_roundtrips_and_reuses_marks() {
     let screpo2 = root.join("clone");
     std::fs::create_dir_all(&screpo2).unwrap();
     sc(&screpo2, &["init"]);
-    sc(&screpo2, &["remote", "add", "hub", bare.to_str().unwrap(), "--git"]);
+    sc(
+        &screpo2,
+        &["remote", "add", "hub", bare.to_str().unwrap(), "--git"],
+    );
     assert!(sc(&screpo2, &["fetch", "hub"]).status.success());
     assert!(sc(&screpo2, &["merge", "hub/main"]).status.success());
     assert_eq!(std::fs::read(screpo2.join("f.txt")).unwrap(), b"v2");
@@ -137,7 +176,11 @@ fn push_refuses_encrypted_content_without_flag() {
     // "encryption public key: scl-pk-…"). Matched by prefix, not position, so
     // it doesn't care where on the line the token lands.
     let kg = sc(&screpo, &["keygen", "--out", id.to_str().unwrap()]);
-    assert!(kg.status.success(), "keygen failed: {}", String::from_utf8_lossy(&kg.stderr));
+    assert!(
+        kg.status.success(),
+        "keygen failed: {}",
+        String::from_utf8_lossy(&kg.stderr)
+    );
     let kg_out = String::from_utf8_lossy(&kg.stdout);
     let pubkey = kg_out
         .lines()
@@ -161,27 +204,48 @@ fn push_refuses_encrypted_content_without_flag() {
         .env("SC_IDENTITY", id.to_str().unwrap())
         .output()
         .expect("sc runs");
-    assert!(pr.status.success(), "protect failed: {}", String::from_utf8_lossy(&pr.stderr));
+    assert!(
+        pr.status.success(),
+        "protect failed: {}",
+        String::from_utf8_lossy(&pr.stderr)
+    );
 
     std::fs::create_dir_all(screpo.join("secret")).unwrap();
     std::fs::write(screpo.join("secret/creds.txt"), b"top-secret-value").unwrap();
     let c = sc(&screpo, &["commit", "-m", "add protected file"]);
-    assert!(c.status.success(), "commit failed: {}", String::from_utf8_lossy(&c.stderr));
+    assert!(
+        c.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
 
     // A bare git target + git remote.
     let bare = root.join("target.git");
     git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    sc(&screpo, &["remote", "add", "hub", bare.to_str().unwrap(), "--git"]);
+    sc(
+        &screpo,
+        &["remote", "add", "hub", bare.to_str().unwrap(), "--git"],
+    );
 
     // Push without the flag MUST refuse (fail-closed confidentiality gate).
     let refused = sc(&screpo, &["push", "hub"]);
-    assert!(!refused.status.success(), "push should refuse encrypted content without --include-encrypted");
+    assert!(
+        !refused.status.success(),
+        "push should refuse encrypted content without --include-encrypted"
+    );
     let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(stderr.contains("refus"), "expected a refusal on stderr, got: {stderr}");
+    assert!(
+        stderr.contains("refus"),
+        "expected a refusal on stderr, got: {stderr}"
+    );
 
     // Push WITH the flag MUST succeed (protected files export as ciphertext).
     let allowed = sc(&screpo, &["push", "hub", "--include-encrypted"]);
-    assert!(allowed.status.success(), "push --include-encrypted failed: {}", String::from_utf8_lossy(&allowed.stderr));
+    assert!(
+        allowed.status.success(),
+        "push --include-encrypted failed: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -200,7 +264,10 @@ fn push_fast_forwards_after_new_commit() {
 
     let bare = root.join("target.git");
     git(&root, &["init", "-q", "--bare", bare.to_str().unwrap()]);
-    sc(&screpo, &["remote", "add", "hub", bare.to_str().unwrap(), "--git"]);
+    sc(
+        &screpo,
+        &["remote", "add", "hub", bare.to_str().unwrap(), "--git"],
+    );
 
     // First push: absent ref -> creates refs/heads/main at c1.
     assert!(sc(&screpo, &["push", "hub"]).status.success());
@@ -210,11 +277,18 @@ fn push_fast_forwards_after_new_commit() {
     std::fs::write(screpo.join("f.txt"), b"v2").unwrap();
     assert!(sc(&screpo, &["commit", "-m", "c2"]).status.success());
     let p = sc(&screpo, &["push", "hub"]);
-    assert!(p.status.success(), "fast-forward push failed: {}", String::from_utf8_lossy(&p.stderr));
+    assert!(
+        p.status.success(),
+        "fast-forward push failed: {}",
+        String::from_utf8_lossy(&p.stderr)
+    );
 
     let log = git(&bare, &["log", "--format=%s", "main"]);
     let subjects = String::from_utf8_lossy(&log.stdout);
-    assert!(subjects.contains("c2") && subjects.contains("c1"), "git log: {subjects}");
+    assert!(
+        subjects.contains("c2") && subjects.contains("c1"),
+        "git log: {subjects}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -235,7 +309,10 @@ fn push_refuses_when_remote_has_unseen_commit() {
     sc(&repo_a, &["init"]);
     std::fs::write(repo_a.join("f.txt"), b"from-a").unwrap();
     assert!(sc(&repo_a, &["commit", "-m", "a1"]).status.success());
-    sc(&repo_a, &["remote", "add", "hub", bare.to_str().unwrap(), "--git"]);
+    sc(
+        &repo_a,
+        &["remote", "add", "hub", bare.to_str().unwrap(), "--git"],
+    );
     assert!(sc(&repo_a, &["push", "hub"]).status.success());
 
     // Repo B has its own, disjoint history and no marks for the remote.
@@ -244,11 +321,17 @@ fn push_refuses_when_remote_has_unseen_commit() {
     sc(&repo_b, &["init"]);
     std::fs::write(repo_b.join("g.txt"), b"from-b").unwrap();
     assert!(sc(&repo_b, &["commit", "-m", "b1"]).status.success());
-    sc(&repo_b, &["remote", "add", "hub", bare.to_str().unwrap(), "--git"]);
+    sc(
+        &repo_b,
+        &["remote", "add", "hub", bare.to_str().unwrap(), "--git"],
+    );
 
     // The remote ref maps to a commit B has never seen -> refuse (fetch first).
     let p = sc(&repo_b, &["push", "hub"]);
-    assert!(!p.status.success(), "push should refuse when remote has an unseen commit");
+    assert!(
+        !p.status.success(),
+        "push should refuse when remote has an unseen commit"
+    );
     let stderr = String::from_utf8_lossy(&p.stderr);
     assert!(
         stderr.contains("non-fast-forward") && stderr.contains("fetch first"),

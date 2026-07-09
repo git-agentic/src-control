@@ -35,7 +35,11 @@ fn author_resolves_from_flag_env_then_os_user() {
     assert!(sc(&root, &["init"]).status.success());
 
     std::fs::write(root.join("f.txt"), "1\n").unwrap();
-    assert!(sc_env(&root, &["commit", "-m", "c1"], &[("SC_AUTHOR", "Envy")]).status.success());
+    assert!(
+        sc_env(&root, &["commit", "-m", "c1"], &[("SC_AUTHOR", "Envy")])
+            .status
+            .success()
+    );
     std::fs::write(root.join("f.txt"), "2\n").unwrap();
     assert!(sc_env(
         &root,
@@ -72,7 +76,11 @@ fn log_shows_date_and_merge_marker() {
     // Every line carries an ISO date (the year at minimum).
     assert!(log.contains("20"), "log shows a date: {log}");
     let merge_lines: Vec<&str> = log.lines().filter(|l| l.contains("(merge)")).collect();
-    assert_eq!(merge_lines.len(), 1, "exactly the merge commit is marked: {log}");
+    assert_eq!(
+        merge_lines.len(),
+        1,
+        "exactly the merge commit is marked: {log}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -92,8 +100,14 @@ fn diff_shows_unified_hunks_for_modified_added_deleted() {
     let out = sc(&root, &["diff"]);
     assert!(out.status.success());
     let d = stdout(&out);
-    assert!(d.contains("--- a/mod.txt") && d.contains("+++ b/mod.txt"), "headers: {d}");
-    assert!(d.contains("-two") && d.contains("+TWO"), "changed line: {d}");
+    assert!(
+        d.contains("--- a/mod.txt") && d.contains("+++ b/mod.txt"),
+        "headers: {d}"
+    );
+    assert!(
+        d.contains("-two") && d.contains("+TWO"),
+        "changed line: {d}"
+    );
     assert!(d.contains("+hello"), "added file content: {d}");
     assert!(d.contains("-bye"), "deleted file content: {d}");
 
@@ -120,7 +134,11 @@ fn json_output_for_status_log_and_secret_list() {
     assert_eq!(st["added"], serde_json::json!(["f.txt"]));
     assert_eq!(st["modified"], serde_json::json!([]));
 
-    assert!(sc_env(&root, &["commit", "-m", "c1"], &[("SC_AUTHOR", "J")]).status.success());
+    assert!(
+        sc_env(&root, &["commit", "-m", "c1"], &[("SC_AUTHOR", "J")])
+            .status
+            .success()
+    );
 
     let log: serde_json::Value =
         serde_json::from_str(&stdout(&sc(&root, &["log", "--json"]))).expect("valid json");

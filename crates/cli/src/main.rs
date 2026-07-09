@@ -743,37 +743,81 @@ fn main() -> Result<()> {
         Cmd::Keygen { out } => run_keygen(out),
         Cmd::SecretDemo(args) => run_secret_demo(args),
         Cmd::Init => run_init(),
-        Cmd::Commit { message, author, sign, identity } => {
-            run_commit(&resolve_author(author), &message, sign, identity)
-        }
-        Cmd::Amend { message, author, sign, identity } => {
-            run_amend(&resolve_author(author), message, sign, identity)
-        }
+        Cmd::Commit {
+            message,
+            author,
+            sign,
+            identity,
+        } => run_commit(&resolve_author(author), &message, sign, identity),
+        Cmd::Amend {
+            message,
+            author,
+            sign,
+            identity,
+        } => run_amend(&resolve_author(author), message, sign, identity),
         Cmd::Status { json } => run_status(json),
         Cmd::Diff => run_diff(),
         Cmd::Log { json } => run_log(json),
         Cmd::Branch { name } => run_branch(&name),
         Cmd::Switch { name, identity } => run_switch(&name, identity),
-        Cmd::Conflicts { path, identity, json } => run_conflicts(path, identity, json),
-        Cmd::Resolve { ours, theirs, paths, identity } => run_resolve(ours, theirs, paths, identity),
+        Cmd::Conflicts {
+            path,
+            identity,
+            json,
+        } => run_conflicts(path, identity, json),
+        Cmd::Resolve {
+            ours,
+            theirs,
+            paths,
+            identity,
+        } => run_resolve(ours, theirs, paths, identity),
         Cmd::Scan => run_scan(),
-        Cmd::Merge { branch, abort, author, identity } => {
-            run_merge(branch, abort, &resolve_author(author), identity)
-        }
-        Cmd::CherryPick { refname, abort, mainline, author, identity } => {
-            run_cherry_pick(refname, abort, mainline, &resolve_author(author), identity)
-        }
-        Cmd::Rebase { target, r#continue, abort, author, identity } => {
-            run_rebase(target, r#continue, abort, &resolve_author(author), identity)
-        }
+        Cmd::Merge {
+            branch,
+            abort,
+            author,
+            identity,
+        } => run_merge(branch, abort, &resolve_author(author), identity),
+        Cmd::CherryPick {
+            refname,
+            abort,
+            mainline,
+            author,
+            identity,
+        } => run_cherry_pick(refname, abort, mainline, &resolve_author(author), identity),
+        Cmd::Rebase {
+            target,
+            r#continue,
+            abort,
+            author,
+            identity,
+        } => run_rebase(target, r#continue, abort, &resolve_author(author), identity),
         Cmd::Secret { op } => run_secret(op),
         Cmd::Run { identity, cmd } => run_run(identity, cmd),
-        Cmd::Work { agents, name, budget_mb, with_secrets, identity, author, cmd } => {
-            run_work(agents, name, budget_mb, with_secrets, identity, author, cmd)
-        }
+        Cmd::Work {
+            agents,
+            name,
+            budget_mb,
+            with_secrets,
+            identity,
+            author,
+            cmd,
+        } => run_work(agents, name, budget_mb, with_secrets, identity, author, cmd),
         Cmd::Ws { op } => run_ws(op),
-        Cmd::Clone { src, dst, git, filter } => run_clone(src, dst, git, filter),
-        Cmd::Serve { sub, stdio, http, read_only, allow_public, path } => match sub {
+        Cmd::Clone {
+            src,
+            dst,
+            git,
+            filter,
+        } => run_clone(src, dst, git, filter),
+        Cmd::Serve {
+            sub,
+            stdio,
+            http,
+            read_only,
+            allow_public,
+            path,
+        } => match sub {
             Some(ServeSub::Token { op }) => run_serve_token(op),
             None => {
                 let path = path.ok_or_else(|| anyhow::anyhow!("sc serve requires a <path>"))?;
@@ -782,12 +826,31 @@ fn main() -> Result<()> {
         },
         Cmd::Remote { op } => run_remote(op),
         Cmd::Fetch { remote } => run_fetch(&remote),
-        Cmd::Push { remote, include_encrypted } => run_push(&remote, include_encrypted),
-        Cmd::Protect { prefix, to, list, json } => run_protect(prefix, to, list, json),
-        Cmd::Grant { prefix, to, identity } => run_grant(prefix, to, identity),
-        Cmd::Revoke { prefix, recipient_id } => run_revoke(prefix, recipient_id),
+        Cmd::Push {
+            remote,
+            include_encrypted,
+        } => run_push(&remote, include_encrypted),
+        Cmd::Protect {
+            prefix,
+            to,
+            list,
+            json,
+        } => run_protect(prefix, to, list, json),
+        Cmd::Grant {
+            prefix,
+            to,
+            identity,
+        } => run_grant(prefix, to, identity),
+        Cmd::Revoke {
+            prefix,
+            recipient_id,
+        } => run_revoke(prefix, recipient_id),
         Cmd::Gc { prune_expire } => run_gc(&prune_expire),
-        Cmd::Export { to, r#ref, include_encrypted } => run_export(to, r#ref, include_encrypted),
+        Cmd::Export {
+            to,
+            r#ref,
+            include_encrypted,
+        } => run_export(to, r#ref, include_encrypted),
         Cmd::Escrow { op } => run_escrow(op),
         Cmd::Rewrap { identity, dry_run } => run_rewrap(identity, dry_run),
         Cmd::Undo => run_undo(),
@@ -886,7 +949,10 @@ fn run_demo(args: DemoArgs) -> Result<()> {
     println!("session dir: {}", session_root.display());
     println!();
 
-    let repo = Repo::new(Store::new(StoreConfig { budget_bytes, backend }));
+    let repo = Repo::new(Store::new(StoreConfig {
+        budget_bytes,
+        backend,
+    }));
 
     // ---- base snapshot: import a Git repo, or synthesize one in memory. ----
     let base = match &args.repo {
@@ -939,7 +1005,10 @@ fn run_demo(args: DemoArgs) -> Result<()> {
         );
     }
     println!();
-    println!("total edits across agents: {}", edits.load(Ordering::Relaxed));
+    println!(
+        "total edits across agents: {}",
+        edits.load(Ordering::Relaxed)
+    );
     println!("store after agents ran:    {}", fmt_stats(&repo));
 
     // Confirm isolation: each agent produced a distinct snapshot from the base.
@@ -1011,15 +1080,28 @@ fn run_agent(
     };
 
     let snapshot = wt.commit(&format!("agent-{id}"), "agent edits")?;
-    Ok(AgentResult { id, edited: 3, snapshot, checked_out })
+    Ok(AgentResult {
+        id,
+        edited: 3,
+        snapshot,
+        checked_out,
+    })
 }
 
 /// Generate a synthetic in-memory repo with a mix of small files and a few large
 /// blobs, so the memory budget and eviction path get exercised.
 fn synth_repo(repo: &Repo) -> Result<scl_core::ObjectId> {
     let mut files: Vec<(String, Vec<u8>, FileMode)> = Vec::new();
-    files.push(("README.md".into(), b"# synthetic repo\n".to_vec(), FileMode::FILE));
-    files.push(("docs/REMOVE_ME.txt".into(), b"delete me\n".to_vec(), FileMode::FILE));
+    files.push((
+        "README.md".into(),
+        b"# synthetic repo\n".to_vec(),
+        FileMode::FILE,
+    ));
+    files.push((
+        "docs/REMOVE_ME.txt".into(),
+        b"delete me\n".to_vec(),
+        FileMode::FILE,
+    ));
     for i in 0..40 {
         files.push((
             format!("src/module_{i:02}.rs"),
@@ -1114,7 +1196,12 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(&path)
-            .with_context(|| format!("identity already exists at {} (refusing to overwrite)", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "identity already exists at {} (refusing to overwrite)",
+                    path.display()
+                )
+            })?;
         f.write_all(seed_line.as_bytes())?;
     }
     #[cfg(not(unix))]
@@ -1179,8 +1266,8 @@ struct EscrowSection {
 fn load_recipients(
     path: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, scl_crypto::PublicKey>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let parsed: RecipientsFile = toml::from_str(&text)?;
     let mut out = std::collections::BTreeMap::new();
     for (name, key_str) in parsed.recipients {
@@ -1202,7 +1289,9 @@ fn load_recipients(
 fn load_trust_map(path: &std::path::Path) -> Result<std::collections::HashMap<[u8; 32], String>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(std::collections::HashMap::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::HashMap::new())
+        }
         Err(e) => return Err(e.into()),
     };
     let parsed: RecipientsFile = toml::from_str(&text)?;
@@ -1215,8 +1304,9 @@ fn load_trust_map(path: &std::path::Path) -> Result<std::collections::HashMap<[u
                 path.display()
             )
         })?;
-        let pk = scl_crypto::SigPublicKey::from_key_string(key_str)
-            .map_err(|_| anyhow::anyhow!("bad signing public key for '{name}' in {}", path.display()))?;
+        let pk = scl_crypto::SigPublicKey::from_key_string(key_str).map_err(|_| {
+            anyhow::anyhow!("bad signing public key for '{name}' in {}", path.display())
+        })?;
         out.insert(pk.to_bytes(), name);
     }
     Ok(out)
@@ -1231,7 +1321,9 @@ fn load_escrows(path: &std::path::Path) -> Result<Vec<scl_crypto::PublicKey>> {
         Err(e) => return Err(e.into()),
     };
     let parsed: RecipientsFile = toml::from_str(&text)?;
-    let Some(section) = parsed.escrow else { return Ok(Vec::new()) };
+    let Some(section) = parsed.escrow else {
+        return Ok(Vec::new());
+    };
     let mut out: Vec<scl_crypto::PublicKey> = Vec::new();
     for k in section.key.iter().chain(section.keys.iter()) {
         let pk = scl_crypto::PublicKey::from_key_string(k)
@@ -1290,17 +1382,17 @@ fn run_with_secret(
         ));
     }
     let plaintext = scl_crypto::open(&secret, identity)?; // Err if unauthorized
-    // Inject the raw secret bytes verbatim. On unix the value can be non-UTF-8;
-    // pass it as an `OsStr` so a binary secret survives intact rather than being
-    // silently replaced by "".
+                                                          // Inject the raw secret bytes verbatim. On unix the value can be non-UTF-8;
+                                                          // pass it as an `OsStr` so a binary secret survives intact rather than being
+                                                          // silently replaced by "".
     #[cfg(unix)]
     let cmd_env_val = {
         use std::os::unix::ffi::OsStrExt;
         std::ffi::OsStr::from_bytes(&plaintext)
     };
     #[cfg(not(unix))]
-    let cmd_env_val =
-        std::str::from_utf8(&plaintext).map_err(|_| anyhow::anyhow!("secret is not valid UTF-8"))?;
+    let cmd_env_val = std::str::from_utf8(&plaintext)
+        .map_err(|_| anyhow::anyhow!("secret is not valid UTF-8"))?;
     // NOTE: `plaintext` is `Zeroizing` and is wiped when this fn returns. The
     // child's stdout copy below is NOT zeroized; acceptable here because the
     // demo only logs its `.len()`, never the value itself.
@@ -1339,9 +1431,16 @@ fn run_secret_demo(args: SecretDemoArgs) -> Result<()> {
         "init",
     )?;
     let mut setup = repo.fork(base, "setup")?;
-    setup.put_secret(scl_crypto::seal("DB_URL", secret_value, std::slice::from_ref(&alice_pk)))?;
+    setup.put_secret(scl_crypto::seal(
+        "DB_URL",
+        secret_value,
+        std::slice::from_ref(&alice_pk),
+    ))?;
     let snap = setup.commit("setup", "commit DB_URL")?;
-    println!("\ncommitted secret DB_URL (wrapped to alice) in snapshot {}", snap.short());
+    println!(
+        "\ncommitted secret DB_URL (wrapped to alice) in snapshot {}",
+        snap.short()
+    );
 
     // 1) Unauthorized context: mallory cannot decrypt.
     println!("\n--- unauthorized context (mallory) ---");
@@ -1354,14 +1453,27 @@ fn run_secret_demo(args: SecretDemoArgs) -> Result<()> {
         let id = repo.fork(snap, "probe")?.secret_id("DB_URL").unwrap();
         repo.store().lock().unwrap().get_secret(&id)?
     };
-    assert_ne!(stored.ciphertext, secret_value, "stored value must be ciphertext");
-    println!("stored DB_URL is ciphertext ({} bytes), not the plaintext ✔", stored.ciphertext.len());
+    assert_ne!(
+        stored.ciphertext, secret_value,
+        "stored value must be ciphertext"
+    );
+    println!(
+        "stored DB_URL is ciphertext ({} bytes), not the plaintext ✔",
+        stored.ciphertext.len()
+    );
 
     // 2) Authorized context: alice decrypts and injects into a child process.
     println!("\n--- authorized context (alice) ---");
     let got = run_with_secret(&repo, snap, "DB_URL", &alice_sk)?;
-    assert_eq!(got.as_bytes(), secret_value, "alice's child must see the plaintext");
-    println!("alice run -> child process read DB_URL = <{} bytes, matches> ✔", got.len());
+    assert_eq!(
+        got.as_bytes(),
+        secret_value,
+        "alice's child must see the plaintext"
+    );
+    println!(
+        "alice run -> child process read DB_URL = <{} bytes, matches> ✔",
+        got.len()
+    );
 
     // Materialize alice's worktree to disk (under session_root): the file tree
     // is written, but the secret registry is NOT a file and must never appear.
@@ -1382,7 +1494,10 @@ fn run_secret_demo(args: SecretDemoArgs) -> Result<()> {
     // 3) Grant mallory by re-wrapping the DEK (no value rotation).
     println!("\n--- grant mallory (re-wrap DEK) ---");
     let granted = scl_crypto::rewrap_for(&stored, &alice_sk, &mallory_pk)?;
-    assert_eq!(granted.ciphertext, stored.ciphertext, "grant must not rotate the value");
+    assert_eq!(
+        granted.ciphertext, stored.ciphertext,
+        "grant must not rotate the value"
+    );
     let mut regrant = repo.fork(snap, "grant")?;
     regrant.put_secret(granted)?;
     let snap2 = regrant.commit("admin", "grant mallory")?;
@@ -1413,21 +1528,32 @@ fn open_repo() -> Result<scl_repo::Repo> {
 
 fn run_init() -> Result<()> {
     let repo = scl_repo::Repo::init(std::env::current_dir()?)?;
-    println!("initialized empty src-control repo at {}", repo.layout().dot_sc.display());
+    println!(
+        "initialized empty src-control repo at {}",
+        repo.layout().dot_sc.display()
+    );
     Ok(())
 }
 
 /// Sign `snapshot` with `identity` and print the `sc sign`-style
 /// confirmation line. Shared by `sc sign` and the `--sign` flag on
 /// `commit`/`amend` so the two surfaces can't drift in output shape.
-fn sign_and_report(repo: &scl_repo::Repo, snapshot: scl_core::ObjectId, identity: Option<PathBuf>) -> Result<()> {
+fn sign_and_report(
+    repo: &scl_repo::Repo,
+    snapshot: scl_core::ObjectId,
+    identity: Option<PathBuf>,
+) -> Result<()> {
     let identity = load_identity_full(identity)?;
     repo.sign_snapshot(snapshot, &identity)?;
     let signing = identity
         .signing
         .as_ref()
         .expect("sign_snapshot succeeded, so identity carries a signing half");
-    println!("signed {} as {}", snapshot.short(), signing.public().to_key_string());
+    println!(
+        "signed {} as {}",
+        snapshot.short(),
+        signing.public().to_key_string()
+    );
     Ok(())
 }
 
@@ -1452,7 +1578,12 @@ fn run_commit(author: &str, message: &str, sign: bool, identity: Option<PathBuf>
     }
 }
 
-fn run_amend(author: &str, message: Option<String>, sign: bool, identity: Option<PathBuf>) -> Result<()> {
+fn run_amend(
+    author: &str,
+    message: Option<String>,
+    sign: bool,
+    identity: Option<PathBuf>,
+) -> Result<()> {
     let repo = open_repo()?;
     let old = repo.head_tip()?;
     match repo.amend(author, message.as_deref()) {
@@ -1580,7 +1711,12 @@ fn run_status(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_merge(branch: Option<String>, abort: bool, author: &str, identity: Option<PathBuf>) -> Result<()> {
+fn run_merge(
+    branch: Option<String>,
+    abort: bool,
+    author: &str,
+    identity: Option<PathBuf>,
+) -> Result<()> {
     let repo = open_repo()?;
     if abort {
         let skipped = repo.merge_abort()?;
@@ -1635,8 +1771,7 @@ fn run_cherry_pick(
         }
         return Ok(());
     }
-    let refname =
-        refname.ok_or_else(|| anyhow::anyhow!("cherry-pick needs a ref or --abort"))?;
+    let refname = refname.ok_or_else(|| anyhow::anyhow!("cherry-pick needs a ref or --abort"))?;
     // Soft-resolve like `run_merge`: a missing identity file is fine —
     // ciphertext-id fast paths and plain picks need no identity at all.
     let sk = resolve_identity_opt(identity)?;
@@ -1699,11 +1834,23 @@ fn run_rebase(
             println!("fast-forwarded to {}", id.short());
             Ok(())
         }
-        Ok(scl_repo::RebaseResult::Rebased { new_tip, replayed, skipped }) => {
-            println!("rebased: {replayed} replayed, {skipped} skipped, tip {}", new_tip.short());
+        Ok(scl_repo::RebaseResult::Rebased {
+            new_tip,
+            replayed,
+            skipped,
+        }) => {
+            println!(
+                "rebased: {replayed} replayed, {skipped} skipped, tip {}",
+                new_tip.short()
+            );
             Ok(())
         }
-        Ok(scl_repo::RebaseResult::Stopped { conflicted, paths, done, total }) => {
+        Ok(scl_repo::RebaseResult::Stopped {
+            conflicted,
+            paths,
+            done,
+            total,
+        }) => {
             println!(
                 "rebase stopped at {} ({} of {}) with {} conflict(s); resolve these files then `sc rebase --continue`:",
                 conflicted.short(),
@@ -1739,7 +1886,11 @@ fn conflict_kind_label(kind: scl_repo::ConflictKind) -> &'static str {
 /// detail under each in-progress banner.
 fn print_conflict_detail_line(repo: &scl_repo::Repo, path: &str) -> Result<()> {
     let kind = repo.conflict_kind(path)?;
-    let note = if kind == scl_repo::ConflictKind::Protected { " (needs --identity)" } else { "" };
+    let note = if kind == scl_repo::ConflictKind::Protected {
+        " (needs --identity)"
+    } else {
+        ""
+    };
     println!("  {path}  [{}]{}", conflict_kind_label(kind), note);
     Ok(())
 }
@@ -1808,12 +1959,20 @@ fn run_conflicts(path: Option<String>, identity: Option<PathBuf>, json: bool) ->
 /// side without editing markers. Continues past a bad path (reporting it)
 /// rather than aborting the whole batch, and exits 1 if any path failed —
 /// mirroring `run_merge`'s lock-release-before-exit discipline.
-fn run_resolve(ours: bool, theirs: bool, paths: Vec<String>, identity: Option<PathBuf>) -> Result<()> {
+fn run_resolve(
+    ours: bool,
+    theirs: bool,
+    paths: Vec<String>,
+    identity: Option<PathBuf>,
+) -> Result<()> {
     if !ours && !theirs {
         anyhow::bail!("resolve: specify exactly one of --ours or --theirs");
     }
-    let (side, label) =
-        if ours { (scl_repo::ResolveSide::Ours, "ours") } else { (scl_repo::ResolveSide::Theirs, "theirs") };
+    let (side, label) = if ours {
+        (scl_repo::ResolveSide::Ours, "ours")
+    } else {
+        (scl_repo::ResolveSide::Theirs, "theirs")
+    };
     let repo = open_repo()?;
     let sk = resolve_identity_opt(identity)?;
     let mut any_failed = false;
@@ -1868,7 +2027,9 @@ fn render_sig_status_line(status: &scl_repo::SigStatus) -> Option<String> {
 /// --json` embeds per entry.
 fn sig_status_json(status: &scl_repo::SigStatus) -> serde_json::Value {
     match status {
-        scl_repo::SigStatus::Trusted(name) => serde_json::json!({"status": "trusted", "name": name}),
+        scl_repo::SigStatus::Trusted(name) => {
+            serde_json::json!({"status": "trusted", "name": name})
+        }
         scl_repo::SigStatus::Untrusted(signer) => {
             serde_json::json!({"status": "untrusted", "signer": hex::encode(signer)})
         }
@@ -1903,11 +2064,20 @@ fn transcript_markers(
     for (snap, tids) in by_snapshot {
         let mut signed = !tids.is_empty();
         for tid in &tids {
-            if matches!(repo.transcript_sig_status(tid, trust)?, scl_repo::SigStatus::Unsigned) {
+            if matches!(
+                repo.transcript_sig_status(tid, trust)?,
+                scl_repo::SigStatus::Unsigned
+            ) {
                 signed = false;
             }
         }
-        out.insert(snap, TranscriptMarker { count: tids.len(), signed });
+        out.insert(
+            snap,
+            TranscriptMarker {
+                count: tids.len(),
+                signed,
+            },
+        );
     }
     Ok(out)
 }
@@ -1947,9 +2117,9 @@ fn run_log(json: bool) -> Result<()> {
     if json {
         let mut arr = Vec::with_capacity(entries.len());
         for ((id, snap), status) in entries.iter().zip(&statuses) {
-            let transcript = markers.get(id).map(|m| {
-                serde_json::json!({"count": m.count, "signed": m.signed})
-            });
+            let transcript = markers
+                .get(id)
+                .map(|m| serde_json::json!({"count": m.count, "signed": m.signed}));
             arr.push(serde_json::json!({
                 "id": id.to_hex(),
                 "author": snap.author,
@@ -1964,7 +2134,11 @@ fn run_log(json: bool) -> Result<()> {
         return Ok(());
     }
     for ((id, snap), status) in entries.iter().zip(&statuses) {
-        let merge = if snap.parents.len() > 1 { " (merge)" } else { "" };
+        let merge = if snap.parents.len() > 1 {
+            " (merge)"
+        } else {
+            ""
+        };
         print_line(&format!(
             "{} {} {} — {}{}",
             id.short(),
@@ -2013,10 +2187,18 @@ fn run_diff() -> Result<()> {
 /// Resolve the commit/merge author: explicit `--author`, then `$SC_AUTHOR`,
 /// then the OS username, then the historical `"you"` placeholder.
 fn resolve_author(flag: Option<String>) -> String {
-    flag.or_else(|| std::env::var("SC_AUTHOR").ok().filter(|s| !s.trim().is_empty()))
-        .or_else(|| std::env::var("USER").ok().filter(|s| !s.trim().is_empty()))
-        .or_else(|| std::env::var("USERNAME").ok().filter(|s| !s.trim().is_empty()))
-        .unwrap_or_else(|| "you".to_string())
+    flag.or_else(|| {
+        std::env::var("SC_AUTHOR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    })
+    .or_else(|| std::env::var("USER").ok().filter(|s| !s.trim().is_empty()))
+    .or_else(|| {
+        std::env::var("USERNAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    })
+    .unwrap_or_else(|| "you".to_string())
 }
 
 /// Unix seconds → `YYYY-MM-DD HH:MM` UTC, no chrono dependency (civil-from-days
@@ -2034,7 +2216,14 @@ fn fmt_utc(ts: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m, d, secs / 3600, (secs % 3600) / 60)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        y,
+        m,
+        d,
+        secs / 3600,
+        (secs % 3600) / 60
+    )
 }
 
 fn run_branch(name: &str) -> Result<()> {
@@ -2078,7 +2267,10 @@ fn run_sign(refname: &str, identity: Option<PathBuf>) -> Result<()> {
 /// the mainline `Repo::log` follows), deduped. `sc verify` needs this because
 /// a merge's non-mainline side can carry an unsigned or badly-signed commit
 /// that `sc log`'s first-parent walk would never visit.
-fn history_all_parents(repo: &scl_repo::Repo, tip: scl_core::ObjectId) -> Result<Vec<scl_core::ObjectId>> {
+fn history_all_parents(
+    repo: &scl_repo::Repo,
+    tip: scl_core::ObjectId,
+) -> Result<Vec<scl_core::ObjectId>> {
     use std::collections::{BTreeSet, VecDeque};
     let mut seen: BTreeSet<scl_core::ObjectId> = BTreeSet::new();
     let mut queue: VecDeque<scl_core::ObjectId> = VecDeque::new();
@@ -2105,7 +2297,9 @@ fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
     let repo = open_repo()?;
     let tip = match refname {
         Some(r) => resolve_ref_tip(&repo, &r)?,
-        None => repo.head_tip()?.ok_or_else(|| anyhow::anyhow!("HEAD is unborn"))?,
+        None => repo
+            .head_tip()?
+            .ok_or_else(|| anyhow::anyhow!("HEAD is unborn"))?,
     };
     let trust = load_trust_map(&repo.layout().dot_sc.join("recipients.toml"))?;
     let history = history_all_parents(&repo, tip)?;
@@ -2146,7 +2340,9 @@ fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
             .promisor()?
             .map(|p| p.prefixes().join(", "))
             .unwrap_or_default();
-        print_line(&format!("partial: {gaps} object(s) outside filter [{prefixes}]"));
+        print_line(&format!(
+            "partial: {gaps} object(s) outside filter [{prefixes}]"
+        ));
     }
 
     if require && (untrusted + invalid + unsigned) > 0 {
@@ -2165,7 +2361,9 @@ fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
 fn transcript_sig_label(status: &scl_repo::SigStatus) -> String {
     match status {
         scl_repo::SigStatus::Trusted(name) => format!("trusted: {name}"),
-        scl_repo::SigStatus::Untrusted(signer) => format!("untrusted: {}…", hex::encode(&signer[..4])),
+        scl_repo::SigStatus::Untrusted(signer) => {
+            format!("untrusted: {}…", hex::encode(&signer[..4]))
+        }
         scl_repo::SigStatus::Invalid => "INVALID".to_string(),
         scl_repo::SigStatus::Unsigned => "unsigned".to_string(),
     }
@@ -2174,7 +2372,13 @@ fn transcript_sig_label(status: &scl_repo::SigStatus) -> String {
 fn run_transcript(op: TranscriptOp) -> Result<()> {
     let repo = open_repo()?;
     match op {
-        TranscriptOp::Attach { r#ref, file, agent, sign, identity } => {
+        TranscriptOp::Attach {
+            r#ref,
+            file,
+            agent,
+            sign,
+            identity,
+        } => {
             let tip = resolve_ref_tip(&repo, &r#ref)?;
             let recipients_path = repo.layout().dot_sc.join("recipients.toml");
             let recips = transcript_recipients(&recipients_path)?;
@@ -2331,7 +2535,13 @@ fn run_secret(op: SecretOp) -> Result<()> {
                 }
             }
         }
-        SecretOp::Rotate { name, value, value_stdin, to, identity } => {
+        SecretOp::Rotate {
+            name,
+            value,
+            value_stdin,
+            to,
+            identity,
+        } => {
             let value = match (value, value_stdin) {
                 (v @ Some(_), _) => v,
                 (None, true) => Some(read_value_from_stdin()?),
@@ -2357,9 +2567,11 @@ fn run_secret(op: SecretOp) -> Result<()> {
             };
             repo.secret_rotate(&name, new_value, &pks, identity.as_ref())?;
             println!("rotated secret {name} for {} recipient(s)", pks.len());
-            eprintln!("note: rotation cuts off future reads via the current registry; the old \
+            eprintln!(
+                "note: rotation cuts off future reads via the current registry; the old \
                        ciphertext stays in history and anyone holding the old DEK keeps it — \
-                       rotate the underlying credential too");
+                       rotate the underlying credential too"
+            );
         }
     }
     Ok(())
@@ -2378,9 +2590,9 @@ fn run_escrow(op: EscrowOp) -> Result<()> {
             Ok(pk) => Ok(pk),
             Err(_) => {
                 let dir = load_recipients(&path)?;
-                dir.get(s)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("'{s}' is not a public key or a known recipient"))
+                dir.get(s).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("'{s}' is not a public key or a known recipient")
+                })
             }
         }
     };
@@ -2396,7 +2608,11 @@ fn run_escrow(op: EscrowOp) -> Result<()> {
             let mut keys = load_escrows(&path)?;
             keys = append_escrow(keys, &[pk.clone()]);
             write_escrow_keys(&path, keys.clone())?;
-            println!("escrow key added: {} ({} total)", pk.recipient_id(), keys.len());
+            println!(
+                "escrow key added: {} ({} total)",
+                pk.recipient_id(),
+                keys.len()
+            );
         }
         EscrowOp::Remove { id_or_name } => {
             // Try parsing as a recipient id; if that fails, look it up in [recipients].
@@ -2504,7 +2720,10 @@ fn run_work(
             Ok(scl_repo::HarvestResult::Unchanged) => "unchanged".to_string(),
             Ok(scl_repo::HarvestResult::Rejected(report)) => {
                 failed = true;
-                format!("REJECTED by secret scanner ({} finding(s))", report.findings.len())
+                format!(
+                    "REJECTED by secret scanner ({} finding(s))",
+                    report.findings.len()
+                )
             }
             Err(e) => {
                 failed = true;
@@ -2526,7 +2745,11 @@ fn run_work(
 fn run_ws(op: WsOp) -> Result<()> {
     let repo = open_repo()?;
     match op {
-        WsOp::Fork { agents, identity, author } => {
+        WsOp::Fork {
+            agents,
+            identity,
+            author,
+        } => {
             let sk = resolve_identity_opt(identity)?;
             let session = repo.ws_fork(agents, &resolve_author(author), sk.as_ref())?;
             println!(
@@ -2554,7 +2777,12 @@ fn run_ws(op: WsOp) -> Result<()> {
                 }
             }
         },
-        WsOp::Run { index, with_secrets, identity, cmd } => {
+        WsOp::Run {
+            index,
+            with_secrets,
+            identity,
+            cmd,
+        } => {
             // Resolve identity: --with-secrets requires it (hard error);
             // otherwise it's optional and only decrypts protected paths.
             let sk = if with_secrets {
@@ -2575,9 +2803,16 @@ fn run_ws(op: WsOp) -> Result<()> {
                 None => println!("abandoned the session ({remaining} workspace(s) remain)"),
             }
         }
-        WsOp::Harvest { into, identity, author, transcript, sign } => {
+        WsOp::Harvest {
+            into,
+            identity,
+            author,
+            transcript,
+            sign,
+        } => {
             let sk = resolve_identity_opt(identity.clone())?;
-            let outcomes = repo.ws_harvest(into.as_deref(), &resolve_author(author), sk.as_ref())?;
+            let outcomes =
+                repo.ws_harvest(into.as_deref(), &resolve_author(author), sk.as_ref())?;
 
             // ws_harvest has already moved the landing refs by this point —
             // print the per-workspace landing status FIRST, unconditionally,
@@ -2706,7 +2941,10 @@ fn read_value_from_stdin() -> Result<String> {
     eprintln!("reading secret value from stdin…");
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
-    let value = buf.strip_suffix('\n').map(|s| s.strip_suffix('\r').unwrap_or(s)).unwrap_or(&buf);
+    let value = buf
+        .strip_suffix('\n')
+        .map(|s| s.strip_suffix('\r').unwrap_or(s))
+        .unwrap_or(&buf);
     if value.is_empty() {
         anyhow::bail!("empty secret value on stdin; pass --value or pipe a non-empty value");
     }
@@ -2756,7 +2994,11 @@ fn resolve_names(
 ) -> Result<Vec<scl_crypto::PublicKey>> {
     names
         .iter()
-        .map(|n| dir.get(n).cloned().ok_or_else(|| anyhow::anyhow!("unknown recipient: {n}")))
+        .map(|n| {
+            dir.get(n)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown recipient: {n}"))
+        })
         .collect()
 }
 
@@ -2770,7 +3012,10 @@ fn resolve_ids_to_pubkeys(
     let mut out = Vec::with_capacity(ids.len());
     let mut unresolved = Vec::new();
     for id in ids {
-        match pool.iter().find(|pk| pk.recipient_id().as_str() == id.as_str()) {
+        match pool
+            .iter()
+            .find(|pk| pk.recipient_id().as_str() == id.as_str())
+        {
             Some(pk) => out.push(pk.clone()),
             None => unresolved.push(id.as_str().to_string()),
         }
@@ -2789,8 +3034,7 @@ fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>) -> Resul
     // those can never be sc-native, so no flag is needed. Bare `ssh://` is
     // ambiguous — it means an sc-native remote (ADR-0022) unless `--git`
     // forces the mirror-bridge path (ADR-0028; user-adjudicated).
-    let git_shaped =
-        scl_gitio::bridge::is_network_git_url(&src) && !src.starts_with("ssh://");
+    let git_shaped = scl_gitio::bridge::is_network_git_url(&src) && !src.starts_with("ssh://");
     if git || git_shaped {
         if !filter.is_empty() {
             anyhow::bail!("partial clone is not supported over git remotes");
@@ -2825,7 +3069,9 @@ fn run_backfill(prefixes: Vec<String>, all: bool) -> Result<()> {
             anyhow::bail!("--all fetches every remaining object; pass either --all or explicit prefixes, not both");
         }
         repo.backfill_all()?;
-        println!("backfilled every remaining object; this is now a full clone (.sc/promisor removed)");
+        println!(
+            "backfilled every remaining object; this is now a full clone (.sc/promisor removed)"
+        );
         return Ok(());
     }
     repo.backfill(&prefixes)?;
@@ -2963,7 +3209,12 @@ fn git_remote_effective_path(
     if !scl_gitio::bridge::is_network_git_url(url) {
         return Ok(std::path::PathBuf::from(url));
     }
-    let mirror_dir = repo.layout().dot_sc.join("git-remotes").join(remote).join("mirror.git");
+    let mirror_dir = repo
+        .layout()
+        .dot_sc
+        .join("git-remotes")
+        .join(remote)
+        .join("mirror.git");
     let mirror = scl_gitio::bridge::ensure_mirror(&mirror_dir, url)?;
     if sync_from_network {
         scl_gitio::bridge::mirror_fetch(&mirror)?;
@@ -3039,7 +3290,10 @@ fn run_fetch(remote: &str) -> Result<()> {
 fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
     use std::collections::HashMap;
     let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
-    let url = cfg.url(remote).ok_or_else(|| anyhow::anyhow!("no such remote: {remote}"))?.to_string();
+    let url = cfg
+        .url(remote)
+        .ok_or_else(|| anyhow::anyhow!("no such remote: {remote}"))?
+        .to_string();
     let branch = scl_repo::refs::current_branch(repo.layout())?;
     let path = git_remote_effective_path(repo, remote, &url, true)?;
 
@@ -3047,7 +3301,9 @@ fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
     let marks = scl_repo::MarksStore::open(repo.layout(), remote)?;
     let mut known: HashMap<String, scl_core::ObjectId> = HashMap::new();
     for (g, s) in marks.load()? {
-        let id = s.parse().map_err(|_| anyhow::anyhow!("bad sc id in marks: {s}"))?;
+        let id = s
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad sc id in marks: {s}"))?;
         known.insert(g, id);
     }
 
@@ -3058,14 +3314,19 @@ fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
     };
 
     // Persist new marks first, then the reachability root (the tracking ref) last.
-    let new: Vec<(String, String)> =
-        report.new_marks.iter().map(|(g, s)| (g.clone(), s.to_hex().to_string())).collect();
+    let new: Vec<(String, String)> = report
+        .new_marks
+        .iter()
+        .map(|(g, s)| (g.clone(), s.to_hex().to_string()))
+        .collect();
     marks.append(&new)?;
     scl_repo::refs::write_remote_tip(repo.layout(), remote, &branch, &report.tip)?;
 
     println!(
         "fetched {remote} (git): {}/{branch} -> {} ({} new commit(s))",
-        remote, report.tip.short(), report.new_marks.len()
+        remote,
+        report.tip.short(),
+        report.new_marks.len()
     );
     Ok(())
 }
@@ -3094,10 +3355,15 @@ fn run_push(remote: &str, include_encrypted: bool) -> Result<()> {
 fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) -> Result<()> {
     use std::collections::HashMap;
     let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
-    let url = cfg.url(remote).ok_or_else(|| anyhow::anyhow!("no such remote: {remote}"))?.to_string();
+    let url = cfg
+        .url(remote)
+        .ok_or_else(|| anyhow::anyhow!("no such remote: {remote}"))?
+        .to_string();
     let branch = scl_repo::refs::current_branch(repo.layout())?;
     let ref_name = format!("refs/heads/{branch}");
-    let local_tip = repo.head_tip()?.ok_or_else(|| anyhow::anyhow!("branch is unborn — nothing to push"))?;
+    let local_tip = repo
+        .head_tip()?
+        .ok_or_else(|| anyhow::anyhow!("branch is unborn — nothing to push"))?;
     let path = git_remote_effective_path(repo, remote, &url, false)?;
 
     // Load marks both directions.
@@ -3106,7 +3372,9 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
     let mut git_to_sc: HashMap<String, scl_core::ObjectId> = HashMap::new();
     let mut known_sc_to_git: HashMap<scl_core::ObjectId, String> = HashMap::new();
     for (g, s) in &pairs {
-        let id: scl_core::ObjectId = s.parse().map_err(|_| anyhow::anyhow!("bad sc id in marks: {s}"))?;
+        let id: scl_core::ObjectId = s
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad sc id in marks: {s}"))?;
         git_to_sc.insert(g.clone(), id);
         known_sc_to_git.insert(id, g.clone());
     }
@@ -3157,8 +3425,11 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
         };
         scl_gitio::export_branch(&mut store, local_tip, &opts)?
     };
-    let new: Vec<(String, String)> =
-        report.new_marks.iter().map(|(g, s)| (g.clone(), s.to_hex().to_string())).collect();
+    let new: Vec<(String, String)> = report
+        .new_marks
+        .iter()
+        .map(|(g, s)| (g.clone(), s.to_hex().to_string()))
+        .collect();
     marks.append(&new)?;
 
     // Ordering: export + marks precede the network push (mirroring the
@@ -3273,14 +3544,10 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
     // regardless.
     let boundary_prefix = prefix.trim_end_matches('/');
     let boundary_dir_prefix = format!("{boundary_prefix}/");
-    if let Some(path) = repo
-        .worktree_paths()?
-        .into_iter()
-        .find(|path| {
-            (path == boundary_prefix || path.starts_with(&boundary_dir_prefix))
-                && looks_like_low_entropy_secret(path.rsplit('/').next().unwrap_or(path))
-        })
-    {
+    if let Some(path) = repo.worktree_paths()?.into_iter().find(|path| {
+        (path == boundary_prefix || path.starts_with(&boundary_dir_prefix))
+            && looks_like_low_entropy_secret(path.rsplit('/').next().unwrap_or(path))
+    }) {
         eprintln!("warning: {path} looks like a low-entropy secret; convergent encryption (sc protect) is equality-confirmable — prefer 'sc secret' for API keys / .env / credentials (see ADR-0014).");
     }
 
@@ -3290,7 +3557,11 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
     let escrows = load_escrows(&recipients_path)?;
     pks = append_escrow(pks, &escrows);
     let id = repo.protect(&prefix, &pks, None)?;
-    println!("protected {prefix} for {} recipient(s): {}", pks.len(), id.short());
+    println!(
+        "protected {prefix} for {} recipient(s): {}",
+        pks.len(),
+        id.short()
+    );
     Ok(())
 }
 
@@ -3342,8 +3613,14 @@ fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) ->
 
     let store_arc = repo.vfs().store();
     let mut store = store_arc.lock().unwrap();
-    let known: std::collections::HashMap<scl_core::ObjectId, String> = std::collections::HashMap::new();
-    let opts = scl_gitio::ExportOptions { to: &to, ref_name: &ref_name, include_encrypted, known_git_commits: &known };
+    let known: std::collections::HashMap<scl_core::ObjectId, String> =
+        std::collections::HashMap::new();
+    let opts = scl_gitio::ExportOptions {
+        to: &to,
+        ref_name: &ref_name,
+        include_encrypted,
+        known_git_commits: &known,
+    };
     let report = scl_gitio::export_branch(&mut store, tip, &opts)?;
 
     println!(
@@ -3391,8 +3668,12 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
         Some('d') => (&s[..s.len() - 1], 86400),
         _ => anyhow::bail!("duration needs a unit suffix s/m/h/d, got {s:?}"),
     };
-    let n: u64 = num.parse().map_err(|_| anyhow::anyhow!("bad duration number: {s:?}"))?;
-    let secs = n.checked_mul(mult).ok_or_else(|| anyhow::anyhow!("duration too large: {s:?}"))?;
+    let n: u64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad duration number: {s:?}"))?;
+    let secs = n
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("duration too large: {s:?}"))?;
     Ok(std::time::Duration::from_secs(secs))
 }
 
@@ -3464,10 +3745,16 @@ mod tests {
 
     #[test]
     fn parses_suffixed_durations() {
-        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(24 * 3600));
+        assert_eq!(
+            parse_duration("24h").unwrap(),
+            Duration::from_secs(24 * 3600)
+        );
         assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
         assert_eq!(parse_duration("45s").unwrap(), Duration::from_secs(45));
-        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(7 * 86400));
+        assert_eq!(
+            parse_duration("7d").unwrap(),
+            Duration::from_secs(7 * 86400)
+        );
         assert!(parse_duration("nope").is_err());
         assert!(parse_duration("7").is_err());
     }
@@ -3488,10 +3775,16 @@ mod tests {
             "SERVER.PEM",
             "AWS_CREDENTIALS",
         ] {
-            assert!(looks_like_low_entropy_secret(basename), "expected match: {basename}");
+            assert!(
+                looks_like_low_entropy_secret(basename),
+                "expected match: {basename}"
+            );
         }
         for basename in ["main.rs", "README.md", "util.rs"] {
-            assert!(!looks_like_low_entropy_secret(basename), "expected no match: {basename}");
+            assert!(
+                !looks_like_low_entropy_secret(basename),
+                "expected no match: {basename}"
+            );
         }
     }
 
@@ -3547,7 +3840,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("recipients.toml");
         let (_sk, pk) = scl_crypto::generate_keypair();
-        std::fs::write(&path, format!("[escrow]\nkey = \"{}\"\n", pk.to_key_string())).unwrap();
+        std::fs::write(
+            &path,
+            format!("[escrow]\nkey = \"{}\"\n", pk.to_key_string()),
+        )
+        .unwrap();
         let keys = load_escrows(&path).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].recipient_id(), pk.recipient_id());
@@ -3563,7 +3860,11 @@ mod tests {
         let (_s2, p2) = scl_crypto::generate_keypair();
         std::fs::write(
             &path,
-            format!("[escrow]\nkeys = [\"{}\", \"{}\"]\n", p1.to_key_string(), p2.to_key_string()),
+            format!(
+                "[escrow]\nkeys = [\"{}\", \"{}\"]\n",
+                p1.to_key_string(),
+                p2.to_key_string()
+            ),
         )
         .unwrap();
         let keys = load_escrows(&path).unwrap();
@@ -3634,7 +3935,8 @@ mod tests {
         let hub = root.join("hub.git");
         std::process::Command::new("git")
             .args(["init", "--bare", "-b", "main", hub.to_str().unwrap()])
-            .status().unwrap();
+            .status()
+            .unwrap();
         let url = format!("file://{}", hub.display());
 
         // sc repo with one commit.
@@ -3648,9 +3950,14 @@ mod tests {
         // Push through the mirror, then verify the HUB (not the mirror) has it.
         run_push_git(&repo, "origin", false).unwrap();
         let out = std::process::Command::new("git")
-            .current_dir(&hub).args(["log", "--oneline"]).output().unwrap();
-        assert!(String::from_utf8_lossy(&out.stdout).contains("first"),
-            "commit must be visible on the hub via git log");
+            .current_dir(&hub)
+            .args(["log", "--oneline"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("first"),
+            "commit must be visible on the hub via git log"
+        );
 
         // Fetch back through the mirror (round trip sanity).
         run_fetch_git(&repo, "origin").unwrap();
@@ -3667,14 +3974,16 @@ mod tests {
     #[test]
     fn network_push_failure_is_retryable() {
         let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let root = std::env::temp_dir().join(format!("scl-cli-netgit-retry-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("scl-cli-netgit-retry-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
         let hub = root.join("hub.git");
         std::process::Command::new("git")
             .args(["init", "--bare", "-b", "main", hub.to_str().unwrap()])
-            .status().unwrap();
+            .status()
+            .unwrap();
         let url = format!("file://{}", hub.display());
 
         let work = root.join("repo");
@@ -3702,13 +4011,21 @@ mod tests {
         std::env::set_var("SC_GIT", shim.to_str().unwrap());
         let err = run_push_git(&repo, "origin", false);
         std::env::remove_var("SC_GIT");
-        assert!(err.is_err(), "first push must fail when the network leg fails");
+        assert!(
+            err.is_err(),
+            "first push must fail when the network leg fails"
+        );
 
         // The hub must NOT have the commit yet.
         let out = std::process::Command::new("git")
-            .current_dir(&hub).args(["log", "--oneline"]).output().unwrap();
-        assert!(!String::from_utf8_lossy(&out.stdout).contains("first"),
-            "hub must not have the commit after a failed network push");
+            .current_dir(&hub)
+            .args(["log", "--oneline"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("first"),
+            "hub must not have the commit after a failed network push"
+        );
 
         // Retry with the real git — must succeed and land the commit on the
         // hub, proving the ff-gate didn't strand it behind "already up to
@@ -3716,9 +4033,14 @@ mod tests {
         // export_branch call.
         run_push_git(&repo, "origin", false).unwrap();
         let out = std::process::Command::new("git")
-            .current_dir(&hub).args(["log", "--oneline"]).output().unwrap();
-        assert!(String::from_utf8_lossy(&out.stdout).contains("first"),
-            "retry must land the commit on the hub");
+            .current_dir(&hub)
+            .args(["log", "--oneline"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("first"),
+            "retry must land the commit on the hub"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -3733,24 +4055,59 @@ mod tests {
         // Hub with default branch "trunk" and one seeded commit.
         let hub = root.join("hub.git");
         std::process::Command::new("git")
-            .args(["init", "--bare", "-b", "trunk", hub.to_str().unwrap()]).status().unwrap();
+            .args(["init", "--bare", "-b", "trunk", hub.to_str().unwrap()])
+            .status()
+            .unwrap();
         let seed = root.join("seed");
-        std::process::Command::new("git").args(["init", "-b", "trunk", seed.to_str().unwrap()]).status().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-b", "trunk", seed.to_str().unwrap()])
+            .status()
+            .unwrap();
         std::fs::write(seed.join("a.txt"), "x").unwrap();
-        for args in [vec!["add", "."], vec!["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "seed"]] {
-            std::process::Command::new("git").current_dir(&seed).args(&args).status().unwrap();
+        for args in [
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "seed",
+            ],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(&seed)
+                .args(&args)
+                .status()
+                .unwrap();
         }
-        std::process::Command::new("git").current_dir(&seed)
-            .args(["push", &format!("file://{}", hub.display()), "trunk"]).status().unwrap();
+        std::process::Command::new("git")
+            .current_dir(&seed)
+            .args(["push", &format!("file://{}", hub.display()), "trunk"])
+            .status()
+            .unwrap();
 
         // Route through run_clone WITHOUT --git: file:// is an unambiguous
         // git URL form, so auto-detect must pick the mirror-bridge path.
         let dst = root.join("cloned");
-        run_clone(format!("file://{}", hub.display()), dst.clone(), false, Vec::new()).unwrap();
+        run_clone(
+            format!("file://{}", hub.display()),
+            dst.clone(),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
         let repo = scl_repo::Repo::open(&dst).unwrap();
-        assert_eq!(scl_repo::refs::current_branch(repo.layout()).unwrap(), "trunk",
-            "local branch must adopt the remote default name");
-        assert!(dst.join("a.txt").exists(), "working tree must be materialized");
+        assert_eq!(
+            scl_repo::refs::current_branch(repo.layout()).unwrap(),
+            "trunk",
+            "local branch must adopt the remote default name"
+        );
+        assert!(
+            dst.join("a.txt").exists(),
+            "working tree must be materialized"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -3789,15 +4146,23 @@ mod tests {
     fn clone_git_flag_with_local_path_errors_clearly() {
         // Env mutation (git init) — serialize with the shared git-env lock.
         let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let root = std::env::temp_dir().join(format!("scl-cli-gitflag-local-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("scl-cli-gitflag-local-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
         // Create a local bare git repo (plain path, no file:// URL scheme).
         let local_git_repo = root.join("local.git");
         std::process::Command::new("git")
-            .args(["init", "--bare", "-b", "main", local_git_repo.to_str().unwrap()])
-            .status().unwrap();
+            .args([
+                "init",
+                "--bare",
+                "-b",
+                "main",
+                local_git_repo.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
 
         // Calling run_clone_git directly with a local path must bail with
         // a clear error message mentioning "git URL", not misroute into
@@ -3825,21 +4190,44 @@ mod tests {
         let unsigned = scl_repo::SigStatus::Unsigned;
 
         let t = render_sig_status_line(&trusted).unwrap();
-        assert!(t.contains("alice") && t.contains('\u{2713}'), "trusted line: {t}");
+        assert!(
+            t.contains("alice") && t.contains('\u{2713}'),
+            "trusted line: {t}"
+        );
 
         let u = render_sig_status_line(&untrusted).unwrap();
-        assert!(u.contains("abababab") && u.contains('?'), "untrusted line shows an 8-hex prefix: {u}");
-        assert!(!u.contains('\u{2713}'), "untrusted must not carry the trusted check mark: {u}");
+        assert!(
+            u.contains("abababab") && u.contains('?'),
+            "untrusted line shows an 8-hex prefix: {u}"
+        );
+        assert!(
+            !u.contains('\u{2713}'),
+            "untrusted must not carry the trusted check mark: {u}"
+        );
 
         let i = render_sig_status_line(&invalid).unwrap();
-        assert!(i.contains("INVALID") && i.contains('\u{2717}'), "invalid line: {i}");
+        assert!(
+            i.contains("INVALID") && i.contains('\u{2717}'),
+            "invalid line: {i}"
+        );
 
-        assert!(render_sig_status_line(&unsigned).is_none(), "unsigned must render no line at all");
+        assert!(
+            render_sig_status_line(&unsigned).is_none(),
+            "unsigned must render no line at all"
+        );
 
         // The four states are pairwise distinct as rendered text.
-        let rendered: Vec<String> =
-            [&trusted, &untrusted, &invalid].iter().map(|s| render_sig_status_line(s).unwrap()).collect();
-        assert_eq!(rendered.len(), rendered.iter().collect::<std::collections::HashSet<_>>().len());
+        let rendered: Vec<String> = [&trusted, &untrusted, &invalid]
+            .iter()
+            .map(|s| render_sig_status_line(s).unwrap())
+            .collect();
+        assert_eq!(
+            rendered.len(),
+            rendered
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
 
         assert_eq!(sig_status_json(&trusted)["status"], "trusted");
         assert_eq!(sig_status_json(&trusted)["name"], "alice");
@@ -3861,7 +4249,11 @@ mod tests {
         let alice_sig = alice.signing.as_ref().unwrap().public();
 
         // [signing] with no [signers] section → nobody trusted yet.
-        std::fs::write(&path, format!("[signing]\nalice = \"{}\"\n", alice_sig.to_key_string())).unwrap();
+        std::fs::write(
+            &path,
+            format!("[signing]\nalice = \"{}\"\n", alice_sig.to_key_string()),
+        )
+        .unwrap();
         assert!(load_trust_map(&path).unwrap().is_empty());
 
         // Listing alice as trusted resolves her key.
@@ -3881,7 +4273,10 @@ mod tests {
         std::fs::write(&path, "[signers]\ntrusted = [\"bob\"]\n").unwrap();
         let err = load_trust_map(&path).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("bob") && msg.contains("signing"), "error names the fix: {msg}");
+        assert!(
+            msg.contains("bob") && msg.contains("signing"),
+            "error names the fix: {msg}"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

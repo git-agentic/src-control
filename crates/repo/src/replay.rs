@@ -113,12 +113,9 @@ fn split_for_encryption(
             to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, recipients));
         } else if f.perms & scl_core::PROTECTED == 0 {
             match protect::matching_prefix(union_prot, &f.path) {
-                Some(rule) => to_encrypt.push((
-                    f.path.clone(),
-                    f.bytes.clone(),
-                    f.mode,
-                    rule.granted_keys(),
-                )),
+                Some(rule) => {
+                    to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, rule.granted_keys()))
+                }
                 None => carried.push((f.path.clone(), f.bytes.clone(), f.mode, 0)),
             }
         } else {
@@ -216,7 +213,10 @@ pub(crate) fn replay_commit(
     // snapshot's rule set. `union_prot` exists only to drive
     // `matching_prefix` lookups — its `wrapped` map is irrelevant here.
     let union_prefixes = protect::merge_prefixes(&onto_prot.prefixes, &theirs_prot.prefixes);
-    let union_prot = Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
+    let union_prot = Protection {
+        prefixes: union_prefixes.clone(),
+        wrapped: Default::default(),
+    };
 
     let (mut all, to_encrypt) = split_for_encryption(&fm.files, &union_prot)?;
     let (encrypted, fresh_wrapped) = protect::encrypt_protected(to_encrypt)?;
@@ -264,7 +264,10 @@ pub(crate) fn replay_commit(
 
     Ok(ReplayOutcome::Clean {
         root,
-        protection: Protection { prefixes: union_prefixes, wrapped },
+        protection: Protection {
+            prefixes: union_prefixes,
+            wrapped,
+        },
     })
 }
 
@@ -360,7 +363,9 @@ impl Repo {
                         "--mainline only applies to merge commits".into(),
                     ));
                 }
-                let idx = usize::try_from(n).ok().filter(|&i| i >= 1 && i <= picked_snap.parents.len());
+                let idx = usize::try_from(n)
+                    .ok()
+                    .filter(|&i| i >= 1 && i <= picked_snap.parents.len());
                 let idx = idx.ok_or_else(|| {
                     Error::InvalidArgument(format!(
                         "--mainline {n} is out of range (commit has {} parents)",
@@ -407,8 +412,10 @@ impl Repo {
                     Ok(PickResult::AlreadyApplied)
                 } else {
                     let msg_first_line = picked_snap.message.lines().next().unwrap_or("");
-                    let message =
-                        format!("{msg_first_line} (cherry-picked from {})", picked_tip.short());
+                    let message = format!(
+                        "{msg_first_line} (cherry-picked from {})",
+                        picked_tip.short()
+                    );
                     // Same crash discipline as the Clean path below: CAS
                     // write, then the ref move (atomic commit point), then
                     // the oplog record. No materialize needed — the tree is
@@ -434,7 +441,10 @@ impl Repo {
             }
             ReplayOutcome::Clean { root, protection } => {
                 let msg_first_line = picked_snap.message.lines().next().unwrap_or("");
-                let message = format!("{msg_first_line} (cherry-picked from {})", picked_tip.short());
+                let message = format!(
+                    "{msg_first_line} (cherry-picked from {})",
+                    picked_tip.short()
+                );
                 // Ordering matters for crash safety (same discipline as
                 // `Repo::merge`'s ff and three-way paths): build the snapshot
                 // (CAS-only, no visible state), materialize the working tree,
@@ -481,7 +491,11 @@ impl Repo {
                 )?;
                 Ok(PickResult::Picked(id))
             }
-            ReplayOutcome::Conflicts { files, sidecars, paths } => {
+            ReplayOutcome::Conflicts {
+                files,
+                sidecars,
+                paths,
+            } => {
                 // Conflicted pick (P15 Task 7) — same worktree-direct-write
                 // restructure as `Repo::merge_with_identity`'s conflict path
                 // (Task 6). The working set holds plaintext `needs_encrypt`
@@ -514,8 +528,10 @@ impl Repo {
                     let entry = wrapped.entry(*id).or_default();
                     *entry = crate::protect::union_wraps(entry, wks);
                 }
-                let conflict_prot =
-                    scl_core::Protection { prefixes: union_prefixes, wrapped };
+                let conflict_prot = scl_core::Protection {
+                    prefixes: union_prefixes,
+                    wrapped,
+                };
                 let conflict_root = self.materialize_conflict_state(
                     &carried,
                     &to_encrypt,
@@ -731,14 +747,26 @@ impl Repo {
                     ));
                 }
                 range.push(cur);
-                cur = snap.parents.first().copied().ok_or(Error::NoCommonAncestor)?;
+                cur = snap
+                    .parents
+                    .first()
+                    .copied()
+                    .ok_or(Error::NoCommonAncestor)?;
             }
         }
         range.reverse();
         let total = range.len();
 
         self.rebase_fold_and_finish(
-            head, ours_tip, target, target_tip, range, total, author, identity, (0, 0),
+            head,
+            ours_tip,
+            target,
+            target_tip,
+            range,
+            total,
+            author,
+            identity,
+            (0, 0),
         )
     }
 
@@ -780,7 +808,11 @@ impl Repo {
     ) -> Result<RebaseResult> {
         let original_root = self.snapshot(&original_tip)?.root;
         let acc_snap = self.snapshot(&acc_tip)?;
-        let disk_root = if range.len() == total { original_root } else { acc_snap.root };
+        let disk_root = if range.len() == total {
+            original_root
+        } else {
+            acc_snap.root
+        };
 
         let mut acc_tip = acc_tip;
         let mut acc_root = acc_snap.root;
@@ -820,9 +852,10 @@ impl Repo {
                     Error::ProtectedMergeNeedsIdentity(path) => Error::ProtectedMergeNeedsIdentity(
                         format!("{path} (replaying commit {})", commit.short()),
                     ),
-                    Error::NotAuthorized(path) => {
-                        Error::NotAuthorized(format!("{path} (replaying commit {})", commit.short()))
-                    }
+                    Error::NotAuthorized(path) => Error::NotAuthorized(format!(
+                        "{path} (replaying commit {})",
+                        commit.short()
+                    )),
                     other => other,
                 })?;
             match outcome {
@@ -869,7 +902,11 @@ impl Repo {
                     acc_secrets = merged_secrets;
                     replayed += 1;
                 }
-                ReplayOutcome::Conflicts { files, sidecars, paths } => {
+                ReplayOutcome::Conflicts {
+                    files,
+                    sidecars,
+                    paths,
+                } => {
                     // Stop, don't abort (P19/ADR-0029): persist the fold's
                     // progress and put P4 markers in the working tree. The
                     // branch ref does NOT move — the atomic commit point
@@ -893,7 +930,10 @@ impl Repo {
                         let entry = wrapped.entry(*id).or_default();
                         *entry = crate::protect::union_wraps(entry, wks);
                     }
-                    let conflict_prot = scl_core::Protection { prefixes: union_prefixes, wrapped };
+                    let conflict_prot = scl_core::Protection {
+                        prefixes: union_prefixes,
+                        wrapped,
+                    };
                     let conflict_root = self.materialize_conflict_state(
                         &carried,
                         &to_encrypt,
@@ -904,7 +944,9 @@ impl Repo {
                         &paths,
                     )?;
                     let remaining_after_current: Vec<ObjectId> = remaining.into_iter().collect();
-                    let done = total.saturating_sub(remaining_after_current.len()).saturating_sub(1);
+                    let done = total
+                        .saturating_sub(remaining_after_current.len())
+                        .saturating_sub(1);
                     // Decided root, then conflicts, then REBASE_STATE last —
                     // REBASE_STATE is the in_progress signal (mirrors
                     // pick_state/merge_state crash discipline: a crash
@@ -927,7 +969,12 @@ impl Repo {
                             skipped,
                         },
                     )?;
-                    return Ok(RebaseResult::Stopped { conflicted: commit, paths, done, total });
+                    return Ok(RebaseResult::Stopped {
+                        conflicted: commit,
+                        paths,
+                        done,
+                        total,
+                    });
                 }
             }
         }
@@ -982,7 +1029,11 @@ impl Repo {
         // state — documented here rather than closed, matching this
         // function's existing crash-discipline comments elsewhere.
         crate::rebase_state::clear(&self.layout)?;
-        Ok(RebaseResult::Rebased { new_tip: acc_tip, replayed, skipped })
+        Ok(RebaseResult::Rebased {
+            new_tip: acc_tip,
+            replayed,
+            skipped,
+        })
     }
 
     /// Resume a rebase [`rebase`][Repo::rebase] stopped on conflict: complete
@@ -1126,7 +1177,9 @@ impl Repo {
     /// mirrors [`crate::repo::Repo::merge_abort`]'s contract exactly.
     pub fn rebase_abort(&self) -> Result<Vec<String>> {
         let Some(st) = crate::rebase_state::read(&self.layout)? else {
-            return Err(Error::InvalidArgument("no rebase in progress — nothing to abort".into()));
+            return Err(Error::InvalidArgument(
+                "no rebase in progress — nothing to abort".into(),
+            ));
         };
         for path in crate::rebase_state::read_conflicts(&self.layout)? {
             let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
@@ -1168,13 +1221,22 @@ pub enum RebaseResult {
     /// Current tip was an ancestor of target — ref fast-forwarded.
     FastForwarded(ObjectId),
     /// Commits replayed; branch now points at the last new snapshot.
-    Rebased { new_tip: ObjectId, replayed: usize, skipped: usize },
+    Rebased {
+        new_tip: ObjectId,
+        replayed: usize,
+        skipped: usize,
+    },
     /// The fold stopped on a conflicting commit (P19, new default): its
     /// progress is persisted and P4-style markers are on disk, but the
     /// branch ref has NOT moved. Resolve the markers then
     /// `sc rebase --continue`, or `sc rebase --abort`. `done`/`total` are
     /// "k of n" over the ORIGINAL replay range (not just this fold segment).
-    Stopped { conflicted: ObjectId, paths: Vec<String>, done: usize, total: usize },
+    Stopped {
+        conflicted: ObjectId,
+        paths: Vec<String>,
+        done: usize,
+        total: usize,
+    },
 }
 
 #[cfg(test)]
@@ -1245,10 +1307,18 @@ mod tests {
         assert_eq!(repo.head_tip().unwrap(), Some(main_tip));
 
         let onto_snap = repo.snapshot(&main_tip).unwrap();
-        let outcome =
-            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None, None).unwrap();
+        let outcome = replay_commit(
+            &repo,
+            b_tip,
+            (onto_snap.root, &onto_snap.protection),
+            None,
+            None,
+        )
+        .unwrap();
         match outcome {
-            ReplayOutcome::Clean { root: merged_root, .. } => {
+            ReplayOutcome::Clean {
+                root: merged_root, ..
+            } => {
                 let store_arc = repo.vfs().store();
                 let mut store = store_arc.lock().unwrap();
                 let ids = tree_file_ids(&mut store, merged_root).unwrap();
@@ -1280,8 +1350,14 @@ mod tests {
         repo.switch("main").unwrap();
 
         let onto_snap = repo.snapshot(&main_tip).unwrap();
-        let outcome =
-            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None, None).unwrap();
+        let outcome = replay_commit(
+            &repo,
+            b_tip,
+            (onto_snap.root, &onto_snap.protection),
+            None,
+            None,
+        )
+        .unwrap();
         match outcome {
             ReplayOutcome::Conflicts { files, paths, .. } => {
                 assert_eq!(paths, vec!["x.txt".to_string()]);
@@ -1311,8 +1387,14 @@ mod tests {
         let main_tip = repo.commit("me", "main makes same edit").unwrap();
 
         let onto_snap = repo.snapshot(&main_tip).unwrap();
-        let outcome =
-            replay_commit(&repo, b_tip, (onto_snap.root, &onto_snap.protection), None, None).unwrap();
+        let outcome = replay_commit(
+            &repo,
+            b_tip,
+            (onto_snap.root, &onto_snap.protection),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(matches!(outcome, ReplayOutcome::Empty));
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -1364,11 +1446,18 @@ mod tests {
             drop(store_b);
 
             let onto_snap = repo_b.snapshot(&b_tip).unwrap();
-            let outcome =
-                replay_commit(&repo_b, copied_commit, (onto_snap.root, &onto_snap.protection), None, None)
-                    .unwrap();
+            let outcome = replay_commit(
+                &repo_b,
+                copied_commit,
+                (onto_snap.root, &onto_snap.protection),
+                None,
+                None,
+            )
+            .unwrap();
             match outcome {
-                ReplayOutcome::Clean { root: merged_root, .. } => {
+                ReplayOutcome::Clean {
+                    root: merged_root, ..
+                } => {
                     let mut store_b = store_b_arc.lock().unwrap();
                     let ids = tree_file_ids(&mut store_b, merged_root).unwrap();
                     assert!(ids.contains_key("new.txt"));
@@ -1400,9 +1489,18 @@ mod tests {
         assert!(repo.snapshot(&merged).unwrap().parents.len() >= 2);
 
         let onto_snap = repo.snapshot(&main_tip).unwrap();
-        let err = replay_commit(&repo, merged, (onto_snap.root, &onto_snap.protection), None, None)
-            .unwrap_err();
-        assert!(matches!(err, Error::CannotReplayMerge(id, _) if id == merged), "got {err:?}");
+        let err = replay_commit(
+            &repo,
+            merged,
+            (onto_snap.root, &onto_snap.protection),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::CannotReplayMerge(id, _) if id == merged),
+            "got {err:?}"
+        );
         let _ = base;
 
         drop(repo);
@@ -1433,7 +1531,8 @@ mod tests {
         let snap = repo.snapshot(&id).unwrap();
         assert_eq!(snap.parents, vec![old_main_tip]);
         assert!(
-            snap.message.ends_with(&format!("(cherry-picked from {})", picked.short())),
+            snap.message
+                .ends_with(&format!("(cherry-picked from {})", picked.short())),
             "got message: {}",
             snap.message
         );
@@ -1465,7 +1564,11 @@ mod tests {
 
         let err = repo.cherry_pick("work-1", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
-        assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "main tip must not move");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(main_tip),
+            "main tip must not move"
+        );
         assert_eq!(repo.pick_head().unwrap(), Some(picked));
         let on_disk = std::fs::read_to_string(root.join("x.txt")).unwrap();
         assert!(on_disk.contains("<<<<<<<"), "got: {on_disk}");
@@ -1533,8 +1636,16 @@ mod tests {
             None,
             "PICK_DECIDED_ROOT cleared"
         );
-        assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "branch tip unchanged");
-        assert_eq!(std::fs::read(root.join("x.txt")).unwrap(), before_x, "x.txt byte-identical");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(main_tip),
+            "branch tip unchanged"
+        );
+        assert_eq!(
+            std::fs::read(root.join("x.txt")).unwrap(),
+            before_x,
+            "x.txt byte-identical"
+        );
         assert_eq!(
             std::fs::read(root.join("stable.txt")).unwrap(),
             before_stable,
@@ -1544,7 +1655,11 @@ mod tests {
             !root.join("new.txt").exists(),
             "abort must drop the pick-materialized theirs-only file"
         );
-        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no oplog record from abort");
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before,
+            "no oplog record from abort"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -1605,7 +1720,10 @@ mod tests {
         repo.switch("target1").unwrap();
         let outcome = repo.cherry_pick("a-side", "me", None, Some(1)).unwrap();
         assert!(matches!(outcome, PickResult::Picked(_)), "got {outcome:?}");
-        assert!(root.join("b.txt").exists(), "mainline 1 lands b-side's addition");
+        assert!(
+            root.join("b.txt").exists(),
+            "mainline 1 lands b-side's addition"
+        );
         assert!(root.join("a.txt").exists());
 
         // --mainline 2: base = parents[1] (b-side) → the delta is a-side's
@@ -1613,9 +1731,15 @@ mod tests {
         // b.txt), nothing new lands — already applied.
         repo.switch("target2").unwrap();
         let outcome = repo.cherry_pick("a-side", "me", None, Some(2)).unwrap();
-        assert!(matches!(outcome, PickResult::AlreadyApplied), "got {outcome:?}");
+        assert!(
+            matches!(outcome, PickResult::AlreadyApplied),
+            "got {outcome:?}"
+        );
         assert!(root.join("a.txt").exists());
-        assert!(!root.join("b.txt").exists(), "mainline 2 excludes b-side's addition");
+        assert!(
+            !root.join("b.txt").exists(),
+            "mainline 2 excludes b-side's addition"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -1718,13 +1842,20 @@ mod tests {
         let (_sk, pk) = scl_crypto::generate_keypair();
         repo.secret_add("SECRET_X", b"v1", &[pk]).unwrap();
         let b_tip = repo.head_tip().unwrap().unwrap();
-        assert!(repo.snapshot(&b_tip).unwrap().secrets.contains_key("SECRET_X"));
+        assert!(repo
+            .snapshot(&b_tip)
+            .unwrap()
+            .secrets
+            .contains_key("SECRET_X"));
 
         repo.switch("a-side").unwrap();
         let m = repo.merge("b-side", "me").unwrap();
         let m_snap = repo.snapshot(&m).unwrap();
         assert_eq!(m_snap.parents, vec![a_tip, b_tip]);
-        assert!(m_snap.secrets.contains_key("SECRET_X"), "merge carries the secret forward");
+        assert!(
+            m_snap.secrets.contains_key("SECRET_X"),
+            "merge carries the secret forward"
+        );
 
         // --mainline 2: base = b_tip, which ALREADY has SECRET_X — the
         // delta relative to it is empty, so picking onto a target that
@@ -1733,7 +1864,11 @@ mod tests {
         repo.cherry_pick("a-side", "me", None, Some(2)).unwrap();
         let tip2 = repo.head_tip().unwrap().unwrap();
         assert!(
-            !repo.snapshot(&tip2).unwrap().secrets.contains_key("SECRET_X"),
+            !repo
+                .snapshot(&tip2)
+                .unwrap()
+                .secrets
+                .contains_key("SECRET_X"),
             "mainline 2's base (b_tip) already has SECRET_X, so no delta should land it"
         );
 
@@ -1743,7 +1878,10 @@ mod tests {
         repo.cherry_pick("a-side", "me", None, Some(1)).unwrap();
         let tip1 = repo.head_tip().unwrap().unwrap();
         assert!(
-            repo.snapshot(&tip1).unwrap().secrets.contains_key("SECRET_X"),
+            repo.snapshot(&tip1)
+                .unwrap()
+                .secrets
+                .contains_key("SECRET_X"),
             "mainline 1's base (a_tip) lacks SECRET_X, so the delta adds it"
         );
 
@@ -1786,7 +1924,8 @@ mod tests {
         // (b_tip -> M, "x\n" -> "a-edit\n") conflicts with it.
         repo.switch("target-m2").unwrap();
         std::fs::write(root.join("x.txt"), b"target-edit\n").unwrap();
-        repo.commit("me", "target independently edits x.txt").unwrap();
+        repo.commit("me", "target independently edits x.txt")
+            .unwrap();
 
         repo.switch("b-side").unwrap();
         std::fs::write(root.join("b.txt"), b"b\n").unwrap();
@@ -1794,13 +1933,20 @@ mod tests {
         let (_sk, pk) = scl_crypto::generate_keypair();
         repo.secret_add("SECRET_X", b"v1", &[pk]).unwrap();
         let b_tip = repo.head_tip().unwrap().unwrap();
-        assert!(repo.snapshot(&b_tip).unwrap().secrets.contains_key("SECRET_X"));
+        assert!(repo
+            .snapshot(&b_tip)
+            .unwrap()
+            .secrets
+            .contains_key("SECRET_X"));
 
         repo.switch("a-side").unwrap();
         let m = repo.merge("b-side", "me").unwrap();
         let m_snap = repo.snapshot(&m).unwrap();
         assert_eq!(m_snap.parents, vec![a_tip, b_tip]);
-        assert!(m_snap.secrets.contains_key("SECRET_X"), "merge carries the secret forward");
+        assert!(
+            m_snap.secrets.contains_key("SECRET_X"),
+            "merge carries the secret forward"
+        );
 
         // --mainline 2 onto target-m2: conflicts on x.txt (forced above).
         repo.switch("target-m2").unwrap();
@@ -1843,9 +1989,16 @@ mod tests {
         let ops_before = repo.oplog().unwrap().len();
 
         let outcome = repo.cherry_pick("work-1", "me", None, None).unwrap();
-        assert!(matches!(outcome, PickResult::AlreadyApplied), "got {outcome:?}");
+        assert!(
+            matches!(outcome, PickResult::AlreadyApplied),
+            "got {outcome:?}"
+        );
         assert_eq!(repo.head_tip().unwrap(), Some(merged), "tip must not move");
-        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no new oplog record");
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before,
+            "no new oplog record"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -1883,7 +2036,9 @@ mod tests {
         crate::pick_state::clear(&repo.layout).unwrap();
 
         // Unknown ref.
-        let err = repo.cherry_pick("no-such-branch", "me", None, None).unwrap_err();
+        let err = repo
+            .cherry_pick("no-such-branch", "me", None, None)
+            .unwrap_err();
         assert!(matches!(err, Error::NoSuchBranch(_)), "got {err:?}");
 
         drop(repo);
@@ -1909,7 +2064,11 @@ mod tests {
         crate::merge_state::write(&repo.layout, &ours_tip, &[], None).unwrap();
         let err = repo.cherry_pick("work-1", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
-        assert_eq!(repo.head_tip().unwrap(), Some(ours_tip), "tip must not move");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(ours_tip),
+            "tip must not move"
+        );
 
         crate::merge_state::clear(&repo.layout).unwrap();
         drop(repo);
@@ -2004,11 +2163,20 @@ mod tests {
             matches!(err, Error::ProtectedMergeNeedsIdentity(ref p) if p == "secret/a.txt"),
             "got {err:?}"
         );
-        assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "tip must not move");
-        assert!(!repo.pick_in_progress(), "no pick state on the identity refusal");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(main_tip),
+            "tip must not move"
+        );
+        assert!(
+            !repo.pick_in_progress(),
+            "no pick state on the identity refusal"
+        );
 
         // With identity: clean pick, merged content re-encrypted.
-        let outcome = repo.cherry_pick("work", "me", Some(&alice_sk), None).unwrap();
+        let outcome = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap();
         let id = match outcome {
             PickResult::Picked(id) => id,
             other => panic!("expected Picked, got {other:?}"),
@@ -2018,7 +2186,10 @@ mod tests {
         let (blob_id, perms) = tree_entry(&repo, &id, "secret/a.txt");
         assert_ne!(perms & scl_core::PROTECTED, 0, "PROTECTED preserved");
         let bytes = blob_bytes_of(&repo, &blob_id);
-        assert!(!bytes.windows(4).any(|w| w == b"OURS"), "plaintext leaked into the CAS blob");
+        assert!(
+            !bytes.windows(4).any(|w| w == b"OURS"),
+            "plaintext leaked into the CAS blob"
+        );
         for (who, sk) in [("alice", &alice_sk), ("bob", &bob_sk)] {
             let pt = crate::protect::decrypt_with(
                 &bytes,
@@ -2028,7 +2199,11 @@ mod tests {
                 "secret/a.txt",
             )
             .unwrap();
-            assert_eq!(&pt[..], b"OURS\nl2\nTHEIRS\n", "{who} must decrypt the merged content");
+            assert_eq!(
+                &pt[..],
+                b"OURS\nl2\nTHEIRS\n",
+                "{who} must decrypt the merged content"
+            );
         }
         // The identity-holder gets the merged plaintext on disk.
         assert_eq!(
@@ -2064,23 +2239,36 @@ mod tests {
         let picked = repo.commit("me", "work edits line 1").unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
-        let err = repo.cherry_pick("work", "me", Some(&alice_sk), None).unwrap_err();
+        let err = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
         assert_eq!(repo.head_tip().unwrap(), Some(ours), "tip must not move");
         assert_eq!(repo.pick_head().unwrap(), Some(picked));
         assert!(
-            crate::pick_state::read_decided_root(&repo.layout).unwrap().is_some(),
+            crate::pick_state::read_decided_root(&repo.layout)
+                .unwrap()
+                .is_some(),
             "conflict path records the pick's decided carried tree"
         );
 
         // Markers are on disk as editable plaintext...
         let marked = std::fs::read(root.join("secret/a.txt")).unwrap();
-        assert!(marked.windows(7).any(|w| w == b"<<<<<<<"), "markers on disk");
+        assert!(
+            marked.windows(7).any(|w| w == b"<<<<<<<"),
+            "markers on disk"
+        );
         assert!(marked.windows(9).any(|w| w == b"OURS-EDIT"));
         assert!(marked.windows(11).any(|w| w == b"THEIRS-EDIT"));
         // ...and NO CAS object contains the marker plaintext.
-        assert!(!cas_blob_contains(&repo, b"<<<<<<<"), "marker plaintext leaked into the CAS");
-        assert!(!cas_blob_contains(&repo, b"OURS-EDIT"), "protected plaintext leaked into the CAS");
+        assert!(
+            !cas_blob_contains(&repo, b"<<<<<<<"),
+            "marker plaintext leaked into the CAS"
+        );
+        assert!(
+            !cas_blob_contains(&repo, b"OURS-EDIT"),
+            "protected plaintext leaked into the CAS"
+        );
 
         // Resolve and complete via commit: re-encryption happens there.
         std::fs::write(root.join("secret/a.txt"), b"RESOLVED\nl2\nl3\n").unwrap();
@@ -2095,9 +2283,16 @@ mod tests {
         assert_eq!(snap.parents, vec![ours], "pick completion is single-parent");
 
         let (blob_id, perms) = tree_entry(&repo, &id, "secret/a.txt");
-        assert_ne!(perms & scl_core::PROTECTED, 0, "PROTECTED preserved through completion");
+        assert_ne!(
+            perms & scl_core::PROTECTED,
+            0,
+            "PROTECTED preserved through completion"
+        );
         let bytes = blob_bytes_of(&repo, &blob_id);
-        assert!(!bytes.windows(8).any(|w| w == b"RESOLVED"), "resolved plaintext in CAS blob");
+        assert!(
+            !bytes.windows(8).any(|w| w == b"RESOLVED"),
+            "resolved plaintext in CAS blob"
+        );
         for (who, sk) in [("alice", &alice_sk), ("bob", &bob_sk)] {
             let pt = crate::protect::decrypt_with(
                 &bytes,
@@ -2107,7 +2302,11 @@ mod tests {
                 "secret/a.txt",
             )
             .unwrap();
-            assert_eq!(&pt[..], b"RESOLVED\nl2\nl3\n", "{who} must decrypt the resolution");
+            assert_eq!(
+                &pt[..],
+                b"RESOLVED\nl2\nl3\n",
+                "{who} must decrypt the resolution"
+            );
         }
         // Still no marker/plaintext residue anywhere in the CAS after completion.
         assert!(!cas_blob_contains(&repo, b"<<<<<<<"));
@@ -2144,7 +2343,9 @@ mod tests {
         repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
         std::fs::write(root.join("secret/x.txt"), b"v1").unwrap();
         std::fs::write(root.join("shared.txt"), b"a\nY\nc\n").unwrap();
-        let picked = repo.commit("me", "work updates secret + edits shared").unwrap();
+        let picked = repo
+            .commit("me", "work updates secret + edits shared")
+            .unwrap();
         let (v1_id, _) = tree_entry(&repo, &picked, "secret/x.txt");
 
         // KEYLESS hop back to main (secret/x.txt leaves the disk).
@@ -2154,7 +2355,10 @@ mod tests {
         // cannot materialize without a key; shared.txt conflicts.
         let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
-        assert!(!root.join("secret/x.txt").exists(), "keyless: v1 stays off disk");
+        assert!(
+            !root.join("secret/x.txt").exists(),
+            "keyless: v1 stays off disk"
+        );
 
         std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
         let id = repo.commit("me", "resolve").unwrap();
@@ -2184,7 +2388,11 @@ mod tests {
             "secret/x.txt",
         )
         .unwrap();
-        assert_eq!(&pt[..], b"v1", "the carried blob decrypts to the picked update");
+        assert_eq!(
+            &pt[..],
+            b"v1",
+            "the carried blob decrypts to the picked update"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -2216,7 +2424,9 @@ mod tests {
         repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
         std::fs::write(root.join("secret/x.txt"), b"v1").unwrap();
         std::fs::write(root.join("shared.txt"), b"a\nY\nc\n").unwrap();
-        let picked = repo.commit("me", "work updates secret + edits shared").unwrap();
+        let picked = repo
+            .commit("me", "work updates secret + edits shared")
+            .unwrap();
         let (v1_id, _) = tree_entry(&repo, &picked, "secret/x.txt");
 
         repo.switch("main").unwrap();
@@ -2230,7 +2440,10 @@ mod tests {
             format!("{}\n", ours_root.to_hex()),
         )
         .unwrap();
-        assert!(!crate::merge_state::in_progress(&repo.layout), "no MERGE_HEAD");
+        assert!(
+            !crate::merge_state::in_progress(&repo.layout),
+            "no MERGE_HEAD"
+        );
 
         // Keyless conflicted pick, resolve, complete.
         let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
@@ -2245,7 +2458,10 @@ mod tests {
             "the PICK's decided v1 must win — stale merge residue hijacked the completion"
         );
         // The completing commit's merge_state::clear also swept the residue.
-        assert_eq!(crate::merge_state::read_decided_root(&repo.layout).unwrap(), None);
+        assert_eq!(
+            crate::merge_state::read_decided_root(&repo.layout).unwrap(),
+            None
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -2275,7 +2491,9 @@ mod tests {
         repo.protect("keys/", &[alice_pk], None).unwrap();
         std::fs::create_dir_all(root.join("keys")).unwrap();
         std::fs::write(root.join("keys/k2.txt"), b"k2 contents\n").unwrap();
-        let picked = repo.commit("me", "work adds protected keys/k2.txt").unwrap();
+        let picked = repo
+            .commit("me", "work adds protected keys/k2.txt")
+            .unwrap();
         let (k2_id, _) = tree_entry(&repo, &picked, "keys/k2.txt");
 
         repo.switch("main").unwrap();
@@ -2296,9 +2514,17 @@ mod tests {
         // Ours' formerly-plain k1 is now PROTECTED ciphertext under the union
         // rule, freshly wrapped for the rule's recipients...
         let (k1_id, k1_perms) = tree_entry(&repo, &id, "keys/k1.txt");
-        assert_ne!(k1_perms & scl_core::PROTECTED, 0, "I2: plain file under union rule encrypts");
+        assert_ne!(
+            k1_perms & scl_core::PROTECTED,
+            0,
+            "I2: plain file under union rule encrypts"
+        );
         let k1_bytes = blob_bytes_of(&repo, &k1_id);
-        assert_ne!(&k1_bytes[..], b"k1 contents\n", "no plaintext in the CAS tree");
+        assert_ne!(
+            &k1_bytes[..],
+            b"k1 contents\n",
+            "no plaintext in the CAS tree"
+        );
         let pt = crate::protect::decrypt_with(
             &k1_bytes,
             &k1_id,
@@ -2310,7 +2536,10 @@ mod tests {
         assert_eq!(&pt[..], b"k1 contents\n");
         // ...and the keyless materialize removed the now-protected plaintext
         // from disk (confidentiality: no key, no plaintext).
-        assert!(!root.join("keys/k1.txt").exists(), "keyless: protected file leaves the disk");
+        assert!(
+            !root.join("keys/k1.txt").exists(),
+            "keyless: protected file leaves the disk"
+        );
 
         // The picked side's k2 ciphertext is carried verbatim with its wraps.
         let (got_k2, k2_perms) = tree_entry(&repo, &id, "keys/k2.txt");
@@ -2353,7 +2582,11 @@ mod tests {
 
         let outcome = repo.rebase("main", "me", None).unwrap();
         let (new_tip, replayed, skipped) = match outcome {
-            RebaseResult::Rebased { new_tip, replayed, skipped } => (new_tip, replayed, skipped),
+            RebaseResult::Rebased {
+                new_tip,
+                replayed,
+                skipped,
+            } => (new_tip, replayed, skipped),
             other => panic!("expected Rebased, got {other:?}"),
         };
         assert_eq!(replayed, 2);
@@ -2403,7 +2636,11 @@ mod tests {
         // Target is now an ancestor of current: AlreadyUpToDate.
         let outcome = repo.rebase("feature", "me", None).unwrap();
         assert_eq!(outcome, RebaseResult::AlreadyUpToDate);
-        assert_eq!(repo.head_tip().unwrap(), Some(feature_tip), "tip must not move");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(feature_tip),
+            "tip must not move"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -2433,14 +2670,15 @@ mod tests {
 
         // Snapshot the entire .sc/refs dir (path -> bytes) before rebasing.
         let refs_dir = root.join(".sc/refs");
-        let snapshot_refs = |dir: &std::path::Path| -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-            let mut out = std::collections::BTreeMap::new();
-            for entry in walkdir(dir) {
-                let bytes = std::fs::read(&entry).unwrap();
-                out.insert(entry, bytes);
-            }
-            out
-        };
+        let snapshot_refs =
+            |dir: &std::path::Path| -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+                let mut out = std::collections::BTreeMap::new();
+                for entry in walkdir(dir) {
+                    let bytes = std::fs::read(&entry).unwrap();
+                    out.insert(entry, bytes);
+                }
+                out
+            };
         fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             let mut out = Vec::new();
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -2462,7 +2700,9 @@ mod tests {
 
         let outcome = repo.rebase("main", "me", None).unwrap();
         match outcome {
-            RebaseResult::Stopped { paths, done, total, .. } => {
+            RebaseResult::Stopped {
+                paths, done, total, ..
+            } => {
                 assert_eq!(paths, vec!["x.txt".to_string()]);
                 assert_eq!((done, total), (0, 1));
             }
@@ -2471,10 +2711,20 @@ mod tests {
         assert!(repo.rebase_in_progress());
 
         let after_refs = snapshot_refs(&refs_dir);
-        assert_eq!(before_refs, after_refs, "refs dir must be byte-identical while stopped");
+        assert_eq!(
+            before_refs, after_refs,
+            "refs dir must be byte-identical while stopped"
+        );
         let after_x = std::fs::read(root.join("x.txt")).unwrap();
-        assert!(after_x.windows(7).any(|w| w == b"<<<<<<<"), "P4 markers must be on disk: {after_x:?}");
-        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no oplog record while stopped");
+        assert!(
+            after_x.windows(7).any(|w| w == b"<<<<<<<"),
+            "P4 markers must be on disk: {after_x:?}"
+        );
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before,
+            "no oplog record while stopped"
+        );
 
         repo.rebase_abort().unwrap();
         drop(repo);
@@ -2500,13 +2750,16 @@ mod tests {
 
         repo.switch("main").unwrap();
         std::fs::write(root.join("a.txt"), b"a\n").unwrap();
-        repo.commit("me", "main makes same edit as feature's A").unwrap();
+        repo.commit("me", "main makes same edit as feature's A")
+            .unwrap();
 
         // Rebase feature onto main.
         repo.switch("feature").unwrap();
         let outcome = repo.rebase("main", "me", None).unwrap();
         match outcome {
-            RebaseResult::Rebased { replayed, skipped, .. } => {
+            RebaseResult::Rebased {
+                replayed, skipped, ..
+            } => {
                 assert_eq!(replayed, 1, "only 'adds b' should replay");
                 assert_eq!(skipped, 1, "'adds a' is already present -> skipped");
             }
@@ -2543,8 +2796,16 @@ mod tests {
 
         let outcome = repo.rebase("main", "me", None).unwrap();
         let new_tip = match outcome {
-            RebaseResult::Rebased { new_tip, replayed, skipped } => {
-                assert_eq!((replayed, skipped), (2, 0), "secrets-only commit replays, not skips");
+            RebaseResult::Rebased {
+                new_tip,
+                replayed,
+                skipped,
+            } => {
+                assert_eq!(
+                    (replayed, skipped),
+                    (2, 0),
+                    "secrets-only commit replays, not skips"
+                );
                 new_tip
             }
             other => panic!("expected Rebased, got {other:?}"),
@@ -2561,7 +2822,10 @@ mod tests {
         // ...as a registry-only snapshot: its tree equals its parent's (the
         // replayed file commit), which in turn holds main's + feature's files.
         let parent_snap = repo.snapshot(&tip_snap.parents[0]).unwrap();
-        assert_eq!(tip_snap.root, parent_snap.root, "registry-only snapshot keeps the tree");
+        assert_eq!(
+            tip_snap.root, parent_snap.root,
+            "registry-only snapshot keeps the tree"
+        );
         assert!(!parent_snap.secrets.contains_key("API_KEY"));
         assert!(root.join("main.txt").exists());
         assert!(root.join("f.txt").exists());
@@ -2597,9 +2861,19 @@ mod tests {
         assert_eq!(repo.head_tip().unwrap(), Some(id));
 
         let snap = repo.snapshot(&id).unwrap();
-        assert_eq!(snap.parents, vec![main_tip], "single-parent pick completion");
-        assert!(snap.secrets.contains_key("API_KEY"), "tip registry gains the secret");
-        assert_eq!(snap.root, main_root, "tree unchanged by a secrets-only pick");
+        assert_eq!(
+            snap.parents,
+            vec![main_tip],
+            "single-parent pick completion"
+        );
+        assert!(
+            snap.secrets.contains_key("API_KEY"),
+            "tip registry gains the secret"
+        );
+        assert_eq!(
+            snap.root, main_root,
+            "tree unchanged by a secrets-only pick"
+        );
         assert_eq!(repo.secret_list().unwrap().len(), 1);
         let ops = repo.oplog().unwrap();
         assert_eq!(ops.last().unwrap().desc, "cherry-pick work");
@@ -2656,14 +2930,22 @@ mod tests {
         repo.switch("main").unwrap();
         let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
-        assert_eq!(repo.head_tip().unwrap(), Some(main_tip), "tip must not move");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(main_tip),
+            "tip must not move"
+        );
 
         // Resolve + complete: the picked registry delta survives.
         std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
         let id = repo.commit("me", "resolve pick conflict").unwrap();
         assert!(!repo.pick_in_progress());
         let snap = repo.snapshot(&id).unwrap();
-        assert_eq!(snap.parents, vec![main_tip], "pick completion is single-parent");
+        assert_eq!(
+            snap.parents,
+            vec![main_tip],
+            "pick completion is single-parent"
+        );
         assert!(
             snap.secrets.contains_key("PICKED_SECRET"),
             "completion registry must carry the picked commit's registry delta"
@@ -2688,10 +2970,12 @@ mod tests {
         repo.branch("feature").unwrap();
 
         // main rotates TOKEN one way...
-        repo.secret_rotate("TOKEN", Some(b"main-v"), &[pk.clone()], None).unwrap();
+        repo.secret_rotate("TOKEN", Some(b"main-v"), &[pk.clone()], None)
+            .unwrap();
         // ...feature rotates it differently.
         repo.switch("feature").unwrap();
-        repo.secret_rotate("TOKEN", Some(b"feat-v"), &[pk], None).unwrap();
+        repo.secret_rotate("TOKEN", Some(b"feat-v"), &[pk], None)
+            .unwrap();
         let feature_tip = repo.head_tip().unwrap();
 
         let before_refs = snapshot_dir(&root.join(".sc/refs"));
@@ -2708,8 +2992,16 @@ mod tests {
             snapshot_dir(&root.join(".sc/refs")),
             "refs dir must be byte-identical after the aborted rebase"
         );
-        assert_eq!(repo.head_tip().unwrap(), feature_tip, "feature tip must not move");
-        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no new oplog record");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            feature_tip,
+            "feature tip must not move"
+        );
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before,
+            "no new oplog record"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -2745,8 +3037,16 @@ mod tests {
 
         let outcome = repo.rebase("main", "me", None).unwrap();
         let new_tip = match outcome {
-            RebaseResult::Rebased { new_tip, replayed, skipped } => {
-                assert_eq!((replayed, skipped), (1, 0), "rules-only commit replays, not skips");
+            RebaseResult::Rebased {
+                new_tip,
+                replayed,
+                skipped,
+            } => {
+                assert_eq!(
+                    (replayed, skipped),
+                    (1, 0),
+                    "rules-only commit replays, not skips"
+                );
                 new_tip
             }
             other => panic!("expected Rebased, got {other:?}"),
@@ -2758,7 +3058,10 @@ mod tests {
         );
         // Tree-empty replay: same tree as the target tip it replayed onto.
         let main_tip_snap = repo.snapshot(&snap.parents[0]).unwrap();
-        assert_eq!(snap.root, main_tip_snap.root, "rules-only replay keeps the tree");
+        assert_eq!(
+            snap.root, main_tip_snap.root,
+            "rules-only replay keeps the tree"
+        );
 
         // A file later committed under the rule lands PROTECTED and decrypts
         // for the rule's recipient.
@@ -2766,7 +3069,11 @@ mod tests {
         std::fs::write(root.join("keys/k.txt"), b"k contents\n").unwrap();
         let c = repo.commit("me", "add keys/k.txt").unwrap();
         let (k_id, perms) = tree_entry(&repo, &c, "keys/k.txt");
-        assert_ne!(perms & scl_core::PROTECTED, 0, "file under the replayed rule is PROTECTED");
+        assert_ne!(
+            perms & scl_core::PROTECTED,
+            0,
+            "file under the replayed rule is PROTECTED"
+        );
         let bytes = blob_bytes_of(&repo, &k_id);
         assert_ne!(&bytes[..], b"k contents\n", "no plaintext in the CAS");
         let c_snap = repo.snapshot(&c).unwrap();
@@ -2825,7 +3132,11 @@ mod tests {
         std::fs::write(root.join("keys/k.txt"), b"k contents\n").unwrap();
         let c = repo.commit("me", "add keys/k.txt").unwrap();
         let (_k_id, perms) = tree_entry(&repo, &c, "keys/k.txt");
-        assert_ne!(perms & scl_core::PROTECTED, 0, "file under the picked rule is PROTECTED");
+        assert_ne!(
+            perms & scl_core::PROTECTED,
+            0,
+            "file under the picked rule is PROTECTED"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -2863,13 +3174,20 @@ mod tests {
         assert_eq!(repo.head_tip().unwrap(), feature_tip_before);
 
         let err = repo.rebase("main", "me", None).unwrap_err();
-        assert!(matches!(err, Error::CannotReplayMerge(id, _) if id == merged), "got {err:?}");
+        assert!(
+            matches!(err, Error::CannotReplayMerge(id, _) if id == merged),
+            "got {err:?}"
+        );
         // Rebase-side contextualization (P19 review fix): no `--mainline`
         // hint (rebase has no such flag), and the message names rebase.
         let msg = err.to_string();
         assert!(!msg.contains("--mainline"), "got: {msg}");
         assert!(msg.contains("rebase"), "got: {msg}");
-        assert_eq!(repo.head_tip().unwrap(), feature_tip_before, "feature tip must not move");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            feature_tip_before,
+            "feature tip must not move"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -2915,7 +3233,8 @@ mod tests {
 
         // feature updates the protected file (identity only to materialize it
         // for editing — the rebase itself runs keyless).
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/db.txt"), b"v2").unwrap();
         let feature_tip = repo.commit("me", "feature updates secret").unwrap();
         let (v2_id, _) = tree_entry(&repo, &feature_tip, "secret/db.txt");
@@ -2923,7 +3242,11 @@ mod tests {
         // KEYLESS rebase of feature onto main.
         let outcome = repo.rebase("main", "me", None).unwrap();
         let new_tip = match outcome {
-            RebaseResult::Rebased { new_tip, replayed, skipped } => {
+            RebaseResult::Rebased {
+                new_tip,
+                replayed,
+                skipped,
+            } => {
                 assert_eq!((replayed, skipped), (1, 0));
                 new_tip
             }
@@ -2951,7 +3274,10 @@ mod tests {
         // Keyless final materialize: main's file arrives, the protected file
         // leaves the disk (no key, no plaintext — never ciphertext).
         assert!(root.join("main.txt").exists());
-        assert!(!root.join("secret/db.txt").exists(), "keyless: protected file leaves the disk");
+        assert!(
+            !root.join("secret/db.txt").exists(),
+            "keyless: protected file leaves the disk"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -2977,7 +3303,8 @@ mod tests {
         repo.commit("me", "main edits line 1").unwrap();
 
         // feature edits line 3 (mergeable content divergence).
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
         let feature_tip = repo.commit("me", "feature edits line 3").unwrap();
 
@@ -2988,7 +3315,10 @@ mod tests {
         let err = repo.rebase("main", "me", None).unwrap_err();
         match err {
             Error::ProtectedMergeNeedsIdentity(ref msg) => {
-                assert!(msg.contains("secret/a.txt"), "error must name the path: {msg}");
+                assert!(
+                    msg.contains("secret/a.txt"),
+                    "error must name the path: {msg}"
+                );
                 assert!(
                     msg.contains(&feature_tip.short()),
                     "error must name the replayed commit: {msg}"
@@ -3002,9 +3332,17 @@ mod tests {
             snapshot_dir(&root.join(".sc/refs")),
             "refs dir must be byte-identical after the aborted rebase"
         );
-        assert_eq!(repo.head_tip().unwrap(), Some(feature_tip), "feature tip must not move");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(feature_tip),
+            "feature tip must not move"
+        );
         assert_eq!(std::fs::read(root.join("secret/a.txt")).unwrap(), before_a);
-        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no new oplog record");
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before,
+            "no new oplog record"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -3028,13 +3366,18 @@ mod tests {
         std::fs::write(root.join("secret/a.txt"), b"OURS\nl2\nl3\n").unwrap();
         let main_tip = repo.commit("me", "main edits line 1").unwrap();
 
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
         repo.commit("me", "feature edits line 3").unwrap();
 
         let outcome = repo.rebase("main", "me", Some(&alice_sk)).unwrap();
         let new_tip = match outcome {
-            RebaseResult::Rebased { new_tip, replayed, skipped } => {
+            RebaseResult::Rebased {
+                new_tip,
+                replayed,
+                skipped,
+            } => {
                 assert_eq!((replayed, skipped), (1, 0));
                 new_tip
             }
@@ -3044,9 +3387,16 @@ mod tests {
         assert_eq!(snap.parents, vec![main_tip]);
 
         let (blob_id, perms) = tree_entry(&repo, &new_tip, "secret/a.txt");
-        assert_ne!(perms & scl_core::PROTECTED, 0, "PROTECTED preserved at the new tip");
+        assert_ne!(
+            perms & scl_core::PROTECTED,
+            0,
+            "PROTECTED preserved at the new tip"
+        );
         let bytes = blob_bytes_of(&repo, &blob_id);
-        assert!(!bytes.windows(4).any(|w| w == b"OURS"), "plaintext leaked into the CAS blob");
+        assert!(
+            !bytes.windows(4).any(|w| w == b"OURS"),
+            "plaintext leaked into the CAS blob"
+        );
         for (who, sk) in [("alice", &alice_sk), ("bob", &bob_sk)] {
             let pt = crate::protect::decrypt_with(
                 &bytes,
@@ -3056,7 +3406,11 @@ mod tests {
                 "secret/a.txt",
             )
             .unwrap();
-            assert_eq!(&pt[..], b"OURS\nl2\nTHEIRS\n", "{who} must decrypt the merged content");
+            assert_eq!(
+                &pt[..],
+                b"OURS\nl2\nTHEIRS\n",
+                "{who} must decrypt the merged content"
+            );
         }
         // The identity-holder gets the merged plaintext on disk.
         assert_eq!(
@@ -3093,14 +3447,19 @@ mod tests {
         repo.switch("feature").unwrap();
         std::fs::create_dir_all(root.join("keys")).unwrap();
         std::fs::write(root.join("keys/k1.txt"), b"k1 contents\n").unwrap();
-        repo.commit("me", "A: feature adds plain keys/k1.txt").unwrap();
+        repo.commit("me", "A: feature adds plain keys/k1.txt")
+            .unwrap();
         std::fs::write(root.join("other.txt"), b"o\n").unwrap();
         repo.commit("me", "B: feature adds other.txt").unwrap();
 
         // KEYLESS rebase (fresh encryption uses public keys only).
         let outcome = repo.rebase("main", "me", None).unwrap();
         let new_tip = match outcome {
-            RebaseResult::Rebased { new_tip, replayed, skipped } => {
+            RebaseResult::Rebased {
+                new_tip,
+                replayed,
+                skipped,
+            } => {
                 assert_eq!((replayed, skipped), (2, 0), "both commits replay cleanly");
                 new_tip
             }
@@ -3112,7 +3471,11 @@ mod tests {
         // the fresh wraps minted while replaying A survived B's replay via
         // the accumulated protection: alice decrypts through the TIP snapshot.
         let (k1_id, perms) = tree_entry(&repo, &new_tip, "keys/k1.txt");
-        assert_ne!(perms & scl_core::PROTECTED, 0, "I2: plain file under union rule encrypts");
+        assert_ne!(
+            perms & scl_core::PROTECTED,
+            0,
+            "I2: plain file under union rule encrypts"
+        );
         let bytes = blob_bytes_of(&repo, &k1_id);
         assert_ne!(&bytes[..], b"k1 contents\n", "no plaintext in the CAS tree");
         let pt = crate::protect::decrypt_with(
@@ -3129,7 +3492,10 @@ mod tests {
         // now-protected file off disk.
         assert!(root.join("other.txt").exists());
         assert!(root.join("main.txt").exists());
-        assert!(!root.join("keys/k1.txt").exists(), "keyless: protected file leaves the disk");
+        assert!(
+            !root.join("keys/k1.txt").exists(),
+            "keyless: protected file leaves the disk"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -3164,54 +3530,101 @@ mod tests {
         // rebase -> Stopped: refs untouched, markers present, status reports.
         let outcome = repo.rebase("main", "me", None).unwrap();
         match outcome {
-            RebaseResult::Stopped { conflicted, paths, done, total } => {
+            RebaseResult::Stopped {
+                conflicted,
+                paths,
+                done,
+                total,
+            } => {
                 assert_eq!(conflicted, feature_a);
                 assert_eq!(paths, vec!["x.txt".to_string()]);
                 assert_eq!((done, total), (0, 2));
             }
             other => panic!("expected Stopped, got {other:?}"),
         }
-        assert_eq!(repo.head_tip().unwrap(), Some(original_feature_tip), "feature tip must not move");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(original_feature_tip),
+            "feature tip must not move"
+        );
         assert!(repo.rebase_in_progress());
         let (progress_conflicted, progress_done, progress_total) =
             repo.rebase_progress().unwrap().unwrap();
-        assert_eq!((progress_conflicted, progress_done, progress_total), (feature_a, 0, 2));
+        assert_eq!(
+            (progress_conflicted, progress_done, progress_total),
+            (feature_a, 0, 2)
+        );
         let on_disk = std::fs::read_to_string(root.join("x.txt")).unwrap();
-        assert!(on_disk.contains("<<<<<<<"), "P4 markers must be on disk: {on_disk}");
-        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no oplog record while stopped");
+        assert!(
+            on_disk.contains("<<<<<<<"),
+            "P4 markers must be on disk: {on_disk}"
+        );
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before,
+            "no oplog record while stopped"
+        );
 
         // Resolve; continue completes the conflicted commit and finishes the
         // fold (feature's second commit replays cleanly).
         std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
         let outcome = repo.rebase_continue("me", None).unwrap();
         let new_tip = match outcome {
-            RebaseResult::Rebased { new_tip, replayed, .. } => {
+            RebaseResult::Rebased {
+                new_tip, replayed, ..
+            } => {
                 // P21: cumulative across the whole rebase, not just this
                 // fold segment — the completed conflicted commit (feature_a)
                 // plus the tail commit that replays cleanly after it.
-                assert_eq!(replayed, 2, "cumulative: the completed conflict + the clean tail commit");
+                assert_eq!(
+                    replayed, 2,
+                    "cumulative: the completed conflict + the clean tail commit"
+                );
                 new_tip
             }
             other => panic!("expected Rebased, got {other:?}"),
         };
         assert!(!repo.rebase_in_progress());
-        assert_eq!(repo.head_tip().unwrap(), Some(new_tip), "branch ref moved ONCE, to completion");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(new_tip),
+            "branch ref moved ONCE, to completion"
+        );
         assert!(root.join("y.txt").exists());
-        assert_eq!(std::fs::read_to_string(root.join("x.txt")).unwrap(), "a\nresolved\nc\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("x.txt")).unwrap(),
+            "a\nresolved\nc\n"
+        );
 
         let snap = repo.snapshot(&new_tip).unwrap();
         assert_eq!(snap.parents.len(), 1);
         let parent_snap = repo.snapshot(&snap.parents[0]).unwrap();
-        assert_eq!(parent_snap.parents, vec![main_tip], "the completed conflict commit's parent is main");
+        assert_eq!(
+            parent_snap.parents,
+            vec![main_tip],
+            "the completed conflict commit's parent is main"
+        );
 
         // Exactly one oplog record for the whole rebase.
-        assert_eq!(repo.oplog().unwrap().len(), ops_before + 1, "exactly one oplog record");
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before + 1,
+            "exactly one oplog record"
+        );
         let last_op = repo.oplog().unwrap().last().unwrap().clone();
-        assert!(last_op.desc.starts_with("rebase onto main"), "got: {}", last_op.desc);
+        assert!(
+            last_op.desc.starts_with("rebase onto main"),
+            "got: {}",
+            last_op.desc
+        );
 
         // One undo restores the original (pre-rebase) tip.
         repo.undo().unwrap();
-        assert_eq!(repo.head_tip().unwrap(), Some(original_feature_tip), "undo restores the original tip");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(original_feature_tip),
+            "undo restores the original tip"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -3259,7 +3672,10 @@ mod tests {
         // State is untouched: still in progress, ref still at the moved tip
         // (rebase_continue must not have written anything).
         assert!(repo.rebase_in_progress());
-        assert_eq!(refs::read_branch_tip(&repo.layout, "feature").unwrap(), Some(moved_tip));
+        assert_eq!(
+            refs::read_branch_tip(&repo.layout, "feature").unwrap(),
+            Some(moved_tip)
+        );
         let st = crate::rebase_state::read(&repo.layout).unwrap().unwrap();
         assert!(!st.resolved, "must not have advanced past the guard");
 
@@ -3301,7 +3717,12 @@ mod tests {
 
         let outcome = repo.rebase("main", "me", None).unwrap();
         match outcome {
-            RebaseResult::Stopped { conflicted, done, total, .. } => {
+            RebaseResult::Stopped {
+                conflicted,
+                done,
+                total,
+                ..
+            } => {
                 assert_eq!(conflicted, commit_a);
                 assert_eq!((done, total), (0, 2));
             }
@@ -3312,15 +3733,28 @@ mod tests {
         std::fs::write(root.join("f.txt"), b"resolved-A\n").unwrap();
         let outcome = repo.rebase_continue("me", None).unwrap();
         let second_conflicted = match outcome {
-            RebaseResult::Stopped { conflicted, done, total, .. } => {
+            RebaseResult::Stopped {
+                conflicted,
+                done,
+                total,
+                ..
+            } => {
                 assert_eq!((done, total), (1, 2));
                 conflicted
             }
             other => panic!("expected Stopped (second), got {other:?}"),
         };
-        assert_eq!(repo.head_tip().unwrap(), Some(original_feature_tip), "still not moved");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(original_feature_tip),
+            "still not moved"
+        );
         assert!(repo.rebase_in_progress());
-        assert_eq!(repo.oplog().unwrap().len(), ops_before, "still no oplog record");
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before,
+            "still no oplog record"
+        );
 
         std::fs::write(root.join("f.txt"), b"resolved-B\n").unwrap();
         let outcome = repo.rebase_continue("me", None).unwrap();
@@ -3331,9 +3765,16 @@ mod tests {
         let _ = second_conflicted;
         assert!(!repo.rebase_in_progress());
         assert_eq!(repo.head_tip().unwrap(), Some(new_tip));
-        assert_eq!(std::fs::read_to_string(root.join("f.txt")).unwrap(), "resolved-B\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "resolved-B\n"
+        );
 
-        assert_eq!(repo.oplog().unwrap().len(), ops_before + 1, "exactly one oplog record");
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before + 1,
+            "exactly one oplog record"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -3366,17 +3807,29 @@ mod tests {
         repo.commit("me", "feature B").unwrap();
 
         let outcome = repo.rebase("main", "me", None).unwrap();
-        assert!(matches!(outcome, RebaseResult::Stopped { .. }), "expected first stop");
+        assert!(
+            matches!(outcome, RebaseResult::Stopped { .. }),
+            "expected first stop"
+        );
 
         std::fs::write(root.join("f.txt"), b"resolved-A\n").unwrap();
         let outcome = repo.rebase_continue("me", None).unwrap();
-        assert!(matches!(outcome, RebaseResult::Stopped { .. }), "expected second stop");
+        assert!(
+            matches!(outcome, RebaseResult::Stopped { .. }),
+            "expected second stop"
+        );
 
         std::fs::write(root.join("f.txt"), b"resolved-B\n").unwrap();
         let outcome = repo.rebase_continue("me", None).unwrap();
         match outcome {
-            RebaseResult::Rebased { replayed, skipped, .. } => {
-                assert_eq!((replayed, skipped), (2, 0), "both A and B must count cumulatively");
+            RebaseResult::Rebased {
+                replayed, skipped, ..
+            } => {
+                assert_eq!(
+                    (replayed, skipped),
+                    (2, 0),
+                    "both A and B must count cumulatively"
+                );
             }
             other => panic!("expected Rebased, got {other:?}"),
         }
@@ -3387,7 +3840,11 @@ mod tests {
             "oplog record must report the cumulative count, not just the last segment: {}",
             last.desc
         );
-        assert!(!last.desc.contains("0 replayed"), "must not report the last segment alone: {}", last.desc);
+        assert!(
+            !last.desc.contains("0 replayed"),
+            "must not report the last segment alone: {}",
+            last.desc
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -3418,19 +3875,27 @@ mod tests {
         std::fs::write(root.join("secret/a.txt"), b"OURS\nl2\nl3\n").unwrap();
         repo.commit("me", "main edits x and secret").unwrap();
 
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("x.txt"), b"a\nFEATURE\nc\n").unwrap();
         repo.commit("me", "feature edits x (conflicts)").unwrap();
         std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
-        repo.commit("me", "feature edits secret (protected divergence)").unwrap();
+        repo.commit("me", "feature edits secret (protected divergence)")
+            .unwrap();
 
         let outcome = repo.rebase("main", "me", None).unwrap();
         assert!(matches!(outcome, RebaseResult::Stopped { .. }));
-        assert!(!repo.rebase_resolved().unwrap(), "stopped, not yet resolved: markers still on disk");
+        assert!(
+            !repo.rebase_resolved().unwrap(),
+            "stopped, not yet resolved: markers still on disk"
+        );
 
         std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
         let err = repo.rebase_continue("me", None).unwrap_err();
-        assert!(matches!(err, Error::ProtectedMergeNeedsIdentity(_) | Error::NotAuthorized(_)));
+        assert!(matches!(
+            err,
+            Error::ProtectedMergeNeedsIdentity(_) | Error::NotAuthorized(_)
+        ));
         assert!(
             repo.rebase_resolved().unwrap(),
             "A completed before B's fold errored — the resolved window must be visible"
@@ -3438,7 +3903,10 @@ mod tests {
 
         let outcome = repo.rebase_continue("me", Some(&alice_sk)).unwrap();
         assert!(matches!(outcome, RebaseResult::Rebased { .. }));
-        assert!(!repo.rebase_resolved().unwrap(), "no rebase in progress once completed");
+        assert!(
+            !repo.rebase_resolved().unwrap(),
+            "no rebase in progress once completed"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -3479,8 +3947,15 @@ mod tests {
         assert!(matches!(err, Error::PickConflicts(_)), "got {err:?}");
 
         let skipped = repo.cherry_pick_abort().unwrap();
-        assert_eq!(skipped, vec!["secret/a.txt".to_string()], "no identity at abort: must be skipped");
-        assert!(!root.join("secret/a.txt").exists(), "skipped means absent, not stale plaintext");
+        assert_eq!(
+            skipped,
+            vec!["secret/a.txt".to_string()],
+            "no identity at abort: must be skipped"
+        );
+        assert!(
+            !root.join("secret/a.txt").exists(),
+            "skipped means absent, not stale plaintext"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -3499,7 +3974,8 @@ mod tests {
         std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
         repo.commit("me", "main edits x").unwrap();
 
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("x.txt"), b"a\nFEATURE\nc\n").unwrap();
         repo.commit("me", "feature edits x").unwrap();
 
@@ -3507,8 +3983,15 @@ mod tests {
         assert!(matches!(outcome, RebaseResult::Stopped { .. }));
 
         let skipped = repo.rebase_abort().unwrap();
-        assert_eq!(skipped, vec!["secret/a.txt".to_string()], "no identity at abort: must be skipped");
-        assert!(!root.join("secret/a.txt").exists(), "skipped means absent, not stale plaintext");
+        assert_eq!(
+            skipped,
+            vec!["secret/a.txt".to_string()],
+            "no identity at abort: must be skipped"
+        );
+        assert!(
+            !root.join("secret/a.txt").exists(),
+            "skipped means absent, not stale plaintext"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -3547,14 +4030,26 @@ mod tests {
 
         assert!(!repo.rebase_in_progress(), "state cleared");
         assert!(repo.rebase_progress().unwrap().is_none());
-        assert_eq!(repo.head_tip().unwrap(), Some(original_tip), "branch tip unchanged");
-        assert_eq!(std::fs::read(root.join("x.txt")).unwrap(), before_x, "x.txt byte-identical");
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(original_tip),
+            "branch tip unchanged"
+        );
+        assert_eq!(
+            std::fs::read(root.join("x.txt")).unwrap(),
+            before_x,
+            "x.txt byte-identical"
+        );
         assert_eq!(
             std::fs::read(root.join("stable.txt")).unwrap(),
             before_stable,
             "stable.txt byte-identical"
         );
-        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no oplog record from abort");
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before,
+            "no oplog record from abort"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -3655,14 +4150,16 @@ mod tests {
         let main_tip = repo.commit("me", "main edits x and secret").unwrap();
 
         // feature commit A: conflicting x.txt edit only.
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("x.txt"), b"a\nFEATURE\nc\n").unwrap();
         let commit_a = repo.commit("me", "feature edits x (conflicts)").unwrap();
 
         // feature commit B: edits secret/a.txt line 3 — mergeable but
         // content-divergent from main's line-1 edit.
         std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
-        repo.commit("me", "feature edits secret (protected divergence)").unwrap();
+        repo.commit("me", "feature edits secret (protected divergence)")
+            .unwrap();
         let original_feature_tip = repo.head_tip().unwrap().unwrap();
 
         let ops_before = repo.oplog().unwrap().len();
@@ -3680,16 +4177,26 @@ mod tests {
         // --continue without identity: A completes, then B's replay errors.
         let err = repo.rebase_continue("me", None).unwrap_err();
         assert!(
-            matches!(err, Error::ProtectedMergeNeedsIdentity(_) | Error::NotAuthorized(_)),
+            matches!(
+                err,
+                Error::ProtectedMergeNeedsIdentity(_) | Error::NotAuthorized(_)
+            ),
             "expected a typed identity error, got {err:?}"
         );
-        assert!(repo.rebase_in_progress(), "state must survive the failed --continue for retry");
+        assert!(
+            repo.rebase_in_progress(),
+            "state must survive the failed --continue for retry"
+        );
         assert_eq!(
             repo.head_tip().unwrap(),
             Some(original_feature_tip),
             "branch ref must still not have moved"
         );
-        assert_eq!(repo.oplog().unwrap().len(), ops_before, "no oplog record from the failed retry");
+        assert_eq!(
+            repo.oplog().unwrap().len(),
+            ops_before,
+            "no oplog record from the failed retry"
+        );
 
         // Retry with the identity: must NOT re-ask for A's resolution — the
         // working tree still holds A's resolved x.txt, untouched by the

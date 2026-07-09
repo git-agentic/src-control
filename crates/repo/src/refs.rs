@@ -16,7 +16,10 @@ const HEAD_PREFIX: &str = "ref: refs/heads/";
 
 /// Write `HEAD` as a symbolic ref to `branch`.
 pub fn write_head(layout: &Layout, branch: &str) -> Result<()> {
-    atomic_write(&layout.head_path(), format!("{HEAD_PREFIX}{branch}\n").as_bytes())
+    atomic_write(
+        &layout.head_path(),
+        format!("{HEAD_PREFIX}{branch}\n").as_bytes(),
+    )
 }
 
 /// The branch currently named by `HEAD`.
@@ -48,7 +51,10 @@ pub fn read_branch_tip(layout: &Layout, branch: &str) -> Result<Option<ObjectId>
 pub fn write_branch_tip(layout: &Layout, branch: &str, id: &ObjectId) -> Result<()> {
     validate_branch_name(branch)?;
     std::fs::create_dir_all(layout.refs_heads_dir())?;
-    atomic_write(&layout.ref_path(branch), format!("{}\n", id.to_hex()).as_bytes())
+    atomic_write(
+        &layout.ref_path(branch),
+        format!("{}\n", id.to_hex()).as_bytes(),
+    )
 }
 
 /// The tip recorded for `refs/remotes/<remote>/<branch>`, or None if absent.
@@ -69,7 +75,9 @@ pub fn read_remote_tip(layout: &Layout, remote: &str, branch: &str) -> Result<Op
 /// `.sc/refs/remotes/` on the write side.
 pub fn write_remote_tip(layout: &Layout, remote: &str, branch: &str, id: &ObjectId) -> Result<()> {
     if is_unsafe_ref_component(remote) || is_unsafe_ref_component(branch) {
-        return Err(Error::BadRef(format!("invalid remote-tracking ref: {remote}/{branch}")));
+        return Err(Error::BadRef(format!(
+            "invalid remote-tracking ref: {remote}/{branch}"
+        )));
     }
     let dir = layout.refs_remotes_dir().join(remote);
     std::fs::create_dir_all(&dir)?;
@@ -86,7 +94,9 @@ pub fn resolve_tip(layout: &Layout, name: &str) -> Result<Option<ObjectId>> {
     match name.split_once('/') {
         Some((remote, branch)) => {
             if is_unsafe_ref_component(remote) || is_unsafe_ref_component(branch) {
-                return Err(Error::BadRef(format!("invalid remote-tracking ref: {name:?}")));
+                return Err(Error::BadRef(format!(
+                    "invalid remote-tracking ref: {name:?}"
+                )));
             }
             read_remote_tip(layout, remote, branch)
         }
@@ -243,7 +253,10 @@ mod tests {
             resolve_tip(&layout, "../evil/main"),
             Err(Error::BadRef(_))
         ));
-        assert!(matches!(resolve_tip(&layout, "origin/../x"), Err(Error::BadRef(_))));
+        assert!(matches!(
+            resolve_tip(&layout, "origin/../x"),
+            Err(Error::BadRef(_))
+        ));
         // Absolute branch component (leading `/`) and an empty `//` sub-component
         // — these slip past a `..`-only check but `Path::join` would discard the
         // prefix, so they must be rejected.
@@ -251,7 +264,10 @@ mod tests {
             resolve_tip(&layout, "origin//etc/passwd"),
             Err(Error::BadRef(_))
         ));
-        assert!(matches!(resolve_tip(&layout, "origin/a//b"), Err(Error::BadRef(_))));
+        assert!(matches!(
+            resolve_tip(&layout, "origin/a//b"),
+            Err(Error::BadRef(_))
+        ));
         // A legitimate nested branch under a remote resolves (None = absent ref).
         assert_eq!(resolve_tip(&layout, "origin/feature/x").unwrap(), None);
         // A plain local branch still resolves to its tip.
@@ -271,7 +287,10 @@ mod tests {
         ));
         // A normal write still succeeds and round-trips.
         write_remote_tip(&layout, "origin", "main", &id).unwrap();
-        assert_eq!(read_remote_tip(&layout, "origin", "main").unwrap(), Some(id));
+        assert_eq!(
+            read_remote_tip(&layout, "origin", "main").unwrap(),
+            Some(id)
+        );
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
@@ -288,7 +307,10 @@ mod tests {
 
         let mut heads = list_heads(&layout).unwrap();
         heads.sort();
-        assert_eq!(heads, vec![("feature".to_string(), b), ("main".to_string(), a)]);
+        assert_eq!(
+            heads,
+            vec![("feature".to_string(), b), ("main".to_string(), a)]
+        );
 
         let remotes = list_remote_tips(&layout).unwrap();
         assert_eq!(remotes, vec![("origin".to_string(), "main".to_string(), c)]);
@@ -308,10 +330,16 @@ mod tests {
         assert_eq!(read_branch_tip(&layout, "work-1").unwrap(), None);
 
         // Already-absent branch: NoSuchBranch.
-        assert!(matches!(delete_branch(&layout, "work-1"), Err(Error::NoSuchBranch(_))));
+        assert!(matches!(
+            delete_branch(&layout, "work-1"),
+            Err(Error::NoSuchBranch(_))
+        ));
 
         // Current branch: refused.
-        assert!(matches!(delete_branch(&layout, "main"), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            delete_branch(&layout, "main"),
+            Err(Error::InvalidArgument(_))
+        ));
         assert_eq!(read_branch_tip(&layout, "main").unwrap(), Some(id));
 
         std::fs::remove_dir_all(&layout.root).unwrap();

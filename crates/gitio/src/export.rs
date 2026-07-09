@@ -116,7 +116,11 @@ impl GitTarget {
 
     /// Write a blob, returning its Git oid.
     pub(crate) fn write_blob(&self, bytes: &[u8]) -> Result<gix::ObjectId> {
-        Ok(self.repo.write_blob(bytes).context("writing git blob")?.detach())
+        Ok(self
+            .repo
+            .write_blob(bytes)
+            .context("writing git blob")?
+            .detach())
     }
 
     /// Write a tree from `entries`, canonicalizing entry order to Git's rule.
@@ -145,7 +149,11 @@ impl GitTarget {
                 oid: e.oid,
             });
         }
-        Ok(self.repo.write_object(&tree).context("writing git tree")?.detach())
+        Ok(self
+            .repo
+            .write_object(&tree)
+            .context("writing git tree")?
+            .detach())
     }
 
     /// Write a commit with explicit author=committer signature (deterministic).
@@ -170,7 +178,11 @@ impl GitTarget {
             message: message.into(),
             extra_headers: Vec::new(),
         };
-        Ok(self.repo.write_object(&commit).context("writing git commit")?.detach())
+        Ok(self
+            .repo
+            .write_object(&commit)
+            .context("writing git commit")?
+            .detach())
     }
 
     /// Create or force-overwrite `ref_name` to point at `target` (mirror
@@ -193,10 +205,18 @@ fn synth_sig(author: &str, timestamp: i64) -> GitSig {
         // and falls through to name-only with empty email — acceptable for
         // freeform author strings.
         if let Some(email) = rest.strip_suffix('>') {
-            return GitSig { name: name.trim().to_string(), email: email.trim().to_string(), time_secs: timestamp };
+            return GitSig {
+                name: name.trim().to_string(),
+                email: email.trim().to_string(),
+                time_secs: timestamp,
+            };
         }
     }
-    GitSig { name: author.to_string(), email: String::new(), time_secs: timestamp }
+    GitSig {
+        name: author.to_string(),
+        email: String::new(),
+        time_secs: timestamp,
+    }
 }
 
 /// Write our blob to Git once (memoized by our ObjectId).
@@ -252,7 +272,11 @@ fn map_tree(
                 (mode, map_blob(store, target, e.id, blob_memo)?)
             }
         };
-        git_entries.push(GitTreeEntry { name: e.name.clone(), mode, oid });
+        git_entries.push(GitTreeEntry {
+            name: e.name.clone(),
+            mode,
+            oid,
+        });
     }
     let g = target.write_tree(git_entries)?;
     tree_memo.insert(id, g);
@@ -349,7 +373,11 @@ pub struct ExportReport {
 fn scan_encrypted(
     store: &mut Store,
     tip: ObjectId,
-) -> anyhow::Result<(Vec<String>, Vec<String>, std::collections::HashSet<ObjectId>)> {
+) -> anyhow::Result<(
+    Vec<String>,
+    Vec<String>,
+    std::collections::HashSet<ObjectId>,
+)> {
     let mut protected_paths = Vec::new();
     let mut secret_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut seen_snaps: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
@@ -367,7 +395,11 @@ fn scan_encrypted(
             snaps.push(*p);
         }
     }
-    Ok((protected_paths, secret_names.into_iter().collect(), seen_snaps))
+    Ok((
+        protected_paths,
+        secret_names.into_iter().collect(),
+        seen_snaps,
+    ))
 }
 
 /// Count P22 `Object::Signature` objects covering any snapshot in
@@ -419,7 +451,12 @@ fn count_transcripts(
 /// explicit stack so deep trees can't overflow. Deduplicates subtree object ids
 /// via `seen` so shared subtrees (identical content at multiple paths in a
 /// content-addressed store) are visited exactly once.
-fn scan_tree(store: &mut Store, root: ObjectId, prefix: String, out: &mut Vec<String>) -> anyhow::Result<()> {
+fn scan_tree(
+    store: &mut Store,
+    root: ObjectId,
+    prefix: String,
+    out: &mut Vec<String>,
+) -> anyhow::Result<()> {
     let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
     let mut stack = vec![(root, prefix)];
     while let Some((id, pre)) = stack.pop() {
@@ -428,7 +465,11 @@ fn scan_tree(store: &mut Store, root: ObjectId, prefix: String, out: &mut Vec<St
         }
         let tree = store.get_tree(&id)?;
         for e in &tree.entries {
-            let path = if pre.is_empty() { e.name.clone() } else { format!("{pre}/{}", e.name) };
+            let path = if pre.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{pre}/{}", e.name)
+            };
             if e.perms & PROTECTED != 0 {
                 out.push(path.clone());
             }
@@ -447,7 +488,11 @@ fn scan_tree(store: &mut Store, root: ObjectId, prefix: String, out: &mut Vec<St
 /// and `opts.include_encrypted` is false — no Git repo is created and no
 /// object is written on refusal. With the flag, protected blobs export as
 /// ciphertext and secrets are dropped (counted in the report).
-pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> anyhow::Result<ExportReport> {
+pub fn export_branch(
+    store: &mut Store,
+    tip: ObjectId,
+    opts: &ExportOptions,
+) -> anyhow::Result<ExportReport> {
     // Fail closed BEFORE creating or writing anything.
     let (protected_paths, secret_names, seen_snaps) = scan_encrypted(store, tip)?;
     if !opts.include_encrypted && (!protected_paths.is_empty() || !secret_names.is_empty()) {
@@ -498,7 +543,14 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
         }
         if ready {
             let snap = store.get_snapshot(&sid)?;
-            let tree_oid = map_tree(store, &target, snap.root, &mut tree_memo, &mut blob_memo, &mut protected)?;
+            let tree_oid = map_tree(
+                store,
+                &target,
+                snap.root,
+                &mut tree_memo,
+                &mut blob_memo,
+                &mut protected,
+            )?;
             let parent_oids: Vec<gix::ObjectId> =
                 snap.parents.iter().map(|p| commit_memo[p]).collect();
             let cid = map_commit(&target, &snap, tree_oid, &parent_oids)?;
@@ -544,7 +596,13 @@ pub fn read_ref(path: &Path, ref_name: &str) -> Result<Option<String>> {
         Err(_) => return Ok(None), // absent/uninitialized target => no ref
     };
     match repo.find_reference(ref_name) {
-        Ok(mut r) => Ok(Some(r.peel_to_id().context("peeling ref")?.detach().to_hex().to_string())),
+        Ok(mut r) => Ok(Some(
+            r.peel_to_id()
+                .context("peeling ref")?
+                .detach()
+                .to_hex()
+                .to_string(),
+        )),
         Err(_) => Ok(None),
     }
 }
@@ -558,8 +616,10 @@ mod tests {
         Command::new("git")
             .args(args)
             .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@e")
-            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@e")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
             .output()
             .expect("git runs")
     }
@@ -589,12 +649,28 @@ mod tests {
 
         let x = t.write_blob(b"x").unwrap();
         let y = t.write_blob(b"y").unwrap();
-        let inner = t.write_tree(vec![GitTreeEntry { name: "inner.txt".into(), mode: GitMode::File, oid: y }]).unwrap();
+        let inner = t
+            .write_tree(vec![GitTreeEntry {
+                name: "inner.txt".into(),
+                mode: GitMode::File,
+                oid: y,
+            }])
+            .unwrap();
         // Deliberately pass entries in NON-git order to prove write_tree canonicalizes.
-        let root = t.write_tree(vec![
-            GitTreeEntry { name: "some-dir".into(), mode: GitMode::Tree, oid: inner },
-            GitTreeEntry { name: "some-dir.txt".into(), mode: GitMode::File, oid: x },
-        ]).unwrap();
+        let root = t
+            .write_tree(vec![
+                GitTreeEntry {
+                    name: "some-dir".into(),
+                    mode: GitMode::Tree,
+                    oid: inner,
+                },
+                GitTreeEntry {
+                    name: "some-dir.txt".into(),
+                    mode: GitMode::File,
+                    oid: x,
+                },
+            ])
+            .unwrap();
 
         assert_eq!(root.to_hex().to_string(), git_reference_tree_oid());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -602,16 +678,38 @@ mod tests {
 
     #[test]
     fn single_snapshot_exports_files_and_modes() {
-        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode};
+        use scl_core::{EntryKind, FileMode, Object, Store, StoreConfig, Tree, TreeEntry};
         use std::collections::{BTreeMap, HashMap};
         let mut store = Store::new(StoreConfig::default());
         let blob = store.put(Object::blob(b"fn main(){}".to_vec())).unwrap();
         let exec = store.put(Object::blob(b"#!/bin/sh\n".to_vec())).unwrap();
-        let root = store.put(Object::Tree(Tree::new(vec![
-            TreeEntry { name: "main.rs".into(), kind: EntryKind::Blob, id: blob, mode: FileMode::FILE, perms: 0 },
-            TreeEntry { name: "run.sh".into(), kind: EntryKind::Blob, id: exec, mode: FileMode::EXEC, perms: 0 },
-        ]))).unwrap();
-        let snap = scl_core::Snapshot { root, parents: vec![], author: "Ada <ada@x>".into(), timestamp: 1_700_000_000, message: "c1".into(), secrets: BTreeMap::new(), protection: Default::default() };
+        let root = store
+            .put(Object::Tree(Tree::new(vec![
+                TreeEntry {
+                    name: "main.rs".into(),
+                    kind: EntryKind::Blob,
+                    id: blob,
+                    mode: FileMode::FILE,
+                    perms: 0,
+                },
+                TreeEntry {
+                    name: "run.sh".into(),
+                    kind: EntryKind::Blob,
+                    id: exec,
+                    mode: FileMode::EXEC,
+                    perms: 0,
+                },
+            ])))
+            .unwrap();
+        let snap = scl_core::Snapshot {
+            root,
+            parents: vec![],
+            author: "Ada <ada@x>".into(),
+            timestamp: 1_700_000_000,
+            message: "c1".into(),
+            secrets: BTreeMap::new(),
+            protection: Default::default(),
+        };
 
         let dir = std::env::temp_dir().join(format!("scl-map1-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -619,39 +717,80 @@ mod tests {
         let mut tree_memo = HashMap::new();
         let mut blob_memo = HashMap::new();
         let mut protected = 0usize;
-        let tree_oid = map_tree(&mut store, &target, root, &mut tree_memo, &mut blob_memo, &mut protected).unwrap();
+        let tree_oid = map_tree(
+            &mut store,
+            &target,
+            root,
+            &mut tree_memo,
+            &mut blob_memo,
+            &mut protected,
+        )
+        .unwrap();
         let cid = map_commit(&target, &snap, tree_oid, &[]).unwrap();
         target.set_ref_force("refs/heads/main", cid).unwrap();
 
         // git sees both files with correct modes (100644, 100755).
         let out = std::process::Command::new("git")
-            .args(["--git-dir", dir.to_str().unwrap(), "ls-tree", "main"]).output().unwrap();
+            .args(["--git-dir", dir.to_str().unwrap(), "ls-tree", "main"])
+            .output()
+            .unwrap();
         let listing = String::from_utf8(out.stdout).unwrap();
-        assert!(listing.contains("100644 blob") && listing.contains("main.rs"), "{listing}");
-        assert!(listing.contains("100755 blob") && listing.contains("run.sh"), "{listing}");
+        assert!(
+            listing.contains("100644 blob") && listing.contains("main.rs"),
+            "{listing}"
+        );
+        assert!(
+            listing.contains("100755 blob") && listing.contains("run.sh"),
+            "{listing}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn synth_sig_parses_name_email_and_falls_back() {
         let a = synth_sig("Ada <ada@x>", 42);
-        assert_eq!((a.name.as_str(), a.email.as_str(), a.time_secs), ("Ada", "ada@x", 42));
+        assert_eq!(
+            (a.name.as_str(), a.email.as_str(), a.time_secs),
+            ("Ada", "ada@x", 42)
+        );
         let b = synth_sig("bare-name", 7);
-        assert_eq!((b.name.as_str(), b.email.as_str(), b.time_secs), ("bare-name", "", 7));
+        assert_eq!(
+            (b.name.as_str(), b.email.as_str(), b.time_secs),
+            ("bare-name", "", 7)
+        );
     }
 
     #[test]
     fn exports_multi_commit_history_with_parents() {
-        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot};
+        use scl_core::{
+            EntryKind, FileMode, Object, Snapshot, Store, StoreConfig, Tree, TreeEntry,
+        };
         use std::collections::BTreeMap;
         let mut store = Store::new(StoreConfig::default());
-        let mk = |store: &mut Store, content: &[u8], parents: Vec<scl_core::ObjectId>, msg: &str| {
-            let b = store.put(Object::blob(content.to_vec())).unwrap();
-            let root = store.put(Object::Tree(Tree::new(vec![
-                TreeEntry { name: "a.txt".into(), kind: EntryKind::Blob, id: b, mode: FileMode::FILE, perms: 0 },
-            ]))).unwrap();
-            store.put(Object::Snapshot(Snapshot { root, parents, author: "t".into(), timestamp: 1, message: msg.into(), secrets: BTreeMap::new(), protection: Default::default() })).unwrap()
-        };
+        let mk =
+            |store: &mut Store, content: &[u8], parents: Vec<scl_core::ObjectId>, msg: &str| {
+                let b = store.put(Object::blob(content.to_vec())).unwrap();
+                let root = store
+                    .put(Object::Tree(Tree::new(vec![TreeEntry {
+                        name: "a.txt".into(),
+                        kind: EntryKind::Blob,
+                        id: b,
+                        mode: FileMode::FILE,
+                        perms: 0,
+                    }])))
+                    .unwrap();
+                store
+                    .put(Object::Snapshot(Snapshot {
+                        root,
+                        parents,
+                        author: "t".into(),
+                        timestamp: 1,
+                        message: msg.into(),
+                        secrets: BTreeMap::new(),
+                        protection: Default::default(),
+                    }))
+                    .unwrap()
+            };
         let c1 = mk(&mut store, b"one", vec![], "c1");
         let c2 = mk(&mut store, b"two", vec![c1], "c2");
         let c3 = mk(&mut store, b"three", vec![c2], "c3");
@@ -659,30 +798,71 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("scl-hist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let empty = std::collections::HashMap::new();
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
+        let opts = ExportOptions {
+            to: &dir,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
+        };
         let report = export_branch(&mut store, c3, &opts).unwrap();
         assert_eq!(report.commits_written, 3);
 
         let out = std::process::Command::new("git")
-            .args(["--git-dir", dir.to_str().unwrap(), "log", "--format=%s", "main"]).output().unwrap();
+            .args([
+                "--git-dir",
+                dir.to_str().unwrap(),
+                "log",
+                "--format=%s",
+                "main",
+            ])
+            .output()
+            .unwrap();
         let log = String::from_utf8(out.stdout).unwrap();
-        assert_eq!(log.split_whitespace().collect::<Vec<_>>(), vec!["c3", "c2", "c1"]);
+        assert_eq!(
+            log.split_whitespace().collect::<Vec<_>>(),
+            vec!["c3", "c2", "c1"]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn re_export_is_idempotent() {
-        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot};
+        use scl_core::{
+            EntryKind, FileMode, Object, Snapshot, Store, StoreConfig, Tree, TreeEntry,
+        };
         use std::collections::BTreeMap;
         let mut store = Store::new(StoreConfig::default());
         let b = store.put(Object::blob(b"x".to_vec())).unwrap();
-        let root = store.put(Object::Tree(Tree::new(vec![TreeEntry { name: "a".into(), kind: EntryKind::Blob, id: b, mode: FileMode::FILE, perms: 0 }]))).unwrap();
-        let c = store.put(Object::Snapshot(Snapshot { root, parents: vec![], author: "t".into(), timestamp: 5, message: "m".into(), secrets: BTreeMap::new(), protection: Default::default() })).unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "a".into(),
+                kind: EntryKind::Blob,
+                id: b,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+        let c = store
+            .put(Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 5,
+                message: "m".into(),
+                secrets: BTreeMap::new(),
+                protection: Default::default(),
+            }))
+            .unwrap();
 
         let dir = std::env::temp_dir().join(format!("scl-idem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let empty = std::collections::HashMap::new();
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
+        let opts = ExportOptions {
+            to: &dir,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
+        };
         let a = export_branch(&mut store, c, &opts).unwrap();
         let b2 = export_branch(&mut store, c, &opts).unwrap();
         assert_eq!(a.git_commit, b2.git_commit);
@@ -697,10 +877,20 @@ mod tests {
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("top.txt"), b"top").unwrap();
         std::fs::write(src.join("sub/inner.txt"), b"inner").unwrap();
-        let g = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&src)
-            .env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@e")
-            .env("GIT_COMMITTER_NAME","t").env("GIT_COMMITTER_EMAIL","t@e").output().unwrap();
-        g(&["init","-q"]); g(&["add","."]); g(&["commit","-q","-m","init"]);
+        let g = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .unwrap()
+        };
+        g(&["init", "-q"]);
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "init"]);
 
         let mut store = Store::new(StoreConfig::default());
         let snap = crate::import_head(&mut store, &src).unwrap();
@@ -708,7 +898,12 @@ mod tests {
         let dst = std::env::temp_dir().join(format!("scl-rt-dst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
         let empty = std::collections::HashMap::new();
-        let opts = ExportOptions { to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
+        let opts = ExportOptions {
+            to: &dst,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
+        };
         export_branch(&mut store, snap, &opts).unwrap();
 
         // Re-import our export; the tree must reconstruct the same files.
@@ -724,16 +919,41 @@ mod tests {
 
     // Helper: a snapshot with one PROTECTED entry and one registry secret.
     fn encrypted_snapshot(store: &mut scl_core::Store) -> scl_core::ObjectId {
-        use scl_core::{Object, Tree, TreeEntry, EntryKind, FileMode, Snapshot, Secret, PROTECTED};
+        use scl_core::{EntryKind, FileMode, Object, Secret, Snapshot, Tree, TreeEntry, PROTECTED};
         use std::collections::BTreeMap;
-        let ct = store.put(Object::blob(b"ciphertext-bytes".to_vec())).unwrap();
-        let root = store.put(Object::Tree(Tree::new(vec![
-            TreeEntry { name: "secret.txt".into(), kind: EntryKind::Blob, id: ct, mode: FileMode::FILE, perms: PROTECTED },
-        ]))).unwrap();
-        let sid = store.put(Object::Secret(Secret { name: "DB_URL".into(), nonce: vec![0;24], ciphertext: vec![1,2,3], wrapped_keys: vec![] })).unwrap();
+        let ct = store
+            .put(Object::blob(b"ciphertext-bytes".to_vec()))
+            .unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "secret.txt".into(),
+                kind: EntryKind::Blob,
+                id: ct,
+                mode: FileMode::FILE,
+                perms: PROTECTED,
+            }])))
+            .unwrap();
+        let sid = store
+            .put(Object::Secret(Secret {
+                name: "DB_URL".into(),
+                nonce: vec![0; 24],
+                ciphertext: vec![1, 2, 3],
+                wrapped_keys: vec![],
+            }))
+            .unwrap();
         let mut secrets = BTreeMap::new();
         secrets.insert("DB_URL".to_string(), sid);
-        store.put(Object::Snapshot(Snapshot { root, parents: vec![], author: "t".into(), timestamp: 1, message: "enc".into(), secrets, protection: Default::default() })).unwrap()
+        store
+            .put(Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 1,
+                message: "enc".into(),
+                secrets,
+                protection: Default::default(),
+            }))
+            .unwrap()
     }
 
     #[test]
@@ -743,10 +963,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("scl-refuse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let empty = std::collections::HashMap::new();
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
+        let opts = ExportOptions {
+            to: &dir,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
+        };
         let err = export_branch(&mut store, snap, &opts).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("secret.txt") && msg.contains("DB_URL"), "error must name both the protected path and the secret: {msg}");
+        assert!(
+            msg.contains("secret.txt") && msg.contains("DB_URL"),
+            "error must name both the protected path and the secret: {msg}"
+        );
         assert!(!dir.exists(), "no git repo should be created on refusal");
     }
 
@@ -757,12 +985,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("scl-allow-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let empty = std::collections::HashMap::new();
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: true, known_git_commits: &empty };
+        let opts = ExportOptions {
+            to: &dir,
+            ref_name: "refs/heads/main",
+            include_encrypted: true,
+            known_git_commits: &empty,
+        };
         let report = export_branch(&mut store, snap, &opts).unwrap();
         assert_eq!(report.protected_blobs_as_ciphertext, 1);
         assert_eq!(report.secrets_dropped, 1);
         // The protected file exists in git as its ciphertext; no secret file exists.
-        let out = std::process::Command::new("git").args(["--git-dir", dir.to_str().unwrap(), "ls-tree", "main"]).output().unwrap();
+        let out = std::process::Command::new("git")
+            .args(["--git-dir", dir.to_str().unwrap(), "ls-tree", "main"])
+            .output()
+            .unwrap();
         let listing = String::from_utf8(out.stdout).unwrap();
         assert!(listing.contains("secret.txt"));
         assert!(!listing.contains("DB_URL"));
@@ -776,7 +1012,9 @@ mod tests {
         // PROTECTED file ("key"). scan_tree must visit the shared object only
         // once (dedup guard) yet still detect the protected content and cause
         // export_branch to refuse without --include-encrypted.
-        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot, PROTECTED};
+        use scl_core::{
+            EntryKind, FileMode, Object, Snapshot, Store, StoreConfig, Tree, TreeEntry, PROTECTED,
+        };
         use std::collections::BTreeMap;
 
         let mut store = Store::new(StoreConfig::default());
@@ -784,32 +1022,62 @@ mod tests {
         // Protected blob inside the shared subtree.
         let ct = store.put(Object::blob(b"ciphertext".to_vec())).unwrap();
         // The shared subtree — built once, referenced twice.
-        let shared_sub = store.put(Object::Tree(Tree::new(vec![
-            TreeEntry { name: "key".into(), kind: EntryKind::Blob, id: ct, mode: FileMode::FILE, perms: PROTECTED },
-        ]))).unwrap();
+        let shared_sub = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "key".into(),
+                kind: EntryKind::Blob,
+                id: ct,
+                mode: FileMode::FILE,
+                perms: PROTECTED,
+            }])))
+            .unwrap();
         // Root tree: entries "a" and "b" both point at shared_sub.
-        let root = store.put(Object::Tree(Tree::new(vec![
-            TreeEntry { name: "a".into(), kind: EntryKind::Tree, id: shared_sub, mode: FileMode::FILE, perms: 0 },
-            TreeEntry { name: "b".into(), kind: EntryKind::Tree, id: shared_sub, mode: FileMode::FILE, perms: 0 },
-        ]))).unwrap();
-        let snap = store.put(Object::Snapshot(Snapshot {
-            root,
-            parents: vec![],
-            author: "t".into(),
-            timestamp: 1,
-            message: "shared".into(),
-            secrets: BTreeMap::new(),
-            protection: Default::default(),
-        })).unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![
+                TreeEntry {
+                    name: "a".into(),
+                    kind: EntryKind::Tree,
+                    id: shared_sub,
+                    mode: FileMode::FILE,
+                    perms: 0,
+                },
+                TreeEntry {
+                    name: "b".into(),
+                    kind: EntryKind::Tree,
+                    id: shared_sub,
+                    mode: FileMode::FILE,
+                    perms: 0,
+                },
+            ])))
+            .unwrap();
+        let snap = store
+            .put(Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 1,
+                message: "shared".into(),
+                secrets: BTreeMap::new(),
+                protection: Default::default(),
+            }))
+            .unwrap();
 
         let dir = std::env::temp_dir().join(format!("scl-dedup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let empty = std::collections::HashMap::new();
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
+        let opts = ExportOptions {
+            to: &dir,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
+        };
         let err = export_branch(&mut store, snap, &opts).unwrap_err();
         let msg = format!("{err:#}");
         // The scan must have found the protected content and refused.
-        assert!(msg.contains("key"), "error must name the protected path: {msg}");
+        assert!(
+            msg.contains("key"),
+            "error must name the protected path: {msg}"
+        );
         // No git repo should have been created.
         assert!(!dir.exists(), "no git repo should be created on refusal");
     }
@@ -820,14 +1088,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let t = GitTarget::open_or_init_bare(&dir).unwrap();
         let b = t.write_blob(b"hello").unwrap();
-        let tree = t.write_tree(vec![GitTreeEntry { name: "f.txt".into(), mode: GitMode::File, oid: b }]).unwrap();
-        let sig = GitSig { name: "Ada".into(), email: "ada@x".into(), time_secs: 1_700_000_000 };
+        let tree = t
+            .write_tree(vec![GitTreeEntry {
+                name: "f.txt".into(),
+                mode: GitMode::File,
+                oid: b,
+            }])
+            .unwrap();
+        let sig = GitSig {
+            name: "Ada".into(),
+            email: "ada@x".into(),
+            time_secs: 1_700_000_000,
+        };
         let c = t.write_commit(tree, &[], &sig, "init").unwrap();
         t.set_ref_force("refs/heads/main", c).unwrap();
         assert!(t.created, "a fresh init_bare must report created=true");
         t.set_head("refs/heads/main").unwrap();
         // git resolves the commit via HEAD (no explicit ref) — proves set_head worked.
-        let out = git(&dir, &["--git-dir", dir.to_str().unwrap(), "log", "--format=%s", "-1"]);
+        let out = git(
+            &dir,
+            &[
+                "--git-dir",
+                dir.to_str().unwrap(),
+                "log",
+                "--format=%s",
+                "-1",
+            ],
+        );
         assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "init");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -844,19 +1131,25 @@ mod tests {
         std::fs::create_dir_all(&gsrc).unwrap();
         git(&gsrc, &["init", "-q", "-b", "main"]);
         std::fs::write(gsrc.join("a"), b"1").unwrap();
-        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "c1"]);
+        git(&gsrc, &["add", "."]);
+        git(&gsrc, &["commit", "-q", "-m", "c1"]);
         std::fs::write(gsrc.join("a"), b"2").unwrap();
-        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "c2"]);
+        git(&gsrc, &["add", "."]);
+        git(&gsrc, &["commit", "-q", "-m", "c2"]);
 
         let mut store = Store::new(StoreConfig::default());
-        let ImportReport { tip, .. } = import_history(&mut store, &gsrc, "main", &HashMap::new()).unwrap();
+        let ImportReport { tip, .. } =
+            import_history(&mut store, &gsrc, "main", &HashMap::new()).unwrap();
 
         // First export: empty known-map => all commits written and reported.
         let dst = std::env::temp_dir().join(format!("scl-exp-dst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
         let empty: HashMap<ObjectId, String> = HashMap::new();
         let opts = ExportOptions {
-            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty,
+            to: &dst,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
         };
         let rep1 = export_branch(&mut store, tip, &opts).unwrap();
         assert_eq!(rep1.new_marks.len(), 2);
@@ -866,10 +1159,16 @@ mod tests {
         assert_eq!(tip_git.as_deref(), Some(rep1.git_commit.as_str()));
 
         // Second export with ALL commits known: nothing new written.
-        let known: HashMap<ObjectId, String> =
-            rep1.new_marks.iter().map(|(g, s)| (*s, g.clone())).collect();
+        let known: HashMap<ObjectId, String> = rep1
+            .new_marks
+            .iter()
+            .map(|(g, s)| (*s, g.clone()))
+            .collect();
         let opts2 = ExportOptions {
-            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &known,
+            to: &dst,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &known,
         };
         let rep2 = export_branch(&mut store, tip, &opts2).unwrap();
         assert!(rep2.new_marks.is_empty());
@@ -881,27 +1180,54 @@ mod tests {
 
     #[test]
     fn export_drops_signatures_with_count() {
-        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot, SignatureObj};
+        use scl_core::{
+            EntryKind, FileMode, Object, SignatureObj, Snapshot, Store, StoreConfig, Tree,
+            TreeEntry,
+        };
         use std::collections::BTreeMap;
 
         let mut store = Store::new(StoreConfig::default());
         let b = store.put(Object::blob(b"x".to_vec())).unwrap();
-        let root = store.put(Object::Tree(Tree::new(vec![
-            TreeEntry { name: "a".into(), kind: EntryKind::Blob, id: b, mode: FileMode::FILE, perms: 0 },
-        ]))).unwrap();
-        let snap = store.put(Object::Snapshot(Snapshot {
-            root, parents: vec![], author: "t".into(), timestamp: 1, message: "m".into(),
-            secrets: BTreeMap::new(), protection: Default::default(),
-        })).unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "a".into(),
+                kind: EntryKind::Blob,
+                id: b,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+        let snap = store
+            .put(Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 1,
+                message: "m".into(),
+                secrets: BTreeMap::new(),
+                protection: Default::default(),
+            }))
+            .unwrap();
         // A signature object over `snap`, no fail-closed gate over it (unlike
         // protected content/secrets) — bytes don't need to be a real Ed25519
         // signature for this test since export never verifies them.
-        store.put(Object::Signature(SignatureObj { snapshot: snap, signer: [1u8; 32], sig: [2u8; 64] })).unwrap();
+        store
+            .put(Object::Signature(SignatureObj {
+                snapshot: snap,
+                signer: [1u8; 32],
+                sig: [2u8; 64],
+            }))
+            .unwrap();
 
         let dir = std::env::temp_dir().join(format!("scl-sigdrop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let empty = std::collections::HashMap::new();
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
+        let opts = ExportOptions {
+            to: &dir,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
+        };
         let report = export_branch(&mut store, snap, &opts).unwrap();
         assert_eq!(report.signatures_dropped, 1);
 
@@ -910,38 +1236,63 @@ mod tests {
 
     #[test]
     fn export_drops_transcripts_with_count() {
-        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot, Transcript};
+        use scl_core::{
+            EntryKind, FileMode, Object, Snapshot, Store, StoreConfig, Transcript, Tree, TreeEntry,
+        };
         use std::collections::BTreeMap;
 
         let mut store = Store::new(StoreConfig::default());
         let b = store.put(Object::blob(b"x".to_vec())).unwrap();
-        let root = store.put(Object::Tree(Tree::new(vec![
-            TreeEntry { name: "a".into(), kind: EntryKind::Blob, id: b, mode: FileMode::FILE, perms: 0 },
-        ]))).unwrap();
-        let snap = store.put(Object::Snapshot(Snapshot {
-            root, parents: vec![], author: "t".into(), timestamp: 1, message: "m".into(),
-            secrets: BTreeMap::new(), protection: Default::default(),
-        })).unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "a".into(),
+                kind: EntryKind::Blob,
+                id: b,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+        let snap = store
+            .put(Object::Snapshot(Snapshot {
+                root,
+                parents: vec![],
+                author: "t".into(),
+                timestamp: 1,
+                message: "m".into(),
+                secrets: BTreeMap::new(),
+                protection: Default::default(),
+            }))
+            .unwrap();
         // A transcript object over `snap`, no fail-closed gate over it (P30
         // transcripts are provenance, not confidentiality — like P22
         // signatures) — a garbage ciphertext is fine since export never
         // decrypts it.
-        store.put(Object::Transcript(Transcript {
-            snapshot: snap,
-            agent: "a".into(),
-            session: "s".into(),
-            nonce: vec![0u8; 24],
-            ciphertext: vec![1, 2, 3],
-            wrapped_keys: vec![],
-        })).unwrap();
+        store
+            .put(Object::Transcript(Transcript {
+                snapshot: snap,
+                agent: "a".into(),
+                session: "s".into(),
+                nonce: vec![0u8; 24],
+                ciphertext: vec![1, 2, 3],
+                wrapped_keys: vec![],
+            }))
+            .unwrap();
 
         let dir = std::env::temp_dir().join(format!("scl-transdrop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let empty = std::collections::HashMap::new();
-        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
+        let opts = ExportOptions {
+            to: &dir,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
+        };
         let report = export_branch(&mut store, snap, &opts).unwrap();
         assert_eq!(report.transcripts_dropped, 1);
-        assert_eq!(report.signatures_dropped, 0, "no signature was written for this snapshot");
+        assert_eq!(
+            report.signatures_dropped, 0,
+            "no signature was written for this snapshot"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -961,21 +1312,28 @@ mod tests {
         std::fs::create_dir_all(&gsrc).unwrap();
         git(&gsrc, &["init", "-q", "-b", "main"]);
         std::fs::write(gsrc.join("a"), b"1").unwrap();
-        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "A"]);
+        git(&gsrc, &["add", "."]);
+        git(&gsrc, &["commit", "-q", "-m", "A"]);
         std::fs::write(gsrc.join("a"), b"2").unwrap();
-        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "B"]);
+        git(&gsrc, &["add", "."]);
+        git(&gsrc, &["commit", "-q", "-m", "B"]);
         std::fs::write(gsrc.join("a"), b"3").unwrap();
-        git(&gsrc, &["add", "."]); git(&gsrc, &["commit", "-q", "-m", "C"]);
+        git(&gsrc, &["add", "."]);
+        git(&gsrc, &["commit", "-q", "-m", "C"]);
 
         let mut store = Store::new(StoreConfig::default());
-        let ImportReport { tip: sc_c, .. } = import_history(&mut store, &gsrc, "main", &HashMap::new()).unwrap();
+        let ImportReport { tip: sc_c, .. } =
+            import_history(&mut store, &gsrc, "main", &HashMap::new()).unwrap();
 
         // Export once and recover marks by message.
         let dst = std::env::temp_dir().join(format!("scl-exp-stale-dst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
         let empty: HashMap<ObjectId, String> = HashMap::new();
         let opts = ExportOptions {
-            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty,
+            to: &dst,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &empty,
         };
         let rep1 = export_branch(&mut store, sc_c, &opts).unwrap();
         assert_eq!(rep1.new_marks.len(), 3);
@@ -998,11 +1356,21 @@ mod tests {
         // Re-export with the stale mark for B: must report stale_marks == 1,
         // re-synthesize B and C (C's parent changes), and leave a valid, unbroken parent chain.
         let opts2 = ExportOptions {
-            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &stale,
+            to: &dst,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &stale,
         };
         let rep2 = export_branch(&mut store, sc_c, &opts2).unwrap();
-        assert_eq!(rep2.stale_marks, 1, "exactly one stale mark (B) should be detected");
-        assert_eq!(rep2.new_marks.len(), 2, "B and C should be re-synthesized (C's parent changed)");
+        assert_eq!(
+            rep2.stale_marks, 1,
+            "exactly one stale mark (B) should be detected"
+        );
+        assert_eq!(
+            rep2.new_marks.len(),
+            2,
+            "B and C should be re-synthesized (C's parent changed)"
+        );
         // Find B and C in new_marks; both should be present.
         let has_b = rep2.new_marks.iter().any(|(_, sc_id)| *sc_id == sc_b);
         let has_c = rep2.new_marks.iter().any(|(_, sc_id)| *sc_id == sc_c);
@@ -1010,7 +1378,16 @@ mod tests {
         assert!(has_c, "C should be in new_marks");
 
         // Walk the Git history from the ref to prove the parent chain is valid.
-        let out = git(&dst, &["--git-dir", dst.to_str().unwrap(), "log", "--format=%H %s", "refs/heads/main"]);
+        let out = git(
+            &dst,
+            &[
+                "--git-dir",
+                dst.to_str().unwrap(),
+                "log",
+                "--format=%H %s",
+                "refs/heads/main",
+            ],
+        );
         let log = String::from_utf8(out.stdout).unwrap();
         let mut log_lines: Vec<&str> = log.lines().collect();
         log_lines.reverse(); // root-to-tip order
@@ -1020,12 +1397,24 @@ mod tests {
         assert!(log_lines[2].ends_with(" C"), "commit 2 should be C");
 
         // Verify each commit's parent is correct by parsing git log output.
-        let out = git(&dst, &["--git-dir", dst.to_str().unwrap(), "log", "--format=%H %P", "refs/heads/main"]);
+        let out = git(
+            &dst,
+            &[
+                "--git-dir",
+                dst.to_str().unwrap(),
+                "log",
+                "--format=%H %P",
+                "refs/heads/main",
+            ],
+        );
         let log = String::from_utf8(out.stdout).unwrap();
-        let mut commits: Vec<(&str, &str)> = log.lines().map(|l| {
-            let parts: Vec<&str> = l.split_whitespace().collect();
-            (parts[0], if parts.len() > 1 { parts[1] } else { "" })
-        }).collect();
+        let mut commits: Vec<(&str, &str)> = log
+            .lines()
+            .map(|l| {
+                let parts: Vec<&str> = l.split_whitespace().collect();
+                (parts[0], if parts.len() > 1 { parts[1] } else { "" })
+            })
+            .collect();
         commits.reverse(); // root-to-tip order
         assert_eq!(commits[1].1, commits[0].0, "B's parent should be A");
         assert_eq!(commits[2].1, commits[1].0, "C's parent should be B");
@@ -1041,11 +1430,17 @@ mod tests {
         }
 
         let opts3 = ExportOptions {
-            to: &dst, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &healed,
+            to: &dst,
+            ref_name: "refs/heads/main",
+            include_encrypted: false,
+            known_git_commits: &healed,
         };
         let rep3 = export_branch(&mut store, sc_c, &opts3).unwrap();
         assert_eq!(rep3.stale_marks, 0, "no stale marks after healing");
-        assert!(rep3.new_marks.is_empty(), "no new marks after healing (all reused)");
+        assert!(
+            rep3.new_marks.is_empty(),
+            "no new marks after healing (all reused)"
+        );
 
         std::fs::remove_dir_all(&gsrc).unwrap();
         std::fs::remove_dir_all(&dst).unwrap();

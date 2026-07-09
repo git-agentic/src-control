@@ -34,7 +34,9 @@ pub struct Repo {
 
 impl Repo {
     pub fn new(store: Store) -> Self {
-        Repo { store: Arc::new(Mutex::new(store)) }
+        Repo {
+            store: Arc::new(Mutex::new(store)),
+        }
     }
 
     pub fn store(&self) -> Arc<Mutex<Store>> {
@@ -92,7 +94,10 @@ impl Repo {
     /// Like `write_tree`, but each file carries an explicit `perms` byte (e.g.
     /// `scl_core::PROTECTED` for encrypted blobs). Used by the persistent repo
     /// layer to commit working trees that include encrypted protected paths (P7).
-    pub fn write_tree_with_perms(&self, files: &[(String, Vec<u8>, FileMode, u8)]) -> Result<ObjectId> {
+    pub fn write_tree_with_perms(
+        &self,
+        files: &[(String, Vec<u8>, FileMode, u8)],
+    ) -> Result<ObjectId> {
         let mut map: BTreeMap<String, (ObjectId, FileMode, u8)> = BTreeMap::new();
         {
             let mut store = self.store.lock().unwrap();
@@ -124,8 +129,10 @@ impl Repo {
     /// get `perms = 0`; protected (encrypted) entries go through
     /// `write_tree_with_perms` instead.
     fn build_tree(&self, files: &BTreeMap<String, (ObjectId, FileMode)>) -> Result<ObjectId> {
-        let with_perms: BTreeMap<String, (ObjectId, FileMode, u8)> =
-            files.iter().map(|(p, (id, mode))| (p.clone(), (*id, *mode, 0u8))).collect();
+        let with_perms: BTreeMap<String, (ObjectId, FileMode, u8)> = files
+            .iter()
+            .map(|(p, (id, mode))| (p.clone(), (*id, *mode, 0u8)))
+            .collect();
         self.build_subtree_inner(&with_perms, "")
     }
 
@@ -142,7 +149,9 @@ impl Repo {
         let mut subdirs: BTreeMap<String, ()> = BTreeMap::new();
 
         for (path, (id, mode, perms)) in files {
-            let Some(rest) = strip_prefix_dir(path, prefix) else { continue };
+            let Some(rest) = strip_prefix_dir(path, prefix) else {
+                continue;
+            };
             match rest.split_once('/') {
                 None => entries.push(TreeEntry {
                     name: rest.to_string(),
@@ -225,7 +234,8 @@ impl Worktree {
     /// Stage a write into the overlay (in RAM, pinned — never spilled).
     pub fn write(&mut self, path: &str, bytes: impl Into<Vec<u8>>, mode: FileMode) {
         let arc: Arc<[u8]> = Arc::from(bytes.into().into_boxed_slice());
-        self.overlay.insert(normalize(path), Overlay::Written(arc, mode));
+        self.overlay
+            .insert(normalize(path), Overlay::Written(arc, mode));
     }
 
     /// Tombstone a path in the overlay.
@@ -320,7 +330,9 @@ impl Worktree {
                 }
             }
         }
-        let repo = Repo { store: self.store.clone() };
+        let repo = Repo {
+            store: self.store.clone(),
+        };
         let root = repo.build_tree(&map)?;
         let snap = Object::Snapshot(Snapshot {
             root,
@@ -377,7 +389,9 @@ impl Worktree {
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         for (i, comp) in comps.iter().enumerate() {
             let tree = store.get_tree(&tree_id)?;
-            let Some(entry) = tree.get(comp) else { return Ok(None) };
+            let Some(entry) = tree.get(comp) else {
+                return Ok(None);
+            };
             let last = i == comps.len() - 1;
             match entry.kind {
                 EntryKind::Blob if last => return Ok(Some(entry.id)),
@@ -449,7 +463,11 @@ mod tests {
         repo.commit_files(
             &[
                 ("README.md".into(), b"hello".to_vec(), FileMode::FILE),
-                ("src/main.rs".into(), b"fn main() {}".to_vec(), FileMode::FILE),
+                (
+                    "src/main.rs".into(),
+                    b"fn main() {}".to_vec(),
+                    FileMode::FILE,
+                ),
                 ("src/lib.rs".into(), b"// lib".to_vec(), FileMode::FILE),
             ],
             "seed",
@@ -550,7 +568,10 @@ mod tests {
             name: "DB_URL".into(),
             nonce: vec![0; 24],
             ciphertext: vec![1, 2, 3, 4],
-            wrapped_keys: vec![WrappedKey { recipient_id: "rid".into(), wrapped_dek: vec![7; 80] }],
+            wrapped_keys: vec![WrappedKey {
+                recipient_id: "rid".into(),
+                wrapped_dek: vec![7; 80],
+            }],
         })
         .unwrap();
         let snap2 = wt.commit("setup", "add secret").unwrap();

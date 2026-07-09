@@ -83,7 +83,14 @@ impl Repo {
         }
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
-        let id = self.commit_snapshot(root, parents, secrets, protection, "system", &format!("protect {prefix}"))?;
+        let id = self.commit_snapshot(
+            root,
+            parents,
+            secrets,
+            protection,
+            "system",
+            &format!("protect {prefix}"),
+        )?;
         crate::oplog::record(
             self.layout(),
             &format!("protect {prefix}"),
@@ -99,7 +106,12 @@ impl Repo {
 
     /// Collect the PROTECTED blob ids in the tip tree whose path is governed by
     /// the rule `prefix` (longest-prefix wins, mirroring `matching_prefix`).
-    fn protected_blob_ids_under(&self, root: ObjectId, protection: &Protection, prefix: &str) -> Result<Vec<ObjectId>> {
+    fn protected_blob_ids_under(
+        &self,
+        root: ObjectId,
+        protection: &Protection,
+        prefix: &str,
+    ) -> Result<Vec<ObjectId>> {
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         let entries = worktree::tree_file_entries_with_perms(&mut store, root)?;
@@ -152,7 +164,9 @@ impl Repo {
         let authorized_id = authorized.public().recipient_id().to_string();
         let new_id = new.recipient_id().to_string();
         for blob_id in protected_ids {
-            let Some(wks) = protection.wrapped.get(&blob_id) else { continue };
+            let Some(wks) = protection.wrapped.get(&blob_id) else {
+                continue;
+            };
             if wks.iter().any(|w| w.recipient_id == new_id) {
                 continue; // `new` already a recipient for this blob
             }
@@ -167,7 +181,11 @@ impl Repo {
                 .ok_or_else(|| Error::NotAuthorized(prefix.to_string()))?;
             let dek = scl_crypto::unwrap_dek_with(wk, authorized)?;
             let new_wk = scl_crypto::wrap_dek_for(&dek, new);
-            protection.wrapped.get_mut(&blob_id).expect("present above").push(new_wk);
+            protection
+                .wrapped
+                .get_mut(&blob_id)
+                .expect("present above")
+                .push(new_wk);
         }
 
         let rule = &mut protection.prefixes[rule_idx];
@@ -175,8 +193,14 @@ impl Repo {
         rule.set_standing(new.to_bytes(), epoch, scl_core::RecipientState::Granted);
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
-        let id =
-            self.commit_snapshot(root, vec![tip], secrets, protection, "system", &format!("grant {prefix}"))?;
+        let id = self.commit_snapshot(
+            root,
+            vec![tip],
+            secrets,
+            protection,
+            "system",
+            &format!("grant {prefix}"),
+        )?;
         crate::oplog::record(
             self.layout(),
             &format!("grant {prefix}"),
@@ -217,9 +241,15 @@ impl Repo {
 
         // Refuse to empty the rule's effective set: subsequent commits under the
         // prefix would seal new content for nobody (the empty-recipient footgun).
-        let survives = protection.prefixes[rule_idx].granted_keys().iter().any(|pk| {
-            scl_crypto::PublicKey::from_bytes(*pk).recipient_id().as_str() != recipient_id.as_str()
-        });
+        let survives = protection.prefixes[rule_idx]
+            .granted_keys()
+            .iter()
+            .any(|pk| {
+                scl_crypto::PublicKey::from_bytes(*pk)
+                    .recipient_id()
+                    .as_str()
+                    != recipient_id.as_str()
+            });
         if !survives {
             return Err(Error::InvalidArgument(format!(
                 "revoking the last recipient would leave {prefix} readable by nobody; \
@@ -238,11 +268,12 @@ impl Repo {
         // the LWW register against any pre-revoke branch at merge time (ADR-0026).
         let rule = &mut protection.prefixes[rule_idx];
         let epoch = rule.next_epoch();
-        if let Some(e) = rule
-            .recipients
-            .iter_mut()
-            .find(|e| scl_crypto::PublicKey::from_bytes(e.key).recipient_id().as_str() == rid)
-        {
+        if let Some(e) = rule.recipients.iter_mut().find(|e| {
+            scl_crypto::PublicKey::from_bytes(e.key)
+                .recipient_id()
+                .as_str()
+                == rid
+        }) {
             e.epoch = epoch;
             e.state = scl_core::RecipientState::Revoked;
         }

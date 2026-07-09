@@ -45,7 +45,10 @@ pub fn import_history(
     let mut reference = repo
         .find_reference(&format!("refs/heads/{branch}"))
         .with_context(|| format!("resolving branch {branch}"))?;
-    let tip_oid = reference.peel_to_id().context("peeling branch to commit")?.detach();
+    let tip_oid = reference
+        .peel_to_id()
+        .context("peeling branch to commit")?
+        .detach();
 
     // sc id for every git commit we resolve this call (seed with `known`).
     let mut mapped: HashMap<gix::ObjectId, ObjectId> = HashMap::new();
@@ -69,7 +72,10 @@ pub fn import_history(
         if mapped.contains_key(&oid) {
             continue;
         }
-        let commit = repo.find_object(oid).context("finding commit")?.into_commit();
+        let commit = repo
+            .find_object(oid)
+            .context("finding commit")?
+            .into_commit();
         let decoded = commit.decode().context("decoding commit")?;
         // Raw hex-hash parents in git parent order (gix validated them on parse).
         let parents: Vec<gix::ObjectId> = decoded.parents().collect();
@@ -85,7 +91,11 @@ pub fn import_history(
             let sig = decoded.author().context("parsing commit author")?;
             let name = sig.name.to_string();
             let email = sig.email.to_string();
-            let author = if email.is_empty() { name } else { format!("{name} <{email}>") };
+            let author = if email.is_empty() {
+                name
+            } else {
+                format!("{name} <{email}>")
+            };
             // Author time in seconds (timezone-independent; 0 if unparseable).
             let timestamp = sig.seconds();
             // Git normalizes `-m` messages to end in exactly one newline; strip
@@ -116,7 +126,10 @@ pub fn import_history(
         }
     }
 
-    Ok(ImportReport { tip: mapped[&tip_oid], new_marks })
+    Ok(ImportReport {
+        tip: mapped[&tip_oid],
+        new_marks,
+    })
 }
 
 #[cfg(test)]
@@ -129,8 +142,10 @@ mod tests {
         Command::new("git")
             .args(args)
             .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@x")
-            .env("GIT_COMMITTER_NAME", "Ada").env("GIT_COMMITTER_EMAIL", "ada@x")
+            .env("GIT_AUTHOR_NAME", "Ada")
+            .env("GIT_AUTHOR_EMAIL", "ada@x")
+            .env("GIT_COMMITTER_NAME", "Ada")
+            .env("GIT_COMMITTER_EMAIL", "ada@x")
             .output()
             .expect("git runs")
     }
@@ -274,7 +289,10 @@ mod tests {
             }
         }
         // B was re-created with its same deterministic id.
-        assert!(store.contains(&sb), "sB must be re-imported (deterministic id)");
+        assert!(
+            store.contains(&sb),
+            "sB must be re-imported (deterministic id)"
+        );
         assert!(saw_b, "B must appear in the re-rooted ancestry");
         std::fs::remove_dir_all(&dir).unwrap();
     }

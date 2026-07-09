@@ -186,8 +186,14 @@ mod tests {
 
     #[test]
     fn bad_key_string_is_rejected() {
-        assert!(matches!(PublicKey::from_key_string("nope"), Err(Error::BadKey)));
-        assert!(matches!(SecretKey::from_key_string("scl-sk-zz"), Err(Error::BadKey)));
+        assert!(matches!(
+            PublicKey::from_key_string("nope"),
+            Err(Error::BadKey)
+        ));
+        assert!(matches!(
+            SecretKey::from_key_string("scl-sk-zz"),
+            Err(Error::BadKey)
+        ));
     }
 
     #[test]

@@ -85,17 +85,30 @@ const EC_OTHER: u8 = 255;
 /// verb (plus `Hello`/`Bye` session control).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     Bye,
     ListRefs,
     HeadBranch,
     HasObject(ObjectId),
     GetObject(ObjectId),
-    PutObject { id: ObjectId, bytes: Vec<u8> },
-    UpdateRef { branch: String, id: ObjectId, expected_old: Option<ObjectId> },
+    PutObject {
+        id: ObjectId,
+        bytes: Vec<u8>,
+    },
+    UpdateRef {
+        branch: String,
+        id: ObjectId,
+        expected_old: Option<ObjectId>,
+    },
     /// `filter`: partial-clone prefix list (P27 Task 3), empty = no filter
     /// (full transfer, matching pre-P27 behavior byte-for-byte).
-    GetPack { wants: Vec<ObjectId>, haves: Vec<ObjectId>, filter: Vec<String> },
+    GetPack {
+        wants: Vec<ObjectId>,
+        haves: Vec<ObjectId>,
+        filter: Vec<String>,
+    },
     /// Marker only (P25) — the pack body is no longer embedded in this
     /// request's frame. Immediately after this request frame, the sender
     /// streams the pack as `ST_PACK_CHUNK`/`ST_PACK_END` frames
@@ -112,7 +125,10 @@ fn put_u32(out: &mut Vec<u8>, v: u32) {
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     // A field can't exceed the u32 frame limit; write_frame enforces the total.
-    put_u32(out, u32::try_from(b.len()).expect("field exceeds frame limit"));
+    put_u32(
+        out,
+        u32::try_from(b.len()).expect("field exceeds frame limit"),
+    );
     out.extend_from_slice(b);
 }
 
@@ -233,7 +249,11 @@ impl Request {
                 put_id(&mut out, id);
                 put_bytes(&mut out, bytes);
             }
-            Request::UpdateRef { branch, id, expected_old } => {
+            Request::UpdateRef {
+                branch,
+                id,
+                expected_old,
+            } => {
                 out.push(OP_UPDATE_REF);
                 put_str(&mut out, branch);
                 put_id(&mut out, id);
@@ -245,7 +265,11 @@ impl Request {
                     None => out.push(0),
                 }
             }
-            Request::GetPack { wants, haves, filter } => {
+            Request::GetPack {
+                wants,
+                haves,
+                filter,
+            } => {
                 out.push(OP_GET_PACK);
                 put_ids(&mut out, wants);
                 put_ids(&mut out, haves);
@@ -266,7 +290,10 @@ impl Request {
             OP_HEAD_BRANCH => Request::HeadBranch,
             OP_HAS_OBJECT => Request::HasObject(c.id()?),
             OP_GET_OBJECT => Request::GetObject(c.id()?),
-            OP_PUT_OBJECT => Request::PutObject { id: c.id()?, bytes: c.bytes()? },
+            OP_PUT_OBJECT => Request::PutObject {
+                id: c.id()?,
+                bytes: c.bytes()?,
+            },
             OP_UPDATE_REF => {
                 let branch = c.str()?;
                 let id = c.id()?;
@@ -275,9 +302,17 @@ impl Request {
                     1 => Some(c.id()?),
                     _ => return Err(Error::Protocol("bad expected_old flag".into())),
                 };
-                Request::UpdateRef { branch, id, expected_old }
+                Request::UpdateRef {
+                    branch,
+                    id,
+                    expected_old,
+                }
             }
-            OP_GET_PACK => Request::GetPack { wants: c.ids()?, haves: c.ids()?, filter: c.strs()? },
+            OP_GET_PACK => Request::GetPack {
+                wants: c.ids()?,
+                haves: c.ids()?,
+                filter: c.strs()?,
+            },
             OP_PUT_PACK => Request::PutPack,
             op => return Err(Error::Protocol(format!("unknown opcode 0x{op:02x}"))),
         };
@@ -395,8 +430,8 @@ fn read_up_to(src: &mut (impl Read + ?Sized), buf: &mut [u8]) -> Result<usize> {
 pub fn read_pack_stream(r: &mut impl Read, sink: &mut (impl Write + ?Sized)) -> Result<u64> {
     let mut total: u64 = 0;
     loop {
-        let frame = read_frame_opt(r)?
-            .ok_or_else(|| Error::Protocol("EOF before ST_PACK_END".into()))?;
+        let frame =
+            read_frame_opt(r)?.ok_or_else(|| Error::Protocol("EOF before ST_PACK_END".into()))?;
         match frame.split_first() {
             Some((&ST_PACK_CHUNK, rest)) => {
                 sink.write_all(rest)?;
@@ -427,8 +462,9 @@ pub fn write_err(w: &mut impl Write, code: u8, msg: &str) -> Result<()> {
 
 /// Split a response frame into its OK body, or reconstruct the typed error.
 pub fn parse_response(frame: Vec<u8>) -> Result<Vec<u8>> {
-    let (&status, rest) =
-        frame.split_first().ok_or_else(|| Error::Protocol("empty response frame".into()))?;
+    let (&status, rest) = frame
+        .split_first()
+        .ok_or_else(|| Error::Protocol("empty response frame".into()))?;
     match status {
         ST_OK => Ok(rest.to_vec()),
         ST_ERR => {
@@ -583,7 +619,9 @@ pub fn serve_with_policy(
             write_err(
                 w,
                 EC_PROTOCOL,
-                &format!("unsupported protocol version {version} (server speaks {PROTOCOL_VERSION})"),
+                &format!(
+                    "unsupported protocol version {version} (server speaks {PROTOCOL_VERSION})"
+                ),
             )?;
             return Ok(());
         }
@@ -655,8 +693,16 @@ pub fn serve_with_policy(
         // the initial (empty-body) OK frame.
         match req {
             Request::Bye => return Ok(()),
-            Request::GetPack { wants, haves, filter } => {
-                let filter_opt = if filter.is_empty() { None } else { Some(filter.as_slice()) };
+            Request::GetPack {
+                wants,
+                haves,
+                filter,
+            } => {
+                let filter_opt = if filter.is_empty() {
+                    None
+                } else {
+                    Some(filter.as_slice())
+                };
                 match transport.build_pack_tempfile(&wants, &haves, filter_opt) {
                     Ok(guard) => {
                         // Building the temp pack file (bounded RAM: one
@@ -706,7 +752,11 @@ pub fn serve_with_policy(
                     Request::PutObject { id, bytes } => {
                         transport.put_object(&id, &bytes).map(|()| Vec::new())
                     }
-                    Request::UpdateRef { branch, id, expected_old } => transport
+                    Request::UpdateRef {
+                        branch,
+                        id,
+                        expected_old,
+                    } => transport
                         .update_ref(&branch, &id, expected_old.as_ref())
                         .map(|()| Vec::new()),
                     Request::Bye | Request::GetPack { .. } | Request::PutPack => {
@@ -737,7 +787,10 @@ pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> R
 /// created before any read, so a stream that errors partway (a malformed
 /// frame, a dropped connection) still leaves nothing behind — `Drop` removes
 /// whatever was written so far.
-fn spill_pack_stream(r: &mut impl Read, layout: &crate::layout::Layout) -> Result<crate::transport::TempPackGuard> {
+fn spill_pack_stream(
+    r: &mut impl Read,
+    layout: &crate::layout::Layout,
+) -> Result<crate::transport::TempPackGuard> {
     let guard = crate::transport::TempPackGuard::new(layout)?;
     let mut f = std::fs::File::create(guard.path())?;
     read_pack_stream(r, &mut f)?;
@@ -782,15 +835,28 @@ mod tests {
     #[test]
     fn every_request_encodes_and_decodes_roundtrip() {
         let reqs = vec![
-            Request::Hello { version: PROTOCOL_VERSION },
+            Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
             Request::Bye,
             Request::ListRefs,
             Request::HeadBranch,
             Request::HasObject(some_id(1)),
             Request::GetObject(some_id(2)),
-            Request::PutObject { id: some_id(3), bytes: b"payload".to_vec() },
-            Request::UpdateRef { branch: "main".into(), id: some_id(4), expected_old: None },
-            Request::UpdateRef { branch: "dev".into(), id: some_id(5), expected_old: Some(some_id(6)) },
+            Request::PutObject {
+                id: some_id(3),
+                bytes: b"payload".to_vec(),
+            },
+            Request::UpdateRef {
+                branch: "main".into(),
+                id: some_id(4),
+                expected_old: None,
+            },
+            Request::UpdateRef {
+                branch: "dev".into(),
+                id: some_id(5),
+                expected_old: Some(some_id(6)),
+            },
             Request::GetPack {
                 wants: vec![some_id(7)],
                 haves: vec![some_id(8), some_id(9)],
@@ -801,12 +867,20 @@ mod tests {
                 haves: vec![],
                 filter: vec!["src/".to_string(), "docs/".to_string()],
             },
-            Request::GetPack { wants: vec![], haves: vec![], filter: vec![] },
+            Request::GetPack {
+                wants: vec![],
+                haves: vec![],
+                filter: vec![],
+            },
             Request::PutPack,
         ];
         for req in reqs {
             let bytes = req.encode();
-            assert_eq!(Request::decode(&bytes).unwrap(), req, "roundtrip failed for {req:?}");
+            assert_eq!(
+                Request::decode(&bytes).unwrap(),
+                req,
+                "roundtrip failed for {req:?}"
+            );
         }
     }
 
@@ -815,15 +889,27 @@ mod tests {
         // Truncated HasObject: opcode but only half an id.
         let mut bytes = Request::HasObject(some_id(1)).encode();
         bytes.truncate(10);
-        assert!(matches!(Request::decode(&bytes), Err(crate::error::Error::Protocol(_))));
+        assert!(matches!(
+            Request::decode(&bytes),
+            Err(crate::error::Error::Protocol(_))
+        ));
         // Unknown opcode.
-        assert!(matches!(Request::decode(&[0x7f]), Err(crate::error::Error::Protocol(_))));
+        assert!(matches!(
+            Request::decode(&[0x7f]),
+            Err(crate::error::Error::Protocol(_))
+        ));
         // Empty frame.
-        assert!(matches!(Request::decode(&[]), Err(crate::error::Error::Protocol(_))));
+        assert!(matches!(
+            Request::decode(&[]),
+            Err(crate::error::Error::Protocol(_))
+        ));
         // Trailing garbage after a well-formed request.
         let mut bytes = Request::Bye.encode();
         bytes.push(0);
-        assert!(matches!(Request::decode(&bytes), Err(crate::error::Error::Protocol(_))));
+        assert!(matches!(
+            Request::decode(&bytes),
+            Err(crate::error::Error::Protocol(_))
+        ));
     }
 
     #[test]
@@ -835,13 +921,19 @@ mod tests {
         assert_eq!(read_frame(&mut r).unwrap(), b"hello");
         assert_eq!(read_frame(&mut r).unwrap(), b"");
         // Client-style read: EOF is a lost connection.
-        assert!(matches!(read_frame(&mut r), Err(crate::error::Error::ConnectionLost(_))));
+        assert!(matches!(
+            read_frame(&mut r),
+            Err(crate::error::Error::ConnectionLost(_))
+        ));
         // Server-style read: EOF at a frame boundary is a clean end-of-session.
         let mut r2 = std::io::Cursor::new(Vec::<u8>::new());
         assert!(read_frame_opt(&mut r2).unwrap().is_none());
         // EOF mid-frame is a protocol error even for the server.
         let mut r3 = std::io::Cursor::new(vec![0, 0, 0, 9, b'x']);
-        assert!(matches!(read_frame_opt(&mut r3), Err(crate::error::Error::Protocol(_))));
+        assert!(matches!(
+            read_frame_opt(&mut r3),
+            Err(crate::error::Error::Protocol(_))
+        ));
     }
 
     #[test]
@@ -854,7 +946,10 @@ mod tests {
         let over = (scl_core::MAX_OBJECT_SIZE + 1) as u32;
         let mut r = std::io::Cursor::new(over.to_be_bytes().to_vec());
         let err = read_frame_opt(&mut r).unwrap_err();
-        assert!(matches!(err, crate::error::Error::Protocol(_)), "got {err:?}");
+        assert!(
+            matches!(err, crate::error::Error::Protocol(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -862,7 +957,10 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         write_ok(&mut buf, b"body").unwrap();
         let mut r = std::io::Cursor::new(buf);
-        assert_eq!(parse_response(read_frame(&mut r).unwrap()).unwrap(), b"body");
+        assert_eq!(
+            parse_response(read_frame(&mut r).unwrap()).unwrap(),
+            b"body"
+        );
 
         // Typed errors survive the wire.
         for (err, expect_nff, expect_nar) in [
@@ -874,7 +972,10 @@ mod tests {
             write_err(&mut buf, code, &msg).unwrap();
             let mut r = std::io::Cursor::new(buf);
             let back = parse_response(read_frame(&mut r).unwrap()).unwrap_err();
-            assert_eq!(matches!(back, crate::error::Error::NonFastForward), expect_nff);
+            assert_eq!(
+                matches!(back, crate::error::Error::NonFastForward),
+                expect_nff
+            );
             assert_eq!(matches!(back, crate::error::Error::NotARepo), expect_nar);
         }
 
@@ -895,10 +996,16 @@ mod tests {
         assert!(!decode_bool_body(&bool_body(false)).unwrap());
         let ids = vec![some_id(1), some_id(2)];
         assert_eq!(decode_ids_body(&ids_body(&ids)).unwrap(), ids);
-        let refs = vec![("dev".to_string(), some_id(3)), ("main".to_string(), some_id(4))];
+        let refs = vec![
+            ("dev".to_string(), some_id(3)),
+            ("main".to_string(), some_id(4)),
+        ];
         assert_eq!(decode_refs_body(&refs_body(&refs)).unwrap(), refs);
         // Truncated bodies are protocol errors, not panics.
-        assert!(matches!(decode_refs_body(&[0, 0, 0, 5]), Err(crate::error::Error::Protocol(_))));
+        assert!(matches!(
+            decode_refs_body(&[0, 0, 0, 5]),
+            Err(crate::error::Error::Protocol(_))
+        ));
     }
 
     /// A hostile server can claim a `ListRefs` count beyond the frame's actual
@@ -925,12 +1032,17 @@ mod tests {
     fn serve_answers_hello_then_verbs_until_bye() {
         let root = tmp_repo("serve");
         std::fs::write(root.join("a.txt"), b"one").unwrap();
-        let tip = crate::repo::Repo::open(&root).unwrap().commit("t", "c1").unwrap();
+        let tip = crate::repo::Repo::open(&root)
+            .unwrap()
+            .commit("t", "c1")
+            .unwrap();
 
         let responses = run_session(
             &root,
             &[
-                Request::Hello { version: PROTOCOL_VERSION },
+                Request::Hello {
+                    version: PROTOCOL_VERSION,
+                },
                 Request::ListRefs,
                 Request::HeadBranch,
                 Request::HasObject(tip),
@@ -938,10 +1050,16 @@ mod tests {
             ],
         );
         assert_eq!(responses.len(), 4); // Bye gets no response
-        assert_eq!(decode_u32_body(responses[0].as_ref().unwrap()).unwrap(), PROTOCOL_VERSION);
+        assert_eq!(
+            decode_u32_body(responses[0].as_ref().unwrap()).unwrap(),
+            PROTOCOL_VERSION
+        );
         let refs = decode_refs_body(responses[1].as_ref().unwrap()).unwrap();
         assert_eq!(refs, vec![("main".to_string(), tip)]);
-        assert_eq!(decode_str_body(responses[2].as_ref().unwrap()).unwrap(), "main");
+        assert_eq!(
+            decode_str_body(responses[2].as_ref().unwrap()).unwrap(),
+            "main"
+        );
         assert!(decode_bool_body(responses[3].as_ref().unwrap()).unwrap());
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -965,7 +1083,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap(); // a dir, but no .sc inside
 
-        let responses = run_session(&root, &[Request::Hello { version: PROTOCOL_VERSION }]);
+        let responses = run_session(
+            &root,
+            &[Request::Hello {
+                version: PROTOCOL_VERSION,
+            }],
+        );
         assert!(matches!(responses[0], Err(Error::NotARepo)));
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -975,8 +1098,15 @@ mod tests {
     fn serve_ends_cleanly_on_eof_without_bye() {
         let root = tmp_repo("eof");
         // No Bye at the end: input just runs out. serve must return Ok.
-        let responses =
-            run_session(&root, &[Request::Hello { version: PROTOCOL_VERSION }, Request::ListRefs]);
+        let responses = run_session(
+            &root,
+            &[
+                Request::Hello {
+                    version: PROTOCOL_VERSION,
+                },
+                Request::ListRefs,
+            ],
+        );
         assert_eq!(responses.len(), 2);
         assert!(responses[1].is_ok());
         std::fs::remove_dir_all(&root).unwrap();
@@ -989,14 +1119,19 @@ mod tests {
         let responses = run_session(
             &root,
             &[
-                Request::Hello { version: PROTOCOL_VERSION },
+                Request::Hello {
+                    version: PROTOCOL_VERSION,
+                },
                 Request::GetObject(missing), // NotFound on the server
                 Request::HeadBranch,         // session must still be alive
                 Request::Bye,
             ],
         );
         assert!(responses[1].is_err());
-        assert_eq!(decode_str_body(responses[2].as_ref().unwrap()).unwrap(), "main");
+        assert_eq!(
+            decode_str_body(responses[2].as_ref().unwrap()).unwrap(),
+            "main"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1064,8 +1199,8 @@ mod tests {
         let handle = std::thread::spawn(move || {
             serve_with_policy(&root, &mut server_read, &mut server_write, read_only)
         });
-        let client = crate::stdio_transport::WireClient::handshake(client_read, client_write)
-            .unwrap();
+        let client =
+            crate::stdio_transport::WireClient::handshake(client_read, client_write).unwrap();
         (client, handle)
     }
 
@@ -1075,7 +1210,10 @@ mod tests {
 
         let root = tmp_repo("readonly");
         std::fs::write(root.join("a.txt"), b"one").unwrap();
-        crate::repo::Repo::open(&root).unwrap().commit("t", "c1").unwrap();
+        crate::repo::Repo::open(&root)
+            .unwrap()
+            .commit("t", "c1")
+            .unwrap();
 
         let (client, server_join) = spawn_wire_pair_with_policy(&root, true);
 
@@ -1107,7 +1245,9 @@ mod tests {
         // than a clean Error::ReadOnly. This is the regression the brief's
         // drain-path correction targets.
         let (pack, _idx) = scl_core::pack::build_pack(&[(id, bytes)]).unwrap();
-        let err = client.put_pack(&mut std::io::Cursor::new(pack)).unwrap_err();
+        let err = client
+            .put_pack(&mut std::io::Cursor::new(pack))
+            .unwrap_err();
         assert!(
             matches!(err, Error::ReadOnly)
                 || matches!(&err, Error::Remote(m) if m.contains("read-only")),
@@ -1160,7 +1300,10 @@ mod tests {
         write_frame(&mut buf, &[ST_PACK_CHUNK, b'a', b'b']).unwrap();
         let mut sink = Vec::new();
         let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap_err();
-        assert!(matches!(err, Error::Protocol(_)), "expected Protocol error, got {err:?}");
+        assert!(
+            matches!(err, Error::Protocol(_)),
+            "expected Protocol error, got {err:?}"
+        );
 
         // A wrong-opcode frame mid-stream.
         let mut buf = Vec::new();
@@ -1168,6 +1311,9 @@ mod tests {
         write_frame(&mut buf, &[ST_OK]).unwrap(); // not a valid pack-stream marker
         let mut sink = Vec::new();
         let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap_err();
-        assert!(matches!(err, Error::Protocol(_)), "expected Protocol error, got {err:?}");
+        assert!(
+            matches!(err, Error::Protocol(_)),
+            "expected Protocol error, got {err:?}"
+        );
     }
 }

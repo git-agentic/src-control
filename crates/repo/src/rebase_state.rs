@@ -131,20 +131,31 @@ fn deserialize(text: &str) -> Result<RebaseState> {
     let mut lines = text.lines().peekable();
     let branch = parse_kv(lines.next().ok_or_else(|| bad("missing branch"))?, "branch")?;
     let original_tip = parse_id(
-        &parse_kv(lines.next().ok_or_else(|| bad("missing original_tip"))?, "original_tip")?,
+        &parse_kv(
+            lines.next().ok_or_else(|| bad("missing original_tip"))?,
+            "original_tip",
+        )?,
         "original_tip",
     )?;
     let target = parse_kv(lines.next().ok_or_else(|| bad("missing target"))?, "target")?;
     let acc_tip = parse_id(
-        &parse_kv(lines.next().ok_or_else(|| bad("missing acc_tip"))?, "acc_tip")?,
+        &parse_kv(
+            lines.next().ok_or_else(|| bad("missing acc_tip"))?,
+            "acc_tip",
+        )?,
         "acc_tip",
     )?;
     let conflicted = parse_id(
-        &parse_kv(lines.next().ok_or_else(|| bad("missing conflicted"))?, "conflicted")?,
+        &parse_kv(
+            lines.next().ok_or_else(|| bad("missing conflicted"))?,
+            "conflicted",
+        )?,
         "conflicted",
     )?;
     let total_text = parse_kv(lines.next().ok_or_else(|| bad("missing total"))?, "total")?;
-    let total: usize = total_text.parse().map_err(|_| bad(format!("bad total: {total_text}")))?;
+    let total: usize = total_text
+        .parse()
+        .map_err(|_| bad(format!("bad total: {total_text}")))?;
     let author = parse_kv(lines.next().ok_or_else(|| bad("missing author"))?, "author")?;
     // `resolved=` is optional on parse (added after the initial P19 shape) —
     // a file written before this field existed simply defaults to `false`,
@@ -153,7 +164,8 @@ fn deserialize(text: &str) -> Result<RebaseState> {
     let resolved = match lines.peek() {
         Some(line) if line.starts_with("resolved=") => {
             let text = parse_kv(lines.next().unwrap(), "resolved")?;
-            text.parse::<bool>().map_err(|_| bad(format!("bad resolved: {text}")))?
+            text.parse::<bool>()
+                .map_err(|_| bad(format!("bad resolved: {text}")))?
         }
         _ => false,
     };
@@ -163,14 +175,16 @@ fn deserialize(text: &str) -> Result<RebaseState> {
     let replayed = match lines.peek() {
         Some(line) if line.starts_with("replayed=") => {
             let text = parse_kv(lines.next().unwrap(), "replayed")?;
-            text.parse::<usize>().map_err(|_| bad(format!("bad replayed: {text}")))?
+            text.parse::<usize>()
+                .map_err(|_| bad(format!("bad replayed: {text}")))?
         }
         _ => 0,
     };
     let skipped = match lines.peek() {
         Some(line) if line.starts_with("skipped=") => {
             let text = parse_kv(lines.next().unwrap(), "skipped")?;
-            text.parse::<usize>().map_err(|_| bad(format!("bad skipped: {text}")))?
+            text.parse::<usize>()
+                .map_err(|_| bad(format!("bad skipped: {text}")))?
         }
         _ => 0,
     };
@@ -233,7 +247,11 @@ pub fn write_conflicts(layout: &Layout, paths: &[String]) -> Result<()> {
     // An empty list must serialize to an empty file, not "\n" — `"\n".lines()`
     // yields one empty-string element, not zero, which would make the last
     // resolved path look like it's still conflicted (as `""`).
-    let text = if paths.is_empty() { String::new() } else { format!("{}\n", paths.join("\n")) };
+    let text = if paths.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", paths.join("\n"))
+    };
     atomic_write(&conflicts_path(layout), text.as_bytes())
 }
 
@@ -261,7 +279,10 @@ pub fn read_decided_root(layout: &Layout) -> Result<Option<ObjectId>> {
 /// entries, which completion uses to carry absent protected files without
 /// re-reading a stale tip.
 pub fn write_decided_root(layout: &Layout, tree: ObjectId) -> Result<()> {
-    atomic_write(&decided_root_path(layout), format!("{}\n", tree.to_hex()).as_bytes())
+    atomic_write(
+        &decided_root_path(layout),
+        format!("{}\n", tree.to_hex()).as_bytes(),
+    )
 }
 
 /// Remove a file, treating "already absent" as success but propagating any
@@ -280,7 +301,9 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     // not turning "foo.bar" into "foo.tmp").
     let name = path
         .file_name()
-        .ok_or_else(|| Error::InvalidArgument(format!("path has no file name: {}", path.display())))?
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!("path has no file name: {}", path.display()))
+        })?
         .to_string_lossy()
         .into_owned();
     let tmp = path.with_file_name(format!("{name}.tmp"));
@@ -364,7 +387,13 @@ mod tests {
         let raw = std::fs::read_to_string(state_path(&layout)).unwrap();
         let patched = raw
             .lines()
-            .map(|l| if l.starts_with("total=") { "total=not-a-number" } else { l })
+            .map(|l| {
+                if l.starts_with("total=") {
+                    "total=not-a-number"
+                } else {
+                    l
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n")
             + "\n";
@@ -377,7 +406,11 @@ mod tests {
     #[test]
     fn decided_root_gated_on_state_presence() {
         let layout = tmp_layout("gated");
-        assert_eq!(read_decided_root(&layout).unwrap(), None, "no state yet: reads None");
+        assert_eq!(
+            read_decided_root(&layout).unwrap(),
+            None,
+            "no state yet: reads None"
+        );
         let st = sample("gated");
         write(&layout, &st).unwrap();
         let decided = ObjectId::of(b"decided-tree");
@@ -388,7 +421,10 @@ mod tests {
         // REBASE_STATE (the in_progress signal) is gone, even though the
         // file itself is still on disk.
         remove_if_exists(&state_path(&layout)).unwrap();
-        assert!(decided_root_path(&layout).exists(), "test setup: residue must remain");
+        assert!(
+            decided_root_path(&layout).exists(),
+            "test setup: residue must remain"
+        );
         assert_eq!(
             read_decided_root(&layout).unwrap(),
             None,
@@ -427,8 +463,14 @@ mod tests {
         }
         std::fs::write(state_path(&layout), text).unwrap();
         let read_back = read(&layout).unwrap().unwrap();
-        assert!(!read_back.resolved, "must default to false when the field is absent");
-        assert_eq!(read_back.remaining, st.remaining, "remaining ids must still parse correctly");
+        assert!(
+            !read_back.resolved,
+            "must default to false when the field is absent"
+        );
+        assert_eq!(
+            read_back.remaining, st.remaining,
+            "remaining ids must still parse correctly"
+        );
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
@@ -464,9 +506,18 @@ mod tests {
         }
         std::fs::write(state_path(&layout), text).unwrap();
         let read_back = read(&layout).unwrap().unwrap();
-        assert_eq!(read_back.replayed, 0, "must default to 0 when the field is absent");
-        assert_eq!(read_back.skipped, 0, "must default to 0 when the field is absent");
-        assert_eq!(read_back.remaining, st.remaining, "remaining ids must still parse correctly");
+        assert_eq!(
+            read_back.replayed, 0,
+            "must default to 0 when the field is absent"
+        );
+        assert_eq!(
+            read_back.skipped, 0,
+            "must default to 0 when the field is absent"
+        );
+        assert_eq!(
+            read_back.remaining, st.remaining,
+            "remaining ids must still parse correctly"
+        );
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 

@@ -30,7 +30,10 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// exist.
 pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent directory")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path has no parent directory",
+        )
     })?;
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
@@ -85,7 +88,10 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -107,8 +113,8 @@ mod tests {
     /// losing rename got `ENOENT`.
     #[test]
     fn concurrent_writers_same_target_dont_collide() {
-        let dir = std::env::temp_dir()
-            .join(format!("scl-fsutil-concurrent-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("scl-fsutil-concurrent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("obj");

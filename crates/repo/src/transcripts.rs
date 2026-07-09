@@ -65,9 +65,16 @@ fn write_index(layout: &Layout, entries: &[(ObjectId, ObjectId)]) -> Result<()> 
 
 /// Append one `(snapshot, transcript_id)` entry, deduping against an
 /// identical existing entry.
-pub(crate) fn append_index(layout: &Layout, snapshot: ObjectId, transcript_id: ObjectId) -> Result<()> {
+pub(crate) fn append_index(
+    layout: &Layout,
+    snapshot: ObjectId,
+    transcript_id: ObjectId,
+) -> Result<()> {
     let mut entries = read_index(layout)?;
-    if entries.iter().any(|(s, t)| *s == snapshot && *t == transcript_id) {
+    if entries
+        .iter()
+        .any(|(s, t)| *s == snapshot && *t == transcript_id)
+    {
         return Ok(());
     }
     entries.push((snapshot, transcript_id));
@@ -131,12 +138,9 @@ pub(crate) fn index_incoming(
 ) -> Result<usize> {
     let mut count = 0;
     for id in ids {
-        match store.get(id)? {
-            Object::Transcript(t) => {
-                append_index(layout, t.snapshot, *id)?;
-                count += 1;
-            }
-            _ => {}
+        if let Object::Transcript(t) = store.get(id)? {
+            append_index(layout, t.snapshot, *id)?;
+            count += 1;
         }
     }
     Ok(count)
@@ -296,7 +300,11 @@ impl Repo {
     /// for `sign_snapshot`). Errors with [`Error::InvalidArgument`] if
     /// `identity` has no signing half (a v1 identity), mirroring
     /// `sign_snapshot`.
-    pub fn sign_transcript(&self, tid: ObjectId, identity: &scl_crypto::Identity) -> Result<ObjectId> {
+    pub fn sign_transcript(
+        &self,
+        tid: ObjectId,
+        identity: &scl_crypto::Identity,
+    ) -> Result<ObjectId> {
         let signing = identity.signing.as_ref().ok_or_else(|| {
             Error::InvalidArgument(
                 "identity has no signing half (v1 identity); signing requires a v2 (scl-id-) \
@@ -306,7 +314,11 @@ impl Repo {
         })?;
         let signer = signing.public().to_bytes();
         let sig = scl_crypto::sign_transcript_id(signing, tid.as_bytes());
-        let sig_obj = SignatureObj { snapshot: tid, signer, sig };
+        let sig_obj = SignatureObj {
+            snapshot: tid,
+            signer,
+            sig,
+        };
         let id = {
             let arc = self.store_arc();
             let i = arc.lock().unwrap().put(Object::Signature(sig_obj))?;
@@ -326,7 +338,12 @@ impl Repo {
         trusted: &std::collections::HashMap<[u8; 32], String>,
     ) -> Result<SigStatus> {
         let sigs = self.signatures_for(tid)?;
-        Ok(crate::signatures::status_from(&sigs, tid, trusted, scl_crypto::verify_transcript_sig))
+        Ok(crate::signatures::status_from(
+            &sigs,
+            tid,
+            trusted,
+            scl_crypto::verify_transcript_sig,
+        ))
     }
 }
 
@@ -336,7 +353,8 @@ mod tests {
     use crate::repo::Repo;
 
     fn tmp_root(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("scl-repo-transcripts-{tag}-{}", std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("scl-repo-transcripts-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -352,7 +370,9 @@ mod tests {
         let pk = id.enc.public();
 
         let body = b"USER: fix the bug\nAGENT: done";
-        let tid = repo.attach_transcript(snap, "claude-code", "s1", body, &[pk]).unwrap();
+        let tid = repo
+            .attach_transcript(snap, "claude-code", "s1", body, &[pk])
+            .unwrap();
 
         // Indexed one-to-many under the snapshot.
         let idx = load(repo.layout()).unwrap();
@@ -383,7 +403,9 @@ mod tests {
         let snap = repo.commit("t", "c1").unwrap();
         let (_s, id) = scl_crypto::generate_identity_v2();
         let body = b"USER: hi\nAGENT: hello";
-        let tid = repo.attach_transcript(snap, "a", "s", body, &[id.enc.public()]).unwrap();
+        let tid = repo
+            .attach_transcript(snap, "a", "s", body, &[id.enc.public()])
+            .unwrap();
 
         // decrypt round-trips
         let got = repo.open_transcript(&tid, &id.enc).unwrap();
@@ -392,7 +414,10 @@ mod tests {
         // sign + verify four-state
         repo.sign_transcript(tid, &id).unwrap();
         let mut trusted = std::collections::HashMap::new();
-        trusted.insert(id.signing.as_ref().unwrap().public().to_bytes(), "me".to_string());
+        trusted.insert(
+            id.signing.as_ref().unwrap().public().to_bytes(),
+            "me".to_string(),
+        );
         assert_eq!(
             repo.transcript_sig_status(&tid, &trusted).unwrap(),
             crate::signatures::SigStatus::Trusted("me".into())
@@ -412,7 +437,9 @@ mod tests {
         std::fs::write(root.join("f"), b"x").unwrap();
         let live = repo.commit("t", "c1").unwrap();
         let (_s, id) = scl_crypto::generate_identity_v2();
-        let t_live = repo.attach_transcript(live, "a", "s", b"body", &[id.enc.public()]).unwrap();
+        let t_live = repo
+            .attach_transcript(live, "a", "s", b"body", &[id.enc.public()])
+            .unwrap();
         let dead = ObjectId::of(b"dead-snap");
         // hand-insert a dead-snapshot index line:
         append_index(repo.layout(), dead, ObjectId::of(b"dead-transcript")).unwrap();
@@ -420,7 +447,10 @@ mod tests {
         let mut reachable: std::collections::BTreeSet<ObjectId> = [live].into_iter().collect();
         let dropped = gc_prune(repo.layout(), &mut reachable).unwrap();
         assert_eq!(dropped, 1, "the dead-snapshot entry is dropped");
-        assert!(reachable.contains(&t_live), "the live transcript id is rooted");
+        assert!(
+            reachable.contains(&t_live),
+            "the live transcript id is rooted"
+        );
         assert!(load(repo.layout()).unwrap().iter().all(|(s, _)| *s == live));
 
         drop(repo);

@@ -200,10 +200,7 @@ impl Repo {
     /// Refuses on a dirty working tree, same as [`Repo::set_sparse`] and for
     /// the same reason (the write loop rewrites every in-sparse target entry
     /// unconditionally).
-    pub fn disable_sparse(
-        &self,
-        identity: Option<&scl_crypto::SecretKey>,
-    ) -> Result<Vec<String>> {
+    pub fn disable_sparse(&self, identity: Option<&scl_crypto::SecretKey>) -> Result<Vec<String>> {
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -305,7 +302,10 @@ mod tests {
         assert!(layout.sparse_path().exists());
 
         store(&layout, &Sparse::default()).unwrap();
-        assert!(!layout.sparse_path().exists(), "empty spec must remove the file");
+        assert!(
+            !layout.sparse_path().exists(),
+            "empty spec must remove the file"
+        );
 
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
@@ -329,7 +329,8 @@ mod tests {
         use scl_core::ObjectId;
 
         // Test that set_sparse refuses during merge, pick, and rebase.
-        let root = std::env::temp_dir().join(format!("scl-sparse-in-progress-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("scl-sparse-in-progress-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let repo = Repo::init(&root).unwrap();
 
@@ -396,7 +397,8 @@ mod tests {
         test_refused_during_state!(
             pick,
             |layout: &Layout| {
-                crate::pick_state::write(layout, &ObjectId::of(b"picked"), &[], None, None).unwrap();
+                crate::pick_state::write(layout, &ObjectId::of(b"picked"), &[], None, None)
+                    .unwrap();
             },
             |layout: &Layout| {
                 crate::pick_state::clear(layout).unwrap();
@@ -437,10 +439,10 @@ mod tests {
     /// offending prefix and pointing at `sc backfill`.
     #[test]
     fn set_sparse_widen_beyond_partial_errors_with_backfill_hint() {
-        let src_root = std::env::temp_dir()
-            .join(format!("scl-sparse-widen-src-{}", std::process::id()));
-        let dst_root = std::env::temp_dir()
-            .join(format!("scl-sparse-widen-dst-{}", std::process::id()));
+        let src_root =
+            std::env::temp_dir().join(format!("scl-sparse-widen-src-{}", std::process::id()));
+        let dst_root =
+            std::env::temp_dir().join(format!("scl-sparse-widen-dst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&src_root);
         let _ = std::fs::remove_dir_all(&dst_root);
         std::fs::create_dir_all(src_root.join("src")).unwrap();
@@ -466,7 +468,10 @@ mod tests {
             "expected a gap error naming docs/, got {err:?}"
         );
         let msg = err.to_string();
-        assert!(msg.contains("backfill"), "error must hint at `sc backfill`: {msg}");
+        assert!(
+            msg.contains("backfill"),
+            "error must hint at `sc backfill`: {msg}"
+        );
 
         // No partial write: the spec is unchanged.
         assert_eq!(dst.sparse_spec().unwrap(), before);
@@ -482,10 +487,10 @@ mod tests {
     /// tree. Preflight — before any disk write.
     #[test]
     fn disable_sparse_on_partial_clone_errors_with_backfill_hint() {
-        let src_root = std::env::temp_dir()
-            .join(format!("scl-sparse-disable-src-{}", std::process::id()));
-        let dst_root = std::env::temp_dir()
-            .join(format!("scl-sparse-disable-dst-{}", std::process::id()));
+        let src_root =
+            std::env::temp_dir().join(format!("scl-sparse-disable-src-{}", std::process::id()));
+        let dst_root =
+            std::env::temp_dir().join(format!("scl-sparse-disable-dst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&src_root);
         let _ = std::fs::remove_dir_all(&dst_root);
         std::fs::create_dir_all(src_root.join("src")).unwrap();
@@ -505,8 +510,14 @@ mod tests {
         let before = dst.sparse_spec().unwrap();
 
         let err = dst.disable_sparse(None).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)), "expected a clear refusal, got {err:?}");
-        assert!(err.to_string().contains("backfill"), "error must hint at `sc backfill`: {err}");
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected a clear refusal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("backfill"),
+            "error must hint at `sc backfill`: {err}"
+        );
 
         // No partial write: the spec is unchanged, and nothing outside the
         // filter got materialized to disk.
@@ -523,10 +534,10 @@ mod tests {
     /// promisor's own prefix) must NOT be refused.
     #[test]
     fn set_sparse_within_filter_is_allowed_on_partial_clone() {
-        let src_root = std::env::temp_dir()
-            .join(format!("scl-sparse-within-src-{}", std::process::id()));
-        let dst_root = std::env::temp_dir()
-            .join(format!("scl-sparse-within-dst-{}", std::process::id()));
+        let src_root =
+            std::env::temp_dir().join(format!("scl-sparse-within-src-{}", std::process::id()));
+        let dst_root =
+            std::env::temp_dir().join(format!("scl-sparse-within-dst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&src_root);
         let _ = std::fs::remove_dir_all(&dst_root);
         std::fs::create_dir_all(src_root.join("src/app")).unwrap();
@@ -547,7 +558,10 @@ mod tests {
         // narrowing further within the filter must not touch it (P27 Task 5
         // fix to `materialize`'s old-root walk).
         dst.set_sparse(&["src/app/".to_string()], None).unwrap();
-        assert_eq!(dst.sparse_spec().unwrap().prefixes(), &["src/app/".to_string()]);
+        assert_eq!(
+            dst.sparse_spec().unwrap().prefixes(),
+            &["src/app/".to_string()]
+        );
         assert!(!dst_root.join("docs/b.txt").exists());
         assert!(dst_root.join("src/app/a.txt").exists());
 

@@ -64,7 +64,11 @@ impl Repo {
     fn open_layout(layout: Layout, budget_bytes: usize) -> Result<Repo> {
         let lock = RepoLock::acquire(&layout)?;
         let store = Store::open_persistent(layout.objects_dir(), budget_bytes)?;
-        Ok(Repo { layout, vfs: VfsRepo::new(store), _lock: lock })
+        Ok(Repo {
+            layout,
+            vfs: VfsRepo::new(store),
+            _lock: lock,
+        })
     }
 
     /// The resolved on-disk paths for this repo (root, `.sc/`, refs, etc.).
@@ -321,8 +325,7 @@ impl Repo {
                 // (ours' wrap bytes win on a shared recipient).
                 let ours_p = self.snapshot(&t)?.protection;
                 let theirs_p = self.snapshot(&mh)?.protection;
-                let prefixes =
-                    crate::protect::merge_prefixes(&ours_p.prefixes, &theirs_p.prefixes);
+                let prefixes = crate::protect::merge_prefixes(&ours_p.prefixes, &theirs_p.prefixes);
                 let mut wrapped = ours_p.wrapped;
                 for (id, wks) in &theirs_p.wrapped {
                     let entry = wrapped.entry(*id).or_default();
@@ -437,8 +440,9 @@ impl Repo {
 
             // Decided tree first (merge completion only), then the parents
             // restricted to paths outside the decided tree.
-            let mut sources: Vec<std::collections::BTreeMap<String, (ObjectId, scl_core::FileMode, u8)>> =
-                Vec::new();
+            let mut sources: Vec<
+                std::collections::BTreeMap<String, (ObjectId, scl_core::FileMode, u8)>,
+            > = Vec::new();
             let mut decided_paths: std::collections::BTreeSet<String> = Default::default();
             if let Some(dr) = decided_root {
                 let decided = if partial {
@@ -449,7 +453,7 @@ impl Repo {
                 decided_paths = decided.keys().cloned().collect();
                 sources.push(decided);
             }
-            for parent in tip.into_iter().chain(merge_head.into_iter()) {
+            for parent in tip.into_iter().chain(merge_head) {
                 let parent_root = store.get_snapshot(&parent)?.root;
                 let mut entries = if partial {
                     worktree::tree_file_entries_with_perms_sparse(&mut store, parent_root, sparse)?
@@ -490,7 +494,9 @@ impl Repo {
                     // both-parents union during merge completion, so decided/theirs
                     // blobs find their wraps here too.
                     if let Some(prior_wks) = protection.wrapped.get(&blob_id) {
-                        fresh_wrapped.entry(blob_id).or_insert_with(|| prior_wks.clone());
+                        fresh_wrapped
+                            .entry(blob_id)
+                            .or_insert_with(|| prior_wks.clone());
                     }
                 }
             }
@@ -603,8 +609,11 @@ impl Repo {
         // one (P19 final-review fix I2) — same gating as `decided_root`:
         // only meaningful, and only read, while a pick is actually in
         // progress.
-        let pick_registry_base =
-            if pick_head.is_some() { crate::pick_state::read_mainline_base(&self.layout)? } else { None };
+        let pick_registry_base = if pick_head.is_some() {
+            crate::pick_state::read_mainline_base(&self.layout)?
+        } else {
+            None
+        };
         let merging = merge_head.is_some();
         let picking = pick_head.is_some();
         // Pick completion (no merge in progress) is the extracted assembly
@@ -685,7 +694,9 @@ impl Repo {
         }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
         let tip_snap = self.snapshot(&tip)?;
-        let msg = message.map(|m| m.to_string()).unwrap_or_else(|| tip_snap.message.clone());
+        let msg = message
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| tip_snap.message.clone());
 
         let head = refs::current_branch(&self.layout)?;
         let before = refs::read_branch_tip(&self.layout, &head)?;
@@ -705,7 +716,13 @@ impl Repo {
         )?;
 
         refs::write_branch_tip(&self.layout, &head, &id)?;
-        crate::oplog::record(&self.layout, "amend", &head, &head, &[(head.clone(), before, Some(id))])?;
+        crate::oplog::record(
+            &self.layout,
+            "amend",
+            &head,
+            &head,
+            &[(head.clone(), before, Some(id))],
+        )?;
         Ok(id)
     }
 
@@ -793,16 +810,24 @@ impl Repo {
         };
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
-        worktree::diff_worktree(&self.layout, &mut store, head_root, &protection, &self.sparse_spec()?)
+        worktree::diff_worktree(
+            &self.layout,
+            &mut store,
+            head_root,
+            &protection,
+            &self.sparse_spec()?,
+        )
     }
 
     /// The working-tree file paths (repo-relative, sorted) that `commit` would
     /// snapshot — the same set `sc protect` encrypts when they match a prefix.
     pub fn worktree_paths(&self) -> Result<Vec<String>> {
-        Ok(worktree::read_worktree(&self.layout, &self.tracked_paths()?)?
-            .into_iter()
-            .map(|(path, _bytes, _mode)| path)
-            .collect())
+        Ok(
+            worktree::read_worktree(&self.layout, &self.tracked_paths()?)?
+                .into_iter()
+                .map(|(path, _bytes, _mode)| path)
+                .collect(),
+        )
     }
 
     /// Line-level unified diff of the working tree against HEAD (`sc diff`).
@@ -820,7 +845,11 @@ impl Repo {
     pub fn diff_unified(&self) -> Result<String> {
         use scl_core::PROTECTED;
         let sparse = self.sparse_spec()?;
-        let head_root = self.head_tip()?.map(|t| self.snapshot(&t)).transpose()?.map(|s| s.root);
+        let head_root = self
+            .head_tip()?
+            .map(|t| self.snapshot(&t))
+            .transpose()?
+            .map(|s| s.root);
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         let head = match head_root {
@@ -923,7 +952,10 @@ impl Repo {
     /// underflow — `write` never produces such a file itself.
     pub fn rebase_progress(&self) -> Result<Option<(ObjectId, usize, usize)>> {
         Ok(crate::rebase_state::read(&self.layout)?.map(|st| {
-            let done = st.total.saturating_sub(st.remaining.len()).saturating_sub(1);
+            let done = st
+                .total
+                .saturating_sub(st.remaining.len())
+                .saturating_sub(1);
             (st.conflicted, done, st.total)
         }))
     }
@@ -951,7 +983,8 @@ impl Repo {
     /// (e.g. from a freshly imported git remote) works without an intervening
     /// local commit.
     pub fn merge(&self, branch: &str, author: &str) -> Result<ObjectId> {
-        self.merge_with_identity(branch, author, None).map(|(id, _)| id)
+        self.merge_with_identity(branch, author, None)
+            .map(|(id, _)| id)
     }
 
     /// Like [`merge`][Repo::merge] but threads `identity` through the
@@ -1094,7 +1127,10 @@ impl Repo {
         // lookups below — its `wrapped` map is irrelevant here.
         let union_prefixes =
             crate::protect::merge_prefixes(&ours_protection.prefixes, &theirs_protection.prefixes);
-        let union_prot = scl_core::Protection { prefixes: union_prefixes.clone(), wrapped: Default::default() };
+        let union_prot = scl_core::Protection {
+            prefixes: union_prefixes.clone(),
+            wrapped: Default::default(),
+        };
 
         // Split the resolved file set: carried ciphertext (needs_encrypt:
         // false, PROTECTED) stays byte-for-byte as-is; needs_encrypt outputs
@@ -1113,9 +1149,12 @@ impl Repo {
                 to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, recipients));
             } else if f.perms & scl_core::PROTECTED == 0 {
                 match crate::protect::matching_prefix(&union_prot, &f.path) {
-                    Some(rule) => {
-                        to_encrypt.push((f.path.clone(), f.bytes.clone(), f.mode, rule.granted_keys()))
-                    }
+                    Some(rule) => to_encrypt.push((
+                        f.path.clone(),
+                        f.bytes.clone(),
+                        f.mode,
+                        rule.granted_keys(),
+                    )),
                     None => carried.push((f.path.clone(), f.bytes.clone(), f.mode, 0)),
                 }
             } else {
@@ -1206,7 +1245,10 @@ impl Repo {
                     .collect();
             wrapped.retain(|id, _| reachable.contains(id));
         }
-        let merged_protection = scl_core::Protection { prefixes: union_prefixes, wrapped };
+        let merged_protection = scl_core::Protection {
+            prefixes: union_prefixes,
+            wrapped,
+        };
 
         // Materialize the merged tree into the working dir. Protection-aware:
         // a merged PROTECTED entry decrypts for `identity` when possible, else
@@ -1292,8 +1334,10 @@ impl Repo {
         conflicted_paths: &[String],
     ) -> Result<ObjectId> {
         let sparse = self.sparse_spec()?;
-        let needs_widen: Vec<&String> =
-            conflicted_paths.iter().filter(|p| !sparse.matches(p)).collect();
+        let needs_widen: Vec<&String> = conflicted_paths
+            .iter()
+            .filter(|p| !sparse.matches(p))
+            .collect();
         if !needs_widen.is_empty() {
             let names = needs_widen
                 .iter()
@@ -1410,7 +1454,10 @@ impl Repo {
             }
         }
         names.sort();
-        Ok(names.into_iter().map(|n| (n.clone(), n == current)).collect())
+        Ok(names
+            .into_iter()
+            .map(|n| (n.clone(), n == current))
+            .collect())
     }
 
     /// Create `name` pointing at the current tip (errors if unborn or exists).
@@ -1507,7 +1554,6 @@ impl Repo {
         Ok(skipped)
     }
 
-
     /// Expose the underlying VFS repo handle (needed by secrets.rs methods).
     pub(crate) fn vfs_handle(&self) -> &VfsRepo {
         &self.vfs
@@ -1527,7 +1573,6 @@ impl Repo {
         let mut store = store_arc.lock().unwrap();
         crate::gc::run(&self.layout, &mut store, grace)
     }
-
 }
 
 /// Current unix time in seconds, for snapshot timestamps. Snapshot ids
@@ -1551,7 +1596,6 @@ fn push_file_diff(out: &mut String, path: &str, old: &[u8], new: &[u8]) {
     let new_s = String::from_utf8_lossy(new);
     out.push_str(&crate::textdiff::unified(path, &old_s, &new_s));
 }
-
 
 /// Reject branch names that would escape or corrupt `refs/heads/` or the
 /// oplog grammar. A branch name becomes a single path component under
@@ -1607,7 +1651,14 @@ impl Repo {
                 })
                 .collect(),
         });
-        self.commit_snapshot(root, parents, secrets, protection, "system", "set protected prefix")
+        self.commit_snapshot(
+            root,
+            parents,
+            secrets,
+            protection,
+            "system",
+            "set protected prefix",
+        )
     }
 }
 
@@ -1633,7 +1684,10 @@ mod tests {
 
         // status: the ignored path is invisible; the real file and .scignore show.
         let st = repo.status().unwrap();
-        assert_eq!(st.added, vec![".scignore".to_string(), "real.txt".to_string()]);
+        assert_eq!(
+            st.added,
+            vec![".scignore".to_string(), "real.txt".to_string()]
+        );
 
         // commit: the snapshot tree must not contain the ignored path.
         let id = repo.commit("t", "c1").unwrap();
@@ -1643,7 +1697,10 @@ mod tests {
         let entries = worktree::tree_file_ids(&mut store, snap_root).unwrap();
         drop(store);
         assert!(entries.contains_key("real.txt"));
-        assert!(!entries.keys().any(|p| p.starts_with("junk/")), "ignored path committed");
+        assert!(
+            !entries.keys().any(|p| p.starts_with("junk/")),
+            "ignored path committed"
+        );
 
         // A tracked file stays tracked even when a later rule matches it.
         std::fs::write(root.join(".scignore"), "junk\nreal.txt\n").unwrap();
@@ -1793,7 +1850,10 @@ mod tests {
         let theirs = repo.commit("me", "theirs").unwrap();
         repo.switch("main").unwrap();
         let merge = repo.merge("feature", "me").unwrap();
-        assert_eq!(std::fs::read(root.join("shared.txt")).unwrap(), b"a\nB\nC\n");
+        assert_eq!(
+            std::fs::read(root.join("shared.txt")).unwrap(),
+            b"a\nB\nC\n"
+        );
         let store_arc = repo.vfs_handle().store();
         let snap = store_arc.lock().unwrap().get_snapshot(&merge).unwrap();
         assert_eq!(snap.parents, vec![ours, theirs]);
@@ -1808,7 +1868,9 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         std::fs::write(root.join("a.txt"), b"v1").unwrap();
         let id = repo.commit("me", "first commit\nsecond line").unwrap();
-        let rec = crate::oplog::last(repo.layout()).unwrap().expect("commit must log a record");
+        let rec = crate::oplog::last(repo.layout())
+            .unwrap()
+            .expect("commit must log a record");
         assert!(rec.desc.starts_with("commit: "), "got {:?}", rec.desc);
         assert_eq!(rec.desc, "commit: first commit");
         assert_eq!(rec.head_before, "main");
@@ -1858,7 +1920,10 @@ mod tests {
         assert_eq!(rec2.desc, "merge feature");
         assert_eq!(rec2.head_before, "main");
         assert_eq!(rec2.head_after, "main");
-        assert_eq!(rec2.refs, vec![("main".to_string(), Some(ours), Some(merge))]);
+        assert_eq!(
+            rec2.refs,
+            vec![("main".to_string(), Some(ours), Some(merge))]
+        );
         drop(repo2);
         std::fs::remove_dir_all(&root2).unwrap();
 
@@ -1878,7 +1943,10 @@ mod tests {
         let err = repo3.merge("feature", "me").unwrap_err();
         assert!(matches!(err, Error::MergeConflicts(1)));
         let after_conflict = crate::oplog::last(repo3.layout()).unwrap().unwrap();
-        assert_eq!(before_conflict.seq, after_conflict.seq, "conflicted merge must log nothing");
+        assert_eq!(
+            before_conflict.seq, after_conflict.seq,
+            "conflicted merge must log nothing"
+        );
         drop(repo3);
         std::fs::remove_dir_all(&root3).unwrap();
     }
@@ -1895,7 +1963,10 @@ mod tests {
         assert_eq!(branch_rec.desc, "branch feature");
         assert_eq!(branch_rec.head_before, "main");
         assert_eq!(branch_rec.head_after, "main");
-        assert_eq!(branch_rec.refs, vec![("feature".to_string(), None, Some(tip))]);
+        assert_eq!(
+            branch_rec.refs,
+            vec![("feature".to_string(), None, Some(tip))]
+        );
 
         repo.switch("feature").unwrap();
         let switch_rec = crate::oplog::last(repo.layout()).unwrap().unwrap();
@@ -1997,11 +2068,17 @@ mod tests {
         repo.switch("main").unwrap();
 
         let _ = repo.merge("feature", "me").unwrap_err();
-        assert!(root.join("new.txt").exists(), "merge pulled in theirs' new.txt");
+        assert!(
+            root.join("new.txt").exists(),
+            "merge pulled in theirs' new.txt"
+        );
         repo.merge_abort().unwrap();
         assert!(!repo.merge_in_progress());
         // theirs-only file must be gone, f.txt restored to ours' content
-        assert!(!root.join("new.txt").exists(), "abort must drop theirs-only new.txt");
+        assert!(
+            !root.join("new.txt").exists(),
+            "abort must drop theirs-only new.txt"
+        );
         assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"a\nX\nc\n");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2095,13 +2172,17 @@ mod tests {
         // Switch WITH identity so the protected file stays materialized on
         // disk across the branch hop (a keyless switch would skip/remove it,
         // which is not what this test is about).
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/a.txt"), b"v3").unwrap();
         repo.commit("me", "feature edits").unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
         let err = repo.merge("feature", "me").unwrap_err();
-        assert!(matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "secret/a.txt"), "got {err:?}");
+        assert!(
+            matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "secret/a.txt"),
+            "got {err:?}"
+        );
 
         // Refs untouched.
         assert_eq!(repo.head_tip().unwrap(), Some(ours));
@@ -2132,15 +2213,25 @@ mod tests {
 
         std::fs::write(root.join("secret/a.txt"), b"L1\nl2\nl3\n").unwrap();
         repo.commit("me", "main edits line 1").unwrap();
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nL3\n").unwrap();
         repo.commit("me", "feature edits line 3").unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
-        let (id, skipped) = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap();
-        assert!(skipped.is_empty(), "alice holds the key; nothing skipped: {skipped:?}");
+        let (id, skipped) = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap();
+        assert!(
+            skipped.is_empty(),
+            "alice holds the key; nothing skipped: {skipped:?}"
+        );
         let snap = repo.snapshot(&id).unwrap();
-        assert_eq!(snap.parents.len(), 2, "clean merge is a two-parent snapshot");
+        assert_eq!(
+            snap.parents.len(),
+            2,
+            "clean merge is a two-parent snapshot"
+        );
 
         let (blob_id, bytes) = {
             let store_arc = repo.vfs_handle().store();
@@ -2156,9 +2247,11 @@ mod tests {
         };
         let prot = &snap.protection;
         let alice_pt =
-            crate::protect::decrypt_with(&bytes, &blob_id, &[prot], &alice_sk, "secret/a.txt").unwrap();
+            crate::protect::decrypt_with(&bytes, &blob_id, &[prot], &alice_sk, "secret/a.txt")
+                .unwrap();
         let bob_pt =
-            crate::protect::decrypt_with(&bytes, &blob_id, &[prot], &bob_sk, "secret/a.txt").unwrap();
+            crate::protect::decrypt_with(&bytes, &blob_id, &[prot], &bob_sk, "secret/a.txt")
+                .unwrap();
         assert_eq!(&alice_pt[..], b"L1\nl2\nL3\n");
         assert_eq!(&bob_pt[..], b"L1\nl2\nL3\n");
         drop(repo);
@@ -2209,7 +2302,11 @@ mod tests {
             let (id, _, perms) = entries["keys/b.txt"];
             (id, perms)
         };
-        assert_ne!(b_perms & scl_core::PROTECTED, 0, "new file under keys/ must be protected");
+        assert_ne!(
+            b_perms & scl_core::PROTECTED,
+            0,
+            "new file under keys/ must be protected"
+        );
         // And alice can decrypt it — the rule's recipient was carried too.
         let bytes = {
             let store_arc = repo.vfs_handle().store();
@@ -2219,8 +2316,14 @@ mod tests {
                 _ => panic!("expected Blob"),
             }
         };
-        let pt = crate::protect::decrypt_with(&bytes, &b_id, &[&snap2.protection], &alice_sk, "keys/b.txt")
-            .unwrap();
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &b_id,
+            &[&snap2.protection],
+            &alice_sk,
+            "keys/b.txt",
+        )
+        .unwrap();
         assert_eq!(&pt[..], b"another-secret");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2279,9 +2382,19 @@ mod tests {
                 _ => panic!("expected Blob"),
             }
         };
-        assert_ne!(&bytes[..], b"plain-for-now", "must not be the plaintext blob");
-        let pt = crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "keys/a.txt")
-            .unwrap();
+        assert_ne!(
+            &bytes[..],
+            b"plain-for-now",
+            "must not be the plaintext blob"
+        );
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &blob_id,
+            &[&snap.protection],
+            &alice_sk,
+            "keys/a.txt",
+        )
+        .unwrap();
         assert_eq!(&pt[..], b"plain-for-now");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2325,7 +2438,10 @@ mod tests {
             "conflict markers on disk: {}",
             String::from_utf8_lossy(&marked)
         );
-        assert!(!root.join("secret/db.txt").exists(), "no key: theirs' file stays off disk");
+        assert!(
+            !root.join("secret/db.txt").exists(),
+            "no key: theirs' file stays off disk"
+        );
 
         // Resolve the plain conflict and complete via commit.
         std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
@@ -2336,7 +2452,10 @@ mod tests {
 
         // Theirs' rule survives the completion...
         assert!(
-            snap.protection.prefixes.iter().any(|p| p.prefix == "secret/"),
+            snap.protection
+                .prefixes
+                .iter()
+                .any(|p| p.prefix == "secret/"),
             "theirs' secret/ rule must survive completion"
         );
         // ...and theirs' ciphertext is carried forward verbatim, decryptable.
@@ -2357,9 +2476,14 @@ mod tests {
             }
         };
         assert_ne!(&bytes[..], b"hunter2", "carried blob must stay ciphertext");
-        let pt =
-            crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "secret/db.txt")
-                .unwrap();
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &blob_id,
+            &[&snap.protection],
+            &alice_sk,
+            "secret/db.txt",
+        )
+        .unwrap();
         assert_eq!(&pt[..], b"hunter2", "alice still decrypts the carried file");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2386,7 +2510,9 @@ mod tests {
         std::fs::write(root.join("shared.txt"), b"a\nX\nc\n").unwrap();
         std::fs::create_dir_all(root.join("keys")).unwrap();
         std::fs::write(root.join("keys/a.txt"), b"plain-for-now").unwrap();
-        let ours = repo.commit("me", "ours edits shared + adds plain keys/a.txt").unwrap();
+        let ours = repo
+            .commit("me", "ours edits shared + adds plain keys/a.txt")
+            .unwrap();
 
         // theirs: conflicting plain edit + records the keys/ rule (nothing to
         // encrypt on its side).
@@ -2395,7 +2521,10 @@ mod tests {
         repo.commit("me", "theirs edits shared").unwrap();
         let theirs = repo.protect("keys/", &[alice_pk], None).unwrap();
         repo.switch("main").unwrap();
-        assert_eq!(std::fs::read(root.join("keys/a.txt")).unwrap(), b"plain-for-now");
+        assert_eq!(
+            std::fs::read(root.join("keys/a.txt")).unwrap(),
+            b"plain-for-now"
+        );
 
         let err = repo.merge("feature", "me").unwrap_err();
         assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
@@ -2408,7 +2537,10 @@ mod tests {
             "ours' plain file under theirs' rule must stay on disk while conflicted"
         );
         let marked = std::fs::read(root.join("shared.txt")).unwrap();
-        assert!(marked.windows(7).any(|w| w == b"<<<<<<<"), "markers written");
+        assert!(
+            marked.windows(7).any(|w| w == b"<<<<<<<"),
+            "markers written"
+        );
 
         // Resolve and complete: the file must land ENCRYPTED under theirs' rule.
         std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
@@ -2438,10 +2570,19 @@ mod tests {
                 _ => panic!("expected Blob"),
             }
         };
-        assert_ne!(&bytes[..], b"plain-for-now", "snapshot blob must be ciphertext");
-        let pt =
-            crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "keys/a.txt")
-                .unwrap();
+        assert_ne!(
+            &bytes[..],
+            b"plain-for-now",
+            "snapshot blob must be ciphertext"
+        );
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &blob_id,
+            &[&snap.protection],
+            &alice_sk,
+            "keys/a.txt",
+        )
+        .unwrap();
         assert_eq!(&pt[..], b"plain-for-now");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2463,12 +2604,15 @@ mod tests {
 
         std::fs::write(root.join("secret/a.txt"), b"L1\nl2\nl3\n").unwrap();
         repo.commit("me", "main edits line 1").unwrap();
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nL3\n").unwrap();
         repo.commit("me", "feature edits line 3").unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
-        let (id, _skipped) = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap();
+        let (id, _skipped) = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap();
         let snap = repo.snapshot(&id).unwrap();
         let expected_plain = b"L1\nl2\nL3\n";
 
@@ -2483,10 +2627,19 @@ mod tests {
                 Object::Blob(b) => b.to_vec(),
                 _ => panic!("expected Blob"),
             };
-            assert_ne!(&bytes[..], &expected_plain[..], "{path}: plaintext leaked into the CAS");
-            let pt = crate::protect::decrypt_with(&bytes, blob_id, &[&snap.protection], &alice_sk, path)
-                .unwrap();
-            assert_eq!(&pt[..], expected_plain, "{path}: decrypts back to the merged plaintext");
+            assert_ne!(
+                &bytes[..],
+                &expected_plain[..],
+                "{path}: plaintext leaked into the CAS"
+            );
+            let pt =
+                crate::protect::decrypt_with(&bytes, blob_id, &[&snap.protection], &alice_sk, path)
+                    .unwrap();
+            assert_eq!(
+                &pt[..],
+                expected_plain,
+                "{path}: decrypts back to the merged plaintext"
+            );
         }
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2517,7 +2670,9 @@ mod tests {
             repo.commit("me", "feature edits line 3").unwrap();
             repo.switch_with_identity("main", Some(&sk)).unwrap();
 
-            let (id, _skipped) = repo.merge_with_identity("feature", "me", Some(&sk)).unwrap();
+            let (id, _skipped) = repo
+                .merge_with_identity("feature", "me", Some(&sk))
+                .unwrap();
             let snap = repo.snapshot(&id).unwrap();
             let store_arc = repo.vfs_handle().store();
             let mut s = store_arc.lock().unwrap();
@@ -2529,7 +2684,10 @@ mod tests {
 
         let (repo1, root1, _id1, blob1) = build("p15-merge-convergent-a");
         let (repo2, root2, _id2, blob2) = build("p15-merge-convergent-b");
-        assert_eq!(blob1, blob2, "identical merged plaintext must converge to the same blob id");
+        assert_eq!(
+            blob1, blob2,
+            "identical merged plaintext must converge to the same blob id"
+        );
         drop(repo1);
         drop(repo2);
         std::fs::remove_dir_all(&root1).unwrap();
@@ -2573,31 +2731,50 @@ mod tests {
 
         std::fs::write(root.join("secret/a.txt"), b"OURS-EDIT\nl2\nl3\n").unwrap();
         let ours = repo.commit("me", "main edits line 1").unwrap();
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/a.txt"), b"THEIRS-EDIT\nl2\nl3\n").unwrap();
         let theirs = repo.commit("me", "feature edits line 1").unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
-        let err = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap_err();
+        let err = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
         assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
-        assert_eq!(repo.merge_conflicts().unwrap(), vec!["secret/a.txt".to_string()]);
+        assert_eq!(
+            repo.merge_conflicts().unwrap(),
+            vec!["secret/a.txt".to_string()]
+        );
 
         // Markers are on disk as editable plaintext...
         let marked = std::fs::read(root.join("secret/a.txt")).unwrap();
-        assert!(marked.windows(7).any(|w| w == b"<<<<<<<"), "markers on disk");
+        assert!(
+            marked.windows(7).any(|w| w == b"<<<<<<<"),
+            "markers on disk"
+        );
         assert!(marked.windows(9).any(|w| w == b"OURS-EDIT"));
         assert!(marked.windows(11).any(|w| w == b"THEIRS-EDIT"));
         // ...and NO CAS object contains the marker plaintext (the conflicted
         // working set is written to the worktree directly, never via a tree).
-        assert!(!cas_blob_contains(&repo, b"<<<<<<<"), "marker plaintext leaked into the CAS");
-        assert!(!cas_blob_contains(&repo, b"OURS-EDIT"), "protected plaintext leaked into the CAS");
+        assert!(
+            !cas_blob_contains(&repo, b"<<<<<<<"),
+            "marker plaintext leaked into the CAS"
+        );
+        assert!(
+            !cas_blob_contains(&repo, b"OURS-EDIT"),
+            "protected plaintext leaked into the CAS"
+        );
 
         // Resolve and complete via commit: re-encryption happens there.
         std::fs::write(root.join("secret/a.txt"), b"RESOLVED\nl2\nl3\n").unwrap();
         let id = repo.commit("me", "resolve secret conflict").unwrap();
         assert!(!repo.merge_in_progress());
         let snap = repo.snapshot(&id).unwrap();
-        assert_eq!(snap.parents, vec![ours, theirs], "two-parent completion snapshot");
+        assert_eq!(
+            snap.parents,
+            vec![ours, theirs],
+            "two-parent completion snapshot"
+        );
 
         let (blob_id, perms) = {
             let store_arc = repo.vfs_handle().store();
@@ -2615,11 +2792,24 @@ mod tests {
                 _ => panic!("expected Blob"),
             }
         };
-        assert!(!bytes.windows(8).any(|w| w == b"RESOLVED"), "resolved plaintext in CAS blob");
+        assert!(
+            !bytes.windows(8).any(|w| w == b"RESOLVED"),
+            "resolved plaintext in CAS blob"
+        );
         for (who, sk) in [("alice", &alice_sk), ("bob", &bob_sk)] {
-            let pt = crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], sk, "secret/a.txt")
-                .unwrap();
-            assert_eq!(&pt[..], b"RESOLVED\nl2\nl3\n", "{who} must decrypt the resolution");
+            let pt = crate::protect::decrypt_with(
+                &bytes,
+                &blob_id,
+                &[&snap.protection],
+                sk,
+                "secret/a.txt",
+            )
+            .unwrap();
+            assert_eq!(
+                &pt[..],
+                b"RESOLVED\nl2\nl3\n",
+                "{who} must decrypt the resolution"
+            );
         }
         // Still no marker/plaintext residue anywhere in the CAS after completion.
         assert!(!cas_blob_contains(&repo, b"<<<<<<<"));
@@ -2666,19 +2856,33 @@ mod tests {
         let entries = worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap();
         // The new file lands PROTECTED under theirs' rule...
         let (k2_id, _, k2_perms) = entries["keys/k2.txt"];
-        assert_ne!(k2_perms & scl_core::PROTECTED, 0, "new file under theirs' rule must encrypt");
+        assert_ne!(
+            k2_perms & scl_core::PROTECTED,
+            0,
+            "new file under theirs' rule must encrypt"
+        );
         let bytes = match s.get(&k2_id).unwrap() {
             Object::Blob(b) => b.to_vec(),
             _ => panic!("expected Blob"),
         };
         drop(s);
         assert_ne!(&bytes[..], b"second-key");
-        let pt = crate::protect::decrypt_with(&bytes, &k2_id, &[&snap.protection], &alice_sk, "keys/k2.txt")
-            .unwrap();
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &k2_id,
+            &[&snap.protection],
+            &alice_sk,
+            "keys/k2.txt",
+        )
+        .unwrap();
         assert_eq!(&pt[..], b"second-key");
         // ...and theirs' own protected file + rule survive too.
         let (_, _, k1_perms) = entries["keys/k1.txt"];
-        assert_ne!(k1_perms & scl_core::PROTECTED, 0, "theirs' keys/k1.txt carried forward");
+        assert_ne!(
+            k1_perms & scl_core::PROTECTED,
+            0,
+            "theirs' keys/k1.txt carried forward"
+        );
         assert!(snap.protection.prefixes.iter().any(|p| p.prefix == "keys/"));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2709,10 +2913,13 @@ mod tests {
         let ours = repo.commit("me", "ours edits shared").unwrap();
 
         // theirs: update secret/x.txt to v1 + the conflicting plain edit.
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/x.txt"), b"v1").unwrap();
         std::fs::write(root.join("shared.txt"), b"a\nY\nc\n").unwrap();
-        let theirs = repo.commit("me", "theirs updates secret + edits shared").unwrap();
+        let theirs = repo
+            .commit("me", "theirs updates secret + edits shared")
+            .unwrap();
 
         // Theirs' v1 ciphertext id: the decided blob completion must keep.
         let v1_id = {
@@ -2728,7 +2935,10 @@ mod tests {
         // cannot materialize without a key; shared.txt conflicts.
         let err = repo.merge("feature", "me").unwrap_err();
         assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
-        assert!(!root.join("secret/x.txt").exists(), "keyless: v1 stays off disk");
+        assert!(
+            !root.join("secret/x.txt").exists(),
+            "keyless: v1 stays off disk"
+        );
 
         std::fs::write(root.join("shared.txt"), b"a\nRESOLVED\nc\n").unwrap();
         let id = repo.commit("me", "resolve").unwrap();
@@ -2756,10 +2966,19 @@ mod tests {
                 _ => panic!("expected Blob"),
             }
         };
-        let pt =
-            crate::protect::decrypt_with(&bytes, &got_id, &[&snap.protection], &alice_sk, "secret/x.txt")
-                .unwrap();
-        assert_eq!(&pt[..], b"v1", "the carried blob decrypts to theirs' update");
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &got_id,
+            &[&snap.protection],
+            &alice_sk,
+            "secret/x.txt",
+        )
+        .unwrap();
+        assert_eq!(
+            &pt[..],
+            b"v1",
+            "the carried blob decrypts to theirs' update"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -2777,7 +2996,8 @@ mod tests {
         std::fs::write(root.join("secret/a.txt"), b"v1").unwrap();
         repo.commit("me", "base").unwrap();
         repo.branch("feature").unwrap();
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/a.txt"), b"v2").unwrap();
         let theirs = repo.commit("me", "feature edits secret").unwrap();
 
@@ -2785,9 +3005,14 @@ mod tests {
         repo.switch("main").unwrap();
         assert!(!root.join("secret/a.txt").exists());
 
-        let (id, skipped) = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap();
+        let (id, skipped) = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap();
         assert_eq!(id, theirs, "fast-forward adopts theirs' tip");
-        assert!(skipped.is_empty(), "identity provided; nothing skipped: {skipped:?}");
+        assert!(
+            skipped.is_empty(),
+            "identity provided; nothing skipped: {skipped:?}"
+        );
         assert_eq!(
             std::fs::read(root.join("secret/a.txt")).unwrap(),
             b"v2",
@@ -2857,7 +3082,10 @@ mod tests {
         std::fs::create_dir_all(&repo.layout().dot_sc).unwrap();
         std::fs::write(
             repo.layout().dot_sc.join("scanner-allowlist.toml"),
-            format!("[[allow]]\nblob = \"{}\"\nnote = \"test fixture\"\n", id.to_hex()),
+            format!(
+                "[[allow]]\nblob = \"{}\"\nnote = \"test fixture\"\n",
+                id.to_hex()
+            ),
         )
         .unwrap();
         // Now the commit succeeds.
@@ -2893,13 +3121,20 @@ mod tests {
         let cloned = Repo::clone_to(&a, &b).unwrap();
         // HEAD + branches copied
         assert!(cloned.head_tip().unwrap().is_some());
-        let branches: Vec<String> =
-            cloned.branches().unwrap().into_iter().map(|(n, _)| n).collect();
+        let branches: Vec<String> = cloned
+            .branches()
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert!(
             branches.contains(&"main".to_string()) && branches.contains(&"feature".to_string())
         );
         // working tree materialized
-        assert_eq!(std::fs::read(b.join("README.md")).unwrap(), b"hello from A\n");
+        assert_eq!(
+            std::fs::read(b.join("README.md")).unwrap(),
+            b"hello from A\n"
+        );
         // origin recorded
         assert_eq!(
             cloned.remotes().unwrap(),
@@ -2924,7 +3159,8 @@ mod tests {
             let repo = Repo::init(&a).unwrap();
             std::fs::write(a.join("f.txt"), b"x\n").unwrap();
             repo.commit("me", "base").unwrap();
-            repo.secret_add("DB_URL", b"postgres://secret", &[alice_pk]).unwrap();
+            repo.secret_add("DB_URL", b"postgres://secret", &[alice_pk])
+                .unwrap();
         }
         let b = tmp_root("clone-secret-dst");
         let _ = std::fs::remove_dir_all(&b);
@@ -2937,7 +3173,11 @@ mod tests {
         let code_ok = brepo
             .run(
                 &alice_sk,
-                &["sh".into(), "-c".into(), "test \"$DB_URL\" = postgres://secret".into()],
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "test \"$DB_URL\" = postgres://secret".into(),
+                ],
             )
             .unwrap();
         assert_eq!(code_ok, 0, "alice's key decrypts the cloned secret");
@@ -2947,7 +3187,10 @@ mod tests {
                 &["sh".into(), "-c".into(), "test -z \"$DB_URL\"".into()],
             )
             .unwrap();
-        assert_eq!(code_denied, 0, "non-recipient sees no DB_URL (ciphertext stays sealed)");
+        assert_eq!(
+            code_denied, 0,
+            "non-recipient sees no DB_URL (ciphertext stays sealed)"
+        );
 
         drop(brepo);
         std::fs::remove_dir_all(&a).unwrap();
@@ -3008,7 +3251,11 @@ mod tests {
         unborn.remote_add("origin", a.to_str().unwrap()).unwrap();
         let fetched = unborn.fetch("origin").unwrap();
         assert!(fetched.iter().any(|(br, _)| br == "main"));
-        assert_eq!(unborn.head_tip().unwrap(), None, "local branch is still unborn before merge");
+        assert_eq!(
+            unborn.head_tip().unwrap(),
+            None,
+            "local branch is still unborn before merge"
+        );
 
         let merged = unborn.merge("origin/main", "me").unwrap();
         assert_eq!(std::fs::read(b.join("f.txt")).unwrap(), b"from-theirs\n");
@@ -3127,7 +3374,10 @@ mod tests {
 
         assert_ne!(c1, c2, "the two commits are distinct");
         // Same blob id (convergent) AND byte-identical wrapped DEKs (carried forward).
-        assert_eq!(w1, w2, "wrapped DEKs must be stable for unchanged protected content");
+        assert_eq!(
+            w1, w2,
+            "wrapped DEKs must be stable for unchanged protected content"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -3147,7 +3397,11 @@ mod tests {
         let cid = repo.protect("secret/", &[pk], None).unwrap();
         let snap = repo.snapshot(&cid).unwrap();
         // The prefix is recorded.
-        assert!(snap.protection.prefixes.iter().any(|p| p.prefix == "secret/"));
+        assert!(snap
+            .protection
+            .prefixes
+            .iter()
+            .any(|p| p.prefix == "secret/"));
         // Exactly one wrapped protected blob, and it is ciphertext.
         assert_eq!(snap.protection.wrapped.len(), 1, "one protected blob");
         let blob_id = *snap.protection.wrapped.keys().next().unwrap();
@@ -3207,7 +3461,11 @@ mod tests {
         let head = crate::refs::current_branch(repo.layout()).unwrap();
         repo.protect("secret/", &[alice_pk], None).unwrap();
         let all = crate::oplog::read_all(repo.layout()).unwrap();
-        assert_eq!(all.len(), 2, "protect must log two records: policy + sweep commit");
+        assert_eq!(
+            all.len(),
+            2,
+            "protect must log two records: policy + sweep commit"
+        );
         let rec = &all[all.len() - 2];
         assert_eq!(rec.desc, "protect secret/");
         assert_eq!(rec.head_before, head);
@@ -3276,7 +3534,8 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
         let c1 = repo.commit("me", "add").unwrap();
@@ -3290,11 +3549,21 @@ mod tests {
                 w.wrapped_dek[n - 1] ^= 0xFF;
             }
         }
-        repo.commit_snapshot(snap.root, vec![c1], snap.secrets, protection, "test", "tamper")
-            .unwrap();
+        repo.commit_snapshot(
+            snap.root,
+            vec![c1],
+            snap.secrets,
+            protection,
+            "test",
+            "tamper",
+        )
+        .unwrap();
 
         let err = repo.grant("secret/", &alice_sk, &bob_pk).unwrap_err();
-        assert!(matches!(err, Error::Crypto(_)), "tamper must be a crypto error, got {err:?}");
+        assert!(
+            matches!(err, Error::Crypto(_)),
+            "tamper must be a crypto error, got {err:?}"
+        );
         assert!(!matches!(err, Error::NotAuthorized(_)));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -3306,14 +3575,25 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
         let c1 = repo.commit("me", "add").unwrap();
         let root1 = repo.snapshot(&c1).unwrap().root;
         // Grant bob, then revoke him.
         let c2 = repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
-        assert_eq!(repo.snapshot(&c2).unwrap().protection.wrapped.values().next().unwrap().len(), 2);
+        assert_eq!(
+            repo.snapshot(&c2)
+                .unwrap()
+                .protection
+                .wrapped
+                .values()
+                .next()
+                .unwrap()
+                .len(),
+            2
+        );
         let bob_id = bob_pk.recipient_id();
         let c3 = repo.revoke("secret/", &bob_id).unwrap();
         let snap3 = repo.snapshot(&c3).unwrap();
@@ -3327,10 +3607,16 @@ mod tests {
         // rule retains him as a durable `Revoked` tombstone (ADR-0026) — that
         // tombstone is what keeps the revoke durable against merging a
         // pre-revoke branch.
-        let rule = snap3.protection.prefixes.iter().find(|p| p.prefix == "secret/").unwrap();
-        assert!(!rule.granted_keys().iter().any(|pk| {
-            scl_crypto::PublicKey::from_bytes(*pk).recipient_id() == bob_id
-        }));
+        let rule = snap3
+            .protection
+            .prefixes
+            .iter()
+            .find(|p| p.prefix == "secret/")
+            .unwrap();
+        assert!(!rule
+            .granted_keys()
+            .iter()
+            .any(|pk| { scl_crypto::PublicKey::from_bytes(*pk).recipient_id() == bob_id }));
         let bob_entry = rule
             .recipients
             .iter()
@@ -3340,7 +3626,10 @@ mod tests {
         // protected_prefixes reflects the surviving recipient and bob's revoked standing.
         let listed = repo.protected_prefixes().unwrap();
         let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
-        let alice_r = recips.iter().find(|r| r.id == alice_pk.recipient_id()).unwrap();
+        let alice_r = recips
+            .iter()
+            .find(|r| r.id == alice_pk.recipient_id())
+            .unwrap();
         assert!(alice_r.granted);
         let bob_r = recips.iter().find(|r| r.id == bob_id).unwrap();
         assert!(!bob_r.granted);
@@ -3357,7 +3646,8 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
         repo.commit("me", "add").unwrap();
@@ -3365,11 +3655,18 @@ mod tests {
         let bob_id = bob_pk.recipient_id();
         repo.revoke("secret/", &bob_id).unwrap();
         // Re-protect the same prefix for alice again.
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         let listed = repo.protected_prefixes().unwrap();
         let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
-        let alice_r = recips.iter().find(|r| r.id == alice_pk.recipient_id()).unwrap();
-        assert!(alice_r.granted, "alice must remain granted after re-protect");
+        let alice_r = recips
+            .iter()
+            .find(|r| r.id == alice_pk.recipient_id())
+            .unwrap();
+        assert!(
+            alice_r.granted,
+            "alice must remain granted after re-protect"
+        );
         let bob_r = recips.iter().find(|r| r.id == bob_id).unwrap();
         assert!(!bob_r.granted, "bob's tombstone must survive re-protect");
         drop(repo);
@@ -3386,7 +3683,8 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
         repo.commit("me", "add").unwrap();
@@ -3409,7 +3707,8 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
         repo.commit("me", "add secret").unwrap();
@@ -3429,19 +3728,38 @@ mod tests {
         // Bob stays revoked: tombstone won the register.
         let listed = repo.protected_prefixes().unwrap();
         let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
-        let bob = recips.iter().find(|r| r.id == bob_pk.recipient_id()).unwrap();
+        let bob = recips
+            .iter()
+            .find(|r| r.id == bob_pk.recipient_id())
+            .unwrap();
         assert!(!bob.granted, "merge resurrected a revoked recipient");
-        assert!(recips.iter().find(|r| r.id == alice_pk.recipient_id()).unwrap().granted);
+        assert!(
+            recips
+                .iter()
+                .find(|r| r.id == alice_pk.recipient_id())
+                .unwrap()
+                .granted
+        );
 
         // And a FRESH file under the prefix seals to alice only.
         let before: std::collections::BTreeSet<_> = {
             let tip = repo.head_tip().unwrap().unwrap();
-            repo.snapshot(&tip).unwrap().protection.wrapped.keys().cloned().collect()
+            repo.snapshot(&tip)
+                .unwrap()
+                .protection
+                .wrapped
+                .keys()
+                .cloned()
+                .collect()
         };
         std::fs::write(root.join("secret/new.txt"), b"fresh").unwrap();
         let c = repo.commit("me", "post-revoke secret").unwrap();
         let prot = repo.snapshot(&c).unwrap().protection;
-        let new_ids: Vec<_> = prot.wrapped.keys().filter(|k| !before.contains(k)).collect();
+        let new_ids: Vec<_> = prot
+            .wrapped
+            .keys()
+            .filter(|k| !before.contains(k))
+            .collect();
         assert!(!new_ids.is_empty(), "expected a freshly sealed blob");
         let bob_id = bob_pk.recipient_id();
         for id in new_ids {
@@ -3462,7 +3780,8 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
         repo.commit("me", "add").unwrap();
@@ -3481,7 +3800,11 @@ mod tests {
         let listed = repo.protected_prefixes().unwrap();
         let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
         assert!(
-            recips.iter().find(|r| r.id == bob_pk.recipient_id()).unwrap().granted,
+            recips
+                .iter()
+                .find(|r| r.id == bob_pk.recipient_id())
+                .unwrap()
+                .granted,
             "a deliberate re-grant must out-epoch the old tombstone"
         );
         drop(repo);
@@ -3494,7 +3817,8 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
         repo.commit("me", "add").unwrap();
@@ -3514,7 +3838,11 @@ mod tests {
         let listed = repo.protected_prefixes().unwrap();
         let (_p, recips) = listed.iter().find(|(p, _)| p == "secret/").unwrap();
         assert!(
-            !recips.iter().find(|r| r.id == bob_pk.recipient_id()).unwrap().granted,
+            !recips
+                .iter()
+                .find(|r| r.id == bob_pk.recipient_id())
+                .unwrap()
+                .granted,
             "replay resurrected a revoked recipient"
         );
         drop(repo);
@@ -3534,7 +3862,8 @@ mod tests {
 
         // Seed the prefix on a commit, branch "other" BEFORE the protected file
         // exists so switching there (then back as mallory) leaves it absent.
-        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        repo.test_set_protected_prefix("secret/", &[alice_pk])
+            .unwrap();
         repo.branch("other").unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
@@ -3549,16 +3878,29 @@ mod tests {
                 worktree::tree_file_entries_with_perms(&mut s, snap1.root).unwrap()
             };
             let (id, _mode, perms) = entries.get("secret/db.txt").copied().unwrap();
-            assert_ne!(perms & scl_core::PROTECTED, 0, "db.txt must be PROTECTED in c1");
+            assert_ne!(
+                perms & scl_core::PROTECTED,
+                0,
+                "db.txt must be PROTECTED in c1"
+            );
             id
         };
-        assert_eq!(snap1.protection.wrapped.get(&blob1).map(|w| w.len()), Some(1));
+        assert_eq!(
+            snap1.protection.wrapped.get(&blob1).map(|w| w.len()),
+            Some(1)
+        );
 
         // As mallory: switch away (deletes db.txt) then back (skipped, absent).
-        repo.switch_with_identity("other", Some(&mallory_sk)).unwrap();
-        let skipped = repo.switch_with_identity("main", Some(&mallory_sk)).unwrap();
+        repo.switch_with_identity("other", Some(&mallory_sk))
+            .unwrap();
+        let skipped = repo
+            .switch_with_identity("main", Some(&mallory_sk))
+            .unwrap();
         assert!(skipped.contains(&"secret/db.txt".to_string()));
-        assert!(!root.join("secret/db.txt").exists(), "protected file absent for mallory");
+        assert!(
+            !root.join("secret/db.txt").exists(),
+            "protected file absent for mallory"
+        );
 
         // Mallory commits an UNRELATED file.
         std::fs::write(root.join("readme.txt"), b"hi").unwrap();
@@ -3576,8 +3918,15 @@ mod tests {
             let mut s = a.lock().unwrap();
             worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
         };
-        let (id2, _m, perms2) = entries2.get("secret/db.txt").copied().expect("db.txt still in tree");
-        assert_ne!(perms2 & scl_core::PROTECTED, 0, "db.txt must still be PROTECTED");
+        let (id2, _m, perms2) = entries2
+            .get("secret/db.txt")
+            .copied()
+            .expect("db.txt still in tree");
+        assert_ne!(
+            perms2 & scl_core::PROTECTED,
+            0,
+            "db.txt must still be PROTECTED"
+        );
         assert_eq!(id2, blob1, "same ciphertext blob carried forward unchanged");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -3607,12 +3956,19 @@ mod tests {
                 worktree::tree_file_entries_with_perms(&mut s, snap1.root).unwrap()
             };
             let (id, _mode, perms) = entries.get("docs/b.txt").copied().unwrap();
-            assert_eq!(perms & scl_core::PROTECTED, 0, "docs/b.txt must be plain (PROTECTED) in base");
+            assert_eq!(
+                perms & scl_core::PROTECTED,
+                0,
+                "docs/b.txt must be plain (PROTECTED) in base"
+            );
             id
         };
 
-        crate::sparse::store(repo.layout(), &crate::sparse::Sparse::new(vec!["src/".into()]))
-            .unwrap();
+        crate::sparse::store(
+            repo.layout(),
+            &crate::sparse::Sparse::new(vec!["src/".into()]),
+        )
+        .unwrap();
         std::fs::remove_file(root.join("docs/b.txt")).unwrap();
         std::fs::write(root.join("src/a.txt"), b"a v2").unwrap();
         let c2 = repo.commit("me", "edit in-sparse").unwrap();
@@ -3623,10 +3979,20 @@ mod tests {
             let mut s = a.lock().unwrap();
             worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
         };
-        assert!(entries.contains_key("docs/b.txt"), "out-of-sparse absent path must be carried");
+        assert!(
+            entries.contains_key("docs/b.txt"),
+            "out-of-sparse absent path must be carried"
+        );
         let (blob1_carried, _mode, perms_carried) = entries.get("docs/b.txt").copied().unwrap();
-        assert_eq!(blob1_carried, blob1_base, "carried blob id must match base commit byte-identically");
-        assert_eq!(perms_carried & scl_core::PROTECTED, 0, "carried plain file must not acquire PROTECTED");
+        assert_eq!(
+            blob1_carried, blob1_base,
+            "carried blob id must match base commit byte-identically"
+        );
+        assert_eq!(
+            perms_carried & scl_core::PROTECTED,
+            0,
+            "carried plain file must not acquire PROTECTED"
+        );
         let a_bytes = {
             let a = repo.vfs_handle().store();
             let mut s = a.lock().unwrap();
@@ -3651,8 +4017,11 @@ mod tests {
         std::fs::write(root.join("src/a.txt"), b"a v1").unwrap();
         repo.commit("me", "base").unwrap();
 
-        crate::sparse::store(repo.layout(), &crate::sparse::Sparse::new(vec!["src/".into()]))
-            .unwrap();
+        crate::sparse::store(
+            repo.layout(),
+            &crate::sparse::Sparse::new(vec!["src/".into()]),
+        )
+        .unwrap();
         std::fs::remove_file(root.join("src/a.txt")).unwrap();
         let c2 = repo.commit("me", "delete in-sparse file").unwrap();
 
@@ -3662,7 +4031,10 @@ mod tests {
             let mut s = a.lock().unwrap();
             worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
         };
-        assert!(!entries.contains_key("src/a.txt"), "in-sparse absence must be a real deletion");
+        assert!(
+            !entries.contains_key("src/a.txt"),
+            "in-sparse absence must be a real deletion"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -3680,7 +4052,8 @@ mod tests {
         let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (mallory_sk, _mallory_pk) = scl_crypto::generate_keypair();
 
-        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        repo.test_set_protected_prefix("secret/", &[alice_pk])
+            .unwrap();
         repo.branch("other").unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -3694,7 +4067,10 @@ mod tests {
             let a = repo.vfs_handle().store();
             let mut s = a.lock().unwrap();
             let entries = worktree::tree_file_entries_with_perms(&mut s, snap1.root).unwrap();
-            (entries["secret/db.txt"].0, entries["secret/in_sparse.txt"].0)
+            (
+                entries["secret/db.txt"].0,
+                entries["secret/in_sparse.txt"].0,
+            )
         };
 
         // Sparse set covers `src/` and `secret/in_sparse.txt` only —
@@ -3707,8 +4083,10 @@ mod tests {
 
         // As mallory (non-recipient): switch away and back so both protected
         // files are skipped/absent, then commit something unrelated.
-        repo.switch_with_identity("other", Some(&mallory_sk)).unwrap();
-        repo.switch_with_identity("main", Some(&mallory_sk)).unwrap();
+        repo.switch_with_identity("other", Some(&mallory_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&mallory_sk))
+            .unwrap();
         assert!(!root.join("secret/db.txt").exists());
         assert!(!root.join("secret/in_sparse.txt").exists());
         std::fs::write(root.join("readme.txt"), b"hi").unwrap();
@@ -3755,7 +4133,10 @@ mod tests {
             let mut s = a.lock().unwrap();
             worktree::tree_file_entries_with_perms(&mut s, snap2.root).unwrap()
         };
-        assert!(!entries.contains_key("b.txt"), "deletion with no sparse spec must not be carried");
+        assert!(
+            !entries.contains_key("b.txt"),
+            "deletion with no sparse spec must not be carried"
+        );
         assert!(entries.contains_key("a.txt"));
 
         drop(repo);
@@ -3777,7 +4158,10 @@ mod tests {
         repo.branch("feature").unwrap();
 
         repo.set_sparse(&["src/".into()], None).unwrap();
-        assert!(!root.join("docs/x").exists(), "docs/x must not be materialized once sparse");
+        assert!(
+            !root.join("docs/x").exists(),
+            "docs/x must not be materialized once sparse"
+        );
 
         repo.switch("feature").unwrap();
         std::fs::write(root.join("docs/x"), b"doc v2").unwrap();
@@ -3844,8 +4228,14 @@ mod tests {
             }
             other => panic!("expected InvalidArgument widen hint, got {other:?}"),
         }
-        assert!(!root.join("docs/x").exists(), "no marker may land outside the sparse view");
-        assert!(!repo.merge_in_progress(), "the refused merge must not start an in-progress merge");
+        assert!(
+            !root.join("docs/x").exists(),
+            "no marker may land outside the sparse view"
+        );
+        assert!(
+            !repo.merge_in_progress(),
+            "the refused merge must not start an in-progress merge"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -3868,7 +4258,10 @@ mod tests {
         let tip = brepo.commit("me", "feature").unwrap();
         brepo.push("origin").unwrap();
         let arepo = Repo::open(&a).unwrap();
-        assert_eq!(crate::refs::read_branch_tip(arepo.layout(), "feature").unwrap(), Some(tip));
+        assert_eq!(
+            crate::refs::read_branch_tip(arepo.layout(), "feature").unwrap(),
+            Some(tip)
+        );
         drop(brepo);
         drop(arepo);
         std::fs::remove_dir_all(&a).unwrap();
@@ -3887,7 +4280,8 @@ mod tests {
         // the real `protect` API). Branch "other" at this policy-only commit so
         // it has no protected files — switching to it will delete secret/db.txt
         // from the working tree and switching back as mallory will skip writing it.
-        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        repo.test_set_protected_prefix("secret/", &[alice_pk])
+            .unwrap();
         repo.branch("other").unwrap();
 
         // Add the protected file and commit on "main": it is encrypted for alice.
@@ -3897,7 +4291,10 @@ mod tests {
 
         // Switch away (deletes working-tree secret/db.txt) then back as alice → decrypts.
         repo.switch_with_identity("other", Some(&alice_sk)).unwrap();
-        assert!(!root.join("secret/db.txt").exists(), "switch to other must clear the protected file");
+        assert!(
+            !root.join("secret/db.txt").exists(),
+            "switch to other must clear the protected file"
+        );
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
         assert_eq!(
             std::fs::read(root.join("secret/db.txt")).unwrap(),
@@ -3906,8 +4303,11 @@ mod tests {
         );
 
         // Switch away again (clears file), then back as mallory → skipped (file absent).
-        repo.switch_with_identity("other", Some(&mallory_sk)).unwrap();
-        let skipped = repo.switch_with_identity("main", Some(&mallory_sk)).unwrap();
+        repo.switch_with_identity("other", Some(&mallory_sk))
+            .unwrap();
+        let skipped = repo
+            .switch_with_identity("main", Some(&mallory_sk))
+            .unwrap();
         assert!(
             skipped.contains(&"secret/db.txt".to_string()),
             "mallory's switch must report secret/db.txt as skipped"
@@ -3928,15 +4328,22 @@ mod tests {
         let root = tmp_root("p7-status-clean");
         let repo = Repo::init(&root).unwrap();
         let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
-        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        repo.test_set_protected_prefix("secret/", &[alice_pk])
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
         repo.commit("me", "add").unwrap();
         // The working file is plaintext while HEAD holds ciphertext, yet status
         // must report no changes (no spurious modified/deleted/added).
         let s = repo.status().unwrap();
-        assert!(s.modified.is_empty(), "decrypted protected file must not show as modified: {s:?}");
-        assert!(s.deleted.is_empty(), "protected file present on disk must not show as deleted: {s:?}");
+        assert!(
+            s.modified.is_empty(),
+            "decrypted protected file must not show as modified: {s:?}"
+        );
+        assert!(
+            s.deleted.is_empty(),
+            "protected file present on disk must not show as deleted: {s:?}"
+        );
         assert!(s.added.is_empty(), "{s:?}");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -3949,7 +4356,8 @@ mod tests {
         let root = tmp_root("p7-switch-edit");
         let repo = Repo::init(&root).unwrap();
         let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
-        repo.test_set_protected_prefix("secret/", &[alice_pk]).unwrap();
+        repo.test_set_protected_prefix("secret/", &[alice_pk])
+            .unwrap();
         repo.branch("other").unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
@@ -3957,7 +4365,11 @@ mod tests {
         // Genuinely edit the protected file (still plaintext on disk).
         std::fs::write(root.join("secret/db.txt"), b"edited-secret").unwrap();
         // status must report it modified (convergent re-encryption differs).
-        assert!(repo.status().unwrap().modified.contains(&"secret/db.txt".to_string()));
+        assert!(repo
+            .status()
+            .unwrap()
+            .modified
+            .contains(&"secret/db.txt".to_string()));
         // switch must refuse and preserve the edit.
         let err = repo.switch("other").unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
@@ -3987,17 +4399,24 @@ mod tests {
         // Branch B: same path, but data/ is protected -> committed as ciphertext.
         repo.branch("b").unwrap();
         repo.switch("b").unwrap();
-        repo.test_set_protected_prefix("data/", &[alice_pk]).unwrap();
+        repo.test_set_protected_prefix("data/", &[alice_pk])
+            .unwrap();
         repo.commit("me", "encrypt on B").unwrap();
 
         // Back on A: the working file is plaintext again.
         repo.switch("main").unwrap();
-        assert_eq!(std::fs::read(root.join("data/x.txt")).unwrap(), b"plaintext-A");
+        assert_eq!(
+            std::fs::read(root.join("data/x.txt")).unwrap(),
+            b"plaintext-A"
+        );
 
         // Switch A->B as mallory (non-recipient): the file is skipped AND the
         // stale plaintext must be removed (confidentiality).
         let skipped = repo.switch_with_identity("b", Some(&mallory_sk)).unwrap();
-        assert!(skipped.contains(&"data/x.txt".to_string()), "mallory must skip the protected file");
+        assert!(
+            skipped.contains(&"data/x.txt".to_string()),
+            "mallory must skip the protected file"
+        );
         assert!(
             !root.join("data/x.txt").exists(),
             "stale A plaintext must be removed when the path becomes protected for a non-recipient"
@@ -4011,12 +4430,15 @@ mod tests {
         let origin = std::env::temp_dir().join(format!("scl-bulk-origin-{}", std::process::id()));
         let work = std::env::temp_dir().join(format!("scl-bulk-work-{}", std::process::id()));
         let clone = std::env::temp_dir().join(format!("scl-bulk-clone-{}", std::process::id()));
-        for p in [&origin, &work, &clone] { let _ = std::fs::remove_dir_all(p); }
+        for p in [&origin, &work, &clone] {
+            let _ = std::fs::remove_dir_all(p);
+        }
 
         // origin is an empty remote; work pushes two commits to it.
         Repo::init(&origin).unwrap();
         let w = Repo::init(&work).unwrap();
-        w.remote_add("origin", &origin.display().to_string()).unwrap();
+        w.remote_add("origin", &origin.display().to_string())
+            .unwrap();
         std::fs::write(work.join("a.txt"), b"one").unwrap();
         w.commit("t", "c1").unwrap();
         std::fs::write(work.join("a.txt"), b"two").unwrap();
@@ -4027,7 +4449,9 @@ mod tests {
         let c = Repo::clone_to(&origin, &clone).unwrap();
         assert_eq!(c.head_tip().unwrap(), Some(tip));
 
-        for p in [&origin, &work, &clone] { std::fs::remove_dir_all(p).unwrap(); }
+        for p in [&origin, &work, &clone] {
+            std::fs::remove_dir_all(p).unwrap();
+        }
     }
 
     #[test]
@@ -4047,8 +4471,14 @@ mod tests {
         let _ = repo.merge("feature", "me").unwrap_err();
         assert!(repo.merge_in_progress());
         // Both `merge` and `switch` must refuse mid-merge.
-        assert!(matches!(repo.merge("feature", "me"), Err(Error::MergeInProgress)));
-        assert!(matches!(repo.switch("feature"), Err(Error::MergeInProgress)));
+        assert!(matches!(
+            repo.merge("feature", "me"),
+            Err(Error::MergeInProgress)
+        ));
+        assert!(matches!(
+            repo.switch("feature"),
+            Err(Error::MergeInProgress)
+        ));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -4103,7 +4533,10 @@ mod tests {
         crate::pick_state::write(&repo.layout, &picked, &[], None, None).unwrap();
         assert!(repo.pick_in_progress());
 
-        assert!(matches!(repo.merge("feature", "me"), Err(Error::PickInProgress)));
+        assert!(matches!(
+            repo.merge("feature", "me"),
+            Err(Error::PickInProgress)
+        ));
         assert!(matches!(repo.switch("feature"), Err(Error::PickInProgress)));
         assert!(matches!(repo.undo(), Err(Error::PickInProgress)));
 
@@ -4139,10 +4572,22 @@ mod tests {
         crate::rebase_state::write(&repo.layout, &st).unwrap();
         assert!(repo.rebase_in_progress());
 
-        assert!(matches!(repo.commit("me", "should refuse"), Err(Error::RebaseInProgress)));
-        assert!(matches!(repo.merge("feature", "me"), Err(Error::RebaseInProgress)));
-        assert!(matches!(repo.cherry_pick("feature", "me", None, None), Err(Error::RebaseInProgress)));
-        assert!(matches!(repo.rebase("feature", "me", None), Err(Error::RebaseInProgress)));
+        assert!(matches!(
+            repo.commit("me", "should refuse"),
+            Err(Error::RebaseInProgress)
+        ));
+        assert!(matches!(
+            repo.merge("feature", "me"),
+            Err(Error::RebaseInProgress)
+        ));
+        assert!(matches!(
+            repo.cherry_pick("feature", "me", None, None),
+            Err(Error::RebaseInProgress)
+        ));
+        assert!(matches!(
+            repo.rebase("feature", "me", None),
+            Err(Error::RebaseInProgress)
+        ));
         assert!(matches!(
             repo.rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), false),
             Err(Error::RebaseInProgress)
@@ -4181,11 +4626,17 @@ mod tests {
         crate::rebase_state::write(&repo.layout, &st).unwrap();
         assert!(repo.rebase_in_progress());
 
-        assert!(matches!(repo.switch("feature"), Err(Error::RebaseInProgress)));
+        assert!(matches!(
+            repo.switch("feature"),
+            Err(Error::RebaseInProgress)
+        ));
 
         // Branch ref and current branch untouched; rebase state still present.
         assert_eq!(refs::current_branch(&repo.layout).unwrap(), "main");
-        assert_eq!(refs::read_branch_tip(&repo.layout, "main").unwrap(), before_tip);
+        assert_eq!(
+            refs::read_branch_tip(&repo.layout, "main").unwrap(),
+            before_tip
+        );
         assert!(repo.rebase_in_progress());
         let reread = crate::rebase_state::read(&repo.layout).unwrap().unwrap();
         assert_eq!(reread.original_tip, st.original_tip);
@@ -4227,7 +4678,10 @@ mod tests {
         assert!(matches!(repo.undo(), Err(Error::RebaseInProgress)));
 
         // Branch ref untouched; rebase state still present.
-        assert_eq!(refs::read_branch_tip(&repo.layout, "main").unwrap(), before_tip);
+        assert_eq!(
+            refs::read_branch_tip(&repo.layout, "main").unwrap(),
+            before_tip
+        );
         assert!(repo.rebase_in_progress());
         let reread = crate::rebase_state::read(&repo.layout).unwrap().unwrap();
         assert_eq!(reread.original_tip, st.original_tip);
@@ -4254,38 +4708,53 @@ mod tests {
 
         // Every op needs a real prefix/secret to exist so the guard is what's
         // actually hit, not an earlier `NotProtected`/`NoSuchSecret` error.
-        repo.protect("vault/", std::slice::from_ref(&alice_pk), None).unwrap();
-        repo.secret_add("K", b"v", std::slice::from_ref(&alice_pk)).unwrap();
+        repo.protect("vault/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
+        repo.secret_add("K", b"v", std::slice::from_ref(&alice_pk))
+            .unwrap();
         let recipient = alice_pk.recipient_id();
 
         // (state name, setup fn, teardown fn) — each policy op is exercised
         // against all three, asserting the exact typed error per state.
         let states: [(&str, fn(&Layout), fn(&Layout)); 3] = [
-            ("merge", |layout| {
-                crate::merge_state::write(layout, &ObjectId::of(b"theirs"), &[], None).unwrap();
-            }, |layout| crate::merge_state::clear(layout).unwrap()),
-            ("pick", |layout| {
-                crate::pick_state::write(layout, &ObjectId::of(b"picked"), &[], None, None).unwrap();
-            }, |layout| crate::pick_state::clear(layout).unwrap()),
-            ("rebase", |layout| {
-                crate::rebase_state::write(
-                    layout,
-                    &crate::rebase_state::RebaseState {
-                        branch: "main".into(),
-                        original_tip: ObjectId::of(b"orig"),
-                        target: "feature".into(),
-                        acc_tip: ObjectId::of(b"acc"),
-                        conflicted: ObjectId::of(b"conflicted"),
-                        remaining: vec![],
-                        total: 1,
-                        author: "me".into(),
-                        resolved: false,
-                        replayed: 0,
-                        skipped: 0,
-                    },
-                )
-                .unwrap();
-            }, |layout| crate::rebase_state::clear(layout).unwrap()),
+            (
+                "merge",
+                |layout| {
+                    crate::merge_state::write(layout, &ObjectId::of(b"theirs"), &[], None).unwrap();
+                },
+                |layout| crate::merge_state::clear(layout).unwrap(),
+            ),
+            (
+                "pick",
+                |layout| {
+                    crate::pick_state::write(layout, &ObjectId::of(b"picked"), &[], None, None)
+                        .unwrap();
+                },
+                |layout| crate::pick_state::clear(layout).unwrap(),
+            ),
+            (
+                "rebase",
+                |layout| {
+                    crate::rebase_state::write(
+                        layout,
+                        &crate::rebase_state::RebaseState {
+                            branch: "main".into(),
+                            original_tip: ObjectId::of(b"orig"),
+                            target: "feature".into(),
+                            acc_tip: ObjectId::of(b"acc"),
+                            conflicted: ObjectId::of(b"conflicted"),
+                            remaining: vec![],
+                            total: 1,
+                            author: "me".into(),
+                            resolved: false,
+                            replayed: 0,
+                            skipped: 0,
+                        },
+                    )
+                    .unwrap();
+                },
+                |layout| crate::rebase_state::clear(layout).unwrap(),
+            ),
         ];
 
         for (state_name, write_state, clear_state) in states {
@@ -4315,10 +4784,16 @@ mod tests {
                 };
             }
 
-            assert_refused!(repo.protect("vault/", std::slice::from_ref(&alice_pk), None), "protect");
+            assert_refused!(
+                repo.protect("vault/", std::slice::from_ref(&alice_pk), None),
+                "protect"
+            );
             assert_refused!(repo.grant("vault/", &alice_sk, &alice_pk), "grant");
             assert_refused!(repo.revoke("vault/", &recipient), "revoke");
-            assert_refused!(repo.secret_add("K2", b"v2", std::slice::from_ref(&alice_pk)), "secret_add");
+            assert_refused!(
+                repo.secret_add("K2", b"v2", std::slice::from_ref(&alice_pk)),
+                "secret_add"
+            );
             assert_refused!(repo.secret_grant("K", &alice_sk, &alice_pk), "secret_grant");
             assert_refused!(
                 repo.secret_rotate("K", Some(b"v3"), std::slice::from_ref(&alice_pk), None),
@@ -4357,14 +4832,22 @@ mod tests {
 
         // Stop on conflict.
         let outcome = repo.rebase("main", "me", None).unwrap();
-        assert!(matches!(outcome, crate::replay::RebaseResult::Stopped { .. }));
+        assert!(matches!(
+            outcome,
+            crate::replay::RebaseResult::Stopped { .. }
+        ));
         assert_eq!(repo.head_tip().unwrap(), Some(original_feature_tip));
         assert!(repo.rebase_in_progress());
 
         // The hazard: secret_add must refuse, not force a registry commit
         // over the stopped rebase's branch tip.
-        let err = repo.secret_add("DB_URL", b"v", std::slice::from_ref(&alice_pk)).unwrap_err();
-        assert!(matches!(err, Error::RebaseInProgress), "expected RebaseInProgress, got {err:?}");
+        let err = repo
+            .secret_add("DB_URL", b"v", std::slice::from_ref(&alice_pk))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::RebaseInProgress),
+            "expected RebaseInProgress, got {err:?}"
+        );
 
         // State untouched: still in progress, tip unmoved, registry doesn't
         // carry the refused secret.
@@ -4377,9 +4860,15 @@ mod tests {
         // written anywhere, not even discarded state).
         std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
         let outcome = repo.rebase_continue("me", None).unwrap();
-        assert!(matches!(outcome, crate::replay::RebaseResult::Rebased { .. }));
+        assert!(matches!(
+            outcome,
+            crate::replay::RebaseResult::Rebased { .. }
+        ));
         assert!(!repo.rebase_in_progress());
-        assert!(!repo.registry().unwrap().contains_key("DB_URL"), "refused secret must not resurface");
+        assert!(
+            !repo.registry().unwrap().contains_key("DB_URL"),
+            "refused secret must not resurface"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4412,7 +4901,10 @@ mod tests {
 
         // ── step 2: clone the remote to local (local holds c1 and its objects) ─
         let local = Repo::clone_to(&remote_root, &local_root).unwrap();
-        let c1 = local.head_tip().unwrap().expect("clone should have a HEAD tip");
+        let c1 = local
+            .head_tip()
+            .unwrap()
+            .expect("clone should have a HEAD tip");
 
         // ── step 3: remote advances with a small new file (c2) ──────────────
         let c2 = {
@@ -4479,7 +4971,11 @@ mod tests {
 
         assert_ne!(b_amended, b, "amend must produce a new snapshot id");
         let snap = repo.snapshot(&b_amended).unwrap();
-        assert_eq!(snap.parents, vec![a], "amended parents must match B's parents");
+        assert_eq!(
+            snap.parents,
+            vec![a],
+            "amended parents must match B's parents"
+        );
         assert_eq!(snap.message, "commit B", "message kept unless overridden");
 
         // The edit landed in B', and B is no longer the branch tip.
@@ -4545,7 +5041,11 @@ mod tests {
         std::fs::write(root.join("main-only.txt"), b"m-edited").unwrap();
         let m_amended = repo.amend("me", None).unwrap();
         let amended_snap = repo.snapshot(&m_amended).unwrap();
-        assert_eq!(amended_snap.parents, vec![ours, theirs], "merge amend must keep both parents");
+        assert_eq!(
+            amended_snap.parents,
+            vec![ours, theirs],
+            "merge amend must keep both parents"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4561,7 +5061,10 @@ mod tests {
         std::fs::write(root.join("a.txt"), b"two").unwrap();
         let id = repo.amend("me", None).unwrap();
         let snap = repo.snapshot(&id).unwrap();
-        assert!(snap.parents.is_empty(), "amended root commit must keep empty parents");
+        assert!(
+            snap.parents.is_empty(),
+            "amended root commit must keep empty parents"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4581,7 +5084,10 @@ mod tests {
 
         // Merge in progress.
         crate::merge_state::write(&repo.layout, &ObjectId::of(b"theirs"), &[], None).unwrap();
-        assert!(matches!(repo.amend("me", None), Err(Error::MergeInProgress)));
+        assert!(matches!(
+            repo.amend("me", None),
+            Err(Error::MergeInProgress)
+        ));
         crate::merge_state::clear(&repo.layout).unwrap();
 
         // Cherry-pick in progress.
@@ -4604,7 +5110,10 @@ mod tests {
             skipped: 0,
         };
         crate::rebase_state::write(&repo.layout, &st).unwrap();
-        assert!(matches!(repo.amend("me", None), Err(Error::RebaseInProgress)));
+        assert!(matches!(
+            repo.amend("me", None),
+            Err(Error::RebaseInProgress)
+        ));
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4624,7 +5133,10 @@ mod tests {
         // A plaintext secret introduced via amend must be caught by the scanner.
         std::fs::write(root.join("readme.txt"), b"key = AKIAIOSFODNN7EXAMPLE\n").unwrap();
         let err = repo.amend("me", None).unwrap_err();
-        assert!(matches!(err, Error::SecretDetected(_)), "expected SecretDetected, got {err:?}");
+        assert!(
+            matches!(err, Error::SecretDetected(_)),
+            "expected SecretDetected, got {err:?}"
+        );
 
         // Fix the plaintext file, and edit the protected one: the amended tip's
         // blob must remain PROTECTED ciphertext, wrapped for the granted key.
@@ -4640,7 +5152,11 @@ mod tests {
             let (id, _, perms) = entries["keys/a.txt"];
             (id, perms)
         };
-        assert_ne!(perms & scl_core::PROTECTED, 0, "amended protected file must stay protected");
+        assert_ne!(
+            perms & scl_core::PROTECTED,
+            0,
+            "amended protected file must stay protected"
+        );
 
         let bytes = {
             let store_arc = repo.vfs.store();
@@ -4650,9 +5166,14 @@ mod tests {
                 _ => panic!("expected Blob"),
             }
         };
-        let pt =
-            crate::protect::decrypt_with(&bytes, &blob_id, &[&snap.protection], &alice_sk, "keys/a.txt")
-                .unwrap();
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &blob_id,
+            &[&snap.protection],
+            &alice_sk,
+            "keys/a.txt",
+        )
+        .unwrap();
         assert_eq!(&pt[..], b"rotated-secret-key");
 
         drop(repo);
@@ -4671,9 +5192,18 @@ mod tests {
 
         repo.set_sparse(&["src/".to_string()], None).unwrap();
 
-        assert!(root.join("src/a.txt").exists(), "in-sparse file must stay materialized");
-        assert!(!root.join("docs/b.txt").exists(), "out-of-sparse file must be pruned from disk");
-        assert!(repo.layout().sparse_path().exists(), "sparse spec must persist");
+        assert!(
+            root.join("src/a.txt").exists(),
+            "in-sparse file must stay materialized"
+        );
+        assert!(
+            !root.join("docs/b.txt").exists(),
+            "out-of-sparse file must be pruned from disk"
+        );
+        assert!(
+            repo.layout().sparse_path().exists(),
+            "sparse spec must persist"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4694,8 +5224,14 @@ mod tests {
         repo.disable_sparse(None).unwrap();
 
         assert!(root.join("src/a.txt").exists());
-        assert!(root.join("docs/b.txt").exists(), "disable must restore the full tree");
-        assert!(!repo.layout().sparse_path().exists(), "sparse spec must be cleared");
+        assert!(
+            root.join("docs/b.txt").exists(),
+            "disable must restore the full tree"
+        );
+        assert!(
+            !repo.layout().sparse_path().exists(),
+            "sparse spec must be cleared"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4716,11 +5252,17 @@ mod tests {
         repo.branch("other").unwrap();
         repo.switch("other").unwrap();
         assert!(root.join("src/a.txt").exists());
-        assert!(!root.join("docs/b.txt").exists(), "spec persists across switch away");
+        assert!(
+            !root.join("docs/b.txt").exists(),
+            "spec persists across switch away"
+        );
 
         repo.switch("main").unwrap();
         assert!(root.join("src/a.txt").exists());
-        assert!(!root.join("docs/b.txt").exists(), "spec persists across switch back");
+        assert!(
+            !root.join("docs/b.txt").exists(),
+            "spec persists across switch back"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4772,10 +5314,17 @@ mod tests {
         assert!(!root.join("docs/b.txt").exists());
 
         let st = repo.status().unwrap();
-        assert!(st.deleted.is_empty(), "out-of-sparse path must not read as deleted: {:?}", st);
+        assert!(
+            st.deleted.is_empty(),
+            "out-of-sparse path must not read as deleted: {:?}",
+            st
+        );
 
         let diff = repo.diff_unified().unwrap();
-        assert!(!diff.contains("docs/b.txt"), "sc diff must not show the out-of-sparse path: {diff}");
+        assert!(
+            !diff.contains("docs/b.txt"),
+            "sc diff must not show the out-of-sparse path: {diff}"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4800,7 +5349,10 @@ mod tests {
         assert!(repo.sparse_spec().unwrap().prefixes().is_empty());
 
         repo.set_sparse(&["src/".to_string()], None).unwrap();
-        assert_eq!(repo.sparse_spec().unwrap().prefixes(), &["src/".to_string()]);
+        assert_eq!(
+            repo.sparse_spec().unwrap().prefixes(),
+            &["src/".to_string()]
+        );
 
         let st = repo.status().unwrap();
         assert!(
@@ -4828,14 +5380,23 @@ mod tests {
         ));
         // ...and it must not have persisted the spec or touched the file.
         assert!(!repo.layout().sparse_path().exists());
-        assert_eq!(std::fs::read(root.join("src/a.txt")).unwrap(), b"dirty edit");
+        assert_eq!(
+            std::fs::read(root.join("src/a.txt")).unwrap(),
+            b"dirty edit"
+        );
 
         // Clean up the dirty state, set sparse, then dirty again to check disable_sparse.
         repo.commit("me", "commit the edit").unwrap();
         repo.set_sparse(&["src/".to_string()], None).unwrap();
         std::fs::write(root.join("src/a.txt"), b"dirty again").unwrap();
-        assert!(matches!(repo.disable_sparse(None), Err(Error::InvalidArgument(_))));
-        assert!(repo.layout().sparse_path().exists(), "disable must not have cleared the spec");
+        assert!(matches!(
+            repo.disable_sparse(None),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(
+            repo.layout().sparse_path().exists(),
+            "disable must not have cleared the spec"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -4844,7 +5405,9 @@ mod tests {
     // ── P27 Task 5: gap-tolerant status/diff, verify, export, and the
     // merge/pick out-of-filter guard on a partial clone. ──
 
-    fn tmp_repo_with_src_and_docs_partial(tag: &str) -> (Repo, std::path::PathBuf, Repo, std::path::PathBuf) {
+    fn tmp_repo_with_src_and_docs_partial(
+        tag: &str,
+    ) -> (Repo, std::path::PathBuf, Repo, std::path::PathBuf) {
         let src_root = tmp_root(&format!("{tag}-src"));
         let dst_root = tmp_root(&format!("{tag}-dst"));
         std::fs::create_dir_all(src_root.join("src")).unwrap();
@@ -4870,15 +5433,22 @@ mod tests {
         // unfiltered walker, which `NotFound`s on the out-of-filter `docs/`
         // gap a partial clone never fetched. Both must now succeed and
         // report no spurious deletion for the gapped path.
-        let (src, src_root, dst, dst_root) = tmp_repo_with_src_and_docs_partial("status-diff-partial");
+        let (src, src_root, dst, dst_root) =
+            tmp_repo_with_src_and_docs_partial("status-diff-partial");
 
         let st = dst.status().unwrap();
-        assert!(st.deleted.is_empty(), "out-of-filter docs/ must not read as deleted: {st:?}");
+        assert!(
+            st.deleted.is_empty(),
+            "out-of-filter docs/ must not read as deleted: {st:?}"
+        );
         assert!(st.modified.is_empty());
         assert!(st.added.is_empty());
 
         let diff = dst.diff_unified().unwrap();
-        assert!(diff.is_empty(), "a clean partial-clone checkout must diff empty: {diff}");
+        assert!(
+            diff.is_empty(),
+            "a clean partial-clone checkout must diff empty: {diff}"
+        );
         assert!(!diff.contains("docs/b.txt"));
 
         drop(src);
@@ -4894,10 +5464,15 @@ mod tests {
         let tip = dst.head_tip().unwrap().unwrap();
         let gaps = dst.partial_gap_count(&[tip]).unwrap();
         assert!(gaps.is_some(), "a partial clone must report Some gap count");
-        assert!(gaps.unwrap() >= 1, "the out-of-filter docs/ subtree must show up as a gap");
+        assert!(
+            gaps.unwrap() >= 1,
+            "the out-of-filter docs/ subtree must show up as a gap"
+        );
 
         // A full clone reports no partial-clone gap count at all.
-        let full_gaps = src.partial_gap_count(&[src.head_tip().unwrap().unwrap()]).unwrap();
+        let full_gaps = src
+            .partial_gap_count(&[src.head_tip().unwrap().unwrap()])
+            .unwrap();
         assert_eq!(full_gaps, None, "a full clone is not partial");
 
         drop(src);
@@ -4912,7 +5487,8 @@ mod tests {
         // partial clone would silently DROP out-of-filter subtrees (the
         // Task 4 graft is single-tip-scoped). Refuse loudly instead of
         // relying on an incidental NotFound from deep inside `three_way`.
-        let (src, src_root, dst, dst_root) = tmp_repo_with_src_and_docs_partial("merge-guard-partial");
+        let (src, src_root, dst, dst_root) =
+            tmp_repo_with_src_and_docs_partial("merge-guard-partial");
 
         // Fork a second branch off the initial commit, then diverge both
         // sides so `merge` needs a genuine (non-FF) three-way, not just an
@@ -4936,7 +5512,10 @@ mod tests {
         );
         assert!(err.to_string().contains("backfill"));
         assert!(err.to_string().contains("not supported on a partial clone"));
-        assert!(!dst.merge_in_progress(), "the refusal must be a preflight, not a conflict state");
+        assert!(
+            !dst.merge_in_progress(),
+            "the refusal must be a preflight, not a conflict state"
+        );
 
         drop(src);
         drop(dst);
@@ -4950,7 +5529,8 @@ mod tests {
     /// `NotFound`ed — even with no merge/sparse narrowing involved at all.
     #[test]
     fn switch_succeeds_on_partial_clone_with_a_real_gap() {
-        let (src, src_root, dst, dst_root) = tmp_repo_with_src_and_docs_partial("switch-partial-gap");
+        let (src, src_root, dst, dst_root) =
+            tmp_repo_with_src_and_docs_partial("switch-partial-gap");
 
         dst.branch("feature").unwrap();
         dst.switch("feature").unwrap();
@@ -4960,7 +5540,10 @@ mod tests {
         // Switching back to main (a different tree, same out-of-filter gap)
         // must succeed and must not touch the never-fetched docs/ subtree.
         dst.switch("main").unwrap();
-        assert_eq!(std::fs::read(dst_root.join("src/a.txt")).unwrap(), b"src-one");
+        assert_eq!(
+            std::fs::read(dst_root.join("src/a.txt")).unwrap(),
+            b"src-one"
+        );
         assert!(!dst_root.join("docs/b.txt").exists());
 
         drop(src);
@@ -4975,7 +5558,8 @@ mod tests {
         // MERGE_HEAD/decided-root state is present without having gone
         // through `merge_with_identity`'s upfront refusal (mirrors how
         // `gc`'s tests write merge_state directly).
-        let (src, src_root, dst, dst_root) = tmp_repo_with_src_and_docs_partial("snapshot-files-guard");
+        let (src, src_root, dst, dst_root) =
+            tmp_repo_with_src_and_docs_partial("snapshot-files-guard");
         let tip = dst.head_tip().unwrap().unwrap();
 
         let err = dst
@@ -4992,7 +5576,10 @@ mod tests {
                 "msg",
             )
             .unwrap_err();
-        assert!(matches!(err, Error::PartialCloneUnsupported(_)), "got {err:?}");
+        assert!(
+            matches!(err, Error::PartialCloneUnsupported(_)),
+            "got {err:?}"
+        );
 
         drop(src);
         drop(dst);

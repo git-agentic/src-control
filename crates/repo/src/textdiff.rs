@@ -94,7 +94,7 @@ pub fn unified(path: &str, old: &str, new: &str) -> String {
                     ncount += 1;
                 }
                 i += run; // skip the rest of the unchanged run
-                // Fast-forward line counters over the skipped remainder.
+                          // Fast-forward line counters over the skipped remainder.
                 oline += run - tail;
                 nline += run - tail;
                 break;

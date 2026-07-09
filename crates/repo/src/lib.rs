@@ -1,16 +1,13 @@
 //! `scl-repo` — the durable on-disk repository: `.sc/` layout, refs/HEAD,
 //! named branches, a git-like working tree, and commit/secret orchestration.
 
-pub mod diff3;
 pub(crate) mod conflicts;
-pub mod scanner;
-pub mod textdiff;
-pub mod scanner_patterns;
+pub mod diff3;
 pub mod error;
 pub mod gc;
+pub mod git_marks;
 pub mod http_transport;
 pub mod ignore;
-pub mod git_marks;
 pub mod layout;
 pub mod lock;
 pub mod merge;
@@ -27,18 +24,21 @@ pub mod remote;
 pub mod replay;
 pub mod repo;
 pub mod rewrap;
+pub mod scanner;
+pub mod scanner_patterns;
 pub mod secrets;
 pub mod serve_tokens;
 pub mod signatures;
 pub mod sparse;
 pub mod stdio_transport;
 pub mod sync;
+pub mod textdiff;
 pub mod transcripts;
 pub mod transport;
 pub mod wire;
-pub(crate) mod ws;
 pub mod workspace;
 pub mod worktree;
+pub(crate) mod ws;
 
 pub use conflicts::{ActiveOp, ConflictKind, ConflictVersions, ResolveSide, Side};
 pub use error::{Error, Result};

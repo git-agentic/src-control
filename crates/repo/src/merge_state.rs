@@ -71,14 +71,21 @@ pub fn write(
     conflicts: &[String],
     decided_root: Option<&ObjectId>,
 ) -> Result<()> {
-    atomic_write(&merge_conflicts_path(layout), (conflicts.join("\n") + "\n").as_bytes())?;
+    atomic_write(
+        &merge_conflicts_path(layout),
+        (conflicts.join("\n") + "\n").as_bytes(),
+    )?;
     match decided_root {
-        Some(root) => {
-            atomic_write(&decided_root_path(layout), format!("{}\n", root.to_hex()).as_bytes())?
-        }
+        Some(root) => atomic_write(
+            &decided_root_path(layout),
+            format!("{}\n", root.to_hex()).as_bytes(),
+        )?,
         None => remove_if_exists(&decided_root_path(layout))?,
     }
-    atomic_write(&merge_head_path(layout), format!("{}\n", theirs.to_hex()).as_bytes())?;
+    atomic_write(
+        &merge_head_path(layout),
+        format!("{}\n", theirs.to_hex()).as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -90,7 +97,11 @@ pub fn set_conflicts(layout: &Layout, paths: &[String]) -> Result<()> {
     // An empty list must serialize to an empty file, not "\n" — `"\n".lines()`
     // yields one empty-string element, not zero, which would make the last
     // resolved path look like it's still conflicted (as `""`).
-    let text = if paths.is_empty() { String::new() } else { format!("{}\n", paths.join("\n")) };
+    let text = if paths.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", paths.join("\n"))
+    };
     atomic_write(&merge_conflicts_path(layout), text.as_bytes())
 }
 
@@ -118,7 +129,9 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     // turning "foo.bar" into "foo.tmp").
     let name = path
         .file_name()
-        .ok_or_else(|| Error::InvalidArgument(format!("path has no file name: {}", path.display())))?
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!("path has no file name: {}", path.display()))
+        })?
         .to_string_lossy()
         .into_owned();
     let tmp = path.with_file_name(format!("{name}.tmp"));
@@ -132,7 +145,8 @@ mod tests {
     use super::*;
 
     fn tmp_layout(tag: &str) -> Layout {
-        let root = std::env::temp_dir().join(format!("scl-mergestate-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("scl-mergestate-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let layout = Layout::at(&root);
         std::fs::create_dir_all(&layout.dot_sc).unwrap();
@@ -149,7 +163,11 @@ mod tests {
         assert!(in_progress(&layout));
         assert_eq!(read_merge_head(&layout).unwrap(), Some(theirs));
         assert_eq!(read_conflicts(&layout).unwrap(), vec!["a.txt", "b.txt"]);
-        assert_eq!(read_decided_root(&layout).unwrap(), None, "absent record reads None");
+        assert_eq!(
+            read_decided_root(&layout).unwrap(),
+            None,
+            "absent record reads None"
+        );
         // With a decided root: round-trips; a later record without one drops it.
         let decided = ObjectId::of(b"decided-tree");
         write(&layout, &theirs, &["a.txt".into()], Some(&decided)).unwrap();
@@ -160,7 +178,11 @@ mod tests {
         clear(&layout).unwrap();
         assert!(!in_progress(&layout));
         assert_eq!(read_merge_head(&layout).unwrap(), None);
-        assert_eq!(read_decided_root(&layout).unwrap(), None, "clear drops the decided root");
+        assert_eq!(
+            read_decided_root(&layout).unwrap(),
+            None,
+            "clear drops the decided root"
+        );
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 }

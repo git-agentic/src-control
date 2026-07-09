@@ -51,7 +51,11 @@ pub fn build_pack(objects: &[(ObjectId, Vec<u8>)]) -> Result<(Vec<u8>, Vec<u8>)>
         let offset = pack.len() as u64; // position of compressed_len
         pack.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         pack.extend_from_slice(&compressed);
-        entries.push(IndexEntry { id: *id, offset, length: compressed.len() as u64 });
+        entries.push(IndexEntry {
+            id: *id,
+            offset,
+            length: compressed.len() as u64,
+        });
     }
     entries.sort_by_key(|e| e.id);
 
@@ -92,7 +96,8 @@ impl<W: Write> PackWriter<W> {
     /// tracked in memory purely so `finish` can catch a short write.
     pub fn new(mut w: W, count: u32) -> Result<Self> {
         w.write_all(PACK_MAGIC).map_err(Error::Io)?;
-        w.write_all(&FORMAT_VERSION.to_le_bytes()).map_err(Error::Io)?;
+        w.write_all(&FORMAT_VERSION.to_le_bytes())
+            .map_err(Error::Io)?;
         Ok(PackWriter {
             w,
             pos: 8,
@@ -119,7 +124,11 @@ impl<W: Write> PackWriter<W> {
         self.pos += 4;
         self.w.write_all(&compressed).map_err(Error::Io)?;
         self.pos += compressed.len() as u64;
-        self.entries.push(IndexEntry { id: *id, offset, length: compressed.len() as u64 });
+        self.entries.push(IndexEntry {
+            id: *id,
+            offset,
+            length: compressed.len() as u64,
+        });
         self.count_written += 1;
         Ok(())
     }
@@ -199,7 +208,9 @@ pub fn read_object_at(pack: &[u8], offset: u64, id: &ObjectId) -> Result<Object>
     let start = off + 4;
     let end = start + len;
     if end > pack.len() {
-        return Err(Error::PackCorrupt(format!("record at {offset} runs past end")));
+        return Err(Error::PackCorrupt(format!(
+            "record at {offset} runs past end"
+        )));
     }
     decompress_and_decode(&pack[start..end], id)
 }
@@ -209,7 +220,9 @@ fn decompress_and_decode(payload: &[u8], id: &ObjectId) -> Result<Object> {
     let canonical = zstd::decode_all(std::io::Cursor::new(payload))
         .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
     if ObjectId::of(&canonical) != *id {
-        return Err(Error::Malformed(format!("packed object {id} failed hash verification")));
+        return Err(Error::Malformed(format!(
+            "packed object {id} failed hash verification"
+        )));
     }
     Object::decode(&canonical)
 }
@@ -292,7 +305,8 @@ pub fn parse_pack_reader<R: Read>(
     mut f: impl FnMut(ObjectId, Object) -> Result<()>,
 ) -> Result<()> {
     let mut header = [0u8; 8];
-    r.read_exact(&mut header).map_err(|e| Error::PackCorrupt(format!("truncated header: {e}")))?;
+    r.read_exact(&mut header)
+        .map_err(|e| Error::PackCorrupt(format!("truncated header: {e}")))?;
     if &header[..4] != PACK_MAGIC {
         return Err(Error::PackCorrupt("missing magic".into()));
     }
@@ -391,13 +405,22 @@ mod tests {
         pack[last] ^= 0xFF; // corrupt the compressed payload
         let e = parse_index(&idx).unwrap().pop().unwrap();
         let err = read_object_at(&pack, e.offset, &e.id).unwrap_err();
-        assert!(matches!(err, crate::error::Error::Malformed(_) | crate::error::Error::PackCorrupt(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Malformed(_) | crate::error::Error::PackCorrupt(_)
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
     fn bad_index_magic_rejected() {
         let err = parse_index(b"XXXXnot an index").unwrap_err();
-        assert!(matches!(err, crate::error::Error::BadPackIndex(_)), "got {err:?}");
+        assert!(
+            matches!(err, crate::error::Error::BadPackIndex(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -450,7 +473,10 @@ mod tests {
         corrupt[last] ^= 0xFF;
         let err = parse_pack_reader(&corrupt[..], |_id, _obj| Ok(())).unwrap_err();
         assert!(
-            matches!(err, crate::error::Error::PackCorrupt(_) | crate::error::Error::Malformed(_)),
+            matches!(
+                err,
+                crate::error::Error::PackCorrupt(_) | crate::error::Error::Malformed(_)
+            ),
             "got {err:?}"
         );
     }
@@ -467,7 +493,10 @@ mod tests {
             writer.write_object(id, bytes).unwrap();
         }
         let err = writer.finish().unwrap_err();
-        assert!(matches!(err, crate::error::Error::PackCorrupt(_)), "got {err:?}");
+        assert!(
+            matches!(err, crate::error::Error::PackCorrupt(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -499,7 +528,10 @@ mod tests {
         let bomb_plain = vec![0u8; crate::MAX_OBJECT_SIZE + 1024];
         let compressed =
             zstd::encode_all(std::io::Cursor::new(&bomb_plain[..]), COMPRESSION_LEVEL).unwrap();
-        assert!(compressed.len() < bomb_plain.len() / 10, "expected the all-zero payload to compress small");
+        assert!(
+            compressed.len() < bomb_plain.len() / 10,
+            "expected the all-zero payload to compress small"
+        );
 
         let mut buf = Vec::new();
         buf.extend_from_slice(PACK_MAGIC);
@@ -521,6 +553,9 @@ mod tests {
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&0x1000_0000_0000_0000u64.to_le_bytes());
         let err = parse_index(&bytes).unwrap_err();
-        assert!(matches!(err, crate::error::Error::BadPackIndex(_)), "got {err:?}");
+        assert!(
+            matches!(err, crate::error::Error::BadPackIndex(_)),
+            "got {err:?}"
+        );
     }
 }

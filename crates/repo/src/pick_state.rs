@@ -99,11 +99,15 @@ pub fn write(
     decided_root: Option<&ObjectId>,
     mainline_base: Option<&ObjectId>,
 ) -> Result<()> {
-    atomic_write(&pick_conflicts_path(layout), (conflicts.join("\n") + "\n").as_bytes())?;
+    atomic_write(
+        &pick_conflicts_path(layout),
+        (conflicts.join("\n") + "\n").as_bytes(),
+    )?;
     match decided_root {
-        Some(root) => {
-            atomic_write(&decided_root_path(layout), format!("{}\n", root.to_hex()).as_bytes())?
-        }
+        Some(root) => atomic_write(
+            &decided_root_path(layout),
+            format!("{}\n", root.to_hex()).as_bytes(),
+        )?,
         None => remove_if_exists(&decided_root_path(layout))?,
     }
     match mainline_base {
@@ -113,7 +117,10 @@ pub fn write(
         )?,
         None => remove_if_exists(&mainline_base_path(layout))?,
     }
-    atomic_write(&pick_head_path(layout), format!("{}\n", picked.to_hex()).as_bytes())?;
+    atomic_write(
+        &pick_head_path(layout),
+        format!("{}\n", picked.to_hex()).as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -126,7 +133,11 @@ pub fn set_conflicts(layout: &Layout, paths: &[String]) -> Result<()> {
     // An empty list must serialize to an empty file, not "\n" — `"\n".lines()`
     // yields one empty-string element, not zero, which would make the last
     // resolved path look like it's still conflicted (as `""`).
-    let text = if paths.is_empty() { String::new() } else { format!("{}\n", paths.join("\n")) };
+    let text = if paths.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", paths.join("\n"))
+    };
     atomic_write(&pick_conflicts_path(layout), text.as_bytes())
 }
 
@@ -155,7 +166,9 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     // turning "foo.bar" into "foo.tmp").
     let name = path
         .file_name()
-        .ok_or_else(|| Error::InvalidArgument(format!("path has no file name: {}", path.display())))?
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!("path has no file name: {}", path.display()))
+        })?
         .to_string_lossy()
         .into_owned();
     let tmp = path.with_file_name(format!("{name}.tmp"));
@@ -183,28 +196,65 @@ mod tests {
         let picked = ObjectId::of(b"picked");
         // Without a decided root or mainline base (older code paths / plain
         // picks): both read None.
-        write(&layout, &picked, &["a.txt".into(), "b.txt".into()], None, None).unwrap();
+        write(
+            &layout,
+            &picked,
+            &["a.txt".into(), "b.txt".into()],
+            None,
+            None,
+        )
+        .unwrap();
         assert!(in_progress(&layout));
         assert_eq!(read_pick_head(&layout).unwrap(), Some(picked));
         assert_eq!(read_conflicts(&layout).unwrap(), vec!["a.txt", "b.txt"]);
-        assert_eq!(read_decided_root(&layout).unwrap(), None, "absent record reads None");
-        assert_eq!(read_mainline_base(&layout).unwrap(), None, "absent record reads None");
+        assert_eq!(
+            read_decided_root(&layout).unwrap(),
+            None,
+            "absent record reads None"
+        );
+        assert_eq!(
+            read_mainline_base(&layout).unwrap(),
+            None,
+            "absent record reads None"
+        );
         // With a decided root and mainline base: round-trip; a later record
         // without them drops both.
         let decided = ObjectId::of(b"decided-tree");
         let mainline_base = ObjectId::of(b"mainline-base");
-        write(&layout, &picked, &["a.txt".into()], Some(&decided), Some(&mainline_base)).unwrap();
+        write(
+            &layout,
+            &picked,
+            &["a.txt".into()],
+            Some(&decided),
+            Some(&mainline_base),
+        )
+        .unwrap();
         assert_eq!(read_decided_root(&layout).unwrap(), Some(decided));
         assert_eq!(read_mainline_base(&layout).unwrap(), Some(mainline_base));
         write(&layout, &picked, &["a.txt".into()], None, None).unwrap();
         assert_eq!(read_decided_root(&layout).unwrap(), None);
         assert_eq!(read_mainline_base(&layout).unwrap(), None);
-        write(&layout, &picked, &["a.txt".into()], Some(&decided), Some(&mainline_base)).unwrap();
+        write(
+            &layout,
+            &picked,
+            &["a.txt".into()],
+            Some(&decided),
+            Some(&mainline_base),
+        )
+        .unwrap();
         clear(&layout).unwrap();
         assert!(!in_progress(&layout));
         assert_eq!(read_pick_head(&layout).unwrap(), None);
-        assert_eq!(read_decided_root(&layout).unwrap(), None, "clear drops the decided root");
-        assert_eq!(read_mainline_base(&layout).unwrap(), None, "clear drops the mainline base");
+        assert_eq!(
+            read_decided_root(&layout).unwrap(),
+            None,
+            "clear drops the decided root"
+        );
+        assert_eq!(
+            read_mainline_base(&layout).unwrap(),
+            None,
+            "clear drops the mainline base"
+        );
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 }

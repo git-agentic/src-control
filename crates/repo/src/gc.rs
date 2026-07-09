@@ -18,7 +18,10 @@ use scl_core::{Object, ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
-use crate::{merge_state, oplog, pick_state, promisor, reachable, rebase_state, refs, signatures, transcripts, ws};
+use crate::{
+    merge_state, oplog, pick_state, promisor, reachable, rebase_state, refs, signatures,
+    transcripts, ws,
+};
 
 /// What a gc pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -213,7 +216,10 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
             continue;
         }
         let old_enough = match store.loose_mtime(&id)? {
-            Some(mtime) => now.duration_since(mtime).map(|age| age >= grace).unwrap_or(false),
+            Some(mtime) => now
+                .duration_since(mtime)
+                .map(|age| age >= grace)
+                .unwrap_or(false),
             None => false,
         };
         if old_enough {
@@ -315,7 +321,10 @@ mod tests {
         repo.gc(Duration::from_secs(0)).unwrap();
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
-        assert!(s.contains(&second), "remote-tracking ref must protect its commit");
+        assert!(
+            s.contains(&second),
+            "remote-tracking ref must protect its commit"
+        );
         drop(s);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -337,23 +346,33 @@ mod tests {
             let mut s = arc.lock().unwrap();
             let blob = s.put(Object::blob(b"decided-only-bytes".to_vec())).unwrap();
             let tree = s
-                .put(Object::Tree(scl_core::Tree::new(vec![scl_core::TreeEntry {
-                    name: "d.txt".into(),
-                    kind: scl_core::EntryKind::Blob,
-                    id: blob,
-                    mode: scl_core::FileMode::FILE,
-                    perms: 0,
-                }])))
+                .put(Object::Tree(scl_core::Tree::new(vec![
+                    scl_core::TreeEntry {
+                        name: "d.txt".into(),
+                        kind: scl_core::EntryKind::Blob,
+                        id: blob,
+                        mode: scl_core::FileMode::FILE,
+                        perms: 0,
+                    },
+                ])))
                 .unwrap();
             (blob, tree)
         };
-        merge_state::write(repo.layout(), &theirs, &["a.txt".into()], Some(&decided_tree))
-            .unwrap();
+        merge_state::write(
+            repo.layout(),
+            &theirs,
+            &["a.txt".into()],
+            Some(&decided_tree),
+        )
+        .unwrap();
 
         repo.gc(Duration::from_secs(0)).unwrap();
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
-        assert!(s.contains(&theirs), "MERGE_HEAD must protect the in-progress other parent");
+        assert!(
+            s.contains(&theirs),
+            "MERGE_HEAD must protect the in-progress other parent"
+        );
         assert!(
             s.contains(&decided_tree) && s.contains(&decided_blob),
             "MERGE_DECIDED_ROOT must protect the decided carried tree + its blobs"
@@ -382,25 +401,38 @@ mod tests {
         let (decided_blob, decided_tree) = {
             let arc = repo.vfs().store();
             let mut s = arc.lock().unwrap();
-            let blob = s.put(Object::blob(b"pick-decided-only-bytes".to_vec())).unwrap();
+            let blob = s
+                .put(Object::blob(b"pick-decided-only-bytes".to_vec()))
+                .unwrap();
             let tree = s
-                .put(Object::Tree(scl_core::Tree::new(vec![scl_core::TreeEntry {
-                    name: "d.txt".into(),
-                    kind: scl_core::EntryKind::Blob,
-                    id: blob,
-                    mode: scl_core::FileMode::FILE,
-                    perms: 0,
-                }])))
+                .put(Object::Tree(scl_core::Tree::new(vec![
+                    scl_core::TreeEntry {
+                        name: "d.txt".into(),
+                        kind: scl_core::EntryKind::Blob,
+                        id: blob,
+                        mode: scl_core::FileMode::FILE,
+                        perms: 0,
+                    },
+                ])))
                 .unwrap();
             (blob, tree)
         };
-        crate::pick_state::write(repo.layout(), &picked, &["a.txt".into()], Some(&decided_tree), None)
-            .unwrap();
+        crate::pick_state::write(
+            repo.layout(),
+            &picked,
+            &["a.txt".into()],
+            Some(&decided_tree),
+            None,
+        )
+        .unwrap();
 
         repo.gc(Duration::from_secs(0)).unwrap();
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
-        assert!(s.contains(&picked), "PICK_HEAD must protect the in-progress picked commit");
+        assert!(
+            s.contains(&picked),
+            "PICK_HEAD must protect the in-progress picked commit"
+        );
         assert!(
             s.contains(&decided_tree) && s.contains(&decided_blob),
             "PICK_DECIDED_ROOT must protect the decided carried tree + its blobs"
@@ -447,15 +479,19 @@ mod tests {
         let (decided_blob, decided_tree) = {
             let arc = repo.vfs().store();
             let mut s = arc.lock().unwrap();
-            let blob = s.put(Object::blob(b"rebase-decided-only-bytes".to_vec())).unwrap();
+            let blob = s
+                .put(Object::blob(b"rebase-decided-only-bytes".to_vec()))
+                .unwrap();
             let tree = s
-                .put(Object::Tree(scl_core::Tree::new(vec![scl_core::TreeEntry {
-                    name: "d.txt".into(),
-                    kind: scl_core::EntryKind::Blob,
-                    id: blob,
-                    mode: scl_core::FileMode::FILE,
-                    perms: 0,
-                }])))
+                .put(Object::Tree(scl_core::Tree::new(vec![
+                    scl_core::TreeEntry {
+                        name: "d.txt".into(),
+                        kind: scl_core::EntryKind::Blob,
+                        id: blob,
+                        mode: scl_core::FileMode::FILE,
+                        perms: 0,
+                    },
+                ])))
                 .unwrap();
             (blob, tree)
         };
@@ -478,7 +514,10 @@ mod tests {
         repo.gc(Duration::from_secs(0)).unwrap();
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
-        assert!(s.contains(&acc_tip), "REBASE_STATE's acc_tip must protect the fold's landed progress");
+        assert!(
+            s.contains(&acc_tip),
+            "REBASE_STATE's acc_tip must protect the fold's landed progress"
+        );
         assert!(
             s.contains(&decided_tree) && s.contains(&decided_blob),
             "REBASE_DECIDED_ROOT must protect the decided carried tree + its blobs"
@@ -514,11 +553,17 @@ mod tests {
         assert_eq!(refs::head_tip(repo.layout()).unwrap(), Some(c1));
 
         let stats = repo.gc(Duration::from_secs(0)).unwrap();
-        assert_eq!(stats.loose_pruned, 0, "oplog-referenced c2 must not be pruned");
+        assert_eq!(
+            stats.loose_pruned, 0,
+            "oplog-referenced c2 must not be pruned"
+        );
 
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
-        assert!(s.contains(&c2), "c2 must survive gc: still referenced by the oplog");
+        assert!(
+            s.contains(&c2),
+            "c2 must survive gc: still referenced by the oplog"
+        );
         drop(s);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -556,7 +601,11 @@ mod tests {
             .iter()
             .find(|r| r.refs.iter().any(|(_, _, after)| *after == Some(old_snap)))
             .expect("old_snap's commit record must exist");
-        assert_ne!(old_rec.seq, all.last().unwrap().seq, "old_snap's record must not be the newest");
+        assert_ne!(
+            old_rec.seq,
+            all.last().unwrap().seq,
+            "old_snap's record must not be the newest"
+        );
         // All these records land in the same wall-clock second in a fast test
         // run, so their `ts` lines are identical text — a blind string
         // replace could land on the wrong block. Scope the edit to
@@ -566,12 +615,24 @@ mod tests {
         let block_start = raw
             .find(&format!("op {}\n", old_rec.seq))
             .expect("old_rec's block must be present");
-        let block_end = block_start + raw[block_start..].find("end\n").expect("block has an end line") + "end\n".len();
+        let block_end = block_start
+            + raw[block_start..]
+                .find("end\n")
+                .expect("block has an end line")
+            + "end\n".len();
         let old_ts_line = format!("ts {}\n", old_rec.ts);
         let block = &raw[block_start..block_end];
-        assert!(block.contains(&old_ts_line), "old record's ts line must be present in its own block");
+        assert!(
+            block.contains(&old_ts_line),
+            "old record's ts line must be present in its own block"
+        );
         let patched_block = block.replacen(&old_ts_line, "ts 100\n", 1);
-        let raw = format!("{}{}{}", &raw[..block_start], patched_block, &raw[block_end..]);
+        let raw = format!(
+            "{}{}{}",
+            &raw[..block_start],
+            patched_block,
+            &raw[block_end..]
+        );
         std::fs::write(repo.layout().oplog_path(), raw).unwrap();
 
         // Zero grace (same convention as the other gc tests above): the
@@ -585,24 +646,37 @@ mod tests {
             "old record must be trimmed: {remaining:?}"
         );
         assert!(
-            remaining
+            remaining.iter().any(|r| r
+                .refs
                 .iter()
-                .any(|r| r.refs.iter().any(|(_, _, after)| *after == Some(fresh_snap))),
+                .any(|(_, _, after)| *after == Some(fresh_snap))),
             "fresh record must survive: {remaining:?}"
         );
 
-        assert!(stats.loose_pruned >= 1, "old_snap's only root (the trimmed record) is gone");
+        assert!(
+            stats.loose_pruned >= 1,
+            "old_snap's only root (the trimmed record) is gone"
+        );
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
-        assert!(!s.contains(&old_snap), "old_snap must be pruned once its only root is trimmed");
-        assert!(s.contains(&fresh_snap), "fresh_snap stays alive via its surviving record");
+        assert!(
+            !s.contains(&old_snap),
+            "old_snap must be pruned once its only root is trimmed"
+        );
+        assert!(
+            s.contains(&fresh_snap),
+            "fresh_snap stays alive via its surviving record"
+        );
         assert!(s.contains(&base), "base stays alive via the branch tip");
         drop(s);
 
         // Undo (which reads the log via `oplog::last`) still sees the
         // surviving fresh record after the trim rewrote the file.
         let last = crate::oplog::last(repo.layout()).unwrap().unwrap();
-        assert!(last.refs.iter().any(|(_, _, after)| *after == Some(fresh_snap)));
+        assert!(last
+            .refs
+            .iter()
+            .any(|(_, _, after)| *after == Some(fresh_snap)));
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -625,8 +699,15 @@ mod tests {
 
         // Live: attached to `base`, which stays reachable via the branch tip
         // for the whole test.
-        let live_tid =
-            repo.attach_transcript(base, "a", "s-live", b"live transcript body", &[identity.enc.public()]).unwrap();
+        let live_tid = repo
+            .attach_transcript(
+                base,
+                "a",
+                "s-live",
+                b"live transcript body",
+                &[identity.enc.public()],
+            )
+            .unwrap();
         repo.sign_transcript(live_tid, &identity).unwrap();
 
         // Dead: committed on top of `base`, then the branch tip is rewound
@@ -636,7 +717,13 @@ mod tests {
         std::fs::write(root.join("a.txt"), b"old").unwrap();
         let dead_snap = repo.commit("t", "dead snap").unwrap();
         let dead_tid = repo
-            .attach_transcript(dead_snap, "a", "s-dead", b"dead transcript body", &[identity.enc.public()])
+            .attach_transcript(
+                dead_snap,
+                "a",
+                "s-dead",
+                b"dead transcript body",
+                &[identity.enc.public()],
+            )
             .unwrap();
         repo.sign_transcript(dead_tid, &identity).unwrap();
         refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
@@ -658,17 +745,34 @@ mod tests {
             .find(|r| r.refs.iter().any(|(_, _, after)| *after == Some(dead_snap)))
             .expect("dead_snap's commit record must exist");
         let raw = std::fs::read_to_string(repo.layout().oplog_path()).unwrap();
-        let block_start = raw.find(&format!("op {}\n", dead_rec.seq)).expect("dead_rec's block must be present");
-        let block_end = block_start + raw[block_start..].find("end\n").expect("block has an end line") + "end\n".len();
+        let block_start = raw
+            .find(&format!("op {}\n", dead_rec.seq))
+            .expect("dead_rec's block must be present");
+        let block_end = block_start
+            + raw[block_start..]
+                .find("end\n")
+                .expect("block has an end line")
+            + "end\n".len();
         let old_ts_line = format!("ts {}\n", dead_rec.ts);
         let block = &raw[block_start..block_end];
-        assert!(block.contains(&old_ts_line), "dead record's ts line must be present in its own block");
+        assert!(
+            block.contains(&old_ts_line),
+            "dead record's ts line must be present in its own block"
+        );
         let patched_block = block.replacen(&old_ts_line, "ts 100\n", 1);
-        let raw = format!("{}{}{}", &raw[..block_start], patched_block, &raw[block_end..]);
+        let raw = format!(
+            "{}{}{}",
+            &raw[..block_start],
+            patched_block,
+            &raw[block_end..]
+        );
         std::fs::write(repo.layout().oplog_path(), raw).unwrap();
 
         let stats = repo.gc(Duration::from_secs(0)).unwrap();
-        assert_eq!(stats.transcripts_pruned, 1, "dead_snap's transcript index entry is dropped");
+        assert_eq!(
+            stats.transcripts_pruned, 1,
+            "dead_snap's transcript index entry is dropped"
+        );
 
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
@@ -677,8 +781,14 @@ mod tests {
         drop(s);
 
         let idx = transcripts::load(repo.layout()).unwrap();
-        assert!(idx.iter().any(|(snap, t)| *snap == base && *t == live_tid), "live entry stays indexed");
-        assert!(!idx.iter().any(|(_, t)| *t == dead_tid), "dead entry is dropped from the index");
+        assert!(
+            idx.iter().any(|(snap, t)| *snap == base && *t == live_tid),
+            "live entry stays indexed"
+        );
+        assert!(
+            !idx.iter().any(|(_, t)| *t == dead_tid),
+            "dead entry is dropped from the index"
+        );
 
         // gc ordering, the load-bearing assertion: the live transcript's OWN
         // signature (keyed by the transcript id, in the SHARED
@@ -700,7 +810,9 @@ mod tests {
 
     /// Build a repo at `root` with `src/a.txt` and `docs/b.txt` in separate
     /// subtrees, one commit. Returns `(repo, src blob id, docs blob id)`.
-    fn tmp_repo_with_src_and_docs(root: &std::path::Path) -> (crate::repo::Repo, ObjectId, ObjectId) {
+    fn tmp_repo_with_src_and_docs(
+        root: &std::path::Path,
+    ) -> (crate::repo::Repo, ObjectId, ObjectId) {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("docs")).unwrap();
         let repo = crate::repo::Repo::init(root).unwrap();
@@ -742,8 +854,14 @@ mod tests {
         {
             let arc = dst.vfs().store();
             let s = arc.lock().unwrap();
-            assert!(s.contains(&src_blob_id), "in-filter src/ blob present before gc");
-            assert!(!s.contains(&docs_blob_id), "out-of-filter docs/ blob was never fetched");
+            assert!(
+                s.contains(&src_blob_id),
+                "in-filter src/ blob present before gc"
+            );
+            assert!(
+                !s.contains(&docs_blob_id),
+                "out-of-filter docs/ blob was never fetched"
+            );
         }
 
         // A genuinely-unreachable PRESENT loose object on the partial clone:
@@ -751,17 +869,27 @@ mod tests {
         let dangling = {
             let arc = dst.vfs().store();
             let mut s = arc.lock().unwrap();
-            s.put(scl_core::Object::blob(b"dangling-on-partial".to_vec())).unwrap()
+            s.put(scl_core::Object::blob(b"dangling-on-partial".to_vec()))
+                .unwrap()
         };
 
         let stats = dst.gc(Duration::from_secs(0)).unwrap();
-        assert!(stats.loose_pruned >= 1, "the dangling object must still be pruned: {stats:?}");
+        assert!(
+            stats.loose_pruned >= 1,
+            "the dangling object must still be pruned: {stats:?}"
+        );
 
         let arc = dst.vfs().store();
         let s = arc.lock().unwrap();
         assert!(s.contains(&src_blob_id), "in-filter src/ blob survives gc");
-        assert!(!s.contains(&docs_blob_id), "out-of-filter docs/ blob stays absent, not an error");
-        assert!(!s.contains(&dangling), "the genuinely-unreachable object is pruned");
+        assert!(
+            !s.contains(&docs_blob_id),
+            "out-of-filter docs/ blob stays absent, not an error"
+        );
+        assert!(
+            !s.contains(&dangling),
+            "the genuinely-unreachable object is pruned"
+        );
         drop(s);
 
         drop(src);
@@ -792,7 +920,10 @@ mod tests {
         dst.gc(Duration::from_secs(0)).unwrap();
         let arc = dst.vfs().store();
         let s = arc.lock().unwrap();
-        assert!(s.contains(&src_blob_id), "in-filter object reached and kept by the filtered gc walk");
+        assert!(
+            s.contains(&src_blob_id),
+            "in-filter object reached and kept by the filtered gc walk"
+        );
         drop(s);
 
         drop(src);
@@ -845,8 +976,14 @@ mod tests {
         {
             let arc = dst.vfs().store();
             let mut s = arc.lock().unwrap();
-            assert!(!s.contains(&docs_tree_id), "out-of-filter docs/ tree starts absent");
-            assert!(!s.contains(&docs_blob_id), "out-of-filter docs/ blob starts absent");
+            assert!(
+                !s.contains(&docs_tree_id),
+                "out-of-filter docs/ tree starts absent"
+            );
+            assert!(
+                !s.contains(&docs_blob_id),
+                "out-of-filter docs/ blob starts absent"
+            );
             // Directly seed the store with the gap's own content, copied
             // verbatim from the source — content addressing guarantees the
             // ids match what the tip's own (in-filter) root tree already
@@ -920,7 +1057,8 @@ mod tests {
     fn gc_walk_in_tolerates_absent_child_of_present_gap_frontier() {
         let src_root = tmp_root("gc-crash-src");
         let dst_root = tmp_root("gc-crash-dst");
-        let (src, docs_tree_id, sub_tree_id, sub_blob_id) = tmp_repo_with_src_and_nested_docs(&src_root);
+        let (src, docs_tree_id, sub_tree_id, sub_blob_id) =
+            tmp_repo_with_src_and_nested_docs(&src_root);
 
         let docs_tree_obj = {
             let arc = src.vfs().store();
@@ -938,18 +1076,27 @@ mod tests {
         {
             let arc = dst.vfs().store();
             let mut s = arc.lock().unwrap();
-            assert!(!s.contains(&docs_tree_id), "out-of-filter docs/ tree starts absent");
+            assert!(
+                !s.contains(&docs_tree_id),
+                "out-of-filter docs/ tree starts absent"
+            );
             assert!(!s.contains(&sub_tree_id), "docs/sub/ tree starts absent");
             // Simulate a crash mid-backfill-ingest: only the gap-frontier
             // `docs` tree object landed; its child `sub` tree (and
             // transitively the blob under it) did not.
             let tid = s.put(docs_tree_obj).unwrap();
             assert_eq!(tid, docs_tree_id, "seeded tree must match the gap's own id");
-            assert!(!s.contains(&sub_tree_id), "the crash-window child must still be absent");
+            assert!(
+                !s.contains(&sub_tree_id),
+                "the crash-window child must still be absent"
+            );
         }
 
         let stats = dst.gc(Duration::from_secs(0));
-        assert!(stats.is_ok(), "gc must not error on a crash-interrupted backfill frontier: {stats:?}");
+        assert!(
+            stats.is_ok(),
+            "gc must not error on a crash-interrupted backfill frontier: {stats:?}"
+        );
 
         let arc = dst.vfs().store();
         let s = arc.lock().unwrap();
@@ -957,8 +1104,14 @@ mod tests {
             s.contains(&docs_tree_id),
             "the present gap-frontier tree must survive gc, not be pruned or fail"
         );
-        assert!(!s.contains(&sub_tree_id), "the never-landed child stays absent (never fetched)");
-        assert!(!s.contains(&sub_blob_id), "the never-landed grandchild blob stays absent");
+        assert!(
+            !s.contains(&sub_tree_id),
+            "the never-landed child stays absent (never fetched)"
+        );
+        assert!(
+            !s.contains(&sub_blob_id),
+            "the never-landed grandchild blob stays absent"
+        );
         drop(s);
 
         drop(src);
@@ -975,7 +1128,10 @@ mod tests {
         repo.commit("t", "c1").unwrap();
         // A second open on the same repo is refused: the open `Repo` already holds
         // the single-writer lock, so gc always runs serialized against other writers.
-        assert!(matches!(crate::repo::Repo::open(&root), Err(crate::error::Error::Locked(_))));
+        assert!(matches!(
+            crate::repo::Repo::open(&root),
+            Err(crate::error::Error::Locked(_))
+        ));
         repo.gc(Duration::from_secs(0)).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -56,7 +56,10 @@ impl Ignore {
             }
             let components: Vec<String> = line.split('/').map(str::to_string).collect();
             let anchored = components.len() > 1;
-            patterns.push(Pattern { components, anchored });
+            patterns.push(Pattern {
+                components,
+                anchored,
+            });
         }
         Ignore { patterns }
     }
@@ -76,7 +79,11 @@ impl Pattern {
             // The pattern's components must glob-match the path's leading
             // components (so a matched directory swallows everything under it).
             self.components.len() <= path.len()
-                && self.components.iter().zip(path).all(|(pat, comp)| glob_component(pat, comp))
+                && self
+                    .components
+                    .iter()
+                    .zip(path)
+                    .all(|(pat, comp)| glob_component(pat, comp))
         } else {
             let pat = &self.components[0];
             path.iter().any(|comp| glob_component(pat, comp))

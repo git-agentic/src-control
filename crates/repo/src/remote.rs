@@ -55,7 +55,10 @@ impl RemoteConfig {
         }
         self.remote.insert(
             name.to_string(),
-            RemoteEntry { url: url.to_string(), kind: RemoteKind::default() },
+            RemoteEntry {
+                url: url.to_string(),
+                kind: RemoteKind::default(),
+            },
         );
         Ok(())
     }
@@ -65,7 +68,13 @@ impl RemoteConfig {
         if self.remote.contains_key(name) {
             return Err(Error::RemoteExists(name.to_string()));
         }
-        self.remote.insert(name.to_string(), RemoteEntry { url: url.to_string(), kind });
+        self.remote.insert(
+            name.to_string(),
+            RemoteEntry {
+                url: url.to_string(),
+                kind,
+            },
+        );
         Ok(())
     }
 
@@ -117,11 +126,7 @@ mod tests {
     fn legacy_config_without_kind_loads_as_sc() {
         let layout = tmp_layout("legacy");
         // A config written before RemoteKind existed: no `kind` key.
-        std::fs::write(
-            layout.config_path(),
-            "[remote.origin]\nurl = \"/path/a\"\n",
-        )
-        .unwrap();
+        std::fs::write(layout.config_path(), "[remote.origin]\nurl = \"/path/a\"\n").unwrap();
         let loaded = RemoteConfig::load(&layout).unwrap();
         assert_eq!(loaded.kind("origin"), Some(RemoteKind::Sc));
         std::fs::remove_dir_all(&layout.root).unwrap();

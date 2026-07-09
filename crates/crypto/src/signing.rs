@@ -295,7 +295,10 @@ mod tests {
         let back = SigPublicKey::from_key_string(&s).unwrap();
         assert_eq!(pk.to_bytes(), back.to_bytes());
 
-        assert!(matches!(SigPublicKey::from_key_string("nope"), Err(Error::BadKey)));
+        assert!(matches!(
+            SigPublicKey::from_key_string("nope"),
+            Err(Error::BadKey)
+        ));
         assert!(matches!(
             SigPublicKey::from_key_string("scl-sig-zz"),
             Err(Error::BadKey)

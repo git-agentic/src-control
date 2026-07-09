@@ -119,7 +119,10 @@ impl Store {
     }
 
     pub fn with_budget(budget_bytes: usize) -> Self {
-        Store::new(StoreConfig { budget_bytes, ..Default::default() })
+        Store::new(StoreConfig {
+            budget_bytes,
+            ..Default::default()
+        })
     }
 
     /// Open (or create) a persistent store backed by `objects_dir`.
@@ -181,7 +184,14 @@ impl Store {
             self.resident_blob_bytes += blob_size;
         }
         let t = self.tick();
-        self.resident.insert(id, Resident { obj, blob_size, last_used: t });
+        self.resident.insert(
+            id,
+            Resident {
+                obj,
+                blob_size,
+                last_used: t,
+            },
+        );
         Ok(id)
     }
 
@@ -202,7 +212,14 @@ impl Store {
             self.resident_blob_bytes += size;
             self.rehydrations += 1;
             let t = self.tick();
-            self.resident.insert(*id, Resident { obj: obj.clone(), blob_size: size, last_used: t });
+            self.resident.insert(
+                *id,
+                Resident {
+                    obj: obj.clone(),
+                    blob_size: size,
+                    last_used: t,
+                },
+            );
             return Ok(obj);
         }
         // Persistent backend: load any object kind from disk (loose, else pack).
@@ -218,7 +235,14 @@ impl Store {
             }
             self.rehydrations += 1;
             let t = self.tick();
-            self.resident.insert(*id, Resident { obj: obj.clone(), blob_size, last_used: t });
+            self.resident.insert(
+                *id,
+                Resident {
+                    obj: obj.clone(),
+                    blob_size,
+                    last_used: t,
+                },
+            );
             return Ok(obj);
         }
         Err(Error::NotFound(*id))
@@ -402,7 +426,9 @@ impl Store {
     /// name that isn't a 64-char hex id. Empty in ephemeral mode.
     pub fn list_loose(&self) -> Result<Vec<ObjectId>> {
         let mut out = Vec::new();
-        let Some(dir) = self.persistent_dir() else { return Ok(out) };
+        let Some(dir) = self.persistent_dir() else {
+            return Ok(out);
+        };
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
@@ -440,8 +466,8 @@ impl Store {
         }
         let shard = path.parent().expect("sharded path has a parent");
         std::fs::create_dir_all(shard)?;
-        let compressed = zstd::encode_all(std::io::Cursor::new(bytes), COMPRESSION_LEVEL)
-            .map_err(Error::Io)?;
+        let compressed =
+            zstd::encode_all(std::io::Cursor::new(bytes), COMPRESSION_LEVEL).map_err(Error::Io)?;
         crate::fsutil::atomic_write_durable(&path, &compressed)?;
         Ok(())
     }
@@ -458,7 +484,9 @@ impl Store {
             Err(_) => raw, // legacy uncompressed loose file
         };
         if ObjectId::of(&canonical) != *id {
-            return Err(Error::Malformed(format!("object {id} failed hash verification on read")));
+            return Err(Error::Malformed(format!(
+                "object {id} failed hash verification on read"
+            )));
         }
         Object::decode(&canonical)
     }
@@ -491,7 +519,9 @@ impl Store {
     /// Rescan `objects/pack/*.idx`, rebuilding the in-memory id->location map.
     pub fn reload_packs(&mut self) -> Result<()> {
         self.pack_index.clear();
-        let Some(pack_dir) = self.pack_dir() else { return Ok(()) };
+        let Some(pack_dir) = self.pack_dir() else {
+            return Ok(());
+        };
         let entries = match std::fs::read_dir(&pack_dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -509,9 +539,10 @@ impl Store {
             }
             let idx_bytes = std::fs::read(&path)?;
             for ie in crate::pack::parse_index(&idx_bytes)? {
-                self.pack_index
-                    .entry(ie.id)
-                    .or_insert(PackLoc { pack_path: pack_path.clone(), offset: ie.offset });
+                self.pack_index.entry(ie.id).or_insert(PackLoc {
+                    pack_path: pack_path.clone(),
+                    offset: ie.offset,
+                });
             }
         }
         Ok(())
@@ -537,7 +568,11 @@ impl Store {
     /// definition. Also covers spilled blobs, which still answer `contains`
     /// via rehydration.
     pub fn resident_ids(&self) -> Vec<ObjectId> {
-        self.resident.keys().copied().chain(self.spilled.keys().copied()).collect()
+        self.resident
+            .keys()
+            .copied()
+            .chain(self.spilled.keys().copied())
+            .collect()
     }
 
     /// Every object id resolvable in this store: RAM-resident, loose
@@ -548,7 +583,8 @@ impl Store {
     /// P22 signature objects, which are leaves referenced by no
     /// tree/snapshot).
     pub fn all_ids(&self) -> Result<Vec<ObjectId>> {
-        let mut set: std::collections::BTreeSet<ObjectId> = self.resident_ids().into_iter().collect();
+        let mut set: std::collections::BTreeSet<ObjectId> =
+            self.resident_ids().into_iter().collect();
         set.extend(self.list_loose()?);
         set.extend(self.packed_ids());
         Ok(set.into_iter().collect())
@@ -617,14 +653,19 @@ impl Store {
     }
 
     fn read_spill(&self, id: &ObjectId) -> Result<Object> {
-        let path = self.spill_dir().ok_or(Error::NotFound(*id))?.join(id.to_hex());
+        let path = self
+            .spill_dir()
+            .ok_or(Error::NotFound(*id))?
+            .join(id.to_hex());
         // Spill files hold RAW blob bytes (not `encode()` output), so reconstruct
         // the blob and verify its content address rather than hashing the bytes
         // directly.
         let bytes = std::fs::read(path)?;
         let obj = Object::blob(bytes);
         if obj.id() != *id {
-            return Err(Error::Malformed(format!("spill object {id} failed hash verification")));
+            return Err(Error::Malformed(format!(
+                "spill object {id} failed hash verification"
+            )));
         }
         Ok(obj)
     }
@@ -723,9 +764,12 @@ mod tests {
                 }))
                 .unwrap();
         } // store dropped; nothing deleted
-        // Reopen on the same dir: resident cache is empty, must load from disk.
+          // Reopen on the same dir: resident cache is empty, must load from disk.
         let mut s2 = Store::open_persistent(&dir, 1024).unwrap();
-        assert_eq!(&s2.get(&blob_id).unwrap().encode(), &Object::blob(b"hello".to_vec()).encode());
+        assert_eq!(
+            &s2.get(&blob_id).unwrap().encode(),
+            &Object::blob(b"hello".to_vec()).encode()
+        );
         assert!(matches!(s2.get(&snap_id).unwrap(), Object::Snapshot(_)));
         drop(s2);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -771,7 +815,9 @@ mod tests {
         let dir = temp_objects_dir("shard");
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = Store::open_persistent(&dir, 1 << 20).unwrap();
-        let id = s.put(Object::blob(b"hello sharded world".to_vec())).unwrap();
+        let id = s
+            .put(Object::blob(b"hello sharded world".to_vec()))
+            .unwrap();
         // File lives at objects/<aa>/<rest>, NOT objects/<hex>.
         let hex = id.to_hex();
         let sharded = dir.join(&hex[..2]).join(&hex[2..]);
@@ -779,10 +825,16 @@ mod tests {
         assert!(!dir.join(&hex).exists(), "must not write flat path");
         // Payload is compressed, not the raw canonical bytes.
         let on_disk = std::fs::read(&sharded).unwrap();
-        assert_ne!(on_disk, Object::blob(b"hello sharded world".to_vec()).encode());
+        assert_ne!(
+            on_disk,
+            Object::blob(b"hello sharded world".to_vec()).encode()
+        );
         // Reopen (empty RAM cache) and read back through decompress+verify.
         let mut s2 = Store::open_persistent(&dir, 1 << 20).unwrap();
-        assert_eq!(s2.get(&id).unwrap().encode(), Object::blob(b"hello sharded world".to_vec()).encode());
+        assert_eq!(
+            s2.get(&id).unwrap().encode(),
+            Object::blob(b"hello sharded world".to_vec()).encode()
+        );
         drop((s, s2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -819,7 +871,10 @@ mod tests {
         assert!(s.list_loose().unwrap().is_empty());
         // Reopen so RAM cache is cold: read must come from the pack.
         let mut s2 = Store::open_persistent(&dir, 1 << 20).unwrap();
-        assert_eq!(s2.get(&a).unwrap().encode(), Object::blob(b"packed-a".to_vec()).encode());
+        assert_eq!(
+            s2.get(&a).unwrap().encode(),
+            Object::blob(b"packed-a".to_vec()).encode()
+        );
         assert!(s2.contains(&b));
         drop((s, s2));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -869,7 +924,7 @@ mod tests {
         let mut s = Store::open_persistent(&dir, 150).unwrap();
         let a = s.put(Object::blob(vec![0xAA; 100])).unwrap();
         let _b = s.put(Object::blob(vec![0xBB; 100])).unwrap(); // evicts a from RAM
-        // After eviction only b is resident.
+                                                                // After eviction only b is resident.
         assert_eq!(s.stats().resident_blob_bytes, 100);
         // Re-putting a (already durable on disk) must not re-admit + double-count.
         let a2 = s.put(Object::blob(vec![0xAA; 100])).unwrap();

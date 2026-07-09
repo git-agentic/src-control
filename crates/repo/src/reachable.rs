@@ -39,7 +39,10 @@ impl ObjectSource for TransportSource<'_> {
 /// All object ids reachable from `tips`: each snapshot + its parents, its root
 /// tree (recursively into subtrees and blobs), and its `secrets` registry
 /// objects.
-pub fn reachable_objects(src: &mut impl ObjectSource, tips: &[ObjectId]) -> Result<BTreeSet<ObjectId>> {
+pub fn reachable_objects(
+    src: &mut impl ObjectSource,
+    tips: &[ObjectId],
+) -> Result<BTreeSet<ObjectId>> {
     Ok(reachable_objects_filtered(src, tips, None)?.included)
 }
 
@@ -49,7 +52,11 @@ pub fn reachable_objects(src: &mut impl ObjectSource, tips: &[ObjectId]) -> Resu
 /// so gc can protect an in-progress merge's decided carried tree
 /// (`MERGE_DECIDED_ROOT`), which is a TREE root, not a snapshot. Unfiltered:
 /// thin wrapper over [`walk_tree_filtered`] with `filter = None`.
-pub(crate) fn walk_tree(src: &mut impl ObjectSource, root: ObjectId, seen: &mut BTreeSet<ObjectId>) -> Result<()> {
+pub(crate) fn walk_tree(
+    src: &mut impl ObjectSource,
+    root: ObjectId,
+    seen: &mut BTreeSet<ObjectId>,
+) -> Result<()> {
     let mut gaps = BTreeSet::new();
     // `filter = None` never consults `expanded` (see the bare-id gate below),
     // so a throwaway empty set is correct and harmless here.
@@ -75,7 +82,11 @@ pub(crate) fn walk_tree(src: &mut impl ObjectSource, root: ObjectId, seen: &mut 
 /// documented nuance that gc only protects content connected to the local
 /// graph — see ADR-0037's gc section). Takes `&mut Store` directly (not
 /// the generic `ObjectSource`) since gc always walks the local store.
-pub(crate) fn walk_tree_present_only(store: &mut Store, root: ObjectId, seen: &mut BTreeSet<ObjectId>) -> Result<()> {
+pub(crate) fn walk_tree_present_only(
+    store: &mut Store,
+    root: ObjectId,
+    seen: &mut BTreeSet<ObjectId>,
+) -> Result<()> {
     if !store.contains(&root) || !seen.insert(root) {
         return Ok(());
     }
@@ -187,7 +198,14 @@ pub fn reachable_objects_filtered(
         for id in snap.secrets.values() {
             included.insert(*id);
         }
-        walk_tree_filtered(src, snap.root, &mut included, &mut gaps, filter, &mut expanded)?;
+        walk_tree_filtered(
+            src,
+            snap.root,
+            &mut included,
+            &mut gaps,
+            filter,
+            &mut expanded,
+        )?;
     }
     // A byte-identical subtree can be gapped at one path and included at
     // another (same id, different filter verdict per path) — included
@@ -413,12 +431,21 @@ mod tests {
             }))
             .unwrap()
         };
-        (arc, snap_id, root, src_tree_id, src_blob_id, docs_tree_id, docs_blob_id)
+        (
+            arc,
+            snap_id,
+            root,
+            src_tree_id,
+            src_blob_id,
+            docs_tree_id,
+            docs_blob_id,
+        )
     }
 
     #[test]
     fn filtered_prunes_out_of_prefix_subtree() {
-        let (arc, snap_id, root, src_tree_id, src_blob_id, docs_tree_id, docs_blob_id) = two_subtree_repo();
+        let (arc, snap_id, root, src_tree_id, src_blob_id, docs_tree_id, docs_blob_id) =
+            two_subtree_repo();
         let filter = crate::promisor::Promisor::new("origin", vec!["src/".into()]);
         let mut s = arc.lock().unwrap();
         let r = reachable_objects_filtered(&mut *s, &[snap_id], Some(&filter)).unwrap();
@@ -438,8 +465,16 @@ mod tests {
         let repo = VfsRepo::new(Store::with_budget(1 << 20));
         let root = repo
             .write_tree(&[
-                ("src/app/x.txt".into(), b"X".to_vec(), scl_core::FileMode::FILE),
-                ("src/other/y.txt".into(), b"Y".to_vec(), scl_core::FileMode::FILE),
+                (
+                    "src/app/x.txt".into(),
+                    b"X".to_vec(),
+                    scl_core::FileMode::FILE,
+                ),
+                (
+                    "src/other/y.txt".into(),
+                    b"Y".to_vec(),
+                    scl_core::FileMode::FILE,
+                ),
             ])
             .unwrap();
         let arc = repo.store();
@@ -449,13 +484,28 @@ mod tests {
                 Object::Tree(t) => t,
                 _ => panic!("expected tree"),
             };
-            let src_tree_id = root_tree.entries.iter().find(|e| e.name == "src").unwrap().id;
+            let src_tree_id = root_tree
+                .entries
+                .iter()
+                .find(|e| e.name == "src")
+                .unwrap()
+                .id;
             let src_tree = match Store::get(&mut s, &src_tree_id).unwrap() {
                 Object::Tree(t) => t,
                 _ => panic!("expected tree"),
             };
-            let app_tree_id = src_tree.entries.iter().find(|e| e.name == "app").unwrap().id;
-            let other_tree_id = src_tree.entries.iter().find(|e| e.name == "other").unwrap().id;
+            let app_tree_id = src_tree
+                .entries
+                .iter()
+                .find(|e| e.name == "app")
+                .unwrap()
+                .id;
+            let other_tree_id = src_tree
+                .entries
+                .iter()
+                .find(|e| e.name == "other")
+                .unwrap()
+                .id;
             let app_tree = match Store::get(&mut s, &app_tree_id).unwrap() {
                 Object::Tree(t) => t,
                 _ => panic!("expected tree"),
@@ -466,7 +516,13 @@ mod tests {
                 _ => panic!("expected tree"),
             };
             let y_blob_id = other_tree.entries[0].id;
-            (src_tree_id, app_tree_id, x_blob_id, other_tree_id, y_blob_id)
+            (
+                src_tree_id,
+                app_tree_id,
+                x_blob_id,
+                other_tree_id,
+                y_blob_id,
+            )
         };
         let snap_id = {
             let mut s = arc.lock().unwrap();
@@ -540,7 +596,10 @@ mod tests {
             let b_tree_id = root_tree.entries.iter().find(|e| e.name == "b").unwrap().id;
             // Content addressing: identical entries under "a" and "b" mean
             // the two subtrees hash to the same id.
-            assert_eq!(a_tree_id, b_tree_id, "test setup assumption: a and b subtrees must share an id");
+            assert_eq!(
+                a_tree_id, b_tree_id,
+                "test setup assumption: a and b subtrees must share an id"
+            );
             let a_tree = match Store::get(&mut s, &a_tree_id).unwrap() {
                 Object::Tree(t) => t,
                 _ => panic!("expected tree"),
@@ -561,7 +620,9 @@ mod tests {
                 _ => panic!("expected tree"),
             };
             let g_blob_id = ay_tree.entries[0].id;
-            (a_tree_id, b_tree_id, ax_tree_id, by_tree_id, f_blob_id, g_blob_id)
+            (
+                a_tree_id, b_tree_id, ax_tree_id, by_tree_id, f_blob_id, g_blob_id,
+            )
         };
         assert_eq!(a_tree_id, b_tree_id);
         let snap_id = {
@@ -584,10 +645,22 @@ mod tests {
 
         // In-filter content at BOTH paths must be included: a/x's f.txt and
         // b/y's g.txt.
-        assert!(r.included.contains(&ax_tree_id), "a/x tree must be included");
-        assert!(r.included.contains(&f_blob_id), "a/x/f.txt blob must be included");
-        assert!(r.included.contains(&by_tree_id), "b/y tree must be included");
-        assert!(r.included.contains(&g_blob_id), "b/y/g.txt blob must be included");
+        assert!(
+            r.included.contains(&ax_tree_id),
+            "a/x tree must be included"
+        );
+        assert!(
+            r.included.contains(&f_blob_id),
+            "a/x/f.txt blob must be included"
+        );
+        assert!(
+            r.included.contains(&by_tree_id),
+            "b/y tree must be included"
+        );
+        assert!(
+            r.included.contains(&g_blob_id),
+            "b/y/g.txt blob must be included"
+        );
 
         // Disjointness: nothing that's included may also linger in gaps.
         assert!(!r.gaps.contains(&ax_tree_id));
@@ -624,8 +697,16 @@ mod tests {
             .unwrap();
         let root2 = repo
             .write_tree(&[
-                ("x/a/f.txt".into(), b"AAA".to_vec(), scl_core::FileMode::FILE),
-                ("x/z/g.txt".into(), b"ZZZ".to_vec(), scl_core::FileMode::FILE),
+                (
+                    "x/a/f.txt".into(),
+                    b"AAA".to_vec(),
+                    scl_core::FileMode::FILE,
+                ),
+                (
+                    "x/z/g.txt".into(),
+                    b"ZZZ".to_vec(),
+                    scl_core::FileMode::FILE,
+                ),
             ])
             .unwrap();
         let arc = repo.store();
@@ -635,13 +716,26 @@ mod tests {
                 Object::Tree(t) => t,
                 _ => panic!("expected tree"),
             };
-            let x_tree_id = root2_tree.entries.iter().find(|e| e.name == "x").unwrap().id;
-            assert_eq!(x_tree_id, root1, "test setup assumption: c2's x/ subtree must dedup to c1's root");
+            let x_tree_id = root2_tree
+                .entries
+                .iter()
+                .find(|e| e.name == "x")
+                .unwrap()
+                .id;
+            assert_eq!(
+                x_tree_id, root1,
+                "test setup assumption: c2's x/ subtree must dedup to c1's root"
+            );
             let root1_tree = match Store::get(&mut s, &root1).unwrap() {
                 Object::Tree(t) => t,
                 _ => panic!("expected tree"),
             };
-            let z_tree_id = root1_tree.entries.iter().find(|e| e.name == "z").unwrap().id;
+            let z_tree_id = root1_tree
+                .entries
+                .iter()
+                .find(|e| e.name == "z")
+                .unwrap()
+                .id;
             let z_tree = match Store::get(&mut s, &z_tree_id).unwrap() {
                 Object::Tree(t) => t,
                 _ => panic!("expected tree"),
@@ -683,8 +777,14 @@ mod tests {
         // one `reachable_objects_filtered` call.
         let r = reachable_objects_filtered(&mut *s, &[snap2_id, snap1_id], Some(&filter)).unwrap();
 
-        assert!(r.included.contains(&z_tree_id), "c1's own z/ tree must be included, not dropped");
-        assert!(r.included.contains(&z_blob_id), "c1's own z/g.txt blob must be included, not dropped");
+        assert!(
+            r.included.contains(&z_tree_id),
+            "c1's own z/ tree must be included, not dropped"
+        );
+        assert!(
+            r.included.contains(&z_blob_id),
+            "c1's own z/g.txt blob must be included, not dropped"
+        );
         assert!(!r.gaps.contains(&z_tree_id));
         assert!(!r.gaps.contains(&z_blob_id));
     }
@@ -694,7 +794,8 @@ mod tests {
     /// out-of-filter objects does not error.
     #[test]
     fn gap_object_is_never_fetched() {
-        let (arc, snap_id, _root, _src_tree_id, _src_blob_id, docs_tree_id, docs_blob_id) = two_subtree_repo();
+        let (arc, snap_id, _root, _src_tree_id, _src_blob_id, docs_tree_id, docs_blob_id) =
+            two_subtree_repo();
         {
             let mut s = arc.lock().unwrap();
             s.delete(&docs_tree_id).unwrap();

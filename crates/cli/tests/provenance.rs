@@ -29,7 +29,11 @@ fn tmp(tag: &str) -> std::path::PathBuf {
 fn keygen(keys_dir: &Path, name: &str) -> (std::path::PathBuf, String, String) {
     let idfile = keys_dir.join(format!("{name}.id"));
     let out = sc(keys_dir, &["keygen", "--out", idfile.to_str().unwrap()]);
-    assert!(out.status.success(), "keygen: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "keygen: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = stdout(&out);
     let enc_pk = text
         .lines()
@@ -50,7 +54,10 @@ fn keygen_v2_writes_seed_file_and_prints_both_public_halves() {
     let (idfile, enc_pk, sig_pk) = keygen(&keys, "alice");
 
     let contents = std::fs::read_to_string(&idfile).unwrap();
-    assert!(contents.starts_with("scl-id-"), "identity file must carry the v2 seed: {contents}");
+    assert!(
+        contents.starts_with("scl-id-"),
+        "identity file must carry the v2 seed: {contents}"
+    );
     assert!(enc_pk.starts_with("scl-pk-"));
     assert!(sig_pk.starts_with("scl-sig-"));
 
@@ -82,21 +89,53 @@ fn commit_sign_verify_and_log_render_the_trusted_state() {
     write_signing_config(&repo, "alice", &sig_pk, true);
 
     std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
-    let commit = sc(&repo, &["commit", "-m", "c1", "--sign", "--identity", id.to_str().unwrap()]);
-    assert!(commit.status.success(), "commit --sign: {}", String::from_utf8_lossy(&commit.stderr));
+    let commit = sc(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "c1",
+            "--sign",
+            "--identity",
+            id.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        commit.status.success(),
+        "commit --sign: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
     let commit_out = stdout(&commit);
-    assert!(commit_out.contains("signed"), "commit --sign prints a signed line: {commit_out}");
-    assert!(commit_out.contains("scl-sig-"), "signed line names the signer key: {commit_out}");
+    assert!(
+        commit_out.contains("signed"),
+        "commit --sign prints a signed line: {commit_out}"
+    );
+    assert!(
+        commit_out.contains("scl-sig-"),
+        "signed line names the signer key: {commit_out}"
+    );
 
     // Human log: trusted state renders "signed: alice ✓".
     let log = stdout(&sc(&repo, &["log"]));
-    assert!(log.contains("signed: alice"), "log shows the trusted signer name: {log}");
-    assert!(log.contains('✓'), "trusted state uses the check mark: {log}");
+    assert!(
+        log.contains("signed: alice"),
+        "log shows the trusted signer name: {log}"
+    );
+    assert!(
+        log.contains('✓'),
+        "trusted state uses the check mark: {log}"
+    );
 
     // JSON log: a "signature" object with status "trusted" and the name.
     let json = stdout(&sc(&repo, &["log", "--json"]));
-    assert!(json.contains("\"status\":\"trusted\""), "json log signature status: {json}");
-    assert!(json.contains("\"name\":\"alice\""), "json log signer name: {json}");
+    assert!(
+        json.contains("\"status\":\"trusted\""),
+        "json log signature status: {json}"
+    );
+    assert!(
+        json.contains("\"name\":\"alice\""),
+        "json log signer name: {json}"
+    );
 
     // verify --require passes: every commit in history is Trusted.
     let verify = sc(&repo, &["verify", "--require"]);
@@ -106,7 +145,10 @@ fn commit_sign_verify_and_log_render_the_trusted_state() {
         String::from_utf8_lossy(&verify.stderr)
     );
     let verify_out = stdout(&verify);
-    assert!(verify_out.contains("1 trusted"), "verify summary: {verify_out}");
+    assert!(
+        verify_out.contains("1 trusted"),
+        "verify summary: {verify_out}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -119,18 +161,27 @@ fn unsigned_commit_gets_no_log_line_and_fails_require() {
     assert!(sc(&root, &["commit", "-m", "c1"]).status.success());
 
     let log = stdout(&sc(&root, &["log"]));
-    assert!(!log.contains("signed:"), "unsigned commit must print no signature line at all: {log}");
+    assert!(
+        !log.contains("signed:"),
+        "unsigned commit must print no signature line at all: {log}"
+    );
     assert!(!log.contains("INVALID"), "unsigned is not invalid: {log}");
 
     // Without --require, verify just reports and exits 0.
     let verify = sc(&root, &["verify"]);
     assert!(verify.status.success());
     let out = stdout(&verify);
-    assert!(out.contains("1 unsigned"), "verify summary counts the unsigned commit: {out}");
+    assert!(
+        out.contains("1 unsigned"),
+        "verify summary counts the unsigned commit: {out}"
+    );
 
     // With --require, an unsigned commit in history fails the gate.
     let verify_req = sc(&root, &["verify", "--require"]);
-    assert!(!verify_req.status.success(), "verify --require must fail with an unsigned commit in history");
+    assert!(
+        !verify_req.status.success(),
+        "verify --require must fail with an unsigned commit in history"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -149,20 +200,45 @@ fn untrusted_signature_renders_hex_prefix_and_fails_require() {
     write_signing_config(&repo, "mallory", &sig_pk, false);
 
     std::fs::write(repo.join("a.txt"), "hi\n").unwrap();
-    assert!(sc(&repo, &["commit", "-m", "c1", "--sign", "--identity", id.to_str().unwrap()])
-        .status
-        .success());
+    assert!(sc(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "c1",
+            "--sign",
+            "--identity",
+            id.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
 
     let log = stdout(&sc(&repo, &["log"]));
-    assert!(log.contains("signed:"), "untrusted still gets a signed line: {log}");
-    assert!(log.contains('?'), "untrusted state uses the '?' marker: {log}");
-    assert!(!log.contains('✓'), "untrusted must not be rendered as trusted: {log}");
+    assert!(
+        log.contains("signed:"),
+        "untrusted still gets a signed line: {log}"
+    );
+    assert!(
+        log.contains('?'),
+        "untrusted state uses the '?' marker: {log}"
+    );
+    assert!(
+        !log.contains('✓'),
+        "untrusted must not be rendered as trusted: {log}"
+    );
 
     let json = stdout(&sc(&repo, &["log", "--json"]));
-    assert!(json.contains("\"status\":\"untrusted\""), "json log signature status: {json}");
+    assert!(
+        json.contains("\"status\":\"untrusted\""),
+        "json log signature status: {json}"
+    );
 
     let verify_req = sc(&repo, &["verify", "--require"]);
-    assert!(!verify_req.status.success(), "verify --require must fail on an untrusted signature");
+    assert!(
+        !verify_req.status.success(),
+        "verify --require must fail on an untrusted signature"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -183,13 +259,26 @@ fn sign_command_signs_an_arbitrary_ref_after_the_fact() {
     // Commit WITHOUT --sign, then sign the branch tip separately.
     assert!(sc(&repo, &["commit", "-m", "c1"]).status.success());
     let sign = sc(&repo, &["sign", "main", "--identity", id.to_str().unwrap()]);
-    assert!(sign.status.success(), "sc sign: {}", String::from_utf8_lossy(&sign.stderr));
+    assert!(
+        sign.status.success(),
+        "sc sign: {}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
     let sign_out = stdout(&sign);
-    assert!(sign_out.starts_with("signed "), "sign prints the confirmation line: {sign_out}");
-    assert!(sign_out.contains("scl-sig-"), "sign names the signer key: {sign_out}");
+    assert!(
+        sign_out.starts_with("signed "),
+        "sign prints the confirmation line: {sign_out}"
+    );
+    assert!(
+        sign_out.contains("scl-sig-"),
+        "sign names the signer key: {sign_out}"
+    );
 
     let log = stdout(&sc(&repo, &["log"]));
-    assert!(log.contains("signed: alice"), "post-hoc sign shows up as trusted in log: {log}");
+    assert!(
+        log.contains("signed: alice"),
+        "post-hoc sign shows up as trusted in log: {log}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -207,17 +296,44 @@ fn amend_sign_replaces_the_signature_on_the_new_tip() {
     write_signing_config(&repo, "alice", &sig_pk, true);
 
     std::fs::write(repo.join("a.txt"), "hi\n").unwrap();
-    assert!(sc(&repo, &["commit", "-m", "c1", "--sign", "--identity", id.to_str().unwrap()])
-        .status
-        .success());
+    assert!(sc(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "c1",
+            "--sign",
+            "--identity",
+            id.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
     std::fs::write(repo.join("a.txt"), "hi again\n").unwrap();
-    let amend = sc(&repo, &["amend", "--sign", "--identity", id.to_str().unwrap()]);
-    assert!(amend.status.success(), "amend --sign: {}", String::from_utf8_lossy(&amend.stderr));
-    assert!(stdout(&amend).contains("signed"), "amend --sign prints a signed line");
+    let amend = sc(
+        &repo,
+        &["amend", "--sign", "--identity", id.to_str().unwrap()],
+    );
+    assert!(
+        amend.status.success(),
+        "amend --sign: {}",
+        String::from_utf8_lossy(&amend.stderr)
+    );
+    assert!(
+        stdout(&amend).contains("signed"),
+        "amend --sign prints a signed line"
+    );
 
     let log = stdout(&sc(&repo, &["log"]));
-    assert!(log.contains("signed: alice"), "amended tip is signed and trusted: {log}");
-    assert_eq!(log.matches("signed: alice").count(), 1, "amend replaces the tip, not append a parallel history: {log}");
+    assert!(
+        log.contains("signed: alice"),
+        "amended tip is signed and trusted: {log}"
+    );
+    assert_eq!(
+        log.matches("signed: alice").count(),
+        1,
+        "amend replaces the tip, not append a parallel history: {log}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -238,11 +354,28 @@ fn sign_with_v1_identity_errors_naming_the_fix() {
     // is no longer reachable via the CLI, so assert on the repo-level
     // behavior instead — a garbage `scl-sk-` file at least proves --sign
     // surfaces a clear error rather than panicking.
-    std::fs::write(&v1, "scl-sk-0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+    std::fs::write(
+        &v1,
+        "scl-sk-0000000000000000000000000000000000000000000000000000000000000000",
+    )
+    .unwrap();
 
     std::fs::write(repo.join("a.txt"), "hi\n").unwrap();
-    let commit = sc(&repo, &["commit", "-m", "c1", "--sign", "--identity", v1.to_str().unwrap()]);
-    assert!(!commit.status.success(), "commit --sign with a bad/v1 identity must fail, not silently skip signing");
+    let commit = sc(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "c1",
+            "--sign",
+            "--identity",
+            v1.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !commit.status.success(),
+        "commit --sign with a bad/v1 identity must fail, not silently skip signing"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -265,9 +398,19 @@ fn verify_walks_all_parents_of_a_merge_not_just_mainline() {
 
     // Mainline commit: signed + trusted.
     std::fs::write(repo.join("main.txt"), "main\n").unwrap();
-    assert!(sc(&repo, &["commit", "-m", "on-main", "--sign", "--identity", id.to_str().unwrap()])
-        .status
-        .success());
+    assert!(sc(
+        &repo,
+        &[
+            "commit",
+            "-m",
+            "on-main",
+            "--sign",
+            "--identity",
+            id.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
 
     // Side commit: left unsigned — only reachable via the merge's non-first
     // parent, which `Repo::log`'s mainline walk would never visit.
@@ -282,7 +425,10 @@ fn verify_walks_all_parents_of_a_merge_not_just_mainline() {
     assert!(verify.status.success());
     let out = stdout(&verify);
     // base (unsigned) + on-main (trusted) + on-side (unsigned) + merge (unsigned) = 4 commits total.
-    assert!(out.contains("4 commit(s)"), "verify must walk every ancestor via both merge parents: {out}");
+    assert!(
+        out.contains("4 commit(s)"),
+        "verify must walk every ancestor via both merge parents: {out}"
+    );
     assert!(out.contains("1 trusted"), "verify summary: {out}");
     assert!(out.contains("3 unsigned"), "verify summary: {out}");
 
@@ -306,7 +452,9 @@ fn log_output_survives_a_closed_reader_pipe() {
     // still consuming — and reading, not draining, the earlier lines.
     for i in 0..20 {
         std::fs::write(repo.join("f.txt"), format!("v{i}\n")).unwrap();
-        assert!(sc(&repo, &["commit", "-m", &format!("c{i}")]).status.success());
+        assert!(sc(&repo, &["commit", "-m", &format!("c{i}")])
+            .status
+            .success());
     }
 
     let sc_bin = env!("CARGO_BIN_EXE_sc");
@@ -351,7 +499,9 @@ fn verify_output_survives_a_closed_reader_pipe() {
     // first line.
     for i in 0..20 {
         std::fs::write(repo.join("f.txt"), format!("v{i}\n")).unwrap();
-        assert!(sc(&repo, &["commit", "-m", &format!("c{i}")]).status.success());
+        assert!(sc(&repo, &["commit", "-m", &format!("c{i}")])
+            .status
+            .success());
     }
 
     let sc_bin = env!("CARGO_BIN_EXE_sc");

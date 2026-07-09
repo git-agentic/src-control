@@ -30,7 +30,11 @@ fn tmp(tag: &str) -> std::path::PathBuf {
 fn keygen(keys_dir: &Path, name: &str) -> (std::path::PathBuf, String, String) {
     let idfile = keys_dir.join(format!("{name}.id"));
     let out = sc(keys_dir, &["keygen", "--out", idfile.to_str().unwrap()]);
-    assert!(out.status.success(), "keygen: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "keygen: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = stdout(&out);
     let enc_pk = text
         .lines()
@@ -85,25 +89,58 @@ fn attach_list_show_and_log_marker_round_trip() {
             id.to_str().unwrap(),
         ],
     );
-    assert!(attach.status.success(), "transcript attach: {}", String::from_utf8_lossy(&attach.stderr));
+    assert!(
+        attach.status.success(),
+        "transcript attach: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
     let attach_out = stdout(&attach);
-    assert!(!attach_out.trim().is_empty(), "attach prints the transcript id");
+    assert!(
+        !attach_out.trim().is_empty(),
+        "attach prints the transcript id"
+    );
 
     // list shows the tip carrying a transcript.
     let list = sc(&repo, &["transcript", "list"]);
-    assert!(list.status.success(), "transcript list: {}", String::from_utf8_lossy(&list.stderr));
+    assert!(
+        list.status.success(),
+        "transcript list: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
     let list_out = stdout(&list);
-    assert!(list_out.contains("claude"), "list names the agent: {list_out}");
+    assert!(
+        list_out.contains("claude"),
+        "list names the agent: {list_out}"
+    );
 
     // show decrypts and prints the body.
-    let show = sc(&repo, &["transcript", "show", "main", "--identity", id.to_str().unwrap()]);
-    assert!(show.status.success(), "transcript show: {}", String::from_utf8_lossy(&show.stderr));
+    let show = sc(
+        &repo,
+        &[
+            "transcript",
+            "show",
+            "main",
+            "--identity",
+            id.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        show.status.success(),
+        "transcript show: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
     let show_out = stdout(&show);
-    assert!(show_out.contains("USER: fix the bug"), "show prints the plaintext body: {show_out}");
+    assert!(
+        show_out.contains("USER: fix the bug"),
+        "show prints the plaintext body: {show_out}"
+    );
 
     // sc log carries a transcript presence marker on that commit.
     let log = stdout(&sc(&repo, &["log"]));
-    assert!(log.contains("transcript"), "log shows a transcript marker: {log}");
+    assert!(
+        log.contains("transcript"),
+        "log shows a transcript marker: {log}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -132,7 +169,14 @@ fn show_without_identity_errors_clearly() {
     std::fs::write(&body_path, "body").unwrap();
     assert!(sc(
         &repo,
-        &["transcript", "attach", "main", body_path.to_str().unwrap(), "--identity", id.to_str().unwrap()]
+        &[
+            "transcript",
+            "attach",
+            "main",
+            body_path.to_str().unwrap(),
+            "--identity",
+            id.to_str().unwrap()
+        ]
     )
     .status
     .success());
@@ -144,7 +188,10 @@ fn show_without_identity_errors_clearly() {
     c.env_remove("SC_IDENTITY");
     c.env("HOME", root.join("no-such-home").to_str().unwrap());
     let show = c.output().expect("sc runs");
-    assert!(!show.status.success(), "show without a resolvable identity must fail, not silently print nothing");
+    assert!(
+        !show.status.success(),
+        "show without a resolvable identity must fail, not silently print nothing"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -175,10 +222,16 @@ fn ws_harvest_transcript_prints_landing_before_reporting_attach_failure() {
     std::fs::write(repo.join(".sc/recipients.toml"), "[recipients]\n").unwrap();
 
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
-    assert!(sc(&repo, &["commit", "-m", "base", "--author", "demo"]).status.success());
+    assert!(sc(&repo, &["commit", "-m", "base", "--author", "demo"])
+        .status
+        .success());
 
     let fork = sc(&repo, &["ws", "fork", "--agents", "1", "--author", "demo"]);
-    assert!(fork.status.success(), "ws fork: {}", String::from_utf8_lossy(&fork.stderr));
+    assert!(
+        fork.status.success(),
+        "ws fork: {}",
+        String::from_utf8_lossy(&fork.stderr)
+    );
     let fork_out = stdout(&fork);
     let ws_dir = fork_out
         .lines()
@@ -192,7 +245,14 @@ fn ws_harvest_transcript_prints_landing_before_reporting_attach_failure() {
 
     let harvest = sc(
         &repo,
-        &["ws", "harvest", "--author", "demo", "--transcript", body_path.to_str().unwrap()],
+        &[
+            "ws",
+            "harvest",
+            "--author",
+            "demo",
+            "--transcript",
+            body_path.to_str().unwrap(),
+        ],
     );
     let harvest_stdout = stdout(&harvest);
     let harvest_stderr = String::from_utf8_lossy(&harvest.stderr).into_owned();
@@ -202,7 +262,10 @@ fn ws_harvest_transcript_prints_landing_before_reporting_attach_failure() {
         "attach failure must be reported via a non-zero exit, not swallowed: stdout={harvest_stdout} stderr={harvest_stderr}"
     );
     assert!(
-        harvest_stdout.contains("1   landed @") || harvest_stdout.lines().any(|l| l.trim_start().starts_with('1') && l.contains("landed @")),
+        harvest_stdout.contains("1   landed @")
+            || harvest_stdout
+                .lines()
+                .any(|l| l.trim_start().starts_with('1') && l.contains("landed @")),
         "landing status for workspace 1 must still be printed even though the transcript \
          attach failed (the ref already moved by the time attach runs): stdout={harvest_stdout}"
     );
@@ -218,7 +281,10 @@ fn ws_harvest_transcript_prints_landing_before_reporting_attach_failure() {
         .lines()
         .find(|l| l.contains("landed @"))
         .expect("a landed line must be present in stdout");
-    assert!(landed_line.trim_start().starts_with('1'), "landed line should be for workspace 1: {landed_line}");
+    assert!(
+        landed_line.trim_start().starts_with('1'),
+        "landed line should be for workspace 1: {landed_line}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }

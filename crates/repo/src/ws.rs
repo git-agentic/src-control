@@ -146,7 +146,12 @@ impl TryFrom<SessionToml> for WsSession {
                         ObjectId::from_str(&t).map_err(|_| bad(format!("bad landed_tip: {t}")))
                     })
                     .transpose()?;
-                Ok(WsEntry { index: e.index, dir: PathBuf::from(e.dir), live: e.live, landed_tip })
+                Ok(WsEntry {
+                    index: e.index,
+                    dir: PathBuf::from(e.dir),
+                    live: e.live,
+                    landed_tip,
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(WsSession {
@@ -292,7 +297,8 @@ impl Repo {
         let sparse = crate::sparse::Sparse::new(session.sparse.clone());
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
-        let d = worktree::diff_worktree(&ws, &mut store, Some(base.root), &base.protection, &sparse)?;
+        let d =
+            worktree::diff_worktree(&ws, &mut store, Some(base.root), &base.protection, &sparse)?;
         Ok(!(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
     }
 
@@ -397,7 +403,9 @@ impl Repo {
             .find(|e| e.index == index)
             .ok_or_else(|| Error::InvalidArgument(format!("no such workspace: {index}")))?;
         if !entry.live {
-            return Err(Error::InvalidArgument(format!("no such workspace: {index}")));
+            return Err(Error::InvalidArgument(format!(
+                "no such workspace: {index}"
+            )));
         }
 
         // Build secret env vars if requested (strict mode, mirroring `sc work`).
@@ -570,8 +578,12 @@ impl Repo {
             )));
         }
 
-        let mut live_indices: Vec<u32> =
-            session.workspaces.iter().filter(|e| e.live).map(|e| e.index).collect();
+        let mut live_indices: Vec<u32> = session
+            .workspaces
+            .iter()
+            .filter(|e| e.live)
+            .map(|e| e.index)
+            .collect();
         live_indices.sort_unstable();
 
         // Preflight: if any live workspace actually diverged, a candidate
@@ -610,7 +622,12 @@ impl Repo {
                 .expect("index came from this session's own live list")
                 .dir
                 .clone();
-            let entry = WsEntry { index: i, dir: dir.clone(), live: true, landed_tip: None };
+            let entry = WsEntry {
+                index: i,
+                dir: dir.clone(),
+                live: true,
+                landed_tip: None,
+            };
 
             // Step 1: unchanged workspaces resolve with no branch created.
             if !self.ws_changed_for(&session, &entry)? {
@@ -658,7 +675,10 @@ impl Repo {
                     // (`harvest_workspace` never calls `write_branch_tip` on
                     // the `SecretDetected` path), so nothing to clean up; the
                     // manifest is untouched for this entry.
-                    outcomes.push(WsHarvestOutcome::Rejected { index: i, report: report.to_string() });
+                    outcomes.push(WsHarvestOutcome::Rejected {
+                        index: i,
+                        report: report.to_string(),
+                    });
                 }
                 crate::workspace::HarvestResult::Unchanged => {
                     // `ws_changed` already confirmed a diff, but
@@ -670,8 +690,8 @@ impl Repo {
                     outcomes.push(WsHarvestOutcome::Unchanged { index: i });
                 }
                 crate::workspace::HarvestResult::Committed(id) => {
-                    let current_tip = refs::read_branch_tip(self.layout(), &landing)?
-                        .ok_or(Error::Unborn)?;
+                    let current_tip =
+                        refs::read_branch_tip(self.layout(), &landing)?.ok_or(Error::Unborn)?;
                     let clean = self.would_merge_cleanly(current_tip, id, identity)?;
                     if clean {
                         // The second tuple element on `Ok` is skipped
@@ -683,8 +703,17 @@ impl Repo {
                                 // (merge_with_identity resolved by branch
                                 // name, not object id).
                                 refs::delete_branch(self.layout(), &branch)?;
-                                resolve_and_teardown(self.layout(), &mut session, i, &dir, Some(merged))?;
-                                outcomes.push(WsHarvestOutcome::Landed { index: i, merged_tip: merged });
+                                resolve_and_teardown(
+                                    self.layout(),
+                                    &mut session,
+                                    i,
+                                    &dir,
+                                    Some(merged),
+                                )?;
+                                outcomes.push(WsHarvestOutcome::Landed {
+                                    index: i,
+                                    merged_tip: merged,
+                                });
                             }
                             Err(Error::UpToDate) => {
                                 // The candidate is already an ancestor of the
@@ -869,8 +898,14 @@ mod tests {
 
         let session = repo.ws_fork(1, "t", None).unwrap();
         let entry = &session.workspaces[0];
-        assert!(entry.dir.join("src/a.txt").exists(), "in-sparse file must materialize");
-        assert!(!entry.dir.join("docs/x").exists(), "out-of-sparse file must not materialize");
+        assert!(
+            entry.dir.join("src/a.txt").exists(),
+            "in-sparse file must materialize"
+        );
+        assert!(
+            !entry.dir.join("docs/x").exists(),
+            "out-of-sparse file must not materialize"
+        );
 
         // Harvest carries the untouched out-of-sparse subtree verbatim.
         std::fs::write(entry.dir.join("src/a.txt"), b"a v2").unwrap();
@@ -887,7 +922,10 @@ mod tests {
             let mut s = a.lock().unwrap();
             worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap()
         };
-        assert!(entries.contains_key("docs/x"), "harvest must carry the out-of-sparse subtree");
+        assert!(
+            entries.contains_key("docs/x"),
+            "harvest must carry the out-of-sparse subtree"
+        );
         let blob = entries.get("docs/x").map(|(id, _, _)| *id).unwrap();
         let bytes = {
             let a = repo.vfs().store();
@@ -932,7 +970,10 @@ mod tests {
         // working tree, but must not affect what the already-forked
         // workspace is diffed/committed against.
         repo.disable_sparse(None).unwrap();
-        assert!(root.join("docs/x.txt").exists(), "host disable re-lays its own tree");
+        assert!(
+            root.join("docs/x.txt").exists(),
+            "host disable re-lays its own tree"
+        );
 
         // 3. Make an in-sparse edit in the workspace (the only kind of edit
         // this workspace was ever capable of making).
@@ -969,7 +1010,10 @@ mod tests {
                 _ => panic!("expected blob"),
             }
         };
-        assert_eq!(&*bytes, b"doc v1", "carried content must be byte-identical, unchanged");
+        assert_eq!(
+            &*bytes, b"doc v1",
+            "carried content must be byte-identical, unchanged"
+        );
 
         // The in-sparse edit landed correctly too.
         let a_blob = entries.get("src/a.txt").map(|(id, _, _)| *id).unwrap();
@@ -1307,16 +1351,26 @@ mod tests {
         }
 
         // main's tip contains BOTH edits.
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "edited-a\n");
-        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "new-b\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "edited-a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "new-b\n"
+        );
 
         // Exactly 2 new oplog records (one per landing).
         let oplog_after = repo.oplog().unwrap().len();
         assert_eq!(oplog_after - oplog_before, 2);
 
         // No work-1/work-2 branches remain (candidate refs deleted after landing).
-        assert!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap().is_none());
-        assert!(crate::refs::read_branch_tip(repo.layout(), "work-2").unwrap().is_none());
+        assert!(crate::refs::read_branch_tip(repo.layout(), "work-1")
+            .unwrap()
+            .is_none());
+        assert!(crate::refs::read_branch_tip(repo.layout(), "work-2")
+            .unwrap()
+            .is_none());
 
         // Session ended.
         assert!(repo.ws_session().unwrap().is_none());
@@ -1325,7 +1379,10 @@ mod tests {
         // sc undo reverts ONLY the second landing: a.txt edit still present,
         // b.txt edit gone.
         repo.undo().unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "edited-a\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "edited-a\n"
+        );
         assert!(!root.join("b.txt").exists());
 
         drop(repo);
@@ -1362,11 +1419,19 @@ mod tests {
         }
 
         // main tip contains ws-1's edit and NOT ws-2's.
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "edited-a\n");
-        assert_eq!(std::fs::read_to_string(root.join("x.txt")).unwrap(), "main-x\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "edited-a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("x.txt")).unwrap(),
+            "main-x\n"
+        );
 
         // work-2 branch exists with ws-2's commit.
-        assert!(crate::refs::read_branch_tip(repo.layout(), "work-2").unwrap().is_some());
+        assert!(crate::refs::read_branch_tip(repo.layout(), "work-2")
+            .unwrap()
+            .is_some());
 
         // NO conflict markers anywhere in main's working tree.
         for entry in std::fs::read_dir(&root).unwrap() {
@@ -1401,14 +1466,23 @@ mod tests {
         let err = repo.ws_harvest(None, "t", None).unwrap_err();
         match err {
             Error::InvalidArgument(msg) => {
-                assert!(msg.contains("main"), "message must name the landing branch: {msg}");
-                assert!(msg.contains("sc switch"), "message must suggest sc switch: {msg}");
+                assert!(
+                    msg.contains("main"),
+                    "message must name the landing branch: {msg}"
+                );
+                assert!(
+                    msg.contains("sc switch"),
+                    "message must suggest sc switch: {msg}"
+                );
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
 
         // Session still open; nothing moved.
-        let after = repo.ws_session().unwrap().expect("session must still be open");
+        let after = repo
+            .ws_session()
+            .unwrap()
+            .expect("session must still be open");
         assert_eq!(after.workspaces.len(), session.workspaces.len());
         assert!(after.workspaces[0].live);
 
@@ -1443,7 +1517,9 @@ mod tests {
 
         // --into a non-checked-out branch errors.
         let _session2 = repo.ws_fork(1, "t", None).unwrap();
-        let err = repo.ws_harvest(Some("nonexistent-branch"), "t", None).unwrap_err();
+        let err = repo
+            .ws_harvest(Some("nonexistent-branch"), "t", None)
+            .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
 
         drop(repo);
@@ -1458,11 +1534,17 @@ mod tests {
 
         // (a) merge/pick/rebase in progress -> typed errors.
         crate::merge_state::write(repo.layout(), &ObjectId::of(b"theirs"), &[], None).unwrap();
-        assert!(matches!(repo.ws_harvest(None, "t", None), Err(Error::MergeInProgress)));
+        assert!(matches!(
+            repo.ws_harvest(None, "t", None),
+            Err(Error::MergeInProgress)
+        ));
         crate::merge_state::clear(repo.layout()).unwrap();
 
         crate::pick_state::write(repo.layout(), &ObjectId::of(b"picked"), &[], None, None).unwrap();
-        assert!(matches!(repo.ws_harvest(None, "t", None), Err(Error::PickInProgress)));
+        assert!(matches!(
+            repo.ws_harvest(None, "t", None),
+            Err(Error::PickInProgress)
+        ));
         crate::pick_state::clear(repo.layout()).unwrap();
 
         let st = crate::rebase_state::RebaseState {
@@ -1479,7 +1561,10 @@ mod tests {
             skipped: 0,
         };
         crate::rebase_state::write(repo.layout(), &st).unwrap();
-        assert!(matches!(repo.ws_harvest(None, "t", None), Err(Error::RebaseInProgress)));
+        assert!(matches!(
+            repo.ws_harvest(None, "t", None),
+            Err(Error::RebaseInProgress)
+        ));
         crate::rebase_state::clear(repo.layout()).unwrap();
 
         // (b) dirty user working tree -> InvalidArgument, caught by the
@@ -1491,13 +1576,21 @@ mod tests {
         let err = repo.ws_harvest(None, "t", None).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
 
-        let after = repo.ws_session().unwrap().expect("session must still be open");
-        assert!(after.workspaces[0].live, "workspace must remain live after the abort");
+        let after = repo
+            .ws_session()
+            .unwrap()
+            .expect("session must still be open");
+        assert!(
+            after.workspaces[0].live,
+            "workspace must remain live after the abort"
+        );
 
         // No stray work-1 branch: the preflight refused before
         // `harvest_workspace` ever ran.
         assert!(
-            crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap().is_none(),
+            crate::refs::read_branch_tip(repo.layout(), "work-1")
+                .unwrap()
+                .is_none(),
             "preflight must refuse before any candidate branch is minted"
         );
 
@@ -1512,7 +1605,11 @@ mod tests {
         let session = repo.ws_fork(2, "t", None).unwrap();
         std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited-a\n").unwrap();
         // An AWS-style key id trips the P5 scanner in ws-2's checkout.
-        std::fs::write(session.workspaces[1].dir.join("leak.txt"), "AKIAIOSFODNN7EXAMPLE\n").unwrap();
+        std::fs::write(
+            session.workspaces[1].dir.join("leak.txt"),
+            "AKIAIOSFODNN7EXAMPLE\n",
+        )
+        .unwrap();
 
         let outcomes = repo.ws_harvest(None, "t", None).unwrap();
         assert_eq!(outcomes.len(), 2);
@@ -1527,7 +1624,10 @@ mod tests {
 
         // ws-2 stays LIVE (rejected != resolved); session still open with
         // ws-2 only.
-        let after = repo.ws_session().unwrap().expect("session must still be open");
+        let after = repo
+            .ws_session()
+            .unwrap()
+            .expect("session must still be open");
         assert_eq!(after.workspaces.len(), 2);
         let e1 = after.workspaces.iter().find(|e| e.index == 1).unwrap();
         let e2 = after.workspaces.iter().find(|e| e.index == 2).unwrap();
@@ -1548,9 +1648,14 @@ mod tests {
         // ancestor of the landing branch's tip. `sc ws list` must say so
         // truthfully instead of the misleading generic "abandoned".
         repo.undo().unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "base\n");
-        let after_undo =
-            repo.ws_session().unwrap().expect("ws-2 still live keeps the session open");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "base\n"
+        );
+        let after_undo = repo
+            .ws_session()
+            .unwrap()
+            .expect("ws-2 still live keeps the session open");
         let e1_after_undo = after_undo.workspaces.iter().find(|e| e.index == 1).unwrap();
         assert_eq!(
             repo.ws_status_label(&after_undo, e1_after_undo).unwrap(),
@@ -1592,10 +1697,16 @@ mod tests {
 
         let outcomes = repo.ws_harvest(None, "t", None).unwrap();
         let landed_tip = match &outcomes[0] {
-            WsHarvestOutcome::Landed { index: 1, merged_tip } => *merged_tip,
+            WsHarvestOutcome::Landed {
+                index: 1,
+                merged_tip,
+            } => *merged_tip,
             other => panic!("expected Landed(1), got {other:?}"),
         };
-        assert!(repo.ws_session().unwrap().is_none(), "session must have ended");
+        assert!(
+            repo.ws_session().unwrap().is_none(),
+            "session must have ended"
+        );
 
         // Simulate a kill -9 between the candidate branch landing and the
         // manifest rewrite that would have resolved the entry: re-mark ws-1
@@ -1610,7 +1721,12 @@ mod tests {
             base_branch: session.base_branch.clone(),
             author: session.author.clone(),
             sparse: session.sparse.clone(),
-            workspaces: vec![WsEntry { index: 1, dir: dir.clone(), live: true, landed_tip: None }],
+            workspaces: vec![WsEntry {
+                index: 1,
+                dir: dir.clone(),
+                live: true,
+                landed_tip: None,
+            }],
         };
         write_manifest(repo.layout(), &crashed).unwrap();
 
@@ -1619,7 +1735,10 @@ mod tests {
         let outcomes2 = repo.ws_harvest(None, "t", None).unwrap();
         assert_eq!(outcomes2.len(), 1);
         match &outcomes2[0] {
-            WsHarvestOutcome::Landed { index: 1, merged_tip } => {
+            WsHarvestOutcome::Landed {
+                index: 1,
+                merged_tip,
+            } => {
                 assert_eq!(
                     *merged_tip, landed_tip,
                     "re-harvest of an already-landed workspace must resolve to the existing landing tip"
@@ -1628,7 +1747,9 @@ mod tests {
             other => panic!("expected Landed(1), got {other:?}"),
         }
         assert!(
-            crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap().is_none(),
+            crate::refs::read_branch_tip(repo.layout(), "work-1")
+                .unwrap()
+                .is_none(),
             "no stray candidate branch after the UpToDate no-op resolution"
         );
         assert!(repo.ws_session().unwrap().is_none());
@@ -1668,7 +1789,10 @@ mod tests {
             "expected the explicit partial-clone-unsupported refusal, got {err:?}"
         );
         assert!(err.to_string().contains("not supported on a partial clone"));
-        assert!(read_manifest(dst.layout()).unwrap().is_none(), "no dead-end session must be created");
+        assert!(
+            read_manifest(dst.layout()).unwrap().is_none(),
+            "no dead-end session must be created"
+        );
 
         drop(src);
         drop(dst);

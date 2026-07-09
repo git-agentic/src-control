@@ -144,12 +144,9 @@ pub(crate) fn index_incoming(
 ) -> Result<usize> {
     let mut count = 0;
     for id in ids {
-        match store.get(id)? {
-            Object::Signature(sig) => {
-                append_index(layout, sig.snapshot, *id)?;
-                count += 1;
-            }
-            _ => {}
+        if let Object::Signature(sig) = store.get(id)? {
+            append_index(layout, sig.snapshot, *id)?;
+            count += 1;
         }
     }
     Ok(count)
@@ -260,7 +257,11 @@ impl Repo {
     /// rebase has a pending ref move that a naive concurrent op could
     /// clobber. Signing writes neither — one CAS `put` plus an index
     /// append — so there is no ref state for it to race with or corrupt.
-    pub fn sign_snapshot(&self, snapshot: ObjectId, identity: &scl_crypto::Identity) -> Result<ObjectId> {
+    pub fn sign_snapshot(
+        &self,
+        snapshot: ObjectId,
+        identity: &scl_crypto::Identity,
+    ) -> Result<ObjectId> {
         let signing = identity.signing.as_ref().ok_or_else(|| {
             Error::InvalidArgument(
                 "identity has no signing half (v1 identity); signing requires a v2 (scl-id-) \
@@ -270,7 +271,11 @@ impl Repo {
         })?;
         let signer = signing.public().to_bytes();
         let sig = scl_crypto::sign_snapshot_id(signing, snapshot.as_bytes());
-        let sig_obj = SignatureObj { snapshot, signer, sig };
+        let sig_obj = SignatureObj {
+            snapshot,
+            signer,
+            sig,
+        };
         let id = {
             let arc = self.store_arc();
             let i = arc.lock().unwrap().put(Object::Signature(sig_obj))?;
@@ -310,7 +315,12 @@ impl Repo {
         trusted: &std::collections::HashMap<[u8; 32], String>,
     ) -> Result<SigStatus> {
         let sigs = self.signatures_for(snapshot)?;
-        Ok(status_from(&sigs, snapshot, trusted, scl_crypto::verify_snapshot_sig))
+        Ok(status_from(
+            &sigs,
+            snapshot,
+            trusted,
+            scl_crypto::verify_snapshot_sig,
+        ))
     }
 }
 
@@ -337,16 +347,30 @@ mod tests {
 
         let sig_id1 = repo.sign_snapshot(snap, &identity).unwrap();
         let sig_id2 = repo.sign_snapshot(snap, &identity).unwrap();
-        assert_eq!(sig_id1, sig_id2, "same signer+snapshot must yield the same object id");
+        assert_eq!(
+            sig_id1, sig_id2,
+            "same signer+snapshot must yield the same object id"
+        );
 
         let sigs = repo.signatures_for(&snap).unwrap();
-        assert_eq!(sigs.len(), 1, "idempotent sign must leave a single index entry, not two");
+        assert_eq!(
+            sigs.len(),
+            1,
+            "idempotent sign must leave a single index entry, not two"
+        );
         assert_eq!(sigs[0].snapshot, snap);
-        assert_eq!(sigs[0].signer, identity.signing.as_ref().unwrap().public().to_bytes());
+        assert_eq!(
+            sigs[0].signer,
+            identity.signing.as_ref().unwrap().public().to_bytes()
+        );
 
         // The index file itself has exactly one line for this snapshot.
         let raw = std::fs::read_to_string(repo.layout().signatures_path()).unwrap();
-        assert_eq!(raw.lines().count(), 1, "index must dedup the repeated sign, got: {raw:?}");
+        assert_eq!(
+            raw.lines().count(),
+            1,
+            "index must dedup the repeated sign, got: {raw:?}"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -360,7 +384,10 @@ mod tests {
         let snap = repo.commit("t", "c1").unwrap();
 
         let (sk, _pk) = scl_crypto::generate_keypair();
-        let identity = scl_crypto::Identity { enc: sk, signing: None };
+        let identity = scl_crypto::Identity {
+            enc: sk,
+            signing: None,
+        };
         let err = repo.sign_snapshot(snap, &identity).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
 
@@ -378,7 +405,10 @@ mod tests {
         let snap = repo.commit("t", "c1").unwrap();
 
         // Unsigned: no indexed signatures at all.
-        assert_eq!(repo.sig_status(&snap, &HashMap::new()).unwrap(), SigStatus::Unsigned);
+        assert_eq!(
+            repo.sig_status(&snap, &HashMap::new()).unwrap(),
+            SigStatus::Unsigned
+        );
 
         // Untrusted: a valid signature from a signer not in the trust map.
         let (_s1, id1) = scl_crypto::generate_identity_v2();
@@ -408,7 +438,11 @@ mod tests {
         };
         let bad_id = {
             let arc = repo.store();
-            let i = arc.lock().unwrap().put(scl_core::Object::Signature(bad_sig_obj)).unwrap();
+            let i = arc
+                .lock()
+                .unwrap()
+                .put(scl_core::Object::Signature(bad_sig_obj))
+                .unwrap();
             i
         };
         // Append directly to the index (simulating a second signer / a
@@ -468,7 +502,10 @@ mod tests {
 
         // Dead snapshot's signature is gone: index entry dropped, CAS
         // object pruned.
-        assert!(repo.signatures_for(&dead).unwrap().is_empty(), "dead entry must be dropped from the index");
+        assert!(
+            repo.signatures_for(&dead).unwrap().is_empty(),
+            "dead entry must be dropped from the index"
+        );
         assert!(
             !repo.store().lock().unwrap().contains(&dead_sig_id),
             "dead signature object must be pruned"
@@ -492,7 +529,11 @@ mod tests {
         // transfer seam passes (a mixed batch of every object kind).
         let signing = identity.signing.as_ref().unwrap();
         let sig = scl_crypto::sign_snapshot_id(signing, snap.as_bytes());
-        let sig_obj = SignatureObj { snapshot: snap, signer: signing.public().to_bytes(), sig };
+        let sig_obj = SignatureObj {
+            snapshot: snap,
+            signer: signing.public().to_bytes(),
+            sig,
+        };
         let (sig_id, blob_id) = {
             let arc = repo.store();
             let mut s = arc.lock().unwrap();
@@ -500,14 +541,20 @@ mod tests {
             let blob_id = s.put(Object::blob(b"not a signature".to_vec())).unwrap();
             (sig_id, blob_id)
         };
-        assert!(repo.signatures_for(&snap).unwrap().is_empty(), "not indexed yet");
+        assert!(
+            repo.signatures_for(&snap).unwrap().is_empty(),
+            "not indexed yet"
+        );
 
         let count = {
             let arc = repo.store();
             let mut s = arc.lock().unwrap();
             index_incoming(repo.layout(), &mut s, &[sig_id, blob_id]).unwrap()
         };
-        assert_eq!(count, 1, "only the signature object counts, the blob is skipped silently");
+        assert_eq!(
+            count, 1,
+            "only the signature object counts, the blob is skipped silently"
+        );
         assert_eq!(repo.signatures_for(&snap).unwrap().len(), 1);
 
         drop(repo);
@@ -552,7 +599,10 @@ mod tests {
         // the trip" (e.g. it lives outside the CAS on purpose): wipe the
         // index file, then reindex from the store contents alone.
         std::fs::remove_file(repo.layout().signatures_path()).unwrap();
-        assert!(repo.signatures_for(&snap).unwrap().is_empty(), "index wiped");
+        assert!(
+            repo.signatures_for(&snap).unwrap().is_empty(),
+            "index wiped"
+        );
 
         let count = {
             let arc = repo.store();
@@ -584,8 +634,11 @@ mod tests {
         let phantom_snap = ObjectId::of(b"a snapshot id nobody stored");
         let signing = identity.signing.as_ref().unwrap();
         let orphan_sig = scl_crypto::sign_snapshot_id(signing, phantom_snap.as_bytes());
-        let orphan_obj =
-            SignatureObj { snapshot: phantom_snap, signer: signing.public().to_bytes(), sig: orphan_sig };
+        let orphan_obj = SignatureObj {
+            snapshot: phantom_snap,
+            signer: signing.public().to_bytes(),
+            sig: orphan_sig,
+        };
         {
             let arc = repo.store();
             let mut s = arc.lock().unwrap();

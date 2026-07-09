@@ -72,8 +72,11 @@ pub(crate) fn write_client_opening(
     path: &str,
     bearer: Option<&str>,
 ) -> Result<()> {
-    write!(w, "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: sc/2\r\n")
-        .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))?;
+    write!(
+        w,
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: sc/2\r\n"
+    )
+    .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))?;
     if let Some(tok) = bearer {
         write!(w, "Authorization: Bearer {tok}\r\n")
             .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))?;
@@ -117,14 +120,20 @@ pub(crate) fn read_client_opening(r: &mut impl Read) -> Result<ClientOpening> {
         if let Some((name, value)) = line.split_once(':') {
             if name.trim().eq_ignore_ascii_case("authorization") {
                 let v = value.trim();
-                if let Some(tok) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")) {
+                if let Some(tok) = v
+                    .strip_prefix("Bearer ")
+                    .or_else(|| v.strip_prefix("bearer "))
+                {
                     bearer = Some(tok.trim().to_string());
                 }
             }
         }
     }
 
-    Ok(ClientOpening { target: target.to_string(), bearer })
+    Ok(ClientOpening {
+        target: target.to_string(),
+        bearer,
+    })
 }
 
 /// SERVER: write `HTTP/1.1 <code> <reason>\r\nContent-Length: 0\r\n\r\n`.
@@ -135,7 +144,11 @@ pub(crate) fn write_status(w: &mut impl Write, code: u16) -> Result<()> {
         404 => "Not Found",
         400 => "Bad Request",
         401 => "Unauthorized",
-        _ => return Err(Error::InvalidArgument(format!("unsupported HTTP status code: {code}"))),
+        _ => {
+            return Err(Error::InvalidArgument(format!(
+                "unsupported HTTP status code: {code}"
+            )))
+        }
     };
     write!(w, "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n\r\n")
         .map_err(|e| Error::InvalidArgument(format!("HTTP status write failed: {e}")))
@@ -199,9 +212,15 @@ impl ScHttpUrl {
             None => (authority, DEFAULT_PORT),
         };
         if host.is_empty() {
-            return Err(Error::InvalidArgument(format!("sc+http url has empty host: {url}")));
+            return Err(Error::InvalidArgument(format!(
+                "sc+http url has empty host: {url}"
+            )));
         }
-        let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
+        let path = if path.is_empty() {
+            "/".to_string()
+        } else {
+            path.to_string()
+        };
         // CARRY-IN from the Task 2 review: `write_client_opening` interpolates
         // host/path into the request line/header with no CRLF escaping — a
         // host or path containing '\r'/'\n' could inject extra header lines
@@ -214,7 +233,11 @@ impl ScHttpUrl {
                 "sc+http url host/path must not contain CR or LF: {url}"
             )));
         }
-        Ok(ScHttpUrl { host: host.to_string(), port, path })
+        Ok(ScHttpUrl {
+            host: host.to_string(),
+            port,
+            path,
+        })
     }
 
     /// `host:port`, for `TcpStream::connect`.
@@ -241,7 +264,9 @@ impl HttpTransport {
     /// a clearly-named [`Error::Protocol`] — none of these are wire-protocol
     /// errors, so they must not be mistaken for a `HELLO` failure.
     pub fn connect(url: &ScHttpUrl) -> Result<HttpTransport> {
-        let token = std::env::var("SC_HTTP_TOKEN").ok().filter(|s| !s.is_empty());
+        let token = std::env::var("SC_HTTP_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
         Self::connect_with_token(url, token.as_deref())
     }
 
@@ -420,7 +445,12 @@ fn auth_is_mandatory(addr: &str, read_only: bool, allow_public: bool) -> bool {
 /// unless justified by `read_only`, `allow_public`, or ≥1 configured serve
 /// token (see [`bind_is_allowed`]) — an unauthenticated server must not
 /// silently listen on a public interface.
-pub fn serve_http(addr: &str, root: &std::path::Path, read_only: bool, allow_public: bool) -> Result<()> {
+pub fn serve_http(
+    addr: &str,
+    root: &std::path::Path,
+    read_only: bool,
+    allow_public: bool,
+) -> Result<()> {
     if !bind_is_allowed(addr, root, read_only, allow_public)? {
         return Err(Error::InvalidArgument(format!(
             "refusing to bind non-loopback address {addr} without --read-only, \
@@ -757,7 +787,9 @@ mod tests {
     /// real TCP socket, not one frame.
     #[test]
     fn client_clones_over_loopback_http() {
-        let _env_guard = PACK_CHUNK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = PACK_CHUNK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         std::env::set_var("SC_PACK_CHUNK", "37");
 
         let src_root = tmp_repo("clone-src");
@@ -795,7 +827,10 @@ mod tests {
             let dst_store_arc = dst.vfs().store();
             let mut dst_store = dst_store_arc.lock().unwrap();
             for id in &reachable {
-                assert!(dst_store.get(id).is_ok(), "dst missing reachable object {id}");
+                assert!(
+                    dst_store.get(id).is_ok(),
+                    "dst missing reachable object {id}"
+                );
             }
         }
 
@@ -867,7 +902,9 @@ mod tests {
     /// chunks, not one frame.
     #[test]
     fn real_server_clone_push_fetch_sign_and_404() {
-        let _env_guard = PACK_CHUNK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = PACK_CHUNK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         std::env::set_var("SC_PACK_CHUNK", "37");
 
         // --- (d) a root without `.sc/` answers NotARepo, no handshake. ---
@@ -921,7 +958,10 @@ mod tests {
             let dst_store_arc = dst.vfs().store();
             let mut dst_store = dst_store_arc.lock().unwrap();
             for id in &reachable {
-                assert!(dst_store.get(id).is_ok(), "dst missing reachable object {id}");
+                assert!(
+                    dst_store.get(id).is_ok(),
+                    "dst missing reachable object {id}"
+                );
             }
         }
 
@@ -971,7 +1011,10 @@ mod tests {
         let mut trust = std::collections::HashMap::new();
         trust.insert(signer, "alice".to_string());
         let status = signed_dst.sig_status(&signed_tip, &trust).unwrap();
-        assert_eq!(status, crate::signatures::SigStatus::Trusted("alice".to_string()));
+        assert_eq!(
+            status,
+            crate::signatures::SigStatus::Trusted("alice".to_string())
+        );
 
         std::env::remove_var("SC_PACK_CHUNK");
         drop(signed_dst);
@@ -1005,7 +1048,10 @@ mod tests {
         // and refused *before* any bind is attempted (port 0 would always
         // succeed to bind if we got that far).
         let err = serve_http("0.0.0.0:0", &root, false, false).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)), "public bind refused: {err:?}");
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "public bind refused: {err:?}"
+        );
 
         // Justified by --read-only.
         assert!(bind_is_allowed("0.0.0.0:0", &root, true, false).unwrap());
@@ -1073,8 +1119,10 @@ mod tests {
     fn tokens_configured_requires_bearer_and_scope_gates_writes() {
         let root = tmp_repo("auth-matrix");
         let layout = crate::layout::Layout::at(&root);
-        let ro_raw = crate::serve_tokens::add(&layout, "ro", crate::serve_tokens::Scope::Ro).unwrap();
-        let rw_raw = crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
+        let ro_raw =
+            crate::serve_tokens::add(&layout, "ro", crate::serve_tokens::Scope::Ro).unwrap();
+        let rw_raw =
+            crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
 
         let port = spawn_real_http_server_policy(root.clone(), false);
 
@@ -1093,7 +1141,10 @@ mod tests {
         let encoded = obj.encode();
         let id = obj.id();
         let err = ro_client.put_object(&id, &encoded).unwrap_err();
-        assert!(matches!(err, Error::ReadOnly), "ro token write refused: {err:?}");
+        assert!(
+            matches!(err, Error::ReadOnly),
+            "ro token write refused: {err:?}"
+        );
 
         // rw token: a write succeeds.
         let rw_client = connect_with_bearer(port, Some(&rw_raw)).unwrap();
@@ -1110,7 +1161,8 @@ mod tests {
     fn server_read_only_floors_rw_token() {
         let root = tmp_repo("ro-floor");
         let layout = crate::layout::Layout::at(&root);
-        let rw_raw = crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
+        let rw_raw =
+            crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
 
         let port = spawn_real_http_server_policy(root.clone(), true);
 
@@ -1188,10 +1240,15 @@ mod tests {
     fn client_presents_sc_http_token_and_maps_401() {
         let root = tmp_repo("client-token");
         let layout = crate::layout::Layout::at(&root);
-        let rw_raw = crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
+        let rw_raw =
+            crate::serve_tokens::add(&layout, "rw", crate::serve_tokens::Scope::Rw).unwrap();
 
         let port = spawn_real_http_server_policy(root.clone(), false);
-        let url = ScHttpUrl { host: "127.0.0.1".to_string(), port, path: "/repo".to_string() };
+        let url = ScHttpUrl {
+            host: "127.0.0.1".to_string(),
+            port,
+            path: "/repo".to_string(),
+        };
 
         // A valid rw token is accepted and the wire protocol proceeds.
         let transport = HttpTransport::connect_with_token(&url, Some(&rw_raw)).unwrap();
@@ -1202,7 +1259,10 @@ mod tests {
         // handshake failure).
         let err = HttpTransport::connect_with_token(&url, None).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("authentication"), "expected an authentication error, got: {msg}");
+        assert!(
+            msg.contains("authentication"),
+            "expected an authentication error, got: {msg}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

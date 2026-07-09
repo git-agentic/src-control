@@ -21,7 +21,7 @@ pub fn is_network_git_url(url: &str) -> bool {
     }
     // scp-style: user@host:path — an '@' and a ':' before any '/'.
     match (url.find('@'), url.find(':'), url.find('/')) {
-        (Some(a), Some(c), slash) if a < c && slash.map_or(true, |s| c < s) => true,
+        (Some(a), Some(c), slash) if a < c && slash.is_none_or(|s| c < s) => true,
         _ => false,
     }
 }
@@ -47,7 +47,11 @@ fn run_git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
             _ => anyhow::anyhow!("spawning '{prog}': {e}"),
         })?;
     if !status.success() {
-        anyhow::bail!("{prog} {} failed (exit {})", args.join(" "), status.code().unwrap_or(-1));
+        anyhow::bail!(
+            "{prog} {} failed (exit {})",
+            args.join(" "),
+            status.code().unwrap_or(-1)
+        );
     }
     Ok(())
 }
@@ -68,7 +72,11 @@ fn run_git_capture(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         })?;
     if !out.status.success() {
         std::io::Write::write_all(&mut std::io::stderr(), &out.stderr).ok();
-        anyhow::bail!("{prog} {} failed (exit {})", args.join(" "), out.status.code().unwrap_or(-1));
+        anyhow::bail!(
+            "{prog} {} failed (exit {})",
+            args.join(" "),
+            out.status.code().unwrap_or(-1)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -90,7 +98,16 @@ pub fn ensure_mirror(mirror_dir: &Path, url: &str) -> anyhow::Result<PathBuf> {
 /// mirror heads are cache (a post-push mirror head that the remote later
 /// rejected self-heals here), and `--prune` drops deleted branches.
 pub fn mirror_fetch(mirror: &Path) -> anyhow::Result<()> {
-    run_git(mirror, &["fetch", "--prune", "--quiet", "origin", "+refs/heads/*:refs/heads/*"])
+    run_git(
+        mirror,
+        &[
+            "fetch",
+            "--prune",
+            "--quiet",
+            "origin",
+            "+refs/heads/*:refs/heads/*",
+        ],
+    )
 }
 
 /// Push one branch of the mirror up to the network remote. Non-ff rejections
@@ -135,7 +152,12 @@ mod tests {
         ] {
             assert!(is_network_git_url(u), "{u} must classify as network");
         }
-        for u in ["/abs/path/repo.git", "../rel/repo.git", "repo.git", "C:repo"] {
+        for u in [
+            "/abs/path/repo.git",
+            "../rel/repo.git",
+            "repo.git",
+            "C:repo",
+        ] {
             assert!(!is_network_git_url(u), "{u} must classify as local");
         }
         // file:// is handled by the bridge (real-git transport) so demos/tests
@@ -149,7 +171,11 @@ mod tests {
         let root = tmp("ensure");
         // A real local bare repo as the "network" origin, via file://.
         let hub = root.join("hub.git");
-        run_git(std::path::Path::new("."), &["init", "--bare", hub.to_str().unwrap()]).unwrap();
+        run_git(
+            std::path::Path::new("."),
+            &["init", "--bare", hub.to_str().unwrap()],
+        )
+        .unwrap();
         let url = format!("file://{}", hub.display());
 
         let mirror_dir = root.join("mirror.git");
@@ -166,14 +192,38 @@ mod tests {
         let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let root = tmp("roundtrip");
         let hub = root.join("hub.git");
-        run_git(std::path::Path::new("."), &["init", "--bare", hub.to_str().unwrap()]).unwrap();
+        run_git(
+            std::path::Path::new("."),
+            &["init", "--bare", hub.to_str().unwrap()],
+        )
+        .unwrap();
         // Seed the hub with one commit via a scratch worktree.
         let seed = root.join("seed");
-        run_git(std::path::Path::new("."), &["init", "-b", "main", seed.to_str().unwrap()]).unwrap();
+        run_git(
+            std::path::Path::new("."),
+            &["init", "-b", "main", seed.to_str().unwrap()],
+        )
+        .unwrap();
         std::fs::write(seed.join("a.txt"), "hello").unwrap();
         run_git(&seed, &["add", "."]).unwrap();
-        run_git(&seed, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "seed"]).unwrap();
-        run_git(&seed, &["push", &format!("file://{}", hub.display()), "main"]).unwrap();
+        run_git(
+            &seed,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "seed",
+            ],
+        )
+        .unwrap();
+        run_git(
+            &seed,
+            &["push", &format!("file://{}", hub.display()), "main"],
+        )
+        .unwrap();
 
         let url = format!("file://{}", hub.display());
         let mirror = ensure_mirror(&root.join("mirror.git"), &url).unwrap();
@@ -186,15 +236,34 @@ mod tests {
         // Write a second commit into the MIRROR's head (simulating P10 export),
         // push it up, and see it on the hub.
         let seed2 = root.join("seed2");
-        run_git(std::path::Path::new("."), &["clone", mirror.to_str().unwrap(), seed2.to_str().unwrap()]).unwrap();
+        run_git(
+            std::path::Path::new("."),
+            &["clone", mirror.to_str().unwrap(), seed2.to_str().unwrap()],
+        )
+        .unwrap();
         std::fs::write(seed2.join("b.txt"), "world").unwrap();
         run_git(&seed2, &["add", "."]).unwrap();
-        run_git(&seed2, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "two"]).unwrap();
+        run_git(
+            &seed2,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "two",
+            ],
+        )
+        .unwrap();
         run_git(&seed2, &["push", "origin", "main"]).unwrap();
         mirror_push(&mirror, "main").unwrap();
         let hub_tip = run_git_capture(&hub, &["rev-parse", "refs/heads/main"]).unwrap();
         let mirror_tip = run_git_capture(&mirror, &["rev-parse", "refs/heads/main"]).unwrap();
-        assert_eq!(hub_tip, mirror_tip, "push must land the mirror head on the hub");
+        assert_eq!(
+            hub_tip, mirror_tip,
+            "push must land the mirror head on the hub"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -213,12 +282,18 @@ mod tests {
         // sync.rs/wire tests for the exact pattern used there and reuse it.)
         std::env::set_var("SC_GIT", shim.to_str().unwrap());
         let err = mirror_fetch(&root).unwrap_err();
-        assert!(format!("{err:#}").contains("exit"), "shim exit must surface: {err:#}");
+        assert!(
+            format!("{err:#}").contains("exit"),
+            "shim exit must surface: {err:#}"
+        );
 
         std::env::set_var("SC_GIT", root.join("no-such-binary").to_str().unwrap());
         let err = mirror_fetch(&root).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("SC_GIT") || msg.contains("not found"), "missing binary must be a clear error: {msg}");
+        assert!(
+            msg.contains("SC_GIT") || msg.contains("not found"),
+            "missing binary must be a clear error: {msg}"
+        );
         std::env::remove_var("SC_GIT");
         std::fs::remove_dir_all(&root).unwrap();
     }

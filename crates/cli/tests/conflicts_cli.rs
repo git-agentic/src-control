@@ -4,7 +4,11 @@ use std::path::Path;
 use std::process::Command;
 
 fn sc(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_sc")).args(args).current_dir(dir).output().expect("sc runs")
+    Command::new(env!("CARGO_BIN_EXE_sc"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("sc runs")
 }
 
 fn stdout(out: &std::process::Output) -> String {
@@ -59,7 +63,10 @@ fn conflicts_lists_paths_with_kind() {
     let out = sc(&root, &["conflicts"]);
     assert!(out.status.success());
     let text = stdout(&out);
-    assert!(text.contains("file.txt"), "expected file.txt listed, got: {text}");
+    assert!(
+        text.contains("file.txt"),
+        "expected file.txt listed, got: {text}"
+    );
     assert!(text.contains("[text]"), "expected [text] kind, got: {text}");
 
     std::fs::remove_dir_all(&root).unwrap();
@@ -105,10 +112,17 @@ fn resolve_ours_completes_the_merge_and_hints_commit() {
     make_conflicted_merge(&root);
 
     let out = sc(&root, &["resolve", "--ours", "file.txt"]);
-    assert!(out.status.success(), "resolve failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "resolve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = stdout(&out);
     assert!(text.contains("resolved file.txt (ours)"), "got: {text}");
-    assert!(text.contains("sc commit"), "expected completion hint, got: {text}");
+    assert!(
+        text.contains("sc commit"),
+        "expected completion hint, got: {text}"
+    );
 
     let content = std::fs::read_to_string(root.join("file.txt")).unwrap();
     assert_eq!(content, "ours\n");
@@ -117,7 +131,11 @@ fn resolve_ours_completes_the_merge_and_hints_commit() {
     // remaining conflicts, so `sc conflicts` lists none.
     let conflicts_after = sc(&root, &["conflicts"]);
     assert!(conflicts_after.status.success());
-    assert!(stdout(&conflicts_after).trim().is_empty(), "expected no conflicts left, got: {}", stdout(&conflicts_after));
+    assert!(
+        stdout(&conflicts_after).trim().is_empty(),
+        "expected no conflicts left, got: {}",
+        stdout(&conflicts_after)
+    );
 
     assert!(sc(&root, &["commit", "-m", "merged"]).status.success());
 
@@ -130,10 +148,16 @@ fn resolve_requires_exactly_one_side() {
     make_conflicted_merge(&root);
 
     let out = sc(&root, &["resolve", "file.txt"]);
-    assert!(!out.status.success(), "resolve with neither --ours nor --theirs must fail");
+    assert!(
+        !out.status.success(),
+        "resolve with neither --ours nor --theirs must fail"
+    );
 
     let out2 = sc(&root, &["resolve", "--ours", "--theirs", "file.txt"]);
-    assert!(!out2.status.success(), "clap should reject --ours and --theirs together");
+    assert!(
+        !out2.status.success(),
+        "clap should reject --ours and --theirs together"
+    );
 
     // Abort so the temp dir teardown isn't left with a stale lock/merge.
     let _ = sc(&root, &["merge", "--abort"]);
@@ -145,10 +169,20 @@ fn resolve_reports_bad_path_but_continues_and_exits_nonzero() {
     let root = tmp("bad-path");
     make_conflicted_merge(&root);
 
-    let out = sc(&root, &["resolve", "--ours", "does-not-exist.txt", "file.txt"]);
-    assert_eq!(out.status.code(), Some(1), "a bad path among good ones must exit 1");
+    let out = sc(
+        &root,
+        &["resolve", "--ours", "does-not-exist.txt", "file.txt"],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a bad path among good ones must exit 1"
+    );
     let text = stdout(&out);
-    assert!(text.contains("resolved file.txt (ours)"), "good path must still resolve: {text}");
+    assert!(
+        text.contains("resolved file.txt (ours)"),
+        "good path must still resolve: {text}"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("does-not-exist.txt"),
         "bad path must be reported on stderr"
@@ -170,9 +204,18 @@ fn status_shows_per_path_conflict_detail_under_merge_banner() {
     let out = sc(&root, &["status"]);
     assert!(out.status.success());
     let text = stdout(&out);
-    assert!(text.contains("merge in progress"), "banner must be unchanged, got: {text}");
-    assert!(text.contains("file.txt"), "expected per-path detail, got: {text}");
-    assert!(text.contains("[text]"), "expected kind in detail line, got: {text}");
+    assert!(
+        text.contains("merge in progress"),
+        "banner must be unchanged, got: {text}"
+    );
+    assert!(
+        text.contains("file.txt"),
+        "expected per-path detail, got: {text}"
+    );
+    assert!(
+        text.contains("[text]"),
+        "expected kind in detail line, got: {text}"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }

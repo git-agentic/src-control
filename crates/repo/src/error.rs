@@ -76,7 +76,9 @@ pub enum Error {
     ConnectionLost(String),
     #[error("remote error: {0}")]
     Remote(String),
-    #[error("secret {0} changed differently on both branches; resolve with `sc secret` then retry")]
+    #[error(
+        "secret {0} changed differently on both branches; resolve with `sc secret` then retry"
+    )]
     SecretMergeConflict(String),
     /// Refused to replay a merge commit. Field 1 is the full, call-site-
     /// contextualized message: `cherry_pick`'s `replay_commit` guard points

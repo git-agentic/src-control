@@ -33,8 +33,12 @@ pub trait Transport {
     /// [`Error::NonFastForward`] when the ref moved in between, so two racing
     /// pushers cannot silently clobber each other's commits. Setting the ref
     /// to the value it already has succeeds regardless of `expected_old`.
-    fn update_ref(&self, branch: &str, id: &ObjectId, expected_old: Option<&ObjectId>)
-        -> Result<()>;
+    fn update_ref(
+        &self,
+        branch: &str,
+        id: &ObjectId,
+        expected_old: Option<&ObjectId>,
+    ) -> Result<()>;
 
     /// Stream a pack of every object reachable from `wants` but not already
     /// implied by `haves` (the receiver's closure) into `out`. An
@@ -81,7 +85,10 @@ impl LocalTransport {
         // Match the repo's store budget so a single large object never fails to resolve
         // (a blob bigger than the whole budget would BudgetExceed).
         let store = Store::open_persistent(layout.objects_dir(), crate::repo::DEFAULT_BUDGET)?;
-        Ok(LocalTransport { layout, store: RefCell::new(store) })
+        Ok(LocalTransport {
+            layout,
+            store: RefCell::new(store),
+        })
     }
 
     /// This transport's layout — `wire::serve` (a sibling module) needs it to
@@ -121,14 +128,17 @@ impl LocalTransport {
         let mut store = self.store.borrow_mut();
         // Reachable-from-wants minus reachable-from-haves, computed on this
         // (the remote) store. `haves` the remote doesn't have are skipped.
-        let promisor_filter = filter.map(|prefixes| crate::promisor::Promisor::new(String::new(), prefixes.to_vec()));
+        let promisor_filter =
+            filter.map(|prefixes| crate::promisor::Promisor::new(String::new(), prefixes.to_vec()));
         let mut want_set = match &promisor_filter {
-            Some(pf) => crate::reachable::reachable_objects_filtered(
-                &mut *store,
-                wants,
-                Some(pf as &dyn crate::reachable::PrefixFilter),
-            )?
-            .included,
+            Some(pf) => {
+                crate::reachable::reachable_objects_filtered(
+                    &mut *store,
+                    wants,
+                    Some(pf as &dyn crate::reachable::PrefixFilter),
+                )?
+                .included
+            }
             None => crate::reachable::reachable_objects(&mut *store, wants)?,
         };
 
@@ -163,16 +173,24 @@ impl LocalTransport {
         // object but landed `Unsigned` on the far side).
         let transcript_ids =
             crate::transcripts::indexed_transcript_ids_for(&self.layout, &all_snaps)?;
-        let sig_targets: Vec<ObjectId> =
-            all_snaps.iter().chain(transcript_ids.iter()).copied().collect();
-        want_set.extend(crate::signatures::indexed_signature_ids_for(&self.layout, &sig_targets)?);
+        let sig_targets: Vec<ObjectId> = all_snaps
+            .iter()
+            .chain(transcript_ids.iter())
+            .copied()
+            .collect();
+        want_set.extend(crate::signatures::indexed_signature_ids_for(
+            &self.layout,
+            &sig_targets,
+        )?);
         // Over-send every indexed transcript covering any transfer-relevant
         // snapshot; never subtract any of them from `have_set` — the
         // has-gated filter below still applies.
         want_set.extend(transcript_ids);
 
-        let ids: Vec<ObjectId> =
-            want_set.into_iter().filter(|id| !have_set.contains(id)).collect();
+        let ids: Vec<ObjectId> = want_set
+            .into_iter()
+            .filter(|id| !have_set.contains(id))
+            .collect();
 
         write_ids_to_temp_pack(&self.layout, &mut store, &ids)
     }
@@ -471,7 +489,10 @@ mod tests {
         assert_eq!(t.get_object(&id).unwrap(), bytes);
 
         // corrupt put is rejected
-        assert!(matches!(t.put_object(&id, b"not the bytes"), Err(Error::CorruptObject(_))));
+        assert!(matches!(
+            t.put_object(&id, b"not the bytes"),
+            Err(Error::CorruptObject(_))
+        ));
 
         t.update_ref("main", &id, None).unwrap();
         assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), id)]);
@@ -494,13 +515,19 @@ mod tests {
         // Create: expected None means "branch must not exist".
         t.update_ref("main", &c1, None).unwrap();
         // Creating again with expected None must fail (it exists now).
-        assert!(matches!(t.update_ref("main", &c2, None), Err(Error::NonFastForward)));
+        assert!(matches!(
+            t.update_ref("main", &c2, None),
+            Err(Error::NonFastForward)
+        ));
 
         // Advance with the right expected old tip.
         t.update_ref("main", &c2, Some(&c1)).unwrap();
 
         // A raced writer still expecting c1 must fail, not clobber c2.
-        assert!(matches!(t.update_ref("main", &c3, Some(&c1)), Err(Error::NonFastForward)));
+        assert!(matches!(
+            t.update_ref("main", &c3, Some(&c1)),
+            Err(Error::NonFastForward)
+        ));
         assert_eq!(t.list_refs().unwrap(), vec![("main".to_string(), c2)]);
 
         // Re-pushing the value already at the tip is fine (idempotent), even
@@ -525,7 +552,10 @@ mod tests {
             t.update_ref("../../escape", &id, None),
             Err(Error::BadRef(_))
         ));
-        assert!(matches!(t.update_ref("has space", &id, None), Err(Error::BadRef(_))));
+        assert!(matches!(
+            t.update_ref("has space", &id, None),
+            Err(Error::BadRef(_))
+        ));
 
         // No ref file was created anywhere, including outside refs/heads/.
         assert_eq!(t.list_refs().unwrap(), Vec::new());
@@ -550,7 +580,9 @@ mod tests {
             s.put(Object::blob(vec![0xAB; (1 << 20) + 4096])).unwrap();
         }
         let t = LocalTransport::open(&layout.root).unwrap();
-        let got = t.get_object(&id).expect("large object must transfer without BudgetExceeded");
+        let got = t
+            .get_object(&id)
+            .expect("large object must transfer without BudgetExceeded");
         assert_eq!(got, expected);
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
@@ -568,17 +600,18 @@ mod tests {
         }
         let t = LocalTransport::open(&layout.root).unwrap();
         assert!(t.has_object(&id).unwrap());
-        assert_eq!(t.get_object(&id).unwrap(), Object::blob(b"remote-packed".to_vec()).encode());
+        assert_eq!(
+            t.get_object(&id).unwrap(),
+            Object::blob(b"remote-packed".to_vec()).encode()
+        );
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
     #[test]
     fn get_pack_excludes_haves_and_put_pack_verifies() {
         let pid = std::process::id();
-        let src_root =
-            std::env::temp_dir().join(format!("scl-xport-bulk-{pid}"));
-        let dst_root =
-            std::env::temp_dir().join(format!("scl-xport-bulkdst-{pid}"));
+        let src_root = std::env::temp_dir().join(format!("scl-xport-bulk-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-xport-bulkdst-{pid}"));
         let _ = std::fs::remove_dir_all(&src_root);
         let _ = std::fs::remove_dir_all(&dst_root);
         std::fs::create_dir_all(&src_root).unwrap();
@@ -595,7 +628,11 @@ mod tests {
         // Want c2, already have c1: the pack must omit c1's objects but include c2.
         let mut pack = Vec::new();
         t.get_pack(&[c2], &[c1], None, &mut pack).unwrap();
-        let ids: Vec<_> = scl_core::pack::parse_pack(&pack).unwrap().into_iter().map(|(id, _)| id).collect();
+        let ids: Vec<_> = scl_core::pack::parse_pack(&pack)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         assert!(ids.contains(&c2));
         assert!(!ids.contains(&c1));
 
@@ -645,7 +682,8 @@ mod tests {
             other => panic!("expected snapshot, got {other:?}"),
         };
         let mut pack = Vec::new();
-        t.get_pack(&[tip], &[], Some(&["src/".to_string()]), &mut pack).unwrap();
+        t.get_pack(&[tip], &[], Some(&["src/".to_string()]), &mut pack)
+            .unwrap();
 
         let _ = crate::repo::Repo::init(&dst_root).unwrap();
         let t2 = LocalTransport::open(&dst_root).unwrap();
@@ -653,8 +691,14 @@ mod tests {
 
         assert!(t2.has_object(&tip).unwrap(), "snapshot must transfer");
         assert!(t2.has_object(&root_id).unwrap(), "root tree must transfer");
-        assert!(t2.has_object(&src_a_id).unwrap(), "in-filter blob must transfer");
-        assert!(!t2.has_object(&docs_b_id).unwrap(), "out-of-filter blob must NOT transfer");
+        assert!(
+            t2.has_object(&src_a_id).unwrap(),
+            "in-filter blob must transfer"
+        );
+        assert!(
+            !t2.has_object(&docs_b_id).unwrap(),
+            "out-of-filter blob must NOT transfer"
+        );
 
         std::fs::remove_dir_all(&src_root).unwrap();
         std::fs::remove_dir_all(&dst_root).unwrap();
@@ -691,7 +735,10 @@ mod tests {
 
         assert!(t2.has_object(&tip).unwrap());
         assert!(t2.has_object(&src_a_id).unwrap());
-        assert!(t2.has_object(&docs_b_id).unwrap(), "unfiltered transfer must still include everything");
+        assert!(
+            t2.has_object(&docs_b_id).unwrap(),
+            "unfiltered transfer must still include everything"
+        );
 
         std::fs::remove_dir_all(&src_root).unwrap();
         std::fs::remove_dir_all(&dst_root).unwrap();
@@ -725,7 +772,10 @@ mod tests {
         assert_eq!(written.len(), 2);
         assert!(t.has_object(&a.id()).unwrap());
         assert!(t.has_object(&b.id()).unwrap());
-        assert!(tmp_dir_is_empty(&layout), "temp pack file must be gone after a successful put_pack");
+        assert!(
+            tmp_dir_is_empty(&layout),
+            "temp pack file must be gone after a successful put_pack"
+        );
 
         // Failure: corrupt the one record's compressed payload. Pass 1 of
         // ingest_pack_file must reject it BEFORE any write, so the object
@@ -736,8 +786,14 @@ mod tests {
         pack2[last] ^= 0xFF;
 
         assert!(t.put_pack(&mut &pack2[..]).is_err());
-        assert!(!t.has_object(&c.id()).unwrap(), "corrupt pack must not land any object — atomic after verify");
-        assert!(tmp_dir_is_empty(&layout), "temp pack file must be gone after a corrupt ingest too");
+        assert!(
+            !t.has_object(&c.id()).unwrap(),
+            "corrupt pack must not land any object — atomic after verify"
+        );
+        assert!(
+            tmp_dir_is_empty(&layout),
+            "temp pack file must be gone after a corrupt ingest too"
+        );
 
         std::fs::remove_dir_all(&layout.root).unwrap();
     }

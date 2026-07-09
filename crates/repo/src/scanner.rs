@@ -47,10 +47,16 @@ pub fn scan(_name: &str, bytes: &[u8]) -> Vec<Hit> {
     for (i, line) in text.lines().enumerate() {
         let lineno = i + 1;
         for idx in set.matches(line) {
-            hits.push(Hit { rule: HitKind::Pattern(PATTERNS[idx].name), line: lineno });
+            hits.push(Hit {
+                rule: HitKind::Pattern(PATTERNS[idx].name),
+                line: lineno,
+            });
         }
         if has_high_entropy_run(line) {
-            hits.push(Hit { rule: HitKind::Entropy, line: lineno });
+            hits.push(Hit {
+                rule: HitKind::Entropy,
+                line: lineno,
+            });
         }
     }
     hits
@@ -128,8 +134,9 @@ impl Allowlist {
             .map_err(|e| Error::BadConfig(format!("bad scanner-allowlist.toml: {e}")))?;
         let mut ids = HashSet::new();
         for entry in parsed.allow {
-            let id = ObjectId::from_str(entry.blob.trim())
-                .map_err(|_| Error::BadConfig(format!("bad blob id in allowlist: {}", entry.blob)))?;
+            let id = ObjectId::from_str(entry.blob.trim()).map_err(|_| {
+                Error::BadConfig(format!("bad blob id in allowlist: {}", entry.blob))
+            })?;
             ids.insert(id);
         }
         Ok(Allowlist { ids })
@@ -164,7 +171,14 @@ impl ScanReport {
 impl std::fmt::Display for ScanReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for fd in &self.findings {
-            writeln!(f, "{}:{}  {}  blob {}", fd.path, fd.line, fd.rule, fd.blob_id.to_hex())?;
+            writeln!(
+                f,
+                "{}:{}  {}  blob {}",
+                fd.path,
+                fd.line,
+                fd.rule,
+                fd.blob_id.to_hex()
+            )?;
         }
         if !self.findings.is_empty() {
             writeln!(
@@ -205,9 +219,18 @@ mod tests {
         // 44-char high-entropy base64 token.
         let token = "Zm9vYmFyMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A=";
         let hit = scan("f", format!("secret = {token}\n").as_bytes());
-        assert!(rules(&hit).contains(&&HitKind::Entropy), "expected entropy hit, got {hit:?}");
-        let prose = scan("f", b"the quick brown fox jumps over the lazy dog repeatedly\n");
-        assert!(!rules(&prose).contains(&&HitKind::Entropy), "prose should not flag");
+        assert!(
+            rules(&hit).contains(&&HitKind::Entropy),
+            "expected entropy hit, got {hit:?}"
+        );
+        let prose = scan(
+            "f",
+            b"the quick brown fox jumps over the lazy dog repeatedly\n",
+        );
+        assert!(
+            !rules(&prose).contains(&&HitKind::Entropy),
+            "prose should not flag"
+        );
     }
 
     #[test]
@@ -226,7 +249,9 @@ mod tests {
     fn line_numbers_are_one_based() {
         let body = b"clean line\nkey = AKIAIOSFODNN7EXAMPLE\n";
         let hits = scan("f", body);
-        assert!(hits.iter().any(|h| h.line == 2 && h.rule == HitKind::Pattern("aws_access_key")));
+        assert!(hits
+            .iter()
+            .any(|h| h.line == 2 && h.rule == HitKind::Pattern("aws_access_key")));
     }
 
     #[test]
@@ -256,13 +281,14 @@ mod tests {
     fn pattern_on_last_line_without_trailing_newline() {
         let body = b"clean line\nkey = AKIAIOSFODNN7EXAMPLE";
         let hits = scan("f", body);
-        assert!(hits.iter().any(|h| h.line == 2 && h.rule == HitKind::Pattern("aws_access_key")));
+        assert!(hits
+            .iter()
+            .any(|h| h.line == 2 && h.rule == HitKind::Pattern("aws_access_key")));
     }
 
     #[test]
     fn malformed_allowlist_toml_errors_not_panics() {
-        let dir = std::env::temp_dir()
-            .join(format!("scl-allowlist-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("scl-allowlist-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scanner-allowlist.toml");
         std::fs::write(&path, b"not valid toml [[[").unwrap();

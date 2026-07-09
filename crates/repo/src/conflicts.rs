@@ -89,12 +89,13 @@ impl Repo {
     fn op_triple(&self) -> Result<OpTriple> {
         match self.active_conflict_op()? {
             Some(ActiveOp::Merge) => {
-                let ours = self
-                    .head_tip()?
-                    .ok_or_else(|| Error::BadRef("HEAD unborn while a merge is in progress".into()))?;
-                let theirs = crate::merge_state::read_merge_head(&self.layout)?.ok_or_else(|| {
-                    Error::BadRef("MERGE_HEAD missing while a merge is in progress".into())
+                let ours = self.head_tip()?.ok_or_else(|| {
+                    Error::BadRef("HEAD unborn while a merge is in progress".into())
                 })?;
+                let theirs =
+                    crate::merge_state::read_merge_head(&self.layout)?.ok_or_else(|| {
+                        Error::BadRef("MERGE_HEAD missing while a merge is in progress".into())
+                    })?;
                 let store_arc = self.vfs.store();
                 let mut store = store_arc.lock().unwrap();
                 let base = crate::merge::merge_base(&mut store, ours, theirs)?;
@@ -104,9 +105,9 @@ impl Repo {
                 let theirs = crate::pick_state::read_pick_head(&self.layout)?.ok_or_else(|| {
                     Error::BadRef("PICK_HEAD missing while a cherry-pick is in progress".into())
                 })?;
-                let ours = self
-                    .head_tip()?
-                    .ok_or_else(|| Error::BadRef("HEAD unborn while a cherry-pick is in progress".into()))?;
+                let ours = self.head_tip()?.ok_or_else(|| {
+                    Error::BadRef("HEAD unborn while a cherry-pick is in progress".into())
+                })?;
                 // A `--mainline`-resolved base (persisted in PICK_MAINLINE_BASE,
                 // P19 I2) takes priority: a conflicted mainline pick's replay
                 // used that parent as its base, so conflict_versions must
@@ -119,12 +120,19 @@ impl Repo {
                 Ok(OpTriple { ours, theirs, base })
             }
             Some(ActiveOp::Rebase) => {
-                let st = crate::rebase_state::read(&self.layout)?
-                    .ok_or_else(|| Error::BadRef("REBASE_STATE missing while a rebase is in progress".into()))?;
+                let st = crate::rebase_state::read(&self.layout)?.ok_or_else(|| {
+                    Error::BadRef("REBASE_STATE missing while a rebase is in progress".into())
+                })?;
                 let base = self.snapshot(&st.conflicted)?.parents.first().copied();
-                Ok(OpTriple { ours: st.acc_tip, theirs: st.conflicted, base })
+                Ok(OpTriple {
+                    ours: st.acc_tip,
+                    theirs: st.conflicted,
+                    base,
+                })
             }
-            None => Err(Error::InvalidArgument("no merge/pick/rebase is in progress".into())),
+            None => Err(Error::InvalidArgument(
+                "no merge/pick/rebase is in progress".into(),
+            )),
         }
     }
 
@@ -193,7 +201,9 @@ impl Repo {
             .ok_or_else(|| Error::InvalidArgument("no merge/pick/rebase is in progress".into()))?;
         let conflicts = self.active_conflicts()?;
         if !conflicts.iter().any(|p| p == path) {
-            return Err(Error::InvalidArgument(format!("{path} is not currently conflicted")));
+            return Err(Error::InvalidArgument(format!(
+                "{path} is not currently conflicted"
+            )));
         }
         // Gate on sparse (P24 Task 4) before writing anything: resolving a
         // path outside the sparse view would materialize a file the user
@@ -436,15 +446,24 @@ mod tests {
         // Stay on feature: rebase feature onto main.
 
         let outcome = repo.rebase("main", "me", None).unwrap();
-        assert!(matches!(outcome, crate::replay::RebaseResult::Stopped { .. }), "got {outcome:?}");
+        assert!(
+            matches!(outcome, crate::replay::RebaseResult::Stopped { .. }),
+            "got {outcome:?}"
+        );
         assert!(repo.rebase_in_progress());
 
         assert_eq!(repo.active_conflict_op().unwrap(), Some(ActiveOp::Rebase));
         assert_eq!(repo.active_conflicts().unwrap(), vec!["x.txt".to_string()]);
 
         let st = crate::rebase_state::read(repo.layout()).unwrap().unwrap();
-        assert_eq!(st.conflicted, feature_tip, "the replayed (stopped) commit is theirs");
-        assert_eq!(st.acc_tip, main_tip, "acc_tip is ours: nothing landed yet before the stop");
+        assert_eq!(
+            st.conflicted, feature_tip,
+            "the replayed (stopped) commit is theirs"
+        );
+        assert_eq!(
+            st.acc_tip, main_tip,
+            "acc_tip is ours: nothing landed yet before the stop"
+        );
 
         let versions = repo.conflict_versions("x.txt", None).unwrap();
         assert_eq!(versions.base, Side::Present(b"base\n".to_vec()));
@@ -483,8 +502,11 @@ mod tests {
         assert_eq!(repo.active_conflicts().unwrap(), vec!["a.txt".to_string()]);
 
         // Narrow the spec out-of-band so a.txt now falls outside it.
-        crate::sparse::store(repo.layout(), &crate::sparse::Sparse::new(vec!["src/".into()]))
-            .unwrap();
+        crate::sparse::store(
+            repo.layout(),
+            &crate::sparse::Sparse::new(vec!["src/".into()]),
+        )
+        .unwrap();
 
         // Inspection still works.
         let versions = repo.conflict_versions("a.txt", None).unwrap();
@@ -492,7 +514,9 @@ mod tests {
         assert_eq!(versions.theirs, Side::Present(b"theirs\n".to_vec()));
 
         // Resolving is refused with the widen hint.
-        let err = repo.resolve_path("a.txt", ResolveSide::Ours, None).unwrap_err();
+        let err = repo
+            .resolve_path("a.txt", ResolveSide::Ours, None)
+            .unwrap_err();
         match err {
             Error::InvalidArgument(msg) => {
                 assert!(msg.contains("a.txt"), "message must name the path: {msg}");
@@ -554,27 +578,40 @@ mod tests {
 
         std::fs::write(root.join("secret/a.txt"), b"ours\n").unwrap();
         repo.commit("me", "ours edits secret").unwrap();
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/a.txt"), b"theirs\n").unwrap();
         repo.commit("me", "theirs edits secret").unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
-        let err = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap_err();
+        let err = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
         assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
-        assert_eq!(repo.active_conflicts().unwrap(), vec!["secret/a.txt".to_string()]);
+        assert_eq!(
+            repo.active_conflicts().unwrap(),
+            vec!["secret/a.txt".to_string()]
+        );
 
         // Without identity: refuses.
         let err = repo.conflict_versions("secret/a.txt", None).unwrap_err();
-        assert!(matches!(err, Error::ProtectedMergeNeedsIdentity(ref p) if p == "secret/a.txt"), "got {err:?}");
+        assert!(
+            matches!(err, Error::ProtectedMergeNeedsIdentity(ref p) if p == "secret/a.txt"),
+            "got {err:?}"
+        );
 
         // With alice's identity: decrypts all three sides.
-        let versions = repo.conflict_versions("secret/a.txt", Some(&alice_sk)).unwrap();
+        let versions = repo
+            .conflict_versions("secret/a.txt", Some(&alice_sk))
+            .unwrap();
         assert_eq!(versions.base, Side::Present(b"base\n".to_vec()));
         assert_eq!(versions.ours, Side::Present(b"ours\n".to_vec()));
         assert_eq!(versions.theirs, Side::Present(b"theirs\n".to_vec()));
 
         // Bob is also a recipient of every side; his identity decrypts too.
-        let versions = repo.conflict_versions("secret/a.txt", Some(&bob_sk)).unwrap();
+        let versions = repo
+            .conflict_versions("secret/a.txt", Some(&bob_sk))
+            .unwrap();
         assert_eq!(versions.ours, Side::Present(b"ours\n".to_vec()));
         assert_eq!(versions.theirs, Side::Present(b"theirs\n".to_vec()));
 
@@ -601,17 +638,23 @@ mod tests {
         std::fs::write(root.join("bin.dat"), [1u8, 159, 146, 150]).unwrap();
         repo.commit("me", "ours edits all").unwrap();
 
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/p.txt"), b"theirs\n").unwrap();
         std::fs::write(root.join("text.txt"), b"theirs\n").unwrap();
         std::fs::write(root.join("bin.dat"), [2u8, 159, 146, 150]).unwrap();
         repo.commit("me", "theirs edits all").unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
-        let err = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap_err();
+        let err = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
         assert!(matches!(err, Error::MergeConflicts(3)), "got {err:?}");
 
-        assert_eq!(repo.conflict_kind("secret/p.txt").unwrap(), ConflictKind::Protected);
+        assert_eq!(
+            repo.conflict_kind("secret/p.txt").unwrap(),
+            ConflictKind::Protected
+        );
         assert_eq!(repo.conflict_kind("text.txt").unwrap(), ConflictKind::Text);
         assert_eq!(repo.conflict_kind("bin.dat").unwrap(), ConflictKind::Binary);
 
@@ -674,7 +717,8 @@ mod tests {
         let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
 
-        repo.resolve_path("x.txt", ResolveSide::Theirs, None).unwrap();
+        repo.resolve_path("x.txt", ResolveSide::Theirs, None)
+            .unwrap();
         let on_disk = std::fs::read(root.join("x.txt")).unwrap();
         assert_eq!(on_disk, b"work-edit\n");
         assert!(repo.active_conflicts().unwrap().is_empty());
@@ -697,10 +741,14 @@ mod tests {
         repo.commit("me", "feature edits x").unwrap();
 
         let outcome = repo.rebase("main", "me", None).unwrap();
-        assert!(matches!(outcome, crate::replay::RebaseResult::Stopped { .. }), "got {outcome:?}");
+        assert!(
+            matches!(outcome, crate::replay::RebaseResult::Stopped { .. }),
+            "got {outcome:?}"
+        );
         assert!(repo.rebase_in_progress());
 
-        repo.resolve_path("x.txt", ResolveSide::Theirs, None).unwrap();
+        repo.resolve_path("x.txt", ResolveSide::Theirs, None)
+            .unwrap();
         let on_disk = std::fs::read(root.join("x.txt")).unwrap();
         assert_eq!(on_disk, b"feature-edit\n");
         assert!(repo.active_conflicts().unwrap().is_empty());
@@ -729,7 +777,8 @@ mod tests {
         assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
 
         // theirs is Absent: resolving to Theirs must delete the file.
-        repo.resolve_path("a.txt", ResolveSide::Theirs, None).unwrap();
+        repo.resolve_path("a.txt", ResolveSide::Theirs, None)
+            .unwrap();
         assert!(!root.join("a.txt").exists());
         assert!(repo.active_conflicts().unwrap().is_empty());
 
@@ -754,11 +803,21 @@ mod tests {
 
         let err = repo.merge("feature", "me").unwrap_err();
         assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
-        assert!(root.join("bin.dat.theirs").exists(), "test setup: sidecar must be on disk");
+        assert!(
+            root.join("bin.dat.theirs").exists(),
+            "test setup: sidecar must be on disk"
+        );
 
-        repo.resolve_path("bin.dat", ResolveSide::Ours, None).unwrap();
-        assert!(!root.join("bin.dat.theirs").exists(), "sidecar must be removed on resolve");
-        assert_eq!(std::fs::read(root.join("bin.dat")).unwrap(), vec![1u8, 159, 146, 150]);
+        repo.resolve_path("bin.dat", ResolveSide::Ours, None)
+            .unwrap();
+        assert!(
+            !root.join("bin.dat.theirs").exists(),
+            "sidecar must be removed on resolve"
+        );
+        assert_eq!(
+            std::fs::read(root.join("bin.dat")).unwrap(),
+            vec![1u8, 159, 146, 150]
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
@@ -835,7 +894,8 @@ mod tests {
         // An untracked scratch file that happens to share the sidecar name.
         std::fs::write(root.join("file.txt.theirs"), b"user scratch content\n").unwrap();
 
-        repo.resolve_path("file.txt", ResolveSide::Ours, None).unwrap();
+        repo.resolve_path("file.txt", ResolveSide::Ours, None)
+            .unwrap();
 
         assert!(
             root.join("file.txt.theirs").exists(),
@@ -880,7 +940,14 @@ mod tests {
         assert!(matches!(err, Error::MergeConflicts(3)), "got {err:?}");
         let mut before = repo.active_conflicts().unwrap();
         before.sort();
-        assert_eq!(before, vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()]);
+        assert_eq!(
+            before,
+            vec![
+                "a.txt".to_string(),
+                "b.txt".to_string(),
+                "c.txt".to_string()
+            ]
+        );
 
         repo.resolve_path("b.txt", ResolveSide::Ours, None).unwrap();
 
@@ -910,21 +977,27 @@ mod tests {
 
         std::fs::write(root.join("secret/a.txt"), b"ours\n").unwrap();
         repo.commit("me", "ours edits secret").unwrap();
-        repo.switch_with_identity("feature", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
         std::fs::write(root.join("secret/a.txt"), b"theirs\n").unwrap();
         repo.commit("me", "theirs edits secret").unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
 
-        let err = repo.merge_with_identity("feature", "me", Some(&alice_sk)).unwrap_err();
+        let err = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
         assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
 
-        let err = repo.resolve_path("secret/a.txt", ResolveSide::Ours, None).unwrap_err();
+        let err = repo
+            .resolve_path("secret/a.txt", ResolveSide::Ours, None)
+            .unwrap_err();
         assert!(
             matches!(err, Error::ProtectedMergeNeedsIdentity(ref p) if p == "secret/a.txt"),
             "got {err:?}"
         );
 
-        repo.resolve_path("secret/a.txt", ResolveSide::Ours, Some(&alice_sk)).unwrap();
+        repo.resolve_path("secret/a.txt", ResolveSide::Ours, Some(&alice_sk))
+            .unwrap();
         assert_eq!(std::fs::read(root.join("secret/a.txt")).unwrap(), b"ours\n");
         assert!(repo.active_conflicts().unwrap().is_empty());
 
@@ -952,7 +1025,10 @@ mod tests {
 
         repo.resolve_path("a.txt", ResolveSide::Ours, None).unwrap();
         let tip = repo.commit("me", "resolve via ours").unwrap();
-        assert!(repo.active_conflict_op().unwrap().is_none(), "merge state cleared by commit");
+        assert!(
+            repo.active_conflict_op().unwrap().is_none(),
+            "merge state cleared by commit"
+        );
 
         let snap = repo.snapshot(&tip).unwrap();
         let store_arc = repo.vfs.store();
@@ -977,7 +1053,9 @@ mod tests {
         repo.commit("me", "base").unwrap();
 
         // No op in progress at all.
-        let err = repo.resolve_path("a.txt", ResolveSide::Ours, None).unwrap_err();
+        let err = repo
+            .resolve_path("a.txt", ResolveSide::Ours, None)
+            .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
 
         // An op is in progress, but the path named isn't one of its conflicts.
@@ -991,7 +1069,9 @@ mod tests {
         let err = repo.merge("feature", "me").unwrap_err();
         assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
 
-        let err = repo.resolve_path("does-not-exist.txt", ResolveSide::Ours, None).unwrap_err();
+        let err = repo
+            .resolve_path("does-not-exist.txt", ResolveSide::Ours, None)
+            .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
 
         drop(repo);
@@ -1028,7 +1108,8 @@ mod tests {
         // (b_tip -> merge, "x\n" -> "a-edit\n") conflicts with it.
         repo.switch("target-m2").unwrap();
         std::fs::write(root.join("x.txt"), b"target-edit\n").unwrap();
-        repo.commit("me", "target independently edits x.txt").unwrap();
+        repo.commit("me", "target independently edits x.txt")
+            .unwrap();
 
         repo.switch("b-side").unwrap();
         // b-side does not touch x.txt: b_tip's x.txt stays "x\n".
@@ -1054,7 +1135,8 @@ mod tests {
             "base must track the --mainline 2-chosen parent (b_tip), not parents[0] (a_tip)"
         );
 
-        repo.resolve_path("x.txt", ResolveSide::Theirs, None).unwrap();
+        repo.resolve_path("x.txt", ResolveSide::Theirs, None)
+            .unwrap();
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
     }

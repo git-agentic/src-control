@@ -188,7 +188,14 @@ fn parse_block(lines: &[&str], i: usize) -> Option<(OpRecord, usize)> {
     i += 1;
 
     Some((
-        OpRecord { seq, ts, desc, head_before, head_after, refs },
+        OpRecord {
+            seq,
+            ts,
+            desc,
+            head_before,
+            head_after,
+            refs,
+        },
         i,
     ))
 }
@@ -381,7 +388,11 @@ impl Repo {
 
         // Capture the tree materialized right now, before any ref changes,
         // so re-materialize below knows what to remove.
-        let old_root = if rematerialize { self.head_root()? } else { None };
+        let old_root = if rematerialize {
+            self.head_root()?
+        } else {
+            None
+        };
 
         // Restore: ref writes first, inverse oplog record last (crash safety
         // — a crash between the two leaves the refs already-restored state
@@ -436,7 +447,10 @@ impl Repo {
             &inverse_refs,
         )?;
 
-        Ok(UndoOutcome { desc: rec.desc, skipped })
+        Ok(UndoOutcome {
+            desc: rec.desc,
+            skipped,
+        })
     }
 }
 
@@ -559,14 +573,21 @@ mod tests {
         record(&layout, "after crash", "main", "main", &[]).unwrap();
 
         let all = read_all(&layout).unwrap();
-        assert_eq!(all.len(), 2, "new record must be visible past the torn tail");
+        assert_eq!(
+            all.len(),
+            2,
+            "new record must be visible past the torn tail"
+        );
         assert_eq!(all[0].desc, "good op");
         assert_eq!(all[1].desc, "after crash");
         assert_eq!(all[1].seq, 2);
 
         // The torn bytes are physically gone, not just skipped.
         let raw = std::fs::read_to_string(layout.oplog_path()).unwrap();
-        assert!(!raw.contains("half-written"), "torn tail should be truncated");
+        assert!(
+            !raw.contains("half-written"),
+            "torn tail should be truncated"
+        );
 
         std::fs::remove_dir_all(&layout.root).unwrap();
         assert!(!layout.root.exists());
@@ -640,7 +661,10 @@ mod tests {
         let outcome = repo.undo().unwrap();
         assert_eq!(outcome.desc, "commit: commit two");
         assert!(outcome.skipped.is_empty());
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(id1));
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            Some(id1)
+        );
         // The object for the undone commit is still in the store — undo never
         // deletes objects, only moves refs.
         assert!(repo.store().lock().unwrap().get_snapshot(&id2).is_ok());
@@ -648,8 +672,15 @@ mod tests {
         // Double-undo redoes: the first undo logged its own inverse record,
         // and undoing *that* restores the tip to id2.
         let outcome2 = repo.undo().unwrap();
-        assert!(outcome2.desc.starts_with("undo of op"), "got {:?}", outcome2.desc);
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(id2));
+        assert!(
+            outcome2.desc.starts_with("undo of op"),
+            "got {:?}",
+            outcome2.desc
+        );
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            Some(id2)
+        );
 
         teardown_repo(repo, &root);
     }
@@ -666,7 +697,10 @@ mod tests {
 
         let outcome = repo.undo().unwrap();
         assert_eq!(outcome.desc, "branch feature");
-        assert_eq!(refs::read_branch_tip(repo.layout(), "feature").unwrap(), None);
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "feature").unwrap(),
+            None
+        );
         assert!(!repo.layout().ref_path("feature").exists());
 
         // Redo direction (None → Some): undoing the inverse record recreates
@@ -674,7 +708,10 @@ mod tests {
         let redo = repo.undo().unwrap();
         assert!(redo.desc.starts_with("undo of op"), "got {:?}", redo.desc);
         assert!(repo.layout().ref_path("feature").exists());
-        assert_eq!(refs::read_branch_tip(repo.layout(), "feature").unwrap(), feature_tip);
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "feature").unwrap(),
+            feature_tip
+        );
 
         teardown_repo(repo, &root);
     }
@@ -689,13 +726,19 @@ mod tests {
         std::fs::write(root.join("a.txt"), "feature content\n").unwrap();
         repo.commit("me", "feature commit").unwrap();
         repo.switch("main").unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "main content\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "main content\n"
+        );
 
         let outcome = repo.undo().unwrap();
         assert_eq!(outcome.desc, "switch main");
         assert!(outcome.skipped.is_empty());
         assert_eq!(refs::current_branch(repo.layout()).unwrap(), "feature");
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "feature content\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "feature content\n"
+        );
 
         teardown_repo(repo, &root);
     }
@@ -711,7 +754,11 @@ mod tests {
         let opts = crate::workspace::WorkOptions {
             agents: 2,
             base_name: "work".into(),
-            cmd: vec!["sh".into(), "-c".into(), "echo \"$SC_WORKSPACE\" > out.txt".into()],
+            cmd: vec![
+                "sh".into(),
+                "-c".into(),
+                "echo \"$SC_WORKSPACE\" > out.txt".into(),
+            ],
             author: "me".into(),
             message: None,
             identity: None,
@@ -727,19 +774,41 @@ mod tests {
         let main_before = refs::read_branch_tip(repo.layout(), "main").unwrap();
 
         let outcome = repo.undo().unwrap();
-        assert!(outcome.desc.starts_with("work: 2 agents"), "got {:?}", outcome.desc);
-        assert_eq!(refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
-        assert_eq!(refs::read_branch_tip(repo.layout(), "work-2").unwrap(), None);
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), main_before);
+        assert!(
+            outcome.desc.starts_with("work: 2 agents"),
+            "got {:?}",
+            outcome.desc
+        );
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "work-1").unwrap(),
+            None
+        );
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "work-2").unwrap(),
+            None
+        );
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            main_before
+        );
         assert_eq!(refs::current_branch(repo.layout()).unwrap(), "main");
 
         // Redo direction (None → Some): undoing the inverse record recreates
         // both harvested branch refs at their original tips.
         let redo = repo.undo().unwrap();
         assert!(redo.desc.starts_with("undo of op"), "got {:?}", redo.desc);
-        assert_eq!(refs::read_branch_tip(repo.layout(), "work-1").unwrap(), work1_tip);
-        assert_eq!(refs::read_branch_tip(repo.layout(), "work-2").unwrap(), work2_tip);
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), main_before);
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "work-1").unwrap(),
+            work1_tip
+        );
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "work-2").unwrap(),
+            work2_tip
+        );
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            main_before
+        );
 
         std::fs::remove_dir_all(&scratch).unwrap();
         teardown_repo(repo, &root);
@@ -758,7 +827,10 @@ mod tests {
         let before_main = refs::read_branch_tip(repo.layout(), "main").unwrap();
         let err = repo.undo().unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), before_main);
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            before_main
+        );
 
         teardown_repo(repo, &root);
     }
@@ -776,19 +848,32 @@ mod tests {
         repo.commit("me", "theirs").unwrap();
         repo.switch("main").unwrap();
         let merge_id = repo.merge("feature", "me").unwrap();
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(merge_id));
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            Some(merge_id)
+        );
 
         // Undo the merge: tip back to the pre-merge commit; the merge
         // snapshot stays reachable in the CAS.
         let outcome = repo.undo().unwrap();
-        assert!(outcome.desc.starts_with("merge feature"), "got {:?}", outcome.desc);
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(pre_merge));
+        assert!(
+            outcome.desc.starts_with("merge feature"),
+            "got {:?}",
+            outcome.desc
+        );
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            Some(pre_merge)
+        );
         assert!(repo.store().lock().unwrap().get_snapshot(&merge_id).is_ok());
 
         // Redo: undoing the inverse record restores the merge tip.
         let redo = repo.undo().unwrap();
         assert!(redo.desc.starts_with("undo of op"), "got {:?}", redo.desc);
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(merge_id));
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            Some(merge_id)
+        );
 
         // secret add: moves the current branch's tip, same shape as a commit.
         let (_sk, pk) = scl_crypto::generate_keypair();
@@ -798,7 +883,10 @@ mod tests {
 
         let secret_undo = repo.undo().unwrap();
         assert_eq!(secret_undo.desc, "secret add DB_URL");
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), before_secret);
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            before_secret
+        );
         assert!(repo.secret_list().unwrap().is_empty());
 
         teardown_repo(repo, &root);
@@ -814,7 +902,10 @@ mod tests {
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
         // Refused before any ref write: the branch is still born at the
         // first commit, not reverted to unborn.
-        assert_eq!(refs::read_branch_tip(repo.layout(), "main").unwrap(), Some(first));
+        assert_eq!(
+            refs::read_branch_tip(repo.layout(), "main").unwrap(),
+            Some(first)
+        );
         assert!(repo.layout().ref_path("main").exists());
 
         teardown_repo(repo, &root);
@@ -850,7 +941,10 @@ mod tests {
             !root.join("secret/key.txt").exists(),
             "plaintext must not be written (or left) on disk without a key"
         );
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "base\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "base\n"
+        );
 
         teardown_repo(repo, &root);
     }

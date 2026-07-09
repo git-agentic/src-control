@@ -23,7 +23,11 @@ impl RepoLock {
         // Two attempts: the second runs only after breaking a stale lock. If
         // another process wins the re-create race, we report Locked normally.
         for attempt in 0..2 {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(mut f) => {
                     use std::io::Write;
                     // Best-effort: the lock works even if the PID write fails;
@@ -54,8 +58,12 @@ impl RepoLock {
 /// Unreadable file, no parseable PID, or an inconclusive probe all return
 /// false (respect the lock).
 fn holder_is_dead(path: &std::path::Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else { return false };
-    let Ok(pid) = text.trim().parse::<u32>() else { return false };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return false;
+    };
     if pid == std::process::id() {
         return false; // our own pid: definitely alive
     }

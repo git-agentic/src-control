@@ -22,7 +22,14 @@ pub fn read_worktree(
 ) -> Result<Vec<(String, Vec<u8>, FileMode)>> {
     let ignore = Ignore::load(&layout.root)?;
     let mut out = Vec::new();
-    walk_disk(&layout.root, &layout.root, &layout.dot_sc, &ignore, tracked, &mut out)?;
+    walk_disk(
+        &layout.root,
+        &layout.root,
+        &layout.dot_sc,
+        &ignore,
+        tracked,
+        &mut out,
+    )?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
@@ -42,7 +49,11 @@ fn walk_disk(
             continue;
         }
         let ft = entry.file_type()?;
-        let rel = path.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(base)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         if ft.is_dir() {
             // Prune an ignored directory wholesale — unless a tracked path
             // lives under it, in which case we must descend to keep it.
@@ -65,7 +76,10 @@ fn walk_disk(
 /// Is any tracked path inside directory `dir` (repo-relative, no trailing `/`)?
 fn tracked_under(tracked: &BTreeSet<String>, dir: &str) -> bool {
     let prefix = format!("{dir}/");
-    tracked.range(prefix.clone()..).next().is_some_and(|p| p.starts_with(&prefix))
+    tracked
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|p| p.starts_with(&prefix))
 }
 
 #[cfg(unix)]
@@ -99,7 +113,11 @@ fn walk_entries(
 ) -> Result<()> {
     let tree: Tree = store.get_tree(&tree_id)?;
     for e in tree.entries {
-        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
         match e.kind {
             EntryKind::Blob => {
                 out.insert(path, (e.id, e.mode));
@@ -156,7 +174,11 @@ fn walk_entries_with_perms_sparse(
 ) -> Result<()> {
     let tree: Tree = store.get_tree(&tree_id)?;
     for e in tree.entries {
-        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
         match e.kind {
             EntryKind::Blob => {
                 if sparse.matches(&path) {
@@ -234,17 +256,28 @@ pub(crate) fn graft_out_of_sparse(
         if parent_names.contains(&e.name) {
             continue;
         }
-        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
         if !promisor.should_descend(&path) {
             return Err(Error::GappedPathContent(path));
         }
     }
 
-    let mut by_name: BTreeMap<String, scl_core::TreeEntry> =
-        built_tree.entries.into_iter().map(|e| (e.name.clone(), e)).collect();
+    let mut by_name: BTreeMap<String, scl_core::TreeEntry> = built_tree
+        .entries
+        .into_iter()
+        .map(|e| (e.name.clone(), e))
+        .collect();
 
     for pe in parent_tree.entries {
-        let path = if prefix.is_empty() { pe.name.clone() } else { format!("{prefix}/{}", pe.name) };
+        let path = if prefix.is_empty() {
+            pe.name.clone()
+        } else {
+            format!("{prefix}/{}", pe.name)
+        };
         if sparse.matches(&path) {
             // In-sparse: the built side already reflects the working tree's
             // current state (including a genuine deletion) — parent's entry
@@ -305,7 +338,11 @@ fn walk_entries_with_perms(
 ) -> Result<()> {
     let tree: Tree = store.get_tree(&tree_id)?;
     for e in tree.entries {
-        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
         match e.kind {
             EntryKind::Blob => {
                 out.insert(path, (e.id, e.mode, e.perms));
@@ -352,7 +389,11 @@ fn walk_tree_sparse(
 ) -> Result<()> {
     let tree: Tree = store.get_tree(&tree_id)?;
     for e in tree.entries {
-        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
         match e.kind {
             EntryKind::Blob => {
                 if sparse.matches(&path) {
@@ -377,7 +418,11 @@ fn walk_tree(
 ) -> Result<()> {
     let tree: Tree = store.get_tree(&tree_id)?;
     for e in tree.entries {
-        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
         match e.kind {
             EntryKind::Blob => {
                 out.insert(path, e.id);
@@ -444,8 +489,10 @@ pub fn diff_worktree(
         None => BTreeMap::new(),
     };
     let tracked: BTreeSet<String> = head.keys().cloned().collect();
-    let wt: BTreeMap<String, Vec<u8>> =
-        read_worktree(layout, &tracked)?.into_iter().map(|(p, b, _)| (p, b)).collect();
+    let wt: BTreeMap<String, Vec<u8>> = read_worktree(layout, &tracked)?
+        .into_iter()
+        .map(|(p, b, _)| (p, b))
+        .collect();
     let mut diff = Diff::default();
     for (p, bytes) in &wt {
         match head.get(p) {
@@ -491,7 +538,9 @@ pub fn diff_worktree(
 pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
     for comp in rel.split('/') {
         if comp.is_empty() || comp == "." || comp == ".." {
-            return Err(crate::error::Error::BadRef(format!("unsafe path in tree: {rel}")));
+            return Err(crate::error::Error::BadRef(format!(
+                "unsafe path in tree: {rel}"
+            )));
         }
     }
     Ok(root.join(rel))
@@ -631,8 +680,7 @@ mod tests {
 
     #[test]
     fn read_worktree_respects_scignore_but_keeps_tracked() {
-        let root =
-            std::env::temp_dir().join(format!("scl-repo-wt-ignore-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("scl-repo-wt-ignore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -688,11 +736,22 @@ mod tests {
         let vault = layout.root.join("vault");
         std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let result = materialize(&layout, &mut store, root_tree, None, &Default::default(), None, &Sparse::default());
+        let result = materialize(
+            &layout,
+            &mut store,
+            root_tree,
+            None,
+            &Default::default(),
+            None,
+            &Sparse::default(),
+        );
 
         // Restore perms before asserting so cleanup always works.
         std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(result.is_err(), "swallowing a failed stale-plaintext removal leaks plaintext");
+        assert!(
+            result.is_err(),
+            "swallowing a failed stale-plaintext removal leaks plaintext"
+        );
         assert!(vault.join("secret.txt").exists());
 
         drop(store);
@@ -715,8 +774,16 @@ mod tests {
             }])))
             .unwrap();
 
-        let err = materialize(&layout, &mut store, evil_tree, None, &Default::default(), None, &Sparse::default())
-            .unwrap_err();
+        let err = materialize(
+            &layout,
+            &mut store,
+            evil_tree,
+            None,
+            &Default::default(),
+            None,
+            &Sparse::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, crate::error::Error::BadRef(_)), "got {err:?}");
         // Nothing was written outside the repo root: the sibling "<root>.." path
         // would be the repo's parent dir; assert no stray "pwned" file landed there.
@@ -736,7 +803,16 @@ mod tests {
             }))
             .unwrap();
         let snap_root = store.get_snapshot(&snap).unwrap().root;
-        assert!(materialize(&layout, &mut store, snap_root, None, &Default::default(), None, &Sparse::default()).is_err());
+        assert!(materialize(
+            &layout,
+            &mut store,
+            snap_root,
+            None,
+            &Default::default(),
+            None,
+            &Sparse::default()
+        )
+        .is_err());
 
         drop(store);
         std::fs::remove_dir_all(&layout.root).unwrap();

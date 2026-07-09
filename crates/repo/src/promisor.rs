@@ -192,8 +192,7 @@ mod tests {
     use super::*;
 
     fn tmp_layout(tag: &str) -> Layout {
-        let root =
-            std::env::temp_dir().join(format!("scl-promisor-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("scl-promisor-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let layout = Layout::at(&root);
         std::fs::create_dir_all(&layout.dot_sc).unwrap();
@@ -246,7 +245,11 @@ mod tests {
         p.widen(&["docs/".into(), "src/".into(), "tests/".into()]);
         assert_eq!(
             p.prefixes(),
-            &["src/".to_string(), "docs/".to_string(), "tests/".to_string()]
+            &[
+                "src/".to_string(),
+                "docs/".to_string(),
+                "tests/".to_string()
+            ]
         );
 
         // Widening with an already-present set is a no-op.

@@ -63,7 +63,10 @@ pub(crate) fn merge_prefixes(a: &[ProtectPrefix], b: &[ProtectPrefix]) -> Vec<Pr
 pub(crate) fn union_wraps(a: &[WrappedKey], b: &[WrappedKey]) -> Vec<WrappedKey> {
     let mut out: Vec<WrappedKey> = Vec::new();
     for w in a.iter().chain(b.iter()) {
-        if !out.iter().any(|existing| existing.recipient_id == w.recipient_id) {
+        if !out
+            .iter()
+            .any(|existing| existing.recipient_id == w.recipient_id)
+        {
             out.push(w.clone());
         }
     }
@@ -121,7 +124,10 @@ pub(crate) fn decrypt_with(
 /// the seal loudly — sealing to nobody mints permanently unreadable ciphertext.
 pub(crate) fn encrypt_protected(
     plaintexts: Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)>,
-) -> Result<(Vec<(String, Vec<u8>, FileMode, u8)>, BTreeMap<ObjectId, Vec<WrappedKey>>)> {
+) -> Result<(
+    Vec<(String, Vec<u8>, FileMode, u8)>,
+    BTreeMap<ObjectId, Vec<WrappedKey>>,
+)> {
     // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
     let mut all: Vec<(String, Vec<u8>, FileMode, u8)> = Vec::new();
     let mut fresh_wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
@@ -156,8 +162,7 @@ pub(crate) fn reuse_prior_wraps(
     for (blob_id, wks) in fresh.iter_mut() {
         if let Some(prior_wks) = prior.get(blob_id) {
             for wk in wks.iter_mut() {
-                if let Some(existing) =
-                    prior_wks.iter().find(|p| p.recipient_id == wk.recipient_id)
+                if let Some(existing) = prior_wks.iter().find(|p| p.recipient_id == wk.recipient_id)
                 {
                     *wk = existing.clone();
                 }
@@ -174,7 +179,10 @@ mod tests {
         Protection {
             prefixes: prefixes
                 .iter()
-                .map(|p| ProtectPrefix { prefix: p.to_string(), recipients: vec![] })
+                .map(|p| ProtectPrefix {
+                    prefix: p.to_string(),
+                    recipients: vec![],
+                })
                 .collect(),
             wrapped: Default::default(),
         }
@@ -206,12 +214,19 @@ mod tests {
         scl_core::RecipientEntry {
             key: [key; 32],
             epoch,
-            state: if granted { scl_core::RecipientState::Granted } else { scl_core::RecipientState::Revoked },
+            state: if granted {
+                scl_core::RecipientState::Granted
+            } else {
+                scl_core::RecipientState::Revoked
+            },
         }
     }
 
     fn rule(prefix: &str, entries: Vec<scl_core::RecipientEntry>) -> ProtectPrefix {
-        ProtectPrefix { prefix: prefix.into(), recipients: entries }
+        ProtectPrefix {
+            prefix: prefix.into(),
+            recipients: entries,
+        }
     }
 
     #[test]
@@ -226,7 +241,10 @@ mod tests {
             let r = m.iter().find(|p| p.prefix == "secret/").unwrap();
             assert_eq!(r.granted_keys(), vec![[1; 32]]);
             let b_entry = r.recipients.iter().find(|e| e.key == [2; 32]).unwrap();
-            assert_eq!((b_entry.epoch, b_entry.state), (2, scl_core::RecipientState::Revoked));
+            assert_eq!(
+                (b_entry.epoch, b_entry.state),
+                (2, scl_core::RecipientState::Revoked)
+            );
         }
     }
 
@@ -276,7 +294,8 @@ mod tests {
         let (cipher, dek) = scl_crypto::encrypt_path(b"hello");
         let blob_id = scl_core::Object::blob(cipher.clone()).id();
         let mut prot = Protection::default();
-        prot.wrapped.insert(blob_id, vec![scl_crypto::wrap_dek_for(&dek, &alice_pk)]);
+        prot.wrapped
+            .insert(blob_id, vec![scl_crypto::wrap_dek_for(&dek, &alice_pk)]);
         let pt = decrypt_with(&cipher, &blob_id, &[&prot], &alice_sk, "secret/x").unwrap();
         assert_eq!(&pt[..], b"hello");
         let err = decrypt_with(&cipher, &blob_id, &[&prot], &mallory_sk, "secret/x").unwrap_err();
@@ -292,12 +311,19 @@ mod tests {
         let (mut cipher, dek) = scl_crypto::encrypt_path(b"hello");
         let blob_id = scl_core::Object::blob(cipher.clone()).id();
         let mut prot = Protection::default();
-        prot.wrapped.insert(blob_id, vec![scl_crypto::wrap_dek_for(&dek, &alice_pk)]);
+        prot.wrapped
+            .insert(blob_id, vec![scl_crypto::wrap_dek_for(&dek, &alice_pk)]);
         let n = cipher.len();
         cipher[n - 1] ^= 0xFF; // flip one ciphertext byte
         let err = decrypt_with(&cipher, &blob_id, &[&prot], &alice_sk, "secret/x").unwrap_err();
-        assert!(!matches!(err, Error::NotAuthorized(_)), "corruption misreported as NotAuthorized: {err}");
-        assert!(matches!(err, Error::Crypto(_)), "expected Error::Crypto, got: {err}");
+        assert!(
+            !matches!(err, Error::NotAuthorized(_)),
+            "corruption misreported as NotAuthorized: {err}"
+        );
+        assert!(
+            matches!(err, Error::Crypto(_)),
+            "expected Error::Crypto, got: {err}"
+        );
     }
 
     #[test]
@@ -311,7 +337,10 @@ mod tests {
         let u = union_wraps(&[wa.clone()], &[wa_dup, wb.clone()]);
         assert_eq!(u.len(), 2);
         // Dedup keeps a's wrap for pk_a (first occurrence wins).
-        let kept_a = u.iter().find(|w| w.recipient_id == wa.recipient_id).unwrap();
+        let kept_a = u
+            .iter()
+            .find(|w| w.recipient_id == wa.recipient_id)
+            .unwrap();
         assert_eq!(kept_a.wrapped_dek, wa.wrapped_dek);
 
         // Order-independence: equivalent contents (distinct recipients — for
@@ -323,7 +352,9 @@ mod tests {
         let ba = union_wraps(&[wb], &[wa]);
         assert_eq!(ab, ba);
         // And the output is sorted by recipient_id.
-        assert!(ab.windows(2).all(|w| w[0].recipient_id <= w[1].recipient_id));
+        assert!(ab
+            .windows(2)
+            .all(|w| w[0].recipient_id <= w[1].recipient_id));
     }
 
     #[test]
@@ -339,7 +370,10 @@ mod tests {
             matches!(err, Error::InvalidArgument(_)),
             "sealing to nobody must fail loudly, got {err:?}"
         );
-        assert!(format!("{err}").contains("secret/x"), "error must name the path");
+        assert!(
+            format!("{err}").contains("secret/x"),
+            "error must name the path"
+        );
     }
 
     #[test]

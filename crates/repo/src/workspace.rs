@@ -48,7 +48,15 @@ pub(crate) fn materialize_workspace(
     let ws = Layout::at(dir);
     let store_arc = repo.vfs().store();
     let mut store = store_arc.lock().unwrap();
-    worktree::materialize(&ws, &mut store, snap.root, None, &snap.protection, identity, sparse)
+    worktree::materialize(
+        &ws,
+        &mut store,
+        snap.root,
+        None,
+        &snap.protection,
+        identity,
+        sparse,
+    )
 }
 
 /// Diff the checkout at `dir` against the base snapshot `tip`; if changed,
@@ -70,9 +78,15 @@ pub(crate) fn harvest_workspace(
         let store_arc = repo.vfs().store();
         let mut store = store_arc.lock().unwrap();
         let tracked: std::collections::BTreeSet<String> =
-            worktree::tree_file_ids(&mut store, snap.root)?.into_keys().collect();
-        let d = worktree::diff_worktree(&ws, &mut store, Some(snap.root), &snap.protection, sparse)?;
-        (tracked, !(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
+            worktree::tree_file_ids(&mut store, snap.root)?
+                .into_keys()
+                .collect();
+        let d =
+            worktree::diff_worktree(&ws, &mut store, Some(snap.root), &snap.protection, sparse)?;
+        (
+            tracked,
+            !(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()),
+        )
     };
     if !changed {
         return Ok(HarvestResult::Unchanged);
@@ -83,7 +97,18 @@ pub(crate) fn harvest_workspace(
     // fixed at materialize time (or, for `sc work`, is always full), so the
     // carry predicate must see that same view, not the host repo's current
     // `.sc/sparse` — see `snapshot_files`'s doc comment.
-    match repo.snapshot_files(files, Some(tip), None, None, None, None, None, sparse, author, message) {
+    match repo.snapshot_files(
+        files,
+        Some(tip),
+        None,
+        None,
+        None,
+        None,
+        None,
+        sparse,
+        author,
+        message,
+    ) {
         Ok(id) => {
             refs::write_branch_tip(repo.layout(), branch, &id)?;
             Ok(HarvestResult::Committed(id))
@@ -196,8 +221,9 @@ impl Repo {
             return Err(crate::promisor::partial_clone_unsupported("sc work"));
         }
         let tip = self.head_tip()?.ok_or(Error::Unborn)?;
-        let labels: Vec<String> =
-            (1..=opts.agents).map(|i| format!("{}-{i}", opts.base_name)).collect();
+        let labels: Vec<String> = (1..=opts.agents)
+            .map(|i| format!("{}-{i}", opts.base_name))
+            .collect();
         for label in &labels {
             crate::repo::validate_branch_name(label)?;
             if refs::read_branch_tip(self.layout(), label)?.is_some() {
@@ -214,10 +240,9 @@ impl Repo {
             _ => Vec::new(),
         };
 
-        let session_root = opts
-            .session_root
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("sc-work-{}", std::process::id())));
+        let session_root = opts.session_root.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("sc-work-{}", std::process::id()))
+        });
         create_session_root(&session_root)?;
         let _teardown = Teardown(session_root.clone());
 
@@ -286,7 +311,11 @@ impl Repo {
                 &message,
                 &crate::sparse::Sparse::default(),
             );
-            outcomes.push(WorkspaceOutcome { label, agent_exit, harvest });
+            outcomes.push(WorkspaceOutcome {
+                label,
+                agent_exit,
+                harvest,
+            });
         }
 
         let created: Vec<(String, Option<ObjectId>, Option<ObjectId>)> = outcomes
@@ -345,9 +374,14 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        let skipped = materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default()).unwrap();
+        let skipped =
+            materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default())
+                .unwrap();
         assert!(skipped.is_empty());
-        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "base\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "base\n"
+        );
 
         std::fs::write(dir.join("a.txt"), "edited\n").unwrap();
         let res = harvest_workspace(
@@ -365,7 +399,10 @@ mod tests {
             other => panic!("expected Committed, got {other:?}"),
         };
         // Branch points at the new snapshot; parent is the base tip; HEAD untouched.
-        assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), Some(id));
+        assert_eq!(
+            crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(),
+            Some(id)
+        );
         assert_eq!(repo.snapshot(&id).unwrap().parents, vec![tip]);
         assert_eq!(repo.head_tip().unwrap(), Some(tip));
         drop(repo);
@@ -390,7 +427,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(res, HarvestResult::Unchanged));
-        assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
+        assert_eq!(
+            crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(),
+            None
+        );
         drop(repo);
         teardown(&root);
     }
@@ -415,7 +455,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(res, HarvestResult::Rejected(_)));
-        assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
+        assert_eq!(
+            crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(),
+            None
+        );
         drop(repo);
         teardown(&root);
     }
@@ -469,7 +512,10 @@ mod tests {
             "the agent's genuine deletion of an out-of-host-sparse file must land, \
              not be silently reverted by the host's narrow spec"
         );
-        assert!(ids.contains_key("src/a.txt"), "untouched in-sparse file still present");
+        assert!(
+            ids.contains_key("src/a.txt"),
+            "untouched in-sparse file still present"
+        );
         drop(store);
         drop(repo);
         teardown(&root);
@@ -480,7 +526,11 @@ mod tests {
         let (root, scratch) = setup("session");
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
-        let opts = work_opts(3, &["sh", "-c", "echo \"$SC_WORKSPACE\" > out.txt"], &scratch);
+        let opts = work_opts(
+            3,
+            &["sh", "-c", "echo \"$SC_WORKSPACE\" > out.txt"],
+            &scratch,
+        );
         let session_root = opts.session_root.clone().unwrap();
         let outcomes = repo.work(opts).unwrap();
         assert_eq!(outcomes.len(), 3);
@@ -492,7 +542,10 @@ mod tests {
                 HarvestResult::Committed(id) => *id,
                 other => panic!("expected Committed, got {other:?}"),
             };
-            assert_eq!(crate::refs::read_branch_tip(repo.layout(), &label).unwrap(), Some(id));
+            assert_eq!(
+                crate::refs::read_branch_tip(repo.layout(), &label).unwrap(),
+                Some(id)
+            );
         }
         // HEAD untouched; session temp dir gone (zero residue).
         assert_eq!(repo.head_tip().unwrap(), Some(tip));
@@ -506,18 +559,29 @@ mod tests {
         let (root, scratch) = setup("mixed");
         let repo = Repo::open(&root).unwrap();
         // Agent 1..N all run the same cmd; use one that edits then fails.
-        let opts =
-            work_opts(1, &["sh", "-c", "echo partial > wip.txt; exit 3"], &scratch);
+        let opts = work_opts(1, &["sh", "-c", "echo partial > wip.txt; exit 3"], &scratch);
         let outcomes = repo.work(opts).unwrap();
         assert_eq!(outcomes[0].agent_exit, Some(3));
         // Partial work still harvested.
-        assert!(matches!(outcomes[0].harvest.as_ref().unwrap(), HarvestResult::Committed(_)));
+        assert!(matches!(
+            outcomes[0].harvest.as_ref().unwrap(),
+            HarvestResult::Committed(_)
+        ));
 
         // A no-op agent produces Unchanged and no branch.
-        let opts2 = WorkOptions { base_name: "idle".into(), ..work_opts(1, &["true"], &scratch) };
+        let opts2 = WorkOptions {
+            base_name: "idle".into(),
+            ..work_opts(1, &["true"], &scratch)
+        };
         let outcomes2 = repo.work(opts2).unwrap();
-        assert!(matches!(outcomes2[0].harvest.as_ref().unwrap(), HarvestResult::Unchanged));
-        assert_eq!(crate::refs::read_branch_tip(repo.layout(), "idle-1").unwrap(), None);
+        assert!(matches!(
+            outcomes2[0].harvest.as_ref().unwrap(),
+            HarvestResult::Unchanged
+        ));
+        assert_eq!(
+            crate::refs::read_branch_tip(repo.layout(), "idle-1").unwrap(),
+            None
+        );
         drop(repo);
         teardown(&root);
     }
@@ -533,8 +597,14 @@ mod tests {
         let outcomes = repo.work(opts).unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].agent_exit, None);
-        assert!(matches!(outcomes[0].harvest.as_ref().unwrap(), HarvestResult::Unchanged));
-        assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
+        assert!(matches!(
+            outcomes[0].harvest.as_ref().unwrap(),
+            HarvestResult::Unchanged
+        ));
+        assert_eq!(
+            crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(),
+            None
+        );
         assert!(!session_root.exists(), "session root must be torn down");
         drop(repo);
         teardown(&root);
@@ -549,7 +619,10 @@ mod tests {
         let opts = work_opts(2, &["true"], &scratch);
         let session_root = opts.session_root.clone().unwrap();
         assert!(matches!(repo.work(opts), Err(Error::BadRef(_))));
-        assert!(!session_root.exists(), "refusal must not leave a session dir");
+        assert!(
+            !session_root.exists(),
+            "refusal must not leave a session dir"
+        );
         // Zero agents / empty command.
         assert!(matches!(
             repo.work(work_opts(0, &["true"], &scratch)),
@@ -578,7 +651,10 @@ mod tests {
         // pre-existing dir is left exactly as it was (not torn down by the
         // session's Drop guard, since the guard is only installed after the
         // refusal).
-        assert_eq!(crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(), None);
+        assert_eq!(
+            crate::refs::read_branch_tip(repo.layout(), "work-1").unwrap(),
+            None
+        );
         assert!(session_root.exists());
         drop(repo);
         teardown(&root);
@@ -590,8 +666,11 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let (sk, pk) = scl_crypto::generate_keypair();
         repo.secret_add("DEMO_TOKEN", b"tok-123", &[pk]).unwrap();
-        let mut opts =
-            work_opts(1, &["sh", "-c", "printf %s \"$DEMO_TOKEN\" > tok.txt"], &scratch);
+        let mut opts = work_opts(
+            1,
+            &["sh", "-c", "printf %s \"$DEMO_TOKEN\" > tok.txt"],
+            &scratch,
+        );
         opts.base_name = "sec".into();
         opts.with_secrets = true;
         opts.identity = Some(sk);
@@ -630,15 +709,24 @@ mod tests {
         {
             let repo = Repo::open_with_budget(&root, 4 * 1024 * 1024).unwrap();
             let outcomes = repo.work(work_opts(1, &["true"], &scratch)).unwrap();
-            assert!(matches!(outcomes[0].harvest.as_ref().unwrap(), HarvestResult::Unchanged));
-            assert!(repo.vfs().stats().evictions > 0, "over-budget session must evict");
+            assert!(matches!(
+                outcomes[0].harvest.as_ref().unwrap(),
+                HarvestResult::Unchanged
+            ));
+            assert!(
+                repo.vfs().stats().evictions > 0,
+                "over-budget session must evict"
+            );
         }
         {
             // Budget smaller than a single blob: nothing reclaimable → the
             // failure is loud (BudgetExceeded from core), never a silent drop.
             let repo = Repo::open_with_budget(&root, 1024 * 1024).unwrap();
             let err = repo.work(work_opts(1, &["true"], &scratch)).unwrap_err();
-            assert!(err.to_string().contains("budget"), "unexpected error: {err}");
+            assert!(
+                err.to_string().contains("budget"),
+                "unexpected error: {err}"
+            );
         }
         let repo = Repo::open(&root).unwrap();
         drop(repo);
@@ -658,7 +746,9 @@ mod tests {
                 other => panic!("expected Committed, got {other:?}"),
             })
             .collect();
-        let rec = crate::oplog::last(repo.layout()).unwrap().expect("work session must log a record");
+        let rec = crate::oplog::last(repo.layout())
+            .unwrap()
+            .expect("work session must log a record");
         assert_eq!(rec.desc, "work: 2 agents, base work");
         assert_eq!(rec.head_before, "main");
         assert_eq!(rec.head_after, "main");
@@ -699,8 +789,9 @@ mod tests {
         repo.commit("test", "big").unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let before = repo.vfs().stats().resident_blob_bytes;
-        let _forks: Vec<_> =
-            (0..8).map(|i| repo.vfs().fork(tip, format!("z{i}")).unwrap()).collect();
+        let _forks: Vec<_> = (0..8)
+            .map(|i| repo.vfs().fork(tip, format!("z{i}")).unwrap())
+            .collect();
         assert_eq!(
             repo.vfs().stats().resident_blob_bytes,
             before,
@@ -720,8 +811,8 @@ mod tests {
     /// up front instead.
     #[test]
     fn work_refuses_on_partial_clone_instead_of_raw_notfound() {
-        let base = std::env::temp_dir()
-            .join(format!("sc-work-partial-test-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("sc-work-partial-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let src_root = base.join("src");
         let dst_root = base.join("dst");

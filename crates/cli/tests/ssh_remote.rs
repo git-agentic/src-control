@@ -55,8 +55,7 @@ fn ssh_env(shim: &Path) -> Vec<(String, String)> {
 
 fn sc_ssh(dir: &Path, shim: &Path, args: &[&str]) -> Output {
     let envs = ssh_env(shim);
-    let envs_ref: Vec<(&str, &str)> =
-        envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let envs_ref: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     sc_env(dir, &envs_ref, args)
 }
 
@@ -87,13 +86,19 @@ fn ssh_clone_push_fetch_merge_round_trip() {
     // A: the "server-side" repo.
     assert!(sc(&a, &["init"]).status.success());
     std::fs::write(a.join("file.txt"), b"v1").unwrap();
-    assert!(sc(&a, &["commit", "-m", "c1", "--author", "t"]).status.success());
+    assert!(sc(&a, &["commit", "-m", "c1", "--author", "t"])
+        .status
+        .success());
 
     // Clone over ssh:// (through the shim) into B.
     let url = format!("ssh://testhost{}", a.display());
     let b = root.join("B");
     let out = sc_ssh(&root, &shim, &["clone", &url, b.to_str().unwrap()]);
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(std::fs::read(b.join("file.txt")).unwrap(), b"v1");
     // origin recorded the ssh URL verbatim.
     let config = std::fs::read_to_string(b.join(".sc/config")).unwrap();
@@ -101,9 +106,15 @@ fn ssh_clone_push_fetch_merge_round_trip() {
 
     // B: commit and push back over the wire.
     std::fs::write(b.join("file.txt"), b"v2").unwrap();
-    assert!(sc(&b, &["commit", "-m", "c2", "--author", "t"]).status.success());
+    assert!(sc(&b, &["commit", "-m", "c2", "--author", "t"])
+        .status
+        .success());
     let out = sc_ssh(&b, &shim, &["push", "origin"]);
-    assert!(out.status.success(), "push failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // A's history now contains c2 (log reads refs + objects; its working tree
     // staying at v1 is expected, like pushing into a non-bare git repo).
@@ -114,7 +125,11 @@ fn ssh_clone_push_fetch_merge_round_trip() {
     // Fetch direction: B fetches after A's tip moved (it moved via B's own
     // push; a second fetch must be a clean no-op that still succeeds).
     let out = sc_ssh(&b, &shim, &["fetch", "origin"]);
-    assert!(out.status.success(), "fetch failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "fetch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -127,22 +142,32 @@ fn racing_pushes_second_gets_non_fast_forward_then_recovers_via_fetch_merge() {
     std::fs::create_dir_all(&a).unwrap();
     assert!(sc(&a, &["init"]).status.success());
     std::fs::write(a.join("base.txt"), b"base").unwrap();
-    assert!(sc(&a, &["commit", "-m", "base", "--author", "t"]).status.success());
+    assert!(sc(&a, &["commit", "-m", "base", "--author", "t"])
+        .status
+        .success());
 
     let url = format!("ssh://testhost{}", a.display());
     let b = root.join("B");
     let c = root.join("C");
-    assert!(sc_ssh(&root, &shim, &["clone", &url, b.to_str().unwrap()]).status.success());
-    assert!(sc_ssh(&root, &shim, &["clone", &url, c.to_str().unwrap()]).status.success());
+    assert!(sc_ssh(&root, &shim, &["clone", &url, b.to_str().unwrap()])
+        .status
+        .success());
+    assert!(sc_ssh(&root, &shim, &["clone", &url, c.to_str().unwrap()])
+        .status
+        .success());
 
     // C lands first.
     std::fs::write(c.join("from_c.txt"), b"c").unwrap();
-    assert!(sc(&c, &["commit", "-m", "from-c", "--author", "t"]).status.success());
+    assert!(sc(&c, &["commit", "-m", "from-c", "--author", "t"])
+        .status
+        .success());
     assert!(sc_ssh(&c, &shim, &["push", "origin"]).status.success());
 
     // B diverged; its push must fail typed, not clobber.
     std::fs::write(b.join("from_b.txt"), b"b").unwrap();
-    assert!(sc(&b, &["commit", "-m", "from-b", "--author", "t"]).status.success());
+    assert!(sc(&b, &["commit", "-m", "from-b", "--author", "t"])
+        .status
+        .success());
     let out = sc_ssh(&b, &shim, &["push", "origin"]);
     assert!(!out.status.success(), "second push must fail");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -151,9 +176,17 @@ fn racing_pushes_second_gets_non_fast_forward_then_recovers_via_fetch_merge() {
     // Recovery: fetch + merge + push.
     assert!(sc_ssh(&b, &shim, &["fetch", "origin"]).status.success());
     let merge = sc(&b, &["merge", "origin/main"]);
-    assert!(merge.status.success(), "merge failed: {}", String::from_utf8_lossy(&merge.stderr));
+    assert!(
+        merge.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
     let out = sc_ssh(&b, &shim, &["push", "origin"]);
-    assert!(out.status.success(), "push after merge failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "push after merge failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -179,13 +212,20 @@ fn unauthorized_ssh_clone_receives_ciphertext_it_cannot_read() {
         .and_then(|l| l.split_whitespace().find(|w| w.starts_with("scl-pk-")))
         .expect("keygen prints the public key")
         .to_string();
-    std::fs::write(a.join(".sc/recipients.toml"), format!("[recipients]\nalice = \"{pk}\"\n"))
-        .unwrap();
-    assert!(sc(&a, &["protect", "secret/", "--to", "alice"]).status.success());
+    std::fs::write(
+        a.join(".sc/recipients.toml"),
+        format!("[recipients]\nalice = \"{pk}\"\n"),
+    )
+    .unwrap();
+    assert!(sc(&a, &["protect", "secret/", "--to", "alice"])
+        .status
+        .success());
     std::fs::create_dir_all(a.join("secret")).unwrap();
     std::fs::write(a.join("secret/db.txt"), secret_plaintext).unwrap();
     std::fs::write(a.join("README.md"), public_marker).unwrap();
-    assert!(sc(&a, &["commit", "-m", "add secret", "--author", "t"]).status.success());
+    assert!(sc(&a, &["commit", "-m", "add secret", "--author", "t"])
+        .status
+        .success());
 
     // Positive control on A: an unprotected file's bytes ARE findable in the
     // object store, so the negative greps below are not vacuous.
@@ -196,11 +236,21 @@ fn unauthorized_ssh_clone_receives_ciphertext_it_cannot_read() {
     let url = format!("ssh://testhost{}", a.display());
     let b = root.join("B");
     let out = sc_ssh(&root, &shim, &["clone", &url, b.to_str().unwrap()]);
-    assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "clone failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // The protected file was not materialized, and no plaintext crossed the wire.
-    assert!(!b.join("secret/db.txt").exists(), "unauthorized clone wrote protected plaintext");
-    assert!(!tree_contains(&b.join(".sc"), secret_plaintext), "plaintext leaked over the wire");
+    assert!(
+        !b.join("secret/db.txt").exists(),
+        "unauthorized clone wrote protected plaintext"
+    );
+    assert!(
+        !tree_contains(&b.join(".sc"), secret_plaintext),
+        "plaintext leaked over the wire"
+    );
     // The public file arrived intact (transfer itself works).
     assert_eq!(std::fs::read(b.join("README.md")).unwrap(), public_marker);
 
@@ -216,17 +266,27 @@ fn serving_a_non_repo_fails_typed_and_remote_add_validates_ssh_urls() {
 
     // Clone of a served non-repo path: typed NotARepo crosses the wire.
     let url = format!("ssh://testhost{}", empty.display());
-    let out = sc_ssh(&root, &shim, &["clone", &url, root.join("dst").to_str().unwrap()]);
+    let out = sc_ssh(
+        &root,
+        &shim,
+        &["clone", &url, root.join("dst").to_str().unwrap()],
+    );
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(stderr.contains("not a src-control repo"), "wrong error: {stderr}");
+    assert!(
+        stderr.contains("not a src-control repo"),
+        "wrong error: {stderr}"
+    );
 
     // remote add rejects malformed ssh URLs eagerly.
     let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
     assert!(sc(&work, &["init"]).status.success());
     let out = sc(&work, &["remote", "add", "up", "ssh://hostonly-no-path"]);
-    assert!(!out.status.success(), "malformed ssh url must be rejected at remote add");
+    assert!(
+        !out.status.success(),
+        "malformed ssh url must be rejected at remote add"
+    );
 
     std::fs::remove_dir_all(&root).unwrap();
 }

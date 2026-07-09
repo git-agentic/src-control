@@ -42,7 +42,11 @@ pub fn import_head(store: &mut Store, repo_path: &Path) -> Result<ObjectId> {
     store.put(snap).context("storing imported snapshot")
 }
 
-pub(crate) fn import_tree(store: &mut Store, repo: &gix::Repository, tree: &gix::Tree) -> Result<ObjectId> {
+pub(crate) fn import_tree(
+    store: &mut Store,
+    repo: &gix::Repository,
+    tree: &gix::Tree,
+) -> Result<ObjectId> {
     let mut entries: Vec<TreeEntry> = Vec::new();
 
     for entry in tree.iter() {
@@ -72,7 +76,13 @@ pub(crate) fn import_tree(store: &mut Store, repo: &gix::Repository, tree: &gix:
                     GitEntryKind::Link => FileMode(0o120000),
                     _ => FileMode::FILE,
                 };
-                entries.push(TreeEntry { name, kind: EntryKind::Blob, id, mode, perms: 0 });
+                entries.push(TreeEntry {
+                    name,
+                    kind: EntryKind::Blob,
+                    id,
+                    mode,
+                    perms: 0,
+                });
             }
             // Submodule pointers carry no content in this repo; skip for the MVP.
             GitEntryKind::Commit => continue,

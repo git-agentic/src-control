@@ -3,6 +3,7 @@ name = "scl-crypto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 scl-core = { path = "../core" }
@@ -19,3 +20,6 @@ ed25519-dalek = "3.0.0"
 
 [dev-dependencies]
 rand_chacha = "0.3"
+
+[lints]
+workspace = true

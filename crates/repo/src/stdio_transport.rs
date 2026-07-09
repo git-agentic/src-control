@@ -25,8 +25,12 @@ impl<R: Read, W: Write> WireClient<R, W> {
     /// `Protocol`, a served non-repo path is `NotARepo`, a dead peer is
     /// `ConnectionLost`.
     pub fn handshake(r: R, w: W) -> Result<WireClient<R, W>> {
-        let client = WireClient { rw: RefCell::new((r, w)) };
-        let body = client.call(Request::Hello { version: wire::PROTOCOL_VERSION })?;
+        let client = WireClient {
+            rw: RefCell::new((r, w)),
+        };
+        let body = client.call(Request::Hello {
+            version: wire::PROTOCOL_VERSION,
+        })?;
         let version = wire::decode_u32_body(&body)?;
         if version != wire::PROTOCOL_VERSION {
             return Err(Error::Protocol(format!(
@@ -66,7 +70,10 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
         self.call(Request::GetObject(*id))
     }
     fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
-        self.call(Request::PutObject { id: *id, bytes: bytes.to_vec() })?;
+        self.call(Request::PutObject {
+            id: *id,
+            bytes: bytes.to_vec(),
+        })?;
         Ok(())
     }
     fn update_ref(
@@ -141,7 +148,9 @@ impl StdioTransport {
     /// child's stderr is folded into the error so the user sees the real cause.
     pub fn spawn(mut cmd: Command) -> Result<StdioTransport> {
         let program = cmd.get_program().to_string_lossy().into_owned();
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::ConnectionLost(format!("failed to spawn {program}: {e}")))?;
@@ -262,15 +271,17 @@ impl SshUrl {
         };
         let (host, port) = match hostport.split_once(':') {
             Some((h, p)) => {
-                let port = p.parse::<u16>().map_err(|_| {
-                    Error::InvalidArgument(format!("bad port in ssh url: {url}"))
-                })?;
+                let port = p
+                    .parse::<u16>()
+                    .map_err(|_| Error::InvalidArgument(format!("bad port in ssh url: {url}")))?;
                 (h, Some(port))
             }
             None => (hostport, None),
         };
         if host.is_empty() {
-            return Err(Error::InvalidArgument(format!("ssh url has empty host: {url}")));
+            return Err(Error::InvalidArgument(format!(
+                "ssh url has empty host: {url}"
+            )));
         }
         if host.starts_with('-') {
             return Err(Error::InvalidArgument(format!(
@@ -299,14 +310,23 @@ impl SshUrl {
         // whitespace or control bytes there are never a legitimate hostname and
         // only invite confusion — reject them too.
         if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return Err(Error::InvalidArgument(format!("ssh url host is malformed: {url}")));
+            return Err(Error::InvalidArgument(format!(
+                "ssh url host is malformed: {url}"
+            )));
         }
         if let Some(u) = &user {
             if u.chars().any(|c| c.is_whitespace() || c.is_control()) {
-                return Err(Error::InvalidArgument(format!("ssh url user is malformed: {url}")));
+                return Err(Error::InvalidArgument(format!(
+                    "ssh url user is malformed: {url}"
+                )));
             }
         }
-        Ok(SshUrl { user, host: host.to_string(), port, path: path.to_string() })
+        Ok(SshUrl {
+            user,
+            host: host.to_string(),
+            port,
+            path: path.to_string(),
+        })
     }
 }
 
@@ -331,7 +351,11 @@ pub(crate) fn ssh_command(url: &SshUrl) -> Command {
         Some(user) => cmd.arg(format!("{user}@{}", url.host)),
         None => cmd.arg(&url.host),
     };
-    cmd.arg("--").arg("sc").arg("serve").arg("--stdio").arg(&url.path);
+    cmd.arg("--")
+        .arg("sc")
+        .arg("serve")
+        .arg("--stdio")
+        .arg(&url.path);
     cmd
 }
 
@@ -344,7 +368,9 @@ pub fn open_transport(url: &str) -> Result<Box<dyn Transport>> {
         Ok(Box::new(StdioTransport::spawn(ssh_command(&parsed))?))
     } else if url.starts_with("sc+http://") {
         let parsed = crate::http_transport::ScHttpUrl::parse(url)?;
-        Ok(Box::new(crate::http_transport::HttpTransport::connect(&parsed)?))
+        Ok(Box::new(crate::http_transport::HttpTransport::connect(
+            &parsed,
+        )?))
     } else {
         Ok(Box::new(crate::transport::LocalTransport::open(url)?))
     }
@@ -370,8 +396,10 @@ mod tests {
     /// Returns the client and the server thread handle.
     fn connect(
         root: std::path::PathBuf,
-    ) -> (WireClient<std::io::PipeReader, std::io::PipeWriter>, std::thread::JoinHandle<crate::error::Result<()>>)
-    {
+    ) -> (
+        WireClient<std::io::PipeReader, std::io::PipeWriter>,
+        std::thread::JoinHandle<crate::error::Result<()>>,
+    ) {
         let (client_read, mut server_write) = std::io::pipe().unwrap();
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let handle =
@@ -384,7 +412,10 @@ mod tests {
     fn wire_client_satisfies_the_transport_contract() {
         let root = tmp_repo("contract");
         std::fs::write(root.join("a.txt"), b"one").unwrap();
-        let tip = crate::repo::Repo::open(&root).unwrap().commit("t", "c1").unwrap();
+        let tip = crate::repo::Repo::open(&root)
+            .unwrap()
+            .commit("t", "c1")
+            .unwrap();
 
         let (client, server) = connect(root.clone());
 
@@ -408,7 +439,10 @@ mod tests {
 
         // CAS semantics survive the wire (mirrors transport.rs::update_ref_is_compare_and_swap)
         let c2 = Object::blob(b"c2".to_vec()).id();
-        assert!(matches!(client.update_ref("main", &c2, None), Err(Error::NonFastForward)));
+        assert!(matches!(
+            client.update_ref("main", &c2, None),
+            Err(Error::NonFastForward)
+        ));
 
         client.bye().unwrap();
         drop(client);
@@ -428,19 +462,30 @@ mod tests {
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("src/a"), b"src-a").unwrap();
         std::fs::write(root.join("docs/b"), b"docs-b").unwrap();
-        let tip = crate::repo::Repo::open(&root).unwrap().commit("t", "c1").unwrap();
+        let tip = crate::repo::Repo::open(&root)
+            .unwrap()
+            .commit("t", "c1")
+            .unwrap();
         let src_a_id = Object::blob(b"src-a".to_vec()).id();
         let docs_b_id = Object::blob(b"docs-b".to_vec()).id();
 
         let (client, server) = connect(root.clone());
 
         let mut pack = Vec::new();
-        client.get_pack(&[tip], &[], Some(&["src/".to_string()]), &mut pack).unwrap();
-        let ids: Vec<_> =
-            scl_core::pack::parse_pack(&pack).unwrap().into_iter().map(|(id, _)| id).collect();
+        client
+            .get_pack(&[tip], &[], Some(&["src/".to_string()]), &mut pack)
+            .unwrap();
+        let ids: Vec<_> = scl_core::pack::parse_pack(&pack)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         assert!(ids.contains(&tip), "snapshot must transfer");
         assert!(ids.contains(&src_a_id), "in-filter blob must transfer");
-        assert!(!ids.contains(&docs_b_id), "out-of-filter blob must NOT transfer over the wire");
+        assert!(
+            !ids.contains(&docs_b_id),
+            "out-of-filter blob must NOT transfer over the wire"
+        );
 
         client.bye().unwrap();
         drop(client);
@@ -475,7 +520,10 @@ mod tests {
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let server = std::thread::spawn(move || {
             let f = wire::read_frame(&mut server_read).unwrap();
-            assert!(matches!(wire::Request::decode(&f).unwrap(), wire::Request::Hello { .. }));
+            assert!(matches!(
+                wire::Request::decode(&f).unwrap(),
+                wire::Request::Hello { .. }
+            ));
             wire::write_ok(&mut server_write, &wire::u32_body(2)).unwrap();
         });
         let err = WireClient::handshake(client_read, client_write).unwrap_err();
@@ -490,14 +538,20 @@ mod tests {
         // the ref must be untouched and the client must see ConnectionLost.
         let root = tmp_repo("droppush");
         std::fs::write(root.join("a.txt"), b"one").unwrap();
-        let tip = crate::repo::Repo::open(&root).unwrap().commit("t", "c1").unwrap();
+        let tip = crate::repo::Repo::open(&root)
+            .unwrap()
+            .commit("t", "c1")
+            .unwrap();
 
         let (client_read, mut server_write) = std::io::pipe().unwrap();
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let root2 = root.clone();
         let server = std::thread::spawn(move || {
             let f = wire::read_frame(&mut server_read).unwrap();
-            assert!(matches!(wire::Request::decode(&f).unwrap(), wire::Request::Hello { .. }));
+            assert!(matches!(
+                wire::Request::decode(&f).unwrap(),
+                wire::Request::Hello { .. }
+            ));
             wire::write_ok(&mut server_write, &wire::u32_body(wire::PROTOCOL_VERSION)).unwrap();
             let t = LocalTransport::open(&root2).unwrap();
             loop {
@@ -523,7 +577,9 @@ mod tests {
         let blob = Object::blob(b"new object".to_vec());
         let (pack, _idx) = scl_core::pack::build_pack(&[(blob.id(), blob.encode())]).unwrap();
         client.put_pack(&mut &pack[..]).unwrap();
-        let err = client.update_ref("main", &blob.id(), Some(&tip)).unwrap_err();
+        let err = client
+            .update_ref("main", &blob.id(), Some(&tip))
+            .unwrap_err();
         assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
         drop(client);
         server.join().unwrap();
@@ -553,7 +609,9 @@ mod tests {
     /// state).
     #[test]
     fn streaming_push_and_fetch_round_trip_tiny_chunks() {
-        let _env_guard = PACK_CHUNK_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env_guard = PACK_CHUNK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let root = tmp_repo("streaming-src");
         for i in 0..5 {
@@ -563,7 +621,10 @@ mod tests {
             )
             .unwrap();
         }
-        let tip = crate::repo::Repo::open(&root).unwrap().commit("t", "many files").unwrap();
+        let tip = crate::repo::Repo::open(&root)
+            .unwrap()
+            .commit("t", "many files")
+            .unwrap();
 
         // ── GetPack leg: hand-rolled client counts ST_PACK_CHUNK frames ──
         let (client_read, mut server_write) = std::io::pipe().unwrap();
@@ -579,14 +640,22 @@ mod tests {
         let mut client_write = client_write;
         wire::write_frame(
             &mut client_write,
-            &Request::Hello { version: wire::PROTOCOL_VERSION }.encode(),
+            &Request::Hello {
+                version: wire::PROTOCOL_VERSION,
+            }
+            .encode(),
         )
         .unwrap();
         wire::parse_response(wire::read_frame(&mut client_read).unwrap()).unwrap();
 
         wire::write_frame(
             &mut client_write,
-            &Request::GetPack { wants: vec![tip], haves: vec![], filter: vec![] }.encode(),
+            &Request::GetPack {
+                wants: vec![tip],
+                haves: vec![],
+                filter: vec![],
+            }
+            .encode(),
         )
         .unwrap();
         // Empty OK body: "a chunk stream follows".
@@ -605,7 +674,10 @@ mod tests {
                 other => panic!("unexpected pack-stream marker byte {other:?}"),
             }
         }
-        assert!(chunk_frames > 1, "expected multiple chunk frames, got {chunk_frames}");
+        assert!(
+            chunk_frames > 1,
+            "expected multiple chunk frames, got {chunk_frames}"
+        );
         let fetched = scl_core::pack::parse_pack(&pack_bytes).unwrap();
         assert!(fetched.iter().any(|(id, _)| *id == tip));
 
@@ -625,8 +697,9 @@ mod tests {
         let (client_read2, mut server_write2) = std::io::pipe().unwrap();
         let (mut server_read2, client_write2) = std::io::pipe().unwrap();
         let dst_root2 = dst_root.clone();
-        let server2 =
-            std::thread::spawn(move || wire::serve(&dst_root2, &mut server_read2, &mut server_write2));
+        let server2 = std::thread::spawn(move || {
+            wire::serve(&dst_root2, &mut server_read2, &mut server_write2)
+        });
         let client2 = WireClient::handshake(client_read2, client_write2).unwrap();
 
         // Drive PutPack's wire shape directly so the chunk size is explicit
@@ -678,7 +751,10 @@ mod tests {
         client.bye().unwrap();
         drop(client);
         server.join().unwrap().unwrap();
-        assert!(tmp_dir_is_empty(&layout), "temp pack file must be gone after a successful put_pack");
+        assert!(
+            tmp_dir_is_empty(&layout),
+            "temp pack file must be gone after a successful put_pack"
+        );
 
         // ── failure: corrupt the LAST byte of the pack (lands in the final
         // wire chunk given a small chunk_size); nothing must land ──
@@ -696,7 +772,10 @@ mod tests {
         let mut client_read = client_read;
         wire::write_frame(
             &mut client_write,
-            &Request::Hello { version: wire::PROTOCOL_VERSION }.encode(),
+            &Request::Hello {
+                version: wire::PROTOCOL_VERSION,
+            }
+            .encode(),
         )
         .unwrap();
         wire::parse_response(wire::read_frame(&mut client_read).unwrap()).unwrap();
@@ -720,7 +799,10 @@ mod tests {
             !t.has_object(&c.id()).unwrap(),
             "corrupt pack must not land any object — atomic after verify"
         );
-        assert!(tmp_dir_is_empty(&layout), "temp pack file must be gone after a corrupt ingest too");
+        assert!(
+            tmp_dir_is_empty(&layout),
+            "temp pack file must be gone after a corrupt ingest too"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -761,18 +843,18 @@ mod tests {
     #[test]
     fn ssh_url_rejects_malformed_forms() {
         for bad in [
-            "/plain/path",                     // not ssh
-            "ssh://host",                      // no path
-            "ssh:///path",                     // empty host
-            "ssh://host:notaport/path",        // bad port
-            "ssh://-oProxyCommand=evil/path",  // host looks like an option flag
-            "ssh://-user@host/path",           // user looks like an option flag
-            "ssh://host/repo;rm -rf ~",        // command injection into remote shell
-            "ssh://host/repo$(touch pwned)",   // command substitution
-            "ssh://host/repo`id`",             // backtick substitution
-            "ssh://host/repo|curl evil",       // pipe to remote command
-            "ssh://host/with space/repo",      // whitespace splits the remote command
-            "ssh://host/repo&background",      // background operator
+            "/plain/path",                    // not ssh
+            "ssh://host",                     // no path
+            "ssh:///path",                    // empty host
+            "ssh://host:notaport/path",       // bad port
+            "ssh://-oProxyCommand=evil/path", // host looks like an option flag
+            "ssh://-user@host/path",          // user looks like an option flag
+            "ssh://host/repo;rm -rf ~",       // command injection into remote shell
+            "ssh://host/repo$(touch pwned)",  // command substitution
+            "ssh://host/repo`id`",            // backtick substitution
+            "ssh://host/repo|curl evil",      // pipe to remote command
+            "ssh://host/with space/repo",     // whitespace splits the remote command
+            "ssh://host/repo&background",     // background operator
         ] {
             assert!(
                 matches!(SshUrl::parse(bad), Err(Error::InvalidArgument(_))),
@@ -805,14 +887,30 @@ mod tests {
     fn ssh_command_builds_the_expected_argv() {
         let u = SshUrl::parse("ssh://alice@host:2222/srv/repo").unwrap();
         let cmd = ssh_command(&u);
-        let args: Vec<String> =
-            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args, ["-p", "2222", "alice@host", "--", "sc", "serve", "--stdio", "/srv/repo"]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-p",
+                "2222",
+                "alice@host",
+                "--",
+                "sc",
+                "serve",
+                "--stdio",
+                "/srv/repo"
+            ]
+        );
 
         let u = SshUrl::parse("ssh://host/repo").unwrap();
         let cmd = ssh_command(&u);
-        let args: Vec<String> =
-            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(args, ["host", "--", "sc", "serve", "--stdio", "/repo"]);
     }
 
@@ -823,7 +921,10 @@ mod tests {
         let t = open_transport(root.to_str().unwrap()).unwrap();
         assert_eq!(t.head_branch().unwrap(), "main");
         // A malformed ssh URL fails fast in parsing, before spawning anything.
-        assert!(matches!(open_transport("ssh://nopath"), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            open_transport("ssh://nopath"),
+            Err(Error::InvalidArgument(_))
+        ));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

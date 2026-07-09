@@ -294,7 +294,7 @@ impl Object {
                     // Sort registers by key so the same logical policy hashes
                     // identically regardless of insertion order.
                     let mut sorted = p.recipients.clone();
-                    sorted.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+                    sorted.sort_unstable_by_key(|a| a.key);
                     for r in &sorted {
                         w.raw(&r.key); // 32 bytes
                         w.u32(r.epoch);
@@ -366,7 +366,13 @@ impl Object {
                     let id = r.id()?;
                     let mode = FileMode(r.u32()?);
                     let perms = r.u8()?;
-                    entries.push(TreeEntry { name, kind, id, mode, perms });
+                    entries.push(TreeEntry {
+                        name,
+                        kind,
+                        id,
+                        mode,
+                        perms,
+                    });
                 }
                 Object::Tree(Tree { entries })
             }
@@ -409,7 +415,11 @@ impl Object {
                             1 => RecipientState::Revoked,
                             s => return Err(Error::Malformed(format!("bad recipient state {s}"))),
                         };
-                        recipients.push(RecipientEntry { key: rk, epoch, state });
+                        recipients.push(RecipientEntry {
+                            key: rk,
+                            epoch,
+                            state,
+                        });
                     }
                     prefixes.push(ProtectPrefix { prefix, recipients });
                 }
@@ -422,12 +432,23 @@ impl Object {
                     for _ in 0..n_keys {
                         let recipient_id = r.str()?;
                         let wrapped_dek = r.bytes()?;
-                        wks.push(WrappedKey { recipient_id, wrapped_dek });
+                        wks.push(WrappedKey {
+                            recipient_id,
+                            wrapped_dek,
+                        });
                     }
                     wrapped.insert(id, wks);
                 }
                 let protection = Protection { prefixes, wrapped };
-                Object::Snapshot(Snapshot { root, parents, author, timestamp, message, secrets, protection })
+                Object::Snapshot(Snapshot {
+                    root,
+                    parents,
+                    author,
+                    timestamp,
+                    message,
+                    secrets,
+                    protection,
+                })
             }
             TAG_SECRET => {
                 let name = r.str()?;
@@ -438,9 +459,17 @@ impl Object {
                 for _ in 0..nk {
                     let recipient_id = r.str()?;
                     let wrapped_dek = r.bytes()?;
-                    wrapped_keys.push(WrappedKey { recipient_id, wrapped_dek });
+                    wrapped_keys.push(WrappedKey {
+                        recipient_id,
+                        wrapped_dek,
+                    });
                 }
-                Object::Secret(Secret { name, nonce, ciphertext, wrapped_keys })
+                Object::Secret(Secret {
+                    name,
+                    nonce,
+                    ciphertext,
+                    wrapped_keys,
+                })
             }
             TAG_SIGNATURE => {
                 let snapshot = r.id()?;
@@ -450,9 +479,15 @@ impl Object {
                 sig.copy_from_slice(r.take(64)?);
                 // Strict decode: fixed-width fields only, no trailing bytes.
                 if r.remaining() != 0 {
-                    return Err(Error::Malformed("trailing bytes in signature object".into()));
+                    return Err(Error::Malformed(
+                        "trailing bytes in signature object".into(),
+                    ));
                 }
-                Object::Signature(SignatureObj { snapshot, signer, sig })
+                Object::Signature(SignatureObj {
+                    snapshot,
+                    signer,
+                    sig,
+                })
             }
             TAG_TRANSCRIPT => {
                 let snapshot = r.id()?;
@@ -465,9 +500,19 @@ impl Object {
                 for _ in 0..nk {
                     let recipient_id = r.str()?;
                     let wrapped_dek = r.bytes()?;
-                    wrapped_keys.push(WrappedKey { recipient_id, wrapped_dek });
+                    wrapped_keys.push(WrappedKey {
+                        recipient_id,
+                        wrapped_dek,
+                    });
                 }
-                Object::Transcript(Transcript { snapshot, agent, session, nonce, ciphertext, wrapped_keys })
+                Object::Transcript(Transcript {
+                    snapshot,
+                    agent,
+                    session,
+                    nonce,
+                    ciphertext,
+                    wrapped_keys,
+                })
             }
             t => return Err(Error::Malformed(format!("unknown object tag {t}"))),
         };
@@ -543,7 +588,9 @@ impl<'a> Reader<'a> {
     fn count(&mut self) -> Result<usize> {
         let n = self.u32()? as usize;
         if n > self.remaining() {
-            return Err(Error::Malformed("element count exceeds remaining bytes".into()));
+            return Err(Error::Malformed(
+                "element count exceeds remaining bytes".into(),
+            ));
         }
         Ok(n)
     }
@@ -669,17 +716,32 @@ mod tests {
         let root = Object::blob(b"r".to_vec()).id();
         let cid = Object::blob(b"ct".to_vec()).id();
         let mut wrapped = std::collections::BTreeMap::new();
-        wrapped.insert(cid, vec![WrappedKey { recipient_id: "rid".into(), wrapped_dek: vec![7; 80] }]);
+        wrapped.insert(
+            cid,
+            vec![WrappedKey {
+                recipient_id: "rid".into(),
+                wrapped_dek: vec![7; 80],
+            }],
+        );
         let prot = Protection {
             prefixes: vec![ProtectPrefix {
                 prefix: "secrets/".into(),
-                recipients: vec![RecipientEntry { key: [9u8; 32], epoch: 1, state: RecipientState::Granted }],
+                recipients: vec![RecipientEntry {
+                    key: [9u8; 32],
+                    epoch: 1,
+                    state: RecipientState::Granted,
+                }],
             }],
             wrapped,
         };
         let snap = Object::Snapshot(Snapshot {
-            root, parents: vec![], author: "a".into(), timestamp: 0, message: "m".into(),
-            secrets: std::collections::BTreeMap::new(), protection: prot,
+            root,
+            parents: vec![],
+            author: "a".into(),
+            timestamp: 0,
+            message: "m".into(),
+            secrets: std::collections::BTreeMap::new(),
+            protection: prot,
         });
         assert_eq!(snap, Object::decode(&snap.encode()).unwrap());
     }
@@ -687,8 +749,16 @@ mod tests {
     #[test]
     fn protection_recipients_order_independent_id() {
         let root = Object::blob(b"r".to_vec()).id();
-        let a = RecipientEntry { key: [1u8; 32], epoch: 1, state: RecipientState::Granted };
-        let b = RecipientEntry { key: [2u8; 32], epoch: 1, state: RecipientState::Granted };
+        let a = RecipientEntry {
+            key: [1u8; 32],
+            epoch: 1,
+            state: RecipientState::Granted,
+        };
+        let b = RecipientEntry {
+            key: [2u8; 32],
+            epoch: 1,
+            state: RecipientState::Granted,
+        };
         let snap = |recipients: Vec<RecipientEntry>| {
             Object::Snapshot(Snapshot {
                 root,
@@ -698,7 +768,10 @@ mod tests {
                 message: "m".into(),
                 secrets: std::collections::BTreeMap::new(),
                 protection: Protection {
-                    prefixes: vec![ProtectPrefix { prefix: "secrets/".into(), recipients }],
+                    prefixes: vec![ProtectPrefix {
+                        prefix: "secrets/".into(),
+                        recipients,
+                    }],
                     wrapped: std::collections::BTreeMap::new(),
                 },
             })
@@ -720,15 +793,25 @@ mod tests {
                 prefixes: vec![ProtectPrefix {
                     prefix: "secret/".into(),
                     recipients: vec![
-                        RecipientEntry { key: [2; 32], epoch: 3, state: RecipientState::Granted },
-                        RecipientEntry { key: [1; 32], epoch: 2, state: RecipientState::Revoked },
+                        RecipientEntry {
+                            key: [2; 32],
+                            epoch: 3,
+                            state: RecipientState::Granted,
+                        },
+                        RecipientEntry {
+                            key: [1; 32],
+                            epoch: 2,
+                            state: RecipientState::Revoked,
+                        },
                     ],
                 }],
                 wrapped: Default::default(),
             },
         };
         let bytes = Object::Snapshot(snap.clone()).encode();
-        let Object::Snapshot(back) = Object::decode(&bytes).unwrap() else { panic!("not a snapshot") };
+        let Object::Snapshot(back) = Object::decode(&bytes).unwrap() else {
+            panic!("not a snapshot")
+        };
         // Entries round-trip, sorted by key in the encoding.
         let rule = &back.protection.prefixes[0];
         assert_eq!(rule.recipients.len(), 2);
@@ -749,14 +832,25 @@ mod tests {
                 message: "m".into(),
                 secrets: Default::default(),
                 protection: Protection {
-                    prefixes: vec![ProtectPrefix { prefix: "secret/".into(), recipients: entries }],
+                    prefixes: vec![ProtectPrefix {
+                        prefix: "secret/".into(),
+                        recipients: entries,
+                    }],
                     wrapped: Default::default(),
                 },
             })
             .id()
         };
-        let e1 = RecipientEntry { key: [1; 32], epoch: 1, state: RecipientState::Granted };
-        let e2 = RecipientEntry { key: [2; 32], epoch: 2, state: RecipientState::Revoked };
+        let e1 = RecipientEntry {
+            key: [1; 32],
+            epoch: 1,
+            state: RecipientState::Granted,
+        };
+        let e2 = RecipientEntry {
+            key: [2; 32],
+            epoch: 2,
+            state: RecipientState::Revoked,
+        };
         assert_eq!(mk(vec![e1.clone(), e2.clone()]), mk(vec![e2, e1]));
     }
 
@@ -833,7 +927,10 @@ mod tests {
         // TAG_TREE: tag(1) + entry-count(u32, fabricated), no entries follow.
         let mut tree = vec![TAG_TREE];
         tree.extend_from_slice(&HUGE.to_be_bytes());
-        assert!(matches!(Object::decode(&tree), Err(Error::Malformed(_))), "tree");
+        assert!(
+            matches!(Object::decode(&tree), Err(Error::Malformed(_))),
+            "tree"
+        );
 
         // TAG_SNAPSHOT parents: tag(4) + root id(32) + parents-count(u32, fabricated).
         let mut snap_parents = vec![TAG_SNAPSHOT];
@@ -865,7 +962,10 @@ mod tests {
         secret.extend_from_slice(&0u32.to_be_bytes()); // nonce len
         secret.extend_from_slice(&0u32.to_be_bytes()); // ciphertext len
         secret.extend_from_slice(&HUGE.to_be_bytes()); // wrapped_keys count
-        assert!(matches!(Object::decode(&secret), Err(Error::Malformed(_))), "secret wrapped_keys");
+        assert!(
+            matches!(Object::decode(&secret), Err(Error::Malformed(_))),
+            "secret wrapped_keys"
+        );
     }
 
     #[test]
@@ -876,14 +976,20 @@ mod tests {
             session: "sess-42".into(),
             nonce: vec![1, 2, 3],
             ciphertext: vec![9, 8, 7, 6],
-            wrapped_keys: vec![WrappedKey { recipient_id: "rid".into(), wrapped_dek: vec![4, 5] }],
+            wrapped_keys: vec![WrappedKey {
+                recipient_id: "rid".into(),
+                wrapped_dek: vec![4, 5],
+            }],
         };
         let obj = Object::Transcript(t.clone());
         let bytes = obj.encode();
         let back = Object::decode(&bytes).unwrap();
         assert_eq!(back, obj);
         // id-stability: same content encodes byte-identically → same id.
-        assert_eq!(ObjectId::of(&bytes), ObjectId::of(&Object::Transcript(t).encode()));
+        assert_eq!(
+            ObjectId::of(&bytes),
+            ObjectId::of(&Object::Transcript(t).encode())
+        );
     }
 
     #[test]
@@ -902,7 +1008,10 @@ mod tests {
 
     #[test]
     fn granted_keys_next_epoch_set_standing() {
-        let mut rule = ProtectPrefix { prefix: "secret/".into(), recipients: vec![] };
+        let mut rule = ProtectPrefix {
+            prefix: "secret/".into(),
+            recipients: vec![],
+        };
         assert_eq!(rule.next_epoch(), 1);
         rule.set_standing([1; 32], 1, RecipientState::Granted);
         rule.set_standing([2; 32], 1, RecipientState::Granted);

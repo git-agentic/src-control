@@ -64,7 +64,10 @@ impl Repo {
                 match obj {
                     Object::Secret(s) => s,
                     _ => {
-                        skipped.push((format!("secret {name}"), "registry entry is not a secret".into()));
+                        skipped.push((
+                            format!("secret {name}"),
+                            "registry entry is not a secret".into(),
+                        ));
                         continue;
                     }
                 }
@@ -73,9 +76,15 @@ impl Repo {
             let mut targets: Vec<PublicKey> = Vec::new();
             let mut unresolvable = None;
             for w in &secret.wrapped_keys {
-                match known_keys.iter().find(|k| k.recipient_id().as_str() == w.recipient_id) {
+                match known_keys
+                    .iter()
+                    .find(|k| k.recipient_id().as_str() == w.recipient_id)
+                {
                     Some(pk) => {
-                        if !targets.iter().any(|t| t.recipient_id() == pk.recipient_id()) {
+                        if !targets
+                            .iter()
+                            .any(|t| t.recipient_id() == pk.recipient_id())
+                        {
                             targets.push(pk.clone());
                         }
                     }
@@ -96,7 +105,10 @@ impl Repo {
             let value = match scl_crypto::open(&secret, identity) {
                 Ok(v) => v,
                 Err(_) => {
-                    skipped.push((format!("secret {name}"), "identity cannot open this secret".into()));
+                    skipped.push((
+                        format!("secret {name}"),
+                        "identity cannot open this secret".into(),
+                    ));
                     continue;
                 }
             };
@@ -122,24 +134,34 @@ impl Repo {
                 continue;
             }
             let Some(rule) = crate::protect::matching_prefix(&protection, &path) else {
-                skipped.push((format!("path {path}"), "no governing rule (bit/rule mismatch)".into()));
+                skipped.push((
+                    format!("path {path}"),
+                    "no governing rule (bit/rule mismatch)".into(),
+                ));
                 continue;
             };
             let granted = rule.granted_keys();
             if granted.is_empty() {
                 skipped.push((
                     format!("path {path}"),
-                    "rule has no granted recipients (crossed revokes?); run `sc grant` first".into(),
+                    "rule has no granted recipients (crossed revokes?); run `sc grant` first"
+                        .into(),
                 ));
                 continue;
             }
             let Some(wks) = protection.wrapped.get(&blob_id) else {
-                skipped.push((format!("path {path}"), "no wrapped DEKs recorded for blob".into()));
+                skipped.push((
+                    format!("path {path}"),
+                    "no wrapped DEKs recorded for blob".into(),
+                ));
                 continue;
             };
             let my_id = identity.public().recipient_id().to_string();
             let Some(wk) = wks.iter().find(|w| w.recipient_id == my_id) else {
-                skipped.push((format!("path {path}"), "identity is not a recipient of this blob".into()));
+                skipped.push((
+                    format!("path {path}"),
+                    "identity is not a recipient of this blob".into(),
+                ));
                 continue;
             };
             let dek = match scl_crypto::unwrap_dek_with(wk, identity) {
@@ -161,7 +183,10 @@ impl Repo {
             let mut target_pks: Vec<PublicKey> =
                 granted.iter().map(|b| PublicKey::from_bytes(*b)).collect();
             for e in escrows {
-                if !target_pks.iter().any(|t| t.recipient_id() == e.recipient_id()) {
+                if !target_pks
+                    .iter()
+                    .any(|t| t.recipient_id() == e.recipient_id())
+                {
                     target_pks.push(e.clone());
                 }
             }
@@ -178,8 +203,15 @@ impl Repo {
         }
 
         // ---- Nothing to do / dry-run: report only. ----
-        if dry_run || (secrets_rewrapped.is_empty() && new_secret_objs.is_empty() && blobs_rewrapped == 0) {
-            return Ok(RewrapReport { secrets_rewrapped, blobs_rewrapped, skipped, commit: None });
+        if dry_run
+            || (secrets_rewrapped.is_empty() && new_secret_objs.is_empty() && blobs_rewrapped == 0)
+        {
+            return Ok(RewrapReport {
+                secrets_rewrapped,
+                blobs_rewrapped,
+                skipped,
+                commit: None,
+            });
         }
 
         // ---- One commit + one oplog record. ----
@@ -199,9 +231,21 @@ impl Repo {
             secrets_rewrapped.len(),
             blobs_rewrapped
         );
-        let id = self.commit_snapshot(snap.root, vec![tip], registry, protection, "system", &msg)?;
-        crate::oplog::record(self.layout(), "rewrap", &head, &head, &[(head.clone(), before, Some(id))])?;
-        Ok(RewrapReport { secrets_rewrapped, blobs_rewrapped, skipped, commit: Some(id) })
+        let id =
+            self.commit_snapshot(snap.root, vec![tip], registry, protection, "system", &msg)?;
+        crate::oplog::record(
+            self.layout(),
+            "rewrap",
+            &head,
+            &head,
+            &[(head.clone(), before, Some(id))],
+        )?;
+        Ok(RewrapReport {
+            secrets_rewrapped,
+            blobs_rewrapped,
+            skipped,
+            commit: Some(id),
+        })
     }
 }
 
@@ -223,12 +267,19 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_esc_sk, esc_pk) = scl_crypto::generate_keypair();
-        repo.secret_add("db-pass", b"hunter2", std::slice::from_ref(&alice_pk)).unwrap();
-        repo.secret_add("api-key", b"tok", std::slice::from_ref(&alice_pk)).unwrap();
+        repo.secret_add("db-pass", b"hunter2", std::slice::from_ref(&alice_pk))
+            .unwrap();
+        repo.secret_add("api-key", b"tok", std::slice::from_ref(&alice_pk))
+            .unwrap();
         let tip_before = repo.head_tip().unwrap().unwrap();
 
         let report = repo
-            .rewrap(&alice_sk, std::slice::from_ref(&esc_pk), std::slice::from_ref(&alice_pk), false)
+            .rewrap(
+                &alice_sk,
+                std::slice::from_ref(&esc_pk),
+                std::slice::from_ref(&alice_pk),
+                false,
+            )
             .unwrap();
         assert_eq!(report.secrets_rewrapped.len(), 2);
         assert!(report.skipped.is_empty());
@@ -259,7 +310,8 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
         repo.commit("me", "add").unwrap();
@@ -277,7 +329,9 @@ mod tests {
         let prot = repo.snapshot(&tip).unwrap().protection;
         let bob_id = bob_pk.recipient_id();
         assert!(
-            prot.wrapped.values().any(|wks| wks.iter().any(|w| w.recipient_id == bob_id.as_str())),
+            prot.wrapped
+                .values()
+                .any(|wks| wks.iter().any(|w| w.recipient_id == bob_id.as_str())),
             "test setup must reproduce the R1 re-attachment"
         );
 
@@ -291,7 +345,11 @@ mod tests {
         let commit = report.commit.unwrap();
         let snap = repo.snapshot(&commit).unwrap();
         assert!(
-            !snap.protection.wrapped.values().any(|wks| wks.iter().any(|w| w.recipient_id == bob_id.as_str())),
+            !snap
+                .protection
+                .wrapped
+                .values()
+                .any(|wks| wks.iter().any(|w| w.recipient_id == bob_id.as_str())),
             "rewrap must strip the revoked recipient's re-attached wrap"
         );
         assert_eq!(snap.root, repo.snapshot(&tip).unwrap().root);
@@ -306,8 +364,10 @@ mod tests {
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
         // One secret alice can open, one she cannot (bob-only).
-        repo.secret_add("mine", b"a", std::slice::from_ref(&alice_pk)).unwrap();
-        repo.secret_add("theirs", b"b", std::slice::from_ref(&bob_pk)).unwrap();
+        repo.secret_add("mine", b"a", std::slice::from_ref(&alice_pk))
+            .unwrap();
+        repo.secret_add("theirs", b"b", std::slice::from_ref(&bob_pk))
+            .unwrap();
 
         let known = [alice_pk.clone(), bob_pk.clone()];
         let report = repo.rewrap(&alice_sk, &[], &known, false).unwrap();
@@ -327,7 +387,8 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_ghost_sk, ghost_pk) = scl_crypto::generate_keypair();
-        repo.secret_add("shared", b"v", &[alice_pk.clone(), ghost_pk]).unwrap();
+        repo.secret_add("shared", b"v", &[alice_pk.clone(), ghost_pk])
+            .unwrap();
         // ghost's pubkey is NOT in the known pool.
         let report = repo
             .rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), false)
@@ -345,12 +406,22 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_e, esc_pk) = scl_crypto::generate_keypair();
-        repo.secret_add("s", b"v", std::slice::from_ref(&alice_pk)).unwrap();
+        repo.secret_add("s", b"v", std::slice::from_ref(&alice_pk))
+            .unwrap();
         let tip_before = repo.head_tip().unwrap();
         let report = repo
-            .rewrap(&alice_sk, std::slice::from_ref(&esc_pk), std::slice::from_ref(&alice_pk), true)
+            .rewrap(
+                &alice_sk,
+                std::slice::from_ref(&esc_pk),
+                std::slice::from_ref(&alice_pk),
+                true,
+            )
             .unwrap();
-        assert_eq!(report.secrets_rewrapped.len(), 1, "dry-run still REPORTS the work");
+        assert_eq!(
+            report.secrets_rewrapped.len(),
+            1,
+            "dry-run still REPORTS the work"
+        );
         assert!(report.commit.is_none());
         assert_eq!(repo.head_tip().unwrap(), tip_before, "tip must not move");
         drop(repo);
@@ -363,12 +434,22 @@ mod tests {
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
         let (_e, esc_pk) = scl_crypto::generate_keypair();
-        repo.secret_add("s", b"v", std::slice::from_ref(&alice_pk)).unwrap();
-        let tip_before = repo.head_tip().unwrap().unwrap();
-        repo.rewrap(&alice_sk, std::slice::from_ref(&esc_pk), std::slice::from_ref(&alice_pk), false)
+        repo.secret_add("s", b"v", std::slice::from_ref(&alice_pk))
             .unwrap();
+        let tip_before = repo.head_tip().unwrap().unwrap();
+        repo.rewrap(
+            &alice_sk,
+            std::slice::from_ref(&esc_pk),
+            std::slice::from_ref(&alice_pk),
+            false,
+        )
+        .unwrap();
         repo.undo().unwrap();
-        assert_eq!(repo.head_tip().unwrap().unwrap(), tip_before, "one undo reverts the whole rewrap");
+        assert_eq!(
+            repo.head_tip().unwrap().unwrap(),
+            tip_before,
+            "one undo reverts the whole rewrap"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -381,7 +462,8 @@ mod tests {
         let root = tmp_root("empty-rule");
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
-        repo.protect("secret/", std::slice::from_ref(&alice_pk), None).unwrap();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
         std::fs::create_dir_all(root.join("secret")).unwrap();
         std::fs::write(root.join("secret/db.txt"), b"x").unwrap();
         repo.commit("me", "add").unwrap();
@@ -395,15 +477,25 @@ mod tests {
                 e.state = scl_core::RecipientState::Revoked;
             }
         }
-        repo.commit_snapshot(snap.root, vec![tip], snap.secrets, snap.protection, "test", "empty rule")
-            .unwrap();
+        repo.commit_snapshot(
+            snap.root,
+            vec![tip],
+            snap.secrets,
+            snap.protection,
+            "test",
+            "empty rule",
+        )
+        .unwrap();
 
         let report = repo
             .rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), false)
             .unwrap();
         assert_eq!(report.blobs_rewrapped, 0);
         assert_eq!(report.skipped.len(), 1);
-        assert!(report.skipped[0].1.contains("sc grant"), "reason must point at sc grant");
+        assert!(
+            report.skipped[0].1.contains("sc grant"),
+            "reason must point at sc grant"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

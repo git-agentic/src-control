@@ -46,7 +46,9 @@ pub fn load(layout: &Layout) -> Result<Vec<TokenEntry>> {
 }
 
 fn save(layout: &Layout, tokens: &[TokenEntry]) -> Result<()> {
-    let file = TokenFile { tokens: tokens.to_vec() };
+    let file = TokenFile {
+        tokens: tokens.to_vec(),
+    };
     let text = toml::to_string(&file).map_err(|e| Error::BadConfig(e.to_string()))?;
     scl_core::fsutil::atomic_write_durable(&layout.serve_tokens_path(), text.as_bytes())?;
     Ok(())
@@ -57,7 +59,14 @@ fn save(layout: &Layout, tokens: &[TokenEntry]) -> Result<()> {
 pub fn generate(label: &str, scope: Scope) -> (String, TokenEntry) {
     let raw = format!("sct-{}", scl_crypto::random_hex(32));
     let hash = ObjectId::of(raw.as_bytes()).to_hex();
-    (raw, TokenEntry { label: label.to_string(), hash, scope })
+    (
+        raw,
+        TokenEntry {
+            label: label.to_string(),
+            hash,
+            scope,
+        },
+    )
 }
 
 /// Generate + persist a token, returning the raw value to show once. Errors if
@@ -81,7 +90,9 @@ pub fn remove(layout: &Layout, label: &str) -> Result<()> {
     let before = tokens.len();
     tokens.retain(|t| t.label != label);
     if tokens.len() == before {
-        return Err(Error::InvalidArgument(format!("no serve token with label: {label}")));
+        return Err(Error::InvalidArgument(format!(
+            "no serve token with label: {label}"
+        )));
     }
     save(layout, &tokens)
 }
@@ -98,7 +109,7 @@ pub fn verify(tokens: &[TokenEntry], presented: &str) -> Option<Scope> {
             .hash
             .parse::<ObjectId>()
             .ok()
-            .map_or(false, |stored| ct_eq(want.as_bytes(), stored.as_bytes()));
+            .is_some_and(|stored| ct_eq(want.as_bytes(), stored.as_bytes()));
         if ok {
             matched = Some(t.scope);
         }
@@ -125,7 +136,8 @@ mod tests {
     use crate::layout::Layout;
 
     fn tmp_layout(tag: &str) -> Layout {
-        let root = std::env::temp_dir().join(format!("scl-servetokens-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("scl-servetokens-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let layout = Layout::at(&root);
         std::fs::create_dir_all(&layout.dot_sc).unwrap();
@@ -151,7 +163,11 @@ mod tests {
         let tokens = load(&layout).unwrap();
         assert_eq!(verify(&tokens, &raw_ro), Some(Scope::Ro));
         assert_eq!(verify(&tokens, &raw_rw), Some(Scope::Rw));
-        assert_eq!(verify(&tokens, "sct-deadbeef"), None, "unknown token rejected");
+        assert_eq!(
+            verify(&tokens, "sct-deadbeef"),
+            None,
+            "unknown token rejected"
+        );
         assert_eq!(verify(&tokens, ""), None);
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
@@ -161,7 +177,10 @@ mod tests {
         let layout = tmp_layout("dup");
         add(&layout, "dup", Scope::Ro).unwrap();
         assert!(add(&layout, "dup", Scope::Rw).is_err(), "duplicate label");
-        assert!(remove(&layout, "nope").is_err(), "removing an absent label errors");
+        assert!(
+            remove(&layout, "nope").is_err(),
+            "removing an absent label errors"
+        );
         remove(&layout, "dup").unwrap();
         assert!(load(&layout).unwrap().is_empty());
         std::fs::remove_dir_all(&layout.root).unwrap();

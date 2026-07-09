@@ -401,12 +401,23 @@ pub(crate) fn three_way_files(
         }
     }
 
-    Ok(FileMerge { files, sidecars, conflicts, wrapped_carry })
+    Ok(FileMerge {
+        files,
+        sidecars,
+        conflicts,
+        wrapped_carry,
+    })
 }
 
 /// Shorthand for an unprotected [`MergedFile`].
 fn plain(path: String, mode: FileMode, bytes: Vec<u8>) -> MergedFile {
-    MergedFile { path, mode, bytes, perms: 0, needs_encrypt: false }
+    MergedFile {
+        path,
+        mode,
+        bytes,
+        perms: 0,
+        needs_encrypt: false,
+    }
 }
 
 /// Union of every wrap the given protections know for `id` (deduped by
@@ -442,7 +453,7 @@ fn plain_input(
         return Ok(scl_crypto::Zeroizing::new(bytes));
     }
     let sk = identity.ok_or_else(|| Error::ProtectedMergeNeedsIdentity(path.to_string()))?;
-    Ok(protect::decrypt_with(&bytes, &entry.0, prots, sk, path)?)
+    protect::decrypt_with(&bytes, &entry.0, prots, sk, path)
 }
 
 /// Three-way merge of two secret registries against base. A name changed
@@ -491,7 +502,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn snap(store: &mut Store, parents: Vec<ObjectId>, msg: &str) -> ObjectId {
-        let root = store.put(Object::Tree(scl_core::Tree::new(vec![]))).unwrap();
+        let root = store
+            .put(Object::Tree(scl_core::Tree::new(vec![])))
+            .unwrap();
         store
             .put(Object::Snapshot(scl_core::Snapshot {
                 root,
@@ -569,9 +582,25 @@ mod tests {
     #[test]
     fn clean_three_way_merges_disjoint_files_and_lines() {
         let repo = VfsRepo::new(Store::with_budget(1 << 20));
-        let base = commit_files(&repo, &[("shared.txt", "a\nb\nc\n"), ("only.txt", "keep\n")], vec![]);
-        let ours = commit_files(&repo, &[("shared.txt", "a\nB\nc\n"), ("only.txt", "keep\n"), ("ours.txt", "o\n")], vec![base]);
-        let theirs = commit_files(&repo, &[("shared.txt", "a\nb\nC\n"), ("only.txt", "keep\n")], vec![base]);
+        let base = commit_files(
+            &repo,
+            &[("shared.txt", "a\nb\nc\n"), ("only.txt", "keep\n")],
+            vec![],
+        );
+        let ours = commit_files(
+            &repo,
+            &[
+                ("shared.txt", "a\nB\nc\n"),
+                ("only.txt", "keep\n"),
+                ("ours.txt", "o\n"),
+            ],
+            vec![base],
+        );
+        let theirs = commit_files(
+            &repo,
+            &[("shared.txt", "a\nb\nC\n"), ("only.txt", "keep\n")],
+            vec![base],
+        );
         let arc = repo.store();
         let mut s = arc.lock().unwrap();
         let m = three_way(&mut s, base, ours, theirs, None).unwrap();
@@ -656,7 +685,11 @@ mod tests {
     #[test]
     fn both_deleted_is_clean_and_absent() {
         let repo = VfsRepo::new(Store::with_budget(1 << 20));
-        let base = commit_files(&repo, &[("f.txt", "a\nb\nc\n"), ("keep.txt", "k\n")], vec![]);
+        let base = commit_files(
+            &repo,
+            &[("f.txt", "a\nb\nc\n"), ("keep.txt", "k\n")],
+            vec![],
+        );
         // both sides delete f.txt
         let ours = commit_files(&repo, &[("keep.txt", "k\n")], vec![base]);
         let theirs = commit_files(&repo, &[("keep.txt", "k\n")], vec![base]);
@@ -670,10 +703,18 @@ mod tests {
     #[test]
     fn one_sided_delete_is_clean_and_absent() {
         let repo = VfsRepo::new(Store::with_budget(1 << 20));
-        let base = commit_files(&repo, &[("f.txt", "a\nb\nc\n"), ("keep.txt", "k\n")], vec![]);
+        let base = commit_files(
+            &repo,
+            &[("f.txt", "a\nb\nc\n"), ("keep.txt", "k\n")],
+            vec![],
+        );
         // ours deletes f.txt; theirs leaves it unchanged
         let ours = commit_files(&repo, &[("keep.txt", "k\n")], vec![base]);
-        let theirs = commit_files(&repo, &[("f.txt", "a\nb\nc\n"), ("keep.txt", "k\n")], vec![base]);
+        let theirs = commit_files(
+            &repo,
+            &[("f.txt", "a\nb\nc\n"), ("keep.txt", "k\n")],
+            vec![base],
+        );
         let arc = repo.store();
         let mut s = arc.lock().unwrap();
         let m = three_way(&mut s, base, ours, theirs, None).unwrap();
@@ -693,7 +734,11 @@ mod tests {
         let m = three_way(&mut s, base, ours, theirs, None).unwrap();
         assert_eq!(m.conflicts, vec!["b.bin"]);
         // sidecar with theirs' bytes
-        let sidecar = m.sidecars.iter().find(|(p, _)| p == "b.bin.theirs").unwrap();
+        let sidecar = m
+            .sidecars
+            .iter()
+            .find(|(p, _)| p == "b.bin.theirs")
+            .unwrap();
         assert_eq!(sidecar.1, vec![0x00, 0xff]);
         // file kept with ours' bytes
         let f = m.files.iter().find(|f| f.path == "b.bin").unwrap();
@@ -742,8 +787,11 @@ mod tests {
         // resolve by ciphertext-id equality — no identity, no decryption.
         let repo = VfsRepo::new(Store::with_budget(1 << 20));
         let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
-        let (mut bp, mut op, mut tp) =
-            (Protection::default(), Protection::default(), Protection::default());
+        let (mut bp, mut op, mut tp) = (
+            Protection::default(),
+            Protection::default(),
+            Protection::default(),
+        );
         let a1 = enc_file(&mut bp, &alice_pk, b"a1\n");
         let b1 = enc_file(&mut bp, &alice_pk, b"b1\n");
         let a2 = enc_file(&mut op, &alice_pk, b"a2\n");
@@ -752,15 +800,24 @@ mod tests {
         let b2 = enc_file(&mut tp, &alice_pk, b"b2\n");
         let base = tree_with_perms(
             &repo,
-            &[("secret/a.txt", a1, PROTECTED), ("secret/b.txt", b1, PROTECTED)],
+            &[
+                ("secret/a.txt", a1, PROTECTED),
+                ("secret/b.txt", b1, PROTECTED),
+            ],
         );
         let ours = tree_with_perms(
             &repo,
-            &[("secret/a.txt", a2.clone(), PROTECTED), ("secret/b.txt", b1_o, PROTECTED)],
+            &[
+                ("secret/a.txt", a2.clone(), PROTECTED),
+                ("secret/b.txt", b1_o, PROTECTED),
+            ],
         );
         let theirs = tree_with_perms(
             &repo,
-            &[("secret/a.txt", a1_t, PROTECTED), ("secret/b.txt", b2.clone(), PROTECTED)],
+            &[
+                ("secret/a.txt", a1_t, PROTECTED),
+                ("secret/b.txt", b2.clone(), PROTECTED),
+            ],
         );
         let arc = repo.store();
         let mut s = arc.lock().unwrap();
@@ -775,8 +832,14 @@ mod tests {
         assert!(fm.files.iter().all(|f| f.perms & PROTECTED != 0));
         let a2_id = Object::blob(a2).id();
         let b2_id = Object::blob(b2).id();
-        assert!(fm.wrapped_carry.contains_key(&a2_id), "surviving a.txt blob's wraps carried");
-        assert!(fm.wrapped_carry.contains_key(&b2_id), "surviving b.txt blob's wraps carried");
+        assert!(
+            fm.wrapped_carry.contains_key(&a2_id),
+            "surviving a.txt blob's wraps carried"
+        );
+        assert!(
+            fm.wrapped_carry.contains_key(&b2_id),
+            "surviving b.txt blob's wraps carried"
+        );
     }
 
     /// Fixture for the content-divergent cases: secret/a.txt protected on all
@@ -786,10 +849,18 @@ mod tests {
         base_c: &[u8],
         ours_c: &[u8],
         theirs_c: &[u8],
-    ) -> (VfsRepo, (ObjectId, Protection), (ObjectId, Protection), (ObjectId, Protection)) {
+    ) -> (
+        VfsRepo,
+        (ObjectId, Protection),
+        (ObjectId, Protection),
+        (ObjectId, Protection),
+    ) {
         let repo = VfsRepo::new(Store::with_budget(1 << 20));
-        let (mut bp, mut op, mut tp) =
-            (Protection::default(), Protection::default(), Protection::default());
+        let (mut bp, mut op, mut tp) = (
+            Protection::default(),
+            Protection::default(),
+            Protection::default(),
+        );
         let cb = enc_file(&mut bp, pk, base_c);
         let co = enc_file(&mut op, pk, ours_c);
         let ct = enc_file(&mut tp, pk, theirs_c);
@@ -838,7 +909,10 @@ mod tests {
         assert_eq!(fm.files.len(), 1);
         let f = &fm.files[0];
         assert_eq!(f.path, "secret/a.txt");
-        assert!(f.needs_encrypt, "content merge outputs plaintext pending re-encryption");
+        assert!(
+            f.needs_encrypt,
+            "content merge outputs plaintext pending re-encryption"
+        );
         assert!(f.perms & PROTECTED != 0);
         assert_eq!(f.bytes, b"L1\nl2\nL3\n", "both edits present in plaintext");
     }
@@ -867,7 +941,10 @@ mod tests {
         let f = fm.files.iter().find(|f| f.path == "secret/a.txt").unwrap();
         let text = String::from_utf8_lossy(&f.bytes);
         assert!(text.contains("<<<<<<<"), "markers present: {text}");
-        assert!(text.contains("OURS") && text.contains("THEIRS"), "both plaintexts: {text}");
+        assert!(
+            text.contains("OURS") && text.contains("THEIRS"),
+            "both plaintexts: {text}"
+        );
         assert!(f.needs_encrypt);
     }
 
@@ -929,14 +1006,27 @@ mod tests {
         let mut bp = Protection::default();
         let (op, tp) = (Protection::default(), Protection::default());
         let cb = enc_file(&mut bp, &alice_pk, b"secret\n");
-        let base = tree_with_perms(&repo, &[("f.txt", cb, PROTECTED), ("keep.txt", b"k\n".to_vec(), 0)]);
-        let ours = tree_with_perms(&repo, &[("f.txt", b"public\n".to_vec(), 0), ("keep.txt", b"k\n".to_vec(), 0)]);
+        let base = tree_with_perms(
+            &repo,
+            &[("f.txt", cb, PROTECTED), ("keep.txt", b"k\n".to_vec(), 0)],
+        );
+        let ours = tree_with_perms(
+            &repo,
+            &[
+                ("f.txt", b"public\n".to_vec(), 0),
+                ("keep.txt", b"k\n".to_vec(), 0),
+            ],
+        );
         let theirs = tree_with_perms(&repo, &[("keep.txt", b"k\n".to_vec(), 0)]);
         let arc = repo.store();
         let mut s = arc.lock().unwrap();
         let fm =
             three_way_files(&mut s, Some((base, &bp)), (ours, &op), (theirs, &tp), None).unwrap();
-        assert_eq!(fm.conflicts, vec!["f.txt"], "delete-vs-modify still conflicts");
+        assert_eq!(
+            fm.conflicts,
+            vec!["f.txt"],
+            "delete-vs-modify still conflicts"
+        );
         let f = fm.files.iter().find(|f| f.path == "f.txt").unwrap();
         assert_eq!(f.bytes, b"public\n", "plain survivor kept as-is");
         assert_eq!(f.perms, 0);
@@ -962,7 +1052,10 @@ mod tests {
         // Without an identity the base can't be decrypted for the ancestor.
         let err = three_way_files(&mut s, Some((base, &bp)), (ours, &op), (theirs, &tp), None)
             .unwrap_err();
-        assert!(matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "f.txt"), "got {err:?}");
+        assert!(
+            matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "f.txt"),
+            "got {err:?}"
+        );
         // With one, the merge is clean against the true ancestor and PLAIN.
         let fm = three_way_files(
             &mut s,
@@ -975,7 +1068,10 @@ mod tests {
         assert!(fm.conflicts.is_empty());
         let f = fm.files.iter().find(|f| f.path == "f.txt").unwrap();
         assert_eq!(f.bytes, b"L1\nl2\nL3\n");
-        assert_eq!(f.perms, 0, "both sides removed the rule — output stays plain");
+        assert_eq!(
+            f.perms, 0,
+            "both sides removed the rule — output stays plain"
+        );
         assert!(!f.needs_encrypt);
     }
 
@@ -991,15 +1087,30 @@ mod tests {
         let tp = Protection::default();
         let cb = enc_file(&mut bp, &alice_pk, b"v1\n");
         let co = enc_file(&mut op, &alice_pk, b"v2\n");
-        let base = tree_with_perms(&repo, &[("secret/f", cb, PROTECTED), ("keep.txt", b"k\n".to_vec(), 0)]);
-        let ours = tree_with_perms(&repo, &[("secret/f", co, PROTECTED), ("keep.txt", b"k\n".to_vec(), 0)]);
+        let base = tree_with_perms(
+            &repo,
+            &[
+                ("secret/f", cb, PROTECTED),
+                ("keep.txt", b"k\n".to_vec(), 0),
+            ],
+        );
+        let ours = tree_with_perms(
+            &repo,
+            &[
+                ("secret/f", co, PROTECTED),
+                ("keep.txt", b"k\n".to_vec(), 0),
+            ],
+        );
         let theirs = tree_with_perms(&repo, &[("keep.txt", b"k\n".to_vec(), 0)]);
         let arc = repo.store();
         let mut s = arc.lock().unwrap();
         // Keyless: the protected survivor can't be decrypted.
         let err = three_way_files(&mut s, Some((base, &bp)), (ours, &op), (theirs, &tp), None)
             .unwrap_err();
-        assert!(matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "secret/f"), "got {err:?}");
+        assert!(
+            matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "secret/f"),
+            "got {err:?}"
+        );
         // With identity: conflict marked, survivor in plaintext, needs_encrypt.
         let fm = three_way_files(
             &mut s,
@@ -1038,7 +1149,11 @@ mod tests {
             three_way_files(&mut s, Some((root, &bp)), (root, &op), (root, &tp), None).unwrap();
         assert!(fm.conflicts.is_empty());
         let wraps = &fm.wrapped_carry[&Object::blob(ct).id()];
-        assert_eq!(wraps.len(), 2, "alice's wrap deduped, bob's grant unioned in");
+        assert_eq!(
+            wraps.len(),
+            2,
+            "alice's wrap deduped, bob's grant unioned in"
+        );
         let alice_id = alice_pk.recipient_id().to_string();
         let bob_id = bob_pk.recipient_id().to_string();
         assert!(wraps.iter().any(|w| w.recipient_id == alice_id));
@@ -1060,7 +1175,10 @@ mod tests {
         let arc = repo.store();
         let mut s = arc.lock().unwrap();
         let err = three_way_files(&mut s, None, (ours, &op), (theirs, &tp), None).unwrap_err();
-        assert!(matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "x.txt"), "got {err:?}");
+        assert!(
+            matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "x.txt"),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1081,7 +1199,10 @@ mod tests {
             three_way_files(&mut s, None, (ours, &op), (theirs, &tp), Some(&alice_sk)).unwrap();
         assert!(fm.conflicts.is_empty());
         let f = fm.files.iter().find(|f| f.path == "x.txt").unwrap();
-        assert!(f.perms & PROTECTED != 0, "protection wins the perms divergence");
+        assert!(
+            f.perms & PROTECTED != 0,
+            "protection wins the perms divergence"
+        );
         assert!(f.needs_encrypt);
         assert_eq!(f.bytes, b"hello\n");
     }
@@ -1098,7 +1219,11 @@ mod tests {
         );
         let ours = commit_files(
             &repo,
-            &[("shared.txt", "a\nB\nc\n"), ("only.txt", "keep\n"), ("ours.txt", "o\n")],
+            &[
+                ("shared.txt", "a\nB\nc\n"),
+                ("only.txt", "keep\n"),
+                ("ours.txt", "o\n"),
+            ],
             vec![base],
         );
         let theirs = commit_files(
@@ -1111,14 +1236,21 @@ mod tests {
         let m = three_way(&mut s, base, ours, theirs, None).unwrap();
         assert!(m.conflicts.is_empty());
         // Exact captured outcome: paths, modes, bytes — and no protected residue.
-        let got: Vec<(String, FileMode, Vec<u8>)> =
-            m.files.iter().map(|f| (f.path.clone(), f.mode, f.bytes.clone())).collect();
+        let got: Vec<(String, FileMode, Vec<u8>)> = m
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.mode, f.bytes.clone()))
+            .collect();
         assert_eq!(
             got,
             vec![
                 ("only.txt".to_string(), FileMode::FILE, b"keep\n".to_vec()),
                 ("ours.txt".to_string(), FileMode::FILE, b"o\n".to_vec()),
-                ("shared.txt".to_string(), FileMode::FILE, b"a\nB\nC\n".to_vec()),
+                (
+                    "shared.txt".to_string(),
+                    FileMode::FILE,
+                    b"a\nB\nC\n".to_vec()
+                ),
             ]
         );
         assert!(m.files.iter().all(|f| !f.needs_encrypt && f.perms == 0));
