@@ -33,6 +33,7 @@ pub mod signatures;
 pub mod sparse;
 pub mod stdio_transport;
 pub mod sync;
+pub mod transcripts;
 pub mod transport;
 pub mod wire;
 pub(crate) mod ws;

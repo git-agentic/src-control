@@ -78,6 +78,12 @@ impl Layout {
     pub fn sparse_path(&self) -> PathBuf {
         self.dot_sc.join("sparse")
     }
+    /// `.sc/transcripts` — the append-only snapshot->transcript index (P30):
+    /// one `<snapshot-hex> <transcript-hex>` line per attachment
+    /// (one-to-many — a snapshot can have multiple transcripts).
+    pub fn transcripts_path(&self) -> PathBuf {
+        self.dot_sc.join("transcripts")
+    }
     /// `.sc/tmp` — scratch space for transient files (P25 streaming pack
     /// transfer: spilled sender/receiver pack bodies). Never durable state —
     /// safe to delete at any time; callers that write here are responsible

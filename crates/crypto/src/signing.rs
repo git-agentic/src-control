@@ -37,6 +37,7 @@ use crate::key::SecretKey;
 const ID_PREFIX: &str = "scl-id-";
 const SIG_PUB_PREFIX: &str = "scl-sig-";
 const SIG_DOMAIN: &[u8] = b"sc-snapshot-sig-v1";
+const TRANSCRIPT_SIG_DOMAIN: &[u8] = b"sc-transcript-sig-v1";
 const ENC_INFO: &[u8] = b"scl-id-v2-enc";
 const SIG_INFO: &[u8] = b"scl-id-v2-sig";
 
@@ -146,29 +147,55 @@ pub fn generate_identity_v2() -> (String, Identity) {
     (s, identity)
 }
 
-/// Sign a snapshot id under the domain-separated message
-/// `"sc-snapshot-sig-v1" || id`.
-pub fn sign_snapshot_id(key: &SigningKey, id: &[u8; 32]) -> [u8; 64] {
-    let mut message = Vec::with_capacity(SIG_DOMAIN.len() + id.len());
-    message.extend_from_slice(SIG_DOMAIN);
+/// Sign `id` under `domain`, producing the domain-separated message
+/// `domain || id`. Shared body for both the snapshot and transcript signing
+/// domains — the only difference between them is which domain constant is
+/// passed in.
+fn sign_id(domain: &[u8], key: &SigningKey, id: &[u8; 32]) -> [u8; 64] {
+    let mut message = Vec::with_capacity(domain.len() + id.len());
+    message.extend_from_slice(domain);
     message.extend_from_slice(id);
     key.0.sign(&message).to_bytes()
 }
 
-/// Verify a domain-separated snapshot-id signature. Returns `false` on a
+/// Verify a domain-separated signature over `id`. Returns `false` on a
 /// malformed signer key (bad Ed25519 point) as well as on a genuine
 /// verification failure — callers only need one "not valid" outcome.
-pub fn verify_snapshot_sig(signer: &[u8; 32], id: &[u8; 32], sig: &[u8; 64]) -> bool {
+fn verify_id(domain: &[u8], signer: &[u8; 32], id: &[u8; 32], sig: &[u8; 64]) -> bool {
     let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(signer) else {
         return false;
     };
     let signature = ed25519_dalek::Signature::from_bytes(sig);
 
-    let mut message = Vec::with_capacity(SIG_DOMAIN.len() + id.len());
-    message.extend_from_slice(SIG_DOMAIN);
+    let mut message = Vec::with_capacity(domain.len() + id.len());
+    message.extend_from_slice(domain);
     message.extend_from_slice(id);
 
     vk.verify_strict(&message, &signature).is_ok()
+}
+
+/// Sign a snapshot id under the domain-separated message
+/// `"sc-snapshot-sig-v1" || id`.
+pub fn sign_snapshot_id(key: &SigningKey, id: &[u8; 32]) -> [u8; 64] {
+    sign_id(SIG_DOMAIN, key, id)
+}
+
+/// Verify a domain-separated snapshot-id signature.
+pub fn verify_snapshot_sig(signer: &[u8; 32], id: &[u8; 32], sig: &[u8; 64]) -> bool {
+    verify_id(SIG_DOMAIN, signer, id, sig)
+}
+
+/// Sign a transcript id under the domain-separated message
+/// `"sc-transcript-sig-v1" || id` — a distinct domain from
+/// [`sign_snapshot_id`], so a transcript signature can never be replayed as
+/// if it covered a snapshot id (or vice versa).
+pub fn sign_transcript_id(key: &SigningKey, id: &[u8; 32]) -> [u8; 64] {
+    sign_id(TRANSCRIPT_SIG_DOMAIN, key, id)
+}
+
+/// Verify a domain-separated transcript-id signature.
+pub fn verify_transcript_sig(signer: &[u8; 32], id: &[u8; 32], sig: &[u8; 64]) -> bool {
+    verify_id(TRANSCRIPT_SIG_DOMAIN, signer, id, sig)
 }
 
 #[cfg(test)]
@@ -243,6 +270,18 @@ mod tests {
         // No regression: from_key_string still works unchanged on the same string.
         let back = SecretKey::from_key_string(&s).unwrap();
         assert_eq!(back.public().to_bytes(), sk.public().to_bytes());
+    }
+
+    #[test]
+    fn transcript_domain_is_separated_from_snapshot_domain() {
+        let (_s, id) = generate_identity_v2();
+        let sk = id.signing.as_ref().unwrap();
+        let idb = [7u8; 32];
+        let tsig = sign_transcript_id(sk, &idb);
+        // A transcript signature verifies under the transcript domain,
+        assert!(verify_transcript_sig(&sk.public().to_bytes(), &idb, &tsig));
+        // but NOT under the snapshot domain (domain separation).
+        assert!(!verify_snapshot_sig(&sk.public().to_bytes(), &idb, &tsig));
     }
 
     #[test]

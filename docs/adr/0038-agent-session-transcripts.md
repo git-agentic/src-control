@@ -1,9 +1,8 @@
 # ADR-0038: Agent session transcripts as CAS objects
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-09
-- **Phase:** P30 (candidate — after P29 sc+http access control closes the security horizon;
-  slot decided in the brainstorm, D7)
+- **Phase:** 30
 - **Builds on:** ADR-0002 (content addressing), ADR-0008/0010 (envelope
   encryption), ADR-0017 (secret scanner), ADR-0023/0030 (agent
   workspaces/sessions), ADR-0032 (side-metadata CAS-object pattern)
@@ -59,8 +58,9 @@ worthless and prompts are precisely the guessable content the convergent
 confirmation-attack caveat excludes. Plaintext transcripts never enter
 the CAS, so an unauthorized or public clone carries ciphertext only —
 Entire's visibility-inheritance problem cannot occur by construction.
-Recipient set comes from a `[transcripts]` section in `recipients.toml`
-(default: full recipient set + escrow). Before sealing, the P5 scanner
+Recipient set is the full `[recipients]` set + escrow from `recipients.toml`
+(sealing to the whole recipient pool, not a caller-chosen subset — there is no
+separate `[transcripts]` section and no `--to` flag in the MVP). Before sealing, the P5 scanner
 runs over the plaintext and **warns** (never rejects — the body is
 sealed, and refusing to record would destroy provenance because an agent
 echoed a credential); redaction is defense-in-depth, not the boundary.
@@ -79,10 +79,11 @@ from day one rather than rediscovering it. `sc clone` reindexes from a
 full post-copy object scan. Git boundary drops transcripts with a
 `transcripts_dropped` count (signatures precedent).
 
-Surface: `sc ws harvest --transcript <path|auto>` attaches a workspace's
-session transcript to the snapshot its landing produced (`auto` probes
-well-known agent transcript locations relative to the checkout);
-retroactive `sc transcript attach <ref> <file> [--agent <name>]`;
+Surface: `sc ws harvest --transcript <path>` attaches a workspace's
+session transcript to the snapshot its landing produced (`--transcript auto`
+probing of well-known agent transcript locations is deferred — see the
+Brainstorm-resolution note above); retroactive
+`sc transcript attach <ref> <file> [--agent <name>] [--sign]`;
 `sc transcript show <ref> [--identity <key>]` and `sc transcript list`;
 `sc log` gains a presence marker beside the signature marker (index-only,
 status precomputed for the whole history before printing — the P22
@@ -140,8 +141,10 @@ pipe-safety discipline).
   always); loss of agent context at harvest; transcripts outliving the
   history they describe (gc-coupled index).
 - **Does NOT defend:** a fabricated transcript attached by an authorized
-  writer (attachment is a claim; signing transcript ids — a
-  `"sc-transcript-sig-v1"` domain — is the natural extension, spec
-  decision); secrets echoed into a transcript remaining readable to
+  writer — attachment alone is a claim. Opt-in signing (`sc transcript
+  --sign` / `sc transcript sign`, over the `"sc-transcript-sig-v1"` domain)
+  upgrades it to an *attested* claim binding a specific identity, but an
+  unsigned transcript from an authorized writer is still just a claim.
+  Also does not defend: secrets echoed into a transcript remaining readable to
   *authorized* transcript recipients (scan-and-warn mitigates, rotation
   remedies); content quality or truthfulness of the recorded session.

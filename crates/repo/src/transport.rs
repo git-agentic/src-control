@@ -149,7 +149,27 @@ impl LocalTransport {
         // transfer-relevant snapshot, never subtract any of them from
         // `have_set`.
         let all_snaps: Vec<ObjectId> = want_set.iter().chain(have_set.iter()).copied().collect();
-        want_set.extend(crate::signatures::indexed_signature_ids_for(&self.layout, &all_snaps)?);
+        // Sender seam (P30 Task 4, mirroring the signature over-send
+        // verbatim): a Transcript is likewise a leaf referenced by no
+        // tree/snapshot, so it has to be pulled in explicitly via the
+        // `.sc/transcripts` index. Compute these BEFORE the signature
+        // over-send below — a transcript's own signature lives in the
+        // SHARED `.sc/signatures` index keyed by the transcript's own id
+        // (not the snapshot's), so `indexed_signature_ids_for` must be
+        // queried over snapshots AND transcript ids together, or a signed
+        // transcript's signature never crosses the wire (review-caught: an
+        // earlier draft queried signatures over `all_snaps` alone, so a
+        // `sc transcript attach --sign` survived clone/fetch/push as an
+        // object but landed `Unsigned` on the far side).
+        let transcript_ids =
+            crate::transcripts::indexed_transcript_ids_for(&self.layout, &all_snaps)?;
+        let sig_targets: Vec<ObjectId> =
+            all_snaps.iter().chain(transcript_ids.iter()).copied().collect();
+        want_set.extend(crate::signatures::indexed_signature_ids_for(&self.layout, &sig_targets)?);
+        // Over-send every indexed transcript covering any transfer-relevant
+        // snapshot; never subtract any of them from `have_set` — the
+        // has-gated filter below still applies.
+        want_set.extend(transcript_ids);
 
         let ids: Vec<ObjectId> =
             want_set.into_iter().filter(|id| !have_set.contains(id)).collect();
@@ -299,6 +319,9 @@ pub(crate) fn ingest_pack_file(
     // Receiver seam (P22 Task 3): every id above was just written to this
     // store, so `index_incoming`'s "ids just written" contract holds.
     crate::signatures::index_incoming(layout, store, &ids)?;
+    // Receiver seam (P30 Task 4): same "ids just written" contract, for
+    // Transcript objects.
+    crate::transcripts::index_incoming(layout, store, &ids)?;
     Ok(ids)
 }
 

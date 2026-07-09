@@ -433,11 +433,52 @@ across every phase.
   anywhere — the P26/ssh/streaming demos stay green unchanged. Closes the
   security horizon (P28 + P29). (ADR-0040.)
 
+- **Phase 30 — agent session transcripts.** The opening move of the
+  agent/workspace-depth horizon: a `Transcript { snapshot, agent, session,
+  nonce, ciphertext, wrapped_keys }` CAS object (`TAG_TRANSCRIPT`,
+  bytes-only in `crates/core` — the crypto quarantine holds) lets `sc
+  transcript attach <ref> <file> [--agent <name>] [--sign] [--identity
+  <key>]` seal an agent-session body to a commit's tip snapshot, reusing
+  `scl_crypto::seal`/`open` verbatim (a fresh per-attach DEK wrapped per
+  recipient, `TAG_SECRET` shape) so plaintext never enters the CAS — a
+  keyless clone gets ciphertext only. A one-to-many `.sc/transcripts`
+  index (snapshot → transcript ids) means `amend`/`rebase`/`merge` start a
+  new snapshot with none attached — no silent carry-forward of stale
+  provenance. Signing is opt-in (`sc transcript sign`/`--sign` at attach)
+  under a `"sc-transcript-sig-v1"` domain, sharing P22's `SignatureObj` and
+  `.sc/signatures` index verbatim — no second index, no format change —
+  with the same four-state trust precedence. Transfer needed zero wire
+  changes: the sender over-sends indexed transcript ids into the want-set
+  (has-gated) and the receiver reindexes idempotently, adopting the P22
+  refetch-fix discipline; a final-review Critical caught that the SAME
+  discipline had a gap of its own — a transcript's own signature is keyed
+  by the transcript's id, not its snapshot's, so the original over-send
+  (queried over snapshot ids alone) silently dropped a signed transcript's
+  signature on clone/fetch/push, landing it `Unsigned` on the far side.
+  Fixed by folding transcript ids into the signature query at both sender
+  seams (`get_pack`, `push`), pinned by a new regression test. `sc gc`
+  roots live transcript ids BEFORE `signatures::gc_prune` runs (the same
+  ordering discipline P22's signature index needed), so a signed
+  transcript's signature survives exactly when the transcript itself does;
+  a transcript whose only snapshot goes unreachable is pruned with it. `sc
+  export --to <git-repo>` drops transcripts (no Git-native form) and
+  reports a `transcripts_dropped` count. `sc ws harvest --transcript <path>
+  [--sign]` attaches one transcript per landed workspace. `sc log` renders
+  an index-only presence marker (`transcript: N` / `transcript: N ✓`) that
+  never decrypts. Accepted boundaries: the body is opaque (no schema,
+  agent-agnostic); sealed-by-default (no plaintext-transcript escape
+  hatch); no access-lifecycle (rewrap/grant/revoke) and no deletion in the
+  MVP. Proven by `demo/run_transcript_demo.sh`: attach + sign, a plain `sc
+  clone` carrying the transcript, a wrong-identity `sc transcript show`
+  failing closed on ciphertext while the right identity decrypts the exact
+  body bytes, the `sc log` marker, and `sc gc` pruning a deleted branch's
+  transcript while the still-reachable one survives — run twice, zero
+  residue. No new dependency. (ADR-0038.)
+
 ## Active
 
-**None.** The security horizon (P28 + P29) is complete; the next horizon
-(agent/workspace depth, anchored by P30 session transcripts, ADR-0038) is
-next up.
+**None.** The agent/workspace-depth horizon opened by P30 is complete; the
+next horizon is TBD.
 
 ## Completed phases (usability-first ordering)
 
@@ -469,6 +510,7 @@ next up.
 | **P27 — Partial clone** | Bound network transfer to a subset of paths, not the whole repo | `sc clone --filter <prefix…> <src> <dst>` fetches only in-filter objects (`.sc/promisor` + filtered reachability walk); `sc backfill <prefix…>` widens on demand; `sc gc`/`sc verify` are gap-tolerant; merge/rebase/`ws harvest`/`sc work`/`sc export` refuse on a partial clone; proven by `demo/run_partial_clone_demo.sh` (fewer objects fetched, push composes after a partial-clone commit, backfill shrinks the gap count, gc preserves everything, run twice) | [0037](docs/adr/0037-partial-clone.md) |
 | **P28 — Security hardening sweep** | Close the audit's concrete-bug Highs + surface the accepted Mediums | strict ref-name validation at the write/read boundary (hostile wire `UpdateRef` + git-remote branch names rejected); `MAX_OBJECT_SIZE` caps every untrusted frame/pack-record/zstd-output length; `sc protect` nudges low-entropy secret filenames toward `sc secret`; secret env-var boundary documented as authorized-local-process-context + plaintext stays `Zeroizing`; every prior demo green + new pinned regression tests, no new dependency | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | **P29 — sc+http access control** | Close the audit's remaining unauthenticated-server High | fail-closed non-loopback bind; `sc serve token add/remove/list` + `SC_HTTP_TOKEN` bearer auth at the HTTP opening (constant-time `BLAKE3` compare, `401` before the wire handoff); `--read-only`/`ro`-scope tokens reject mutating verbs before any store write via `EC_READONLY`; proven by `demo/run_http_auth_demo.sh` | [0040](docs/adr/0040-sc-http-access-control.md) |
+| **P30 — Agent session transcripts** | Attach a sealed, provenance-checked agent-session record to a commit | `sc transcript attach <ref> <file> --agent claude --sign`; a keyless clone gets ciphertext only, the recipient's identity decrypts byte-exact; `sc log` shows a non-decrypting presence marker; `sc gc` prunes a transcript once its only snapshot is unreachable; proven by `demo/run_transcript_demo.sh` | [0038](docs/adr/0038-agent-session-transcripts.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -679,6 +721,44 @@ scale-&-reach horizon):
   checks `.sc/` presence before the bearer-auth gate, so an unauthenticated
   client can distinguish "repo here, need a token" (401) from "no repo here"
   (404) — a minor information leak, not a read/write bypass. Deferred.
+- **`--transcript auto` probing (P30).** `sc ws harvest --transcript
+  <path>` requires an explicit path today; auto-discovering a
+  conventional transcript location (e.g. an agent-runner-written temp
+  file) per workspace is deferred.
+- **`sc transcript drop` + resurrection tombstone (P30).** There is no
+  command to remove an attached transcript short of gc-by-unreachability;
+  a first-class drop with a tombstone (so a later merge of a pre-drop
+  branch can't silently resurrect it, mirroring P16's revocation
+  tombstones) is deferred.
+- **Transcript access lifecycle (P30).** Transcripts have no
+  rewrap/grant/revoke surface — sealed once, to the recipient set at
+  attach time, permanently. Extending P17's rewrap and P16's
+  grant/revoke machinery to transcripts is deferred.
+- **`--no-transcripts` transfer knob (P30).** `fetch`/`clone`/`push`
+  always carry every indexed transcript covering a transferred snapshot;
+  an opt-out for bandwidth- or exposure-sensitive transfers is deferred.
+- **`sc export --transcripts=entire` (P30).** Git export unconditionally
+  drops transcripts (reported via `transcripts_dropped`); an opt-in mode
+  that carries them as detached Git notes or a sidecar format is
+  deferred.
+- **Per-turn live checkpointing (P30).** `sc transcript attach` is a
+  whole-session, after-the-fact seal; incremental per-turn attachment
+  during a live agent session (rather than one file at the end) is
+  deferred.
+- **P30 review follow-ons.** The final-review pass that caught the
+  transcript-signature transfer Critical (see the Phase 30 entry above)
+  also named four small non-blocking items, deferred rather than
+  silently dropped: threading `--transcript`/`--sign` through
+  `Repo::ws_harvest` itself instead of the current CLI-side post-harvest
+  seam in `main.rs`; `sc transcript list` with no `<ref>` walking the
+  full DAG (every parent) rather than only the first-parent mainline
+  `sc log` follows, so a transcript attached on a merged-in side branch
+  can go unlisted; a `transcripts_ride_ssh_transport` wire-harness test
+  twin of the local-transport transfer tests, since the ssh:// path is
+  exercised only by the local `Repo::clone_to`/`fetch`/`push` tests
+  today; and a one-line fix to `SignatureObj.snapshot`'s now-stale doc
+  comment, which still describes the field as always a snapshot id even
+  though signing a transcript stores a transcript id there instead.
 
 ## How a phase gets built
 

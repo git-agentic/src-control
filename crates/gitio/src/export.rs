@@ -315,6 +315,15 @@ pub struct ExportReport {
     /// (unlike secret names) two signers signing the same snapshot are two
     /// genuinely distinct dropped signatures, not the same one repeated.
     pub signatures_dropped: usize,
+    /// Number of P30 session-transcript objects dropped from history (Git
+    /// has no native equivalent for a sealed transcript attached to an sc
+    /// snapshot, so transcripts are silently absent from the exported Git
+    /// history, counted here like `signatures_dropped`). Counts every
+    /// `Object::Transcript` in the store whose `snapshot` field is one of
+    /// the exported DAG's snapshot ids — not deduped, since multiple
+    /// transcripts can legitimately attach to the same snapshot (e.g.
+    /// multiple agents).
+    pub transcripts_dropped: usize,
     /// Commits written *this call* as `(git_oid_hex, sc_id)`, for the caller to
     /// persist into the marks map. Excludes reused (already-known) commits.
     pub new_marks: Vec<(String, ObjectId)>,
@@ -385,6 +394,27 @@ fn count_signatures(
     Ok(count)
 }
 
+/// Count P30 `Object::Transcript` objects covering any snapshot in
+/// `seen_snaps` (the exported DAG). Same non-reachability, CAS-only scan as
+/// `count_signatures` — a `Transcript` is likewise referenced by no
+/// tree/parent, and `gitio` cannot read the repo-side `.sc/transcripts`
+/// index directly (the dependency rule is `repo -> gitio`, not the
+/// reverse).
+fn count_transcripts(
+    store: &mut Store,
+    seen_snaps: &std::collections::HashSet<ObjectId>,
+) -> anyhow::Result<usize> {
+    let mut count = 0;
+    for id in store.all_ids()? {
+        if let Object::Transcript(t) = store.get(&id)? {
+            if seen_snaps.contains(&t.snapshot) {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Record PROTECTED entry paths under `prefix`, recursing into subtrees. Uses an
 /// explicit stack so deep trees can't overflow. Deduplicates subtree object ids
 /// via `seen` so shared subtrees (identical content at multiple paths in a
@@ -431,6 +461,9 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
     // a dropped signature is a provenance-completeness loss, not a
     // confidentiality one) — always counted, exported or not.
     let signatures_dropped = count_signatures(store, &seen_snaps)?;
+    // Same non-fail-closed treatment as signatures: transcripts have no
+    // Git-native equivalent either, always counted, exported or not.
+    let transcripts_dropped = count_transcripts(store, &seen_snaps)?;
 
     let target = GitTarget::open_or_init_bare(opts.to)?;
 
@@ -497,6 +530,7 @@ pub fn export_branch(store: &mut Store, tip: ObjectId, opts: &ExportOptions) -> 
         protected_blobs_as_ciphertext: protected,
         secrets_dropped,
         signatures_dropped,
+        transcripts_dropped,
         new_marks,
         stale_marks,
     })
@@ -870,6 +904,44 @@ mod tests {
         let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
         let report = export_branch(&mut store, snap, &opts).unwrap();
         assert_eq!(report.signatures_dropped, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_drops_transcripts_with_count() {
+        use scl_core::{Object, Store, StoreConfig, Tree, TreeEntry, EntryKind, FileMode, Snapshot, Transcript};
+        use std::collections::BTreeMap;
+
+        let mut store = Store::new(StoreConfig::default());
+        let b = store.put(Object::blob(b"x".to_vec())).unwrap();
+        let root = store.put(Object::Tree(Tree::new(vec![
+            TreeEntry { name: "a".into(), kind: EntryKind::Blob, id: b, mode: FileMode::FILE, perms: 0 },
+        ]))).unwrap();
+        let snap = store.put(Object::Snapshot(Snapshot {
+            root, parents: vec![], author: "t".into(), timestamp: 1, message: "m".into(),
+            secrets: BTreeMap::new(), protection: Default::default(),
+        })).unwrap();
+        // A transcript object over `snap`, no fail-closed gate over it (P30
+        // transcripts are provenance, not confidentiality — like P22
+        // signatures) — a garbage ciphertext is fine since export never
+        // decrypts it.
+        store.put(Object::Transcript(Transcript {
+            snapshot: snap,
+            agent: "a".into(),
+            session: "s".into(),
+            nonce: vec![0u8; 24],
+            ciphertext: vec![1, 2, 3],
+            wrapped_keys: vec![],
+        })).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("scl-transdrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let empty = std::collections::HashMap::new();
+        let opts = ExportOptions { to: &dir, ref_name: "refs/heads/main", include_encrypted: false, known_git_commits: &empty };
+        let report = export_branch(&mut store, snap, &opts).unwrap();
+        assert_eq!(report.transcripts_dropped, 1);
+        assert_eq!(report.signatures_dropped, 0, "no signature was written for this snapshot");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

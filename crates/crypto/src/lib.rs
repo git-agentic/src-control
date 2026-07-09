@@ -20,8 +20,8 @@ pub use error::{Error, Result};
 pub use key::{generate_keypair, PublicKey, RecipientId, SecretKey};
 pub use provider::{FileKeyProvider, KeyProvider};
 pub use signing::{
-    generate_identity_v2, parse_identity, sign_snapshot_id, verify_snapshot_sig, Identity,
-    SigPublicKey, SigningKey,
+    generate_identity_v2, parse_identity, sign_snapshot_id, sign_transcript_id,
+    verify_snapshot_sig, verify_transcript_sig, Identity, SigPublicKey, SigningKey,
 };
 /// Re-exported so downstream crates can name the zeroizing-on-drop wrapper
 /// type returned by `decrypt_path`/`open` without adding a direct `zeroize`
