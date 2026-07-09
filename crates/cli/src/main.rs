@@ -3014,7 +3014,20 @@ mod tests {
 
     #[test]
     fn looks_like_low_entropy_secret_matches_and_misses() {
-        for basename in [".env", ".env.local", "id_rsa", "deploy.key", "server.pem", "aws_credentials", "cert.p12"] {
+        for basename in [
+            ".env",
+            ".env.local",
+            "id_rsa",
+            "deploy.key",
+            "server.pem",
+            "aws_credentials",
+            "cert.p12",
+            // Case-insensitivity (`to_lowercase`) — P28 final review M2.
+            ".ENV",
+            "ID_RSA",
+            "SERVER.PEM",
+            "AWS_CREDENTIALS",
+        ] {
             assert!(looks_like_low_entropy_secret(basename), "expected match: {basename}");
         }
         for basename in ["main.rs", "README.md", "util.rs"] {

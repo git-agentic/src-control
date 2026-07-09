@@ -215,7 +215,11 @@ fn decompress_and_decode(payload: &[u8], id: &ObjectId) -> Result<Object> {
 }
 
 /// Parse a standalone `.pack` (no index) into `(id, Object)` pairs, verifying
-/// every record. Used when receiving a pack over a transport.
+/// every record. Test-convenience whole-pack helper only — its
+/// `zstd::decode_all` is UNBOUNDED, and every caller in this codebase is
+/// `#[cfg(test)]`. Untrusted or transport-received input MUST go through
+/// [`parse_pack_reader`] instead, which enforces the `MAX_OBJECT_SIZE` cap
+/// on both compressed length and decompressed output.
 pub fn parse_pack(pack: &[u8]) -> Result<Vec<(ObjectId, Object)>> {
     if pack.len() < 8 || &pack[..4] != PACK_MAGIC {
         return Err(Error::PackCorrupt("missing magic".into()));
@@ -314,7 +318,7 @@ pub fn parse_pack_reader<R: Read>(
         let len = u32::from_le_bytes(len_bytes) as usize;
         if len > crate::MAX_OBJECT_SIZE {
             return Err(Error::PackCorrupt(format!(
-                "record compressed_len {len} exceeds MAX_OBJECT_SIZE"
+                "record compressed length {len} exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit"
             )));
         }
 
@@ -335,7 +339,9 @@ pub fn parse_pack_reader<R: Read>(
             .read_to_end(&mut canonical)
             .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
         if canonical.len() > crate::MAX_OBJECT_SIZE {
-            return Err(Error::PackCorrupt("zstd output exceeds MAX_OBJECT_SIZE".into()));
+            return Err(Error::PackCorrupt(
+                "decompressed object exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit".into(),
+            ));
         }
         let actual_id = ObjectId::of(&canonical);
         if actual_id != expected_id {

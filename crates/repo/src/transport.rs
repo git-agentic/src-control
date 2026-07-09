@@ -245,20 +245,22 @@ pub(crate) fn write_ids_to_temp_pack(
 /// # Why re-reading the file (not the untrusted wire) is what makes the
 /// per-record length prefix safe (Task 1 carry-in #1)
 ///
-/// `parse_pack_reader` trusts each record's `u32` length prefix and
-/// allocates `vec![0u8; len]` for it — up to 4 GiB per record, unchecked.
-/// Read live off an untrusted socket that cap would be a memory-exhaustion
-/// footgun. Both passes here read the *already-fully-spilled* temp file
-/// instead (whether it was spilled by `Transport::put_pack`'s own bounded
-/// copy from `src`, or by `wire::serve` destreaming a chunked wire
-/// transfer): the total bytes any record's length prefix can possibly claim
-/// is bounded by the file's own size on disk, which was itself bounded by
-/// however many bytes the sender actually sent — so a hostile length prefix
-/// can time out (large but bounded `vec!` alloc) but cannot allocate more
-/// than the attacker already transferred. No separate per-record cap was
-/// added to `parse_pack_reader` itself; every call site in this codebase
-/// (both here and `wire::serve`'s own dispatch) reads a spilled file, never
-/// the live connection.
+/// Two defenses now compose here (updated for P28 Task 2). First,
+/// `parse_pack_reader` itself hard-rejects any record whose compressed
+/// length prefix, or whose decompressed zstd output, exceeds
+/// `MAX_OBJECT_SIZE` (256 MiB) — an absolute per-record cap enforced
+/// regardless of source. Second, and independently, both passes here read
+/// the *already-fully-spilled* temp file rather than the live connection
+/// (whether it was spilled by `Transport::put_pack`'s own bounded copy from
+/// `src`, or by `wire::serve` destreaming a chunked wire transfer): the
+/// total bytes any record's length prefix can possibly claim is also
+/// bounded by the file's own size on disk, which was itself bounded by
+/// however many bytes the sender actually sent. So a hostile length prefix
+/// is now rejected outright by the `MAX_OBJECT_SIZE` cap, and even absent
+/// that cap could never claim more than the attacker already transferred —
+/// both defenses hold. Every call site in this codebase (both here and
+/// `wire::serve`'s own dispatch) reads a spilled file, never the live
+/// connection.
 ///
 /// # Task 1 carry-in #2 (exact-EOF framing)
 ///

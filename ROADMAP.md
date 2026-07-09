@@ -614,6 +614,21 @@ scale-&-reach horizon):
 - **`--max-object-size` operator config knob (P28).** `MAX_OBJECT_SIZE`
   (256 MiB) is a compile-time constant anchoring every untrusted-length
   guard; letting an operator raise or lower it per-deployment is deferred.
+- **P28 review follow-ons.** A whole-branch final review of the P28
+  security sweep closed the one real client-side DoS gap
+  (`wire::decode_refs_body`'s fabricated-count allocation) and corrected
+  stale docs, but named four small non-blocking items, deferred rather
+  than silently dropped: `refs::write_head`/`refs::delete_branch` gaining
+  a one-line `validate_branch_name` call for ref-validation class
+  completeness (not exploitable today — `HEAD`'s path is fixed and
+  `delete_branch` only takes internally-generated names); an
+  `SC_PACK_CHUNK` upper-clamp to `MAX_OBJECT_SIZE` (an oversized chunk
+  config today produces frames the receiver's cap rejects — a
+  self-inflicted confusing failure rather than a clear one);
+  `Repo::worktree_paths` doing a paths-only walk instead of loading every
+  file's full bytes; and extracting a shared `path_under_prefix(path,
+  prefix)` helper so `run_protect`'s `/`-boundary filter and
+  `protect.rs::matching_prefix` stop duplicating the same rule.
 
 ## How a phase gets built
 

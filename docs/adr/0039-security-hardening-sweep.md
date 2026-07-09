@@ -86,8 +86,22 @@ object-decode count sites (TAG_TREE entries, TAG_SNAPSHOT parents, TAG_SNAPSHOT
 secrets, TAG_SECRET wrapped_keys) switched from a raw `r.u32()` to the existing
 `Reader::count()` guard, which already rejects a count exceeding remaining input
 bytes. Scope is deliberately the untrusted-peer path only (`parse_pack_reader`);
-`read_object_at`'s local already-verified on-disk pack is untouched. 4 pinned
-regression tests (`pack.rs`). No new dependency — `zstd` was already present.
+`read_object_at`'s local already-verified on-disk pack is untouched. The DoS
+regression pins span three files, not just `pack.rs`: `pack_record_over_cap_rejected`
+and `zstd_bomb_rejected` (`pack.rs`), `object_decode_fabricated_counts_rejected`
+(`object.rs`), and — closed in the P28 final review, the client-side `ListRefs`
+count gap `Cur::count()`/`decode_refs_body` missed on the wire path —
+`frame_over_cap_rejected` and `decode_refs_body_rejects_fabricated_count`
+(`wire.rs`). No new dependency — `zstd` was already present.
+
+**Final-review addendum: the cap is transfer-path only, not a local-commit
+limit.** `MAX_OBJECT_SIZE` is enforced where untrusted bytes are received
+(`parse_pack_reader`, `wire::read_frame_inner`), not at local `commit`/
+`Store::put`. A locally-committed blob larger than 256 MiB therefore commits
+fine but then fails at every subsequent sync (`push`/`fetch`/`clone`) once it
+hits a receiver's cap. Accepted MVP boundary — committable but not
+transferable — and part of the case for the deferred `--max-object-size`
+operator knob (see ROADMAP).
 
 **Decision 3's heuristic is filename-only, deliberately distinct from the P5
 content scanner.** `looks_like_low_entropy_secret(basename)`

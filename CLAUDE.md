@@ -1115,7 +1115,16 @@ randomized protected mode is deferred, not a bug); the secret's child-env
 copy is fundamental and un-zeroizable (fd/stdin injection is deferred, not
 a bug) — the parent's own decrypted buffer is what gets zeroized. Every
 prior demo stays green plus new pinned regression tests across all four
-fixes. See ADR-0039.
+fixes. Accepted boundary: `MAX_OBJECT_SIZE` guards the transfer path only
+(`parse_pack_reader`, `read_frame_inner`), not local `commit`/`Store::put`,
+so a >256 MiB local blob commits fine but fails every subsequent
+push/fetch/clone at the receiver's cap. **Final-review fix wave (same
+phase):** the client-side `ListRefs` DoS gap — a hostile server's response
+could claim a fabricated `u32` count and drive a `Vec::with_capacity`
+allocation on the client before validating any entry, the same class
+`Reader::count()` already closed for object decoding — is closed by the
+same guard, `Cur::count()`, applied to `wire::decode_refs_body`. See
+ADR-0039.
 
 Remaining follow-ons: operation objects in the CAS, oplog entries for
 remote-tracking refs, extending the sparse gate to
@@ -1126,10 +1135,20 @@ accept-loop backoff), the three P27 items named above (transparent
 lazy-fetch as a deferred alternative to explicit `sc backfill`, per-case
 gap-tolerant merge/rebase/`ws harvest`/`sc work` instead of blanket
 refusal, and blob-size/object-count clone filters alongside the
-prefix-only filter shipped here), and the three P28 items named above
+prefix-only filter shipped here), the three P28 items named above
 (randomized protected mode for equality-hiding, fd/stdin secret injection
 as an alternative to env vars, and a `--max-object-size` operator config
-knob).
+knob), and the P28 final-review follow-ons (a one-line
+`validate_branch_name` call in `refs::write_head`/`refs::delete_branch`
+for ref-validation class completeness — not exploitable today, since
+HEAD's path is fixed and `delete_branch` only takes internally-generated
+names; an `SC_PACK_CHUNK` upper-clamp to `MAX_OBJECT_SIZE`, so an
+oversized chunk config fails clearly instead of producing frames the
+receiver's cap silently rejects; `Repo::worktree_paths` doing a
+paths-only walk instead of loading every file's full bytes; and
+extracting a shared `path_under_prefix(path, prefix)` helper so
+`run_protect`'s `/`-boundary filter and `protect.rs::matching_prefix`
+stop duplicating the same rule).
 
 ## Agent skills
 
