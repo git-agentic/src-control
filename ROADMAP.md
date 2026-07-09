@@ -713,14 +713,18 @@ scale-&-reach horizon):
   bearer token crosses the wire in cleartext, so a public deployment must
   front with a TLS reverse proxy today. A first-party TLS dependency is
   deferred, against the P25/P26 dep-free grain.
-- **Full OS-assigned-port de-flake for the CLI http-serving tests
-  (launch prep).** `serve_http_cli_answers_on_socket` and
-  `serve_http_read_only_flag_flows_through` spawn `sc serve --http` on a
-  pid-derived fixed port. Launch prep gave them disjoint port ranges plus a
-  ~10s child-aware readiness wait, which makes `cargo test --workspace`
-  (and CI) reliable; the proper fix — bind `127.0.0.1:0` and have `sc serve`
-  report the OS-assigned port back to the test — is still deferred, as it
-  needs a small `sc serve` port-reporting affordance.
+- ~~**Full OS-assigned-port de-flake for the CLI http-serving tests
+  (launch prep).**~~ **Done.** `sc serve --http` now announces its bound
+  address on stdout (`listening on <addr>`) right after `TcpListener::bind`
+  — stdout is free in `--http` mode (the wire protocol rides the TCP
+  socket, unlike `--stdio`). `serve_http_cli_answers_on_socket` and
+  `serve_http_read_only_flag_flows_through` bind `127.0.0.1:0` and read the
+  OS-assigned port back from that line (which doubles as the readiness
+  signal), eliminating the pid-derived fixed port entirely. The launch-prep
+  investigation also surfaced the true root cause of the historical flake:
+  a lone `stream.read()` for the `HTTP/1.1 400` assertion returned as soon
+  as the first TCP segment arrived, so under load it split off just
+  `HTTP/1.1 ` before `400 Bad Request` — now read to EOF.
 - **Tighten the workspace clippy allow-list (launch prep).** CI runs
   `clippy --all-targets -D warnings`; `[workspace.lints.clippy]` in the root
   `Cargo.toml` allows a curated set (`type_complexity`, `too_many_arguments`,
