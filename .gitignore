@@ -1,2 +1,18 @@
+# Rust build artifacts
 target/
+**/*.rs.bk
+
+# macOS finder metadata
+.DS_Store
+**/.DS_Store
+
+# Session / agent scratch (superpowers SDD ledger, task briefs & reports)
 .superpowers/
+
+# Editor / OS cruft
+*.swp
+*~
+.idea/
+.vscode/
+
+# Note: Cargo.lock IS committed for this workspace (it ships a binary).
