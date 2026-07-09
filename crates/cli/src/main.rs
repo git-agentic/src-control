@@ -459,10 +459,9 @@ enum TranscriptOp {
         /// (requires a v2 identity; see `sc keygen`).
         #[arg(long)]
         sign: bool,
-        /// Identity file (default ~/.sc/identity or $SC_IDENTITY). Used to
-        /// decrypt-recover recipients for sealing is not needed — recipients
-        /// come from `.sc/recipients.toml` — but is required when --sign is
-        /// given.
+        /// Identity file (default ~/.sc/identity or $SC_IDENTITY). Only
+        /// used when --sign is given (recipients for sealing come from
+        /// `.sc/recipients.toml`, so no identity is needed to attach).
         #[arg(long)]
         identity: Option<PathBuf>,
     },
@@ -2580,43 +2579,12 @@ fn run_ws(op: WsOp) -> Result<()> {
             let sk = resolve_identity_opt(identity.clone())?;
             let outcomes = repo.ws_harvest(into.as_deref(), &resolve_author(author), sk.as_ref())?;
 
-            // P30: attach the transcript file to each workspace's landed
-            // snapshot, one transcript per landing. Recipients are the same
-            // full-recipients + escrow pool `sc transcript attach` uses.
-            // This runs post-harvest (WsHarvestOutcome::Landed carries the
-            // landed snapshot id), the lower-churn seam — no ws_harvest
-            // signature change needed.
-            if let Some(file) = &transcript {
-                let recipients_path = repo.layout().dot_sc.join("recipients.toml");
-                let recips = transcript_recipients(&recipients_path)?;
-                let body = std::fs::read(file)
-                    .with_context(|| format!("reading transcript file {}", file.display()))?;
-                let session_label = file
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("ws-harvest")
-                    .to_string();
-                let mut sig_identity: Option<scl_crypto::Identity> = None;
-                if sign {
-                    sig_identity = Some(load_identity_full(identity)?);
-                }
-                for o in &outcomes {
-                    if let scl_repo::WsHarvestOutcome::Landed { index, merged_tip } = o {
-                        let tid = repo.attach_transcript(
-                            *merged_tip,
-                            "sc-ws",
-                            &session_label,
-                            &body,
-                            &recips,
-                        )?;
-                        if let Some(ident) = &sig_identity {
-                            repo.sign_transcript(tid, ident)?;
-                        }
-                        println!("{index:<3} transcript attached: {}", tid.short());
-                    }
-                }
-            }
-
+            // ws_harvest has already moved the landing refs by this point —
+            // print the per-workspace landing status FIRST, unconditionally,
+            // so ref-moving success is always reported even if the
+            // transcript-attach step below fails (P17 rewrap skip-and-report
+            // discipline: don't let fallible work layered on top of an
+            // already-committed change hide that the change happened).
             let mut failed = false;
             for o in &outcomes {
                 match o {
@@ -2636,6 +2604,70 @@ fn run_ws(op: WsOp) -> Result<()> {
                     }
                 }
             }
+
+            // P30: attach the transcript file to each workspace's landed
+            // snapshot, one transcript per landing. Recipients are the same
+            // full-recipients + escrow pool `sc transcript attach` uses.
+            // This runs post-harvest (WsHarvestOutcome::Landed carries the
+            // landed snapshot id), the lower-churn seam — no ws_harvest
+            // signature change needed.
+            //
+            // Skip-and-report: the landing refs already moved above, so a
+            // per-workspace attach/sign failure (e.g. missing
+            // .sc/recipients.toml on a first run) must not abort the whole
+            // command and hide the landing status already printed — it's
+            // warned to stderr and the loop continues to the next
+            // workspace, mirroring `sc rewrap`'s skipped-entries handling.
+            if let Some(file) = &transcript {
+                let recipients_path = repo.layout().dot_sc.join("recipients.toml");
+                let recips = transcript_recipients(&recipients_path)?;
+                // A missing/unreadable transcript file is a genuine user
+                // error (bad path) — that read stays a hard `?`, unlike the
+                // per-workspace attach/sign below.
+                let body = std::fs::read(file)
+                    .with_context(|| format!("reading transcript file {}", file.display()))?;
+                let session_label = file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("ws-harvest")
+                    .to_string();
+                let mut sig_identity: Option<scl_crypto::Identity> = None;
+                if sign {
+                    sig_identity = Some(load_identity_full(identity)?);
+                }
+                for o in &outcomes {
+                    if let scl_repo::WsHarvestOutcome::Landed { index, merged_tip } = o {
+                        let attach_result = repo
+                            .attach_transcript(*merged_tip, "sc-ws", &session_label, &body, &recips)
+                            .with_context(|| format!("attaching transcript to workspace {index}"));
+                        let tid = match attach_result {
+                            Ok(tid) => tid,
+                            Err(err) => {
+                                failed = true;
+                                eprintln!(
+                                    "warning: workspace {index} landed at {} but its \
+                                     transcript could not be attached: {err:#}",
+                                    merged_tip.short()
+                                );
+                                continue;
+                            }
+                        };
+                        if let Some(ident) = &sig_identity {
+                            if let Err(err) = repo.sign_transcript(tid, ident) {
+                                failed = true;
+                                eprintln!(
+                                    "warning: workspace {index} transcript {} attached but \
+                                     could not be signed: {err:#}",
+                                    tid.short()
+                                );
+                                continue;
+                            }
+                        }
+                        println!("{index:<3} transcript attached: {}", tid.short());
+                    }
+                }
+            }
+
             // Drop before exit so the RepoLock's Drop runs (process::exit
             // skips destructors — same reasoning as run_run/run_work).
             drop(repo);

@@ -148,3 +148,77 @@ fn show_without_identity_errors_clearly() {
 
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// P30 t5 review (Important): `sc ws harvest` has already moved the landing
+/// refs by the time the `--transcript` attach step runs. If the attach fails
+/// for a workspace (here: an empty `[recipients]` set, so
+/// `attach_transcript`'s `require_recipients` guard refuses to seal an
+/// unreadable transcript), the command must still report that the workspace
+/// landed — not abort silently with the ref already moved and nothing
+/// printed. This reproduces the ordering bug end to end: fork a workspace,
+/// edit it, harvest with `--transcript` in a repo whose recipients set is
+/// empty, and assert the landing line is on stdout while the attach warning
+/// is on stderr, in that order.
+#[test]
+fn ws_harvest_transcript_prints_landing_before_reporting_attach_failure() {
+    let root = tmp("ws-harvest-attach-fail");
+    let repo = root.join("work");
+    std::fs::create_dir_all(&repo).unwrap();
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    assert!(sc(&repo, &["init"]).status.success());
+    // Present but empty: no recipients, no escrow. `transcript_recipients`
+    // succeeds with an empty Vec (the file exists, so `load_recipients`
+    // doesn't hard-error) — the failure surfaces per-workspace inside
+    // `attach_transcript`'s `require_recipients` guard instead.
+    std::fs::write(repo.join(".sc/recipients.toml"), "[recipients]\n").unwrap();
+
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    assert!(sc(&repo, &["commit", "-m", "base", "--author", "demo"]).status.success());
+
+    let fork = sc(&repo, &["ws", "fork", "--agents", "1", "--author", "demo"]);
+    assert!(fork.status.success(), "ws fork: {}", String::from_utf8_lossy(&fork.stderr));
+    let fork_out = stdout(&fork);
+    let ws_dir = fork_out
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().nth(1))
+        .expect("fork output names workspace 1's dir");
+    std::fs::write(std::path::Path::new(ws_dir).join("new.txt"), "edited\n").unwrap();
+
+    let body_path = outside.join("session.txt");
+    std::fs::write(&body_path, "USER: hi\nAGENT: done\n").unwrap();
+
+    let harvest = sc(
+        &repo,
+        &["ws", "harvest", "--author", "demo", "--transcript", body_path.to_str().unwrap()],
+    );
+    let harvest_stdout = stdout(&harvest);
+    let harvest_stderr = String::from_utf8_lossy(&harvest.stderr).into_owned();
+
+    assert!(
+        !harvest.status.success(),
+        "attach failure must be reported via a non-zero exit, not swallowed: stdout={harvest_stdout} stderr={harvest_stderr}"
+    );
+    assert!(
+        harvest_stdout.contains("1   landed @") || harvest_stdout.lines().any(|l| l.trim_start().starts_with('1') && l.contains("landed @")),
+        "landing status for workspace 1 must still be printed even though the transcript \
+         attach failed (the ref already moved by the time attach runs): stdout={harvest_stdout}"
+    );
+    assert!(
+        harvest_stderr.contains("could not be attached"),
+        "expected a per-workspace attach-failure warning on stderr: stderr={harvest_stderr}"
+    );
+
+    // Ordering: the landing line's position in stdout must not depend on
+    // the attach step ever running — assert it unconditionally exists
+    // rather than trying to interleave stdout/stderr (separate streams).
+    let landed_line = harvest_stdout
+        .lines()
+        .find(|l| l.contains("landed @"))
+        .expect("a landed line must be present in stdout");
+    assert!(landed_line.trim_start().starts_with('1'), "landed line should be for workspace 1: {landed_line}");
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
