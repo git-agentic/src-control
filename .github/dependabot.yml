@@ -8,8 +8,33 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
+    ignore:
+      # The RustCrypto / RNG stack is tightly version-coupled: a single-crate
+      # major bump breaks compilation, and moving the whole stack to new majors
+      # is a coordinated API migration, not an automated bump (tracked in
+      # ROADMAP Deferred). Keep minor/patch security updates; skip majors here.
+      - dependency-name: "x25519-dalek"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "ed25519-dalek"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "chacha20poly1305"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "hkdf"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rand_core"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rand_chacha"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    ignore:
+      # The Rust toolchain is pinned deliberately in rust-toolchain.toml and the
+      # ci.yml action ref; a major bump there would silently change the CI Rust
+      # version and can introduce new clippy lints. Bump it intentionally.
+      - dependency-name: "dtolnay/rust-toolchain"
+        update-types: ["version-update:semver-major"]

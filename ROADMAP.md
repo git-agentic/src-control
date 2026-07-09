@@ -731,6 +731,13 @@ scale-&-reach horizon):
   workflow (as the sibling `git.agentic` has) was left out of the initial
   launch because CodeQL's Rust support is newer; add it once verified not to
   red-X, so the security posture is scanned as well as documented.
+- **Coordinated RustCrypto-stack major-version migration (post-launch).** The
+  crypto/RNG stack (`x25519-dalek`, `ed25519-dalek`, `chacha20poly1305`,
+  `sha2`, `hkdf`, `rand_core`/`rand_chacha`) is tightly version-coupled — a
+  single-crate major bump breaks compilation, so Dependabot is configured to
+  skip majors on these (minor/patch security updates still flow). Migrating the
+  whole stack to current majors is a deliberate, tested pass, not an automated
+  bump; likewise `toml` 0.8 → 1.x and any pinned-toolchain bump.
 - **`404`-before-auth repo-presence oracle (P29).** `handle_http_connection`
   checks `.sc/` presence before the bearer-auth gate, so an unauthenticated
   client can distinguish "repo here, need a token" (401) from "no repo here"
