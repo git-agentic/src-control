@@ -796,6 +796,15 @@ impl Repo {
         worktree::diff_worktree(&self.layout, &mut store, head_root, &protection, &self.sparse_spec()?)
     }
 
+    /// The working-tree file paths (repo-relative, sorted) that `commit` would
+    /// snapshot — the same set `sc protect` encrypts when they match a prefix.
+    pub fn worktree_paths(&self) -> Result<Vec<String>> {
+        Ok(worktree::read_worktree(&self.layout, &self.tracked_paths()?)?
+            .into_iter()
+            .map(|(path, _bytes, _mode)| path)
+            .collect())
+    }
+
     /// Line-level unified diff of the working tree against HEAD (`sc diff`).
     ///
     /// Text files get standard `---`/`+++`/`@@` hunks; a file with a NUL byte

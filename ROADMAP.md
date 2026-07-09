@@ -374,10 +374,39 @@ across every phase.
   and makes docs/ genuinely readable, and `sc gc` on the partial clone
   succeeds and preserves everything — run twice, zero residue. (ADR-0037.)
 
+- **Phase 28 — Security hardening sweep.** The P25–P27 scale-&-reach
+  horizon surfaced a wire attack surface (a hostile `UpdateRef` over
+  ssh/http) that never got a dedicated closing pass; a 2026-07-09 security
+  audit's four fix-now findings close it, security-only, no new feature
+  axis. Ref-name validation: `refs::write_branch_tip`/`read_branch_tip`
+  now call the existing strict `validate_branch_name` — the one choke
+  point every local-branch write reaches (CLI, the wire `UpdateRef` arm,
+  undo, ws) — and `is_unsafe_ref_component` (the distinct, `/`-permitting
+  remote-tracking validator) is upgraded to also reject whitespace/control,
+  closing an oplog-corruption gap via a hostile git remote's branch name.
+  DoS caps: a single `MAX_OBJECT_SIZE` (256 MiB) in `crates/core` bounds
+  the wire frame length, the pack-record compressed length, AND the zstd
+  decompressed output via a decode-WITH-LIMIT reader (never decode-then-
+  check, so a decompression bomb never fully materializes); four
+  object-decode count sites switch from a raw length read to the existing
+  `Reader::count()` guard. `sc protect` equality nudge: a filename-only
+  `looks_like_low_entropy_secret` heuristic (deliberately distinct from
+  the P5 content scanner) prints one stderr warning steering low-entropy
+  secret basenames (`.env`/`*.key`/`*credentials*`…) toward `sc secret`,
+  citing ADR-0014 — warning-only, convergent encryption's
+  equality-confirmability stays accepted by design. Secret env-var
+  boundary: the threat model is tightened to "authorized local process
+  context, NOT strong isolation," and a compile-time pin locks in that
+  `scl_crypto::open`'s `Zeroizing<Vec<u8>>` plaintext rides unchanged to
+  the unavoidable `OsString` child-env hand-off — the parent's buffer
+  zeroizes on drop, the child-env copy is fundamental and un-zeroizable.
+  Every prior demo stays green plus new pinned regression tests; no new
+  dependency. (ADR-0039.)
+
 ## Active
 
-None — the P25–P27 scale-&-reach horizon is complete; brainstorm the next
-horizon.
+**None.** P29 — sc+http access control (read-only mode + fail-closed bind
++ dep-free bearer-token auth, ADR-0040) is next up.
 
 ## Completed phases (usability-first ordering)
 
@@ -407,6 +436,7 @@ horizon.
 | **P25 — Streaming pack transfer (bounded-RAM, >4 GiB)** | `push`/`fetch`/`clone` over ssh:// don't hold a whole pack in RAM anywhere — server, wire, or client | `PackWriter`/`parse_pack_reader` (bounded-RAM pack build/parse); `ST_PACK_CHUNK`/`ST_PACK_END` chunk framing (`SC_PACK_CHUNK`-tunable); `PROTOCOL_VERSION` 2, v1 dropped; two-pass atomic-after-verify ingest + `TempPackGuard`; the ssh client's own `sync.rs` fetch/push call sites route through the same `ingest_pack_file`/`write_ids_to_temp_pack` machinery (final-review fix); proven by `demo/run_streaming_demo.sh` (forced 4 KiB chunks, byte-for-byte clone, signature rides the stream, zero temp residue) | [0035](docs/adr/0035-streaming-transfer.md) |
 | **P26 — sc-native HTTP transport** | Reach a repo over plain TCP with no ssh account | `sc serve --http <addr> <path>`; `sc clone sc+http://host[:port]/repo`; thread-per-connection server, opening-status mapped before the wire handshake, P25 chunk stream + P22 signatures ride the raw socket with no HTTP framing; proven by `demo/run_http_remote_demo.sh` (real loopback TCP, no shim; clone/push/fetch byte-for-byte, signed commit verifies clean, zero `.sc/tmp` residue) | [0036](docs/adr/0036-http-transport.md) |
 | **P27 — Partial clone** | Bound network transfer to a subset of paths, not the whole repo | `sc clone --filter <prefix…> <src> <dst>` fetches only in-filter objects (`.sc/promisor` + filtered reachability walk); `sc backfill <prefix…>` widens on demand; `sc gc`/`sc verify` are gap-tolerant; merge/rebase/`ws harvest`/`sc work`/`sc export` refuse on a partial clone; proven by `demo/run_partial_clone_demo.sh` (fewer objects fetched, push composes after a partial-clone commit, backfill shrinks the gap count, gc preserves everything, run twice) | [0037](docs/adr/0037-partial-clone.md) |
+| **P28 — Security hardening sweep** | Close the audit's concrete-bug Highs + surface the accepted Mediums | strict ref-name validation at the write/read boundary (hostile wire `UpdateRef` + git-remote branch names rejected); `MAX_OBJECT_SIZE` caps every untrusted frame/pack-record/zstd-output length; `sc protect` nudges low-entropy secret filenames toward `sc secret`; secret env-var boundary documented as authorized-local-process-context + plaintext stays `Zeroizing`; every prior demo green + new pinned regression tests, no new dependency | [0039](docs/adr/0039-security-hardening-sweep.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -570,6 +600,35 @@ scale-&-reach horizon):
   prefix-only, matching the sparse path-boundary machinery already built;
   git's `--filter=blob:limit` size-based filtering is a separate axis,
   deferred.
+- **Randomized protected mode (P28).** `sc protect` stays convergent
+  (deterministic DEK/nonce per plaintext), so ciphertext equality still
+  confirms plaintext equality without decryption — accepted by design in
+  ADR-0014, surfaced rather than closed by P28's filename nudge. A
+  non-convergent DEK/nonce mode for equality-hiding on high-sensitivity
+  paths is the follow-on.
+- **fd/stdin secret injection (P28).** `sc run` hands decrypted secrets to
+  the child via its environment — observable by same-user processes,
+  crash dumps, and shell wrappers, per the tightened threat-model wording.
+  An alternative injection path (an fd or stdin the child reads instead of
+  inheriting an env var) would shrink that exposure and is deferred.
+- **`--max-object-size` operator config knob (P28).** `MAX_OBJECT_SIZE`
+  (256 MiB) is a compile-time constant anchoring every untrusted-length
+  guard; letting an operator raise or lower it per-deployment is deferred.
+- **P28 review follow-ons.** A whole-branch final review of the P28
+  security sweep closed the one real client-side DoS gap
+  (`wire::decode_refs_body`'s fabricated-count allocation) and corrected
+  stale docs, but named four small non-blocking items, deferred rather
+  than silently dropped: `refs::write_head`/`refs::delete_branch` gaining
+  a one-line `validate_branch_name` call for ref-validation class
+  completeness (not exploitable today — `HEAD`'s path is fixed and
+  `delete_branch` only takes internally-generated names); an
+  `SC_PACK_CHUNK` upper-clamp to `MAX_OBJECT_SIZE` (an oversized chunk
+  config today produces frames the receiver's cap rejects — a
+  self-inflicted confusing failure rather than a clear one);
+  `Repo::worktree_paths` doing a paths-only walk instead of loading every
+  file's full bytes; and extracting a shared `path_under_prefix(path,
+  prefix)` helper so `run_protect`'s `/`-boundary filter and
+  `protect.rs::matching_prefix` stop duplicating the same rule.
 
 ## How a phase gets built
 

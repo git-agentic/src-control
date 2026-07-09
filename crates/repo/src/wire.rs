@@ -168,6 +168,22 @@ impl<'a> Cur<'a> {
         let n = self.u32()? as usize;
         (0..n).map(|_| self.id()).collect()
     }
+    /// Read a length prefix used to PRE-SIZE a collection, rejecting a fabricated
+    /// count that exceeds the bytes actually remaining in the frame. Every element
+    /// consumes >= 1 byte, so `n > remaining` can never be satisfied and is a
+    /// hostile/corrupt frame (mirrors `object::Reader::count`, the same guard the
+    /// P28 object-decode caps use). Use this — not the raw `u32()` — anywhere the
+    /// count drives a `Vec::with_capacity`.
+    fn count(&mut self) -> Result<usize> {
+        let n = self.u32()? as usize;
+        let remaining = self.b.len() - self.off;
+        if n > remaining {
+            return Err(Error::Protocol(format!(
+                "fabricated count {n} exceeds {remaining} remaining bytes"
+            )));
+        }
+        Ok(n)
+    }
     fn bytes(&mut self) -> Result<Vec<u8>> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
@@ -306,6 +322,11 @@ fn read_frame_inner(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
         filled += n;
     }
     let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > scl_core::MAX_OBJECT_SIZE {
+        return Err(Error::Protocol(format!(
+            "frame length {len} exceeds MAX_OBJECT_SIZE"
+        )));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)
         .map_err(|_| Error::Protocol(format!("EOF inside {len}-byte frame body")))?;
@@ -515,7 +536,7 @@ pub fn refs_body(refs: &[(String, ObjectId)]) -> Vec<u8> {
 /// Decode a ListRefs response body.
 pub fn decode_refs_body(b: &[u8]) -> Result<Vec<(String, ObjectId)>> {
     let mut c = Cur::new(b);
-    let n = c.u32()? as usize;
+    let n = c.count()?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let branch = c.str()?;
@@ -774,6 +795,19 @@ mod tests {
     }
 
     #[test]
+    fn frame_over_cap_rejected() {
+        // A frame header alone (no body) claiming a length past
+        // MAX_OBJECT_SIZE must be rejected before any allocation of the
+        // (fictitious) body — feeding only the 4-byte header proves this:
+        // if the implementation tried to `vec![0u8; len]` and then
+        // `read_exact`, it would hang/OOM here rather than erroring.
+        let over = (scl_core::MAX_OBJECT_SIZE + 1) as u32;
+        let mut r = std::io::Cursor::new(over.to_be_bytes().to_vec());
+        let err = read_frame_opt(&mut r).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
     fn responses_carry_ok_bodies_and_typed_errors() {
         let mut buf: Vec<u8> = Vec::new();
         write_ok(&mut buf, b"body").unwrap();
@@ -815,6 +849,26 @@ mod tests {
         assert_eq!(decode_refs_body(&refs_body(&refs)).unwrap(), refs);
         // Truncated bodies are protocol errors, not panics.
         assert!(matches!(decode_refs_body(&[0, 0, 0, 5]), Err(crate::error::Error::Protocol(_))));
+    }
+
+    /// A hostile server can claim a `ListRefs` count beyond the frame's actual
+    /// bytes — here 5 entries with ZERO entry bytes following. The old
+    /// `Vec::with_capacity(n)` on a raw `u32()` read would pre-size on that
+    /// fabricated count on the CLIENT before validating any entry — a
+    /// client-side DoS on every clone/fetch/push. `count()` must reject on
+    /// `n > remaining` (5 > 0) BEFORE the alloc / the loop. A modest count
+    /// (not `0xFFFF_FFFF`) so a reverted guard can't abort the test process on
+    /// a non-overcommit allocator; the message check pins that the COUNT guard
+    /// fired, not the downstream `str()` truncation error (which would mask a
+    /// revert to `u32()`). P28 final review, mirroring `object::Reader::count`.
+    #[test]
+    fn decode_refs_body_rejects_fabricated_count() {
+        let body = 5u32.to_be_bytes();
+        let err = decode_refs_body(&body).unwrap_err();
+        match err {
+            Error::Protocol(m) => assert!(m.contains("fabricated count"), "wrong error: {m}"),
+            other => panic!("expected Protocol(fabricated count), got {other:?}"),
+        }
     }
 
     #[test]

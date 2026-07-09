@@ -324,8 +324,8 @@ impl Object {
         let obj = match tag {
             TAG_BLOB => Object::Blob(Arc::from(r.rest())),
             TAG_TREE => {
-                let n = r.u32()?;
-                let mut entries = Vec::with_capacity(n as usize);
+                let n = r.count()?;
+                let mut entries = Vec::with_capacity(n);
                 for _ in 0..n {
                     let name = r.str()?;
                     let kind = match r.u8()? {
@@ -349,15 +349,15 @@ impl Object {
             }
             TAG_SNAPSHOT => {
                 let root = r.id()?;
-                let np = r.u32()?;
-                let mut parents = Vec::with_capacity(np as usize);
+                let np = r.count()?;
+                let mut parents = Vec::with_capacity(np);
                 for _ in 0..np {
                     parents.push(r.id()?);
                 }
                 let author = r.str()?;
                 let timestamp = r.i64()?;
                 let message = r.str()?;
-                let ns = r.u32()?;
+                let ns = r.count()?;
                 let mut secrets = std::collections::BTreeMap::new();
                 for _ in 0..ns {
                     let name = r.str()?;
@@ -403,8 +403,8 @@ impl Object {
                 let name = r.str()?;
                 let nonce = r.bytes()?;
                 let ciphertext = r.bytes()?;
-                let nk = r.u32()?;
-                let mut wrapped_keys = Vec::with_capacity(nk as usize);
+                let nk = r.count()?;
+                let mut wrapped_keys = Vec::with_capacity(nk);
                 for _ in 0..nk {
                     let recipient_id = r.str()?;
                     let wrapped_dek = r.bytes()?;
@@ -773,6 +773,54 @@ mod tests {
         let mut extended = bytes.clone();
         extended.push(0xff);
         assert!(Object::decode(&extended).is_err());
+    }
+
+    #[test]
+    fn object_decode_fabricated_counts_rejected() {
+        // Each buffer is hand-crafted with a fabricated huge u32 count
+        // (0xFFFF_FFFF) as the LAST bytes, with nothing following it — the
+        // same idiom Reader::count()'s own doc comment describes: every
+        // element consumes at least one byte, so a count exceeding the
+        // reader's remaining bytes (here, zero) is fabricated and must be
+        // rejected before `Vec::with_capacity(n)` ever runs.
+        const HUGE: u32 = 0xFFFF_FFFF;
+
+        // TAG_TREE: tag(1) + entry-count(u32, fabricated), no entries follow.
+        let mut tree = vec![TAG_TREE];
+        tree.extend_from_slice(&HUGE.to_be_bytes());
+        assert!(matches!(Object::decode(&tree), Err(Error::Malformed(_))), "tree");
+
+        // TAG_SNAPSHOT parents: tag(4) + root id(32) + parents-count(u32, fabricated).
+        let mut snap_parents = vec![TAG_SNAPSHOT];
+        snap_parents.extend_from_slice(&[0u8; 32]); // root
+        snap_parents.extend_from_slice(&HUGE.to_be_bytes());
+        assert!(
+            matches!(Object::decode(&snap_parents), Err(Error::Malformed(_))),
+            "snapshot parents"
+        );
+
+        // TAG_SNAPSHOT secrets: tag(4) + root(32) + parents-count(0) + author
+        // str(0) + timestamp(8) + message str(0) + secrets-count(u32, fabricated).
+        let mut snap_secrets = vec![TAG_SNAPSHOT];
+        snap_secrets.extend_from_slice(&[0u8; 32]); // root
+        snap_secrets.extend_from_slice(&0u32.to_be_bytes()); // parents count
+        snap_secrets.extend_from_slice(&0u32.to_be_bytes()); // author str len
+        snap_secrets.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+        snap_secrets.extend_from_slice(&0u32.to_be_bytes()); // message str len
+        snap_secrets.extend_from_slice(&HUGE.to_be_bytes()); // secrets count
+        assert!(
+            matches!(Object::decode(&snap_secrets), Err(Error::Malformed(_))),
+            "snapshot secrets"
+        );
+
+        // TAG_SECRET wrapped_keys: tag(3) + name str(0) + nonce bytes(0) +
+        // ciphertext bytes(0) + wrapped_keys-count(u32, fabricated).
+        let mut secret = vec![TAG_SECRET];
+        secret.extend_from_slice(&0u32.to_be_bytes()); // name str len
+        secret.extend_from_slice(&0u32.to_be_bytes()); // nonce len
+        secret.extend_from_slice(&0u32.to_be_bytes()); // ciphertext len
+        secret.extend_from_slice(&HUGE.to_be_bytes()); // wrapped_keys count
+        assert!(matches!(Object::decode(&secret), Err(Error::Malformed(_))), "secret wrapped_keys");
     }
 
     #[test]

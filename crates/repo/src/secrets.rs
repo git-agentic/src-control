@@ -290,12 +290,22 @@ impl Repo {
             };
             match scl_crypto::open(&secret, identity) {
                 Ok(plaintext) => {
-                    // The decrypted bytes are copied into an `OsString` for the
-                    // child's environment. That `OsString` is NOT separately
-                    // zeroized (and the kernel copies the environment into the
-                    // child anyway), so this is a best-effort confidentiality
-                    // limit inherent to env-var injection — the plaintext lives
-                    // in this process's memory until `command` is dropped.
+                    // Pin the type explicitly: if `scl_crypto::open` ever stops
+                    // returning `Zeroizing<Vec<u8>>`, this line fails to compile.
+                    // The `OsStr::from_bytes` below reads directly out of this
+                    // buffer — no intermediate plain `Vec`/`String` copy — so the
+                    // parent-side plaintext stays zeroized until `plaintext`
+                    // drops at the end of this iteration.
+                    //
+                    // The `OsString` produced below is the unavoidable hand-off:
+                    // injecting a secret into a child's environment is an
+                    // authorized LOCAL PROCESS context, NOT strong isolation —
+                    // the decrypted secret is observable by same-user processes,
+                    // crash dumps, and shell wrappers through the child
+                    // environment. That copy is fundamentally un-zeroizable (the
+                    // kernel owns it once the child is spawned) and is the
+                    // accepted boundary, not a defect.
+                    let plaintext: scl_crypto::Zeroizing<Vec<u8>> = plaintext;
                     #[cfg(unix)]
                     let val = {
                         use std::os::unix::ffi::OsStrExt;
@@ -617,6 +627,31 @@ mod tests {
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].0, "DB_URL");
         assert_eq!(envs[0].1, std::ffi::OsString::from("v"));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn secret_env_plaintext_is_zeroizing() {
+        // Compile-time pin: if `scl_crypto::open` ever stops returning
+        // `Zeroizing<Vec<u8>>`, this coercion fails to compile — locking in
+        // that the decrypted plaintext stays zeroized up to the unavoidable
+        // `OsString` hand-off documented in `secret_env`.
+        let _pin: fn(&scl_core::Secret, &scl_crypto::SecretKey) -> scl_crypto::Result<scl_crypto::Zeroizing<Vec<u8>>> =
+            scl_crypto::open;
+
+        // Behavior unchanged: the round trip through `secret_env` still
+        // produces the correct plaintext value in the (name, OsString) pair.
+        let root = tmp_root("env-zeroizing");
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let repo = Repo::init(&root).unwrap();
+        repo.secret_add("DB_URL", b"postgres://secret", &[alice_pk]).unwrap();
+
+        let envs = repo.secret_env(&alice_sk, false).unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].0, "DB_URL");
+        assert_eq!(envs[0].1, std::ffi::OsString::from("postgres://secret"));
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
