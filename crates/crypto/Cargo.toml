@@ -10,7 +10,7 @@ scl-core = { path = "../core" }
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = "1"
 blake3 = "1.8.5"
