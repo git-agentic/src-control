@@ -27,3 +27,26 @@ pub use signing::{
 /// type returned by `decrypt_path`/`open` without adding a direct `zeroize`
 /// dependency of their own (keeps RustCrypto-family deps quarantined here).
 pub use zeroize::Zeroizing;
+
+/// Generate `n` cryptographically-random bytes from the OS CSPRNG, rendered as
+/// lowercase hex. Lives here because the RNG (`rand_core`/`OsRng`) is quarantined
+/// to this crate; callers outside `crates/crypto` get randomness through this
+/// helper without taking a second RNG dependency.
+pub fn random_hex(n: usize) -> String {
+    use rand_core::{OsRng, RngCore};
+    let mut buf = vec![0u8; n];
+    OsRng.fill_bytes(&mut buf);
+    hex::encode(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn random_hex_is_right_length_and_varies() {
+        let a = crate::random_hex(32);
+        let b = crate::random_hex(32);
+        assert_eq!(a.len(), 64, "32 bytes -> 64 hex chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two draws must differ (probabilistically certain)");
+    }
+}
