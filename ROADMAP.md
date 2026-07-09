@@ -713,10 +713,24 @@ scale-&-reach horizon):
   bearer token crosses the wire in cleartext, so a public deployment must
   front with a TLS reverse proxy today. A first-party TLS dependency is
   deferred, against the P25/P26 dep-free grain.
-- **`serve_http_cli_answers_on_socket` fixed-port flake (P29).** This test
-  binds a fixed loopback port and can flake under concurrent `cargo test`
-  load when another test or process holds it briefly. Move it to a
-  `127.0.0.1:0` OS-assigned port like the rest of the P26/P29 socket tests.
+- **Full OS-assigned-port de-flake for the CLI http-serving tests
+  (launch prep).** `serve_http_cli_answers_on_socket` and
+  `serve_http_read_only_flag_flows_through` spawn `sc serve --http` on a
+  pid-derived fixed port. Launch prep gave them disjoint port ranges plus a
+  ~10s child-aware readiness wait, which makes `cargo test --workspace`
+  (and CI) reliable; the proper fix — bind `127.0.0.1:0` and have `sc serve`
+  report the OS-assigned port back to the test — is still deferred, as it
+  needs a small `sc serve` port-reporting affordance.
+- **Tighten the workspace clippy allow-list (launch prep).** CI runs
+  `clippy --all-targets -D warnings`; `[workspace.lints.clippy]` in the root
+  `Cargo.toml` allows a curated set (`type_complexity`, `too_many_arguments`,
+  `doc_lazy_continuation`, and three cosmetic style lints) that are deliberate
+  design or cosmetic in reviewed code. Revisit whether any should be fixed at
+  the source and removed from the allow-list.
+- **CodeQL / SAST workflow (launch prep).** A CodeQL security-scanning
+  workflow (as the sibling `git.agentic` has) was left out of the initial
+  launch because CodeQL's Rust support is newer; add it once verified not to
+  red-X, so the security posture is scanned as well as documented.
 - **`404`-before-auth repo-presence oracle (P29).** `handle_http_connection`
   checks `.sc/` presence before the bearer-auth gate, so an unauthenticated
   client can distinguish "repo here, need a token" (401) from "no repo here"

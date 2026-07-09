@@ -32,6 +32,16 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design,
 phase, and [CLAUDE.md](CLAUDE.md) for project conventions and the full phase
 log.
 
+> ⚠️ **Pre-1.0, not independently audited — don't trust production secrets to it
+> yet.** src-control implements real cryptography (committed-secret envelope
+> encryption, convergent-encryption protected paths, Ed25519 signed provenance),
+> but these are MVP implementations that have **not had an independent security
+> audit**. There are deliberate boundaries you should understand first — e.g.
+> convergent encryption is equality-confirmable, `sc serve --http` is plaintext
+> (no TLS), and rotation cuts off future reads but cannot erase ciphertext already
+> in history. They are consolidated in [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
+> Report vulnerabilities privately per [SECURITY.md](SECURITY.md).
+
 ## Workspace layout
 
 ```
