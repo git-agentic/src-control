@@ -76,6 +76,9 @@ const EC_NOT_A_REPO: u8 = 1;
 const EC_NON_FAST_FORWARD: u8 = 2;
 const EC_NOT_FOUND: u8 = 3;
 const EC_PROTOCOL: u8 = 4;
+/// P29: the server is enforcing a read-only serve-token policy and refused a
+/// mutating verb before any store write. See [`serve_with_policy`].
+const EC_READONLY: u8 = 5;
 const EC_OTHER: u8 = 255;
 
 /// A client request — the wire mirror of one [`crate::transport::Transport`]
@@ -447,6 +450,7 @@ pub fn err_to_wire(e: &Error) -> (u8, String) {
         Error::NonFastForward => EC_NON_FAST_FORWARD,
         Error::Core(scl_core::Error::NotFound(_)) => EC_NOT_FOUND,
         Error::Protocol(_) => EC_PROTOCOL,
+        Error::ReadOnly => EC_READONLY,
         _ => EC_OTHER,
     };
     (code, e.to_string())
@@ -459,6 +463,7 @@ pub fn err_from_wire(code: u8, msg: String) -> Error {
         EC_NOT_A_REPO => Error::NotARepo,
         EC_NON_FAST_FORWARD => Error::NonFastForward,
         EC_PROTOCOL => Error::Protocol(msg),
+        EC_READONLY => Error::ReadOnly,
         _ => Error::Remote(msg), // EC_NOT_FOUND + EC_OTHER: typed enough as text
     }
 }
@@ -555,7 +560,17 @@ use crate::transport::{LocalTransport, Transport};
 /// so CAS ref updates, pack verification, and hash-verified reads behave
 /// exactly as for a local remote. Verb failures are *replies*; only protocol
 /// violations end the session.
-pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> Result<()> {
+///
+/// `read_only` (P29): when true, the three mutating verbs
+/// (`PutObject`/`PutPack`/`UpdateRef`) are rejected with [`Error::ReadOnly`]
+/// BEFORE any store write; read verbs are always allowed. [`serve`] is the
+/// `read_only = false` wrapper every pre-P29 caller uses unchanged.
+pub fn serve_with_policy(
+    root: &std::path::Path,
+    r: &mut impl Read,
+    w: &mut impl Write,
+    read_only: bool,
+) -> Result<()> {
     // Handshake: HELLO must come first, and versions must match, before any
     // repo access happens.
     let first = match read_frame_opt(r)? {
@@ -602,6 +617,35 @@ pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> R
                 return Ok(());
             }
         };
+
+        // P29 read-only gate: reject mutating verbs before any store write.
+        if read_only {
+            match &req {
+                Request::PutObject { .. } | Request::UpdateRef { .. } => {
+                    // Single request frames — nothing trails them; reject and
+                    // continue keeps the connection in sync.
+                    let (code, msg) = err_to_wire(&Error::ReadOnly);
+                    write_err(w, code, &msg)?;
+                    continue;
+                }
+                Request::PutPack => {
+                    // The client streams the whole pack immediately after the
+                    // request frame (before reading a response), so drain it
+                    // to keep the connection in sync — then reject. The pack
+                    // is spilled to a temp file and DROPPED (never ingested),
+                    // so no object reaches the store: "rejected before any
+                    // store write" holds. `spill_pack_stream` + guard drop is
+                    // the same bounded-RAM machinery the normal PutPack arm
+                    // uses.
+                    let guard = spill_pack_stream(r, transport.layout())?;
+                    drop(guard);
+                    let (code, msg) = err_to_wire(&Error::ReadOnly);
+                    write_err(w, code, &msg)?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
 
         // GetPack and PutPack (P25) can't go through the generic
         // "compute a body, write_ok/write_err it" dispatch below: neither
@@ -679,6 +723,12 @@ pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> R
             }
         }
     }
+}
+
+/// Serve with full read/write access — the pre-P29 behavior. Every existing
+/// caller (stdio transport, sync, tests) uses this unchanged.
+pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> Result<()> {
+    serve_with_policy(root, r, w, false)
 }
 
 /// Destream an incoming pack chunk stream (`ST_PACK_CHUNK`/`ST_PACK_END`
@@ -996,6 +1046,111 @@ mod tests {
         let total = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap();
         assert_eq!(total, 0);
         assert!(sink.is_empty());
+    }
+
+    /// Connect a `WireClient` to a `serve_with_policy` thread over in-process
+    /// pipes. Mirrors `stdio_transport::tests::connect`, adding the
+    /// `read_only` parameter (P29 Task 3).
+    fn spawn_wire_pair_with_policy(
+        root: &std::path::Path,
+        read_only: bool,
+    ) -> (
+        crate::stdio_transport::WireClient<std::io::PipeReader, std::io::PipeWriter>,
+        std::thread::JoinHandle<Result<()>>,
+    ) {
+        let root = root.to_path_buf();
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let handle = std::thread::spawn(move || {
+            serve_with_policy(&root, &mut server_read, &mut server_write, read_only)
+        });
+        let client = crate::stdio_transport::WireClient::handshake(client_read, client_write)
+            .unwrap();
+        (client, handle)
+    }
+
+    #[test]
+    fn read_only_policy_rejects_mutations_allows_reads() {
+        use crate::transport::Transport;
+
+        let root = tmp_repo("readonly");
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        crate::repo::Repo::open(&root).unwrap().commit("t", "c1").unwrap();
+
+        let (client, server_join) = spawn_wire_pair_with_policy(&root, true);
+
+        // A read verb succeeds under read-only.
+        assert!(client.list_refs().is_ok(), "reads allowed under read-only");
+
+        // A single-frame mutating verb (UpdateRef) is rejected with the
+        // read-only error, and the connection stays usable afterward.
+        let err = client.update_ref("main", &some_id(0xAB), None).unwrap_err();
+        assert!(
+            matches!(err, Error::ReadOnly)
+                || matches!(&err, Error::Remote(m) if m.contains("read-only")),
+            "update_ref rejected read-only, got {err:?}"
+        );
+
+        // PutObject (single-frame) is also rejected.
+        let blob = scl_core::Object::blob(b"payload".to_vec());
+        let (id, bytes) = (blob.id(), blob.encode());
+        let err = client.put_object(&id, &bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::ReadOnly)
+                || matches!(&err, Error::Remote(m) if m.contains("read-only")),
+            "put_object rejected read-only, got {err:?}"
+        );
+
+        // PutPack streams its whole body before reading a response — the
+        // server must DRAIN that stream before rejecting, or the connection
+        // desyncs and this call would surface a broken-pipe/IO error rather
+        // than a clean Error::ReadOnly. This is the regression the brief's
+        // drain-path correction targets.
+        let (pack, _idx) = scl_core::pack::build_pack(&[(id, bytes)]).unwrap();
+        let err = client.put_pack(&mut std::io::Cursor::new(pack)).unwrap_err();
+        assert!(
+            matches!(err, Error::ReadOnly)
+                || matches!(&err, Error::Remote(m) if m.contains("read-only")),
+            "put_pack rejected read-only (not desynced/IO error), got {err:?}"
+        );
+
+        // The connection is still in sync after all three rejections: a
+        // further read verb still works.
+        assert_eq!(client.head_branch().unwrap(), "main");
+
+        client.bye().unwrap();
+        drop(client);
+        server_join.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_wrapper_still_permits_mutations() {
+        use crate::transport::Transport;
+
+        let root = tmp_repo("rw-wrapper");
+        crate::repo::Repo::open(&root).unwrap();
+
+        // `serve` (not `serve_with_policy(.., false)` directly) is the
+        // pre-P29 rw path every existing caller uses; it must still allow a
+        // mutating verb end to end.
+        let root2 = root.clone();
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server_join =
+            std::thread::spawn(move || serve(&root2, &mut server_read, &mut server_write));
+        let client =
+            crate::stdio_transport::WireClient::handshake(client_read, client_write).unwrap();
+
+        let blob = scl_core::Object::blob(b"rw payload".to_vec());
+        let (id, bytes) = (blob.id(), blob.encode());
+        client.put_object(&id, &bytes).unwrap();
+        assert!(client.has_object(&id).unwrap());
+
+        client.bye().unwrap();
+        drop(client);
+        server_join.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
