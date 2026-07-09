@@ -198,6 +198,14 @@ impl Repo {
         if agents == 0 {
             return Err(Error::InvalidArgument("agents must be >= 1".into()));
         }
+        // Partial-clone guard (P27 final review I2): `sc ws harvest` already
+        // refuses on a partial clone (a real merge needs the full tree
+        // closure), so an unguarded `ws fork` would create a session that
+        // can never be harvested — a guaranteed dead end. Refuse at the
+        // source instead of letting the session get created first.
+        if self.promisor()?.is_some() {
+            return Err(crate::promisor::partial_clone_unsupported("ws fork"));
+        }
         if let Some(existing) = read_manifest(self.layout())? {
             return Err(Error::InvalidArgument(format!(
                 "a workspace session is already open ({} workspace(s) forked from branch {} @ {}); \
@@ -1629,15 +1637,17 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// P27 Task 5 review Important fix: `would_merge_cleanly` used to call
-    /// `three_way` directly, bypassing `merge_with_identity`'s own
-    /// partial-clone refusal — so a `sc ws harvest` landing on a partial
-    /// clone would hit the raw corruption-shaped `NotFound` that guard
-    /// family exists to eliminate, instead of a loud typed error.
+    /// P27 final review I2: `sc ws fork` is now refused up front on a
+    /// partial clone (it used to succeed, creating a session that could
+    /// never be harvested — `ws harvest` already refused with
+    /// `PartialCloneUnsupported`, but only after the dead-end session was
+    /// created and an agent may have already done work in it). Refusing at
+    /// the source eliminates the whole dead-end class instead of just
+    /// naming it after the fact.
     #[test]
-    fn harvest_refuses_on_partial_clone_instead_of_raw_notfound() {
-        let src_root = tmp_root("harvest-partial-src");
-        let dst_root = tmp_root("harvest-partial-dst");
+    fn fork_refuses_on_partial_clone() {
+        let src_root = tmp_root("fork-partial-src");
+        let dst_root = tmp_root("fork-partial-dst");
         std::fs::create_dir_all(src_root.join("src")).unwrap();
         std::fs::create_dir_all(src_root.join("docs")).unwrap();
         let src = Repo::init(&src_root).unwrap();
@@ -1652,15 +1662,13 @@ mod tests {
         )
         .unwrap();
 
-        let session = dst.ws_fork(1, "t", None).unwrap();
-        std::fs::write(session.workspaces[0].dir.join("src/a.txt"), "edited\n").unwrap();
-
-        let err = dst.ws_harvest(None, "t", None).unwrap_err();
+        let err = dst.ws_fork(1, "t", None).unwrap_err();
         assert!(
             matches!(err, Error::PartialCloneUnsupported(_)),
             "expected the explicit partial-clone-unsupported refusal, got {err:?}"
         );
         assert!(err.to_string().contains("not supported on a partial clone"));
+        assert!(read_manifest(dst.layout()).unwrap().is_none(), "no dead-end session must be created");
 
         drop(src);
         drop(dst);

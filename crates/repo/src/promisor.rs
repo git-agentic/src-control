@@ -148,6 +148,19 @@ pub fn store(layout: &Layout, p: &Promisor) -> Result<()> {
     Ok(())
 }
 
+/// Remove the repo's promisor marker: this repo becomes a genuine full
+/// clone (P27 final review I2, `Repo::backfill_all`'s escape hatch). A
+/// no-op if the marker is already absent. Callers MUST only call this
+/// after independently confirming the object closure is actually
+/// complete — this function does not itself verify anything.
+pub fn remove(layout: &Layout) -> Result<()> {
+    match std::fs::remove_file(layout.promisor_path()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl Repo {
     /// The repo's current promisor marker, if any (thin wrapper over
     /// `load`). `None` means this is a full clone.

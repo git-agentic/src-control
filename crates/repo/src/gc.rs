@@ -111,17 +111,27 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
             // refusal above, which closes the one known way such an object
             // could be created; this is the backstop for any path that
             // doesn't yet route through that guard). Walk every PRESENT gap
-            // id in, unfiltered, so it — and anything it in turn references
-            // — becomes part of `reachable` and survives the sweep below:
-            // gc is structurally incapable of pruning a present, reachable
-            // object, not just accidentally sparing it.
+            // id in, so it — and anything it in turn references — becomes
+            // part of `reachable` and survives the sweep below: gc never
+            // prunes reachable content it holds. This walk-in is itself
+            // ABSENCE-TOLERANT (P27 final review I1, `walk_tree_present_only`),
+            // not the strict `walk_tree`: `ingest_pack_file`'s write pass is
+            // not all-or-nothing, so a crash-interrupted `sc backfill` can
+            // leave a present gap-frontier tree with an absent child — the
+            // strict walk would `get()` that child and hard-error, which
+            // `Store::write_pack` below would then repeat on the id anyway
+            // if it were smuggled into `reachable`. Present content BELOW an
+            // absent child is not reached and is pruned by the ordinary
+            // loose-object sweep if it's otherwise disconnected — gc never
+            // prunes anything connected to the local graph, but it is not
+            // structurally incapable of pruning locally-disconnected residue.
             for gap in &r.gaps {
                 if included.contains(gap) || !store.contains(gap) {
                     continue;
                 }
                 match store.get(gap)? {
                     Object::Tree(_) => {
-                        reachable::walk_tree(store, *gap, &mut included)?;
+                        reachable::walk_tree_present_only(store, *gap, &mut included)?;
                     }
                     _ => {
                         included.insert(*gap);
@@ -753,6 +763,94 @@ mod tests {
             s.contains(&docs_blob_id),
             "a PRESENT reachable out-of-filter blob must survive gc, not be pruned as a gap"
         );
+        drop(s);
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// Build a repo at `root` with `src/a.txt` and a NESTED `docs/sub/x.txt`
+    /// (so the `docs` tree references a sub-TREE, not just a blob), one
+    /// commit. Returns `(repo, docs_tree_id, sub_tree_id, sub_blob_id)`.
+    fn tmp_repo_with_src_and_nested_docs(
+        root: &std::path::Path,
+    ) -> (crate::repo::Repo, ObjectId, ObjectId, ObjectId) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs/sub")).unwrap();
+        let repo = crate::repo::Repo::init(root).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"S").unwrap();
+        std::fs::write(root.join("docs/sub/x.txt"), b"D").unwrap();
+        let tip = repo.commit("t", "c1").unwrap();
+        let store_arc = repo.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        let snap = s.get_snapshot(&tip).unwrap();
+        let root_tree = s.get_tree(&snap.root).unwrap();
+        let docs_tree_id = root_tree.get("docs").unwrap().id;
+        let docs_tree = s.get_tree(&docs_tree_id).unwrap();
+        let sub_tree_id = docs_tree.get("sub").unwrap().id;
+        let sub_tree = s.get_tree(&sub_tree_id).unwrap();
+        let sub_blob_id = sub_tree.get("x.txt").unwrap().id;
+        drop(s);
+        (repo, docs_tree_id, sub_tree_id, sub_blob_id)
+    }
+
+    /// P27 final review I1: gc's walk-what-you-have backstop must be
+    /// absence-tolerant, not just the filtered reachability walk. A
+    /// crash-interrupted `sc backfill` (Ctrl-C, power loss mid-ingest) can
+    /// leave a gap-frontier tree PRESENT while one of its children never
+    /// landed — `ingest_pack_file`'s write pass is not all-or-nothing. The
+    /// strict `walk_tree` used to `get()` every child unconditionally and
+    /// hard-error on the missing one, bricking `sc gc` on a partial clone
+    /// (violates "gc must never error on a partial clone"). Seed the
+    /// partial clone with ONLY the gap-frontier `docs` tree object present
+    /// (its child `sub` tree and blob absent, mirroring the repro's exact
+    /// crash-window shape) and assert `sc gc` succeeds and keeps the
+    /// present frontier tree.
+    #[test]
+    fn gc_walk_in_tolerates_absent_child_of_present_gap_frontier() {
+        let src_root = tmp_root("gc-crash-src");
+        let dst_root = tmp_root("gc-crash-dst");
+        let (src, docs_tree_id, sub_tree_id, sub_blob_id) = tmp_repo_with_src_and_nested_docs(&src_root);
+
+        let docs_tree_obj = {
+            let arc = src.vfs().store();
+            let mut s = arc.lock().unwrap();
+            scl_core::Object::Tree(s.get_tree(&docs_tree_id).unwrap())
+        };
+
+        let dst = crate::repo::Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+
+        {
+            let arc = dst.vfs().store();
+            let mut s = arc.lock().unwrap();
+            assert!(!s.contains(&docs_tree_id), "out-of-filter docs/ tree starts absent");
+            assert!(!s.contains(&sub_tree_id), "docs/sub/ tree starts absent");
+            // Simulate a crash mid-backfill-ingest: only the gap-frontier
+            // `docs` tree object landed; its child `sub` tree (and
+            // transitively the blob under it) did not.
+            let tid = s.put(docs_tree_obj).unwrap();
+            assert_eq!(tid, docs_tree_id, "seeded tree must match the gap's own id");
+            assert!(!s.contains(&sub_tree_id), "the crash-window child must still be absent");
+        }
+
+        let stats = dst.gc(Duration::from_secs(0));
+        assert!(stats.is_ok(), "gc must not error on a crash-interrupted backfill frontier: {stats:?}");
+
+        let arc = dst.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(
+            s.contains(&docs_tree_id),
+            "the present gap-frontier tree must survive gc, not be pruned or fail"
+        );
+        assert!(!s.contains(&sub_tree_id), "the never-landed child stays absent (never fetched)");
+        assert!(!s.contains(&sub_blob_id), "the never-landed grandchild blob stays absent");
         drop(s);
 
         drop(src);

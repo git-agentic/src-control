@@ -400,6 +400,14 @@ enum Cmd {
     Backfill {
         /// Path prefixes to backfill (repeatable).
         prefixes: Vec<String>,
+        /// Fetch EVERY remaining out-of-filter object (no prefix
+        /// restriction) and, once the object closure is verified complete,
+        /// remove `.sc/promisor` — this repo becomes a genuine full clone
+        /// and merge/pick/rebase/`ws harvest`/`sc work`/export/sparse
+        /// disable all work again. Mutually exclusive with `prefixes`
+        /// (P27 final review I2).
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -654,7 +662,7 @@ fn main() -> Result<()> {
         Cmd::Sign { r#ref, identity } => run_sign(&r#ref, identity),
         Cmd::Verify { r#ref, require } => run_verify(r#ref, require),
         Cmd::Sparse { op } => run_sparse(op),
-        Cmd::Backfill { prefixes } => run_backfill(prefixes),
+        Cmd::Backfill { prefixes, all } => run_backfill(prefixes, all),
     }
 }
 
@@ -2416,9 +2424,18 @@ fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>) -> Resul
 
 /// Widen a partial clone: fetch objects under `prefixes` from the promisor
 /// origin and widen `.sc/promisor`. Errors if this repo is not a partial
-/// clone.
-fn run_backfill(prefixes: Vec<String>) -> Result<()> {
+/// clone. `--all` ignores `prefixes` and instead fetches every remaining
+/// object, then removes `.sc/promisor` entirely (P27 final review I2).
+fn run_backfill(prefixes: Vec<String>, all: bool) -> Result<()> {
     let repo = open_repo()?;
+    if all {
+        if !prefixes.is_empty() {
+            anyhow::bail!("--all fetches every remaining object; pass either --all or explicit prefixes, not both");
+        }
+        repo.backfill_all()?;
+        println!("backfilled every remaining object; this is now a full clone (.sc/promisor removed)");
+        return Ok(());
+    }
     repo.backfill(&prefixes)?;
     println!("backfilled {} prefix(es)", prefixes.len());
     Ok(())
@@ -2807,7 +2824,7 @@ fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) ->
     if repo.promisor()?.is_some() {
         anyhow::bail!(
             "refusing to export: this is a partial clone (.sc/promisor present) and export \
-             needs the full object closure; run `sc backfill <prefix>...` to widen to a full \
+             needs the full object closure; run `sc backfill --all` to convert to a full \
              clone first"
         );
     }

@@ -222,7 +222,7 @@ impl Repo {
         if let Some(promisor) = self.promisor()? {
             return Err(Error::InvalidArgument(format!(
                 "cannot disable sparse checkout (full materialization) on a partial clone: \
-                 only [{}] was fetched; run `sc backfill <prefix>...` to widen the filter \
+                 only [{}] was fetched; run `sc backfill --all` to convert to a full clone \
                  first, or `sc sparse set` to a prefix within it",
                 promisor.prefixes().join(", ")
             )));

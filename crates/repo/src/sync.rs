@@ -227,6 +227,72 @@ impl Repo {
         Ok(())
     }
 
+    /// Fully convert a partial clone into a genuine full clone (P27 final
+    /// review I2). `sc backfill <prefix>...` can only ever WIDEN the
+    /// filter — nothing ever removes `.sc/promisor`, so even a caller who
+    /// has manually backfilled every prefix in the repo is stuck with
+    /// merge/pick/rebase/`ws harvest`/`sc work`/export/sparse-disable
+    /// refusing forever (those guards' error text used to say "backfill to
+    /// a full clone first", which named a remedy that did not exist). This
+    /// is that remedy: fetch EVERY remaining object with `filter = None`
+    /// (no prefix restriction — the whole tree, unlike `backfill`'s
+    /// prefix-scoped transfer), verify the object closure is genuinely
+    /// complete (an unfiltered reachability walk over every local ref tip
+    /// resolves with no `NotFound`), and ONLY THEN remove `.sc/promisor`.
+    /// Ordering is load-bearing: removing the marker before verifying
+    /// closure would leave a partial clone that no longer knows it's
+    /// partial — silent corruption with no promisor left to explain a
+    /// later `NotFound`. `haves` stays empty for the same reason
+    /// [`Repo::backfill`] documents (a partial clone's local tip has no
+    /// complete closure to compute a correct "have" set from); `tips`
+    /// (the `wants`) are `refs/remotes/origin/*`, which the origin can
+    /// always resolve (mirrors `backfill`'s I2 fix).
+    pub fn backfill_all(&self) -> Result<()> {
+        let promisor = crate::promisor::load(&self.layout)?.ok_or_else(|| {
+            Error::InvalidArgument(
+                "not a partial clone (.sc/promisor absent); nothing to backfill".into(),
+            )
+        })?;
+        let transport = open_transport(&promisor.origin)?;
+
+        let tips: Vec<ObjectId> = refs::list_remote_tips(&self.layout)?
+            .into_iter()
+            .filter(|(remote, _, _)| remote == "origin")
+            .map(|(_, _, id)| id)
+            .collect();
+        if tips.is_empty() {
+            return Err(Error::InvalidArgument(
+                "no refs/remotes/origin/* tracking refs recorded; run `sc fetch origin` first"
+                    .into(),
+            ));
+        }
+
+        {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            // filter = None: fetch every remaining object, not just a
+            // named prefix — this is the whole point of `--all`.
+            transfer_objects(&self.layout, transport.as_ref(), &mut store, &tips, &[], None)?;
+
+            // Verify closure completeness before ever touching the marker.
+            // Walk from every local ref tip too (not just origin's), so a
+            // local unpushed commit made while still partial is also
+            // covered — mirrors `backfill`'s own I2 rationale for why
+            // local tips can't be used as the FETCH want-set, but they are
+            // exactly the right set to verify closure against once the
+            // fetch itself is done.
+            let mut verify_tips = tips.clone();
+            for (_, id) in refs::list_heads(&self.layout)? {
+                verify_tips.push(id);
+            }
+            reachable::reachable_objects(&mut *store, &verify_tips)?;
+        }
+
+        // Closure verified complete: this is now a genuine full clone.
+        crate::promisor::remove(&self.layout)?;
+        Ok(())
+    }
+
     /// Fetch objects + branch tips from `remote` into remote-tracking refs
     /// (`refs/remotes/<remote>/<branch>`). Local branches are left untouched.
     pub fn fetch(&self, remote: &str) -> Result<Vec<(String, ObjectId)>> {
@@ -1156,6 +1222,98 @@ mod tests {
         assert!(
             msg.contains("not a partial clone"),
             "backfill on a full clone must error clearly, got: {msg}"
+        );
+
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    /// P27 final review I2: `sc backfill --all` is the escape hatch a plain
+    /// prefix-scoped `sc backfill` cannot be — even backfilling EVERY
+    /// prefix in the repo never removed `.sc/promisor`, so merge stayed
+    /// refused forever. `backfill_all` must fetch the whole remaining
+    /// closure, remove the marker, and leave the repo able to merge a
+    /// local branch that touches the formerly out-of-filter subtree.
+    #[test]
+    fn backfill_all_removes_promisor_and_unblocks_merge() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-backfillall-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-backfillall-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+
+        let (src, _tip, docs_blob_id, _docs_tree_id) = tmp_repo_with_src_and_docs(&src_root);
+        drop(src);
+
+        let dst = Repo::clone_url_filtered(
+            src_root.to_str().unwrap(),
+            &dst_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+        assert!(dst.promisor().unwrap().is_some(), "must start as a partial clone");
+        {
+            let store_arc = dst.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(!store.contains(&docs_blob_id), "docs/ must be gapped before backfill --all");
+        }
+
+        dst.backfill_all().unwrap();
+
+        assert!(
+            dst.promisor().unwrap().is_none(),
+            ".sc/promisor must be gone after backfill --all: this is now a full clone"
+        );
+        {
+            let store_arc = dst.vfs().store();
+            let store = store_arc.lock().unwrap();
+            assert!(store.contains(&docs_blob_id), "docs/ blob must be present after backfill --all");
+        }
+
+        // `.sc/promisor` is gone, but `.sc/sparse` (a separate, P24
+        // mechanism) still narrows the working tree to `src/` — widen it
+        // now that the object closure is genuinely complete, so `docs/`
+        // materializes on disk.
+        dst.disable_sparse(None).unwrap();
+        assert!(dst_root.join("docs/b.txt").exists(), "docs/ must materialize once sparse is disabled");
+
+        // The escape hatch's whole point: a real merge that touches the
+        // formerly out-of-filter `docs/` subtree now works, where it was
+        // refused as `PartialCloneUnsupported` before.
+        dst.branch("feature").unwrap();
+        dst.switch("feature").unwrap();
+        std::fs::write(dst_root.join("docs/b.txt"), b"docs-edited-on-feature").unwrap();
+        dst.commit("t", "feature edit").unwrap();
+        dst.switch("main").unwrap();
+        std::fs::write(dst_root.join("src/a.txt"), b"src-edited-on-main").unwrap();
+        dst.commit("t", "main edit").unwrap();
+        dst.merge("feature", "t").unwrap();
+
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn backfill_all_on_full_clone_errors() {
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-backfillallfull-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-backfillallfull-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&src_root);
+        let _ = std::fs::remove_dir_all(&dst_root);
+        std::fs::create_dir_all(&src_root).unwrap();
+
+        let repo = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("a.txt"), b"one").unwrap();
+        repo.commit("t", "c1").unwrap();
+        drop(repo);
+
+        let dst = Repo::clone_url(src_root.to_str().unwrap(), &dst_root).unwrap();
+        let err = dst.backfill_all().unwrap_err();
+        assert!(
+            err.to_string().contains("not a partial clone"),
+            "backfill --all on a full clone must error clearly, got: {err}"
         );
 
         drop(dst);

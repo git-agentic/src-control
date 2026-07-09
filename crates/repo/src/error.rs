@@ -56,7 +56,7 @@ pub enum Error {
     /// just the operation name and the message never implies a bare
     /// `sc backfill` with no prefix would fix it — these operations need a
     /// full clone (or a full backfill of every prefix), not one path.
-    #[error("{0} is not supported on a partial clone; backfill to a full clone first")]
+    #[error("{0} is not supported on a partial clone; run `sc backfill --all` to convert to a full clone first")]
     PartialCloneUnsupported(String),
     #[error("already up to date")]
     UpToDate,

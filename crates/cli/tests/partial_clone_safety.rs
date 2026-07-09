@@ -97,6 +97,48 @@ fn status_diff_and_gc_succeed_on_fresh_partial_clone() {
     std::fs::remove_dir_all(&dst_root).unwrap();
 }
 
+/// P27 final review I2: `sc backfill --all` is the real escape hatch —
+/// fetches every remaining object and removes `.sc/promisor`, after which
+/// a merge that was refused as unsupported on a partial clone works.
+#[test]
+fn backfill_all_lifts_partial_clone_refusals() {
+    let (src_root, dst_root) = make_partial_clone("backfill-all");
+
+    // Merge is refused while partial: create a divergent (non-conflicting —
+    // different files, so a clean merge is the only thing this test is
+    // exercising) branch first.
+    assert!(sc(&dst_root, &["branch", "feature"]).status.success());
+    assert!(sc(&dst_root, &["switch", "feature"]).status.success());
+    std::fs::write(dst_root.join("src/feature.txt"), "feature-only\n").unwrap();
+    assert!(sc(&dst_root, &["commit", "-m", "feature"]).status.success());
+    assert!(sc(&dst_root, &["switch", "main"]).status.success());
+    std::fs::write(dst_root.join("src/a.txt"), "main-edit\n").unwrap();
+    assert!(sc(&dst_root, &["commit", "-m", "main"]).status.success());
+
+    let merge_before = sc(&dst_root, &["merge", "feature"]);
+    assert!(!merge_before.status.success(), "merge must still be refused before backfill --all");
+    assert!(
+        stderr(&merge_before).contains("backfill --all"),
+        "refusal must point at `sc backfill --all`: {}",
+        stderr(&merge_before)
+    );
+
+    let backfill = sc(&dst_root, &["backfill", "--all"]);
+    assert!(backfill.status.success(), "sc backfill --all failed: {}", stderr(&backfill));
+    assert!(!dst_root.join(".sc/promisor").exists(), ".sc/promisor must be removed by backfill --all");
+
+    // Widen sparse too (a separate P24 mechanism `--all` doesn't touch) so
+    // `docs/` materializes before the merge fast-forward/land needs it.
+    let sparse_disable = sc(&dst_root, &["sparse", "disable"]);
+    assert!(sparse_disable.status.success(), "sparse disable must now succeed: {}", stderr(&sparse_disable));
+
+    let merge_after = sc(&dst_root, &["merge", "feature"]);
+    assert!(merge_after.status.success(), "merge must succeed after backfill --all: {}", stderr(&merge_after));
+
+    std::fs::remove_dir_all(&src_root).unwrap();
+    std::fs::remove_dir_all(&dst_root).unwrap();
+}
+
 #[test]
 fn sparse_widen_beyond_partial_filter_is_refused() {
     let (src_root, dst_root) = make_partial_clone("sparse-widen");
