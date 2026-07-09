@@ -2,8 +2,8 @@
 
 A next-generation version control system built around a snapshot-and-tag model
 (Jujutsu-inspired), with per-file permissions, native committed secrets, and
-in-memory clones as the long-term thesis. This repository is the MVP, which now
-proves the core thesis end to end:
+in-memory clones as the long-term thesis. Across 30 shipped phases, this
+repository now proves that thesis end to end:
 
 1. **In-memory virtual worktrees** (the agent wedge) — fork N parallel worktrees
    of a repo entirely in RAM, run and check out against each, and tear them down
@@ -11,36 +11,54 @@ proves the core thesis end to end:
 2. **Native committed secrets** — env vars / keys committed into repo state,
    encrypted at rest and in transit, decrypted only in an authorized execution
    context. **Implemented (Phase 2).**
-3. **Persistent collaborative VCS features** — durable `.sc/` repos, branches,
-   merge, accidental-secret scanning, local remotes, per-path encryption,
-   packfiles/GC, and Git export. **Implemented (Phases 3-9).**
+3. **Per-file permissions** — individual paths encrypted to a chosen set of
+   recipients via convergent encryption, merged/replayed/revoked/rewrapped
+   without ever writing plaintext to the object store. **Implemented (Phase 7,
+   hardened through Phases 15-17.)**
+4. **A full persistent collaborative VCS** on top of those three pillars:
+   durable `.sc/` repos, branches, three-way merge, history editing
+   (cherry-pick/rebase/amend/undo), durable multi-invocation agent sessions,
+   signed commits with session-transcript provenance, sparse and partial
+   checkouts, and local/ssh/HTTP/Git network transports. **Implemented
+   (Phases 3-30.)**
 
-The MVP builds on / interoperates with Git rather than replacing it: it imports
-an existing Git repo's `HEAD` in-process (via `gix`) and exports src-control
-history back to Git commits.
+The system builds on / interoperates with Git rather than replacing it: it
+imports an existing Git repo's `HEAD` in-process (via `gix`), exports history
+back to Git commits, and reaches hosted Git (e.g. GitHub) through a spawned
+system-git mirror bridge.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design,
-[docs/adr/](docs/adr/) for the architecture decision records covering both
-phases, and [CLAUDE.md](CLAUDE.md) for project conventions.
+[docs/adr/](docs/adr/) for the architecture decision records covering every
+phase, and [CLAUDE.md](CLAUDE.md) for project conventions and the full phase
+log.
 
 ## Workspace layout
 
 ```
 crates/
-  core/   content-addressed object store, snapshot model, memory budget + eviction
+  core/   content-addressed object store (blob/tree/snapshot/secret/signature/
+          transcript), memory budget + eviction
   vfs/    in-memory virtual worktree engine (fork / edit / checkout / commit / teardown)
-  gitio/  Git interop boundary — import/export Git history via gix
-  crypto/ envelope encryption for committed secrets and protected paths
-  repo/   durable .sc repo, refs, worktree, merge, remotes, protection, GC
+  gitio/  Git interop boundary — import/export Git history and the network-git
+          mirror bridge, via gix (the ONLY crate that links gix)
+  crypto/ envelope encryption for committed secrets and protected paths, plus
+          Ed25519 signing (the ONLY crate that links RustCrypto)
+  repo/   durable .sc repo — refs, branches, working tree, merge, history
+          editing, remotes, protection, GC, sparse/partial clone, transcripts,
+          transport
   cli/    `sc` binary
 demo/
-  run_demo.sh         independent before/after filesystem diff proving zero residue
-  run_repo_demo.sh    persistent repo end-to-end demo
-  run_protect_demo.sh protected-path confidentiality demo
+  ~22 end-to-end proof scripts covering everything below, e.g.:
+  run_demo.sh              independent before/after filesystem diff, zero residue
+  run_repo_demo.sh         persistent repo end-to-end demo
+  run_ssh_remote_demo.sh   ssh-native transport round trip
+  run_provenance_demo.sh   signed history + rewrite-attack proof
+  run_transcript_demo.sh   sealed agent-session transcript proof
 ```
 
 Dependency direction is strict: `cli → repo → {vfs, gitio, crypto} → core`.
-Only `gitio` links `gix`, keeping the rest of the system Git-agnostic.
+Only `gitio` links `gix` and only `crypto` links RustCrypto, keeping the rest
+of the system Git- and crypto-library-agnostic.
 
 ## Quick start
 
@@ -62,12 +80,24 @@ cargo run --bin sc -- import --repo /path/to/some/git/repo
 cargo run --bin sc -- init
 cargo run --bin sc -- commit -m "initial import"
 
+# Sign a commit and verify the resulting history
+cargo run --bin sc -- commit -m "signed change" --sign
+cargo run --bin sc -- verify --require
+
+# Serve a repo over the sc-native HTTP transport and clone it elsewhere
+cargo run --bin sc -- serve --http 127.0.0.1:8730 .
+cargo run --bin sc -- clone sc+http://127.0.0.1:8730/repo /path/to/dst
+
 # Export the current branch history to Git
 cargo run --bin sc -- export --to /path/to/git/repo
 
 # Independent zero-residue proof (snapshots the filesystem before/after)
 bash demo/run_demo.sh
 ```
+
+See `CLAUDE.md`'s Commands section for the full command surface (merge,
+history editing, secrets lifecycle, sparse/partial clone, ssh/HTTP remotes,
+session transcripts, and more).
 
 ## How Phase 1 works
 
@@ -88,8 +118,17 @@ the zero-residue guarantee holds even with spill enabled.
 
 ## Status
 
-Phases 1-9 are implemented and tested. The system now covers in-RAM virtual
-worktrees, committed secrets, persistent repos, merge, secret scanning, remotes,
-encrypted paths, packfiles/GC, and Git export. Remaining work is beyond the P9
-roadmap: network transports, richer merge ergonomics, secret/permission
-lifecycle, sparse/subtree sharing, and signed provenance.
+The long-term thesis is proven end to end, not just prototyped: in-RAM virtual
+worktrees (Phase 1), native committed secrets (Phase 2), and per-file
+permissions via encrypted paths (Phase 7) all ship alongside a full persistent,
+branchable, content-addressed VCS — merge and history editing, durable
+multi-invocation agent sessions with auto-merge, a commit-time secret scanner,
+secret/permission lifecycle (rotation, escrow, revocation tombstones, bulk
+rewrap), signed commits with sealed session-transcript provenance, sparse and
+partial checkouts, and local, ssh-native, sc-native HTTP, and Git (including
+hosted GitHub) network transports. All 30 phases are implemented and tested;
+`demo/` holds roughly 22 independent end-to-end proofs, one per major
+capability. Remaining follow-ons (transparent lazy-fetch, per-case
+gap-tolerant merge on partial clones, connection pooling for `sc serve
+--http`, and similar hardening items) are tracked in
+[ROADMAP.md](ROADMAP.md)'s Deferred section rather than being open MVP scope.

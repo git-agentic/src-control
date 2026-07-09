@@ -2,9 +2,10 @@
 
 A next-generation version control system built around a snapshot-and-tag model
 (Jujutsu-inspired) with per-file permissions, native committed secrets, and
-in-memory clones. This document covers the MVP architecture and the two wedges
-we are proving first. The rationale behind each major decision is recorded as an
-ADR in [`docs/adr/`](docs/adr/).
+in-memory clones. This document covers the architecture as built — the two
+founding wedges and the full collaborative VCS grown around them across 30
+vertical-slice phases. The rationale behind each major decision is recorded as an
+ADR in [`docs/adr/`](docs/adr/), and a compact per-phase appendix closes this doc.
 
 ## Thesis and MVP scope
 
@@ -14,20 +15,30 @@ world of autonomous coding agents. Agents want to fork many short-lived working
 copies cheaply, and teams want to commit secrets into repo state without bolting
 on an external vault. Git makes both painful.
 
-The MVP does not try to replace Git. It proves two wedges that have the clearest
-near-term value and builds on / interoperates with Git wherever that saves time:
+The project does not try to replace Git. It began by proving two wedges with the
+clearest near-term value, and has since grown — one vertical-slice phase at a
+time — into a full persistent, branchable, content-addressed VCS that builds on
+and interoperates with Git wherever that saves time. The two founding wedges:
 
 - **Phase 1 — In-memory virtual worktrees (the agent wedge).** A library + CLI
   that lets an autonomous agent fork *N* parallel worktrees of a repo entirely
   in RAM, run and checkout against each, and tear them down cleanly leaving zero
   local artifacts. Includes a bounded memory budget with eviction and optional
   spill so large repos don't exhaust the heap.
-- **Phase 2 — Native committed secrets (built).** Env vars / keys committed
-  directly into repo state, encrypted at rest and in transit, decrypted only
-  inside an authorized execution context through integrated key management.
+- **Phase 2 — Native committed secrets.** Env vars / keys committed directly into
+  repo state, encrypted at rest and in transit, decrypted only inside an
+  authorized execution context through integrated key management.
 
-Everything in Phase 1 is designed so Phase 2 drops in without re-architecting:
-secrets are just a special object kind in the same content-addressed store.
+Everything in Phase 1 was designed so Phase 2 dropped in without re-architecting:
+secrets are just a special object kind in the same content-addressed store. That
+composability held across every phase since. **All three long-term-thesis pillars
+now ship** — in-RAM worktrees (P1), committed secrets (P2), and per-file
+permissions (P7, encrypted paths) — atop a full collaborative VCS: three-way
+merge and history editing, packfiles + GC, ssh:// / sc+http:// / Git network
+transports, sparse and partial clone, signed commits, and intent-deep provenance
+via sealed agent-session transcripts. The phase-by-phase build log is in
+[`ROADMAP.md`](ROADMAP.md) and [`CLAUDE.md`](CLAUDE.md); the sections below cover
+the architecture, with a compact per-phase appendix at the end.
 
 ## Why Rust
 
@@ -37,10 +48,12 @@ core requirement; Rust's lack of a tracing GC means the heap budget we enforce i
 the heap we actually use, with no hidden retention or GC pauses skewing the
 numbers. Second, the **content-addressed store** benefits from zero-copy hashing
 and slicing over `Bytes`/`Arc<[u8]>` without defensive copies. Third, the
-**crypto** for Phase 2 wants mature, audited primitives — the RustCrypto
-ecosystem and `ring` provide AEAD (XChaCha20-Poly1305), X25519, and Argon2 with
-good ergonomics. Git interop is in-process via **`gix`** (pure-Rust Git), so
-there is no subprocess boundary or dependency on a system `git` binary.
+**crypto** wants mature, audited primitives — the RustCrypto ecosystem provides
+AEAD (XChaCha20-Poly1305), X25519 ECDH, HKDF-SHA256, and Ed25519 with good
+ergonomics, all pure-Rust. Git interop is in-process via **`gix`** (pure-Rust
+Git), so there is no subprocess boundary or dependency on a system `git` binary
+(the P18 hosted-Git bridge is the one exception, spawning system `git` only
+because `gix` cannot push).
 
 Go was the main alternative and would scaffold faster with excellent concurrency,
 but its GC makes a *precise* heap budget and eviction strategy materially harder
@@ -54,25 +67,29 @@ direction (`cli → repo → {vfs, gitio, crypto} → core`):
 ```
 src-control/
 ├── crates/
-│   ├── core/     content-addressed store, snapshot model, memory budget + eviction
-│   ├── vfs/      in-memory virtual worktree engine (fork / edit / checkout / teardown)
-│   ├── gitio/    Git interop boundary (import a Git repo's tree into the store via gix)
-│   ├── crypto/   envelope encryption for committed secrets (scl-crypto; depends on core)
-│   ├── repo/     durable on-disk repo: .sc/ layout, refs, branches, working tree
-│   └── cli/      `sc` binary: the full command surface — demo/import, init/commit/status/log,
-│                 branch/switch/merge, secret/run/scan, protect/grant/revoke, clone/remote/
-│                 fetch/push, gc, export, escrow
+│   ├── core/     content-addressed store (loose + packfiles), object model, memory
+│   │             budget + eviction, streaming pack build/parse
+│   ├── vfs/      in-memory copy-on-write worktree engine (fork / edit / checkout / teardown)
+│   ├── gitio/    Git interop: import a repo's HEAD + export history back to Git via gix,
+│   │             plus a system-git mirror bridge for hosted Git (the only crate linking gix)
+│   ├── crypto/   envelope encryption (secrets + protected paths) AND Ed25519 signing +
+│   │             v2 dual-key identities (scl-crypto; the only crate linking RustCrypto)
+│   ├── repo/     durable .sc/ repo: refs/branches/working tree, three-way merge, history
+│   │             editing (cherry-pick/rebase/amend/undo), remotes + wire transport (ssh://,
+│   │             sc+http://), protection + secret lifecycle, GC, sparse & partial clone,
+│   │             signatures & session transcripts, agent workspaces
+│   └── cli/      `sc` binary — the full ~42-command surface (see CLAUDE.md)
 └── ARCHITECTURE.md
 ```
 
 `core` knows nothing about Git, worktrees, or cryptography. `gitio` is the only
 crate that links `gix`, keeping the Git dependency quarantined behind one
 boundary. `crypto` is the only crate that links the RustCrypto stack, keeping
-the cryptographic dependency quarantined behind another. `repo` owns the
-`.sc/` on-disk layout and the `init`/`commit`/`switch`/`secret` orchestration;
-`cli` depends on `repo` and links `gitio` directly only for the `import`
-command. This matters because the long-term plan is to own the object format
-outright; Git is an import/export peer, not a foundation.
+the cryptographic dependency quarantined behind another. `repo` owns the `.sc/`
+on-disk layout and all repo orchestration; it is deliberately **Git-agnostic**
+(it never links `gitio`) — `cli` links both `repo` and `gitio` and passes
+imported snapshots down. This matters because the long-term plan is to own the
+object format outright; Git is an import/export peer, not a foundation.
 
 ## Content-addressed snapshot model
 
@@ -81,25 +98,39 @@ its serialized bytes — the `ObjectId`. BLAKE3 (not SHA-1/SHA-256) because it i
 fast, parallel, and tree-structured, which lines up with verified streaming and
 future incremental hashing. Identical content anywhere in history is stored once.
 
-There are four object kinds:
+There are six object kinds (the leading byte of the canonical encoding tags the
+kind: blob 0, tree 1, secret 3, snapshot 4, signature 5, transcript 6; tag 2 is
+a retired pre-P16 snapshot encoding, refused with a clear error):
 
 - **Blob** — raw file contents.
 - **Tree** — a sorted directory listing mapping a name to `(kind, ObjectId,
-  mode, permissions)`. The per-entry `permissions` field is unused in the MVP but
-  is where the long-term per-file permission model lands, so the on-disk format
-  doesn't have to change later.
+  mode, permissions)`. The per-entry `permissions` byte carries the `PROTECTED`
+  bit (P7): a protected entry's blob is convergently-encrypted ciphertext, and
+  the bit is what makes "protected" and "ciphertext" synonymous in every tree.
 - **Snapshot** — the Jujutsu-inspired analogue of a commit: a root tree id plus
-  metadata (parent snapshot ids, author, timestamp, message). The distinction
-  from Git is that snapshots are cheap and implicit — the working copy *is* a
-  snapshot that gets amended, rather than a staging area that must be explicitly
-  committed.
-- **Secret** (Phase 2) — an envelope-encrypted object: ciphertext + AEAD nonce +
-  wrapped data-encryption key + recipient key ids. Stored and addressed exactly
-  like any other object, so it flows through fork/checkout/clone untouched and
-  stays ciphertext until an authorized context decrypts it.
+  metadata (parent snapshot ids, author, timestamp, message), a `secrets`
+  side-registry (name → secret-object id, so secrets are env vars, not files),
+  and a `protection` registry (per-prefix recipient rules as last-writer-wins
+  epoch registers, plus the per-blob wrapped-DEK map). The distinction from Git
+  is that snapshots are cheap and implicit — the working copy *is* a snapshot
+  that gets amended, rather than a staging area that must be explicitly committed.
+- **Secret** — an envelope-encrypted object: ciphertext + AEAD nonce + wrapped
+  data-encryption key + recipient ids. Stored and addressed exactly like any
+  other object, so it flows through fork/checkout/clone untouched and stays
+  ciphertext until an authorized context decrypts it.
+- **Signature** (P22) — a bytes-only object over a domain-separated snapshot id
+  (`Ed25519`), indexed on the side (`.sc/signatures`); the crypto stays
+  quarantined in `crates/crypto`, so `core` sees only opaque bytes.
+- **Transcript** (P30) — a sealed agent-session record attached to the snapshot
+  it motivated: the same envelope shape as a `Secret` (fresh DEK wrapped per
+  recipient) plus `{snapshot, agent, session}` metadata, so the plaintext session
+  never enters the store. Indexed on the side (`.sc/transcripts`), optionally
+  signed under its own domain.
 
 Objects are serialized canonically (length-prefixed, sorted tree entries) so the
-hash is stable across machines.
+hash is stable across machines. Every decode length prefix is bounded by a
+`MAX_OBJECT_SIZE` / remaining-bytes guard (P28) so a hostile object can't drive
+an unbounded allocation.
 
 ## In-memory VFS layer
 
@@ -159,10 +190,20 @@ returning the root `Snapshot` id. Agents then fork in-memory worktrees off that
 snapshot. No subprocess, no dependency on an installed `git`, and the boundary is
 a single crate so the rest of the system stays Git-agnostic. Export (writing a
 snapshot back out as a Git commit) is the symmetric operation, built in Phase 9;
-Phase 10 composes the two into bidirectional sync with a Git repo as a
-first-class remote. Both keep `gix` quarantined in `gitio`.
+Phase 10 composes the two into bidirectional sync with a *local* Git repo as a
+first-class remote, and Phase 18 reaches *hosted* Git (GitHub over https/ssh)
+through a spawned-system-`git` mirror bridge (`gix` can fetch but not push, so a
+lazily-built bare `mirror.git` beside the marks map is the transport). All of it
+keeps `gix` quarantined in `gitio`. This is distinct from sc's **own** network
+transport: `repo` speaks a framed wire protocol over ssh:// (P12) and sc+http://
+(P26) that mirrors its `Transport` trait — no `gix` involved (see the appendix).
 
-## Key management design (Phase 2)
+## Cryptography and key management
+
+All cryptography is quarantined in `crates/crypto`; `core` and `repo` see only
+opaque bytes. The crate owns three surfaces, all built on the RustCrypto stack:
+**envelope encryption** (secrets, below), **convergent encryption** for protected
+paths, and **Ed25519 signing** for provenance.
 
 Committed secrets use **envelope encryption**. Each secret object carries
 ciphertext encrypted under a fresh per-secret data-encryption key (DEK) using
@@ -189,10 +230,37 @@ re-wrapping the DEK for a changed recipient set — a cheap metadata operation t
 does not require rotating the secret itself. This is the same envelope model used
 by age and cloud KMS, chosen because it is well-understood and auditable.
 
+**Protected paths (P7)** encrypt designated file *content* rather than named
+env-var secrets. They use **convergent encryption** — the DEK and nonce derive
+from `BLAKE3(plaintext)` — so identical protected content dedups and an
+unauthorized clone gets ciphertext it cannot read. The tradeoff (equality is
+confirmable) is deliberate and documented; the `sc protect` CLI nudges genuine
+low-entropy secrets toward `sc secret` instead (P28). Per-prefix recipient rules
+are last-writer-wins epoch registers so a revoke is durable across merges (P16),
+and `sc grant`/`revoke`/`rewrap` manage the recipient set without re-encrypting
+convergent content. See ADR-0014/0026.
+
+**Lifecycle (P11/P17):** `sc secret rotate` re-seals a secret under a fresh DEK
+(the real cryptographic cutover, distinct from metadata-only revoke); `sc escrow`
+maintains break-glass recovery keys auto-included at seal time; `sc rewrap` is a
+one-commit bulk cutover of every secret and protected blob to the current
+recipient/escrow set. See ADR-0019/0027.
+
+**Provenance (P22):** `sc keygen` emits a **v2 identity** — one random seed,
+HKDF-derived into *both* an X25519 encryption key and an Ed25519 signing key,
+written as a single `scl-id-<hex>` file (a pre-P22 v1 `scl-sk-` identity still
+parses and encrypts but cannot sign). Signatures are bytes-only CAS objects over
+a domain-separated snapshot id, indexed in `.sc/signatures`; `sc verify` walks
+history and reports a four-state status (trusted ✓ / untrusted ? / invalid ✗ /
+unsigned). Session transcripts (P30) reuse the same signing machinery under a
+distinct domain. Signing binds identity to a *snapshot id*, detecting history
+rewrites in clones and remotes. See ADR-0032.
+
 ## Persistence
 
-The third wedge adds a durable on-disk store so commits and committed secrets
-survive between `sc` invocations. See ADR-0011.
+Persistence (Phase 3) adds a durable on-disk store so commits and committed
+secrets survive between `sc` invocations — the foundation every collaborative
+phase after it builds on. See ADR-0011.
 
 ### Persistent Store backend
 
@@ -207,16 +275,35 @@ extends naturally.
 
 ### `.sc/` layout and `scl-repo`
 
-The `scl-repo` crate owns everything `.sc/`-related:
+The `scl-repo` crate owns everything `.sc/`-related. The layout grew with the
+phases but the shape is stable:
 
-- `objects/` — loose content-addressed object files (one per `ObjectId`).
-- `refs/heads/<branch>` — one hex-id-per-line branch tip file, updated
-  atomically.
+- `objects/` — content-addressed object storage: sharded/zstd loose files
+  (`<aa>/<rest>`) plus `objects/pack/<hash>.pack` + `.idx` packfiles (P8).
+- `refs/heads/<branch>` — one hex-id-per-line branch tip, updated atomically.
+  `refs/remotes/<remote>/<branch>` — remote-tracking refs (P6).
 - `HEAD` — symbolic ref (`ref: refs/heads/<branch>`), updated atomically.
 - `lock` — exclusive lock file; acquired on `Repo::open`/`init`, removed on
   drop. Enforces the single-writer invariant.
-- `recipients.toml` — `[recipients]` table mapping a name to its
-  `scl-pk-<hex>` public key; read by `sc secret add/grant`.
+- `config` — remote definitions (`sc remote add`), TOML.
+- `recipients.toml` — `[recipients]` (name → `scl-pk-<hex>` encryption key),
+  `[escrow]` break-glass keys (P11/P17), and `[signing]`/`[signers]` (P22).
+- `scanner-allowlist.toml` — hash-scoped allowlist for the commit-time secret
+  scanner (P5).
+- `oplog` — append-only operation log; every ref-moving op records before/after
+  so `sc undo`/redo can invert it (P14). Local-only, like a reflog.
+- `signatures` — snapshot→signature-object index (P22); `transcripts` —
+  snapshot→transcript-object index, one-to-many (P30). Both gc-rooted, local-only.
+- `sparse` — the local, uncommitted sparse-checkout prefix spec (P24);
+  `promisor` — a partial clone's fetch-filter + origin (P27).
+- `serve-tokens.toml` — bearer-token access control for `sc serve --http` (P29).
+- `tmp/` — guard-cleaned scratch for streaming pack transfer (P25).
+- `ws/` — durable agent-session workspaces: `session.toml` manifest + per-agent
+  checkouts (P20). `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
+  lazily-built bare `mirror.git` for network Git (P10/P18).
+- Transient in-progress state (removed on completion/abort): `MERGE_HEAD`,
+  `PICK_HEAD`, `REBASE_STATE`, and their `*_DECIDED_ROOT` records — an
+  interrupted merge/pick/rebase resumes or aborts cleanly from these.
 
 ### Git-like working tree
 
@@ -234,9 +321,12 @@ zero-residue guarantee unchanged: nothing touches disk except `Worktree::checkou
 and the optional spill backend, both of which are removed after the session.
 
 **Persistent mode** (`sc init` repos) writes to `.sc/` by design. `.sc/` is
-user-owned durable state — the same relationship Git has with `.git/`. The
-two modes are mutually exclusive: a session is either ephemeral or persistent,
-never a mix.
+user-owned durable state — the same relationship Git has with `.git/`. The two
+modes compose in exactly one way: a `sc work`/`sc ws` agent session (P13/P20) is
+a bounded ephemeral session *hosted by* a persistent repo — temp checkouts are
+removed on teardown and the only durable writes go through the same commit path
+persistent mode already owns. Otherwise a session is either ephemeral or
+persistent, never a mix.
 
 ### Durability & concurrency (hardened)
 
@@ -518,3 +608,295 @@ every path they blocked has a decrypt-on-demand or ciphertext-id
 resolution. `demo/run_protected_merge_demo.sh` proves the keyless disjoint
 case, the identity-gated content-divergent case, and registry replay
 end-to-end. See ADR-0025.
+
+## Phase 16 — revocation tombstones (built)
+
+Protection rules moved from a bare recipient-key list to a per-recipient
+**last-writer-wins register**: `RecipientEntry { key, epoch, state: Granted |
+Revoked }`. `grant`/`revoke` mint a fresh `epoch = max(current) + 1`;
+`merge_prefixes` keeps the higher-epoch entry per recipient and resolves an
+epoch tie with disagreeing states as **Revoked** (fail-closed). Commit-time
+sealing reads only `granted_keys()` — Granted entries — so a tombstoned
+recipient never seals a fresh DEK again, even when a pre-revoke branch merges
+in later. This is the closure of the P15 boundary note: P15's union merge
+made revoke non-durable against a merge of a pre-revoke branch, because the
+old key-list union simply re-added the revoked recipient.
+
+`grant`'s authorization and `decrypt_with` are unchanged (they key off wrap
+*presence*, not standing), so a revoked recipient can still read ciphertext
+sealed before the revoke — revoke is a standing cutover, not a
+cryptographic one; rotation remains the only way to cut off a key that
+already saw plaintext. The rules-format tag bumped `2 → 4`
+(`TAG_SNAPSHOT_LEGACY = 2`), so a pre-P16 store fails to decode with an
+explicit error rather than silently misparsing the new layout. See ADR-0026.
+
+## Phase 17 — bulk re-wrap + multiple escrow keys (built)
+
+`sc rewrap [--identity <key>] [--dry-run]` is a one-commit, one-oplog-record
+sweep that recovers every secret and unwraps every protected blob's DEK by
+wrap presence, then re-seals to exactly the governing rule's current
+`granted_keys() + escrow` — the practical answer to the P16 corollary that a
+merged-in pre-revoke branch can re-attach a revoked recipient's old wraps to
+the live tip. Convergent DEKs keep ciphertext ids unchanged, so the commit is
+policy-only (root tree byte-identical to the parent). Entries the identity
+can't open are **skipped and named**, not silently dropped; the sweep commits
+what it could and exits non-zero when anything was skipped.
+
+Escrow grew from a single key to a managed list: `sc escrow add/remove/show`
+join `set` (kept as replace-with-one sugar), and `.sc/recipients.toml
+[escrow]` grows from `key = "…"` to `keys = […]` (old singular form still
+read on load). Same honesty caveat as rotation: rewrap cuts the *live tip*
+only — old snapshots in history keep their old wraps via content addressing.
+See ADR-0027.
+
+## Phase 18 — network Git remotes (built)
+
+Hosted Git (GitHub over https/ssh) becomes reachable because upstream `gix`
+can fetch/clone but not push, so a pure in-process path is impossible today.
+Each git-backed network remote gets a lazily-created bare mirror at
+`.sc/git-remotes/<name>/mirror.git`, alongside (not replacing) P10's `marks`
+file — deleting `mirror.git` is always safe (self-reconstructs), deleting
+`marks` is not (it carries `git_oid ↔ sc_id` identity). The spawned system
+`git` binary (quarantined to `crates/gitio`) is transport-only: `fetch` runs
+`git fetch --prune` into the mirror then P10's unchanged import; `push` runs
+P10's unchanged export into the mirror then `git push`, reusing the P9/P10
+confidentiality gate verbatim. Auth is fully delegated to the spawned `git`
+(ssh-agent, credential helpers, tokens) — `sc` has no credential surface of
+its own.
+
+Clone routing auto-detects unambiguous git URL forms (`https://`, `http://`,
+scp-style, `file://`); bare `ssh://` stays sc-native unless `--git` forces
+the bridge. `SC_GIT` overrides the spawned binary, mirroring P12's `SC_SSH`.
+See ADR-0028.
+
+## Phase 19 — history-editing polish (built)
+
+Riding the same P14/P15 replay core with no second merge implementation.
+`sc amend [-m <msg>]` rebuilds the tip from the working tree with the tip's
+own parents kept, via a `parents_override` parameter on the existing
+`snapshot_files` pipeline. **Resumable rebase is now the default**, revising
+P14's atomic-abort: a conflict stops with P4 markers and a persisted
+`.sc/REBASE_STATE` instead of aborting; `sc rebase --continue` completes the
+conflicted commit and resumes the fold, and any number of stops still
+collapses into ONE oplog record because the branch ref only moves at final
+completion. `sc cherry-pick --abort` restores the untouched tip with no
+oplog record at all — no ref ever moved, so abort is its own inverse. `sc
+cherry-pick <ref> --mainline <N>` replays a merge commit relative to its Nth
+parent; rebase over a merge-containing range stays refused (a rebase replays
+a whole range, so there's no single relative parent a flag could resolve).
+
+A review Critical closed a resumability bug: `--continue` used to clear
+`REBASE_STATE` before running the resumed fold, so a typed error mid-fold
+destroyed retry/abort; state now clears only on the fold's own completion,
+and a `resolved` flag makes a retried `--continue` idempotent. See ADR-0029.
+
+## Phase 20 — agent sessions + auto-merge (built)
+
+Agent sessions now outlive a single process. `sc ws fork --agents N`
+materializes N checkouts under `.sc/ws/<i>/` and atomically writes
+`.sc/ws/session.toml` (base snapshot, base branch, workspace dirs + status,
+author) — the checkout directories plus this manifest **are** the durable
+state, so `sc ws list/run/harvest/abandon` work across any number of later
+invocations, even a different day. `sc ws harvest` runs each live workspace
+through P13's harvest pipeline, then auto-merges the candidate onto the
+landing branch through a read-only conflict probe (`would_merge_cleanly`,
+composing P4's `three_way` + `merge_secrets`) that guarantees no conflict
+markers land unattended: clean merges land immediately and cumulatively (one
+oplog record each), anything conflicted falls back to a `work-<i>` branch
+exactly as P13 did. Harvest joins the P19 merge/pick/rebase-in-progress
+guard family as a ref-mover.
+
+`resolve_and_teardown` writes the manifest before removing the workspace
+directory, so a crash between the two never strands a `live = true` entry
+pointing at a directory that no longer exists. See ADR-0030.
+
+## Phase 21 — hardening & consolidation sweep (built)
+
+No new capability axis — a sweep closing the P16–P20 review tail. Every
+commit-creating policy op (`protect`/`grant`/`revoke`,
+`secret add/rotate/grant/revoke`) now opens with the same
+merge/pick/rebase-in-progress guard the ref-movers already used, closing a
+hazard where an unguarded policy op mid-stopped-rebase had its commit
+silently discarded by completion. Git marks staleness self-heals at the one
+dangerous point of use: `GitTarget::has_object` verifies a mark-reused git
+commit still exists in the target before reuse, re-synthesizing instead of
+writing a broken parent chain when `git gc` pruned it upstream. The three
+verbatim conflict-materialization copies (merge, cherry-pick, rebase fold)
+collapse into one `Repo::materialize_conflict_state` helper. `sc ws list`
+gains a `landed_tip` field so a workspace whose merge actually landed
+reports `"landed"` (or `"landed (undone by sc undo)"`) instead of the
+generic `"abandoned"` a manual `ws abandon` still shows. See ADR-0031.
+
+## Phase 22 — signed commits & provenance (built)
+
+Signatures are ordinary CAS objects (`TAG_SIGNATURE`, bytes-only in
+`crates/core` — no crypto crosses the quarantine) over the domain-separated
+snapshot id; a local `.sc/signatures` index maps snapshot → signature ids,
+gc-rooted and pruned alongside dead snapshots. `sc keygen` now emits a **v2
+identity**: one random seed, HKDF-derived into *both* an X25519 encryption
+key and an Ed25519 signing key in a single `scl-id-<hex>` file (a v1
+`scl-sk-` identity still parses and encrypts, but can't sign). Verification
+(`sig_status`) is strict four-state — `Invalid` beats `Trusted` beats
+`Untrusted` beats `Unsigned` — and `sc verify [<ref>] [--require]` walks
+every parent, not just the mainline.
+
+Transfer needed zero wire changes: signatures ride the existing pack as
+ordinary objects, reindexed by id on receipt. `recipients.toml` gains
+`[signing]` (name → key) and `[signers] trusted = […]`, mirroring
+`[recipients]`'s shape. Stated plainly: signing defends against history
+rewriting and attribution disputes, not against a trusted signer acting
+maliciously — and `amend`/`rebase`/`merge` results start unsigned by design,
+since a new snapshot id is a new claim. See ADR-0032.
+
+## Phase 23 — merge ergonomics (built)
+
+One new abstraction, `conflict_versions(path) -> {base, ours, theirs}`
+(`crates/repo/src/conflicts.rs`), re-derives all three sides of a conflict
+from the DAG for whichever op is active (merge/pick/stopped-rebase) instead
+of parsing marker text off disk. `sc conflicts [<path>] [--identity]` lists
+conflicted paths and kinds, or renders a path's base/ours/theirs sections
+(protected paths decrypted per-side against *that side's own* protection
+registry, gated on `--identity`); `sc resolve --ours|--theirs <path…>`
+writes the chosen side and clears the path from the active conflict record.
+Resolution only decrypts — it never re-encrypts, so plaintext still never
+enters the CAS before the unchanged `sc commit`/`sc rebase --continue`
+completion re-encrypts through the same helpers `commit` always used.
+
+`sc status --json`'s `"conflicts"` field grew from a bare path list to
+`[{path, kind}]` — a strict superset, no existing consumer broke. Whole-file
+resolution only; no hunk-level modes. See ADR-0033.
+
+## Phase 24 — sparse checkouts (built)
+
+`.sc/sparse` is a local, uncommitted prefix spec (`sc sparse set/show/
+disable`; empty/absent = full materialization). The whole feature is one
+generalized carry predicate: `commit`'s existing absent-path carry (the
+P15/ADR-0025 discipline) widens from "absent AND still-protected-and-not-a-
+recipient" to "absent AND (that OR outside the sparse set)", so a commit
+made while narrowed carries the untouched out-of-sparse subtree forward
+byte-identical, while an in-sparse absence stays a genuine deletion.
+`materialize` filters its write and old-root-removal loops by the same spec;
+`sc ws` workspaces inherit the host's sparse view, persisted at fork time in
+`session.toml` so a later `sparse set` on the host can't reinterpret a
+workspace's never-materialized paths as deletions.
+
+A clean merge/pick/rebase change to an out-of-sparse path lands in the CAS
+without materializing; a CONFLICT there refuses up front with a "run `sc
+sparse set` to include it" hint. Sparse is CHECKOUT-only — every object
+stays in the CAS regardless of the spec, so `sc gc`'s reachability walk is
+unaffected; not fetching out-of-prefix objects at all is deferred to P27.
+See ADR-0034.
+
+## Phase 25 — streaming pack transfer (built)
+
+`push`/`fetch`/`clone` no longer hold a whole pack in RAM on either side.
+`crates/core/src/pack.rs` gained an incremental `PackWriter` (appends
+objects one at a time to any `Write`) and a streaming `parse_pack_reader`
+(verifies each record's hash off a `Read` without holding the whole body).
+`crates/repo/src/wire.rs` frames a pack as `ST_PACK_CHUNK`/`ST_PACK_END`
+opcodes under the unchanged `u32` frame header, `CHUNK_SIZE` defaulting to 1
+MiB (`SC_PACK_CHUNK` overrides it). **`PROTOCOL_VERSION` bumped 1 → 2**, v1
+dropped outright — one pack encoding, always chunked, rejected cleanly at
+handshake on mismatch. The receiver does a two-pass atomic-after-verify
+ingest into a guarded temp file (`.sc/tmp/`, `TempPackGuard`) so a corrupt or
+truncated pack never partially lands.
+
+A final-review fix closed the client side too: `fetch`/`clone`'s incoming
+pack and `push`'s outgoing pack both now spill through the same guarded
+temp-file path instead of destreaming into a `Vec`, so peak RAM is one
+object end to end, not just on the wire and server. See ADR-0035.
+
+## Phase 26 — sc-native HTTP transport (built)
+
+A second sc-native transport alongside P12's ssh://: `sc+http://
+host[:port]/repo` (default port 8730). The opening codec is four small pure
+`Read`/`Write` functions routed through one `read_bounded_opening` helper
+that errors out past `MAX_OPENING_BYTES` (8 KiB) rather than allocating
+unbounded on a hostile/unterminated opening. The client reads and maps an
+HTTP-style status line (`200`/`404`/other) *before* the `WireClient`
+handshake begins, so a non-repo server is never mistaken for a HELLO
+failure. The server (`sc serve --http <addr> <path>`) is a
+`TcpListener`, thread-per-connection, each thread opening `LocalTransport`
+fresh — no store or lock shared across threads. Concurrency safety layers
+the pre-existing single-writer `RepoLock` (ref updates) with lock-free
+content-addressed object writes, tightened with thread-unique temp sibling
+names now that thread-per-connection puts multiple writers in one process
+for the first time.
+
+After the `200` status, the raw `TcpStream` goes straight to `wire::serve` —
+no HTTP framing wraps the P25 chunk stream. Zero new dependencies
+(`std::net`/`std::io` only). Standing boundaries stated plainly: plaintext
+only (no TLS), unauthenticated (closed in P29), not proxy/CDN-safe. See
+ADR-0036.
+
+## Phase 27 — partial clone (built)
+
+`.sc/promisor` (local, uncommitted) records a partial clone's fetch-filter
+prefixes plus the promisor origin URL; its presence makes a gap expected.
+One path-aware walk, `reachable_objects_filtered` → `Reachable { included,
+gaps }`, serves both the server's `get_pack` filter (`GetPack.filter`,
+**`PROTOCOL_VERSION` 2 → 3**) and the client's own gc/`sc verify`: an
+out-of-filter child's id lands in `gaps` and is never fetched — which is why
+absent out-of-filter objects never surface as errors. `sc clone --filter
+<prefix…>` writes both `.sc/promisor` and `.sc/sparse` to the same prefixes
+(partial ⊇ sparse, one filter); `sc backfill <prefix…>` widens both,
+explicitly and offline — no lazy-fetch from inside a read path.
+
+Building a *new* commit on a partial clone needed real machinery beyond
+carry-by-id: `worktree::graft_out_of_sparse` splices the tip's untouched
+out-of-filter subtrees back into a freshly built root by id, never reading
+their content, so push's filtered reachability walk still sends only the
+client's new in-filter objects. `commit` refuses (`Error::GappedPathContent`)
+rather than silently drop content under an unfetched subtree. `sc backfill
+--all` is the genuine full-clone escape hatch: fetch everything, verify the
+closure, then remove `.sc/promisor`. Merge, replay, `sc ws fork/harvest`, and
+`sc work` are all refused outright on a partial clone as a deliberate MVP
+coarsening rather than per-case gap tolerance. See ADR-0037.
+
+## Phase 28 — security hardening sweep (built)
+
+A dedicated security pass closing exposure introduced by opening the store
+to untrusted network peers (P26/P27). One `MAX_OBJECT_SIZE` cap bounds any
+single object's decompressed/decoded size at every read/write boundary that
+takes attacker-controlled bytes, closing a decompression-bomb / unbounded-
+allocation class that P25's `read_frame_inner` had already named as a known
+gap. Ref names are validated at the write boundary (rejecting path traversal
+and control characters) before ever touching `.sc/refs/` on disk, since a
+ref name had until now been trusted as an internal identifier rather than
+treated as attacker-reachable input once a network write path existed. See
+ADR-0039.
+
+## Phase 29 — sc+http access control (built)
+
+`sc serve --http` gains three composed access-control gates at the
+connection opening, closing P26's stated "unauthenticated" boundary: a
+read-only mode that rejects any write-shaped request before it reaches
+`wire::serve`, a fail-closed bind check, and bearer-token authentication
+against a `.sc/serve-tokens.toml` allowlist. `EC_READONLY` (or equivalent
+server flag) forces the read-only gate independent of tokens, so a
+public-read mirror needs no token management at all. Each gate runs before
+the P25/P26 wire handshake begins, matching P26's own status-line-before-
+handshake discipline, so a rejected connection never reaches
+`LocalTransport`. See ADR-0040.
+
+## Phase 30 — agent session transcripts (built)
+
+A sealed provenance record can now attach to a commit. `Transcript {
+snapshot, agent, session, nonce, ciphertext, wrapped_keys }` is a bytes-only
+`TAG_TRANSCRIPT` object in `crates/core` (the crypto quarantine holds) whose
+body is *always* sealed via `scl_crypto::seal` before it reaches the CAS —
+a keyless clone gets ciphertext only. A one-to-many `.sc/transcripts` index
+(snapshot → transcript ids) means history-editing ops start each fresh
+snapshot with none attached, so there is no stale-provenance carry-forward
+to reason about. Signing is opt-in and reuses P22's machinery outright —
+same `SignatureObj` type, same `.sc/signatures` index, no second index —
+under a distinct signature domain string.
+
+Because transcripts are ordinary content-addressed CAS objects, transfer
+needed zero wire changes: the sender over-sends every indexed transcript
+(and its signature, folded into the same over-send query as P22's) covering
+a transfer-relevant snapshot, and the receiver reindexes idempotently. `sc
+gc` roots live transcript ids into reachability before signature pruning
+runs, so a signed transcript survives exactly as long as the transcript
+itself does. `sc export --to <git-repo>` drops transcripts (no Git-native
+form exists) and reports a count. See ADR-0038.
