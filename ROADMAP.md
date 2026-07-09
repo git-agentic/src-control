@@ -405,8 +405,20 @@ across every phase.
 
 ## Active
 
-**None.** P29 — sc+http access control (read-only mode + fail-closed bind
-+ dep-free bearer-token auth, ADR-0040) is next up.
+**Phase 29 — sc+http access control** (ADR-0040, Proposed; spec
+`docs/superpowers/specs/2026-07-09-p29-sc-http-access-control-design.md`).
+The second, larger half of the security horizon: P26's `sc serve --http` is
+unauthenticated and unrestricted. P29 adds three composed gates — a
+fail-closed non-loopback bind (refused unless `--read-only`,
+`--allow-public`, or ≥1 configured token), dep-free bearer-token auth at the
+HTTP opening (`Authorization: Bearer`, constant-time `BLAKE3` compare, `401`
+before the wire handoff; `sct-` tokens in `.sc/serve-tokens.toml` as
+`{label, hash, scope}`; `SC_HTTP_TOKEN` client env; `sc serve token
+add/remove/list`), and per-connection read-only enforcement
+(`wire::serve_with_policy` rejects `PutObject`/`PutPack`/`UpdateRef` before
+any store write via a new `EC_READONLY`). No TLS, no new dependency; the wire
+format is unchanged but for the new error code, so the ssh path is untouched.
+Closes the audit's remaining unauthenticated-server High.
 
 ## Completed phases (usability-first ordering)
 
