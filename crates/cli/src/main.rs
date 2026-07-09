@@ -301,6 +301,10 @@ enum Cmd {
     },
     /// Protect a path prefix: files under it are convergently encrypted for the
     /// named recipients on commit. With `--list` (or no prefix), list the rules.
+    /// Convergent encryption is equality-confirmable — an attacker who can
+    /// guess a candidate plaintext can confirm a match (see ADR-0014); for
+    /// low-entropy secrets (API keys, `.env` files, credentials), prefer
+    /// `sc secret` instead.
     Protect {
         /// Path prefix to protect (e.g. `secret/`). Omit to list.
         prefix: Option<String>,
@@ -2746,6 +2750,31 @@ fn run_push_git(repo: &scl_repo::Repo, remote: &str, include_encrypted: bool) ->
     Ok(())
 }
 
+/// FILENAME heuristic (NOT the P5 content scanner): does this basename look
+/// like a low-entropy secret better served by `sc secret` than by convergent
+/// `sc protect`? Case-insensitive. This is deliberately distinct from
+/// `crates/repo`'s content-regex secret scanner (which inspects file bytes at
+/// commit time) — this predicate only ever looks at a path's basename, and
+/// must not invoke or import the content scanner's patterns.
+fn looks_like_low_entropy_secret(basename: &str) -> bool {
+    let lower = basename.to_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") {
+        return true;
+    }
+    if let Some(ext) = lower.rsplit('.').next() {
+        if lower.contains('.') && matches!(ext, "pem" | "key" | "p12" | "pfx") {
+            return true;
+        }
+    }
+    if lower.starts_with("id_") {
+        return true;
+    }
+    if lower.contains("credentials") || lower.contains("secret") {
+        return true;
+    }
+    false
+}
+
 fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) -> Result<()> {
     let repo = open_repo()?;
     if list || prefix.is_none() {
@@ -2778,6 +2807,25 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
         return Ok(());
     }
     let prefix = prefix.unwrap();
+
+    // Pattern-aware nudge (P28): warn, stderr-only, if a file this prefix
+    // would govern looks like a low-entropy secret filename that's better
+    // served by `sc secret` than convergent `sc protect` (ADR-0014's
+    // equality-confirmability caveat). Never blocks; protect proceeds
+    // regardless.
+    let boundary_prefix = prefix.trim_end_matches('/');
+    let boundary_dir_prefix = format!("{boundary_prefix}/");
+    if let Some(path) = repo
+        .worktree_paths()?
+        .into_iter()
+        .find(|path| {
+            (path == boundary_prefix || path.starts_with(&boundary_dir_prefix))
+                && looks_like_low_entropy_secret(path.rsplit('/').next().unwrap_or(path))
+        })
+    {
+        eprintln!("warning: {path} looks like a low-entropy secret; convergent encryption (sc protect) is equality-confirmable — prefer 'sc secret' for API keys / .env / credentials (see ADR-0014).");
+    }
+
     let recipients_path = repo.layout().dot_sc.join("recipients.toml");
     let dir = load_recipients(&recipients_path)?;
     let mut pks = resolve_names(&dir, &to)?;
@@ -2958,6 +3006,16 @@ mod tests {
         assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(7 * 86400));
         assert!(parse_duration("nope").is_err());
         assert!(parse_duration("7").is_err());
+    }
+
+    #[test]
+    fn looks_like_low_entropy_secret_matches_and_misses() {
+        for basename in [".env", ".env.local", "id_rsa", "deploy.key", "server.pem", "aws_credentials", "cert.p12"] {
+            assert!(looks_like_low_entropy_secret(basename), "expected match: {basename}");
+        }
+        for basename in ["main.rs", "README.md", "util.rs"] {
+            assert!(!looks_like_low_entropy_secret(basename), "expected no match: {basename}");
+        }
     }
 
     #[test]
