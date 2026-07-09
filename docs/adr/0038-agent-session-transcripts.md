@@ -2,7 +2,8 @@
 
 - **Status:** Proposed
 - **Date:** 2026-07-09
-- **Phase:** 28 (candidate — next horizon after P27)
+- **Phase:** P30 (candidate — after P29 sc+http access control closes the security horizon;
+  slot decided in the brainstorm, D7)
 - **Builds on:** ADR-0002 (content addressing), ADR-0008/0010 (envelope
   encryption), ADR-0017 (secret scanner), ADR-0023/0030 (agent
   workspaces/sessions), ADR-0032 (side-metadata CAS-object pattern)
@@ -10,8 +11,25 @@
   dedicated git branch; validates demand, and its gaps (transcripts
   inherit repo visibility, no commit↔transcript integrity, ref-namespace
   pollution) are exactly what a native design closes.
-- **Spec:** `docs/superpowers/specs/` (to be written; brainstorm at
-  `2026-07-09-p28-session-transcripts-brainstorm.md`)
+- **Spec:** `docs/superpowers/specs/2026-07-09-p28-session-transcripts-brainstorm.md`
+  (decision-complete; grilling resolved every open tension into D1–D7)
+
+## Brainstorm resolution (2026-07-09)
+
+The grilling session settled the decisions this ADR left open (see the brainstorm's
+"Decisions locked" section for the reasoning):
+
+- **Wrap location — Secret-shape confirmed** over the split-envelope alternative this ADR
+  flagged as "the main open design tension" (D1): wraps live inside the object; a recipient-set
+  change mints a new transcript object + re-points the index. Chosen for natural zero-wire
+  transfer and `TAG_SECRET` reuse, accepted because transcripts are per-session and rarely
+  rewrapped.
+- **Signed transcripts — in the MVP, opt-in** (D2/D3): reuse `SignatureObj` + `.sc/signatures`
+  with a `"sc-transcript-sig-v1"` domain; `--sign` at attach + retroactive `sc transcript sign`.
+- **Index — one-to-many, additive, no silent carry under amend/rebase/merge** (D4).
+- **Access lifecycle deferred** — seal fixed at attach; no rewrap/grant/revoke for transcripts
+  in the MVP (D5). **Deletion (`sc transcript drop` + resurrection tombstone) deferred** (D6).
+  **`--transcript auto` probing deferred** — MVP takes an explicit `<path>` (D6).
 
 ## Context
 

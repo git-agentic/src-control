@@ -1,8 +1,11 @@
-# Phase brainstorm — Agent session transcripts as CAS objects (P28 candidate)
+# Phase brainstorm — Agent session transcripts as CAS objects (P30 candidate)
 
 **Date:** 2026-07-09
-**Status:** Brainstorm (feeds a spec + Proposed ADR-0038)
+**Status:** Decision-complete (grilling resolved all open questions — see "Decisions locked"
+below; ready to become the P30 spec when P29 completes). Feeds ADR-0038.
+**Slot:** P30, after P29 (sc+http access control) closes the security horizon (D7).
 **Prior art:** [Entire](https://entire.io/) (`entireio/cli`, MIT, Go, ~4.6K stars)
+**Note:** filename retains the `p28-` prefix it was created under; the phase is P30 (D7).
 
 ## The problem
 
@@ -127,7 +130,11 @@ should store the body in (or losslessly convertible to) Entire's
 session/checkpoint JSON layout rather than inventing a gratuitously
 different one.
 
-## Open questions (for the spec)
+## Open questions (for the spec) — ALL RESOLVED
+
+> These are the questions the brainstorm opened; every one is now settled in
+> "Decisions locked" below (OQ1/OQ5→D6, OQ2→D1+D5, OQ3→D4, OQ4→D2+D3, OQ6→D7).
+> Kept as the historical record of the design space explored.
 
 1. **Size discipline.** Transcripts are KBs–MBs, not signature-sized.
    P22's over-send-on-every-transfer fix (the refetch Critical) is cheap
@@ -168,18 +175,77 @@ different one.
    sessions, which it composes with (named sessions → named transcript
    streams).
 
-## MVP cut proposal
+## Decisions locked (grilling, 2026-07-09)
+
+This section is authoritative over the "leaning" language above; it accumulates as
+`/grill-with-docs` resolves each open question into a firm decision.
+
+- **D1 — Wrap location: Secret-shape, wraps inside the object** (resolves OQ2's
+  where-do-wraps-live half). `Transcript { snapshot, agent, session, nonce, ciphertext,
+  wrapped_keys }`, wraps content-addressed inside the object like `TAG_SECRET`. Chosen for
+  natural zero-wire-change transfer (wraps ride the already-over-sent object), reuse of the
+  exact `TAG_SECRET` seal/open path (crypto quarantine untouched), and a self-contained
+  object — accepting that a recipient-set change mints a *new* transcript object + re-points
+  the index (cheap because transcripts are per-session, rarely rewrapped). The split
+  envelope (wraps in the index) was rejected: it optimizes a near-zero rewrap cost at the
+  expense of the transfer property. *Still open (OQ2 remainder): whether `sc rewrap` sweeps
+  transcripts at all in the MVP.*
+- **D2 — Transcript ids are signable** (resolves OQ4's MVP-or-not: IN the MVP). Attachment
+  alone is only an authorized-writer claim (threat model gap); signing the transcript id
+  binds a specific identity and composes with P22 (signed transcript → its `snapshot` field
+  binds the code snapshot → itself possibly signed). Recommended mechanism (pending Q3
+  confirmation): reuse P22 `SignatureObj` + `.sc/signatures` index verbatim, adding only a
+  `"sc-transcript-sig-v1"` domain string selected at verify time by the signed target's
+  object kind — no signature-object format change, no second index.
+- **D3 — Signing is opt-in, not mandatory** (resolves Q3). Mirror P22: `--sign
+  [--identity <key>]` on `sc transcript attach` and `sc ws harvest --transcript`, plus
+  retroactive `sc transcript sign <ref>`. An unsigned transcript is a valid authorized-writer
+  claim; signing upgrades it to attested. Rationale: sealing needs only recipient public keys
+  (always available), but signing needs the writer's v2 signing secret key, which CI/automation
+  and v1 identities lack — mandatory signing would silently block provenance capture in exactly
+  those contexts. Four-state `SigStatus` surfaced in `sc transcript show`/`list`.
+- **D4 — One-to-many additive index; no silent carry** (resolves OQ3). The `.sc/transcripts`
+  index maps snapshot → *list of* transcript ids (mirrors the signatures index: several agents
+  or a human design-note beside an agent session can share a snapshot; identical re-attach is a
+  no-op). amend/rebase/merge mint new snapshot ids that start with NO transcripts — attachment
+  is never silently carried (a new id is a new claim); re-attach deliberately. gc prunes the
+  orphaned transcript once its old snapshot leaves history.
+- **D5 — Seal is fixed at attach; access lifecycle deferred** (resolves OQ2 remainder). A
+  transcript is sealed once to the then-current `[transcripts]` recipient set; changing that set
+  affects only future attachments (forward-only, like P11 escrow). `sc rewrap` does not touch
+  transcripts; no `sc transcript grant/revoke/rewrap` in the MVP. Old-transcript access-cutover
+  is a named follow-on (would mint new objects, same caveats as secret rewrap, far less urgency).
+- **D6 — MVP boundary** (resolves OQ1 + OQ5 + the deferred surface). IN: `TAG_TRANSCRIPT = 6`
+  sealed object; opt-in signing; one-to-many index; fixed-at-attach seal; `[transcripts]`
+  recipients defaulting to full set + escrow; P5 scan-and-warn before seal; **opaque body** (no
+  schema/validation, agent-agnostic); surface `sc ws harvest --transcript <path>` +
+  `sc transcript attach/show/list/sign` + `sc log` presence marker; transfer by over-sending
+  indexed transcript ids into the want-set (has-gated by the existing pack diff — a transcript
+  the receiver already holds is never re-shipped), reindex on receipt, clone full-scan reindex,
+  zero wire change; gc prunes transcripts of dead snapshots; git export drops with a
+  `transcripts_dropped` count. DEFERRED (named follow-ons): `--transcript auto` probing (MVP is
+  explicit `<path>` only), `sc transcript drop` + resurrection tombstone, access lifecycle
+  (rewrap/grant/revoke — D5), `--no-transcripts` transfer knob, `sc export --transcripts=entire`,
+  per-turn live checkpointing.
+- **D7 — Slot: P30, after P29** (resolves OQ6). The security horizon finishes first — P29
+  (sc+http access control) closes the audit's remaining unauthenticated-server High. Transcripts
+  open the next horizon (agent/workspace depth; they compose with the deferred named/multiple
+  ws-sessions → named transcript streams). ADR-0038's stale "Phase 28" label updates to P30.
+
+## MVP cut proposal (authoritative: D1–D7 above)
 
 `TAG_TRANSCRIPT = 6` (bytes-only in core, quarantine held) + sealed body
-+ `.sc/transcripts` gc-rooted index + zero-wire-change pack transfer with
-idempotent index dedup + `sc ws harvest --transcript` + `sc transcript
-attach/show/list` + `sc log` marker + P5 scan-and-warn before seal + git
-export drops-with-count. Deferred: per-turn checkpoints, Entire-format
-export, signed transcripts (unless cheap), transfer opt-out knob,
-drop-tombstones.
++ `.sc/transcripts` gc-rooted one-to-many index + zero-wire-change pack transfer with
+idempotent index dedup + `sc ws harvest --transcript <path>` + `sc transcript
+attach/show/list/sign` + **opt-in transcript signing** (`--sign`, `"sc-transcript-sig-v1"`
+domain, reusing the P22 `SignatureObj` + `.sc/signatures` index) + `sc log` marker
++ P5 scan-and-warn before seal + git export drops-with-count. Deferred: per-turn
+checkpoints, Entire-format export, `--transcript auto` probing, transfer opt-out knob
+(`--no-transcripts`), access lifecycle (rewrap/grant/revoke), drop + resurrection-tombstones.
 
 Demoable outcome: `demo/run_transcript_demo.sh` — run a session, harvest
-with a transcript, clone to a second repo, prove the transcript rode the
-pack, prove a keyless clone gets ciphertext only (positive control per
-the P7 demo discipline), decrypt with an authorized identity, gc a
-deleted branch and prove the transcript died with it.
+with a transcript (`--sign` under an identity), clone to a second repo, prove the
+transcript rode the pack AND its signature verifies (`sc transcript show`), prove a
+keyless clone gets ciphertext only (positive control per the P7 demo discipline),
+decrypt with an authorized identity, gc a deleted branch and prove the transcript
+died with it.
