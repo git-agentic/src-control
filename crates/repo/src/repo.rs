@@ -4317,7 +4317,7 @@ mod tests {
         use crate::transport::Transport as _;
         let transport = crate::transport::LocalTransport::open(&remote_root).unwrap();
         let mut pack = Vec::new();
-        transport.get_pack(&[c2], &haves, &mut pack).unwrap();
+        transport.get_pack(&[c2], &haves, None, &mut pack).unwrap();
         let entries: Vec<scl_core::ObjectId> = scl_core::pack::parse_pack(&pack)
             .unwrap()
             .into_iter()

@@ -272,8 +272,14 @@ impl Transport for HttpTransport {
     ) -> Result<()> {
         self.client.update_ref(branch, id, expected_old)
     }
-    fn get_pack(&self, wants: &[ObjectId], haves: &[ObjectId], out: &mut dyn Write) -> Result<()> {
-        self.client.get_pack(wants, haves, out)
+    fn get_pack(
+        &self,
+        wants: &[ObjectId],
+        haves: &[ObjectId],
+        filter: Option<&[String]>,
+        out: &mut dyn Write,
+    ) -> Result<()> {
+        self.client.get_pack(wants, haves, filter, out)
     }
     fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
         self.client.put_pack(src)

@@ -68,7 +68,7 @@ impl Repo {
             let store_arc = dst_repo.vfs.store();
             let mut store = store_arc.lock().unwrap();
             // Fresh clone dst has no local refs yet → no haves → full transfer.
-            transfer_objects(&dst_repo.layout, transport.as_ref(), &mut store, &tips, &[])?;
+            transfer_objects(&dst_repo.layout, transport.as_ref(), &mut store, &tips, &[], None)?;
             // Clone-specific belt-and-suspenders (P22 Task 3): the transfer
             // above already indexes every signature object it wrote via
             // `index_incoming`, but a fresh clone is a wholesale copy of the
@@ -131,7 +131,7 @@ impl Repo {
             let mut store = store_arc.lock().unwrap();
             // Derive haves from local refs before the mutable borrow for transfer.
             let haves = local_have_tips(&self.layout, &store)?;
-            transfer_objects(&self.layout, transport.as_ref(), &mut store, &tips, &haves)?;
+            transfer_objects(&self.layout, transport.as_ref(), &mut store, &tips, &haves, None)?;
         }
         for (branch, tip) in &remote_refs {
             refs::write_remote_tip(&self.layout, remote, branch, tip)?;
@@ -268,11 +268,12 @@ fn transfer_objects(
     store: &mut Store,
     tips: &[ObjectId],
     haves: &[ObjectId],
+    filter: Option<&[String]>,
 ) -> Result<()> {
     let guard = crate::transport::TempPackGuard::new(layout)?;
     {
         let mut f = std::fs::File::create(guard.path())?;
-        transport.get_pack(tips, haves, &mut f)?;
+        transport.get_pack(tips, haves, filter, &mut f)?;
     }
     crate::transport::ingest_pack_file(layout, store, guard.path())?;
     Ok(())
@@ -438,7 +439,7 @@ mod tests {
         {
             let store_arc = dst.vfs().store();
             let mut store = store_arc.lock().unwrap();
-            transfer_objects(&dst.layout, &client, &mut store, &[tip], &[]).unwrap();
+            transfer_objects(&dst.layout, &client, &mut store, &[tip], &[], None).unwrap();
         }
         client.bye().unwrap();
         drop(client);
@@ -503,7 +504,7 @@ mod tests {
         {
             let store_arc = dst.vfs().store();
             let mut store = store_arc.lock().unwrap();
-            transfer_objects(dst.layout(), &client, &mut store, &[c2], &[]).unwrap();
+            transfer_objects(dst.layout(), &client, &mut store, &[c2], &[], None).unwrap();
             assert!(store.contains(&c1), "c1 must have landed (ancestor of the want)");
             assert!(store.contains(&c2), "c2 (the want) must have landed");
         }
