@@ -141,8 +141,10 @@ pipe-safety discipline).
   always); loss of agent context at harvest; transcripts outliving the
   history they describe (gc-coupled index).
 - **Does NOT defend:** a fabricated transcript attached by an authorized
-  writer (attachment is a claim; signing transcript ids — a
-  `"sc-transcript-sig-v1"` domain — is the natural extension, spec
-  decision); secrets echoed into a transcript remaining readable to
+  writer — attachment alone is a claim. Opt-in signing (`sc transcript
+  --sign` / `sc transcript sign`, over the `"sc-transcript-sig-v1"` domain)
+  upgrades it to an *attested* claim binding a specific identity, but an
+  unsigned transcript from an authorized writer is still just a claim.
+  Also does not defend: secrets echoed into a transcript remaining readable to
   *authorized* transcript recipients (scan-and-warn mitigates, rotation
   remedies); content quality or truthfulness of the recorded session.
