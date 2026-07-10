@@ -93,8 +93,12 @@ pre-1.0 in-workspace signature change, not a wire change.
 `spill_pack_stream` gain a byte budget. The running total is checked as chunk
 frames arrive (git's `receive.maxInputSize` shape: abort *while counting*,
 never after materializing); exceeding it raises a new typed
-`Error::PackTooLarge { limit }`, the partial spool is removed by the guard,
-and the server replies with a new wire error code **`EC_TOO_LARGE = 6`**.
+`Error::PackTooLarge`, the partial spool is removed by the guard,
+and the server sends a best-effort reply with a new wire error code
+**`EC_TOO_LARGE = 6`**, then closes the connection — aborting mid-stream
+leaves unread chunk frames in flight, so the stream is desynced by
+construction and the connection cannot be reused (same posture as the RO
+drain overflow below).
 Old clients degrade gracefully — unknown codes already fall back to
 `Error::Remote(msg)` — so no protocol version bump. The cap composes *above*
 ADR-0039's per-frame/per-record/decompression caps; it never replaces them.
@@ -119,7 +123,7 @@ misconfigurations keep the clear error, hostile bulk spools almost nothing).
 |---|---|---|
 | Accept while full | 503 + close, no handshake | "server busy, retry" |
 | Zero-byte stall > timeout | log + drop connection, spool cleaned | connection error |
-| Pack exceeds `--max-pack-size` | abort mid-stream, `EC_TOO_LARGE`, spool cleaned, connection continues | "pack exceeds server limit (N)" |
+| Pack exceeds `--max-pack-size` | abort mid-stream, best-effort `EC_TOO_LARGE`, spool cleaned, close | "pack exceeds server limit (N)" or connection error |
 | RO push ≤ 8 MiB | drain, `EC_READONLY` (unchanged) | "read-only" |
 | RO push > 8 MiB | best-effort `EC_READONLY`, close | read-only error or connection error |
 | Accept error (EMFILE etc.) | 5ms→1s backoff, loop stays alive | connect delay/refusal |
@@ -137,8 +141,8 @@ Pinned regression tests per bound:
    dropped after the (test-shortened) timeout; `.sc/tmp` empty afterwards.
 4. Write-side stall: a client that stops reading mid-`GetPack` is dropped.
 5. Spool cap: a pack exceeding a small `--max-pack-size` fails mid-stream with
-   the typed error, `.sc/tmp` is empty, and the same connection can issue a
-   subsequent successful request.
+   the typed error, `.sc/tmp` is empty, the connection is closed, and a fresh
+   connection succeeds.
 6. Config floor: `--max-pack-size` below `MAX_OBJECT_SIZE` refused at startup.
 7. RO drain: small RO push still gets `EC_READONLY`; oversized RO push gets the
    connection closed, ≤ 8 MiB spooled (assert via temp-dir observation), zero
