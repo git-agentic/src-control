@@ -3188,7 +3188,14 @@ fn run_serve(
             if let Some(m) = max_pack_size {
                 limits.max_pack_size = m;
             }
-            scl_repo::http_transport::serve_http(&addr, &path, read_only, allow_public, limits)?;
+            scl_repo::http_transport::serve_http(
+                &addr,
+                &path,
+                read_only,
+                allow_public,
+                limits,
+                scl_repo::http_transport::TlsMode::Off,
+            )?;
             Ok(())
         }
         (true, Some(_)) => anyhow::bail!("sc serve accepts only one of --stdio or --http"),

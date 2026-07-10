@@ -515,6 +515,46 @@ fn auth_is_mandatory(addr: &str, read_only: bool, allow_public: bool) -> bool {
     !is_loopback_host(host) && !read_only && !allow_public
 }
 
+/// How `sc serve --http` provides its TLS identity (P32). `Off` keeps the
+/// P26 plaintext listener; `AutoMint` loads-or-mints `.sc/serve-tls/`;
+/// `Pem` loads an operator-supplied pair (certbot etc.).
+#[derive(Debug, Clone)]
+pub enum TlsMode {
+    Off,
+    AutoMint,
+    Pem {
+        cert: std::path::PathBuf,
+        key: std::path::PathBuf,
+    },
+}
+
+/// Resolve a [`TlsMode`] into a ready-to-use server config, or `None` for
+/// [`TlsMode::Off`]. Factored out of [`serve_http`] so the config can be
+/// built BEFORE the bind gate (Task 6 needs `tls_config.is_some()` to relax
+/// the non-loopback refusal for a TLS-protected listener).
+fn resolve_tls(
+    root: &std::path::Path,
+    tls: &TlsMode,
+) -> Result<Option<scl_tlsio::TlsServerConfig>> {
+    let identity = match tls {
+        TlsMode::Off => return Ok(None),
+        TlsMode::AutoMint => {
+            scl_tlsio::load_or_mint(&crate::layout::Layout::at(root).serve_tls_dir())?
+        }
+        TlsMode::Pem { cert, key } => scl_tlsio::load_pem(cert, key)?,
+    };
+    Ok(Some(scl_tlsio::server_config(identity)?))
+}
+
+/// The repo's serve-TLS fingerprint (`sha256:<hex>`), minting the identity
+/// if it doesn't exist yet — so an operator can distribute the pin BEFORE
+/// first serve (`sc serve fingerprint`, P32). Same load-or-mint path the
+/// server uses; no drift possible.
+pub fn serve_tls_fingerprint(root: &std::path::Path) -> Result<String> {
+    let id = scl_tlsio::load_or_mint(&crate::layout::Layout::at(root).serve_tls_dir())?;
+    Ok(scl_tlsio::fingerprint_hex(&id.spki_sha256))
+}
+
 /// Bind `addr`, serve the single repo at `root` to `sc+http://` clients
 /// until the listener is dropped or the process exits. Thin wrapper around
 /// [`serve_http_listener`] — see that function for the accept-loop
@@ -530,8 +570,10 @@ pub fn serve_http(
     read_only: bool,
     allow_public: bool,
     limits: ServeLimits,
+    tls: TlsMode,
 ) -> Result<()> {
     crate::wire::validate_max_pack_size(limits.max_pack_size)?;
+    let tls_config = resolve_tls(root, &tls)?;
     if !bind_is_allowed(addr, root, read_only, allow_public)? {
         return Err(Error::InvalidArgument(format!(
             "refusing to bind non-loopback address {addr} without --read-only, \
@@ -552,8 +594,14 @@ pub fn serve_http(
         .local_addr()
         .map_err(|e| Error::ConnectionLost(format!("sc+http local_addr: {e}")))?;
     println!("listening on {bound}");
+    if let Some(cfg) = &tls_config {
+        println!(
+            "tls fingerprint: {}",
+            scl_tlsio::fingerprint_hex(&cfg.spki_sha256)
+        );
+    }
     std::io::Write::flush(&mut std::io::stdout()).ok();
-    serve_http_listener(listener, root, read_only, mandatory_auth, limits)
+    serve_http_listener(listener, root, read_only, mandatory_auth, limits, tls_config)
 }
 
 /// Accept-loop core, factored out of [`serve_http`] so tests can bind
@@ -581,6 +629,7 @@ pub fn serve_http_listener(
     read_only: bool,
     mandatory_auth: bool,
     limits: ServeLimits,
+    tls: Option<scl_tlsio::TlsServerConfig>,
 ) -> Result<()> {
     let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut backoff = AcceptBackoff::new();
@@ -601,16 +650,30 @@ pub fn serve_http_listener(
             let prev = live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let g = SlotGuard(live.clone());
             if limits.max_connections != 0 && prev >= limits.max_connections as usize {
-                let _ = write_status(&mut stream, 503);
+                if tls.is_none() {
+                    let _ = write_status(&mut stream, 503);
+                }
+                // Under TLS: close without a status. Sending a readable 503
+                // would require a TLS handshake ON THE ACCEPT THREAD, letting
+                // one slow client stall all accepts — the property P31
+                // exists to protect. (git-daemon sheds the same way: plain
+                // close.)
                 continue; // g drops here → count restored; no thread, no handshake
             }
             g
         };
         let root = root.to_path_buf();
+        let tls = tls.clone();
         let spawn_result = std::thread::Builder::new().spawn(move || {
             let _guard = guard; // slot held for the connection's lifetime
-            if let Err(e) = handle_http_connection(stream, &root, read_only, mandatory_auth, limits)
-            {
+            if let Err(e) = handle_http_connection(
+                stream,
+                &root,
+                read_only,
+                mandatory_auth,
+                limits,
+                tls.as_ref(),
+            ) {
                 eprintln!("sc serve --http: connection error: {e}");
             }
         });
@@ -644,28 +707,86 @@ pub fn serve_http_listener(
 /// but a session that goes silent (or, on the write side, stalls reading a
 /// streamed response) must still be reaped rather than parking the thread
 /// forever.
+/// Server-side maybe-TLS halves: the opening codec, status writes, and
+/// `wire::serve` are all generic over Read/Write, so one enum layer at the
+/// seam keeps plaintext and TLS on the identical code path after wrap.
+enum SrvRead {
+    Plain(TcpStream),
+    Tls(scl_tlsio::TlsServerReadHalf),
+}
+enum SrvWrite {
+    Plain(TcpStream),
+    Tls(scl_tlsio::TlsServerWriteHalf),
+}
+impl Read for SrvRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            SrvRead::Plain(s) => s.read(buf),
+            SrvRead::Tls(r) => r.read(buf),
+        }
+    }
+}
+impl Write for SrvWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            SrvWrite::Plain(s) => s.write(buf),
+            SrvWrite::Tls(w) => w.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SrvWrite::Plain(s) => s.flush(),
+            SrvWrite::Tls(w) => w.flush(),
+        }
+    }
+}
+impl SrvRead {
+    /// P31 session timeouts, below TLS when wrapped. SO_RCVTIMEO/SO_SNDTIMEO
+    /// live on the socket (shared across `try_clone` fds), so setting them
+    /// through either half governs the whole connection — the same fact the
+    /// plaintext path has relied on since P31.
+    fn set_session_timeouts(&self, d: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            SrvRead::Plain(s) => {
+                s.set_read_timeout(d)?;
+                s.set_write_timeout(d)
+            }
+            SrvRead::Tls(r) => r.set_socket_timeouts(d, d),
+        }
+    }
+}
+
 fn handle_http_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     root: &std::path::Path,
     server_read_only: bool,
     mandatory_auth: bool,
     limits: ServeLimits,
+    tls: Option<&scl_tlsio::TlsServerConfig>,
 ) -> Result<()> {
     stream
         .set_read_timeout(Some(OPENING_READ_TIMEOUT))
         .map_err(|e| Error::ConnectionLost(format!("sc+http set_read_timeout: {e}")))?;
 
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?,
-    );
+    let (mut reader, mut writer) = match tls {
+        None => {
+            let r = stream
+                .try_clone()
+                .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?;
+            (BufReader::new(SrvRead::Plain(r)), SrvWrite::Plain(stream))
+        }
+        Some(cfg) => {
+            let t = scl_tlsio::server_stream(cfg, stream)?;
+            let (r, w) = t.split();
+            (BufReader::new(SrvRead::Tls(r)), SrvWrite::Tls(w))
+        }
+    };
 
     let opening = match read_client_opening(&mut reader) {
         Ok(o) => o,
         Err(_) => {
             // Malformed/slow-loris opening: best-effort 400, then close.
-            let _ = write_status(&mut stream, 400);
+            let _ = write_status(&mut writer, 400);
             return Ok(());
         }
     };
@@ -673,7 +794,7 @@ fn handle_http_connection(
     let _ = &opening.target;
 
     if !root.join(".sc").is_dir() {
-        write_status(&mut stream, 404)?;
+        write_status(&mut writer, 404)?;
         return Ok(());
     }
 
@@ -694,7 +815,7 @@ fn handle_http_connection(
                  justified only by tokens, but none are configured (re-add a token, or \
                  restart with --read-only / --allow-public)"
             );
-            write_status(&mut stream, 401)?;
+            write_status(&mut writer, 401)?;
             return Ok(());
         }
         false // loopback, or --read-only / --allow-public public bind: proceed unauthenticated
@@ -707,13 +828,13 @@ fn handle_http_connection(
             Some(crate::serve_tokens::Scope::Ro) => true,
             Some(crate::serve_tokens::Scope::Rw) => false,
             None => {
-                write_status(&mut stream, 401)?;
+                write_status(&mut writer, 401)?;
                 return Ok(());
             }
         }
     };
 
-    write_status(&mut stream, 200)?;
+    write_status(&mut writer, 200)?;
 
     // P31: the opening timeout is REPLACED (not cleared) by the session
     // timeout, on BOTH read and write sides — a write timeout covers a client
@@ -724,18 +845,16 @@ fn handle_http_connection(
     } else {
         Some(Duration::from_secs(limits.timeout_secs))
     };
-    stream
-        .set_read_timeout(session)
-        .map_err(|e| Error::ConnectionLost(format!("sc+http set session read_timeout: {e}")))?;
-    stream
-        .set_write_timeout(session)
-        .map_err(|e| Error::ConnectionLost(format!("sc+http set session write_timeout: {e}")))?;
+    reader
+        .get_ref()
+        .set_session_timeouts(session)
+        .map_err(|e| Error::ConnectionLost(format!("sc+http set session timeouts: {e}")))?;
 
     let read_only = server_read_only || token_read_only;
     crate::wire::serve_with_policy(
         root,
         &mut reader,
-        &mut stream,
+        &mut writer,
         crate::wire::WirePolicy {
             read_only,
             max_pack_size: limits.max_pack_size,
@@ -1047,6 +1166,7 @@ mod tests {
                 read_only,
                 mandatory_auth,
                 ServeLimits::default(),
+                None,
             )
             .unwrap();
         });
@@ -1207,7 +1327,15 @@ mod tests {
         // Non-loopback, no --read-only / --allow-public / tokens → refused,
         // and refused *before* any bind is attempted (port 0 would always
         // succeed to bind if we got that far).
-        let err = serve_http("0.0.0.0:0", &root, false, false, ServeLimits::default()).unwrap_err();
+        let err = serve_http(
+            "0.0.0.0:0",
+            &root,
+            false,
+            false,
+            ServeLimits::default(),
+            TlsMode::Off,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(_)),
             "public bind refused: {err:?}"
@@ -1464,7 +1592,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            let _ = serve_http_listener(listener, &root, false, false, limits);
+            let _ = serve_http_listener(listener, &root, false, false, limits, None);
         });
         addr
     }
@@ -1653,5 +1781,73 @@ mod tests {
         let tmp = root.join(".sc").join("tmp");
         assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 4: TLS-wrapped server seam. ──
+
+    /// Bind a TLS listener over a fresh repo; returns (addr, spki, join guard).
+    fn spawn_tls_server(root: &std::path::Path) -> (String, [u8; 32]) {
+        let id = scl_tlsio::load_or_mint(&root.join(".sc").join("serve-tls")).unwrap();
+        let spki = id.spki_sha256;
+        let cfg = scl_tlsio::server_config(id).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let root = root.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = serve_http_listener(
+                listener,
+                &root,
+                false,
+                false,
+                ServeLimits::default(),
+                Some(cfg),
+            );
+        });
+        (addr, spki)
+    }
+
+    #[test]
+    fn tls_server_answers_opening_over_tls_and_rejects_plaintext() {
+        let root = tmp_repo("tls-opening"); // reuse the file's existing repo-fixture helper
+        let (addr, spki) = spawn_tls_server(&root);
+
+        // A TLS client (raw tlsio, pinned) gets a 200 through the TLS channel.
+        let tcp = std::net::TcpStream::connect(&addr).unwrap();
+        let (stream, seen) = scl_tlsio::client_connect(tcp, "127.0.0.1", Some(spki), false).unwrap();
+        assert_eq!(seen, spki);
+        let (r, mut w) = stream.split();
+        write_client_opening(&mut w, "127.0.0.1", "/", None).unwrap();
+        use std::io::Write as _;
+        w.flush().unwrap();
+        let mut br = std::io::BufReader::new(r);
+        assert_eq!(read_status(&mut br).unwrap(), 200);
+
+        // A PLAINTEXT client against the TLS listener fails cleanly (the
+        // server-side handshake errors; the client sees close/garbage, not 200).
+        let mut plain = std::net::TcpStream::connect(&addr).unwrap();
+        plain
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        write_client_opening(&mut plain, "127.0.0.1", "/", None).unwrap();
+        let mut resp = Vec::new();
+        use std::io::Read as _;
+        let _ = plain.read_to_end(&mut resp);
+        assert!(
+            !String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200"),
+            "plaintext client must not reach the opening handler on a TLS listener"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn serve_tls_fingerprint_mints_and_is_stable() {
+        let root = tmp_repo("tls-fpr");
+        let f1 = serve_tls_fingerprint(&root).unwrap();
+        assert!(f1.starts_with("sha256:"), "got: {f1}");
+        assert!(root.join(".sc").join("serve-tls").join("key.pem").exists());
+        let f2 = serve_tls_fingerprint(&root).unwrap();
+        assert_eq!(f1, f2, "fingerprint must load, not re-mint");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
