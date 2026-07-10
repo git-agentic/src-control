@@ -22,20 +22,27 @@ use crate::layout::Layout;
 /// Load (minting if absent) the per-repo random cache key. The key file is
 /// the only hard-error surface here: if it can't be created/read, the cache
 /// cannot be safely keyed, so surface it rather than running unkeyed.
+///
+/// Mirrors the serve-TLS key discipline (`crates/tlsio/src/identity.rs`):
+/// the file is created 0600 from its first byte via `create_new`, so there
+/// is never a window where the key sits at default permissions. A
+/// concurrent minter losing the `create_new` race falls through to reading
+/// the winner's file rather than erroring or clobbering it.
 pub(crate) fn local_key(layout: &Layout) -> Result<[u8; 32]> {
     let path = layout.local_key_path();
     let hex_str = match std::fs::read_to_string(&path) {
         Ok(s) => s.trim().to_string(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let s = scl_crypto::random_hex(32); // 32 random bytes -> 64 hex chars
-            // Mirror the serve-TLS key discipline: 0600 before content matters.
-            std::fs::write(&path, &s)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            match write_key_0600(&path, s.as_bytes()) {
+                Ok(()) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Lost the create_new race to a concurrent minter: read
+                    // their file instead of clobbering it.
+                    std::fs::read_to_string(&path)?.trim().to_string()
+                }
+                Err(e) => return Err(e.into()),
             }
-            s
         }
         Err(e) => return Err(e.into()),
     };
@@ -44,6 +51,28 @@ pub(crate) fn local_key(layout: &Layout) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| Error::InvalidArgument("malformed .sc/local-key".into()))
+}
+
+#[cfg(unix)]
+fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(bytes)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -129,7 +158,9 @@ impl ProtectedCache {
         }
     }
 
-    /// Atomic write (temp sibling + rename); no-op for an ephemeral cache.
+    /// Durable atomic write via the shared `fsutil` helper (fsync temp +
+    /// rename + fsync parent dir, no residue on failure); no-op for an
+    /// ephemeral cache.
     pub(crate) fn save(&self) -> Result<()> {
         let Some(path) = &self.path else { return Ok(()) };
         let mut out = String::new();
@@ -146,9 +177,7 @@ impl ProtectedCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&tmp, out)?;
-        std::fs::rename(&tmp, path)?;
+        scl_core::fsutil::atomic_write_durable(path, out.as_bytes())?;
         Ok(())
     }
 }
