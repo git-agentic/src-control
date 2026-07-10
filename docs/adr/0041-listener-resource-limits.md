@@ -27,7 +27,7 @@ This phase closes all four, dep-free, with no wire-protocol change.
 
 ## Decision
 
-`sc serve` gains three new flags plus one hardcoded internal behavior, all
+`sc serve` gains three new flags plus two hardcoded internal behaviors, all
 scoped to the listener (`--stdio` is unaffected except where noted):
 
 1. **`--max-connections <n>` (default 32, 0 = unlimited).** An atomic
