@@ -105,7 +105,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join("key.pem")).unwrap().permissions().mode();
+            let mode = std::fs::metadata(dir.join("key.pem"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600, "key.pem must be 0600");
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -118,7 +121,10 @@ mod tests {
         load_or_mint(&dir).unwrap();
         std::fs::remove_file(dir.join("key.pem")).unwrap();
         let err = load_or_mint(&dir).unwrap_err();
-        assert!(err.to_string().contains("half a TLS identity"), "got: {err}");
+        assert!(
+            err.to_string().contains("half a TLS identity"),
+            "got: {err}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
     }

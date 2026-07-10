@@ -794,7 +794,14 @@ pub fn serve_http(
         );
     }
     std::io::Write::flush(&mut std::io::stdout()).ok();
-    serve_http_listener(listener, root, read_only, mandatory_auth, limits, tls_config)
+    serve_http_listener(
+        listener,
+        root,
+        read_only,
+        mandatory_auth,
+        limits,
+        tls_config,
+    )
 }
 
 /// Accept-loop core, factored out of [`serve_http`] so tests can bind
@@ -2077,7 +2084,8 @@ mod tests {
 
         // A TLS client (raw tlsio, pinned) gets a 200 through the TLS channel.
         let tcp = std::net::TcpStream::connect(&addr).unwrap();
-        let (stream, seen) = scl_tlsio::client_connect(tcp, "127.0.0.1", Some(spki), false).unwrap();
+        let (stream, seen) =
+            scl_tlsio::client_connect(tcp, "127.0.0.1", Some(spki), false).unwrap();
         assert_eq!(seen, spki);
         let (r, mut w) = stream.split();
         write_client_opening(&mut w, "127.0.0.1", "/", None).unwrap();
@@ -2245,8 +2253,7 @@ mod tests {
             tls: true,
         };
         let policy = crate::tls_pins::TlsClientPolicy {
-            known_hosts: std::env::temp_dir()
-                .join(format!("scl-verbs-kh-{}", std::process::id())),
+            known_hosts: std::env::temp_dir().join(format!("scl-verbs-kh-{}", std::process::id())),
             pre_pin: Some(spki),
             strict: false,
         };

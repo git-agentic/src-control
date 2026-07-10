@@ -50,7 +50,9 @@ impl rustls::client::danger::ServerCertVerifier for PinVerifier {
         *self.seen.lock().unwrap() = Some(hash);
         match self.expected {
             Some(p) if p == hash => Ok(rustls::client::danger::ServerCertVerified::assertion()),
-            Some(_) => Err(rustls::Error::General("sc: pinned fingerprint mismatch".into())),
+            Some(_) => Err(rustls::Error::General(
+                "sc: pinned fingerprint mismatch".into(),
+            )),
             None if self.strict => Err(rustls::Error::General("sc: unknown host (strict)".into())),
             None => Ok(rustls::client::danger::ServerCertVerified::assertion()),
         }
@@ -179,7 +181,9 @@ pub fn client_connect(
             if expected_pin.is_none() && strict && seen.is_some() {
                 return Err(Error::UnknownHostStrict);
             }
-            return Err(Error::Handshake(format!("client handshake with {host}: {e}")));
+            return Err(Error::Handshake(format!(
+                "client handshake with {host}: {e}"
+            )));
         }
     }
     let seen = verifier
@@ -287,7 +291,9 @@ mod tests {
             let (tcp, _) = listener.accept().unwrap();
             // A client that aborts its handshake (mismatch/strict tests)
             // surfaces as Err here — that's fine, just return.
-            let Ok(stream) = server_stream(&cfg, tcp) else { return };
+            let Ok(stream) = server_stream(&cfg, tcp) else {
+                return;
+            };
             let (mut r, mut w) = stream.split();
             let mut buf = [0u8; 5];
             if r.read_exact(&mut buf).is_err() {
@@ -370,7 +376,8 @@ mod tests {
         // (covered by echo_server's `else return`), and the client just sees
         // a dead/garbled connection — no hang.
         tcp.write_all(b"POST / HTTP/1.1\r\n\r\n").ok();
-        tcp.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let mut buf = [0u8; 16];
         // Read either 0 (close) or a TLS alert — anything but a hang.
         let _ = tcp.read(&mut buf);

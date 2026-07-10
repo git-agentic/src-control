@@ -292,8 +292,7 @@ fn https_clone_push_fetch_round_trip_with_signed_chunked_blob() {
     // Zero .sc/tmp residue on every end.
     for repo in [&origin, &clone_dir, &clone2] {
         let tmp_dir = repo.join(".sc").join("tmp");
-        let empty =
-            !tmp_dir.exists() || std::fs::read_dir(&tmp_dir).unwrap().next().is_none();
+        let empty = !tmp_dir.exists() || std::fs::read_dir(&tmp_dir).unwrap().next().is_none();
         assert!(empty, ".sc/tmp residue in {}", repo.display());
     }
 

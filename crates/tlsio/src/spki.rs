@@ -92,7 +92,10 @@ mod tests {
         let params = rcgen::CertificateParams::new(vec!["sc-serve".to_string()]).unwrap();
         let cert = params.self_signed(&key).unwrap();
         let extracted = spki_der(cert.der()).unwrap();
-        assert_eq!(extracted, rcgen::PublicKeyData::subject_public_key_info(&key).as_slice());
+        assert_eq!(
+            extracted,
+            rcgen::PublicKeyData::subject_public_key_info(&key).as_slice()
+        );
     }
 
     #[test]
@@ -109,7 +112,10 @@ mod tests {
         // Different cert bytes, same key → same SPKI hash (the whole point
         // of pinning the SPKI, not the cert).
         assert_ne!(c1.der().as_ref(), c2.der().as_ref());
-        assert_eq!(spki_sha256(c1.der()).unwrap(), spki_sha256(c2.der()).unwrap());
+        assert_eq!(
+            spki_sha256(c1.der()).unwrap(),
+            spki_sha256(c2.der()).unwrap()
+        );
     }
 
     #[test]

@@ -65,7 +65,10 @@ pub fn default_known_hosts_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(xdg).join("sc").join("known_hosts"));
     }
     match std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        Some(home) => Ok(PathBuf::from(home).join(".config").join("sc").join("known_hosts")),
+        Some(home) => Ok(PathBuf::from(home)
+            .join(".config")
+            .join("sc")
+            .join("known_hosts")),
         None => Err(Error::InvalidArgument(
             "cannot resolve the sc+https pin file: set HOME, XDG_CONFIG_HOME, \
              or SC_HTTPS_KNOWN_HOSTS"
@@ -192,7 +195,10 @@ mod tests {
     fn parse_fingerprint_accepts_both_forms_and_rejects_junk() {
         let hexs = "ab".repeat(32);
         let expected = [0xabu8; 32];
-        assert_eq!(parse_fingerprint(&format!("sha256:{hexs}")).unwrap(), expected);
+        assert_eq!(
+            parse_fingerprint(&format!("sha256:{hexs}")).unwrap(),
+            expected
+        );
         assert_eq!(parse_fingerprint(&hexs).unwrap(), expected);
         assert!(parse_fingerprint("sha256:short").is_err());
         assert!(parse_fingerprint("md5:abcd").is_err());

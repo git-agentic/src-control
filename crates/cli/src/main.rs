@@ -862,7 +862,10 @@ fn main() -> Result<()> {
                     Some(p) => p,
                     None => std::env::current_dir()?,
                 };
-                println!("{}", scl_repo::http_transport::serve_tls_fingerprint(&root)?);
+                println!(
+                    "{}",
+                    scl_repo::http_transport::serve_tls_fingerprint(&root)?
+                );
                 Ok(())
             }
             None => {
