@@ -758,12 +758,24 @@ mod tests {
 
     // ---- P15: perms-aware three_way_files ----
 
-    use scl_core::{Protection, PROTECTED};
+    use scl_core::{Protection, PROTECTED, RANDOMIZED};
 
     /// Convergently encrypt `content`, wrap its DEK for `pk`, and register the
     /// wrap in `prot` under the ciphertext blob's id. Returns the ciphertext.
     fn enc_file(prot: &mut Protection, pk: &scl_crypto::PublicKey, content: &[u8]) -> Vec<u8> {
         let (cipher, dek) = scl_crypto::encrypt_path(content);
+        let id = Object::blob(cipher.clone()).id();
+        prot.wrapped
+            .entry(id)
+            .or_default()
+            .push(scl_crypto::wrap_dek_for(&dek, pk));
+        cipher
+    }
+
+    /// Randomized twin of `enc_file` (P33): seals via `encrypt_path_randomized`,
+    /// so identical plaintext yields a fresh ciphertext/id on every call.
+    fn enc_file_rand(prot: &mut Protection, pk: &scl_crypto::PublicKey, content: &[u8]) -> Vec<u8> {
+        let (cipher, dek) = scl_crypto::encrypt_path_randomized(content);
         let id = Object::blob(cipher.clone()).id();
         prot.wrapped
             .entry(id)
@@ -915,6 +927,146 @@ mod tests {
         );
         assert!(f.perms & PROTECTED != 0);
         assert_eq!(f.bytes, b"L1\nl2\nL3\n", "both edits present in plaintext");
+    }
+
+    // ---- P33: randomized protected-path encryption ----
+
+    #[test]
+    fn identical_independent_edits_now_conflict_and_resolve_with_identity() {
+        // base: secret/a.txt = "v1" (randomized). ours and theirs BOTH edit it
+        // to "v2" — independently, so each seal is fresh and the two
+        // ciphertexts/ids differ even though the plaintexts are identical.
+        // Pre-P33 convergent sealing would have id-matched this as a clean
+        // fast path; randomized sealing makes it a genuine content-divergent
+        // protected case.
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mut bp, mut op, mut tp) = (
+            Protection::default(),
+            Protection::default(),
+            Protection::default(),
+        );
+        let cb = enc_file_rand(&mut bp, &alice_pk, b"v1\n");
+        let co = enc_file_rand(&mut op, &alice_pk, b"v2\n");
+        let ct = enc_file_rand(&mut tp, &alice_pk, b"v2\n");
+        assert_ne!(co, ct, "independent randomized seals of identical plaintext differ");
+
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let base = tree_with_perms(&repo, &[("secret/a.txt", cb, PROTECTED | RANDOMIZED)]);
+        let ours = tree_with_perms(&repo, &[("secret/a.txt", co, PROTECTED | RANDOMIZED)]);
+        let theirs = tree_with_perms(&repo, &[("secret/a.txt", ct, PROTECTED | RANDOMIZED)]);
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+
+        // Without identity: the same protected-conflict/needs-identity
+        // outcome the existing content-divergent test expects.
+        let err = three_way_files(&mut s, Some((base, &bp)), (ours, &op), (theirs, &tp), None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "secret/a.txt"),
+            "got {err:?}"
+        );
+
+        // With identity: diff3 of identical plaintexts merges cleanly and
+        // the winning content re-seals randomized (needs_encrypt is set).
+        let fm = three_way_files(
+            &mut s,
+            Some((base, &bp)),
+            (ours, &op),
+            (theirs, &tp),
+            Some(&alice_sk),
+        )
+        .unwrap();
+        assert!(fm.conflicts.is_empty());
+        assert_eq!(fm.files.len(), 1);
+        let f = &fm.files[0];
+        assert_eq!(f.path, "secret/a.txt");
+        assert_eq!(f.bytes, b"v2\n", "identical plaintexts merge to v2 with no conflict");
+        assert!(f.needs_encrypt, "merged plaintext pending re-encryption");
+        assert!(f.perms & PROTECTED != 0);
+    }
+
+    #[test]
+    fn mixed_convergent_and_randomized_tree_merges_by_id_fast_paths() {
+        // base holds one plain file, one convergent protected entry
+        // (enc_file), and one randomized protected entry (enc_file_rand).
+        // ours edits only the plain file; theirs edits only the convergent
+        // entry. Assert the merge is clean without identity, the untouched
+        // randomized entry carries its exact blob id AND its
+        // PROTECTED|RANDOMIZED perms verbatim, and the convergent entry
+        // takes theirs' id.
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (mut bp, op, mut tp) = (
+            Protection::default(),
+            Protection::default(),
+            Protection::default(),
+        );
+        let conv_base = enc_file(&mut bp, &alice_pk, b"c1\n");
+        let rand_base = enc_file_rand(&mut bp, &alice_pk, b"r1\n");
+        let conv_theirs = enc_file(&mut tp, &alice_pk, b"c2\n");
+
+        let base = tree_with_perms(
+            &repo,
+            &[
+                ("plain.txt", b"p1\n".to_vec(), 0),
+                ("secret/conv.txt", conv_base.clone(), PROTECTED),
+                ("secret/rand.txt", rand_base.clone(), PROTECTED | RANDOMIZED),
+            ],
+        );
+        let ours = tree_with_perms(
+            &repo,
+            &[
+                ("plain.txt", b"p2\n".to_vec(), 0),
+                ("secret/conv.txt", conv_base.clone(), PROTECTED),
+                ("secret/rand.txt", rand_base.clone(), PROTECTED | RANDOMIZED),
+            ],
+        );
+        let theirs = tree_with_perms(
+            &repo,
+            &[
+                ("plain.txt", b"p1\n".to_vec(), 0),
+                ("secret/conv.txt", conv_theirs.clone(), PROTECTED),
+                ("secret/rand.txt", rand_base.clone(), PROTECTED | RANDOMIZED),
+            ],
+        );
+
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let fm =
+            three_way_files(&mut s, Some((base, &bp)), (ours, &op), (theirs, &tp), None).unwrap();
+        assert!(fm.conflicts.is_empty());
+        assert!(
+            fm.files.iter().all(|f| !f.needs_encrypt),
+            "every entry resolved by an id fast path -- no decryption occurred"
+        );
+
+        let plain = fm.files.iter().find(|f| f.path == "plain.txt").unwrap();
+        assert_eq!(plain.bytes, b"p2\n", "ours' plain edit wins");
+
+        let conv = fm.files.iter().find(|f| f.path == "secret/conv.txt").unwrap();
+        assert_eq!(conv.bytes, conv_theirs, "convergent entry takes theirs' id");
+        assert!(conv.perms & PROTECTED != 0);
+        let conv_theirs_id = Object::blob(conv_theirs).id();
+        assert!(
+            fm.wrapped_carry.contains_key(&conv_theirs_id),
+            "surviving convergent blob's wraps carried"
+        );
+
+        let rand = fm.files.iter().find(|f| f.path == "secret/rand.txt").unwrap();
+        assert_eq!(
+            rand.bytes, rand_base,
+            "untouched randomized entry carries its exact blob id"
+        );
+        assert_eq!(
+            rand.perms,
+            PROTECTED | RANDOMIZED,
+            "untouched randomized entry carries PROTECTED|RANDOMIZED perms verbatim"
+        );
+        let rand_base_id = Object::blob(rand_base).id();
+        assert!(
+            fm.wrapped_carry.contains_key(&rand_base_id),
+            "untouched randomized blob's wraps carried -- recipients can still decrypt"
+        );
     }
 
     #[test]

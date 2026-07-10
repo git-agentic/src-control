@@ -2236,6 +2236,177 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // ---- P33: randomized protected-path encryption, replay twin ----
+    //
+    // `Repo::protect`/`commit` seal every protected file via
+    // `encrypt_protected`, which has sealed randomized (PROTECTED|RANDOMIZED)
+    // since P33 (ADR-0043) — so every real cherry-pick over protected content
+    // already exercises randomized ciphertext. These twins of
+    // `cherry_pick_disjoint_protected_commit_needs_no_identity` and
+    // `cherry_pick_content_divergent_requires_identity_and_reencrypts` pin
+    // that explicitly: the RANDOMIZED bit rides the fast path verbatim, and
+    // a content-divergent pick re-seals randomized on completion.
+
+    #[test]
+    fn cherry_pick_randomized_protected_unchanged_fast_path_needs_no_identity() {
+        // The picked commit updates a protected file ours never touched: the
+        // ciphertext-id fast path carries the picked (randomized) blob
+        // verbatim — no identity needed — and the RANDOMIZED bit rides
+        // along with PROTECTED.
+        let root = tmp_root("cp-prot-rand-disjoint");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"v1").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // work updates the protected file (fresh randomized seal).
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"v2").unwrap();
+        let picked = repo.commit("me", "work updates secret").unwrap();
+        let (v2_id, v2_perms) = tree_entry(&repo, &picked, "secret/db.txt");
+        assert_eq!(
+            v2_perms,
+            scl_core::PROTECTED | scl_core::RANDOMIZED,
+            "encrypt_protected seals PROTECTED|RANDOMIZED"
+        );
+
+        // main gains an unrelated plain commit (keyless hop back).
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("main.txt"), b"m\n").unwrap();
+        let main_tip = repo.commit("me", "main adds main.txt").unwrap();
+
+        // KEYLESS pick: unchanged-on-ours fast path, no identity needed.
+        let outcome = repo.cherry_pick("work", "me", None, None).unwrap();
+        let id = match outcome {
+            PickResult::Picked(id) => id,
+            other => panic!("expected Picked, got {other:?}"),
+        };
+        assert_eq!(repo.head_tip().unwrap(), Some(id), "branch advanced");
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![main_tip]);
+
+        // The picked ciphertext blob is carried byte-for-byte, with its
+        // RANDOMIZED bit intact.
+        let (got_id, perms) = tree_entry(&repo, &id, "secret/db.txt");
+        assert_eq!(got_id, v2_id, "ciphertext carried verbatim");
+        assert_eq!(
+            perms,
+            scl_core::PROTECTED | scl_core::RANDOMIZED,
+            "PROTECTED|RANDOMIZED carried verbatim through the fast path"
+        );
+        let bytes = blob_bytes_of(&repo, &got_id);
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &got_id,
+            &[&snap.protection],
+            &alice_sk,
+            "secret/db.txt",
+        )
+        .unwrap();
+        assert_eq!(&pt[..], b"v2", "recipient decrypts the picked update");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cherry_pick_randomized_protected_content_divergent_requires_identity() {
+        // secret/a.txt diverged in content on both sides (mergeable lines),
+        // each side's seal randomized and distinct: a keyless pick fails
+        // with the typed error and moves nothing; with an identity the
+        // plaintexts are diff3'd and the merged content is re-sealed
+        // randomized for ALL rule recipients.
+        let root = tmp_root("cp-prot-rand-divergent");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk, bob_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        // ours edits line 1.
+        std::fs::write(root.join("secret/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        let main_tip = repo.commit("me", "main edits line 1").unwrap();
+        let (ours_id, _) = tree_entry(&repo, &main_tip, "secret/a.txt");
+
+        // work edits line 3 (mergeable divergence) — a fresh, distinct seal.
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nTHEIRS\n").unwrap();
+        let picked = repo.commit("me", "work edits line 3").unwrap();
+        let (theirs_id, _) = tree_entry(&repo, &picked, "secret/a.txt");
+        assert_ne!(
+            ours_id, theirs_id,
+            "independent randomized seals of divergent content differ"
+        );
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        // Keyless: typed error, refs untouched, no pick state.
+        let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
+        assert!(
+            matches!(err, Error::ProtectedMergeNeedsIdentity(ref p) if p == "secret/a.txt"),
+            "got {err:?}"
+        );
+        assert_eq!(
+            repo.head_tip().unwrap(),
+            Some(main_tip),
+            "tip must not move"
+        );
+        assert!(
+            !repo.pick_in_progress(),
+            "no pick state on the identity refusal"
+        );
+
+        // With identity: clean pick, merged content re-sealed randomized.
+        let outcome = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap();
+        let id = match outcome {
+            PickResult::Picked(id) => id,
+            other => panic!("expected Picked, got {other:?}"),
+        };
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents, vec![main_tip]);
+        let (blob_id, perms) = tree_entry(&repo, &id, "secret/a.txt");
+        assert_eq!(
+            perms,
+            scl_core::PROTECTED | scl_core::RANDOMIZED,
+            "re-encryption seals PROTECTED|RANDOMIZED"
+        );
+        let bytes = blob_bytes_of(&repo, &blob_id);
+        assert!(
+            !bytes.windows(4).any(|w| w == b"OURS"),
+            "plaintext leaked into the CAS blob"
+        );
+        for (who, sk) in [("alice", &alice_sk), ("bob", &bob_sk)] {
+            let pt = crate::protect::decrypt_with(
+                &bytes,
+                &blob_id,
+                &[&snap.protection],
+                sk,
+                "secret/a.txt",
+            )
+            .unwrap();
+            assert_eq!(
+                &pt[..],
+                b"OURS\nl2\nTHEIRS\n",
+                "{who} must decrypt the merged content"
+            );
+        }
+        // The identity-holder gets the merged plaintext on disk.
+        assert_eq!(
+            std::fs::read(root.join("secret/a.txt")).unwrap(),
+            b"OURS\nl2\nTHEIRS\n".to_vec()
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn cherry_pick_protected_conflict_writes_plaintext_markers_worktree_only() {
         // Same-line edits of secret/a.txt on both sides: the pick conflicts.
