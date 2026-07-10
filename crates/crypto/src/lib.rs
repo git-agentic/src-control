@@ -16,7 +16,8 @@ pub mod provider;
 pub mod signing;
 
 pub use envelope::{
-    decrypt_path, encrypt_path, open, revoke, rewrap_for, seal, unwrap_dek_with, wrap_dek_for,
+    decrypt_path, encrypt_path, encrypt_path_randomized, encrypt_path_randomized_with_rng, open,
+    revoke, rewrap_for, seal, unwrap_dek_with, wrap_dek_for,
 };
 pub use error::{Error, Result};
 pub use key::{generate_keypair, PublicKey, RecipientId, SecretKey};
