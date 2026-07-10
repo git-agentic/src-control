@@ -106,6 +106,12 @@ pub(crate) fn harvest_workspace(
     // fixed at materialize time (or, for `sc work`, is always full), so the
     // carry predicate must see that same view, not the host repo's current
     // `.sc/sparse` — see `snapshot_files`'s doc comment.
+    // No workspace-local cache is threaded in yet (P33 Task 7 wires it): pass
+    // `None`, so a randomized protected path in a workspace always re-seals
+    // (spurious-but-safe). Passing the HOST repo's cache here would be WRONG —
+    // the abs-path base in `snapshot_files` is the host root, but these files
+    // came from the workspace dir. Convergent priors still carry (content-only
+    // compare, no cache needed).
     match repo.snapshot_files(
         files,
         Some(tip),
@@ -115,6 +121,7 @@ pub(crate) fn harvest_workspace(
         None,
         None,
         sparse,
+        None,
         author,
         message,
     ) {
