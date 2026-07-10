@@ -381,8 +381,10 @@ impl Transport for HttpTransport {
 /// `read_client_opening` bounds the opening in BYTES (`MAX_OPENING_BYTES`)
 /// but not in TIME, so a peer that trickles in under the byte cap and then
 /// stalls would otherwise hold a server thread (and its socket) forever.
-/// Applied only around the opening read — see [`serve_http_listener`] for
-/// where it's cleared before a legitimate large pack transfer begins.
+/// Applied only around the opening read — the opening timeout is REPLACED
+/// (not cleared) by `limits.timeout_secs`'s session read+write timeouts
+/// after the 200 status is written, before handing off to `wire::serve` —
+/// see [`handle_http_connection`] for the timeout sequencing.
 const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Exponential accept-error backoff (P31): Go net/http's shape — 5ms
@@ -1525,6 +1527,15 @@ mod tests {
     /// timeout (today it parks the server thread in a blocking write forever).
     /// Server sends a pack big enough to overflow socket buffers; the client
     /// never reads; after the timeout the server closes.
+    ///
+    /// Why it cannot flake: the server must reap the connection within ~1s
+    /// through ONE OF TWO PATHS. (a) If the ~4 MiB GetPack response overflows
+    /// the loopback socket buffers, the server blocks in `write` and the 1s
+    /// WRITE timeout fires. (b) If the kernel buffers absorb the whole
+    /// response, the server finishes writing, returns to its request loop,
+    /// blocks in `read_frame_opt` on the silent client, and the 1s READ
+    /// timeout fires. Either way the client's drain loop observes EOF/reset
+    /// well inside its 5s margins.
     #[test]
     fn write_side_stall_is_reaped_by_timeout() {
         let root = std::env::temp_dir().join(format!("scl-http-wstall-{}", std::process::id()));
@@ -1597,6 +1608,9 @@ mod tests {
                 Ok(_) => continue,       // drain what was already buffered
             }
         }
+        // Spool dir is clean.
+        let tmp = root.join(".sc").join("tmp");
+        assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
