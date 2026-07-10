@@ -810,12 +810,15 @@ impl Repo {
         };
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
+        let key = crate::cache::local_key(&self.layout)?;
+        let cache = crate::cache::ProtectedCache::open(key, Some(self.layout.protected_cache_path()));
         worktree::diff_worktree(
             &self.layout,
             &mut store,
             head_root,
             &protection,
             &self.sparse_spec()?,
+            Some(&cache),
         )
     }
 
@@ -850,6 +853,14 @@ impl Repo {
             .map(|t| self.snapshot(&t))
             .transpose()?
             .map(|s| s.root);
+        // Randomized (P33) protected entries need the local unchanged-cache to
+        // report clean at all (re-encryption proves nothing for them). A
+        // failure to load/mint `.sc/local-key` degrades to `None` here rather
+        // than failing the whole diff — spurious-but-safe: every randomized
+        // entry just reports "changed" instead of the diff erroring out.
+        let cache = crate::cache::local_key(&self.layout)
+            .ok()
+            .map(|key| crate::cache::ProtectedCache::open(key, Some(self.layout.protected_cache_path())));
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         let head = match head_root {
@@ -881,8 +892,20 @@ impl Repo {
                 Some((blob_id, _mode, perms)) if *perms & PROTECTED != 0 => {
                     // Never show protected content; report the change status only.
                     if let Some(bytes) = disk {
-                        let disk_id = Object::blob(scl_crypto::encrypt_path(bytes).0).id();
-                        if disk_id != *blob_id {
+                        let changed = if *perms & scl_core::RANDOMIZED == 0 {
+                            // Convergent (legacy): re-encryption yields an exact
+                            // compare, unchanged from pre-P33.
+                            Object::blob(scl_crypto::encrypt_path(bytes).0).id() != *blob_id
+                        } else {
+                            // Randomized (P33): re-encryption proves nothing; the
+                            // cache is the only public-key-free unchanged proof.
+                            // A miss/disagreement/absent cache reports changed —
+                            // spurious-but-safe, never incorrect.
+                            let abs = worktree::safe_join(&self.layout.root, path)?;
+                            cache.as_ref().and_then(|c| c.unchanged(path, &abs, bytes))
+                                != Some(*blob_id)
+                        };
+                        if changed {
                             out.push_str(&format!(
                                 "protected file changed: {path} (content not shown)\n"
                             ));

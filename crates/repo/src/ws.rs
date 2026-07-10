@@ -297,8 +297,17 @@ impl Repo {
         let sparse = crate::sparse::Sparse::new(session.sparse.clone());
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
-        let d =
-            worktree::diff_worktree(&ws, &mut store, Some(base.root), &base.protection, &sparse)?;
+        // No workspace-local cache is threaded in yet (P33 Task 7 wires it);
+        // until then a randomized protected path in a workspace always
+        // reports modified — spurious-but-safe.
+        let d = worktree::diff_worktree(
+            &ws,
+            &mut store,
+            Some(base.root),
+            &base.protection,
+            &sparse,
+            None,
+        )?;
         Ok(!(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
     }
 

@@ -81,8 +81,17 @@ pub(crate) fn harvest_workspace(
             worktree::tree_file_ids(&mut store, snap.root)?
                 .into_keys()
                 .collect();
-        let d =
-            worktree::diff_worktree(&ws, &mut store, Some(snap.root), &snap.protection, sparse)?;
+        // No workspace-local cache is threaded in yet (P33 Task 7 wires it);
+        // until then a randomized protected path in a workspace always
+        // reports modified — spurious-but-safe.
+        let d = worktree::diff_worktree(
+            &ws,
+            &mut store,
+            Some(snap.root),
+            &snap.protection,
+            sparse,
+            None,
+        )?;
         (
             tracked,
             !(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()),

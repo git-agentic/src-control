@@ -5,6 +5,7 @@ use std::path::Path;
 
 use scl_core::{EntryKind, FileMode, Object, ObjectId, Protection, Store, Tree, PROTECTED};
 
+use crate::cache::ProtectedCache;
 use crate::error::{Error, Result};
 use crate::ignore::Ignore;
 use crate::layout::Layout;
@@ -449,9 +450,16 @@ pub struct Diff {
 /// path:
 /// - absent on disk => CLEAN (the expected state for an unauthorized/skipped
 ///   checkout — not a user deletion);
-/// - present on disk => re-encrypt the disk bytes convergently (`encrypt_path`
-///   is a pure, keyless function) and compare the resulting ciphertext blob id
-///   to the stored one: equal => CLEAN, different => MODIFIED (a genuine edit).
+/// - present on disk, format dispatches on the `RANDOMIZED` bit (P33):
+///   - clear (convergent/legacy) => re-encrypt the disk bytes convergently
+///     (`encrypt_path` is a pure, keyless function) and compare the
+///     resulting ciphertext blob id to the stored one: equal => CLEAN,
+///     different => MODIFIED (a genuine edit). Unchanged from pre-P33.
+///   - set (randomized) => re-encryption proves nothing (a fresh seal never
+///     matches the old ciphertext even for identical plaintext), so the only
+///     public-key-free unchanged proof is the local stat cache
+///     (`cache::unchanged`, Task 3): a hit reports CLEAN, a miss/disagreement
+///     reports MODIFIED — spurious-but-safe, never incorrect.
 ///
 /// Non-protected paths use the usual plaintext-blob-id comparison.
 ///
@@ -483,6 +491,7 @@ pub fn diff_worktree(
     // a future richer diff (e.g. prefix-aware reporting) needs no signature change.
     _protection: &Protection,
     sparse: &Sparse,
+    cache: Option<&ProtectedCache>,
 ) -> Result<Diff> {
     let head = match head_root {
         Some(root) => tree_file_entries_with_perms_sparse(store, root, sparse)?,
@@ -499,8 +508,24 @@ pub fn diff_worktree(
             None => diff.added.push(p.clone()),
             Some((hid, _mode, perms)) => {
                 let disk_id = if perms & PROTECTED != 0 {
-                    // Convergent re-encryption yields the same id as the commit did.
-                    Object::blob(scl_crypto::encrypt_path(bytes).0).id()
+                    if perms & scl_core::RANDOMIZED == 0 {
+                        // Convergent (legacy) entry: re-encryption yields the same
+                        // id as the commit did — still exact, no cache needed.
+                        Object::blob(scl_crypto::encrypt_path(bytes).0).id()
+                    } else {
+                        // Randomized entry (P33): re-encrypting proves nothing. The
+                        // stat cache (stat hit, then keyed-tag fallback) is the only
+                        // public-key-free unchanged proof; a missing entry reports
+                        // modified — spurious-but-safe, never incorrect.
+                        let abs = safe_join(&layout.root, p)?;
+                        match cache.and_then(|c| c.unchanged(p, &abs, bytes)) {
+                            Some(id) => id,
+                            None => {
+                                diff.modified.push(p.clone());
+                                continue;
+                            }
+                        }
+                    }
                 } else {
                     Object::blob(bytes.clone()).id()
                 };
@@ -816,5 +841,84 @@ mod tests {
 
         drop(store);
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn diff_dispatches_randomized_entries_through_the_cache() {
+        let (layout, mut store) = tmp_objects("p33-diff");
+        // Build a HEAD tree with one RANDOMIZED protected entry whose plaintext
+        // sits on disk, exactly as an authorized checkout leaves it.
+        let pt = b"top secret".to_vec();
+        let (cipher, _dek) = scl_crypto::encrypt_path_randomized(&pt);
+        let blob = Object::blob(cipher.clone());
+        let blob_id = blob.id();
+        store.put(blob).unwrap();
+        let inner = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "x".into(),
+                kind: EntryKind::Blob,
+                id: blob_id,
+                mode: FileMode::FILE,
+                perms: PROTECTED | scl_core::RANDOMIZED,
+            }])))
+            .unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "secret".into(),
+                kind: EntryKind::Tree,
+                id: inner,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+
+        let abs = layout.root.join("secret/x");
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, &pt).unwrap();
+
+        let key = crate::cache::local_key(&layout).unwrap();
+        let mut cache = crate::cache::ProtectedCache::open(key, None);
+
+        // No cache entry: spurious-but-safe MODIFIED.
+        let d = diff_worktree(
+            &layout,
+            &mut store,
+            Some(root),
+            &Protection::default(),
+            &Sparse::default(),
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(d.modified, vec!["secret/x"]);
+
+        // Recorded: provably clean.
+        cache.record("secret/x", &abs, &pt, blob_id);
+        let d = diff_worktree(
+            &layout,
+            &mut store,
+            Some(root),
+            &Protection::default(),
+            &Sparse::default(),
+            Some(&cache),
+        )
+        .unwrap();
+        assert!(d.modified.is_empty() && d.added.is_empty() && d.deleted.is_empty());
+
+        // Genuine edit: modified again (tag mismatch).
+        std::fs::write(&abs, b"edited").unwrap();
+        let d = diff_worktree(
+            &layout,
+            &mut store,
+            Some(root),
+            &Protection::default(),
+            &Sparse::default(),
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(d.modified, vec!["secret/x"]);
+
+        drop(store);
+        std::fs::remove_dir_all(&layout.root).unwrap();
+        assert!(!layout.root.exists());
     }
 }
