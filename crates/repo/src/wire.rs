@@ -610,6 +610,59 @@ pub fn decode_refs_body(b: &[u8]) -> Result<Vec<(String, ObjectId)>> {
 
 use crate::transport::{LocalTransport, Transport};
 
+/// Default cap on an incoming `PutPack` spool when no operator override is
+/// configured (P31): 16 GiB. Threaded through [`WirePolicy::max_pack_size`];
+/// `0` means unlimited.
+pub const DEFAULT_MAX_PACK_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Cap on how much of a read-only connection's rejected `PutPack` stream is
+/// drained to disk before the connection is closed rather than kept in sync
+/// (P31): 8 MiB. A read-only push is going to be thrown away regardless, so
+/// there is no reason to spool an attacker-sized pack just to reject it —
+/// unlike the normal `PutPack` arm, which must accept up to
+/// [`WirePolicy::max_pack_size`] because that pack might actually be used.
+pub const RO_DRAIN_CAP: u64 = 8 * 1024 * 1024;
+
+/// Per-connection policy for [`serve_with_policy`] (P31): read-only gating
+/// (P29) plus the two spool caps above. `Default` matches every pre-P31
+/// caller's prior unbounded behavior for `read_only`/`ro_drain_cap` sizing
+/// intent, but now bounds `max_pack_size` to [`DEFAULT_MAX_PACK_SIZE`] rather
+/// than leaving `PutPack` spool growth unbounded.
+#[derive(Debug, Clone, Copy)]
+pub struct WirePolicy {
+    pub read_only: bool,
+    /// Cap on a normal (non-read-only) `PutPack` spool, in bytes. `0` means
+    /// unlimited.
+    pub max_pack_size: u64,
+    /// Cap on how much of a read-only connection's rejected `PutPack` stream
+    /// is drained before closing the connection, in bytes.
+    pub ro_drain_cap: u64,
+}
+
+impl Default for WirePolicy {
+    fn default() -> Self {
+        Self {
+            read_only: false,
+            max_pack_size: DEFAULT_MAX_PACK_SIZE,
+            ro_drain_cap: RO_DRAIN_CAP,
+        }
+    }
+}
+
+/// Validate an operator-supplied `--max-pack-size` value. `0` (unlimited) is
+/// always fine; a nonzero cap below [`scl_core::MAX_OBJECT_SIZE`] can never
+/// fit even one object and is rejected as a misconfiguration rather than
+/// silently failing every push at runtime.
+pub fn validate_max_pack_size(max: u64) -> Result<()> {
+    if max != 0 && max < scl_core::MAX_OBJECT_SIZE as u64 {
+        return Err(Error::InvalidArgument(format!(
+            "--max-pack-size {max} is below MAX_OBJECT_SIZE ({}); a cap that cannot fit one object is a misconfiguration",
+            scl_core::MAX_OBJECT_SIZE
+        )));
+    }
+    Ok(())
+}
+
 /// Serve the repo at `root` to one wire-protocol peer until `Bye`/EOF.
 ///
 /// This is the whole server: every verb dispatches onto [`LocalTransport`],
@@ -617,15 +670,17 @@ use crate::transport::{LocalTransport, Transport};
 /// exactly as for a local remote. Verb failures are *replies*; only protocol
 /// violations end the session.
 ///
-/// `read_only` (P29): when true, the three mutating verbs
+/// `policy.read_only` (P29): when true, the three mutating verbs
 /// (`PutObject`/`PutPack`/`UpdateRef`) are rejected with [`Error::ReadOnly`]
-/// BEFORE any store write; read verbs are always allowed. [`serve`] is the
-/// `read_only = false` wrapper every pre-P29 caller uses unchanged.
+/// BEFORE any store write; read verbs are always allowed. `policy.max_pack_size`
+/// / `policy.ro_drain_cap` (P31) bound the `PutPack` spool in both the normal
+/// and read-only-drain arms. [`serve`] is the `WirePolicy::default()` wrapper
+/// every pre-P31 caller uses unchanged.
 pub fn serve_with_policy(
     root: &std::path::Path,
     r: &mut impl Read,
     w: &mut impl Write,
-    read_only: bool,
+    policy: WirePolicy,
 ) -> Result<()> {
     // Handshake: HELLO must come first, and versions must match, before any
     // repo access happens.
@@ -677,7 +732,7 @@ pub fn serve_with_policy(
         };
 
         // P29 read-only gate: reject mutating verbs before any store write.
-        if read_only {
+        if policy.read_only {
             match &req {
                 Request::PutObject { .. } | Request::UpdateRef { .. } => {
                     // Single request frames — nothing trails them; reject and
@@ -694,12 +749,27 @@ pub fn serve_with_policy(
                     // so no object reaches the store: "rejected before any
                     // store write" holds. `spill_pack_stream` + guard drop is
                     // the same bounded-RAM machinery the normal PutPack arm
-                    // uses.
-                    let guard = spill_pack_stream(r, transport.layout())?;
-                    drop(guard);
-                    let (code, msg) = err_to_wire(&Error::ReadOnly);
-                    write_err(w, code, &msg)?;
-                    continue;
+                    // uses, bounded to `policy.ro_drain_cap` (P31) rather than
+                    // the normal arm's larger `max_pack_size` — a read-only
+                    // push is discarded regardless, so there's no reason to
+                    // spool an attacker-sized pack just to reject it.
+                    match spill_pack_stream(r, transport.layout(), policy.ro_drain_cap) {
+                        Ok(guard) => {
+                            drop(guard);
+                            let (code, msg) = err_to_wire(&Error::ReadOnly);
+                            write_err(w, code, &msg)?;
+                            continue;
+                        }
+                        Err(Error::PackTooLarge(_)) => {
+                            // Over the drain cap: the stream is desynced (we
+                            // stopped reading mid-pack), so a best-effort
+                            // reply is all we can do — then close.
+                            let (code, msg) = err_to_wire(&Error::ReadOnly);
+                            let _ = write_err(w, code, &msg);
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 _ => {}
             }
@@ -742,7 +812,7 @@ pub fn serve_with_policy(
                 }
             }
             Request::PutPack => {
-                match spill_pack_stream(r, transport.layout()) {
+                match spill_pack_stream(r, transport.layout(), policy.max_pack_size) {
                     Ok(guard) => {
                         match transport.ingest_from(guard.path()) {
                             Ok(ids) => write_ok(w, &ids_body(&ids))?,
@@ -753,6 +823,17 @@ pub fn serve_with_policy(
                         }
                         // `guard` drops here — temp pack file removed,
                         // whether ingestion succeeded or failed.
+                    }
+                    Err(e @ Error::PackTooLarge(_)) => {
+                        // Over the cap: the stream is desynced (we stopped
+                        // reading mid-pack, so any bytes still on the wire
+                        // are neither read nor a subsequent request), so a
+                        // best-effort reply is the most we can do — then
+                        // close the connection rather than try to serve
+                        // further requests off a desynced stream.
+                        let (code, msg) = err_to_wire(&e);
+                        let _ = write_err(w, code, &msg);
+                        return Ok(());
                     }
                     Err(e) => {
                         let (code, msg) = err_to_wire(&e);
@@ -795,10 +876,12 @@ pub fn serve_with_policy(
     }
 }
 
-/// Serve with full read/write access — the pre-P29 behavior. Every existing
-/// caller (stdio transport, sync, tests) uses this unchanged.
+/// Serve with full read/write access and default spool caps — the pre-P29
+/// behavior for read-only, now with `WirePolicy::default()`'s bounded
+/// `max_pack_size`/`ro_drain_cap` (P31). Every existing caller (stdio
+/// transport, sync, tests) uses this unchanged.
 pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> Result<()> {
-    serve_with_policy(root, r, w, false)
+    serve_with_policy(root, r, w, WirePolicy::default())
 }
 
 /// Destream an incoming pack chunk stream (`ST_PACK_CHUNK`/`ST_PACK_END`
@@ -806,14 +889,16 @@ pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> R
 /// fresh temp pack file, bounded to one chunk in RAM at a time. The guard is
 /// created before any read, so a stream that errors partway (a malformed
 /// frame, a dropped connection) still leaves nothing behind — `Drop` removes
-/// whatever was written so far.
+/// whatever was written so far. `max_bytes` bounds the spool (0 = unlimited,
+/// P31) — see [`read_pack_stream`].
 fn spill_pack_stream(
     r: &mut impl Read,
     layout: &crate::layout::Layout,
+    max_bytes: u64,
 ) -> Result<crate::transport::TempPackGuard> {
     let guard = crate::transport::TempPackGuard::new(layout)?;
     let mut f = std::fs::File::create(guard.path())?;
-    read_pack_stream(r, &mut f, 0)?;
+    read_pack_stream(r, &mut f, max_bytes)?;
     Ok(guard)
 }
 
@@ -1217,7 +1302,11 @@ mod tests {
         let (client_read, mut server_write) = std::io::pipe().unwrap();
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let handle = std::thread::spawn(move || {
-            serve_with_policy(&root, &mut server_read, &mut server_write, read_only)
+            let policy = WirePolicy {
+                read_only,
+                ..Default::default()
+            };
+            serve_with_policy(&root, &mut server_read, &mut server_write, policy)
         });
         let client =
             crate::stdio_transport::WireClient::handshake(client_read, client_write).unwrap();
@@ -1373,5 +1462,105 @@ mod tests {
             Error::PackTooLarge(m) => assert!(m.contains("17179869184")),
             other => panic!("expected PackTooLarge, got {other:?}"),
         }
+    }
+
+    /// A PutPack whose chunk stream exceeds policy.max_pack_size gets a
+    /// best-effort EC_TOO_LARGE reply and the connection closes (desync).
+    #[test]
+    fn putpack_over_cap_replies_too_large_and_closes() {
+        let root = tmp_repo("cap");
+        let mut input = Vec::new();
+        write_frame(
+            &mut input,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            }
+            .encode(),
+        )
+        .unwrap();
+        write_frame(&mut input, &Request::PutPack.encode()).unwrap();
+        let payload = vec![9u8; 8192];
+        write_pack_stream(&mut input, &mut std::io::Cursor::new(&payload), 1024).unwrap();
+        // A trailing request that must never be answered (connection closed):
+        write_frame(&mut input, &Request::HeadBranch.encode()).unwrap();
+
+        let mut reader = std::io::Cursor::new(input);
+        let mut output = Vec::new();
+        let policy = WirePolicy {
+            read_only: false,
+            max_pack_size: 4096,
+            ro_drain_cap: RO_DRAIN_CAP,
+        };
+        serve_with_policy(&root, &mut reader, &mut output, policy).unwrap();
+
+        let mut frames = Vec::new();
+        let mut r = std::io::Cursor::new(output);
+        while let Some(f) = read_frame_opt(&mut r).unwrap() {
+            frames.push(parse_response(f));
+        }
+        assert_eq!(
+            frames.len(),
+            2,
+            "hello-ok + too-large error only, got {frames:?}"
+        );
+        assert!(frames[0].is_ok());
+        assert!(matches!(
+            frames[1].as_ref().unwrap_err(),
+            Error::PackTooLarge(_)
+        ));
+        // Zero spool residue:
+        let tmp = root.join(".sc").join("tmp");
+        assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_max_pack_size_floor() {
+        assert!(validate_max_pack_size(0).is_ok());
+        assert!(validate_max_pack_size(scl_core::MAX_OBJECT_SIZE as u64).is_ok());
+        assert!(validate_max_pack_size(1024).is_err());
+    }
+
+    /// An oversized push on a read-only connection drains at most ro_drain_cap
+    /// bytes, then the connection closes; zero spool residue.
+    #[test]
+    fn readonly_oversized_push_is_dropped_after_drain_cap() {
+        let root = tmp_repo("rocap");
+        let mut input = Vec::new();
+        write_frame(
+            &mut input,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            }
+            .encode(),
+        )
+        .unwrap();
+        write_frame(&mut input, &Request::PutPack.encode()).unwrap();
+        let payload = vec![9u8; 8192];
+        write_pack_stream(&mut input, &mut std::io::Cursor::new(&payload), 1024).unwrap();
+        write_frame(&mut input, &Request::HeadBranch.encode()).unwrap(); // must never be answered
+
+        let mut reader = std::io::Cursor::new(input);
+        let mut output = Vec::new();
+        let policy = WirePolicy {
+            read_only: true,
+            max_pack_size: 0,
+            ro_drain_cap: 4096,
+        };
+        serve_with_policy(&root, &mut reader, &mut output, policy).unwrap();
+
+        let mut frames = Vec::new();
+        let mut r = std::io::Cursor::new(output);
+        while let Some(f) = read_frame_opt(&mut r).unwrap() {
+            frames.push(parse_response(f));
+        }
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(
+            frames[1].as_ref().unwrap_err(),
+            Error::ReadOnly | Error::Remote(_)
+        ));
+        let tmp = root.join(".sc").join("tmp");
+        assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

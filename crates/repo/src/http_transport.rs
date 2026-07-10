@@ -599,7 +599,15 @@ fn handle_http_connection(
         .map_err(|e| Error::ConnectionLost(format!("sc+http clear read_timeout: {e}")))?;
 
     let read_only = server_read_only || token_read_only;
-    crate::wire::serve_with_policy(root, &mut reader, &mut stream, read_only)
+    crate::wire::serve_with_policy(
+        root,
+        &mut reader,
+        &mut stream,
+        crate::wire::WirePolicy {
+            read_only,
+            ..Default::default()
+        },
+    )
 }
 
 #[cfg(test)]
