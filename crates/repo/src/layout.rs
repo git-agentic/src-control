@@ -91,6 +91,12 @@ impl Layout {
     pub fn tmp_dir(&self) -> PathBuf {
         self.dot_sc.join("tmp")
     }
+    /// `.sc/serve-tls/` — the server's TLS identity (`cert.pem` + `key.pem`),
+    /// auto-minted on first `sc serve --http … --tls` (P32). The key IS the
+    /// identity: it is regenerated only when missing.
+    pub fn serve_tls_dir(&self) -> PathBuf {
+        self.dot_sc.join("serve-tls")
+    }
     /// `.sc/promisor` — the partial-clone marker (P27): line 1 `origin
     /// <url>`, then one fetch-filter prefix per line. Absent means a full
     /// clone (every object was fetched, nothing is a promised gap).

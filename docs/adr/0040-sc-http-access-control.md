@@ -24,7 +24,8 @@ Access control for `sc serve --http` composes three gates, dep-free (BLAKE3 is a
 dependency; constant-time compare is std-implementable — no TLS, no new crate):
 
 1. **Fail-closed bind.** A non-loopback bind is refused unless justified by `--read-only`,
-   `--allow-public`, or ≥1 configured token; loopback always binds.
+   `--allow-public`, or ≥1 configured token; loopback always binds. *(Narrowed by P32: a
+   token justifies only together with `--tls` — see ADR-0042.)*
 2. **Bearer-token auth at the HTTP opening.** When `.sc/serve-tokens.toml` holds ≥1 token,
    a valid `Authorization: Bearer <token>` is required on **every** connection (loopback
    included). The check sits at the opening — `read_client_opening` returns

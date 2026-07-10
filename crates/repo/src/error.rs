@@ -76,6 +76,25 @@ pub enum Error {
     ConnectionLost(String),
     #[error("remote error: {0}")]
     Remote(String),
+    #[error("TLS: {0}")]
+    Tls(#[from] scl_tlsio::Error),
+    #[error(
+        "sc+https server key for {host} does not match the pinned fingerprint ({file})\n  \
+         pinned: {pinned}\n  server: {seen}\n\
+         If the server key legitimately changed, remove that host's line from the pin file \
+         and reconnect (the next connect re-pins); verify with `sc serve fingerprint` on the server."
+    )]
+    TlsPinMismatch {
+        host: String,
+        file: String,
+        pinned: String,
+        seen: String,
+    },
+    #[error(
+        "sc+https host {0} is not pinned and SC_HTTPS_STRICT=1 refuses unknown hosts; \
+         pre-pin with SC_HTTPS_FINGERPRINT=sha256:<hex> or connect once without SC_HTTPS_STRICT"
+    )]
+    TlsStrictUnknownHost(String),
     #[error(
         "secret {0} changed differently on both branches; resolve with `sc secret` then retry"
     )]

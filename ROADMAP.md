@@ -475,10 +475,43 @@ across every phase.
   transcript while the still-reachable one survives — run twice, zero
   residue. No new dependency. (ADR-0038.)
 
+- **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
+  (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"
+  boundary. A new leaf crate, `crates/tlsio` (`scl-tlsio`), is the only crate
+  linking rustls (0.23, ring provider, `default-features = false` —
+  ~14 new crates, C compiler only, no cmake) and rcgen; `repo` is its sole
+  consumer, extending the dependency rule to
+  `cli → repo → {vfs, gitio, crypto, tlsio} → core`. Two seam functions grow
+  a TLS wrap and nothing else changes — the opening codec, `wire.rs`, and
+  `serve_tokens.rs` are byte-for-byte unchanged, `PROTOCOL_VERSION` stays 3.
+  Trust is accept-new TOFU (the SSH `known_hosts` shape): the client pins
+  `SHA-256(SPKI)` into `~/.config/sc/known_hosts` on first connect
+  (`SC_HTTPS_KNOWN_HOSTS` override, `SC_HTTPS_FINGERPRINT` pre-pin,
+  `SC_HTTPS_STRICT=1` to refuse unknown hosts); pinning is pin-only in v1
+  (names/validity ignored) but the handshake signature is still verified, and
+  a pin mismatch always hard-fails. `sc serve --http <addr> <path> --tls
+  [--tls-cert <pem> --tls-key <pem>]` auto-mints a self-signed identity into
+  `.sc/serve-tls/` (key `0600`, key-is-identity) unless PEM is supplied;
+  `sc serve fingerprint [<path>]` mints-if-missing and prints the SPKI
+  fingerprint for out-of-band distribution. **Gate change (breaking):** a
+  non-loopback bind now needs `--read-only`, `--allow-public`, or (`--tls`
+  AND ≥1 token) — P29's "tokens alone justify a public bind" is narrowed,
+  since a token protecting only a plaintext channel was never the guarantee
+  its wording implied. **Deliberate spec deviation:** under TLS, the
+  `--max-connections` busy-shed at the connection cap closes the socket
+  silently instead of writing a readable `503`, because a readable status
+  would require a TLS handshake on the accept thread, violating ADR-0041's
+  accepts-never-block property; plaintext connections keep the readable
+  `503` unchanged. Proven by `demo/run_tls_demo.sh`: a TLS round trip
+  carrying a signed chunked blob byte-for-byte, the TOFU
+  pin/mismatch/strict/pre-pin lifecycle, and the tightened plaintext gate —
+  run twice, zero residue. (ADR-0042.)
+
 ## Active
 
-**None.** The agent/workspace-depth horizon opened by P30 is complete; the
-next horizon is TBD.
+**None.** The agent/workspace-depth horizon opened by P30 is complete; P32
+closed the standalone TLS gap the P25–P31 horizon left open; the next
+horizon is TBD.
 
 ## Completed phases (usability-first ordering)
 
@@ -511,6 +544,8 @@ next horizon is TBD.
 | **P28 — Security hardening sweep** | Close the audit's concrete-bug Highs + surface the accepted Mediums | strict ref-name validation at the write/read boundary (hostile wire `UpdateRef` + git-remote branch names rejected); `MAX_OBJECT_SIZE` caps every untrusted frame/pack-record/zstd-output length; `sc protect` nudges low-entropy secret filenames toward `sc secret`; secret env-var boundary documented as authorized-local-process-context + plaintext stays `Zeroizing`; every prior demo green + new pinned regression tests, no new dependency | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | **P29 — sc+http access control** | Close the audit's remaining unauthenticated-server High | fail-closed non-loopback bind; `sc serve token add/remove/list` + `SC_HTTP_TOKEN` bearer auth at the HTTP opening (constant-time `BLAKE3` compare, `401` before the wire handoff); `--read-only`/`ro`-scope tokens reject mutating verbs before any store write via `EC_READONLY`; proven by `demo/run_http_auth_demo.sh` | [0040](docs/adr/0040-sc-http-access-control.md) |
 | **P30 — Agent session transcripts** | Attach a sealed, provenance-checked agent-session record to a commit | `sc transcript attach <ref> <file> --agent claude --sign`; a keyless clone gets ciphertext only, the recipient's identity decrypts byte-exact; `sc log` shows a non-decrypting presence marker; `sc gc` prunes a transcript once its only snapshot is unreachable; proven by `demo/run_transcript_demo.sh` | [0038](docs/adr/0038-agent-session-transcripts.md) |
+| **P31 — Listener resource limits** | Bound `sc serve --http`/`--stdio` against a hostile or overloaded peer | `--max-connections`/`--timeout`/`--max-pack-size` close ADR-0036's three named-but-open accepted consequences plus an aggregate-pack-spool gap this phase's own research pass found; busy-status-and-close at the connection cap, connection-fatal session timeout, `EC_TOO_LARGE` mid-stream abort on both transports, capped read-only pre-drain, Go-shaped exponential accept backoff; proven by `demo/run_limits_demo.sh` plus unit-test-proven timeout/backoff | [0041](docs/adr/0041-listener-resource-limits.md) |
+| **P32 — In-binary TLS (`sc+https://`)** | Confidential `sc+http` transport without a reverse proxy | `sc serve --http <addr> <path> --tls` auto-mints (or loads PEM) a serve identity; `sc clone sc+https://host/repo` with accept-new TOFU pinning into `~/.config/sc/known_hosts`; gate tightened so a plaintext public bind can no longer be justified by tokens alone (`--tls` + ≥1 token now required); proven by `demo/run_tls_demo.sh` (signed chunked blob over TLS, pin/mismatch/strict/pre-pin, tightened plaintext gate) | [0042](docs/adr/0042-in-binary-tls-sc-https.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -709,10 +744,21 @@ scale-&-reach horizon):
 - **Token expiry/rotation metadata (P29).** `sct-` tokens have no expiry
   field; rotation today is add-new + remove-old with no automation or
   reminder. Deferred.
-- **`sc+https://` / TLS (P29).** `sc serve --http` is plaintext-only; a
+- ~~**`sc+https://` / TLS (P29).** `sc serve --http` is plaintext-only; a
   bearer token crosses the wire in cleartext, so a public deployment must
   front with a TLS reverse proxy today. A first-party TLS dependency is
-  deferred, against the P25/P26 dep-free grain.
+  deferred, against the P25/P26 dep-free grain.~~ **Done.** Shipped in P32
+  (ADR-0042): `sc+https://` via in-binary rustls, accept-new TOFU pinning,
+  a narrowed non-loopback bind gate (`--tls` + token, not token alone). See
+  the Phase 32 entry above. Follow-ons this phase named rather than closed:
+  CA-path validation as an additive trust option for PEM-provisioned
+  deployments (v1 is pin-only, names/validity ignored); opt-in SNI/
+  certificate-name validation; pin-management UX (`sc tls` list/remove
+  entries in `~/.config/sc/known_hosts` — today only `sc serve fingerprint`
+  and first-connect/`SC_HTTPS_FINGERPRINT` write pins, nothing removes one);
+  TLS session-resumption knobs (not evaluated this phase — a later
+  throughput pass if repeated short-lived connections to the same host prove
+  handshake cost material).
 - ~~**Full OS-assigned-port de-flake for the CLI http-serving tests
   (launch prep).**~~ **Done.** `sc serve --http` now announces its bound
   address on stdout (`listening on <addr>`) right after `TcpListener::bind`
@@ -784,6 +830,19 @@ scale-&-reach horizon):
   today; and a one-line fix to `SignatureObj.snapshot`'s now-stale doc
   comment, which still describes the field as always a snapshot id even
   though signing a transcript stores a transcript id there instead.
+- **P32 follow-ons.** Four items named but not closed by the P32 TLS work,
+  deferred rather than silently dropped: (1) a `.sc`-existence check before
+  `sc serve fingerprint`/`--tls` auto-mint — today it happily mints
+  `~/.sc/serve-tls` even when run outside a repo; (2) a stderr warning when
+  an `SC_HTTPS_*` env knob (`SC_HTTPS_STRICT`/`SC_HTTPS_FINGERPRINT`/
+  `SC_HTTPS_KNOWN_HOSTS`) is set but the target URL is plaintext
+  `sc+http://` — a scheme-downgrade footgun where the knob silently does
+  nothing; (3) a client-side TLS handshake/read timeout — the server bounds
+  its side at 30s (the opening read), but the `sc+https://` client is
+  unbounded, so this folds into the existing deferred hostile-peer pass
+  alongside `read_frame_inner`'s unbounded frame-length allocation; (4)
+  `sc remote add` parse-validating `sc+http(s)://` URLs at add time, the
+  way `ssh://` already does, instead of deferring the parse to first use.
 
 ## How a phase gets built
 

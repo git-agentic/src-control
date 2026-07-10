@@ -360,13 +360,14 @@ pub(crate) fn ssh_command(url: &SshUrl) -> Command {
 }
 
 /// Open the right [`Transport`] for a remote URL: `ssh://` spawns the wire
-/// client over a child process's stdio, `sc+http://` dials it directly over
-/// TCP; anything else is a local `.sc/` path.
+/// client over a child process's stdio, `sc+http://`/`sc+https://` dial it
+/// directly over TCP (TLS-wrapped for the latter, P32); anything else is a
+/// local `.sc/` path.
 pub fn open_transport(url: &str) -> Result<Box<dyn Transport>> {
     if url.starts_with("ssh://") {
         let parsed = SshUrl::parse(url)?;
         Ok(Box::new(StdioTransport::spawn(ssh_command(&parsed))?))
-    } else if url.starts_with("sc+http://") {
+    } else if url.starts_with("sc+http://") || url.starts_with("sc+https://") {
         let parsed = crate::http_transport::ScHttpUrl::parse(url)?;
         Ok(Box::new(crate::http_transport::HttpTransport::connect(
             &parsed,

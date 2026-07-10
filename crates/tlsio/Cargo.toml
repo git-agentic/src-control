@@ -1,0 +1,17 @@
+[package]
+name = "scl-tlsio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex = "0.4.3"
+rcgen = "0.14.8"
+ring = "0.17.14"
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1.15.0", features = ["std"] }
+thiserror = "2.0.18"
+
+[lints]
+workspace = true
