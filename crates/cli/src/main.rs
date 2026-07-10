@@ -313,8 +313,19 @@ enum Cmd {
         /// when non-zero. (P31)
         #[arg(long)]
         max_pack_size: Option<u64>,
+        /// Serve TLS (`sc+https://`): auto-mints a self-signed identity into
+        /// `.sc/serve-tls/` unless --tls-cert/--tls-key supply a PEM pair.
+        /// `--http` only. (P32)
+        #[arg(long)]
+        tls: bool,
+        /// PEM certificate chain for --tls (requires --tls-key).
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key for --tls (requires --tls-cert).
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
         /// Repo root to serve (the directory containing `.sc/`). Required
-        /// unless a `token` subcommand is used.
+        /// unless a `token`/`fingerprint` subcommand is used.
         path: Option<PathBuf>,
     },
     /// Manage remotes.
@@ -642,6 +653,10 @@ enum ServeSub {
         #[command(subcommand)]
         op: ServeTokenOp,
     },
+    /// Print this repo's serve-TLS fingerprint (sha256:<hex> of the SPKI),
+    /// minting `.sc/serve-tls/` if absent — distribute this to clients as
+    /// SC_HTTPS_FINGERPRINT or to verify a first-connect pin. (P32)
+    Fingerprint { path: Option<PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -834,9 +849,20 @@ fn main() -> Result<()> {
             max_connections,
             timeout,
             max_pack_size,
+            tls,
+            tls_cert,
+            tls_key,
             path,
         } => match sub {
             Some(ServeSub::Token { op }) => run_serve_token(op),
+            Some(ServeSub::Fingerprint { path }) => {
+                let root = match path {
+                    Some(p) => p,
+                    None => std::env::current_dir()?,
+                };
+                println!("{}", scl_repo::http_transport::serve_tls_fingerprint(&root)?);
+                Ok(())
+            }
             None => {
                 let path = path.ok_or_else(|| anyhow::anyhow!("sc serve requires a <path>"))?;
                 run_serve(
@@ -847,6 +873,9 @@ fn main() -> Result<()> {
                     max_connections,
                     timeout,
                     max_pack_size,
+                    tls,
+                    tls_cert,
+                    tls_key,
                     path,
                 )
             }
@@ -3155,6 +3184,9 @@ fn run_serve(
     max_connections: Option<u32>,
     timeout: Option<u64>,
     max_pack_size: Option<u64>,
+    tls: bool,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
     path: PathBuf,
 ) -> Result<()> {
     match (stdio, http) {
@@ -3164,6 +3196,11 @@ fn run_serve(
             }
             if max_connections.is_some() || timeout.is_some() {
                 anyhow::bail!("--max-connections/--timeout apply only to --http, not --stdio");
+            }
+            if tls || tls_cert.is_some() || tls_key.is_some() {
+                anyhow::bail!(
+                    "--tls applies only to --http (ssh already provides --stdio's confidential channel)"
+                );
             }
             let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
             scl_repo::wire::validate_max_pack_size(max_pack)?;
@@ -3188,13 +3225,22 @@ fn run_serve(
             if let Some(m) = max_pack_size {
                 limits.max_pack_size = m;
             }
+            let tls_mode = match (tls, tls_cert, tls_key) {
+                (false, None, None) => scl_repo::http_transport::TlsMode::Off,
+                (false, _, _) => anyhow::bail!("--tls-cert/--tls-key require --tls"),
+                (true, None, None) => scl_repo::http_transport::TlsMode::AutoMint,
+                (true, Some(cert), Some(key)) => {
+                    scl_repo::http_transport::TlsMode::Pem { cert, key }
+                }
+                (true, _, _) => anyhow::bail!("--tls-cert and --tls-key must be given together"),
+            };
             scl_repo::http_transport::serve_http(
                 &addr,
                 &path,
                 read_only,
                 allow_public,
                 limits,
-                scl_repo::http_transport::TlsMode::Off,
+                tls_mode,
             )?;
             Ok(())
         }
