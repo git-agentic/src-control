@@ -102,6 +102,15 @@ pub enum Error {
     /// (`--read-only` or an `ro`-scope token). P29.
     #[error("server is read-only")]
     ReadOnly,
+    /// The server aborted an incoming pack mid-stream because it exceeded the
+    /// operator's `--max-pack-size` cap (P31). Payload is the server's own
+    /// human-readable limit text, carried verbatim across the wire.
+    #[error("pack exceeds the server's --max-pack-size limit: {0}")]
+    PackTooLarge(String),
+    /// The server refused the connection at accept time because
+    /// `--max-connections` was reached (P31). Retryable.
+    #[error("server busy (connection limit reached); retry later")]
+    ServerBusy,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

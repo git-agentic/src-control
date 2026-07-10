@@ -298,6 +298,21 @@ enum Cmd {
         /// configured token, binding a non-loopback address is refused.
         #[arg(long)]
         allow_public: bool,
+        /// Maximum concurrent connections (`--http` only); 0 = unlimited.
+        /// Default 32 (git-daemon parity). At the limit new connections get an
+        /// immediate busy status and close. (P31)
+        #[arg(long)]
+        max_connections: Option<u32>,
+        /// Session idle timeout in seconds (`--http` only); 0 = disabled.
+        /// Default 300. A connection making zero-byte progress for this long is
+        /// dropped. (P31)
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Maximum incoming pack size in bytes (both --http and --stdio);
+        /// 0 = unlimited. Default 16 GiB. Must be ≥ 256 MiB (MAX_OBJECT_SIZE)
+        /// when non-zero. (P31)
+        #[arg(long)]
+        max_pack_size: Option<u64>,
         /// Repo root to serve (the directory containing `.sc/`). Required
         /// unless a `token` subcommand is used.
         path: Option<PathBuf>,
@@ -816,12 +831,24 @@ fn main() -> Result<()> {
             http,
             read_only,
             allow_public,
+            max_connections,
+            timeout,
+            max_pack_size,
             path,
         } => match sub {
             Some(ServeSub::Token { op }) => run_serve_token(op),
             None => {
                 let path = path.ok_or_else(|| anyhow::anyhow!("sc serve requires a <path>"))?;
-                run_serve(stdio, http, read_only, allow_public, path)
+                run_serve(
+                    stdio,
+                    http,
+                    read_only,
+                    allow_public,
+                    max_connections,
+                    timeout,
+                    max_pack_size,
+                    path,
+                )
             }
         },
         Cmd::Remote { op } => run_remote(op),
@@ -3118,12 +3145,16 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
 /// dropped, e.g. by process termination). Exactly one mode is required.
 /// `--read-only`/`--allow-public` are `--http`-only (P29): `--stdio`
 /// delegates auth/access entirely to ssh, so combining them is refused
-/// rather than silently ignored.
+/// rather than silently ignored. `--max-connections`/`--timeout` are also
+/// `--http`-only (P31). `--max-pack-size` applies to both (P31).
 fn run_serve(
     stdio: bool,
     http: Option<String>,
     read_only: bool,
     allow_public: bool,
+    max_connections: Option<u32>,
+    timeout: Option<u64>,
+    max_pack_size: Option<u64>,
     path: PathBuf,
 ) -> Result<()> {
     match (stdio, http) {
@@ -3131,13 +3162,33 @@ fn run_serve(
             if read_only || allow_public {
                 anyhow::bail!("--read-only/--allow-public apply only to --http, not --stdio");
             }
+            if max_connections.is_some() || timeout.is_some() {
+                anyhow::bail!("--max-connections/--timeout apply only to --http, not --stdio");
+            }
+            let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
+            scl_repo::wire::validate_max_pack_size(max_pack)?;
+            let policy = scl_repo::wire::WirePolicy {
+                read_only: false,
+                max_pack_size: max_pack,
+                ro_drain_cap: scl_repo::wire::RO_DRAIN_CAP,
+            };
             let mut stdin = std::io::stdin().lock();
             let mut stdout = std::io::stdout().lock();
-            scl_repo::wire::serve(&path, &mut stdin, &mut stdout)?;
+            scl_repo::wire::serve_with_policy(&path, &mut stdin, &mut stdout, policy)?;
             Ok(())
         }
         (false, Some(addr)) => {
-            scl_repo::http_transport::serve_http(&addr, &path, read_only, allow_public)?;
+            let mut limits = scl_repo::http_transport::ServeLimits::default();
+            if let Some(n) = max_connections {
+                limits.max_connections = n;
+            }
+            if let Some(t) = timeout {
+                limits.timeout_secs = t;
+            }
+            if let Some(m) = max_pack_size {
+                limits.max_pack_size = m;
+            }
+            scl_repo::http_transport::serve_http(&addr, &path, read_only, allow_public, limits)?;
             Ok(())
         }
         (true, Some(_)) => anyhow::bail!("sc serve accepts only one of --stdio or --http"),

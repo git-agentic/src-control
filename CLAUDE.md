@@ -280,12 +280,25 @@ bash demo/run_streaming_demo.sh               # streaming pack transfer proof (P
                                               # in 250+ chunk frames, byte-for-byte clone, zero
                                               # .sc/tmp residue on either end
 cargo run --bin sc -- serve --http <addr> <path> [--read-only] [--allow-public]
+                             [--max-connections <n>] [--timeout <secs>] [--max-pack-size <bytes>]
                                               # sc-native wire protocol over TCP (P26); e.g.
                                               # `sc serve --http 127.0.0.1:8730 .`; exactly one
                                               # of --stdio/--http is required; a non-loopback
                                               # <addr> is refused unless --read-only,
                                               # --allow-public, or a configured serve token
                                               # justifies it (P29)
+                                              # --max-connections <n>: concurrent-connection cap,
+                                              # --http only, default 32, 0=unlimited; at the limit
+                                              # a new connection gets busy-status-and-close, no
+                                              # queuing (P31)
+                                              # --timeout <secs>: session idle/progress timeout,
+                                              # --http only, default 300, 0=disabled; read+write,
+                                              # persists the whole session, connection-fatal on
+                                              # trip; opening keeps its own 30s (P31)
+                                              # --max-pack-size <bytes>: incoming-pack aggregate
+                                              # cap, both --http and --stdio, default 16 GiB,
+                                              # 0=unlimited, floor 256 MiB (MAX_OBJECT_SIZE);
+                                              # counted mid-stream abort -> EC_TOO_LARGE (P31)
 cargo run --bin sc -- serve token add --label <name> --scope ro|rw   # mint an
                                               # sct-<hex> bearer token in .sc/serve-tokens.toml;
                                               # raw value prints once on stdout (P29)
@@ -996,13 +1009,13 @@ serve --http` is unauthenticated, as `--stdio` delegates auth to ssh —
 production auth + TLS means fronting with a reverse proxy; this is the
 reach primitive, not a hosted-git competitor); **not HTTP-proxy/CDN safe**
 (a strict proxy won't tunnel the post-opening raw protocol, the accepted
-cost of the persistent-connection model). **Accepted design consequences,
-not yet closed (deferred, see ROADMAP):** `serve_http_listener` is
-unbounded thread-per-connection with no pool/backpressure; the opening
-timeout is cleared once `wire::serve` takes over, so a client that stalls
-mid-transfer holds its thread indefinitely (no idle-transfer watchdog
-yet); the accept loop has no backoff on sustained fd exhaustion. See
-ADR-0036.
+cost of the persistent-connection model). **Accepted design consequences at
+the time — closed by P31 (ADR-0041):** `serve_http_listener`'s unbounded
+thread-per-connection (no pool/backpressure), the opening timeout being
+cleared once `wire::serve` takes over (no idle-transfer watchdog), and the
+accept loop's lack of backoff on sustained fd exhaustion are all closed by
+P31's `--max-connections`, `--timeout`, and hardcoded accept backoff,
+respectively — see the P31 section below. See ADR-0036.
 
 **Phase 27 is built.** The P25–P27 scale-&-reach horizon's capstone:
 partial clone. `.sc/promisor` (`crates/repo/src/promisor.rs`, local,
@@ -1242,12 +1255,46 @@ bytes, the `sc log` marker, and `sc gc` pruning a deleted branch's
 transcript while the still-reachable one from earlier survives — run
 twice, zero residue. No new dependency. See ADR-0038.
 
+**Phase 31 is built.** Listener resource limits close ADR-0036's three
+named-but-open accepted consequences plus a fourth this phase's own
+research pass (`docs/research/bounded-server-patterns.md`, ticket #27)
+found and named for the first time: the aggregate incoming-pack spool was
+unbounded on both transports, including via the read-only rejection path.
+`sc serve --http` gains `--max-connections <n>` (default 32, matching
+`git-daemon`, 0 = unlimited; at the limit a new connection gets an
+immediate busy status at the pre-handshake opening seam and closes — no
+queuing), `--timeout <secs>` (default 300, 0 = disables; read+write
+timeouts now persist for the whole session rather than being cleared after
+the opening, and a trip is connection-fatal since mid-stream abort desyncs
+the frame stream; the opening keeps its own unchanged 30s), and
+`--max-pack-size <bytes>` (default 16 GiB, 0 = unlimited, floor 256 MiB =
+`MAX_OBJECT_SIZE`; applies to **both** `--http` and `--stdio` since it
+lives in the shared `WirePolicy`, not the `--http`-only `ServeLimits`; a
+counted mid-stream abort replies `EC_TOO_LARGE` best-effort before closing).
+The read-only pre-drain (`wire.rs`'s `EC_READONLY` arm, which drains an
+incoming pack before replying so the connection stays in sync) is now
+capped at 8 MiB (`RO_DRAIN_CAP`): an honest small misconfigured push still
+gets the clean typed error, a larger bulk spool is dropped mid-send instead
+of fully written to disk. The accept loop gained a hardcoded Go-`net/http`-
+shaped exponential backoff (5ms doubling to a 1s cap, reset on success) —
+no operator knob, matching Go's own precedent. Two recorded divergences
+from prior art: the timeout ships **on** by default, unlike `git-daemon`'s
+off-by-default `--timeout` (a defaults-off knob doesn't close an
+audit-tracked High); the pack-spool default is **finite** (16 GiB), unlike
+git's unlimited `receive.maxInputSize` (sc servers often share the working
+tree's volume). `PROTOCOL_VERSION` stays 3 — none of the four bounds touch
+the wire protocol, and `EC_TOO_LARGE` degrades to opaque text on an old
+client, same as `EC_READONLY`'s precedent. Zero new dependencies. Proven by
+`demo/run_limits_demo.sh` (the floor-cap enforcement on the push path and
+the busy-status shed under `--max-connections`); the session-timeout reaper
+and accept-backoff pacing are unit-test-proven rather than demo-proven,
+since forcing a real stalled socket or fd exhaustion reliably in a demo
+script is impractical. See ADR-0041.
+
 Remaining follow-ons: operation objects in the CAS, oplog entries for
 remote-tracking refs, extending the sparse gate to
 `materialize_conflict_state`'s `to_encrypt`/sidecar write loops (see the
-P24 boundary note above), the three P26 `sc serve --http` hardening items
-named above (connection pool/backpressure, idle-transfer watchdog,
-accept-loop backoff), the three P27 items named above (transparent
+P24 boundary note above), the three P27 items named above (transparent
 lazy-fetch as a deferred alternative to explicit `sc backfill`, per-case
 gap-tolerant merge/rebase/`ws harvest`/`sc work` instead of blanket
 refusal, and blob-size/object-count clone filters alongside the
