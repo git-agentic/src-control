@@ -28,6 +28,18 @@ too, not just the src-control-side metadata.
   wrappers can observe the plaintext through the child environment; this is
   fundamental to env-var injection. The parent's intermediate buffer is zeroized
   (best-effort), the child copy is not.
+- **Re-affirmed (map ticket #31): fd/stdin injection stays deferred.** The
+  security claim for a non-env injection mode is mostly illusory against the
+  named adversary — a same-user attacker who can read the identity key file
+  and `.sc/` directly decrypts everything regardless of injection mechanism;
+  what fd/stdin would actually remove is *accidental* propagation (env dumps,
+  inheritance by grandchildren), which is hygiene, not attack surface. Env
+  stays the default contract for `sc run`, `sc work --with-secrets`, and `sc
+  ws run --with-secrets` alike. Revisit triggers: real committed-secret use in
+  agent sessions, or an observed env-leak incident class (agents dumping env
+  into logs or committed files) — at which point an additive fd-pipe opt-in
+  mode is the presumptive shape, since deferring an *additional* mode carries
+  no lock-in cost.
 - **Rotation ≠ erasure:** `sc secret rotate` re-seals under a fresh DEK and cuts
   off future reads through the current registry, but the old ciphertext object
   remains reachable and decryptable by anyone who kept the old DEK. `sc secret
@@ -63,6 +75,19 @@ too, not just the src-control-side metadata.
   into a different branch position (a signature binds identity to a snapshot *id*,
   not to a branch position). `amend`/`rebase`/`merge` results start **unsigned by
   design** — a new snapshot id is a new claim that must be re-signed.
+- **Re-affirmed and sharpened (map ticket #32): replay is ref binding only.** A
+  snapshot's parents are hashed into its id, so a signature over the id already
+  binds identity to the snapshot **and its entire ancestry** — a signed snapshot
+  cannot be grafted under different parents without voiding the signature.
+  "Replayed elsewhere in history" overstates the residue; the accurate claim is
+  narrower: a legitimately-signed snapshot is **replayable to a ref tip within
+  its own history** — nothing stops a hostile remote from pointing a branch name
+  at an older or side-branch signed snapshot (a rollback/ref-swap), the same gap
+  git addresses with signed pushes or gittuf-class ref metadata. Deferred: a
+  gittuf-shaped signed ref attestation (freshness/monotonicity semantics,
+  verified at fetch/clone) is its own trust-model effort, not a corner of an
+  unrelated map. Revisit triggers: the first real multi-writer or hosted `sc
+  serve` deployment, or hosting sc repos on untrusted infrastructure.
 
 ## Agent session transcripts (`sc transcript`) — ADR-0038
 
@@ -76,7 +101,7 @@ too, not just the src-control-side metadata.
   scanner warns at attach time but never blocks; rotation of the underlying secret
   remedies).
 
-## Network transport (`sc serve --http` / `sc+http://`) — ADR-0036/0040
+## Network transport (`sc serve --http` / `sc+http://`) — ADR-0036/0040/0041
 
 - **No TLS.** `sc serve --http` is **plaintext**. When bearer-token auth is
   configured, the token crosses the wire in the clear — a public deployment MUST
@@ -88,10 +113,46 @@ too, not just the src-control-side metadata.
 - **Minor pre-auth information leak:** a `404` (no repo) is written before the auth
   gate, so an unauthenticated client can distinguish "a repo is served here" (`401`)
   from "no repo" (`404`). No content is exposed.
-- **Not proxy/CDN-safe** (raw post-opening protocol), and the server is unbounded
-  thread-per-connection with no idle-transfer watchdog — operational hardening
-  items tracked in [`ROADMAP.md`](../ROADMAP.md)'s Deferred section.
-- The ssh:// transport delegates authentication entirely to ssh (ADR-0022).
+- **Not proxy/CDN-safe** (raw post-opening protocol) — this remains open, deferred
+  in [`ROADMAP.md`](../ROADMAP.md).
+- **Listener resource bounds — closed by P31 (ADR-0041).** The three operational-
+  hardening items this section used to track as open are now closed, plus a
+  fourth gap P31's own research pass first named:
+  - **Connection exhaustion:** an atomic connection counter enforces
+    `--max-connections` (default 32, matching `git-daemon`); at the limit a new
+    connection is accepted, immediately given a busy status at the pre-handshake
+    opening seam, and closed — no queuing, no unbounded thread spawn.
+  - **Idle/stalled-peer exhaustion:** `--timeout` (default 300s, 0 disables) sets
+    read *and* write timeouts on the session socket for its whole lifetime — not
+    just the opening's original 30s, which used to be cleared once the wire
+    handoff began. A trip is connection-fatal (frame desync precludes recovery);
+    the spooled temp pack is guard-cleaned on the resulting unwind.
+  - **Accept-loop hot-spin under fd exhaustion:** a hardcoded exponential backoff
+    (5ms doubling to a 1s cap, reset on the next successful accept — Go
+    `net/http`'s shape) paces retries around `EMFILE`/`ENFILE` instead of
+    busy-looping.
+  - **Aggregate pack-spool exhaustion (named and closed together, P31):** this
+    item was never listed here or in ADR-0036 before P31's research pass found
+    it. The incoming-pack spool used no aggregate size bound — only ADR-0039's
+    per-frame/per-record caps applied — so a single oversized or endless pack
+    could exhaust server disk on **either** transport. `--max-pack-size`
+    (default 16 GiB, 0 = unlimited, floor 256 MiB = `MAX_OBJECT_SIZE`) now
+    counts the running total and aborts mid-stream past the cap. This includes
+    the **read-only drain path**: the pre-`EC_READONLY` drain that keeps a
+    connection in sync when a read-only-scoped client streams a pack the server
+    is about to reject was itself unbounded — an `ro`-token client could still
+    write arbitrary bytes to `.sc/tmp` before being told no. It is now capped at
+    ~8 MiB (`RO_DRAIN_CAP`): an honest small misconfigured push still gets the
+    clean typed `EC_READONLY` error, while a larger bulk spool is dropped
+    mid-send instead of fully drained to disk.
+  - **Not closed by P31:** per-IP/per-token sub-limiting (a distributed
+    many-connections-from-many-sources attack below the per-listener cap is
+    unaddressed), and a legitimate transfer slower than a true 300s zero-byte
+    stall is unaffected by `--timeout`, but an operator on an unusually slow
+    network must raise it explicitly. See ADR-0041 for the full decision,
+    including rejected alternatives.
+- The ssh:// transport delegates authentication entirely to ssh (ADR-0022);
+  `--max-pack-size` is the one P31 bound that also applies to `--stdio`.
 
 ## Untrusted-input hardening (DoS) — ADR-0039
 

@@ -51,6 +51,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0038](0038-agent-session-transcripts.md) | Agent session transcripts as CAS objects | Accepted | 30 |
 | [0039](0039-security-hardening-sweep.md) | Security hardening sweep (audit fix-now items) | Accepted | 28 |
 | [0040](0040-sc-http-access-control.md) | sc+http access control (read-only, fail-closed bind, bearer tokens) | Accepted | 29 |
+| [0041](0041-listener-resource-limits.md) | Listener resource limits (connection cap, session timeout, spool cap, accept backoff) | Accepted | 31 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
