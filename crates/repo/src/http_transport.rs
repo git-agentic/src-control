@@ -628,15 +628,20 @@ fn is_loopback_host(host: &str) -> bool {
     }
 }
 
-/// The fail-closed bind decision (P29): a non-loopback `addr` is allowed
-/// only if justified by `--read-only`, `--allow-public`, or ≥1 configured
-/// serve token; loopback always binds. Factored out of [`serve_http`] so
-/// tests can exercise the decision without binding a public port.
+/// The fail-closed bind decision (P29, tightened by P32/ADR-0042): a
+/// non-loopback `addr` is allowed only if justified by `--read-only`,
+/// `--allow-public`, or — once TLS is available — `--tls` plus ≥1 configured
+/// serve token. A PLAINTEXT public bind justified only by tokens (the P29
+/// rule) is refused: the token would cross the wire in the clear, which is
+/// the exact exposure this phase closes. Deliberate, narrow pre-1.0 break.
+/// Factored out of [`serve_http`] so tests can exercise the decision without
+/// binding a public port.
 fn bind_is_allowed(
     addr: &str,
     root: &std::path::Path,
     read_only: bool,
     allow_public: bool,
+    tls: bool,
 ) -> Result<bool> {
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
     // Strip optional [..] brackets around an IPv6 literal.
@@ -646,6 +651,9 @@ fn bind_is_allowed(
     }
     if read_only || allow_public {
         return Ok(true);
+    }
+    if !tls {
+        return Ok(false);
     }
     let tokens_configured =
         !crate::serve_tokens::load(&crate::layout::Layout::at(root))?.is_empty();
@@ -660,6 +668,9 @@ fn bind_is_allowed(
 /// the handler must then fail closed (reject) rather than serve open. Loopback,
 /// `--read-only` (public read-mirror), and `--allow-public` (deliberately open)
 /// all keep their standing posture when tokens vanish, so this is false for them.
+/// (P32: the TLS+tokens public posture rides this same rule unchanged — it is
+/// still non-loopback && !ro && !allow_public, so tokens are still the sole
+/// justification and auth stays mandatory, fail-closed 401 if they vanish.)
 fn auth_is_mandatory(addr: &str, read_only: bool, allow_public: bool) -> bool {
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -725,11 +736,12 @@ pub fn serve_http(
 ) -> Result<()> {
     crate::wire::validate_max_pack_size(limits.max_pack_size)?;
     let tls_config = resolve_tls(root, &tls)?;
-    if !bind_is_allowed(addr, root, read_only, allow_public)? {
+    if !bind_is_allowed(addr, root, read_only, allow_public, tls_config.is_some())? {
         return Err(Error::InvalidArgument(format!(
-            "refusing to bind non-loopback address {addr} without --read-only, \
-             --allow-public, or a configured serve token (sc serve token add); \
-             use 127.0.0.1 for local-only serving"
+            "refusing to bind non-loopback address {addr}: use --tls with a configured serve \
+             token (sc serve token add), or --read-only, or --allow-public; a plaintext public \
+             bind would send bearer tokens and repo traffic in the clear (use 127.0.0.1 for \
+             local-only serving)"
         )));
     }
     let mandatory_auth = auth_is_mandatory(addr, read_only, allow_public);
@@ -1493,26 +1505,70 @@ mod tests {
         );
 
         // Justified by --read-only.
-        assert!(bind_is_allowed("0.0.0.0:0", &root, true, false).unwrap());
+        assert!(bind_is_allowed("0.0.0.0:0", &root, true, false, false).unwrap());
         // Justified by --allow-public.
-        assert!(bind_is_allowed("0.0.0.0:0", &root, false, true).unwrap());
+        assert!(bind_is_allowed("0.0.0.0:0", &root, false, true, false).unwrap());
         // Still refused with neither justification and no tokens yet.
-        assert!(!bind_is_allowed("0.0.0.0:0", &root, false, false).unwrap());
+        assert!(!bind_is_allowed("0.0.0.0:0", &root, false, false, false).unwrap());
 
-        // Justified by a configured token.
+        // A configured token WITHOUT TLS no longer justifies a public bind
+        // (P32/ADR-0042, decision 5 — the P29 rule broke here on purpose:
+        // a plaintext token crosses the wire in the clear).
+        add_test_token(&root);
+        assert!(!bind_is_allowed("0.0.0.0:0", &root, false, false, false).unwrap());
+        // With TLS, the same configured token justifies the bind.
+        assert!(bind_is_allowed("0.0.0.0:0", &root, false, false, true).unwrap());
+
+        // Loopback always allowed regardless of flags/tokens/tls.
+        assert!(bind_is_allowed("127.0.0.1:0", &root, false, false, false).unwrap());
+        assert!(bind_is_allowed("[::1]:0", &root, false, false, false).unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Configure one `rw` serve token on `root`'s `.sc/serve-tokens.toml`,
+    /// via the same mechanism the P29 gate tests use — shared here so the
+    /// P32 gate-lattice test doesn't duplicate the inline setup.
+    fn add_test_token(root: &std::path::Path) {
         crate::serve_tokens::add(
-            &crate::layout::Layout::at(&root),
+            &crate::layout::Layout::at(root),
             "t",
             crate::serve_tokens::Scope::Rw,
         )
         .unwrap();
-        assert!(bind_is_allowed("0.0.0.0:0", &root, false, false).unwrap());
+    }
 
-        // Loopback always allowed regardless of flags/tokens.
-        assert!(bind_is_allowed("127.0.0.1:0", &root, false, false).unwrap());
-        assert!(bind_is_allowed("[::1]:0", &root, false, false).unwrap());
+    /// The full P32 bind-decision lattice: loopback always; non-loopback
+    /// needs `--read-only`/`--allow-public` on their own, or TLS plus a
+    /// configured token; a configured token WITHOUT TLS no longer justifies
+    /// a public bind (the P32 break from the P29 rule, ADR-0042 decision 5).
+    #[test]
+    fn gate_lattice_p32() {
+        let root = tmp_repo("gate32");
+        let no_tls = false;
+        let tls = true;
 
-        let _ = std::fs::remove_dir_all(&root);
+        // Loopback: always, TLS or not, tokens or not.
+        assert!(bind_is_allowed("127.0.0.1:1", &root, false, false, no_tls).unwrap());
+        assert!(bind_is_allowed("127.0.0.1:1", &root, false, false, tls).unwrap());
+
+        // Non-loopback, nothing configured: refused either way.
+        assert!(!bind_is_allowed("0.0.0.0:1", &root, false, false, no_tls).unwrap());
+        assert!(!bind_is_allowed("0.0.0.0:1", &root, false, false, tls).unwrap());
+
+        // --read-only / --allow-public: justify on their own, unchanged.
+        assert!(bind_is_allowed("0.0.0.0:1", &root, true, false, no_tls).unwrap());
+        assert!(bind_is_allowed("0.0.0.0:1", &root, false, true, no_tls).unwrap());
+
+        // Configure a token…
+        add_test_token(&root);
+
+        // …tokens + TLS: the blessed public posture.
+        assert!(bind_is_allowed("0.0.0.0:1", &root, false, false, tls).unwrap());
+        // …tokens WITHOUT TLS: no longer justifies (the P32 break, decision 5).
+        assert!(!bind_is_allowed("0.0.0.0:1", &root, false, false, no_tls).unwrap());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Read the client opening + status line only, without proceeding to the
