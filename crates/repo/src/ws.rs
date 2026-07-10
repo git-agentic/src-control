@@ -232,18 +232,37 @@ impl Repo {
         // No manifest proves any .sc/ws content is crash residue from a
         // killed fork — always safe to clear before materializing.
         let _ = std::fs::remove_dir_all(&root);
+        // Per-workspace P33 cache key (host's `.sc/local-key`), minted once.
+        let key = crate::cache::local_key(self.layout())?;
         let mut workspaces = Vec::with_capacity(agents as usize);
         for i in 1..=agents {
             let dir = root.join(i.to_string());
-            if let Err(e) =
-                crate::workspace::materialize_workspace(self, tip, &dir, identity, &sparse)
-            {
+            // Persistent per-workspace cache (P33 Task 7): `root` is THIS
+            // checkout dir, file at `.sc/ws/cache-<i>` (beside the checkout,
+            // under `ws_dir`, so the whole-session teardown removes it too).
+            // Records every randomized protected path decrypted at fork so a
+            // later `sc ws harvest` (a separate invocation) carries the base
+            // blob instead of re-sealing an untouched file.
+            let mut cache = crate::cache::ProtectedCache::open(
+                key,
+                dir.clone(),
+                Some(self.layout().ws_cache_path(i as usize)),
+            );
+            if let Err(e) = crate::workspace::materialize_workspace(
+                self,
+                tip,
+                &dir,
+                identity,
+                &sparse,
+                Some(&mut cache),
+            ) {
                 // Nothing announced yet (no manifest written) — tear down
                 // whatever partial checkouts exist so a failed fork leaves
                 // no residue under .sc/ws.
                 let _ = std::fs::remove_dir_all(&root);
                 return Err(e);
             }
+            cache.save_best_effort();
             workspaces.push(WsEntry {
                 index: i,
                 dir,
@@ -374,6 +393,9 @@ impl Repo {
                     .ok_or_else(|| Error::InvalidArgument(format!("no such workspace: {i}")))?;
                 if entry.live {
                     let _ = std::fs::remove_dir_all(&entry.dir);
+                    // Drop the workspace's P33 stat cache too (sibling file,
+                    // not under the checkout dir) — P33 Task 7 item 3.
+                    let _ = std::fs::remove_file(self.layout().ws_cache_path(entry.index as usize));
                     entry.live = false;
                 }
             }
@@ -622,6 +644,8 @@ impl Repo {
             }
         }
 
+        // Per-workspace P33 cache key (host's `.sc/local-key`), minted once.
+        let key = crate::cache::local_key(self.layout())?;
         let mut outcomes = Vec::with_capacity(live_indices.len());
         for i in live_indices {
             let dir = session
@@ -666,7 +690,19 @@ impl Repo {
             // `ws_changed_for` above, now threaded into the commit carry too
             // via `harvest_workspace` -> `snapshot_files`.
             let fork_time_sparse = crate::sparse::Sparse::new(session.sparse.clone());
-            match crate::workspace::harvest_workspace(
+            // The workspace's persistent P33 cache (`root` = this checkout dir,
+            // file at `.sc/ws/cache-<i>`), threaded through the harvest so an
+            // untouched randomized protected path carries the base blob instead
+            // of re-sealing. Saved best-effort right after harvest: if the entry
+            // resolves (teardown removes the cache file too), the save is
+            // immediately undone; if it stays live (Rejected/FallbackBranch),
+            // the next harvest gets a warm cache.
+            let mut cache = crate::cache::ProtectedCache::open(
+                key,
+                dir.clone(),
+                Some(self.layout().ws_cache_path(i as usize)),
+            );
+            let harvested = crate::workspace::harvest_workspace(
                 self,
                 session.base_snapshot,
                 &dir,
@@ -674,7 +710,10 @@ impl Repo {
                 author,
                 &msg,
                 &fork_time_sparse,
-            )? {
+                Some(&mut cache),
+            )?;
+            cache.save_best_effort();
+            match harvested {
                 crate::workspace::HarvestResult::Rejected(report) => {
                     // DESIGN DECISION (spec precision note, Task 5): a
                     // scanner-rejected workspace stays LIVE so the offending
@@ -823,6 +862,10 @@ fn resolve_and_teardown(
     // io error with no recorded recovery path).
     write_manifest(layout, session)?;
     let _ = std::fs::remove_dir_all(dir);
+    // Drop this workspace's P33 stat cache alongside its checkout dir (P33
+    // Task 7 item 3): the cache file lives beside the dir, not inside it, so
+    // removing the dir doesn't remove it.
+    let _ = std::fs::remove_file(layout.ws_cache_path(index as usize));
     Ok(())
 }
 
@@ -1174,6 +1217,74 @@ mod tests {
             !text.contains("scl-sk"),
             "manifest must never contain key material: {text}"
         );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn untouched_protected_files_do_not_conflict_across_workspaces() {
+        // P33 Task 7 Step 4 — the false-conflict hazard the per-workspace
+        // cache exists to prevent. Two workspaces forked WITH identity, each
+        // editing a different PLAIN file, both leaving a RANDOMIZED protected
+        // file untouched. Both must land cleanly (no `work-<i>` fallback) AND
+        // carry the base's EXACT protected blob id. Without a per-workspace
+        // cache, harvest would re-seal the untouched randomized path to a
+        // fresh ciphertext id (a randomized seal differs every time), which
+        // the merge would then adopt as a spurious "change".
+        let root = tmp_root("ws-untouched-protected");
+        let repo = init(&root);
+        std::fs::write(root.join("p1.txt"), "one\n").unwrap();
+        std::fs::write(root.join("p2.txt"), "two\n").unwrap();
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "the secret\n").unwrap();
+        repo.commit("t", "add plain + protected").unwrap();
+        let base = repo.head_tip().unwrap().unwrap();
+
+        // Base's protected blob id, and PROOF it is RANDOMIZED — otherwise a
+        // convergent carry-by-re-encrypt would pass this test without ever
+        // touching the cache (the whole point of the regression).
+        let base_secret_id = {
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            let base_root = s.get_snapshot(&base).unwrap().root;
+            let entries = worktree::tree_file_entries_with_perms(&mut s, base_root).unwrap();
+            let (id, _mode, perms) = *entries.get("secret/x").expect("protected file present");
+            assert!(
+                perms & scl_core::PROTECTED != 0 && perms & scl_core::RANDOMIZED != 0,
+                "the protected file must be RANDOMIZED for this regression to exercise the cache"
+            );
+            id
+        };
+
+        // Fork two workspaces WITH identity: the protected file materializes
+        // decrypted AND is recorded in each workspace's own cache at fork.
+        let session = repo.ws_fork(2, "t", Some(&sk)).unwrap();
+        let dir1 = session.workspaces[0].dir.clone();
+        let dir2 = session.workspaces[1].dir.clone();
+        // Each workspace edits ONLY its own plain file; secret/x is untouched.
+        std::fs::write(dir1.join("p1.txt"), "one edited\n").unwrap();
+        std::fs::write(dir2.join("p2.txt"), "two edited\n").unwrap();
+
+        let outcomes = repo.ws_harvest(None, "t", Some(&sk)).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        for o in &outcomes {
+            let merged_tip = match o {
+                WsHarvestOutcome::Landed { merged_tip, .. } => *merged_tip,
+                other => panic!("expected Landed (no work-<i> fallback), got {other:?}"),
+            };
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            let mroot = s.get_snapshot(&merged_tip).unwrap().root;
+            let entries = worktree::tree_file_entries_with_perms(&mut s, mroot).unwrap();
+            let (id, _m, _p) = *entries.get("secret/x").unwrap();
+            assert_eq!(
+                id, base_secret_id,
+                "an untouched randomized protected file must carry the base blob id, not re-seal"
+            );
+        }
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();

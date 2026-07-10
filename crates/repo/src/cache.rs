@@ -85,15 +85,31 @@ struct CacheEntry {
 
 /// Per-checkout unchanged-detection cache (main tree, one ws workspace, or
 /// an ephemeral in-memory one for `sc work` temp checkouts).
+///
+/// The cache owns its `root`: the absolute base directory of the checkout it
+/// serves, against which relative tree paths are resolved for the stat
+/// (mtime+size) short-circuit. This is the P33 Task 7 design choice (over
+/// threading an explicit worktree-root through `snapshot_files`): a stat cache
+/// is inherently tied to one checkout, so it should carry that checkout's root
+/// rather than have every `unchanged`/`record` caller pass an absolute path.
+/// **Invariant:** the `root` passed at `open` must equal `layout.root` of the
+/// checkout that `materialize`/`diff_worktree`/`snapshot_files` operate on —
+/// the main tree opens with `layout.root`, a `sc ws`/`sc work` workspace with
+/// its own checkout dir. A mismatched root only ever loses the stat
+/// short-circuit (the keyed-tag comparison still proves unchanged-ness, and a
+/// miss degrades to a spurious reseal) — never incorrectness.
 pub(crate) struct ProtectedCache {
     key: [u8; 32],
+    /// Absolute base dir of the served checkout; `root.join(rel)` is the file
+    /// a relative tree path stats to.
+    root: PathBuf,
     /// `None` => ephemeral: `save()` is a no-op.
     path: Option<PathBuf>,
     entries: BTreeMap<String, CacheEntry>,
 }
 
 impl ProtectedCache {
-    pub(crate) fn open(key: [u8; 32], path: Option<PathBuf>) -> ProtectedCache {
+    pub(crate) fn open(key: [u8; 32], root: PathBuf, path: Option<PathBuf>) -> ProtectedCache {
         let mut entries = BTreeMap::new();
         if let Some(p) = &path {
             if let Ok(text) = std::fs::read_to_string(p) {
@@ -121,7 +137,7 @@ impl ProtectedCache {
                 }
             }
         }
-        ProtectedCache { key, path, entries }
+        ProtectedCache { key, root, path, entries }
     }
 
     fn tag(&self, plaintext: &[u8]) -> [u8; 32] {
@@ -137,10 +153,11 @@ impl ProtectedCache {
 
     /// The cached ciphertext blob id iff this exact plaintext is what last
     /// sealed at `rel`: stat hit (mtime+size unchanged) short-circuits;
-    /// otherwise fall back to the keyed-tag comparison.
-    pub(crate) fn unchanged(&self, rel: &str, abs: &Path, plaintext: &[u8]) -> Option<ObjectId> {
+    /// otherwise fall back to the keyed-tag comparison. The absolute file is
+    /// resolved against the cache's own `root` (`root.join(rel)`).
+    pub(crate) fn unchanged(&self, rel: &str, plaintext: &[u8]) -> Option<ObjectId> {
         let e = self.entries.get(rel)?;
-        if let Some((mtime_ns, size)) = Self::stat(abs) {
+        if let Some((mtime_ns, size)) = Self::stat(&self.root.join(rel)) {
             if mtime_ns == e.mtime_ns && size == e.size {
                 return Some(e.blob_id);
             }
@@ -148,10 +165,11 @@ impl ProtectedCache {
         (self.tag(plaintext) == e.tag).then_some(e.blob_id)
     }
 
-    /// Record that `plaintext` at `rel` seals to `blob_id`. Missing stat
-    /// (file vanished mid-operation) just skips the entry.
-    pub(crate) fn record(&mut self, rel: &str, abs: &Path, plaintext: &[u8], blob_id: ObjectId) {
-        if let Some((mtime_ns, size)) = Self::stat(abs) {
+    /// Record that `plaintext` at `rel` seals to `blob_id`. The absolute file
+    /// is resolved against the cache's own `root`. Missing stat (file vanished
+    /// mid-operation) just skips the entry.
+    pub(crate) fn record(&mut self, rel: &str, plaintext: &[u8], blob_id: ObjectId) {
+        if let Some((mtime_ns, size)) = Self::stat(&self.root.join(rel)) {
             let tag = self.tag(plaintext);
             self.entries
                 .insert(rel.to_string(), CacheEntry { mtime_ns, size, tag, blob_id });
@@ -179,6 +197,18 @@ impl ProtectedCache {
         }
         scl_core::fsutil::atomic_write_durable(path, out.as_bytes())?;
         Ok(())
+    }
+
+    /// Persist best-effort: on failure, log to stderr and swallow rather than
+    /// propagate. Every ref-moving op that populates the cache saves through
+    /// this AFTER its ref has moved (P33 Task 7), so cache trouble can never
+    /// abort an operation that has already logically succeeded — a lost/stale
+    /// cache only ever degrades to a spurious reseal next time, never to
+    /// incorrectness.
+    pub(crate) fn save_best_effort(&self) {
+        if let Err(e) = self.save() {
+            eprintln!("warning: failed to persist protected-cache: {e}");
+        }
     }
 }
 
@@ -225,20 +255,21 @@ mod tests {
         std::fs::write(&abs, b"v1").unwrap();
         let id = ObjectId::of(b"cipher-of-v1");
 
-        let mut c = ProtectedCache::open(key, Some(layout.protected_cache_path()));
-        assert_eq!(c.unchanged("secret.txt", &abs, b"v1"), None, "empty cache misses");
-        c.record("secret.txt", &abs, b"v1", id);
+        let mut c =
+            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        assert_eq!(c.unchanged("secret.txt", b"v1"), None, "empty cache misses");
+        c.record("secret.txt", b"v1", id);
 
         // Stat hit: file untouched.
-        assert_eq!(c.unchanged("secret.txt", &abs, b"v1"), Some(id));
+        assert_eq!(c.unchanged("secret.txt", b"v1"), Some(id));
 
         // Tag fallback: touch mtime without changing content.
         std::fs::write(&abs, b"v1").unwrap();
-        assert_eq!(c.unchanged("secret.txt", &abs, b"v1"), Some(id));
+        assert_eq!(c.unchanged("secret.txt", b"v1"), Some(id));
 
         // Real change: miss.
         std::fs::write(&abs, b"v2").unwrap();
-        assert_eq!(c.unchanged("secret.txt", &abs, b"v2"), None);
+        assert_eq!(c.unchanged("secret.txt", b"v2"), None);
         cleanup(&layout);
     }
 
@@ -251,17 +282,20 @@ mod tests {
         std::fs::write(&abs, b"v").unwrap();
         let id = ObjectId::of(b"c");
 
-        let mut c = ProtectedCache::open(key, Some(layout.protected_cache_path()));
-        c.record("a b/spaced name.txt", &abs, b"v", id);
+        let mut c =
+            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        c.record("a b/spaced name.txt", b"v", id);
         c.save().unwrap();
 
-        let c2 = ProtectedCache::open(key, Some(layout.protected_cache_path()));
-        assert_eq!(c2.unchanged("a b/spaced name.txt", &abs, b"v"), Some(id));
+        let c2 =
+            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        assert_eq!(c2.unchanged("a b/spaced name.txt", b"v"), Some(id));
 
         // Corrupt file: degrades to empty, never errors.
         std::fs::write(layout.protected_cache_path(), b"garbage\nlines\n").unwrap();
-        let c3 = ProtectedCache::open(key, Some(layout.protected_cache_path()));
-        assert_eq!(c3.unchanged("a b/spaced name.txt", &abs, b"v"), None);
+        let c3 =
+            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        assert_eq!(c3.unchanged("a b/spaced name.txt", b"v"), None);
         cleanup(&layout);
     }
 
@@ -271,8 +305,8 @@ mod tests {
         let key = local_key(&layout).unwrap();
         let abs = layout.root.join("f");
         std::fs::write(&abs, b"v").unwrap();
-        let mut c = ProtectedCache::open(key, None);
-        c.record("f", &abs, b"v", ObjectId::of(b"c"));
+        let mut c = ProtectedCache::open(key, layout.root.clone(), None);
+        c.record("f", b"v", ObjectId::of(b"c"));
         c.save().unwrap();
         assert!(!layout.protected_cache_path().exists());
         cleanup(&layout);

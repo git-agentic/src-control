@@ -192,7 +192,11 @@ impl Repo {
             &spec,
             Some(&mut cache),
         )?;
-        cache.save()?;
+        // The sparse spec (the operation's durable commit point) is already
+        // persisted above; this re-lay moves no branch ref, so the cache save
+        // is best-effort — never abort a sparse change on cache trouble
+        // (P33 Task 7).
+        cache.save_best_effort();
         Ok(skipped)
     }
 
@@ -253,7 +257,9 @@ impl Repo {
             &Sparse::default(),
             Some(&mut cache),
         )?;
-        cache.save()?;
+        // Best-effort: the cleared sparse spec is already persisted above and
+        // this re-lay moves no branch ref (P33 Task 7).
+        cache.save_best_effort();
         Ok(skipped)
     }
 }

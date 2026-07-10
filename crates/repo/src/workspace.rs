@@ -42,18 +42,20 @@ pub(crate) fn materialize_workspace(
     dir: &Path,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &crate::sparse::Sparse,
+    cache: Option<&mut crate::cache::ProtectedCache>,
 ) -> Result<Vec<String>> {
     std::fs::create_dir_all(dir)?;
     let snap = repo.snapshot(&tip)?;
     let ws = Layout::at(dir);
     let store_arc = repo.vfs().store();
     let mut store = store_arc.lock().unwrap();
-    // No cache threaded here: a workspace checkout's stat cache would need to
-    // live beside the checkout dir (`Layout::ws_cache_path`), not inside it,
-    // to avoid harvest's worktree read picking it up as an untracked file —
-    // wiring that per-workspace cache through is a follow-on (P33 doesn't
-    // require it: a miss here only ever degrades to a spurious reseal on the
-    // next harvest, never to incorrectness, per `cache.rs`'s contract).
+    // The per-workspace cache (P33 Task 7) is opened by the caller with its
+    // `root` set to THIS checkout dir and its file at `Layout::ws_cache_path`
+    // (beside the checkout dir, never inside it, so harvest's worktree read
+    // can't pick it up). `sc ws fork` passes a persistent cache; `sc work`
+    // passes an ephemeral one threaded fork->harvest. A `None` cache still
+    // works — a workspace's randomized protected path just re-seals on the
+    // next harvest instead of carrying (spurious-but-safe, per `cache.rs`).
     worktree::materialize(
         &ws,
         &mut store,
@@ -62,7 +64,7 @@ pub(crate) fn materialize_workspace(
         &snap.protection,
         identity,
         sparse,
-        None,
+        cache,
     )
 }
 
@@ -78,6 +80,7 @@ pub(crate) fn harvest_workspace(
     author: &str,
     message: &str,
     sparse: &crate::sparse::Sparse,
+    cache: Option<&mut crate::cache::ProtectedCache>,
 ) -> Result<HarvestResult> {
     let snap = repo.snapshot(&tip)?;
     let ws = Layout::at(dir);
@@ -88,16 +91,19 @@ pub(crate) fn harvest_workspace(
             worktree::tree_file_ids(&mut store, snap.root)?
                 .into_keys()
                 .collect();
-        // No workspace-local cache is threaded in yet (P33 Task 7 wires it);
-        // until then a randomized protected path in a workspace always
-        // reports modified — spurious-but-safe.
+        // The workspace-local cache (P33 Task 7) proves an untouched randomized
+        // protected path unchanged, so it isn't spuriously reported modified
+        // here (which would send it into the fresh-seal path in `snapshot_files`
+        // below). Its `root` is this checkout dir, so its stat lookups resolve
+        // against the workspace's own files — unlike the host cache, which
+        // would stat the wrong tree.
         let d = worktree::diff_worktree(
             &ws,
             &mut store,
             Some(snap.root),
             &snap.protection,
             sparse,
-            None,
+            cache.as_deref(),
         )?;
         (
             tracked,
@@ -113,12 +119,11 @@ pub(crate) fn harvest_workspace(
     // fixed at materialize time (or, for `sc work`, is always full), so the
     // carry predicate must see that same view, not the host repo's current
     // `.sc/sparse` — see `snapshot_files`'s doc comment.
-    // No workspace-local cache is threaded in yet (P33 Task 7 wires it): pass
-    // `None`, so a randomized protected path in a workspace always re-seals
-    // (spurious-but-safe). Passing the HOST repo's cache here would be WRONG —
-    // the abs-path base in `snapshot_files` is the host root, but these files
-    // came from the workspace dir. Convergent priors still carry (content-only
-    // compare, no cache needed).
+    // The workspace-local cache is threaded into the commit too (P33 Task 7):
+    // its `root` is this checkout dir, so a randomized protected path the
+    // workspace never touched carries the base's exact ciphertext blob id
+    // (proven unchanged by the cache) instead of re-sealing. Convergent priors
+    // still carry via content-only compare, no cache needed.
     match repo.snapshot_files(
         files,
         Some(tip),
@@ -128,7 +133,7 @@ pub(crate) fn harvest_workspace(
         None,
         None,
         sparse,
-        None,
+        cache,
         author,
         message,
     ) {
@@ -286,25 +291,36 @@ impl Repo {
         // guarantees no early return can occur while children are running —
         // an interleaved failure would orphan live agents and race the
         // teardown guard's remove_dir_all underneath them.
+        // One EPHEMERAL protected-cache per temp checkout (P33 Task 7): `root`
+        // is the checkout dir, `path` is `None` so nothing persists (a `sc
+        // work` session leaves zero residue outside `.sc/`). Threaded from
+        // this materialize loop into the harvest loop below so an untouched
+        // randomized protected path carries the base blob instead of resealing.
+        let key = crate::cache::local_key(&self.layout)?;
         let mut dirs = Vec::with_capacity(labels.len());
+        let mut caches = Vec::with_capacity(labels.len());
         for label in &labels {
             let dir = session_root.join(label);
+            let mut cache = crate::cache::ProtectedCache::open(key, dir.clone(), None);
             let skipped = materialize_workspace(
                 self,
                 tip,
                 &dir,
                 opts.identity.as_ref(),
                 &crate::sparse::Sparse::default(),
+                Some(&mut cache),
             )?;
             for path in &skipped {
                 eprintln!("workspace {label}: skipped (no key): {path}");
             }
             dirs.push(dir);
+            caches.push(cache);
         }
 
-        // Spawn all agents first (they run concurrently), then await each.
+        // Spawn all agents first (they run concurrently), then await each. The
+        // ephemeral cache travels alongside each (label, dir) into the harvest.
         let mut children = Vec::with_capacity(labels.len());
-        for (label, dir) in labels.iter().zip(dirs) {
+        for ((label, dir), cache) in labels.iter().zip(dirs).zip(caches) {
             let mut c = std::process::Command::new(exe);
             c.args(args)
                 .current_dir(&dir)
@@ -313,11 +329,11 @@ impl Repo {
             for (k, v) in &secret_envs {
                 c.env(k, v);
             }
-            children.push((label.clone(), dir, c.spawn()));
+            children.push((label.clone(), dir, cache, c.spawn()));
         }
 
         let mut outcomes = Vec::with_capacity(children.len());
-        for (label, dir, spawn) in children {
+        for (label, dir, mut cache, spawn) in children {
             let agent_exit = match spawn {
                 Ok(mut child) => child.wait().ok().and_then(|s| s.code()),
                 Err(e) => {
@@ -333,6 +349,7 @@ impl Repo {
                 &opts.author,
                 &message,
                 &crate::sparse::Sparse::default(),
+                Some(&mut cache),
             );
             outcomes.push(WorkspaceOutcome {
                 label,
@@ -398,7 +415,7 @@ mod tests {
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
         let skipped =
-            materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default())
+            materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default(), None)
                 .unwrap();
         assert!(skipped.is_empty());
         assert_eq!(
@@ -415,6 +432,7 @@ mod tests {
             "test",
             "msg",
             &crate::sparse::Sparse::default(),
+            None,
         )
         .unwrap();
         let id = match res {
@@ -438,7 +456,7 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default()).unwrap();
+        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default(), None).unwrap();
         let res = harvest_workspace(
             &repo,
             tip,
@@ -447,6 +465,7 @@ mod tests {
             "test",
             "msg",
             &crate::sparse::Sparse::default(),
+            None,
         )
         .unwrap();
         assert!(matches!(res, HarvestResult::Unchanged));
@@ -464,7 +483,7 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default()).unwrap();
+        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default(), None).unwrap();
         // An AWS-style key id trips the P5 pattern rules.
         std::fs::write(dir.join("leak.txt"), "AKIAIOSFODNN7EXAMPLE\n").unwrap();
         let res = harvest_workspace(
@@ -475,6 +494,7 @@ mod tests {
             "test",
             "msg",
             &crate::sparse::Sparse::default(),
+            None,
         )
         .unwrap();
         assert!(matches!(res, HarvestResult::Rejected(_)));

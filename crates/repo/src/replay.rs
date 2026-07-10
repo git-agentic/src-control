@@ -465,13 +465,15 @@ impl Repo {
                     author,
                     &message,
                 )?;
+                // Cache hoisted above the block so its save follows the ref
+                // move below, matching commit/amend's discipline (P33 Task 7).
+                let mut cache = self.open_protected_cache()?;
                 {
                     let store_arc = self.vfs().store();
                     let mut store = store_arc.lock().unwrap();
                     // Protection-aware materialize: a PROTECTED entry decrypts
                     // for `identity` when possible, else is skipped (never
                     // writes ciphertext to disk) — same as merge's clean path.
-                    let mut cache = self.open_protected_cache()?;
                     worktree::materialize(
                         &self.layout,
                         &mut store,
@@ -482,9 +484,9 @@ impl Repo {
                         &self.sparse_spec()?,
                         Some(&mut cache),
                     )?;
-                    cache.save()?;
                 }
                 refs::write_branch_tip(&self.layout, &head, &id)?;
+                cache.save_best_effort();
                 crate::oplog::record(
                     &self.layout,
                     &format!("cherry-pick {refname}"),
@@ -593,7 +595,9 @@ impl Repo {
             let snap = self.snapshot(&tip)?;
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
-            let mut cache = self.open_protected_cache()?;
+            // No identity at abort time: nothing is decrypted, so `materialize`
+            // records nothing — pass `None`, no cache to open or save
+            // (P33 Task 7 item 7).
             skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -602,9 +606,8 @@ impl Repo {
                 &snap.protection,
                 None,
                 &self.sparse_spec()?,
-                Some(&mut cache),
+                None,
             )?;
-            cache.save()?;
         }
         crate::pick_state::clear(&self.layout)?;
         Ok(skipped)
@@ -714,9 +717,9 @@ impl Repo {
                     &self.sparse_spec()?,
                     Some(&mut cache),
                 )?;
-                cache.save()?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &target_tip)?;
+                cache.save_best_effort();
                 crate::oplog::record(
                     &self.layout,
                     &format!("rebase onto {target} (ff)"),
@@ -988,6 +991,9 @@ impl Repo {
             }
         }
 
+        // Cache hoisted above the block so its save follows the ref move
+        // below, matching commit/amend's discipline (P33 Task 7).
+        let mut cache = self.open_protected_cache()?;
         {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
@@ -995,7 +1001,6 @@ impl Repo {
             // (each step pruned its wrap map to its own merged tree): a
             // PROTECTED entry decrypts for `identity` when possible, else is
             // skipped — never writes ciphertext to disk.
-            let mut cache = self.open_protected_cache()?;
             worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1006,9 +1011,9 @@ impl Repo {
                 &self.sparse_spec()?,
                 Some(&mut cache),
             )?;
-            cache.save()?;
         }
         refs::write_branch_tip(&self.layout, &head, &acc_tip)?;
+        cache.save_best_effort();
         crate::oplog::record(
             &self.layout,
             &format!("rebase onto {target} ({replayed} replayed, {skipped} skipped)"),
@@ -1210,8 +1215,10 @@ impl Repo {
         let skipped = {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
-            let mut cache = self.open_protected_cache()?;
-            let skipped = worktree::materialize(
+            // No identity at abort time: nothing is decrypted, so `materialize`
+            // records nothing — pass `None`, no cache to open or save
+            // (P33 Task 7 item 7).
+            worktree::materialize(
                 &self.layout,
                 &mut store,
                 snap.root,
@@ -1219,10 +1226,8 @@ impl Repo {
                 &snap.protection,
                 None,
                 &self.sparse_spec()?,
-                Some(&mut cache),
-            )?;
-            cache.save()?;
-            skipped
+                None,
+            )?
         };
         crate::rebase_state::clear(&self.layout)?;
         Ok(skipped)

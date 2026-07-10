@@ -88,6 +88,7 @@ impl Repo {
         let key = crate::cache::local_key(&self.layout)?;
         Ok(crate::cache::ProtectedCache::open(
             key,
+            self.layout.root.clone(),
             Some(self.layout.protected_cache_path()),
         ))
     }
@@ -213,9 +214,7 @@ impl Repo {
         // recorded-but-unlanded id is benign (the cache degradation contract),
         // and both callers (`commit`'s pick arm, `rebase_continue`) move the
         // ref immediately after a successful return.
-        let key = crate::cache::local_key(&self.layout)?;
-        let mut cache =
-            crate::cache::ProtectedCache::open(key, Some(self.layout.protected_cache_path()));
+        let mut cache = self.open_protected_cache()?;
         let id = self.snapshot_files(
             files,
             Some(parent),
@@ -229,7 +228,11 @@ impl Repo {
             author,
             message,
         )?;
-        cache.save()?;
+        // Best-effort (P33 Task 7): this function does not own the ref move
+        // (both callers move it right after a successful return), and its
+        // save-before-ref is already justified above — a recorded-but-unlanded
+        // id is benign. Never let cache trouble abort the completion.
+        cache.save_best_effort();
         Ok(id)
     }
 
@@ -448,14 +451,14 @@ impl Repo {
                         // Randomized prior: the local stat/tag cache is the only
                         // way to prove "same plaintext". Carry iff the cached id
                         // matches the prior tip id (double-checked: same content
-                        // AND same recorded seal).
-                        match worktree::safe_join(&self.layout.root, &path) {
-                            Ok(abs) => {
-                                cache.as_deref().and_then(|c| c.unchanged(&path, &abs, &bytes))
-                                    == Some(*blob_id)
-                            }
-                            Err(_) => false,
-                        }
+                        // AND same recorded seal). The cache resolves the abs
+                        // stat path against its own checkout root (P33 Task 7),
+                        // so a workspace commit stats the workspace file, not
+                        // the host's.
+                        cache
+                            .as_deref()
+                            .and_then(|c| c.unchanged(&path, &bytes))
+                            == Some(*blob_id)
                     };
                     if unchanged {
                         Some((*blob_id, *perms))
@@ -490,11 +493,8 @@ impl Repo {
                             // the next commit gets a fast stat hit (optimization
                             // only; the caller persists after the ref moves).
                             if perms & scl_core::RANDOMIZED != 0 {
-                                if let (Some(c), Ok(abs)) = (
-                                    cache.as_deref_mut(),
-                                    worktree::safe_join(&self.layout.root, &path),
-                                ) {
-                                    c.record(&path, &abs, &bytes, blob_id);
+                                if let Some(c) = cache.as_deref_mut() {
+                                    c.record(&path, &bytes, blob_id);
                                 }
                             }
                         }
@@ -516,12 +516,10 @@ impl Repo {
         let (protected_all, sealed_wrapped) = crate::protect::encrypt_protected(to_seal)?;
         // Record every freshly sealed path's new blob id into the cache; the
         // committing caller persists it only after the ref actually moves.
-        if let Some(c) = cache.as_deref_mut() {
+        if let Some(c) = cache {
             for (path, cipher, _mode, _perms) in &protected_all {
                 if let Some((_, pt)) = sealed_plaintexts.iter().find(|(p, _)| p == path) {
-                    if let Ok(abs) = worktree::safe_join(&self.layout.root, path) {
-                        c.record(path, &abs, pt, Object::blob(cipher.clone()).id());
-                    }
+                    c.record(path, pt, Object::blob(cipher.clone()).id());
                 }
             }
         }
@@ -806,11 +804,7 @@ impl Repo {
             )?,
             _ => {
                 let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
-                let key = crate::cache::local_key(&self.layout)?;
-                let mut c = crate::cache::ProtectedCache::open(
-                    key,
-                    Some(self.layout.protected_cache_path()),
-                );
+                let mut c = self.open_protected_cache()?;
                 let id = self.snapshot_files(
                     files,
                     tip,
@@ -831,10 +825,11 @@ impl Repo {
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
         crate::pick_state::clear(&self.layout)?;
-        // The ref moved: persist the cache (no-op in the pick arm, which
-        // manages its own).
+        // The ref moved: persist the cache best-effort (no-op in the pick arm,
+        // which manages its own). Cache trouble must never abort a commit
+        // whose ref already moved (P33 Task 7).
         if let Some(c) = cache {
-            c.save()?;
+            c.save_best_effort();
         }
         let label = if merging {
             "commit (merge)"
@@ -890,9 +885,7 @@ impl Repo {
         let before = refs::read_branch_tip(&self.layout, &head)?;
 
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
-        let key = crate::cache::local_key(&self.layout)?;
-        let mut cache =
-            crate::cache::ProtectedCache::open(key, Some(self.layout.protected_cache_path()));
+        let mut cache = self.open_protected_cache()?;
         let id = self.snapshot_files(
             files,
             Some(tip),
@@ -908,7 +901,7 @@ impl Repo {
         )?;
 
         refs::write_branch_tip(&self.layout, &head, &id)?;
-        cache.save()?;
+        cache.save_best_effort();
         crate::oplog::record(
             &self.layout,
             "amend",
@@ -1003,8 +996,7 @@ impl Repo {
         };
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
-        let key = crate::cache::local_key(&self.layout)?;
-        let cache = crate::cache::ProtectedCache::open(key, Some(self.layout.protected_cache_path()));
+        let cache = self.open_protected_cache()?;
         worktree::diff_worktree(
             &self.layout,
             &mut store,
@@ -1051,9 +1043,13 @@ impl Repo {
         // failure to load/mint `.sc/local-key` degrades to `None` here rather
         // than failing the whole diff — spurious-but-safe: every randomized
         // entry just reports "changed" instead of the diff erroring out.
-        let cache = crate::cache::local_key(&self.layout)
-            .ok()
-            .map(|key| crate::cache::ProtectedCache::open(key, Some(self.layout.protected_cache_path())));
+        let cache = crate::cache::local_key(&self.layout).ok().map(|key| {
+            crate::cache::ProtectedCache::open(
+                key,
+                self.layout.root.clone(),
+                Some(self.layout.protected_cache_path()),
+            )
+        });
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         let head = match head_root {
@@ -1094,9 +1090,7 @@ impl Repo {
                             // cache is the only public-key-free unchanged proof.
                             // A miss/disagreement/absent cache reports changed —
                             // spurious-but-safe, never incorrect.
-                            let abs = worktree::safe_join(&self.layout.root, path)?;
-                            cache.as_ref().and_then(|c| c.unchanged(path, &abs, bytes))
-                                != Some(*blob_id)
+                            cache.as_ref().and_then(|c| c.unchanged(path, bytes)) != Some(*blob_id)
                         };
                         if changed {
                             out.push_str(&format!(
@@ -1261,9 +1255,9 @@ impl Repo {
                     &self.sparse_spec()?,
                     Some(&mut cache),
                 )?;
-                cache.save()?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
+                cache.save_best_effort();
                 crate::oplog::record(
                     &self.layout,
                     &format!("merge {branch} (adopt)"),
@@ -1299,9 +1293,9 @@ impl Repo {
                     &self.sparse_spec()?,
                     Some(&mut cache),
                 )?;
-                cache.save()?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
+                cache.save_best_effort();
                 crate::oplog::record(
                     &self.layout,
                     &format!("merge {branch} (ff)"),
@@ -1476,11 +1470,14 @@ impl Repo {
         // a merged PROTECTED entry decrypts for `identity` when possible, else
         // is skipped (never writes ciphertext to disk) and reported to the
         // caller. (Sidecars exist only on the conflict path, handled above.)
+        // The cache is hoisted above the block so its save can follow the ref
+        // move (`commit_snapshot` below), matching commit/amend's discipline
+        // (P33 Task 7).
+        let mut cache = self.open_protected_cache()?;
         let skipped = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            let mut cache = self.open_protected_cache()?;
-            let skipped = worktree::materialize(
+            worktree::materialize(
                 &self.layout,
                 &mut store,
                 merged_root,
@@ -1489,9 +1486,7 @@ impl Repo {
                 identity,
                 &self.sparse_spec()?,
                 Some(&mut cache),
-            )?;
-            cache.save()?;
-            skipped
+            )?
         };
 
         // Clean merge: two-parent snapshot now, carrying the merged
@@ -1504,6 +1499,7 @@ impl Repo {
             author,
             &format!("merge {branch}"),
         )?;
+        cache.save_best_effort();
         crate::oplog::record(
             &self.layout,
             &format!("merge {branch}"),
@@ -1594,7 +1590,9 @@ impl Repo {
                 &self.sparse_spec()?,
                 Some(&mut cache),
             )?;
-            cache.save()?;
+            // Conflict materialization moves no branch ref; best-effort save
+            // so cache trouble never aborts the conflict write-out (P33 Task 7).
+            cache.save_best_effort();
         }
         for (path, bytes, _mode, _recipients) in to_encrypt {
             let full = worktree::safe_join(&self.layout.root, path)?;
@@ -1642,8 +1640,10 @@ impl Repo {
             let ours_root = ours_snap.root;
             let ours_protection = ours_snap.protection;
             let theirs_root = store.get_snapshot(&theirs_id)?.root;
-            // No identity at abort time: protected files in ours are skipped (not decrypted).
-            let mut cache = self.open_protected_cache()?;
+            // No identity at abort time: protected files in ours are skipped
+            // (not decrypted). With nothing decrypted, `materialize` records
+            // nothing into a cache, so pass `None` — no cache to open or save
+            // (P33 Task 7 item 7).
             skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1652,9 +1652,8 @@ impl Repo {
                 &ours_protection,
                 None,
                 &self.sparse_spec()?,
-                Some(&mut cache),
+                None,
             )?;
-            cache.save()?;
         }
         crate::merge_state::clear(&self.layout)?;
         Ok(skipped)
@@ -1762,11 +1761,13 @@ impl Repo {
             let snap = store_arc.lock().unwrap().get_snapshot(&target_tip)?;
             (snap.root, snap.protection)
         };
+        // Cache hoisted above the block so its save follows the ref move
+        // (`write_head` below), matching commit/amend's discipline (P33 Task 7).
+        let mut cache = self.open_protected_cache()?;
         let skipped = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            let mut cache = self.open_protected_cache()?;
-            let skipped = worktree::materialize(
+            worktree::materialize(
                 &self.layout,
                 &mut store,
                 target_root,
@@ -1775,11 +1776,10 @@ impl Repo {
                 identity,
                 &self.sparse_spec()?,
                 Some(&mut cache),
-            )?;
-            cache.save()?;
-            skipped
+            )?
         };
         refs::write_head(&self.layout, name)?;
+        cache.save_best_effort();
         crate::oplog::record(
             &self.layout,
             &format!("switch {name}"),
@@ -3790,9 +3790,10 @@ mod tests {
             let key = crate::cache::local_key(repo.layout()).unwrap();
             let mut cache = crate::cache::ProtectedCache::open(
                 key,
+                repo.layout().root.clone(),
                 Some(repo.layout().protected_cache_path()),
             );
-            cache.record("secret/x", &root.join("secret/x"), &pt, randomized_id);
+            cache.record("secret/x", &pt, randomized_id);
             cache.save().unwrap();
         }
 
