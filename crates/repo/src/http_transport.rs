@@ -144,6 +144,7 @@ pub(crate) fn write_status(w: &mut impl Write, code: u16) -> Result<()> {
         404 => "Not Found",
         400 => "Bad Request",
         401 => "Unauthorized",
+        503 => "Service Unavailable",
         _ => {
             return Err(Error::InvalidArgument(format!(
                 "unsupported HTTP status code: {code}"
@@ -323,6 +324,7 @@ impl HttpTransport {
                 ))
             }
             404 => return Err(Error::NotARepo),
+            503 => return Err(Error::ServerBusy),
             other => {
                 return Err(Error::Protocol(format!(
                     "sc+http server returned unexpected status {other}"
@@ -382,6 +384,34 @@ impl Transport for HttpTransport {
 /// Applied only around the opening read — see [`serve_http_listener`] for
 /// where it's cleared before a legitimate large pack transfer begins.
 const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Exponential accept-error backoff (P31): Go net/http's shape — 5ms
+/// doubling to a 1s cap, reset on the next successful accept. Turns fd
+/// exhaustion (EMFILE) from a busy-loop into a paced retry. Hardcoded: no
+/// operator tuning story exists (Go ships it knobless too).
+// TODO(P31 Task 4 step 7): wired into `serve_http_listener`'s accept loop in
+// the same task's second commit — `allow(dead_code)` covers the gap between
+// the two commits, not a permanent suppression.
+#[allow(dead_code)]
+struct AcceptBackoff {
+    cur: Duration,
+}
+#[allow(dead_code)]
+impl AcceptBackoff {
+    const START: Duration = Duration::from_millis(5);
+    const CAP: Duration = Duration::from_secs(1);
+    fn new() -> Self {
+        Self { cur: Self::START }
+    }
+    fn on_error(&mut self) -> Duration {
+        let d = self.cur;
+        self.cur = (self.cur * 2).min(Self::CAP);
+        d
+    }
+    fn on_success(&mut self) {
+        self.cur = Self::START;
+    }
+}
 
 /// Is `host` a loopback address (always safe to bind)? IPv4 `127.0.0.0/8`,
 /// IPv6 `::1`, or the literal `localhost`. Everything else (`0.0.0.0`, a LAN
@@ -1284,5 +1314,28 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 4: AcceptBackoff + 503 busy status (pure parts). ──
+
+    #[test]
+    fn accept_backoff_doubles_and_resets() {
+        let mut b = AcceptBackoff::new();
+        assert_eq!(b.on_error(), Duration::from_millis(5));
+        assert_eq!(b.on_error(), Duration::from_millis(10));
+        assert_eq!(b.on_error(), Duration::from_millis(20));
+        for _ in 0..20 {
+            b.on_error();
+        }
+        assert_eq!(b.on_error(), Duration::from_secs(1)); // capped
+        b.on_success();
+        assert_eq!(b.on_error(), Duration::from_millis(5)); // reset
+    }
+
+    #[test]
+    fn status_503_round_trips() {
+        let mut buf = Vec::new();
+        write_status(&mut buf, 503).unwrap();
+        assert_eq!(read_status(&mut &buf[..]).unwrap(), 503);
     }
 }
