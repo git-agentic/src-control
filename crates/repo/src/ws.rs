@@ -316,16 +316,29 @@ impl Repo {
         let sparse = crate::sparse::Sparse::new(session.sparse.clone());
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
-        // No workspace-local cache is threaded in yet (P33 Task 7 wires it);
-        // until then a randomized protected path in a workspace always
-        // reports modified — spurious-but-safe.
+        // The workspace's own persistent P33 cache, read-only (this is a
+        // status/list/preflight query, never a harvest, so nothing is
+        // recorded or saved back) — same open-call shape as `ws_harvest`
+        // (below), rooted at the workspace's own checkout dir so an
+        // untouched RANDOMIZED protected path is recognized as unchanged
+        // instead of always reporting modified. Degrades to `None` (never
+        // errors) if the host's cache key can't be loaded/minted: this must
+        // stay a non-fatal query path, and a lost cache only ever costs the
+        // stat/tag short-circuit, never correctness.
+        let cache = crate::cache::local_key(self.layout()).ok().map(|key| {
+            crate::cache::ProtectedCache::open(
+                key,
+                entry.dir.clone(),
+                Some(self.layout().ws_cache_path(entry.index as usize)),
+            )
+        });
         let d = worktree::diff_worktree(
             &ws,
             &mut store,
             Some(base.root),
             &base.protection,
             &sparse,
-            None,
+            cache.as_ref(),
         )?;
         Ok(!(d.added.is_empty() && d.modified.is_empty() && d.deleted.is_empty()))
     }
@@ -729,11 +742,18 @@ impl Repo {
                     });
                 }
                 crate::workspace::HarvestResult::Unchanged => {
-                    // `ws_changed` already confirmed a diff, but
+                    // `ws_changed_for` already confirmed a diff above, and
                     // `harvest_workspace` re-diffs independently against its
                     // own `tip` argument (session.base_snapshot, same value
-                    // here) — so this arm is unreachable in practice, kept
-                    // only so the match is exhaustive without a panic.
+                    // here) using the SAME per-workspace cache — so the two
+                    // checks agree in the common case, but this arm is
+                    // genuinely reachable: a cold or lost cache (e.g. this
+                    // workspace's cache file was never written, or the host's
+                    // `.sc/local-key` changed) can make `ws_changed_for`
+                    // spuriously report "changed" for an untouched
+                    // RANDOMIZED protected path while `harvest_workspace`'s
+                    // own diff — same inputs, same cache lookup — still
+                    // resolves it as unchanged. Handled, not a panic guard.
                     resolve_and_teardown(self.layout(), &mut session, i, &dir, None)?;
                     outcomes.push(WsHarvestOutcome::Unchanged { index: i });
                 }
@@ -1285,6 +1305,54 @@ mod tests {
                 "an untouched randomized protected file must carry the base blob id, not re-seal"
             );
         }
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ws_changed_for_ignores_untouched_randomized_protected_file() {
+        // P33 Task 7 (ws_changed_for arm): before this fix, `ws_changed_for`
+        // always passed `None` for the cache, so a RANDOMIZED protected
+        // path — never bit-for-bit reproducible by re-encrypting the same
+        // plaintext — always compared as "different" even when genuinely
+        // untouched, reporting the workspace "changed" for no real edit.
+        // With the workspace's own persistent cache threaded in (recorded
+        // at fork time, same as `harvest_workspace` uses), an untouched
+        // randomized protected file must resolve as unchanged.
+        let root = tmp_root("ws-changed-for-randomized");
+        let repo = init(&root);
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "the secret\n").unwrap();
+        repo.commit("t", "add protected").unwrap();
+        let base = repo.head_tip().unwrap().unwrap();
+
+        // Confirm RANDOMIZED, mirroring the sibling harvest-level regression
+        // — otherwise this test would pass even without the fix.
+        {
+            let a = repo.vfs().store();
+            let mut s = a.lock().unwrap();
+            let base_root = s.get_snapshot(&base).unwrap().root;
+            let entries = worktree::tree_file_entries_with_perms(&mut s, base_root).unwrap();
+            let (_id, _mode, perms) = *entries.get("secret/x").expect("protected file present");
+            assert!(
+                perms & scl_core::PROTECTED != 0 && perms & scl_core::RANDOMIZED != 0,
+                "the protected file must be RANDOMIZED for this regression to exercise the cache"
+            );
+        }
+
+        // Fork WITH identity so the protected file materializes decrypted
+        // and is recorded in the workspace's own cache at fork time; leave
+        // it completely untouched.
+        let session = repo.ws_fork(1, "t", Some(&sk)).unwrap();
+        assert!(
+            !repo
+                .ws_changed_for(&session, &session.workspaces[0])
+                .unwrap(),
+            "an untouched RANDOMIZED protected file must not report the workspace as changed"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
