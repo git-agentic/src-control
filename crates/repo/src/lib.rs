@@ -33,6 +33,7 @@ pub mod sparse;
 pub mod stdio_transport;
 pub mod sync;
 pub mod textdiff;
+pub mod tls_pins;
 pub mod transcripts;
 pub mod transport;
 pub mod wire;
