@@ -9,6 +9,18 @@
 //! nothing — it does not reintroduce the equality oracle this phase closes.
 //! A lost/stale/corrupt cache degrades to spurious re-seals, never
 //! incorrectness and never a hard error.
+//!
+//! **The keyed tag is the sole authority for a hit.** `mtime_ns`/`size` are
+//! recorded for documentation (when the entry was observed) and as a
+//! possible future input to a paths-only walk that doesn't already hold the
+//! plaintext in RAM, but they are NEVER sufficient on their own: a bare
+//! stat match is the classic git "racy stat" problem (an edit that lands
+//! within the filesystem's mtime granularity and happens to keep the same
+//! size is indistinguishable from no edit at all by stat alone), and every
+//! `unchanged()` caller already has the plaintext in memory (`read_worktree`
+//! loads all bytes before commit/diff), so there is no reason to trust a
+//! cheaper, unsound signal — keyed blake3 over in-memory bytes runs at
+//! GB/s.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -87,17 +99,19 @@ struct CacheEntry {
 /// an ephemeral in-memory one for `sc work` temp checkouts).
 ///
 /// The cache owns its `root`: the absolute base directory of the checkout it
-/// serves, against which relative tree paths are resolved for the stat
-/// (mtime+size) short-circuit. This is the P33 Task 7 design choice (over
-/// threading an explicit worktree-root through `snapshot_files`): a stat cache
-/// is inherently tied to one checkout, so it should carry that checkout's root
-/// rather than have every `unchanged`/`record` caller pass an absolute path.
-/// **Invariant:** the `root` passed at `open` must equal `layout.root` of the
-/// checkout that `materialize`/`diff_worktree`/`snapshot_files` operate on —
-/// the main tree opens with `layout.root`, a `sc ws`/`sc work` workspace with
-/// its own checkout dir. A mismatched root only ever loses the stat
-/// short-circuit (the keyed-tag comparison still proves unchanged-ness, and a
-/// miss degrades to a spurious reseal) — never incorrectness.
+/// serves, against which relative tree paths are resolved to record the
+/// advisory mtime+size fields alongside each entry. This is the P33 Task 7
+/// design choice (over threading an explicit worktree-root through
+/// `snapshot_files`): the cache is inherently tied to one checkout, so it
+/// should carry that checkout's root rather than have every
+/// `unchanged`/`record` caller pass an absolute path. **Invariant:** the
+/// `root` passed at `open` must equal `layout.root` of the checkout that
+/// `materialize`/`diff_worktree`/`snapshot_files` operate on — the main tree
+/// opens with `layout.root`, a `sc ws`/`sc work` workspace with its own
+/// checkout dir. The keyed-tag comparison that decides every `unchanged()`
+/// hit does not depend on `root` at all (it hashes the caller's in-memory
+/// plaintext), so a mismatched root only ever loses the advisory stat
+/// bookkeeping — never incorrectness.
 pub(crate) struct ProtectedCache {
     key: [u8; 32],
     /// Absolute base dir of the served checkout; `root.join(rel)` is the file
@@ -152,16 +166,17 @@ impl ProtectedCache {
     }
 
     /// The cached ciphertext blob id iff this exact plaintext is what last
-    /// sealed at `rel`: stat hit (mtime+size unchanged) short-circuits;
-    /// otherwise fall back to the keyed-tag comparison. The absolute file is
-    /// resolved against the cache's own `root` (`root.join(rel)`).
+    /// sealed at `rel`, decided ENTIRELY by the keyed-tag comparison — never
+    /// by a bare mtime+size stat match. A stat-only hit is the classic git
+    /// "racy stat" problem: an edit that keeps the same file size and lands
+    /// within the filesystem's mtime granularity is indistinguishable from
+    /// no edit at all by stat alone, and misreading it as unchanged would
+    /// silently carry the OLD ciphertext into the commit, dropping the
+    /// user's edit — exactly the incorrectness this cache must never cause.
+    /// Every caller already holds `plaintext` in memory before this is
+    /// called, so the keyed tag is cheap enough to be the sole authority.
     pub(crate) fn unchanged(&self, rel: &str, plaintext: &[u8]) -> Option<ObjectId> {
         let e = self.entries.get(rel)?;
-        if let Some((mtime_ns, size)) = Self::stat(&self.root.join(rel)) {
-            if mtime_ns == e.mtime_ns && size == e.size {
-                return Some(e.blob_id);
-            }
-        }
         (self.tag(plaintext) == e.tag).then_some(e.blob_id)
     }
 
@@ -248,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn stat_hit_tag_fallback_and_miss() {
+    fn tag_is_authoritative_for_hits_and_misses() {
         let layout = tmp("hits");
         let key = local_key(&layout).unwrap();
         let abs = layout.root.join("secret.txt");
@@ -260,16 +275,52 @@ mod tests {
         assert_eq!(c.unchanged("secret.txt", b"v1"), None, "empty cache misses");
         c.record("secret.txt", b"v1", id);
 
-        // Stat hit: file untouched.
+        // Untouched file, same plaintext: hit.
         assert_eq!(c.unchanged("secret.txt", b"v1"), Some(id));
 
-        // Tag fallback: touch mtime without changing content.
+        // Touch mtime without changing content: still a hit (tag matches).
         std::fs::write(&abs, b"v1").unwrap();
         assert_eq!(c.unchanged("secret.txt", b"v1"), Some(id));
 
         // Real change: miss.
         std::fs::write(&abs, b"v2").unwrap();
         assert_eq!(c.unchanged("secret.txt", b"v2"), None);
+        cleanup(&layout);
+    }
+
+    /// Regression for the racy-stat data-loss finding: same-length content
+    /// written back with the SAME recorded mtime (the classic git "racy
+    /// stat" condition — an edit that lands within the filesystem's mtime
+    /// granularity) must still miss, because a stat-only hit would silently
+    /// carry the old ciphertext and drop the user's edit from the commit.
+    #[test]
+    fn racy_stat_same_size_same_mtime_still_misses() {
+        let layout = tmp("racy");
+        let key = local_key(&layout).unwrap();
+        let abs = layout.root.join("secret.txt");
+        std::fs::write(&abs, b"aaaa").unwrap();
+        let id = ObjectId::of(b"cipher-of-aaaa");
+        let original_mtime = std::fs::metadata(&abs).unwrap().modified().unwrap();
+
+        let mut c =
+            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        c.record("secret.txt", b"aaaa", id);
+
+        // Overwrite with same-length content, then force the racy condition
+        // by resetting mtime back to what was recorded.
+        std::fs::write(&abs, b"bbbb").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&abs)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+
+        assert_eq!(
+            c.unchanged("secret.txt", b"bbbb"),
+            None,
+            "racy stat (same mtime, same size, different content) must not be misread as unchanged"
+        );
         cleanup(&layout);
     }
 
