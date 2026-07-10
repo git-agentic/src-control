@@ -140,6 +140,13 @@ too, not just the src-control-side metadata.
   ergonomics, unchanged since P29); `--allow-public` with no tokens is still
   a sanctioned foot-gun — a deliberately open, unauthenticated, plaintext
   server, for the operator who explicitly asked for it.
+  **Residual plaintext-token exposure, stated plainly:** a public bind
+  justified by `--read-only` or `--allow-public` *with* tokens configured
+  still requires the bearer on every connection — the P32 gate closes only
+  the tokens-ALONE justification, not plaintext token use in general — so
+  those tokens still cross the wire in cleartext on such a deployment. Use
+  `sc+https://` (or `ssh://`) instead of `sc+http://` whenever a public bind
+  needs its bearer tokens to stay confidential in transit.
 - **Reverse-proxy guidance, corrected to cover both legs.** Prior guidance
   ("front with a TLS reverse proxy") was incomplete: a server-side proxy
   terminates TLS toward clients that speak TLS, but before P32 the `sc`

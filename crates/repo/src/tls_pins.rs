@@ -18,7 +18,10 @@ pub struct TlsClientPolicy {
     /// `SC_HTTPS_FINGERPRINT`: verified for this process only, never
     /// persisted (CI-friendly).
     pub pre_pin: Option<[u8; 32]>,
-    /// `SC_HTTPS_STRICT=1`: refuse unknown hosts instead of accept-new.
+    /// `SC_HTTPS_STRICT`: refuse unknown hosts instead of accept-new.
+    /// `=1` enables it; any non-empty value other than `0` is also treated
+    /// as enabled (fails closed on typos like `=true`/`=yes` rather than
+    /// silently falling back to accept-new — see [`strict_from`]).
     pub strict: bool,
 }
 
@@ -32,12 +35,26 @@ impl TlsClientPolicy {
             Ok(s) if !s.is_empty() => Some(parse_fingerprint(&s)?),
             _ => None,
         };
-        let strict = std::env::var("SC_HTTPS_STRICT").map(|v| v == "1").unwrap_or(false);
+        let strict = strict_from(std::env::var("SC_HTTPS_STRICT").ok().as_deref());
         Ok(TlsClientPolicy {
             known_hosts,
             pre_pin,
             strict,
         })
+    }
+}
+
+/// Pure decision for `SC_HTTPS_STRICT`: unset, empty, or `"0"` means not
+/// strict; any other value (including typos like `"true"`/`"yes"`) means
+/// strict. Fails closed rather than silently disabling strict mode on an
+/// unrecognized value. Factored out of [`TlsClientPolicy::from_env`] so it
+/// can be unit-tested without mutating process env (racy under parallel
+/// tests).
+fn strict_from(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(v) if v.is_empty() || v == "0" => false,
+        Some(_) => true,
     }
 }
 
@@ -160,6 +177,15 @@ mod tests {
         assert_eq!(lookup(&file, "h", 1).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn strict_from_fails_closed_on_unrecognized_values() {
+        assert!(strict_from(Some("1")));
+        assert!(strict_from(Some("true")));
+        assert!(!strict_from(Some("0")));
+        assert!(!strict_from(Some("")));
+        assert!(!strict_from(None));
     }
 
     #[test]

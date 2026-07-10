@@ -677,6 +677,29 @@ fn auth_is_mandatory(addr: &str, read_only: bool, allow_public: bool) -> bool {
     !is_loopback_host(host) && !read_only && !allow_public
 }
 
+/// Does an already-accepted bind owe its operator a plaintext-token
+/// warning? True when the bind is non-loopback, TLS is off, and ≥1 serve
+/// token is configured — i.e. the bind proceeded justified by
+/// `--read-only`/`--allow-public` (never by tokens alone; [`bind_is_allowed`]
+/// already refuses that combination), but bearer tokens still exist and will
+/// be presented/accepted in cleartext on every connection (I3, P32
+/// final-review fix wave). Mirrors [`bind_is_allowed`]'s host extraction;
+/// kept as a separate function since the two answer different questions —
+/// may this bind proceed vs. should we warn about one that already has.
+fn plaintext_token_warning_applies(addr: &str, root: &std::path::Path, tls: bool) -> Result<bool> {
+    if tls {
+        return Ok(false);
+    }
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if is_loopback_host(host) {
+        return Ok(false);
+    }
+    let tokens_configured =
+        !crate::serve_tokens::load(&crate::layout::Layout::at(root))?.is_empty();
+    Ok(tokens_configured)
+}
+
 /// How `sc serve --http` provides its TLS identity (P32). `Off` keeps the
 /// P26 plaintext listener; `AutoMint` loads-or-mints `.sc/serve-tls/`;
 /// `Pem` loads an operator-supplied pair (certbot etc.).
@@ -745,6 +768,13 @@ pub fn serve_http(
         )));
     }
     let mandatory_auth = auth_is_mandatory(addr, read_only, allow_public);
+    if plaintext_token_warning_applies(addr, root, tls_config.is_some())? {
+        eprintln!(
+            "warning: {addr} is bound publicly with serve tokens configured but no --tls — \
+             bearer tokens will cross the wire in cleartext on every connection; use --tls for \
+             confidential token transport"
+        );
+    }
     let listener = TcpListener::bind(addr)
         .map_err(|e| Error::ConnectionLost(format!("sc+http bind {addr}: {e}")))?;
     // Announce the actually-bound address on stdout, then flush. stdout is
@@ -1522,6 +1552,32 @@ mod tests {
         // Loopback always allowed regardless of flags/tokens/tls.
         assert!(bind_is_allowed("127.0.0.1:0", &root, false, false, false).unwrap());
         assert!(bind_is_allowed("[::1]:0", &root, false, false, false).unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The I3 plaintext-token warning decision: only fires for a
+    /// non-loopback, TLS-off bind that has ≥1 token configured (the
+    /// `--read-only`/`--allow-public`-justified case `bind_is_allowed`
+    /// already lets through) — never for loopback, never once `--tls` is on,
+    /// never with no tokens configured.
+    #[test]
+    fn plaintext_token_warning_fires_only_for_public_plaintext_with_tokens() {
+        let root = tmp_repo("tokenwarn");
+
+        // No tokens configured yet: never warns, loopback or not, TLS or not.
+        assert!(!plaintext_token_warning_applies("0.0.0.0:0", &root, false).unwrap());
+        assert!(!plaintext_token_warning_applies("127.0.0.1:0", &root, false).unwrap());
+
+        add_test_token(&root);
+
+        // Public, plaintext, tokens configured: warns.
+        assert!(plaintext_token_warning_applies("0.0.0.0:0", &root, false).unwrap());
+        // Same, but TLS on: no warning (tokens are confidential in transit).
+        assert!(!plaintext_token_warning_applies("0.0.0.0:0", &root, true).unwrap());
+        // Loopback: never warns regardless of TLS.
+        assert!(!plaintext_token_warning_applies("127.0.0.1:0", &root, false).unwrap());
+        assert!(!plaintext_token_warning_applies("[::1]:0", &root, false).unwrap());
 
         let _ = std::fs::remove_dir_all(&root);
     }

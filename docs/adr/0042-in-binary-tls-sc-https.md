@@ -95,7 +95,9 @@ Storage and knobs:
   override.
 - `SC_HTTPS_STRICT=1` refuses to connect to any host with no existing pin,
   closing the accept-new window for operators who want SSH's
-  `StrictHostKeyChecking=yes` equivalent.
+  `StrictHostKeyChecking=yes` equivalent (`=1` enables it; any non-empty
+  value other than `0` is also treated as enabled — it fails closed on a
+  typo like `=true` rather than silently falling back to accept-new).
 - The server prints its SPKI fingerprint on the `sc serve --tls` startup
   banner and via `sc serve fingerprint [<path>]` (which mints the identity if
   missing), so an operator can distribute the pin out-of-band before a

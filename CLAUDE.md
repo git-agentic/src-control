@@ -289,8 +289,8 @@ cargo run --bin sc -- serve --http <addr> <path> [--read-only] [--allow-public]
                                               # `sc serve --http 127.0.0.1:8730 .`; exactly one
                                               # of --stdio/--http is required; a non-loopback
                                               # <addr> is refused unless --read-only,
-                                              # --allow-public, or a configured serve token
-                                              # justifies it (P29)
+                                              # --allow-public, or — with --tls — a configured
+                                              # serve token justifies it (P29, narrowed by P32)
                                               # --max-connections <n>: concurrent-connection cap,
                                               # --http only, default 32, 0=unlimited; at the limit
                                               # a new connection gets busy-status-and-close, no
@@ -1336,7 +1336,9 @@ Trust model is accept-new TOFU, the SSH `known_hosts` shape: the pin is
 `SHA-256(SPKI DER)`, stored one `host:port sha256:<hex>` line per host in
 `~/.config/sc/known_hosts` (`SC_HTTPS_KNOWN_HOSTS` overrides the path);
 `SC_HTTPS_FINGERPRINT` pre-pins without persisting (CI); `SC_HTTPS_STRICT=1`
-refuses an unknown host outright. Pinning is deliberately pin-only in v1 —
+refuses an unknown host outright (`=1` enables it; any non-empty value other
+than `0` is also treated as enabled — fails closed on a typo). Pinning is
+deliberately pin-only in v1 —
 certificate names/validity are ignored — but the handshake signature is
 still verified, so a captured cert replayed without its private key is
 rejected even against a matching pin; a pin mismatch always hard-fails, never

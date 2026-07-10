@@ -318,10 +318,12 @@ enum Cmd {
         /// `--http` only. (P32)
         #[arg(long)]
         tls: bool,
-        /// PEM certificate chain for --tls (requires --tls-key).
+        /// PEM certificate chain for --tls; must be given together with
+        /// --tls-key (enforced in run_serve, not by clap).
         #[arg(long)]
         tls_cert: Option<PathBuf>,
-        /// PEM private key for --tls (requires --tls-cert).
+        /// PEM private key for --tls; must be given together with
+        /// --tls-cert (enforced in run_serve, not by clap).
         #[arg(long)]
         tls_key: Option<PathBuf>,
         /// Repo root to serve (the directory containing `.sc/`). Required

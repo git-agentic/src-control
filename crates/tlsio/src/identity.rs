@@ -120,6 +120,7 @@ mod tests {
         let err = load_or_mint(&dir).unwrap_err();
         assert!(err.to_string().contains("half a TLS identity"), "got: {err}");
         std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
     }
 
     #[test]
@@ -129,5 +130,6 @@ mod tests {
         let loaded = load_pem(&dir.join("cert.pem"), &dir.join("key.pem")).unwrap();
         assert_eq!(minted.spki_sha256, loaded.spki_sha256);
         std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
     }
 }

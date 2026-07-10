@@ -544,6 +544,8 @@ horizon is TBD.
 | **P28 — Security hardening sweep** | Close the audit's concrete-bug Highs + surface the accepted Mediums | strict ref-name validation at the write/read boundary (hostile wire `UpdateRef` + git-remote branch names rejected); `MAX_OBJECT_SIZE` caps every untrusted frame/pack-record/zstd-output length; `sc protect` nudges low-entropy secret filenames toward `sc secret`; secret env-var boundary documented as authorized-local-process-context + plaintext stays `Zeroizing`; every prior demo green + new pinned regression tests, no new dependency | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | **P29 — sc+http access control** | Close the audit's remaining unauthenticated-server High | fail-closed non-loopback bind; `sc serve token add/remove/list` + `SC_HTTP_TOKEN` bearer auth at the HTTP opening (constant-time `BLAKE3` compare, `401` before the wire handoff); `--read-only`/`ro`-scope tokens reject mutating verbs before any store write via `EC_READONLY`; proven by `demo/run_http_auth_demo.sh` | [0040](docs/adr/0040-sc-http-access-control.md) |
 | **P30 — Agent session transcripts** | Attach a sealed, provenance-checked agent-session record to a commit | `sc transcript attach <ref> <file> --agent claude --sign`; a keyless clone gets ciphertext only, the recipient's identity decrypts byte-exact; `sc log` shows a non-decrypting presence marker; `sc gc` prunes a transcript once its only snapshot is unreachable; proven by `demo/run_transcript_demo.sh` | [0038](docs/adr/0038-agent-session-transcripts.md) |
+| **P31 — Listener resource limits** | Bound `sc serve --http`/`--stdio` against a hostile or overloaded peer | `--max-connections`/`--timeout`/`--max-pack-size` close ADR-0036's three named-but-open accepted consequences plus an aggregate-pack-spool gap this phase's own research pass found; busy-status-and-close at the connection cap, connection-fatal session timeout, `EC_TOO_LARGE` mid-stream abort on both transports, capped read-only pre-drain, Go-shaped exponential accept backoff; proven by `demo/run_limits_demo.sh` plus unit-test-proven timeout/backoff | [0041](docs/adr/0041-listener-resource-limits.md) |
+| **P32 — In-binary TLS (`sc+https://`)** | Confidential `sc+http` transport without a reverse proxy | `sc serve --http <addr> <path> --tls` auto-mints (or loads PEM) a serve identity; `sc clone sc+https://host/repo` with accept-new TOFU pinning into `~/.config/sc/known_hosts`; gate tightened so a plaintext public bind can no longer be justified by tokens alone (`--tls` + ≥1 token now required); proven by `demo/run_tls_demo.sh` (signed chunked blob over TLS, pin/mismatch/strict/pre-pin, tightened plaintext gate) | [0042](docs/adr/0042-in-binary-tls-sc-https.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -828,6 +830,19 @@ scale-&-reach horizon):
   today; and a one-line fix to `SignatureObj.snapshot`'s now-stale doc
   comment, which still describes the field as always a snapshot id even
   though signing a transcript stores a transcript id there instead.
+- **P32 follow-ons.** Four items named but not closed by the P32 TLS work,
+  deferred rather than silently dropped: (1) a `.sc`-existence check before
+  `sc serve fingerprint`/`--tls` auto-mint — today it happily mints
+  `~/.sc/serve-tls` even when run outside a repo; (2) a stderr warning when
+  an `SC_HTTPS_*` env knob (`SC_HTTPS_STRICT`/`SC_HTTPS_FINGERPRINT`/
+  `SC_HTTPS_KNOWN_HOSTS`) is set but the target URL is plaintext
+  `sc+http://` — a scheme-downgrade footgun where the knob silently does
+  nothing; (3) a client-side TLS handshake/read timeout — the server bounds
+  its side at 30s (the opening read), but the `sc+https://` client is
+  unbounded, so this folds into the existing deferred hostile-peer pass
+  alongside `read_frame_inner`'s unbounded frame-length allocation; (4)
+  `sc remote add` parse-validating `sc+http(s)://` URLs at add time, the
+  way `ssh://` already does, instead of deferring the parse to first use.
 
 ## How a phase gets built
 
