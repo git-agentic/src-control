@@ -299,7 +299,6 @@ cargo run --bin sc -- serve --http <addr> <path> [--read-only] [--allow-public]
                                               # cap, both --http and --stdio, default 16 GiB,
                                               # 0=unlimited, floor 256 MiB (MAX_OBJECT_SIZE);
                                               # counted mid-stream abort -> EC_TOO_LARGE (P31)
-                                              # justifies it (P29)
 cargo run --bin sc -- serve token add --label <name> --scope ro|rw   # mint an
                                               # sct-<hex> bearer token in .sc/serve-tokens.toml;
                                               # raw value prints once on stdout (P29)

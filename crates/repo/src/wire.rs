@@ -368,7 +368,7 @@ fn read_frame_inner(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)
-        .map_err(|_| Error::Protocol(format!("EOF inside {len}-byte frame body")))?;
+        .map_err(|e| Error::Protocol(format!("read inside {len}-byte frame body failed: {e}")))?;
     Ok(Some(buf))
 }
 
@@ -445,7 +445,10 @@ pub fn read_pack_stream(
             Some((&ST_PACK_CHUNK, rest)) => {
                 let next = total + rest.len() as u64;
                 if max_bytes != 0 && next > max_bytes {
-                    return Err(Error::PackTooLarge(format!("{max_bytes} bytes")));
+                    return Err(Error::PackTooLarge(format!(
+                        "server cap is {max_bytes} bytes; raise --max-pack-size on the \
+                         server or split the push"
+                    )));
                 }
                 sink.write_all(rest)?;
                 total = next;
@@ -485,7 +488,7 @@ pub fn parse_response(frame: Vec<u8>) -> Result<Vec<u8>> {
             let code = c.u8()?;
             let msg = c.str()?;
             c.done()?;
-            Err(err_from_wire(code, msg))
+            Err(wire_to_err(code, msg))
         }
         s => Err(Error::Protocol(format!("bad response status {s}"))),
     }
@@ -493,6 +496,14 @@ pub fn parse_response(frame: Vec<u8>) -> Result<Vec<u8>> {
 
 /// Map a repo error onto its wire code + message. Errors sync logic matches on
 /// keep their identity; the rest carry only their message.
+///
+/// `Error::PackTooLarge(inner)` is special-cased: its `Display` impl already
+/// prepends the "pack exceeds the server's --max-pack-size limit: " prefix
+/// around `inner`, and [`wire_to_err`] reconstructs a fresh
+/// `Error::PackTooLarge(msg)` from whatever we send here — sending
+/// `e.to_string()` would carry that prefix as part of `msg`, so the
+/// round-tripped error's `Display` would show the prefix twice. Sending only
+/// `inner` keeps the prefix appearing exactly once, on display.
 pub fn err_to_wire(e: &Error) -> (u8, String) {
     let code = match e {
         Error::NotARepo => EC_NOT_A_REPO,
@@ -503,7 +514,11 @@ pub fn err_to_wire(e: &Error) -> (u8, String) {
         Error::PackTooLarge(_) => EC_TOO_LARGE,
         _ => EC_OTHER,
     };
-    (code, e.to_string())
+    let msg = match e {
+        Error::PackTooLarge(inner) => inner.clone(),
+        _ => e.to_string(),
+    };
+    (code, msg)
 }
 
 /// Reconstruct a typed error from its wire code; unknown/untyped codes become
@@ -517,11 +532,6 @@ pub fn wire_to_err(code: u8, msg: String) -> Error {
         EC_TOO_LARGE => Error::PackTooLarge(msg),
         _ => Error::Remote(msg), // EC_NOT_FOUND + EC_OTHER: typed enough as text
     }
-}
-
-/// Alias for backward compatibility with existing call sites.
-fn err_from_wire(code: u8, msg: String) -> Error {
-    wire_to_err(code, msg)
 }
 
 // --- response body builders/decoders (one symmetric pair per verb shape) ---
@@ -1086,7 +1096,7 @@ mod tests {
 
         // Untyped errors become Remote(msg) and keep their message.
         let (code, msg) = err_to_wire(&crate::error::Error::Unborn);
-        let back = err_from_wire(code, msg);
+        let back = wire_to_err(code, msg);
         match back {
             crate::error::Error::Remote(m) => assert!(m.contains("unborn"), "message lost: {m}"),
             other => panic!("expected Remote, got {other:?}"),
@@ -1459,7 +1469,18 @@ mod tests {
         let (code, msg) = err_to_wire(&e);
         assert_eq!(code, EC_TOO_LARGE);
         match wire_to_err(code, msg) {
-            Error::PackTooLarge(m) => assert!(m.contains("17179869184")),
+            Error::PackTooLarge(m) => {
+                assert!(m.contains("17179869184"));
+                // The Display prefix ("pack exceeds the server's
+                // --max-pack-size limit: ") must appear exactly once, not
+                // doubled by a round trip through the wire codes.
+                let display = Error::PackTooLarge(m).to_string();
+                assert_eq!(
+                    display.matches("pack exceeds").count(),
+                    1,
+                    "expected exactly one occurrence of the Display prefix, got: {display}"
+                );
+            }
             other => panic!("expected PackTooLarge, got {other:?}"),
         }
     }

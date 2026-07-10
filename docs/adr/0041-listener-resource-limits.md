@@ -33,11 +33,16 @@ scoped to the listener (`--stdio` is unaffected except where noted):
 1. **`--max-connections <n>` (default 32, 0 = unlimited).** An atomic
    live-connection counter (`SlotGuard`, RAII-decremented on every exit path
    — clean return, error, panic unwind). At the limit, a new connection is
-   accepted, immediately written a busy status at the HTTP opening — the
-   same pre-handshake seam ADR-0040's `401`/`404` already use — and closed.
-   No queuing: for long-lived multi-verb wire sessions, fail-fast beats an
-   invisible wait. Default 32 matches `git-daemon --max-connections`, the
-   closest prior-art analog for a bare TCP git-style server.
+   accepted, immediately written a busy status, and closed — at the same
+   pre-handshake HTTP-opening seam ADR-0040's `401`/`404` write to, but
+   *earlier* in it: ADR-0040's `401`/`404` are written only after reading
+   and parsing the client's opening (they respond to what the opening said),
+   while the `503` here is written before any read of the opening at all —
+   the connection is shed purely on the live-connection count, with the
+   opening never consulted. No queuing: for long-lived multi-verb wire
+   sessions, fail-fast beats an invisible wait. Default 32 matches
+   `git-daemon --max-connections`, the closest prior-art analog for a bare
+   TCP git-style server.
 
 2. **`--timeout <secs>` (default 300, 0 = disabled).** Read *and* write
    timeouts are set on the `TcpStream` once the session begins and persist
@@ -167,3 +172,29 @@ scoped to the listener (`--stdio` is unaffected except where noted):
   slower than 300s of true zero-byte stall is unaffected, but an operator
   with a much slower network than anticipated must raise `--timeout`
   explicitly.
+- **Known boundary (a): the `503` write races the client's own send.**
+  Because the busy status is written *before* the opening is read at all
+  (see Decision #1's seam-timing note above), a client that is mid-send on
+  its opening when the slot check fails can observe the server's write
+  colliding with its own outstanding write, and the kernel/TCP stack may
+  surface that as a connection reset instead of a clean `503` response —
+  observed empirically at roughly 1-in-3 on macOS loopback in this phase's
+  own testing. Draining the client's opening before closing (so the `503`
+  always lands cleanly) was considered and rejected: it would reintroduce a
+  per-shed-connection read cost on precisely the path `--max-connections`
+  exists to keep cheap — an attacker driving the server into the shed state
+  could then force it to spend read cycles per rejected connection instead
+  of none. The `503` is best-effort, not guaranteed-delivered; a client must
+  already treat a bare reset as retryable, same as a real busy response.
+- **Known boundary (b): `--max-connections 0` (unlimited) still exposes
+  thread exhaustion.** With the cap disabled, nothing prevents the accept
+  loop from spawning threads until the OS refuses (`EAGAIN` from
+  `pthread_create` or similar). Finding 1 of this phase's final-review wave
+  closed the crash mode this used to cause — `serve_http_listener` now uses
+  `std::thread::Builder::spawn` instead of the panicking `std::thread::spawn`,
+  so a failed spawn is logged, paced by the same `AcceptBackoff` used for
+  `accept()` errors, and the loop continues — but it does not close the
+  underlying exposure: an operator who explicitly disables the connection
+  cap is still trusting the OS's own thread/fd limits as the only backstop.
+  `--max-connections 0` is an explicit opt-out of this phase's shedding
+  behavior, not a claim that unlimited connections are safe.

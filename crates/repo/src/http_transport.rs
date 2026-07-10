@@ -413,8 +413,9 @@ impl AcceptBackoff {
 /// Server-side resource bounds for `sc serve --http` (P31): a hostile or
 /// merely slow-and-many-clients peer population must not be able to exhaust
 /// server memory, fds, or threads. `0` disables the corresponding limit in
-/// every field, matching the rest of this file's `0 = unbounded` convention
-/// (e.g. `max_connections`/`ro_drain_cap`).
+/// every field of this struct, matching the `0 = unbounded` convention also
+/// used by [`crate::wire::WirePolicy::ro_drain_cap`] (wire.rs — a different
+/// struct, not a field of this one).
 ///
 /// Defaults, each with its own provenance/divergence noted (see the P31
 /// design doc for the full survey):
@@ -606,13 +607,27 @@ pub fn serve_http_listener(
             g
         };
         let root = root.to_path_buf();
-        std::thread::spawn(move || {
+        let spawn_result = std::thread::Builder::new().spawn(move || {
             let _guard = guard; // slot held for the connection's lifetime
             if let Err(e) = handle_http_connection(stream, &root, read_only, mandatory_auth, limits)
             {
                 eprintln!("sc serve --http: connection error: {e}");
             }
         });
+        // OS thread creation can fail (e.g. EAGAIN under fd/thread exhaustion).
+        // `std::thread::spawn` PANICS in that case, which would kill this whole
+        // accept loop — exactly the "accept loop stays alive" property this
+        // phase exists to guarantee. `Builder::spawn` instead returns an
+        // `io::Result`; on `Err`, the closure we tried to spawn is dropped
+        // right here, which drops the moved-in `stream` and `SlotGuard` for us
+        // (closing the socket and freeing the slot) — the client just sees a
+        // plain close, not a 503, since writing a response would require
+        // restructuring the guard/stream ownership above. We shed with the
+        // same backoff used for accept() errors and keep looping.
+        if let Err(e) = spawn_result {
+            eprintln!("sc serve --http: thread spawn failed: {e}");
+            std::thread::sleep(backoff.on_error());
+        }
     }
     Ok(())
 }
