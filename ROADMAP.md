@@ -63,8 +63,10 @@ across every phase.
   (deduped, forward-only) whenever a secret is sealed or a path is protected.
   `revoke` stays metadata-only, now with a hint pointing at `rotate`. Rotation
   is secrets-only — convergent encryption makes protected-path DEK rotation
-  security-meaningless (ADR-0014) — and rotation is a future-reads cutover,
-  not erasure: old ciphertext remains reachable from history. (ADR-0019.)
+  security-meaningless (ADR-0014; → this objection dissolves for randomized
+  content in P33/ADR-0043, unlocking rotate-for-paths as a follow-on) — and
+  rotation is a future-reads cutover, not erasure: old ciphertext remains
+  reachable from history. (ADR-0019.)
 - **Phase 12 — Network transport over SSH.** A framed stdio wire protocol
   mirrors the 8 `Transport` verbs; `sc serve --stdio` dispatches onto the
   existing `LocalTransport` (CAS, pack verification reused verbatim); the
@@ -394,7 +396,8 @@ across every phase.
   the P5 content scanner) prints one stderr warning steering low-entropy
   secret basenames (`.env`/`*.key`/`*credentials*`…) toward `sc secret`,
   citing ADR-0014 — warning-only, convergent encryption's
-  equality-confirmability stays accepted by design. Secret env-var
+  equality-confirmability stayed accepted by design (→ closed for new
+  content in P33/ADR-0043; the nudge itself stays right). Secret env-var
   boundary: the threat model is tightened to "authorized local process
   context, NOT strong isolation," and a compile-time pin locks in that
   `scl_crypto::open`'s `Zeroizing<Vec<u8>>` plaintext rides unchanged to
@@ -506,6 +509,30 @@ across every phase.
   carrying a signed chunked blob byte-for-byte, the TOFU
   pin/mismatch/strict/pre-pin lifecycle, and the tightened plaintext gate —
   run twice, zero residue. (ADR-0042.)
+- **Phase 33 — Randomized protected-path encryption.** Closes ADR-0014's
+  convergent equality-confirmation oracle (the audit's remaining protected-path
+  High, ticket #40) for all **new** content: every new protected seal uses a
+  **fresh random DEK + random nonce** (`encrypt_path_randomized`,
+  `crates/crypto`), so two seals of the same plaintext yield different
+  ciphertext ids. The store is **dual-read, randomized-write**: a `RANDOMIZED`
+  perms-byte flag (alongside `PROTECTED`) tags new entries, the blob layout and
+  `decrypt_path` are unchanged, and there is **no snapshot-tag bump and no
+  `PROTOCOL_VERSION` change** — a pre-P33 store reads byte-for-byte identically.
+  Commit's per-path rule is **format-dispatched** (convergent → carry-if-
+  unchanged, stays convergent; randomized → keyed-PRF stat cache; new → seal
+  randomized), so no forced mass-migration. Unchanged detection is a
+  per-checkout cache (`.sc/protected-cache`, ws `.sc/ws/cache-<i>`, `sc work`
+  in-memory) keyed by a never-committed `.sc/local-key`; the keyed BLAKE3 tag is
+  authoritative in every lookup (stat is advisory — closes the git racy-stat
+  class), and the cache leaks nothing (PRF under a local-only key). `sc rewrap`
+  eagerly re-seals still-convergent blobs randomized (so an upgrading rewrap is
+  no longer tree-identical). Accepted costs: identical independent edits now
+  conflict (4a), rewrap is content-changing when it upgrades (4b), identical
+  plaintext at two paths no longer dedups (4c). Zero new dependencies. Proven by
+  `demo/run_randomized_demo.sh` (oracle closed, quiet history, cost-4a conflict,
+  rewrap policy-only on an all-randomized tip — run twice); dual-read of pre-P33
+  convergent stores and the convergent→randomized rewrap upgrade are unit-pinned
+  (the current binary can no longer write a convergent blob). (ADR-0043.)
 
 ## Active
 
@@ -709,12 +736,19 @@ scale-&-reach horizon):
   prefix-only, matching the sparse path-boundary machinery already built;
   git's `--filter=blob:limit` size-based filtering is a separate axis,
   deferred.
-- **Randomized protected mode (P28).** `sc protect` stays convergent
-  (deterministic DEK/nonce per plaintext), so ciphertext equality still
-  confirms plaintext equality without decryption — accepted by design in
-  ADR-0014, surfaced rather than closed by P28's filename nudge. A
-  non-convergent DEK/nonce mode for equality-hiding on high-sensitivity
-  paths is the follow-on.
+- **Randomized protected mode — SHIPPED in P33 (ADR-0043).** `sc protect`
+  used to stay convergent (deterministic DEK/nonce per plaintext), so
+  ciphertext equality confirmed plaintext equality without decryption —
+  accepted by design in ADR-0014, surfaced by P28's filename nudge. P33 closes
+  it: all new protected content seals under a fresh random DEK + nonce
+  (dual-read for pre-P33 convergent history; `sc rewrap` upgrades a tip on
+  demand). Moved from deferred to Done above.
+- **Rotate-for-paths (P33 follow-on).** ADR-0019 declared per-path DEK rotation
+  "security-meaningless" under convergent encryption. That objection dissolves
+  for randomized content (a random DEK is independent of the plaintext), so a
+  `sc protect … rotate`-style genuine per-path cryptographic cutover — the
+  protected-path analogue of `sc secret rotate` — is now coherent. Recorded in
+  ADR-0043, not built.
 - **fd/stdin secret injection (P28).** `sc run` hands decrypted secrets to
   the child via its environment — observable by same-user processes,
   crash dumps, and shell wrappers, per the tightened threat-model wording.

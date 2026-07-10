@@ -169,11 +169,25 @@ bash demo/run_lifecycle_demo.sh                                # rotation + escr
 cargo run --bin sc -- rewrap [--identity <key>] [--dry-run]   # one-commit bulk reseal of all
                                               # secrets + protected wrap lists to current
                                               # recipient/escrow sets (skip-and-report;
-                                              # exits 1 when entries were skipped)
+                                              # exits 1 when entries were skipped); also
+                                              # eagerly re-seals any still-CONVERGENT (pre-P33)
+                                              # protected blob RANDOMIZED (P33) — so a rewrap
+                                              # that upgrades content is no longer tree-identical,
+                                              # while a second rewrap over an all-randomized tip
+                                              # converges back to policy-only
 cargo run --bin sc -- escrow add <pubkey-or-name>    # append a break-glass key (list)
 cargo run --bin sc -- escrow remove <id-or-name>
 cargo run --bin sc -- escrow show                    # lists all escrow keys
 bash demo/run_rewrap_demo.sh                          # bulk rewrap + escrow-list proof
+bash demo/run_randomized_demo.sh                      # randomized protected-encryption proof
+                                              # (P33): same plaintext → different ciphertext ids
+                                              # (oracle closed), quiet history for unchanged
+                                              # content, cost-4a identical-edit conflict, and
+                                              # sc rewrap policy-only on an all-randomized tip —
+                                              # run twice, zero residue (the convergent→randomized
+                                              # rewrap UPGRADE and pre-P33 dual-read are unit-
+                                              # test-pinned, since the current binary can no
+                                              # longer write a convergent blob)
 cargo run --bin sc -- work --agents 3 -- <cmd>   # fork agent workspaces, run <cmd> in each,
                                                  # harvest changed ones to work-<i> branches
                                                  # (--with-secrets --identity <key> injects
@@ -435,7 +449,11 @@ default to the secret's current set (resolved by reverse `recipient_id`
 lookup against `.sc/recipients.toml`) or `--to`. This is secrets-only —
 per-file protected paths use convergent encryption, where DEK "rotation" is
 either dedup-breaking or security-meaningless, so path lifecycle stays on
-recipient re-wrap (`grant`/`revoke`). `sc secret revoke` remains
+recipient re-wrap (`grant`/`revoke`). **(→ P33/ADR-0043: this objection
+dissolves for randomized content — a random DEK is independent of the
+plaintext, so re-sealing a protected path under a fresh DEK becomes a genuine
+cutover; a rotate-for-paths surface is now an unlocked follow-on, recorded not
+built.)** `sc secret revoke` remains
 metadata-only (unchanged behavior), now printing a hint to run `rotate` for
 an actual cryptographic cutover. `sc escrow {add,remove,show}` / `sc escrow set` (single break-glass key →
 managed list in P17; `set` kept as replace-with-one sugar) in
@@ -588,7 +606,11 @@ presence and its wrap list **replaced** with exactly the governing rule's
 `granted_keys() + escrow`, so a tombstoned recipient's wraps re-attached by
 a pre-revoke merge do not survive the sweep. Convergent DEKs keep
 ciphertext ids unchanged, so the commit is policy-only (root tree
-byte-identical). **Skip-and-report:** entries the identity cannot open are
+byte-identical). **(→ P33/ADR-0043: no longer unconditionally true — rewrap
+now also eagerly re-seals any still-convergent blob RANDOMIZED, changing its
+id and the root tree, so a rewrap that upgrades content is content-changing;
+only a rewrap over an all-randomized tip stays policy-only.)**
+**Skip-and-report:** entries the identity cannot open are
 skipped and named (not silently dropped); the command commits whatever it
 could and exits non-zero when anything was skipped, printing a hint to
 re-run with an identity that can open the rest. **Honesty caveat (same
@@ -1187,7 +1209,9 @@ isolation," and a compile-time pin locks in that `scl_crypto::open`'s
 `Zeroizing<Vec<u8>>` plaintext rides unchanged through to the unavoidable
 `OsString` child-env hand-off. **Two accepted boundaries, unchanged by
 design:** convergent encryption stays equality-confirmable (ADR-0014 —
-randomized protected mode is deferred, not a bug); the secret's child-env
+**closed for new content in P33/ADR-0043**, which seals all new protected
+content randomized; the caveat holds only for pre-P33 convergent ciphertext in
+history until `sc rewrap` upgrades it); the secret's child-env
 copy is fundamental and un-zeroizable (fd/stdin injection is deferred, not
 a bug) — the parent's own decrypted buffer is what gets zeroized. Every
 prior demo stays green plus new pinned regression tests across all four
@@ -1374,6 +1398,105 @@ first connection to any host is unverified by construction (the TOFU trade,
 same as SSH's first connect); a loopback bind with no tokens configured
 stays unauthenticated by design, unchanged from P29. See ADR-0042.
 
+**Phase 33 is built.** Randomized protected-path encryption closes ADR-0014's
+convergent equality-confirmation oracle (the audit's remaining protected-path
+High, ticket #40) for all **new** content, dual-read for the old. All new
+protected content seals under a **fresh random DEK + random nonce**
+(`encrypt_path_randomized`, `crates/crypto`), so two seals of the same
+plaintext yield different ciphertext ids — the dictionary/equality oracle is
+closed from this phase on. **The format tag is a perms-byte flag, not a
+blob-layout change:** a new `RANDOMIZED` bit (`0b0000_0010`, always set with
+`PROTECTED`) rides the tree entry; the blob is still `nonce(24) ‖ ciphertext`
+under the same `PATH_AAD`, decrypted by the unchanged `decrypt_path`, so
+dual-read needs ZERO read-path code. The tag lives in the tree entry (not the
+blob) so format identification never fetches or decrypts bytes, and so a
+format discriminator never perturbs a blob id. **No snapshot-tag bump
+(`TAG_SNAPSHOT` stays 4), no `PROTOCOL_VERSION` change (stays 3)** — a pre-P33
+store reads byte-for-byte identically, and carry-by-id (the P15/P24 discipline,
+preserving the source entry's own perms) rides the bit through merge, replay,
+graft, and sparse carry with no new plumbing. **The commit rule is
+format-dispatched, not cache-only** (spec §3 table): a prior-tip **convergent**
+entry uses today's re-encrypt-and-compare (unchanged → carry as convergent
+forever with no cache; edited → seal randomized), a prior-tip **randomized**
+entry consults the stat cache, a **new** path seals randomized — a cache-only
+rule would have mass-migrated every unchanged protected file on the first
+commit after upgrade; format dispatch means unchanged convergent content stays
+convergent until an edit or `sc rewrap` touches it. **Unchanged detection is a
+per-checkout stat cache** (`crates/repo/src/cache.rs`) keyed by
+`.sc/local-key` (32 random bytes, **0600 from the first byte**, lazily minted,
+**never committed, never transferred**): entries are `path → (mtime, size,
+keyed_tag, blob_id)` with `keyed_tag = BLAKE3-keyed(local_key, plaintext)`.
+Commit still needs only **public keys** — decrypt-and-compare is used nowhere.
+The cache **does not reintroduce the oracle** because the tag is a PRF output
+under a key that never leaves `.sc/`, so the cache file alone leaks nothing;
+its worst failure mode is a spurious re-seal (fresh id for unchanged
+plaintext), never incorrectness — a corrupt line is treated as absent with a
+warning, a missing key is minted, a key that can't be created is a hard error.
+**DEVIATION from #30 decision-3's letter (and the spec §3 table): the stat hit
+is NEVER trusted alone — the keyed BLAKE3 tag is authoritative in every cache
+lookup.** The recorded `(mtime, size)` are advisory; the tag is recomputed and
+compared every time. This closes the git racy-stat class (a same-size edit
+within mtime granularity, at the recorded mtime, would otherwise be silently
+dropped from a commit — pinned by `racy_stat_same_size_same_mtime_still_misses`
+and `tag_is_authoritative_for_hits_and_misses`). Rationale: the plaintext is
+already in memory at every call site, keyed hashing is ~free against it, and
+"never incorrectness" outranks the stat shortcut. **`sc rewrap` performs the
+eager upgrade** (no new command, no flag): while re-wrapping each blob's DEK by
+wrap presence, it additionally decrypts any still-convergent blob and re-seals
+it randomized to `granted_keys() + escrow`, recording the plaintext it already
+holds into the main-tree cache (so the next `sc status`/`commit` stays quiet —
+rewrap never rematerializes the working tree). Output gains a `re-sealed N
+convergent blob(s)` line; a rewrap that upgrades content is **no longer
+tree-identical** (accepted cost 4b), while a second rewrap over an
+all-randomized tip converges back to policy-only. **A review Critical, fixed:**
+two paths sharing ONE convergent blob (pre-P33 dedup of identical plaintext) —
+old-id wrap removal is **DEFERRED past the path loop** (removed only when no
+kept tree entry still references it); removing it in-loop stripped the shared
+entry out from under the second path, leaving it wrap-orphaned at the tip with
+no re-run repair. Each shared path mints its own randomized blob, which also
+closes the intra-tip oracle between those two paths. **Accepted costs 4a–c all
+landed as predicted:** (4a) independent identical edits on two branches now
+conflict — both sides editing to even trivially-identical plaintext no longer
+id-matches, so the merge needs `--identity` (or P23 `sc conflicts`/`sc
+resolve`) even to merge identical content; (4b) rewrap is tree-changing when it
+upgrades; (4c) identical plaintext at two paths no longer dedups. **P15/P17
+semantic adjustments:** merge/replay's content-divergent re-encryption switches
+to the randomized primitive (union/tombstone semantics unchanged; mixed
+convergent+randomized trees need no special casing — every path is carried by
+id or re-sealed randomized), and `sc rewrap` gains the upgrade above.
+**`sc protect <existing-prefix> --to <new>` no longer wraps UNCHANGED content
+at the next commit** (review-confirmed real behavior change): unchanged files
+carry their prior wrap list verbatim, so a bare re-protect does not grant the
+new recipient access to un-re-sealed files. This fails **safe** — it
+under-grants, never over-grants — and `sc grant` / `sc rewrap` are the covering
+flows (operator guidance: use `sc grant`, not a second `sc protect`, to add a
+recipient to already-committed content). **The cache is per-checkout:** the
+main tree uses `.sc/protected-cache`; a ws workspace uses `.sc/ws/cache-<i>`
+**beside** the checkout dir, never inside it (a file inside `.sc/ws/<i>/` would
+be harvested as an untracked working file), removed with the workspace at
+teardown; `sc work`'s one-shot agents use ephemeral in-memory caches. Rationale
+— without per-workspace caches, untouched protected files in forked workspaces
+would have no cache entry, be re-sealed randomized at harvest with a fresh id,
+and identical-edit-**conflict** (cost-4a fired spuriously) into a `work-<i>`
+fallback instead of a clean auto-merge; per-workspace caches reproduce the base
+tree id and preserve P20's clean-auto-merge and crash-recovery `UpToDate`
+idempotency. All production cache saves are **best-effort and ordered after ref
+moves** — the ref move stays the atomic commit point; a save failure warns,
+never errors. **Unlocked follow-on: rotate-for-paths** — ADR-0019 called
+per-path DEK rotation security-meaningless under convergent encryption; that
+objection **dissolves for randomized content** (a random DEK is independent of
+the plaintext), so a `sc protect … rotate` genuine cutover is now coherent —
+**recorded, not built.** **Proof splits honestly:** dual-read of genuine
+pre-P33 stores is pinned by **library-built convergent-tree fixtures** in the
+`rewrap`/`merge`/`replay` unit tests (the current binary can no longer *write*
+a convergent blob), while `demo/run_randomized_demo.sh` proves oracle-closure,
+quiet history, cost-4a conflicts, and rewrap policy-only on an all-randomized
+tip against the current binary (the convergent→randomized rewrap upgrade path
+is unit-pinned, not demo-pinned, for the same reason) — run twice, zero
+residue. Zero new dependencies (`blake3`/`hex`
+were already workspace deps; `scl-repo` now links `blake3` directly for the
+cache tag). See ADR-0043.
+
 Remaining follow-ons: operation objects in the CAS, oplog entries for
 remote-tracking refs, extending the sparse gate to
 `materialize_conflict_state`'s `to_encrypt`/sidecar write loops (see the
@@ -1381,10 +1504,13 @@ P24 boundary note above), the three P27 items named above (transparent
 lazy-fetch as a deferred alternative to explicit `sc backfill`, per-case
 gap-tolerant merge/rebase/`ws harvest`/`sc work` instead of blanket
 refusal, and blob-size/object-count clone filters alongside the
-prefix-only filter shipped here), the three P28 items named above
-(randomized protected mode for equality-hiding, fd/stdin secret injection
-as an alternative to env vars, and a `--max-object-size` operator config
-knob), and the P28 final-review follow-ons (a one-line
+prefix-only filter shipped here), the two remaining P28 items named above
+(fd/stdin secret injection as an alternative to env vars, and a
+`--max-object-size` operator config knob — randomized protected mode is now
+SHIPPED in P33/ADR-0043), the P33 item (**rotate-for-paths** — ADR-0019's
+"path DEK rotation is security-meaningless" objection dissolves for randomized
+content, so a `sc protect … rotate`-style genuine per-path cutover is now
+coherent; recorded, not built), and the P28 final-review follow-ons (a one-line
 `validate_branch_name` call in `refs::write_head`/`refs::delete_branch`
 for ref-validation class completeness — not exploitable today, since
 HEAD's path is fixed and `delete_branch` only takes internally-generated
