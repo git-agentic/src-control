@@ -79,6 +79,7 @@ const EC_PROTOCOL: u8 = 4;
 /// P29: the server is enforcing a read-only serve-token policy and refused a
 /// mutating verb before any store write. See [`serve_with_policy`].
 const EC_READONLY: u8 = 5;
+pub(crate) const EC_TOO_LARGE: u8 = 6;
 const EC_OTHER: u8 = 255;
 
 /// A client request — the wire mirror of one [`crate::transport::Transport`]
@@ -487,6 +488,7 @@ pub fn err_to_wire(e: &Error) -> (u8, String) {
         Error::Core(scl_core::Error::NotFound(_)) => EC_NOT_FOUND,
         Error::Protocol(_) => EC_PROTOCOL,
         Error::ReadOnly => EC_READONLY,
+        Error::PackTooLarge(_) => EC_TOO_LARGE,
         _ => EC_OTHER,
     };
     (code, e.to_string())
@@ -494,14 +496,20 @@ pub fn err_to_wire(e: &Error) -> (u8, String) {
 
 /// Reconstruct a typed error from its wire code; unknown/untyped codes become
 /// `Error::Remote(msg)` so the message is never lost.
-pub fn err_from_wire(code: u8, msg: String) -> Error {
+pub fn wire_to_err(code: u8, msg: String) -> Error {
     match code {
         EC_NOT_A_REPO => Error::NotARepo,
         EC_NON_FAST_FORWARD => Error::NonFastForward,
         EC_PROTOCOL => Error::Protocol(msg),
         EC_READONLY => Error::ReadOnly,
+        EC_TOO_LARGE => Error::PackTooLarge(msg),
         _ => Error::Remote(msg), // EC_NOT_FOUND + EC_OTHER: typed enough as text
     }
+}
+
+/// Alias for backward compatibility with existing call sites.
+fn err_from_wire(code: u8, msg: String) -> Error {
+    wire_to_err(code, msg)
 }
 
 // --- response body builders/decoders (one symmetric pair per verb shape) ---
@@ -1315,5 +1323,16 @@ mod tests {
             matches!(err, Error::Protocol(_)),
             "expected Protocol error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn pack_too_large_round_trips_through_wire_codes() {
+        let e = Error::PackTooLarge("16 GiB (17179869184 bytes)".to_string());
+        let (code, msg) = err_to_wire(&e);
+        assert_eq!(code, EC_TOO_LARGE);
+        match wire_to_err(code, msg) {
+            Error::PackTooLarge(m) => assert!(m.contains("17179869184")),
+            other => panic!("expected PackTooLarge, got {other:?}"),
+        }
     }
 }
