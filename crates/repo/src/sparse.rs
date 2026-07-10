@@ -181,7 +181,8 @@ impl Repo {
         let snap = self.snapshot(&tip)?;
         let store_arc = self.vfs().store();
         let mut s = store_arc.lock().unwrap();
-        crate::worktree::materialize(
+        let mut cache = self.open_protected_cache()?;
+        let skipped = crate::worktree::materialize(
             self.layout(),
             &mut s,
             snap.root,
@@ -189,7 +190,10 @@ impl Repo {
             &snap.protection,
             identity,
             &spec,
-        )
+            Some(&mut cache),
+        )?;
+        cache.save()?;
+        Ok(skipped)
     }
 
     /// Disable sparse checkout: clear the persisted spec and re-materialize
@@ -238,7 +242,8 @@ impl Repo {
         let snap = self.snapshot(&tip)?;
         let store_arc = self.vfs().store();
         let mut s = store_arc.lock().unwrap();
-        crate::worktree::materialize(
+        let mut cache = self.open_protected_cache()?;
+        let skipped = crate::worktree::materialize(
             self.layout(),
             &mut s,
             snap.root,
@@ -246,7 +251,10 @@ impl Repo {
             &snap.protection,
             identity,
             &Sparse::default(),
-        )
+            Some(&mut cache),
+        )?;
+        cache.save()?;
+        Ok(skipped)
     }
 }
 

@@ -471,6 +471,7 @@ impl Repo {
                     // Protection-aware materialize: a PROTECTED entry decrypts
                     // for `identity` when possible, else is skipped (never
                     // writes ciphertext to disk) — same as merge's clean path.
+                    let mut cache = self.open_protected_cache()?;
                     worktree::materialize(
                         &self.layout,
                         &mut store,
@@ -479,7 +480,9 @@ impl Repo {
                         &protection,
                         identity,
                         &self.sparse_spec()?,
+                        Some(&mut cache),
                     )?;
+                    cache.save()?;
                 }
                 refs::write_branch_tip(&self.layout, &head, &id)?;
                 crate::oplog::record(
@@ -590,6 +593,7 @@ impl Repo {
             let snap = self.snapshot(&tip)?;
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
+            let mut cache = self.open_protected_cache()?;
             skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -598,7 +602,9 @@ impl Repo {
                 &snap.protection,
                 None,
                 &self.sparse_spec()?,
+                Some(&mut cache),
             )?;
+            cache.save()?;
         }
         crate::pick_state::clear(&self.layout)?;
         Ok(skipped)
@@ -697,6 +703,7 @@ impl Repo {
                 let target_snap = store.get_snapshot(&target_tip)?;
                 let target_root = target_snap.root;
                 let target_protection = target_snap.protection;
+                let mut cache = self.open_protected_cache()?;
                 worktree::materialize(
                     &self.layout,
                     &mut store,
@@ -705,7 +712,9 @@ impl Repo {
                     &target_protection,
                     identity,
                     &self.sparse_spec()?,
+                    Some(&mut cache),
                 )?;
+                cache.save()?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &target_tip)?;
                 crate::oplog::record(
@@ -986,6 +995,7 @@ impl Repo {
             // (each step pruned its wrap map to its own merged tree): a
             // PROTECTED entry decrypts for `identity` when possible, else is
             // skipped — never writes ciphertext to disk.
+            let mut cache = self.open_protected_cache()?;
             worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -994,7 +1004,9 @@ impl Repo {
                 &acc_protection,
                 identity,
                 &self.sparse_spec()?,
+                Some(&mut cache),
             )?;
+            cache.save()?;
         }
         refs::write_branch_tip(&self.layout, &head, &acc_tip)?;
         crate::oplog::record(
@@ -1198,7 +1210,8 @@ impl Repo {
         let skipped = {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
-            worktree::materialize(
+            let mut cache = self.open_protected_cache()?;
+            let skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
                 snap.root,
@@ -1206,7 +1219,10 @@ impl Repo {
                 &snap.protection,
                 None,
                 &self.sparse_spec()?,
-            )?
+                Some(&mut cache),
+            )?;
+            cache.save()?;
+            skipped
         };
         crate::rebase_state::clear(&self.layout)?;
         Ok(skipped)

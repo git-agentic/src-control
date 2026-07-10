@@ -48,6 +48,12 @@ pub(crate) fn materialize_workspace(
     let ws = Layout::at(dir);
     let store_arc = repo.vfs().store();
     let mut store = store_arc.lock().unwrap();
+    // No cache threaded here: a workspace checkout's stat cache would need to
+    // live beside the checkout dir (`Layout::ws_cache_path`), not inside it,
+    // to avoid harvest's worktree read picking it up as an untracked file —
+    // wiring that per-workspace cache through is a follow-on (P33 doesn't
+    // require it: a miss here only ever degrades to a spurious reseal on the
+    // next harvest, never to incorrectness, per `cache.rs`'s contract).
     worktree::materialize(
         &ws,
         &mut store,
@@ -56,6 +62,7 @@ pub(crate) fn materialize_workspace(
         &snap.protection,
         identity,
         sparse,
+        None,
     )
 }
 

@@ -603,6 +603,7 @@ pub fn materialize(
     protection: &Protection,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
+    mut cache: Option<&mut ProtectedCache>,
 ) -> Result<Vec<String>> {
     // Gap-tolerant when sparse is active (P27 Task 4): a promisor-filtered
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
@@ -662,6 +663,19 @@ pub fn materialize(
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(&full, &pt[..])?;
+                    // Record a randomized entry's cache entry right after the
+                    // write (P33): without this, the next `diff_worktree`/
+                    // `status` on this exact, unmodified plaintext has no
+                    // stat-hit or keyed-tag to match and spuriously reports
+                    // it as modified — since re-encryption can't prove
+                    // unchanged-ness for a randomized seal. Mirrors the
+                    // record call `commit`'s carry/fresh-seal paths already
+                    // make (`repo.rs`'s `snapshot_files`).
+                    if perms & scl_core::RANDOMIZED != 0 {
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.record(path, &full, &pt, *blob_id);
+                        }
+                    }
                     // `pt` (Zeroizing<Vec<u8>>) is dropped and zeroed here.
                 }
                 None => {
@@ -769,6 +783,7 @@ mod tests {
             &Default::default(),
             None,
             &Sparse::default(),
+            None,
         );
 
         // Restore perms before asserting so cleanup always works.
@@ -807,6 +822,7 @@ mod tests {
             &Default::default(),
             None,
             &Sparse::default(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, crate::error::Error::BadRef(_)), "got {err:?}");
@@ -835,7 +851,8 @@ mod tests {
             None,
             &Default::default(),
             None,
-            &Sparse::default()
+            &Sparse::default(),
+            None
         )
         .is_err());
 

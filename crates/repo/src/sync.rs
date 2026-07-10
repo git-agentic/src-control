@@ -163,6 +163,7 @@ impl Repo {
                 &head_protection,
                 None,
                 &sparse_spec,
+                None,
             )?;
         }
         Ok(dst_repo)

@@ -76,6 +76,22 @@ impl Repo {
         &self.layout
     }
 
+    /// Open this repo's main-checkout P33 unchanged-detection cache
+    /// (`.sc/protected-cache`), keyed by `.sc/local-key`. Every
+    /// `worktree::materialize` call against the host working tree opens one
+    /// of these and saves it right after materializing, so a randomized
+    /// protected file just decrypted to disk is recognized as unchanged by
+    /// the very next `status`/`diff` — without this, `diff_worktree`'s
+    /// randomized-entry branch has no stat-hit or keyed-tag to match and
+    /// spuriously reports the untouched file as modified.
+    pub(crate) fn open_protected_cache(&self) -> Result<crate::cache::ProtectedCache> {
+        let key = crate::cache::local_key(&self.layout)?;
+        Ok(crate::cache::ProtectedCache::open(
+            key,
+            Some(self.layout.protected_cache_path()),
+        ))
+    }
+
     /// The tip snapshot of the current branch (None if unborn).
     pub fn head_tip(&self) -> Result<Option<ObjectId>> {
         refs::head_tip(&self.layout)
@@ -1234,6 +1250,7 @@ impl Repo {
                 let theirs_snap = store.get_snapshot(&theirs)?;
                 let theirs_root = theirs_snap.root;
                 let theirs_protection = theirs_snap.protection;
+                let mut cache = self.open_protected_cache()?;
                 let skipped = worktree::materialize(
                     &self.layout,
                     &mut store,
@@ -1242,7 +1259,9 @@ impl Repo {
                     &theirs_protection,
                     identity,
                     &self.sparse_spec()?,
+                    Some(&mut cache),
                 )?;
+                cache.save()?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
                 crate::oplog::record(
@@ -1269,6 +1288,7 @@ impl Repo {
                 let theirs_root = theirs_snap.root;
                 let theirs_protection = theirs_snap.protection;
                 let ours_root = store.get_snapshot(&ours)?.root;
+                let mut cache = self.open_protected_cache()?;
                 let skipped = worktree::materialize(
                     &self.layout,
                     &mut store,
@@ -1277,7 +1297,9 @@ impl Repo {
                     &theirs_protection,
                     identity,
                     &self.sparse_spec()?,
+                    Some(&mut cache),
                 )?;
+                cache.save()?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
                 crate::oplog::record(
@@ -1457,7 +1479,8 @@ impl Repo {
         let skipped = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            worktree::materialize(
+            let mut cache = self.open_protected_cache()?;
+            let skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
                 merged_root,
@@ -1465,7 +1488,10 @@ impl Repo {
                 &merged_protection,
                 identity,
                 &self.sparse_spec()?,
-            )?
+                Some(&mut cache),
+            )?;
+            cache.save()?;
+            skipped
         };
 
         // Clean merge: two-parent snapshot now, carrying the merged
@@ -1557,6 +1583,7 @@ impl Repo {
             // completion commit's decided-tree carry-forward preserves
             // skipped content, so nothing is lost by not surfacing the list
             // here (the `Err`/`Stopped` return can't carry it).
+            let mut cache = self.open_protected_cache()?;
             let _skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1565,7 +1592,9 @@ impl Repo {
                 conflict_prot,
                 identity,
                 &self.sparse_spec()?,
+                Some(&mut cache),
             )?;
+            cache.save()?;
         }
         for (path, bytes, _mode, _recipients) in to_encrypt {
             let full = worktree::safe_join(&self.layout.root, path)?;
@@ -1614,6 +1643,7 @@ impl Repo {
             let ours_protection = ours_snap.protection;
             let theirs_root = store.get_snapshot(&theirs_id)?.root;
             // No identity at abort time: protected files in ours are skipped (not decrypted).
+            let mut cache = self.open_protected_cache()?;
             skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1622,7 +1652,9 @@ impl Repo {
                 &ours_protection,
                 None,
                 &self.sparse_spec()?,
+                Some(&mut cache),
             )?;
+            cache.save()?;
         }
         crate::merge_state::clear(&self.layout)?;
         Ok(skipped)
@@ -1733,7 +1765,8 @@ impl Repo {
         let skipped = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            worktree::materialize(
+            let mut cache = self.open_protected_cache()?;
+            let skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
                 target_root,
@@ -1741,7 +1774,10 @@ impl Repo {
                 &target_protection,
                 identity,
                 &self.sparse_spec()?,
-            )?
+                Some(&mut cache),
+            )?;
+            cache.save()?;
+            skipped
         };
         refs::write_head(&self.layout, name)?;
         crate::oplog::record(
@@ -2846,13 +2882,20 @@ mod tests {
     }
 
     #[test]
-    fn convergent_merge_ids_are_stable_across_repos() {
+    fn merge_ids_no_longer_converge_across_repos() {
+        // P33/ADR-0043: `encrypt_protected`'s seals are now randomized, so
+        // this pre-P33 test's premise ("identical merged plaintext converges
+        // to the same blob id across independent repos") is deliberately
+        // broken — the oracle that convergence gave an equality-testing
+        // observer is exactly what randomization closes (accepted cost 4c).
+        // Renamed and inverted to pin the NEW behavior: two independent
+        // repos building the identical protected divergence and
+        // content-merging it now produce DIFFERENT ciphertext blob ids for
+        // the same plaintext.
+        //
         // Two independent repos build the identical protected divergence
         // (same base plaintext, same edits on both sides) and content-merge
-        // with their own (distinct) recipient identity. Convergent encryption
-        // means the merged plaintext is identical, so the resulting ciphertext
-        // blob id must be IDENTICAL across the two repos — merge output is
-        // deterministic content addressing, not per-repo randomness.
+        // with their own (distinct) recipient identity.
         fn build(tag: &str) -> (Repo, std::path::PathBuf, ObjectId, ObjectId) {
             let root = tmp_root(tag);
             let repo = Repo::init(&root).unwrap();
@@ -2884,9 +2927,9 @@ mod tests {
 
         let (repo1, root1, _id1, blob1) = build("p15-merge-convergent-a");
         let (repo2, root2, _id2, blob2) = build("p15-merge-convergent-b");
-        assert_eq!(
+        assert_ne!(
             blob1, blob2,
-            "identical merged plaintext must converge to the same blob id"
+            "randomized seals must NOT converge across independent repos (oracle closed, P33)"
         );
         drop(repo1);
         drop(repo2);
