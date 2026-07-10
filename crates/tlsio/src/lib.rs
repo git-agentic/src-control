@@ -6,11 +6,15 @@
 
 mod identity;
 mod spki;
-// mod stream; // Task 2
+mod stream;
 
 pub use identity::{load_or_mint, load_pem, ServerIdentity};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 pub use spki::{fingerprint_hex, spki_der, spki_sha256};
+pub use stream::{
+    client_connect, server_config, server_stream, TlsClientReadHalf, TlsClientStream,
+    TlsClientWriteHalf, TlsServerConfig, TlsServerReadHalf, TlsServerStream, TlsServerWriteHalf,
+};
 
 /// Errors from the TLS layer. `PinMismatch` carries both fingerprints so the
 /// caller (crates/repo) can render a recovery hint naming its pin source —
