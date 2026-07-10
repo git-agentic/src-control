@@ -389,14 +389,9 @@ const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// doubling to a 1s cap, reset on the next successful accept. Turns fd
 /// exhaustion (EMFILE) from a busy-loop into a paced retry. Hardcoded: no
 /// operator tuning story exists (Go ships it knobless too).
-// TODO(P31 Task 4 step 7): wired into `serve_http_listener`'s accept loop in
-// the same task's second commit — `allow(dead_code)` covers the gap between
-// the two commits, not a permanent suppression.
-#[allow(dead_code)]
 struct AcceptBackoff {
     cur: Duration,
 }
-#[allow(dead_code)]
 impl AcceptBackoff {
     const START: Duration = Duration::from_millis(5);
     const CAP: Duration = Duration::from_secs(1);
@@ -410,6 +405,57 @@ impl AcceptBackoff {
     }
     fn on_success(&mut self) {
         self.cur = Self::START;
+    }
+}
+
+/// Server-side resource bounds for `sc serve --http` (P31): a hostile or
+/// merely slow-and-many-clients peer population must not be able to exhaust
+/// server memory, fds, or threads. `0` disables the corresponding limit in
+/// every field, matching the rest of this file's `0 = unbounded` convention
+/// (e.g. `max_connections`/`ro_drain_cap`).
+///
+/// Defaults, each with its own provenance/divergence noted (see the P31
+/// design doc for the full survey):
+/// - `max_connections: 32` — matches `git-daemon`'s `--max-connections`
+///   default, the closest prior-art analog for a bare TCP git-style server.
+/// - `timeout_secs: 300` — on by default, unlike `git-daemon`'s `--timeout`
+///   (which defaults to 0/disabled). A silent or write-stalled peer parking
+///   a thread forever is exactly the DoS shape this phase closes, so the
+///   safer default is chosen deliberately over matching git-daemon here.
+/// - `max_pack_size: DEFAULT_MAX_PACK_SIZE` (16 GiB) — also a deliberate
+///   divergence: no comparable git-daemon knob exists, so this default is set
+///   generously (see Task 3) rather than borrowed from prior art.
+#[derive(Debug, Clone, Copy)]
+pub struct ServeLimits {
+    /// Max concurrent connections; beyond this, a new connection is shed with
+    /// `503 Service Unavailable` before its opening is even read. `0` =
+    /// unlimited.
+    pub max_connections: u32,
+    /// Per-connection idle/session timeout in seconds, applied to both the
+    /// read and write halves once the session begins (see
+    /// [`handle_http_connection`]). `0` = disabled.
+    pub timeout_secs: u64,
+    /// Forwarded to [`crate::wire::WirePolicy::max_pack_size`]. `0` =
+    /// unlimited.
+    pub max_pack_size: u64,
+}
+impl Default for ServeLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 32,
+            timeout_secs: 300,
+            max_pack_size: crate::wire::DEFAULT_MAX_PACK_SIZE,
+        }
+    }
+}
+
+/// Decrements the live-connection count on drop, so every exit path — clean
+/// return, error, panic unwind — frees its slot (the TempPackGuard
+/// discipline applied to connection slots).
+struct SlotGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -480,7 +526,9 @@ pub fn serve_http(
     root: &std::path::Path,
     read_only: bool,
     allow_public: bool,
+    limits: ServeLimits,
 ) -> Result<()> {
+    crate::wire::validate_max_pack_size(limits.max_pack_size)?;
     if !bind_is_allowed(addr, root, read_only, allow_public)? {
         return Err(Error::InvalidArgument(format!(
             "refusing to bind non-loopback address {addr} without --read-only, \
@@ -502,7 +550,7 @@ pub fn serve_http(
         .map_err(|e| Error::ConnectionLost(format!("sc+http local_addr: {e}")))?;
     println!("listening on {bound}");
     std::io::Write::flush(&mut std::io::stdout()).ok();
-    serve_http_listener(listener, root, read_only, mandatory_auth)
+    serve_http_listener(listener, root, read_only, mandatory_auth, limits)
 }
 
 /// Accept-loop core, factored out of [`serve_http`] so tests can bind
@@ -519,23 +567,47 @@ pub fn serve_http(
 /// or a fatal accept-level error occurs; a per-connection error (bad
 /// opening, a `wire::serve` failure, a dropped socket) is logged to stderr
 /// and the loop continues — it must never take down the whole server.
+///
+/// P31 additions: a live-connection counter enforces `limits.max_connections`
+/// (shedding with `503` BEFORE spawning a thread or reading an opening, so a
+/// shed connection costs no fd beyond the accept itself); a per-`accept()`
+/// error is paced by [`AcceptBackoff`] instead of busy-looping.
 pub fn serve_http_listener(
     listener: TcpListener,
     root: &std::path::Path,
     read_only: bool,
     mandatory_auth: bool,
+    limits: ServeLimits,
 ) -> Result<()> {
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut backoff = AcceptBackoff::new();
     for incoming in listener.incoming() {
-        let stream = match incoming {
-            Ok(s) => s,
+        let mut stream = match incoming {
+            Ok(s) => {
+                backoff.on_success();
+                s
+            }
             Err(e) => {
                 eprintln!("sc serve --http: accept error: {e}");
+                std::thread::sleep(backoff.on_error());
                 continue;
             }
         };
+        // Connection cap: acquire a slot BEFORE spawning; shed with 503 when full.
+        let guard = {
+            let prev = live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let g = SlotGuard(live.clone());
+            if limits.max_connections != 0 && prev >= limits.max_connections as usize {
+                let _ = write_status(&mut stream, 503);
+                continue; // g drops here → count restored; no thread, no handshake
+            }
+            g
+        };
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            if let Err(e) = handle_http_connection(stream, &root, read_only, mandatory_auth) {
+            let _guard = guard; // slot held for the connection's lifetime
+            if let Err(e) = handle_http_connection(stream, &root, read_only, mandatory_auth, limits)
+            {
                 eprintln!("sc serve --http: connection error: {e}");
             }
         });
@@ -548,14 +620,19 @@ pub fn serve_http_listener(
 ///
 /// The read timeout is set BEFORE `read_client_opening` (closing the
 /// slow-loris gap: the opening is bounded in bytes but not time) and
-/// cleared again AFTER the 200 status is written and BEFORE handing off to
-/// `wire::serve` — a legitimate large pack transfer must not be cut off
-/// mid-stream by the same timeout that guards the opening.
+/// REPLACED (P31, not simply cleared) by `limits.timeout_secs`'s session
+/// timeout — on both the read and write sides — AFTER the 200 status is
+/// written and BEFORE handing off to `wire::serve`: a legitimate large pack
+/// transfer must not be cut off mid-transfer by the short opening timeout,
+/// but a session that goes silent (or, on the write side, stalls reading a
+/// streamed response) must still be reaped rather than parking the thread
+/// forever.
 fn handle_http_connection(
     mut stream: TcpStream,
     root: &std::path::Path,
     server_read_only: bool,
     mandatory_auth: bool,
+    limits: ServeLimits,
 ) -> Result<()> {
     stream
         .set_read_timeout(Some(OPENING_READ_TIMEOUT))
@@ -621,12 +698,21 @@ fn handle_http_connection(
 
     write_status(&mut stream, 200)?;
 
-    // Clear the opening's read timeout before the wire protocol begins: a
-    // real streamed pack transfer can legitimately take longer than
-    // `OPENING_READ_TIMEOUT` and must not be timed out mid-transfer.
+    // P31: the opening timeout is REPLACED (not cleared) by the session
+    // timeout, on BOTH read and write sides — a write timeout covers a client
+    // that stops reading mid-GetPack. Under P25 chunking a per-syscall timeout
+    // is progress-based: only true zero-byte stalls trip it. 0 disables.
+    let session = if limits.timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(limits.timeout_secs))
+    };
     stream
-        .set_read_timeout(None)
-        .map_err(|e| Error::ConnectionLost(format!("sc+http clear read_timeout: {e}")))?;
+        .set_read_timeout(session)
+        .map_err(|e| Error::ConnectionLost(format!("sc+http set session read_timeout: {e}")))?;
+    stream
+        .set_write_timeout(session)
+        .map_err(|e| Error::ConnectionLost(format!("sc+http set session write_timeout: {e}")))?;
 
     let read_only = server_read_only || token_read_only;
     crate::wire::serve_with_policy(
@@ -635,7 +721,8 @@ fn handle_http_connection(
         &mut stream,
         crate::wire::WirePolicy {
             read_only,
-            ..Default::default()
+            max_pack_size: limits.max_pack_size,
+            ro_drain_cap: crate::wire::RO_DRAIN_CAP,
         },
     )
 }
@@ -937,7 +1024,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            serve_http_listener(listener, &root, read_only, mandatory_auth).unwrap();
+            serve_http_listener(
+                listener,
+                &root,
+                read_only,
+                mandatory_auth,
+                ServeLimits::default(),
+            )
+            .unwrap();
         });
         port
     }
@@ -1096,7 +1190,7 @@ mod tests {
         // Non-loopback, no --read-only / --allow-public / tokens → refused,
         // and refused *before* any bind is attempted (port 0 would always
         // succeed to bind if we got that far).
-        let err = serve_http("0.0.0.0:0", &root, false, false).unwrap_err();
+        let err = serve_http("0.0.0.0:0", &root, false, false, ServeLimits::default()).unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(_)),
             "public bind refused: {err:?}"
@@ -1337,5 +1431,198 @@ mod tests {
         let mut buf = Vec::new();
         write_status(&mut buf, 503).unwrap();
         assert_eq!(read_status(&mut &buf[..]).unwrap(), 503);
+    }
+
+    // ── Task 4: connection slots + 503, session timeouts (socket-level). ──
+
+    fn tmp_served_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("scl-http-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".sc")).unwrap();
+        root
+    }
+
+    fn spawn_listener(root: &std::path::Path, limits: ServeLimits) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let root = root.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = serve_http_listener(listener, &root, false, false, limits);
+        });
+        addr
+    }
+
+    fn open_ok(addr: std::net::SocketAddr) -> TcpStream {
+        let mut s = TcpStream::connect(addr).unwrap();
+        write_client_opening(&mut s, "127.0.0.1", "/", None).unwrap();
+        assert_eq!(read_status(&mut s).unwrap(), 200);
+        s
+    }
+
+    #[test]
+    fn connection_limit_shed_and_recover() {
+        let root = tmp_served_root("slots");
+        let limits = ServeLimits {
+            max_connections: 1,
+            timeout_secs: 0,
+            ..Default::default()
+        };
+        let addr = spawn_listener(&root, limits);
+
+        let held = open_ok(addr); // occupies the single slot
+
+        // Second connection: shed with 503 before any opening is read.
+        let mut second = TcpStream::connect(addr).unwrap();
+        assert_eq!(read_status(&mut second).unwrap(), 503);
+
+        // Free the slot; a fresh connection now succeeds (poll: the server
+        // notices the disconnect on its next read).
+        drop(held);
+        let ok = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut s = match TcpStream::connect(addr) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            write_client_opening(&mut s, "127.0.0.1", "/", None).is_ok()
+                && read_status(&mut s).ok() == Some(200)
+        });
+        assert!(ok, "slot was never freed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn errored_connection_frees_its_slot() {
+        let root = tmp_served_root("errslot");
+        let limits = ServeLimits {
+            max_connections: 1,
+            timeout_secs: 0,
+            ..Default::default()
+        };
+        let addr = spawn_listener(&root, limits);
+
+        // A connection whose handler errors (garbage opening → 400) must free
+        // its slot via the guard, not leak it.
+        let mut bad = TcpStream::connect(addr).unwrap();
+        bad.write_all(b"garbage\r\n\r\n").unwrap();
+        let _ = read_status(&mut bad); // 400 (best-effort)
+        drop(bad);
+
+        let ok = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut s = match TcpStream::connect(addr) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            write_client_opening(&mut s, "127.0.0.1", "/", None).is_ok()
+                && read_status(&mut s).ok() == Some(200)
+        });
+        assert!(ok, "errored connection leaked its slot");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A client that stops READING mid-GetPack must be reaped by the write
+    /// timeout (today it parks the server thread in a blocking write forever).
+    /// Server sends a pack big enough to overflow socket buffers; the client
+    /// never reads; after the timeout the server closes.
+    #[test]
+    fn write_side_stall_is_reaped_by_timeout() {
+        let root = std::env::temp_dir().join(format!("scl-http-wstall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::repo::Repo::init(&root).unwrap();
+        // A few MiB of committed content, so GetPack has real bytes to send —
+        // enough (and high-entropy enough to resist the pack's zstd
+        // compression) to overflow socket send/receive buffers and force the
+        // server's write to actually block once the client stops reading.
+        // A forced newline every 8 bytes keeps every "line" well under the
+        // scanner's B64_MIN_RUN (20 chars), so this pseudo-random content
+        // never trips the P5 commit-time secret scan.
+        let mut big = Vec::with_capacity(4 * 1024 * 1024);
+        let mut state: u64 = 0x243F_6A88_85A3_08D3;
+        while big.len() < 4 * 1024 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            big.extend_from_slice(&state.to_le_bytes());
+            big.push(b'\n');
+        }
+        std::fs::write(root.join("big.bin"), &big).unwrap();
+        let repo = crate::repo::Repo::open(&root).unwrap();
+        let tip = repo.commit("t", "big file").unwrap();
+        drop(repo);
+
+        let limits = ServeLimits {
+            max_connections: 0,
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let addr = spawn_listener(&root, limits);
+
+        let mut s = open_ok(addr);
+        // Speak just enough wire protocol to trigger a GetPack, then stop
+        // reading: HELLO handshake, then a GetPack for the branch tip with
+        // empty haves.
+        crate::wire::write_frame(
+            &mut s,
+            &crate::wire::Request::Hello {
+                version: crate::wire::PROTOCOL_VERSION,
+            }
+            .encode(),
+        )
+        .unwrap();
+        // Read (and discard) the HELLO reply frame so the request stream
+        // stays in sync before the GetPack request.
+        let _ = crate::wire::read_frame(&mut s).unwrap();
+        crate::wire::write_frame(
+            &mut s,
+            &crate::wire::Request::GetPack {
+                wants: vec![tip],
+                haves: vec![],
+                filter: vec![],
+            }
+            .encode(),
+        )
+        .unwrap();
+        // After sending the GetPack request, sleep instead of reading —
+        // never drain the response, so the server's write eventually blocks.
+        std::thread::sleep(Duration::from_secs(5));
+        // The server must have dropped the connection rather than blocking
+        // forever: our next read eventually sees EOF or a reset.
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut sink = [0u8; 4096];
+        loop {
+            match s.read(&mut sink) {
+                Ok(0) | Err(_) => break, // EOF or reset — server gave up: pass
+                Ok(_) => continue,       // drain what was already buffered
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn silent_session_is_reaped_by_timeout() {
+        let root = tmp_served_root("reap");
+        let limits = ServeLimits {
+            max_connections: 0,
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let addr = spawn_listener(&root, limits);
+
+        let mut s = open_ok(addr); // handshake never sent; go silent
+        std::thread::sleep(Duration::from_secs(3));
+        // Server must have dropped us: the read sees EOF/reset, not a hang.
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 1];
+        match s.read(&mut buf) {
+            Ok(0) => {}  // clean EOF — dropped
+            Err(_) => {} // reset — also dropped
+            Ok(_) => panic!("server sent data to a silent client"),
+        }
+        // Spool dir is clean.
+        let tmp = root.join(".sc").join("tmp");
+        assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

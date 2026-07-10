@@ -3137,7 +3137,13 @@ fn run_serve(
             Ok(())
         }
         (false, Some(addr)) => {
-            scl_repo::http_transport::serve_http(&addr, &path, read_only, allow_public)?;
+            scl_repo::http_transport::serve_http(
+                &addr,
+                &path,
+                read_only,
+                allow_public,
+                scl_repo::http_transport::ServeLimits::default(),
+            )?;
             Ok(())
         }
         (true, Some(_)) => anyhow::bail!("sc serve accepts only one of --stdio or --http"),
