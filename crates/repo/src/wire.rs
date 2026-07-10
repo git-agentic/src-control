@@ -428,15 +428,27 @@ fn read_up_to(src: &mut (impl Read + ?Sized), buf: &mut [u8]) -> Result<usize> {
 /// Returns the total number of bytes streamed. Any frame that is neither a
 /// well-formed chunk nor the end marker — including EOF before `ST_PACK_END`
 /// — is `Err(Error::Protocol(_))`.
-pub fn read_pack_stream(r: &mut impl Read, sink: &mut (impl Write + ?Sized)) -> Result<u64> {
+///
+/// `max_bytes` bounds the total bytes written to `sink`: if `max_bytes != 0`
+/// and a chunk would exceed the budget, aborts with `Error::PackTooLarge`
+/// *before* writing the chunk. `max_bytes == 0` means unlimited.
+pub fn read_pack_stream(
+    r: &mut impl Read,
+    sink: &mut (impl Write + ?Sized),
+    max_bytes: u64,
+) -> Result<u64> {
     let mut total: u64 = 0;
     loop {
         let frame =
             read_frame_opt(r)?.ok_or_else(|| Error::Protocol("EOF before ST_PACK_END".into()))?;
         match frame.split_first() {
             Some((&ST_PACK_CHUNK, rest)) => {
+                let next = total + rest.len() as u64;
+                if max_bytes != 0 && next > max_bytes {
+                    return Err(Error::PackTooLarge(format!("{max_bytes} bytes")));
+                }
                 sink.write_all(rest)?;
-                total += rest.len() as u64;
+                total = next;
             }
             Some((&ST_PACK_END, [])) => return Ok(total),
             _ => return Err(Error::Protocol("unexpected frame in pack stream".into())),
@@ -801,7 +813,7 @@ fn spill_pack_stream(
 ) -> Result<crate::transport::TempPackGuard> {
     let guard = crate::transport::TempPackGuard::new(layout)?;
     let mut f = std::fs::File::create(guard.path())?;
-    read_pack_stream(r, &mut f)?;
+    read_pack_stream(r, &mut f, 0)?;
     Ok(guard)
 }
 
@@ -1160,7 +1172,7 @@ mod tests {
 
         let mut sink = Vec::new();
         let mut r = std::io::Cursor::new(buf);
-        let total = read_pack_stream(&mut r, &mut sink).unwrap();
+        let total = read_pack_stream(&mut r, &mut sink, 0).unwrap();
         assert_eq!(total, data.len() as u64);
         assert_eq!(sink, data);
     }
@@ -1174,7 +1186,7 @@ mod tests {
             let mut buf = Vec::new();
             write_pack_stream(&mut buf, &mut std::io::Cursor::new(&data), chunk_size).unwrap();
             let mut sink = Vec::new();
-            let total = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap();
+            let total = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink, 0).unwrap();
             assert_eq!(total, data.len() as u64);
             assert_eq!(sink, data, "mismatch for len={len}");
         }
@@ -1186,7 +1198,7 @@ mod tests {
         let mut buf = Vec::new();
         write_pack_stream(&mut buf, &mut std::io::Cursor::new(&data), 7).unwrap();
         let mut sink = Vec::new();
-        let total = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap();
+        let total = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink, 0).unwrap();
         assert_eq!(total, 0);
         assert!(sink.is_empty());
     }
@@ -1307,7 +1319,7 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &[ST_PACK_CHUNK, b'a', b'b']).unwrap();
         let mut sink = Vec::new();
-        let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap_err();
+        let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink, 0).unwrap_err();
         assert!(
             matches!(err, Error::Protocol(_)),
             "expected Protocol error, got {err:?}"
@@ -1318,10 +1330,37 @@ mod tests {
         write_frame(&mut buf, &[ST_PACK_CHUNK, b'a']).unwrap();
         write_frame(&mut buf, &[ST_OK]).unwrap(); // not a valid pack-stream marker
         let mut sink = Vec::new();
-        let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink).unwrap_err();
+        let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink, 0).unwrap_err();
         assert!(
             matches!(err, Error::Protocol(_)),
             "expected Protocol error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pack_stream_over_budget_aborts_typed() {
+        let payload = vec![7u8; 4096];
+        let mut buf = Vec::new();
+        write_pack_stream(&mut buf, &mut std::io::Cursor::new(&payload), 1024).unwrap();
+        let mut sink = Vec::new();
+        let err = read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink, 2048).unwrap_err();
+        assert!(matches!(err, Error::PackTooLarge(_)), "got {err:?}");
+        assert!(
+            sink.len() <= 2048,
+            "sink got over-budget bytes: {}",
+            sink.len()
+        );
+    }
+
+    #[test]
+    fn pack_stream_under_budget_passes() {
+        let payload = vec![7u8; 4096];
+        let mut buf = Vec::new();
+        write_pack_stream(&mut buf, &mut std::io::Cursor::new(&payload), 1024).unwrap();
+        let mut sink = Vec::new();
+        assert_eq!(
+            read_pack_stream(&mut std::io::Cursor::new(buf), &mut sink, 4096).unwrap(),
+            4096
         );
     }
 

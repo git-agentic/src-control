@@ -117,7 +117,7 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
         )?;
         let frame = wire::read_frame(&mut rw.0)?;
         wire::parse_response(frame)?; // Ok(empty body) means "stream follows"; Err propagates typed
-        wire::read_pack_stream(&mut rw.0, out)?;
+        wire::read_pack_stream(&mut rw.0, out, 0)?;
         Ok(())
     }
 
@@ -563,7 +563,7 @@ mod tests {
                     wire::Request::UpdateRef { .. } => return, // die without replying
                     wire::Request::PutPack => {
                         let mut buf = Vec::new();
-                        wire::read_pack_stream(&mut server_read, &mut buf).unwrap();
+                        wire::read_pack_stream(&mut server_read, &mut buf, 0).unwrap();
                         let ids = t.put_pack(&mut &buf[..]).unwrap();
                         wire::write_ok(&mut server_write, &wire::ids_body(&ids)).unwrap();
                     }
