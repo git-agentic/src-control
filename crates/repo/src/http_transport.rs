@@ -181,26 +181,38 @@ pub(crate) fn read_status(r: &mut impl Read) -> Result<u16> {
     Ok(code)
 }
 
-/// A parsed sc-native HTTP URL: `sc+http://host[:port]/repo/path`.
+/// A parsed sc-native HTTP URL: `sc+http://host[:port]/repo/path` or
+/// `sc+https://host[:port]/repo/path` (P32).
 ///
 /// Port defaults to [`DEFAULT_PORT`] when omitted. `path` is everything
 /// after the authority, leading `/` kept; an empty remainder becomes `/`.
+/// `tls` distinguishes the two schemes — it IS the TLS client decision (see
+/// [`HttpTransport::connect_with_pins`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScHttpUrl {
     pub host: String,
     pub port: u16,
     pub path: String,
+    pub tls: bool,
 }
 
 impl ScHttpUrl {
-    /// Parse an `sc+http://` URL; anything malformed is `InvalidArgument`
-    /// with a message naming the URL (mirrors `SshUrl::parse`'s style —
-    /// URL parsing fails before any connection exists, so `Protocol`'s
-    /// wire-protocol-error semantics don't apply here).
+    /// Parse an `sc+http://` or `sc+https://` URL; anything malformed is
+    /// `InvalidArgument` with a message naming the URL (mirrors
+    /// `SshUrl::parse`'s style — URL parsing fails before any connection
+    /// exists, so `Protocol`'s wire-protocol-error semantics don't apply
+    /// here). Plain `https://`/`http://` are GIT urls (P18), never
+    /// sc-native, and are rejected here.
     pub fn parse(url: &str) -> Result<ScHttpUrl> {
-        let rest = url
-            .strip_prefix("sc+http://")
-            .ok_or_else(|| Error::InvalidArgument(format!("not an sc+http:// url: {url}")))?;
+        let (rest, tls) = if let Some(r) = url.strip_prefix("sc+http://") {
+            (r, false)
+        } else if let Some(r) = url.strip_prefix("sc+https://") {
+            (r, true)
+        } else {
+            return Err(Error::InvalidArgument(format!(
+                "not an sc+http(s):// url: {url}"
+            )));
+        };
         let slash = rest.find('/').unwrap_or(rest.len());
         let (authority, path) = rest.split_at(slash);
         let (host, port) = match authority.split_once(':') {
@@ -238,6 +250,7 @@ impl ScHttpUrl {
             host: host.to_string(),
             port,
             path,
+            tls,
         })
     }
 
@@ -247,14 +260,66 @@ impl ScHttpUrl {
     }
 }
 
+/// Client-side maybe-TLS halves: the opening codec, status reads, and
+/// `WireClient` are all generic over Read/Write, so one enum layer at the
+/// seam keeps plaintext and TLS on the identical code path after connect —
+/// the same shape as the server's `SrvRead`/`SrvWrite` above.
+enum HttpReadHalf {
+    Plain(TcpStream),
+    Tls(scl_tlsio::TlsClientReadHalf),
+}
+enum HttpWriteHalf {
+    Plain(TcpStream),
+    Tls(scl_tlsio::TlsClientWriteHalf),
+}
+impl std::fmt::Debug for HttpReadHalf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpReadHalf::Plain(_) => f.write_str("HttpReadHalf::Plain"),
+            HttpReadHalf::Tls(_) => f.write_str("HttpReadHalf::Tls"),
+        }
+    }
+}
+impl std::fmt::Debug for HttpWriteHalf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpWriteHalf::Plain(_) => f.write_str("HttpWriteHalf::Plain"),
+            HttpWriteHalf::Tls(_) => f.write_str("HttpWriteHalf::Tls"),
+        }
+    }
+}
+impl Read for HttpReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            HttpReadHalf::Plain(s) => s.read(buf),
+            HttpReadHalf::Tls(r) => r.read(buf),
+        }
+    }
+}
+impl Write for HttpWriteHalf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            HttpWriteHalf::Plain(s) => s.write(buf),
+            HttpWriteHalf::Tls(w) => w.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            HttpWriteHalf::Plain(s) => s.flush(),
+            HttpWriteHalf::Tls(w) => w.flush(),
+        }
+    }
+}
+
 /// A [`Transport`] that speaks the wire protocol over a `TcpStream`
-/// established via the HTTP opening: connect, write the client opening line,
-/// read+map the status BEFORE any wire-protocol byte crosses the socket,
-/// then hand the (split) stream to the same [`WireClient`] `StdioTransport`
-/// uses over a child process's stdio.
+/// established via the HTTP opening: connect (through a TLS handshake first
+/// when `url.tls`), write the client opening line, read+map the status
+/// BEFORE any wire-protocol byte crosses the socket, then hand the (split)
+/// stream to the same [`WireClient`] `StdioTransport` uses over a child
+/// process's stdio.
 #[derive(Debug)]
 pub struct HttpTransport {
-    client: WireClient<BufReader<TcpStream>, TcpStream>,
+    client: WireClient<BufReader<HttpReadHalf>, HttpWriteHalf>,
 }
 
 impl HttpTransport {
@@ -275,8 +340,32 @@ impl HttpTransport {
     /// reads the token from `SC_HTTP_TOKEN`; this split keeps the env read
     /// out of the socket logic and testable without mutating process env
     /// (`std::env::set_var` is process-global and racy under parallel
-    /// tests).
+    /// tests). For a `sc+https://` url, the TLS pin policy is resolved from
+    /// env (`SC_HTTPS_KNOWN_HOSTS`/`SC_HTTPS_FINGERPRINT`/`SC_HTTPS_STRICT`)
+    /// and delegated to [`Self::connect_with_pins`], the testable,
+    /// env-free core.
     pub fn connect_with_token(url: &ScHttpUrl, token: Option<&str>) -> Result<HttpTransport> {
+        let policy = if url.tls {
+            Some(crate::tls_pins::TlsClientPolicy::from_env()?)
+        } else {
+            None
+        };
+        Self::connect_with_pins(url, token, policy.as_ref())
+    }
+
+    /// The testable core: env-free. `policy` must be `Some` iff `url.tls` —
+    /// the pin policy IS the TLS client decision.
+    ///
+    /// CRITICAL ordering property: for a TLS connect, no application byte —
+    /// the opening line, the bearer token — may be written before the pin
+    /// disposition is settled. `scl_tlsio::client_connect` completes the
+    /// full handshake (and pin check) before returning, so the opening write
+    /// below always happens strictly after that decision, never before.
+    pub fn connect_with_pins(
+        url: &ScHttpUrl,
+        token: Option<&str>,
+        policy: Option<&crate::tls_pins::TlsClientPolicy>,
+    ) -> Result<HttpTransport> {
         if let Some(t) = token {
             if t.contains(['\r', '\n']) {
                 return Err(Error::InvalidArgument(
@@ -285,28 +374,90 @@ impl HttpTransport {
             }
         }
 
-        let mut stream = TcpStream::connect(url.authority())
+        let stream = TcpStream::connect(url.authority())
             .map_err(|e| Error::ConnectionLost(format!("sc+http connect to {url:?}: {e}")))?;
-        write_client_opening(&mut stream, &url.host, &url.path, token)?;
 
-        // Split the stream into independent read/write halves up front —
-        // `try_clone` duplicates the socket handle (both `r` and `w` refer
-        // to the same TCP connection, matching StdioTransport's separate
-        // ChildStdout/ChildStdin), mirroring the read-half construction the
-        // brief specifies. The status line is read through this SAME
-        // `BufReader` that goes on to become the WireClient's `r`, not a
-        // throwaway clone: `BufReader::read` can pull more than one byte
-        // from the kernel into its internal buffer per call, so a separate,
-        // later-dropped reader could silently swallow the first
-        // wire-protocol frame byte(s) if the server ever raced ahead of the
-        // status line. Reusing one buffer means anything it over-reads stays
-        // available for the handshake that follows.
-        let mut r = BufReader::new(
-            stream
-                .try_clone()
-                .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?,
-        );
-        let w = stream;
+        let (mut r, mut w) = match (url.tls, policy) {
+            (false, _) => {
+                // Split the stream into independent read/write halves up
+                // front — `try_clone` duplicates the socket handle (both `r`
+                // and `w` refer to the same TCP connection, matching
+                // StdioTransport's separate ChildStdout/ChildStdin). The
+                // status line is read through this SAME `BufReader` that
+                // goes on to become the WireClient's `r`, not a throwaway
+                // clone: `BufReader::read` can pull more than one byte from
+                // the kernel into its internal buffer per call, so a
+                // separate, later-dropped reader could silently swallow the
+                // first wire-protocol frame byte(s) if the server ever raced
+                // ahead of the status line. Reusing one buffer means
+                // anything it over-reads stays available for the handshake
+                // that follows.
+                let rd = stream
+                    .try_clone()
+                    .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?;
+                (
+                    BufReader::new(HttpReadHalf::Plain(rd)),
+                    HttpWriteHalf::Plain(stream),
+                )
+            }
+            (true, Some(p)) => {
+                let expected = match p.pre_pin {
+                    Some(pin) => Some(pin),
+                    None => crate::tls_pins::lookup(&p.known_hosts, &url.host, url.port)?,
+                };
+                let known_before = expected.is_some();
+                let pin_source = if p.pre_pin.is_some() {
+                    "SC_HTTPS_FINGERPRINT".to_string()
+                } else {
+                    p.known_hosts.display().to_string()
+                };
+                match scl_tlsio::client_connect(stream, &url.host, expected, p.strict) {
+                    Ok((tls_stream, seen)) => {
+                        if !known_before {
+                            // Accept-new TOFU: pin silently, ANNOUNCE loudly.
+                            crate::tls_pins::record(&p.known_hosts, &url.host, url.port, &seen)?;
+                            eprintln!(
+                                "sc+https: first connection to {}:{} — pinned {}",
+                                url.host,
+                                url.port,
+                                scl_tlsio::fingerprint_hex(&seen)
+                            );
+                            eprintln!(
+                                "sc+https: verify against `sc serve fingerprint` on the \
+                                 server; stored in {}",
+                                p.known_hosts.display()
+                            );
+                        }
+                        let (rh, wh) = tls_stream.split();
+                        (
+                            BufReader::new(HttpReadHalf::Tls(rh)),
+                            HttpWriteHalf::Tls(wh),
+                        )
+                    }
+                    Err(scl_tlsio::Error::PinMismatch { expected, seen }) => {
+                        return Err(Error::TlsPinMismatch {
+                            host: url.authority(),
+                            file: pin_source,
+                            pinned: scl_tlsio::fingerprint_hex(&expected),
+                            seen: scl_tlsio::fingerprint_hex(&seen),
+                        })
+                    }
+                    Err(scl_tlsio::Error::UnknownHostStrict) => {
+                        return Err(Error::TlsStrictUnknownHost(url.authority()))
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            (true, None) => {
+                return Err(Error::InvalidArgument(
+                    "internal: sc+https connect without a pin policy".to_string(),
+                ))
+            }
+        };
+
+        write_client_opening(&mut w, &url.host, &url.path, token)?;
+        w.flush()
+            .map_err(|e| Error::ConnectionLost(format!("sc+http opening flush: {e}")))?;
 
         // Status mapping happens BEFORE the wire-protocol handshake: 200
         // proceeds, 401 means the server rejected the bearer (or required
@@ -1536,6 +1687,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port,
             path: "/repo".to_string(),
+            tls: false,
         };
 
         // A valid rw token is accepted and the wire protocol proceeds.
@@ -1848,6 +2000,153 @@ mod tests {
         assert!(root.join(".sc").join("serve-tls").join("key.pem").exists());
         let f2 = serve_tls_fingerprint(&root).unwrap();
         assert_eq!(f1, f2, "fingerprint must load, not re-mint");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ── Task 5: client seam — sc+https:// URLs, TOFU connect flow. ──
+
+    #[test]
+    fn parse_sc_https_sets_tls() {
+        let u = ScHttpUrl::parse("sc+https://example.com:9443/srv/repo").unwrap();
+        assert!(u.tls);
+        assert_eq!(
+            (u.host.as_str(), u.port, u.path.as_str()),
+            ("example.com", 9443, "/srv/repo")
+        );
+        let u = ScHttpUrl::parse("sc+https://host/repo").unwrap();
+        assert_eq!(u.port, DEFAULT_PORT);
+        let u = ScHttpUrl::parse("sc+http://host/repo").unwrap();
+        assert!(!u.tls);
+        // Plain https:// is a GIT url (P18), never sc-native.
+        assert!(ScHttpUrl::parse("https://host/repo").is_err());
+    }
+
+    /// The full client TOFU lifecycle against a real TLS listener:
+    /// first connect pins, second is quiet, a swapped key hard-fails,
+    /// pre-pin never persists, strict refuses unknown.
+    #[test]
+    fn tofu_lifecycle_end_to_end() {
+        let root = tmp_repo("tofu-e2e");
+        let (addr, spki) = spawn_tls_server(&root);
+        let (host, port) = addr
+            .rsplit_once(':')
+            .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap()))
+            .unwrap();
+        let url = ScHttpUrl {
+            host: host.clone(),
+            port,
+            path: "/".into(),
+            tls: true,
+        };
+
+        let pins_dir = std::env::temp_dir().join(format!("scl-tofu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let kh = pins_dir.join("known_hosts");
+        let policy = crate::tls_pins::TlsClientPolicy {
+            known_hosts: kh.clone(),
+            pre_pin: None,
+            strict: false,
+        };
+
+        // 1. Unknown host, accept-new: connects AND records the pin.
+        HttpTransport::connect_with_pins(&url, None, Some(&policy)).unwrap();
+        assert_eq!(
+            crate::tls_pins::lookup(&kh, &host, port).unwrap(),
+            Some(spki)
+        );
+
+        // 2. Second connect: pin already known, still connects.
+        HttpTransport::connect_with_pins(&url, None, Some(&policy)).unwrap();
+
+        // 3. Strict mode with a pin present: fine. Strict against an UNKNOWN
+        //    host (fresh pin file): refused with the typed error.
+        let strict_known = crate::tls_pins::TlsClientPolicy {
+            known_hosts: kh.clone(),
+            pre_pin: None,
+            strict: true,
+        };
+        HttpTransport::connect_with_pins(&url, None, Some(&strict_known)).unwrap();
+        let fresh = pins_dir.join("fresh_kh");
+        let strict_unknown = crate::tls_pins::TlsClientPolicy {
+            known_hosts: fresh.clone(),
+            pre_pin: None,
+            strict: true,
+        };
+        match HttpTransport::connect_with_pins(&url, None, Some(&strict_unknown)) {
+            Err(Error::TlsStrictUnknownHost(_)) => {}
+            other => panic!("expected TlsStrictUnknownHost, got {other:?}"),
+        }
+        assert!(!fresh.exists(), "strict refusal must not write a pin");
+
+        // 4. Pre-pin (SC_HTTPS_FINGERPRINT semantics): connects, never persists.
+        let prepin_file = pins_dir.join("prepin_kh");
+        let prepin = crate::tls_pins::TlsClientPolicy {
+            known_hosts: prepin_file.clone(),
+            pre_pin: Some(spki),
+            strict: true,
+        };
+        HttpTransport::connect_with_pins(&url, None, Some(&prepin)).unwrap();
+        assert!(!prepin_file.exists(), "pre-pin must not persist");
+
+        // 5. A WRONG stored pin hard-fails with recovery context.
+        let bad = pins_dir.join("bad_kh");
+        crate::tls_pins::record(&bad, &host, port, &[0x24u8; 32]).unwrap();
+        let badpol = crate::tls_pins::TlsClientPolicy {
+            known_hosts: bad.clone(),
+            pre_pin: None,
+            strict: false,
+        };
+        match HttpTransport::connect_with_pins(&url, None, Some(&badpol)) {
+            Err(Error::TlsPinMismatch {
+                host: h,
+                file,
+                pinned,
+                seen,
+            }) => {
+                assert!(h.contains(&host));
+                assert!(file.contains("bad_kh"));
+                assert!(pinned.starts_with("sha256:") && seen.starts_with("sha256:"));
+                assert_eq!(seen, scl_tlsio::fingerprint_hex(&spki));
+            }
+            other => panic!("expected TlsPinMismatch, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&pins_dir).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Transport verbs work over TLS end to end (list_refs against the real
+    /// server — the full clone/push/fetch acceptance rides the CLI test in
+    /// Task 7).
+    #[test]
+    fn transport_verbs_over_tls() {
+        let root = tmp_repo("tls-verbs");
+        let (addr, spki) = spawn_tls_server(&root);
+        let (host, port) = addr
+            .rsplit_once(':')
+            .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap()))
+            .unwrap();
+        let url = ScHttpUrl {
+            host,
+            port,
+            path: "/".into(),
+            tls: true,
+        };
+        let policy = crate::tls_pins::TlsClientPolicy {
+            known_hosts: std::env::temp_dir()
+                .join(format!("scl-verbs-kh-{}", std::process::id())),
+            pre_pin: Some(spki),
+            strict: false,
+        };
+        let t = HttpTransport::connect_with_pins(&url, None, Some(&policy)).unwrap();
+        // A fresh `tmp_repo` has no commits, so `list_refs()` is legitimately
+        // empty (no branch file has been written yet) — assert on
+        // `head_branch()` instead, which mirrors what the plaintext
+        // `no_tokens_configured_no_auth_required` test above exercises right
+        // after connect (a successful call, unborn branch and all).
+        t.list_refs().unwrap();
+        assert_eq!(t.head_branch().unwrap(), "main");
+        let _ = std::fs::remove_file(&policy.known_hosts);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
