@@ -37,17 +37,21 @@ crates/core   → content-addressed store, object model, budget + eviction
 crates/vfs    → in-memory worktree engine (depends on core)
 crates/gitio  → Git import via gix (depends on core; ONLY crate that links gix)
 crates/crypto → envelope encryption (depends on core; ONLY crate linking RustCrypto)
-crates/repo   → persistent .sc/ repo: objects, refs, branches, working tree (depends on core/vfs/crypto)
+crates/tlsio  → TLS for sc+https (depends on nothing; ONLY crate linking rustls/rcgen)
+crates/repo   → persistent .sc/ repo: objects, refs, branches, working tree (depends on core/vfs/crypto/tlsio)
 crates/cli    → `sc` binary (depends on repo + vfs + gitio + crypto + core)
 ```
 
-Strict dependency direction: `cli → repo → {vfs, gitio, crypto} → core`.
+Strict dependency direction: `cli → repo → {vfs, gitio, crypto, tlsio} → core`
+(`tlsio` is a leaf — it depends on no other workspace crate, not even `core`).
 **`core` must never depend on Git, worktrees, or crypto.** **`gix` must stay
 quarantined in `gitio`** — if you find yourself reaching for `gix` elsewhere,
 add a function to `gitio` instead. **RustCrypto must stay quarantined in
 `crypto`** — if you find yourself reaching for it elsewhere, add a function to
-`crypto` instead. **`repo` must not depend on `gitio`** — `cli` links both and
-passes imported snapshots down; `repo` stays Git-agnostic.
+`crypto` instead. **rustls/rcgen must stay quarantined in `tlsio`** — if you
+find yourself reaching for TLS elsewhere, add a function to `tlsio` instead.
+**`repo` must not depend on `gitio`** — `cli` links both and passes imported
+snapshots down; `repo` stays Git-agnostic.
 
 ## Core invariants (do not break)
 
@@ -346,6 +350,26 @@ bash demo/run_http_auth_demo.sh               # sc+http access-control proof (P2
                                               # ro-token clone sees it, an unjustified 0.0.0.0
                                               # bind is refused while --allow-public opens it
                                               # deliberately, zero .sc/tmp residue anywhere
+cargo run --bin sc -- serve --http <addr> <path> --tls [--tls-cert <pem> --tls-key <pem>]
+                                              # TLS listener (P32): sc+https://; auto-mints a
+                                              # self-signed identity into .sc/serve-tls/ (key
+                                              # 0600, key-is-identity) unless PEM given; banner
+                                              # prints the SPKI fingerprint; NB gate change:
+                                              # tokens justify a non-loopback bind ONLY with
+                                              # --tls now — plaintext public needs
+                                              # --allow-public (or --read-only)
+cargo run --bin sc -- serve fingerprint [<path>]   # print (minting if absent) the serve-TLS
+                                              # SPKI fingerprint (sha256:<hex>)
+cargo run --bin sc -- clone sc+https://host[:port]/repo <dst>   # TLS clone (P32); accept-new
+                                              # TOFU: first connect pins into
+                                              # ~/.config/sc/known_hosts (SC_HTTPS_KNOWN_HOSTS
+                                              # overrides), mismatch always hard-fails;
+                                              # SC_HTTPS_FINGERPRINT=<sha256:hex> pre-pins (CI),
+                                              # SC_HTTPS_STRICT=1 refuses unknown hosts;
+                                              # remote add/fetch/push accept the same URL form
+bash demo/run_tls_demo.sh                     # sc+https proof (P32): TLS round trip w/ signed
+                                              # chunked blob, TOFU pin/mismatch/strict/pre-pin,
+                                              # tightened plaintext gate — run twice
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -1003,8 +1027,9 @@ tree/`sc log` byte-for-byte identical to the origin, `sc verify --require`
 clean in the clone, a push from a second clone lands and a third clone's
 fetch sees it, zero `.sc/tmp` residue on either end — run twice.
 **Standing boundaries, stated plainly (same class as the ssh transport,
-plus one new one):** plaintext only, **no TLS** (`sc+https://` deferred to
-a TLS-dep phase or a fronting reverse proxy); **no authentication** (`sc
+plus one new one):** plaintext only, **no TLS at the time — closed by P32
+(ADR-0042)**, which adds `sc+https://` in-binary rather than requiring a
+fronting reverse proxy; **no authentication** (`sc
 serve --http` is unauthenticated, as `--stdio` delegates auth to ssh —
 production auth + TLS means fronting with a reverse proxy; this is the
 reach primitive, not a hosted-git competitor); **not HTTP-proxy/CDN safe**
@@ -1193,13 +1218,16 @@ connection into `wire::serve_with_policy`, which rejects
 `PutObject`/`PutPack`/`UpdateRef` before any store write via a new
 `EC_READONLY`. A review fix closed a fail-open: a non-loopback bind
 justified only by tokens now fails closed (`401`, not an open server) if its
-last token is removed while running. **Accepted boundaries:** no TLS — a
-bearer token crosses the wire in plaintext, so a public deployment must
-front with a TLS reverse proxy (`sc+https://` deferred); loopback with no
-tokens configured stays unauthenticated by design, for local-dev ergonomics.
-Wire-unchanged but for `EC_READONLY`; `PROTOCOL_VERSION` stays 3; ssh
-`--stdio` is untouched. Proven by `demo/run_http_auth_demo.sh`. See
-ADR-0040.
+last token is removed while running. **Accepted boundaries at the time —
+closed by P32 (ADR-0042):** no TLS — a bearer token crossed the wire in
+plaintext, so a public deployment had to front with a TLS reverse proxy
+(`sc+https://` deferred); loopback with no tokens configured stays
+unauthenticated by design, for local-dev ergonomics, unchanged by P32. **Note
+also:** P32 narrows this phase's non-loopback bind gate — tokens alone no
+longer justify a *plaintext* public bind; a non-loopback bind now needs
+`--read-only`, `--allow-public`, or (`--tls` AND ≥1 token). Wire-unchanged but
+for `EC_READONLY`; `PROTOCOL_VERSION` stays 3; ssh `--stdio` is untouched.
+Proven by `demo/run_http_auth_demo.sh`. See ADR-0040.
 
 **Phase 30 is built.** Agent session transcripts: a sealed provenance
 record for an agent's session can now attach to a commit. `Transcript {
@@ -1291,6 +1319,59 @@ and accept-backoff pacing are unit-test-proven rather than demo-proven,
 since forcing a real stalled socket or fd exhaustion reliably in a demo
 script is impractical. See ADR-0041.
 
+**Phase 32 is built.** In-binary TLS: `sc+https://` closes ADR-0036's "no
+TLS" boundary and the audit's High #1 (plaintext bearer tokens/traffic). A
+new leaf crate, `crates/tlsio` (`scl-tlsio`), is the only crate linking
+rustls (0.23, `default-features = false`, features `ring, std, tls12,
+logging` — ~14 new crates, C compiler only, no cmake), rcgen, and `ring`
+(digest only, for the SPKI fingerprint — the RustCrypto quarantine in
+`crates/crypto` is untouched); `repo` is its sole consumer, extending the
+dependency rule to `cli → repo → {vfs, gitio, crypto, tlsio} → core`. Two
+seam functions grow a TLS wrap and nothing else changes: client
+`HttpTransport::connect` wraps the `TcpStream` before `write_client_opening`
+when the URL is `sc+https://`; server `handle_http_connection` wraps before
+`read_client_opening` when `--tls` is set — the opening codec, `wire.rs`, and
+`serve_tokens.rs` are byte-for-byte unchanged, `PROTOCOL_VERSION` stays 3.
+Trust model is accept-new TOFU, the SSH `known_hosts` shape: the pin is
+`SHA-256(SPKI DER)`, stored one `host:port sha256:<hex>` line per host in
+`~/.config/sc/known_hosts` (`SC_HTTPS_KNOWN_HOSTS` overrides the path);
+`SC_HTTPS_FINGERPRINT` pre-pins without persisting (CI); `SC_HTTPS_STRICT=1`
+refuses an unknown host outright. Pinning is deliberately pin-only in v1 —
+certificate names/validity are ignored — but the handshake signature is
+still verified, so a captured cert replayed without its private key is
+rejected even against a matching pin; a pin mismatch always hard-fails, never
+prompts. Server: `--tls` (refused together with `--stdio`) auto-mints a
+self-signed identity into `.sc/serve-tls/` (`cert.pem`/`key.pem`, key file
+`0600` — the key IS the server's identity — regenerated only if missing,
+`not_after` 2126) unless `--tls-cert`/`--tls-key` PEM is supplied; the
+startup banner's second line and `sc serve fingerprint [<path>]` (mints if
+missing) print the SPKI fingerprint an operator distributes out-of-band
+before a client's first connect. **Gate change (breaking, decision 5 of
+#39):** a non-loopback bind is now allowed iff `--read-only` OR
+`--allow-public` OR (`--tls` AND ≥1 configured token) — P29's "tokens alone
+justify a public bind" is narrowed, since a token protecting only a
+plaintext channel was never the guarantee its wording implied; the refusal
+message names `--tls` as the fix. **Deliberate spec deviation (plan-approved,
+recorded in ADR-0042):** under TLS, the `--max-connections` busy-shed at the
+connection cap closes the socket silently instead of writing a readable
+`503` — a readable status would need a TLS handshake on the accept thread,
+which would violate ADR-0041's accepts-never-block property; plaintext
+connections keep the readable `503` unchanged. Provider choice: ring over
+the rustls-default aws-lc-rs (18 crates + cmake vs. 14 crates + C-compiler-
+only), aws-lc-rs recorded as the swap-in fallback; pure-Rust providers
+(`graviola`, `rustls-rustcrypto`) rejected as immature; ACME rejected
+outright (`rustls-acme`'s async stack is the wrong shape for this project's
+blocking design). Zero wire-protocol changes; the four `WirePolicy`/
+`ServeLimits` bounds from P31 apply unchanged under TLS (set on the inner
+`TcpStream`, below the TLS wrap). Proven by `demo/run_tls_demo.sh`: a TLS
+round trip carrying a signed chunked blob byte-for-byte, the TOFU
+pin/mismatch/strict/pre-pin lifecycle, and the tightened plaintext gate — run
+twice, zero residue. **Accepted boundaries:** pin-only trust means no
+CA-path validation option yet (deferred, additive for PEM deployments); the
+first connection to any host is unverified by construction (the TOFU trade,
+same as SSH's first connect); a loopback bind with no tokens configured
+stays unauthenticated by design, unchanged from P29. See ADR-0042.
+
 Remaining follow-ons: operation objects in the CAS, oplog entries for
 remote-tracking refs, extending the sparse gate to
 `materialize_conflict_state`'s `to_encrypt`/sidecar write loops (see the
@@ -1322,7 +1403,14 @@ DAG rather than only the first-parent mainline; a
 `transcripts_ride_ssh_transport` wire-harness test twin; and the
 now-stale `SignatureObj.snapshot` doc comment, which still describes the
 field as always a snapshot id though signing a transcript stores a
-transcript id there instead).
+transcript id there instead), and the P32 items — CA-path validation as an
+additive trust option alongside pin-only for PEM-provisioned deployments,
+opt-in SNI/certificate-name validation (v1 is pin-only and ignores names),
+pin-management UX (`sc tls` list/remove entries in
+`~/.config/sc/known_hosts` — today only `sc serve fingerprint` prints and
+first-connect/`SC_HTTPS_FINGERPRINT` write), and TLS session-resumption
+knobs (not evaluated in this phase; a later throughput pass if repeated
+short-lived connections to the same host prove handshake cost material).
 
 ## Agent skills
 

@@ -101,20 +101,81 @@ too, not just the src-control-side metadata.
   scanner warns at attach time but never blocks; rotation of the underlying secret
   remedies).
 
-## Network transport (`sc serve --http` / `sc+http://`) — ADR-0036/0040/0041
+## Network transport (`sc serve --http` / `sc+http(s)://` / `ssh://`) — ADR-0022/0036/0040/0041/0042
 
-- **No TLS.** `sc serve --http` is **plaintext**. When bearer-token auth is
-  configured, the token crosses the wire in the clear — a public deployment MUST
-  be fronted by a TLS reverse proxy. `sc+https://` is deferred.
-- **Auth is opt-in.** With no tokens configured, a loopback bind is unauthenticated
-  by design (local-dev ergonomics); a non-loopback bind is **fail-closed** (refused
-  unless `--read-only`, `--allow-public`, or ≥1 configured token). `--allow-public`
-  with no tokens is a sanctioned foot-gun: a deliberately open server.
-- **Minor pre-auth information leak:** a `404` (no repo) is written before the auth
-  gate, so an unauthenticated client can distinguish "a repo is served here" (`401`)
-  from "no repo" (`404`). No content is exposed.
-- **Not proxy/CDN-safe** (raw post-opening protocol) — this remains open, deferred
-  in [`ROADMAP.md`](../ROADMAP.md).
+- **Two confidential transports now ship: `sc+https://` (P32, ADR-0042) and
+  `ssh://` (P12, ADR-0022).** `ssh://` has been fully confidential since
+  Phase 12 — it delegates the entire channel to the user's `ssh`, inheriting
+  whatever SSH's own transport security and host-key trust already provide;
+  it was never plaintext and needed no separate TLS story. `sc+https://` adds
+  the same property for operators without ssh reach: a bearer token (P29) and
+  all repository traffic are encrypted end to end, at both the server and the
+  client leg, with no reverse proxy required.
+- **`sc+https://` trust model is accept-new TOFU, stated plainly (the SSH
+  `known_hosts` trade).** The server auto-mints a self-signed identity
+  (`.sc/serve-tls/`) or loads an operator-supplied PEM cert; the client pins
+  `SHA-256(SPKI)` on first connect into `~/.config/sc/known_hosts`
+  (`SC_HTTPS_KNOWN_HOSTS` overrides the path). **The first connection to any
+  host is unverified by construction** — an active MITM present on that
+  specific first connection is not detected. Every subsequent connection
+  compares against the stored pin and hard-fails on any mismatch, never
+  silently proceeding and never prompting to accept a changed key.
+  `SC_HTTPS_FINGERPRINT` lets an operator (e.g. CI) pre-pin out-of-band
+  instead of trusting the first connection; `SC_HTTPS_STRICT=1` refuses to
+  connect to any host with no existing pin, closing the accept-new window
+  entirely for operators who need it. Trust is **pin-only in v1** —
+  certificate names and validity periods are deliberately ignored, and
+  CA-path validation as an additional trust option is deferred (see
+  `ROADMAP.md`). The TLS handshake signature is still verified even though
+  names/validity are not, so a captured certificate replayed without its
+  matching private key is rejected regardless of pin state.
+- **`sc+http://` (plaintext) still exists, and its boundary is now narrower
+  and clearer: it applies only to loopback or explicitly `--allow-public`
+  deployments.** A public (non-loopback) plaintext deployment protected by
+  bearer tokens *alone* is no longer a supported configuration — as of P32,
+  `--tls` is required alongside ≥1 token to justify a non-loopback bind (the
+  P29 gate is narrowed; a token guarding only a plaintext channel was always
+  a weaker guarantee than the earlier wording implied). A loopback bind with
+  no tokens configured stays unauthenticated by design (local-dev
+  ergonomics, unchanged since P29); `--allow-public` with no tokens is still
+  a sanctioned foot-gun — a deliberately open, unauthenticated, plaintext
+  server, for the operator who explicitly asked for it.
+- **Reverse-proxy guidance, corrected to cover both legs.** Prior guidance
+  ("front with a TLS reverse proxy") was incomplete: a server-side proxy
+  terminates TLS toward clients that speak TLS, but before P32 the `sc`
+  client itself spoke only plaintext TCP, so a server-side proxy alone
+  encrypted nothing end-to-end. Now that `sc+https://` and `ssh://` both
+  exist, the reverse-proxy path is a **fallback for operators who want their
+  existing proxy infrastructure in front of `sc`**, not the primary
+  confidentiality answer. If used, both legs need care:
+  - **Server side — raw-TCP/stream-mode TLS termination, never HTTP mode.**
+    The post-opening protocol is not HTTP, so an HTTP-mode reverse proxy will
+    not tunnel it. Use nginx `stream {}` + `ngx_stream_ssl_module` (note:
+    neither the `stream` block nor its ssl module is built into a default
+    nginx — check `nginx -V`; and `ssl_preread` is routing-only, it does
+    **not** terminate TLS), or HAProxy `mode tcp` with `bind :<port> ssl crt
+    <pem>`, or stunnel's server mode (`accept`/`connect`/`cert`). Forward
+    decrypted bytes to a **loopback-bound** `sc serve --http 127.0.0.1:…`
+    and keep bearer tokens configured — the proxy→`sc serve` hop is
+    plaintext loopback, and the token is still the authorization mechanism
+    on that hop.
+  - **Client side — the leg the old guidance omitted.** The unmodified `sc`
+    client cannot itself speak TLS to a plaintext `sc+http://` remote it
+    thinks it's talking to over an encrypted channel; a client-side tunnel
+    (stunnel's client mode, `client = yes`, or `ssh -L`) is required to give
+    that plaintext client an encrypted leg to the proxy. **Simplest fix:
+    skip both legs of this section entirely and use `sc+https://` or
+    `ssh://` directly** — they exist now specifically so this two-legged
+    proxy dance is no longer the only option.
+  - See `docs/research/tls-options-sc-http.md` §B for the full comparison
+    (nginx/HAProxy/stunnel capabilities, Caddy's non-bundled layer-4 caveat)
+    that this guidance is drawn from.
+- **Minor pre-auth information leak (both `sc+http://` and `sc+https://`):**
+  a `404` (no repo) is written before the auth gate, so an unauthenticated
+  client can distinguish "a repo is served here" (`401`) from "no repo"
+  (`404`). No content is exposed.
+- **Not proxy/CDN-safe** (raw post-opening protocol, both plaintext and TLS
+  variants) — this remains open, deferred in [`ROADMAP.md`](../ROADMAP.md).
 - **Listener resource bounds — closed by P31 (ADR-0041).** The three operational-
   hardening items this section used to track as open are now closed, plus a
   fourth gap P31's own research pass first named:

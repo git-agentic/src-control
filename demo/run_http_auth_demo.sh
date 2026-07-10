@@ -11,6 +11,15 @@
 # a valid `Authorization: Bearer` is required on every connection, loopback
 # included; an `ro`-scope token floors the connection read-only.
 #
+# P32 (ADR-0042) note: the non-loopback bind gate this demo exercises in
+# step 8 was narrowed by the in-binary-TLS phase. Before P32, a configured
+# token alone justified a plaintext non-loopback bind; as of P32 that combo
+# is refused (the error names --tls as the fix) — a non-loopback bind now
+# needs --read-only, --allow-public, or (--tls AND >=1 token). Step 9 below
+# proves both halves of that change: the now-refused token-only plaintext
+# case, and the --tls+token case that replaces it. The fuller TLS round trip
+# (TOFU pinning, mismatch, strict mode) lives in demo/run_tls_demo.sh.
+#
 # Self-checking: every claim is an assertion; any failure exits non-zero
 # before the RESULT line.
 set -euo pipefail
@@ -26,9 +35,10 @@ A="$W/A"
 A2="$W/A2"
 SERVER_PID=""
 SERVER2_PID=""
+SERVER3_PID=""
 
 cleanup() {
-  for pid in "$SERVER_PID" "$SERVER2_PID"; do
+  for pid in "$SERVER_PID" "$SERVER2_PID" "$SERVER3_PID"; do
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -38,12 +48,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Pick two distinct free ports; probe with `nc -z` first. ---
+# --- Pick distinct free ports; probe with `nc -z` first. ---
 pick_port() {
-  local exclude="$1"
   local candidate
-  for candidate in 8741 8742 8743 8901 18741 18742; do
-    [ "$candidate" = "$exclude" ] && continue
+  for candidate in 8741 8742 8743 8901 18741 18742 18743; do
+    local skip=""
+    for exclude in "$@"; do
+      [ "$candidate" = "$exclude" ] && skip=1
+    done
+    [ -n "$skip" ] && continue
     if ! nc -z 127.0.0.1 "$candidate" 2>/dev/null; then
       echo "$candidate"
       return 0
@@ -51,8 +64,9 @@ pick_port() {
   done
   fail "no free port found among the candidates"
 }
-PORT="$(pick_port '')"
+PORT="$(pick_port)"
 PORT2="$(pick_port "$PORT")"
+PORT3="$(pick_port "$PORT" "$PORT2")"
 
 wait_for_port() {
   local port="$1" tries=0
@@ -178,8 +192,36 @@ echo "server: stopped ✔"
 check_no_tmp_residue "$A2" "origin A2"
 
 echo
+echo "=== 9: P32 gate (ADR-0042) — tokens alone no longer justify a plaintext"
+echo "        public bind; --tls + a token does ==="
+cd "$A2"
+"$SC" serve token add --label a2-writer --scope rw >/dev/null 2>&1
+cd "$W"
+
+if "$SC" serve --http "0.0.0.0:$PORT3" "$A2" 2>"$W/err-tokenonly.txt"; then
+  fail "plaintext non-loopback bind justified by a token alone should now be refused (P32)"
+fi
+grep -qi -- "--tls" "$W/err-tokenonly.txt" \
+  || fail "the P32 refusal must name --tls as the fix, got: $(cat "$W/err-tokenonly.txt")"
+echo "public bind (0.0.0.0, token configured, no --tls): refused, error names --tls ✔"
+
+"$SC" serve --http "0.0.0.0:$PORT3" --tls "$A2" &
+SERVER3_PID=$!
+wait_for_port "$PORT3"
+echo "public bind (0.0.0.0, token configured, --tls): accepted ✔"
+kill "$SERVER3_PID"
+wait "$SERVER3_PID" 2>/dev/null || true
+SERVER3_PID=""
+! nc -z 127.0.0.1 "$PORT3" 2>/dev/null || fail "third server still accepting connections after kill"
+echo "server: stopped ✔"
+
+check_no_tmp_residue "$A2" "origin A2 (after TLS bind)"
+
+echo
 echo "RESULT: sc+http access control — a no-token clone is rejected (401,"
 echo "authentication error), an ro-token clone reads but its push is rejected"
 echo "read-only, an rw-token push lands and a later ro-token clone sees it,"
 echo "an unjustified non-loopback bind is refused while --allow-public opens"
-echo "it deliberately, and zero .sc/tmp residue is left anywhere. OK"
+echo "it deliberately, the P32 gate refuses a token-only plaintext public bind"
+echo "while --tls + a token opens it, and zero .sc/tmp residue is left"
+echo "anywhere. OK"

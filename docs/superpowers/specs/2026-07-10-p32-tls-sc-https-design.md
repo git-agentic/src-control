@@ -95,10 +95,16 @@ Public surface:
   fingerprint.
 - `handle_http_connection` wraps the accepted socket in `TlsServerStream`
   before the opening read; P31's whole-session read/write timeouts still apply
-  (set on the inner `TcpStream`). The `--max-connections` busy-shed changes
-  shape under TLS only: the handshake completes first, then the busy status
-  goes over TLS so the client still gets the clean message (bounded work — the
-  30s opening timeout covers the handshake).
+  (set on the inner `TcpStream`). **Amended (implementation deviation, plan-
+  approved — see ADR-0042):** the `--max-connections` busy-shed does NOT send
+  a status under TLS. Sending a readable busy response would require
+  performing the TLS handshake on the accept thread itself, which would let
+  one slow or hostile client stall every subsequent `accept()` — exactly the
+  accepts-never-block property ADR-0041 exists to protect. So at the
+  connection cap, a TLS connection is simply closed with no handshake and no
+  status; only plaintext (`--tls` unset) connections still get the readable
+  `503` written before any read. This is a deliberate, accepted asymmetry
+  between the two modes, not a bug.
 - New subcommand `sc serve fingerprint [<path>]`: prints the repo's
   `.sc/serve-tls/` SPKI fingerprint, **minting if missing** (so an operator can
   distribute the pin before first serve) — same `load_or_mint` path, no drift.
