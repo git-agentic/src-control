@@ -99,7 +99,11 @@ exec 3<>"/dev/tcp/127.0.0.1/$PORT"
 # 503 status and closes cleanly — so this probe is not subject to any
 # reset race and always observes a clean "503 Service Unavailable".
 exec 4<>"/dev/tcp/127.0.0.1/$PORT"
-PROBE_RESP="$(cat <&4 2>/dev/null || true)"
+# Bounded read (read -t), not a bare `cat`: a regressed server that accepts
+# but stalls instead of writing the 503 must fail this step within 10s, not
+# hang until the 30s opening reap kicks it loose.
+PROBE_RESP=""
+IFS= read -r -t 10 PROBE_RESP <&4 || true
 exec 4<&-
 echo "$PROBE_RESP" | grep -q "503 Service Unavailable" \
   || fail "expected a 503 Service Unavailable status on the second connection while the slot is held, got: $PROBE_RESP"
@@ -145,7 +149,7 @@ SERVER_PID=""
 echo "server: stopped ✔"
 
 echo
-echo "=== 6: --max-pack-size at the floor is accepted; below the floor refuses to start ==="
+echo "=== 6: --max-pack-size floor — a small push lands under the cap; below the floor refuses to start ==="
 PORT2="$(pick_port)"
 "$SC" serve --http "127.0.0.1:$PORT2" --max-pack-size 268435456 "$A" &
 SERVER_PID=$!
@@ -155,7 +159,23 @@ echo "server: started with --max-pack-size at the floor (268435456) ✔"
 URL2="sc+http://127.0.0.1:$PORT2/repo"
 "$SC" clone "$URL2" "$W/c-floor" >/dev/null
 [ "$(cat "$W/c-floor/tracked.txt")" = "v1" ] || fail "c-floor: clone content mismatch"
-echo "clone through a floor-capped server: succeeds (cap present, harmless for a small repo) ✔"
+echo "clone through a floor-capped server: succeeds ✔"
+
+# The cap gates the PutPack spool (the server's receive path) — a clone's
+# GetPack never consults it. Exercise the actually-gated path: a small
+# commit pushed THROUGH the capped server must land (its pack is far under
+# the 256 MiB floor cap). If the cap's enforcement broke open-endedly or
+# regressed to rejecting everything, this push is the step that notices.
+cd "$W/c-floor"
+printf 'v2 via capped push\n' > pushed.txt
+"$SC" commit -m "push through the floor-capped server" --author capclient >/dev/null
+"$SC" push origin >/dev/null \
+  || fail "small push through the floor-capped server should have landed"
+cd "$W"
+"$SC" clone "$URL2" "$W/c-cap-verify" >/dev/null
+[ "$(cat "$W/c-cap-verify/pushed.txt")" = "v2 via capped push" ] \
+  || fail "c-cap-verify: pushed commit did not land through the capped server"
+echo "small push through the floor-capped server: lands (PutPack spool path, under the cap) ✔"
 
 kill "$SERVER_PID"
 wait "$SERVER_PID" 2>/dev/null || true
@@ -176,12 +196,14 @@ echo "=== 7: zero .sc/tmp residue on the served repo and every clone ==="
 check_no_tmp_residue "$A" "origin A"
 check_no_tmp_residue "$W/c-free" "c-free"
 check_no_tmp_residue "$W/c-floor" "c-floor"
+check_no_tmp_residue "$W/c-cap-verify" "c-cap-verify"
 echo "origin + clones: zero .sc/tmp residue ✔"
 
 echo
 echo "RESULT: sc serve --http listener limits — a connection at --max-connections 1"
 echo "is shed with a 'server busy' error while a slot is held, the slot frees once"
 echo "the holder disconnects and a fresh clone succeeds (the post-opening"
-echo "--timeout reap itself is unit-tested, not demoed here), --max-pack-size at"
-echo "the 256 MiB floor serves normally while a value below the floor refuses to"
-echo "start the server, and zero .sc/tmp residue is left anywhere. OK"
+echo "--timeout reap itself is unit-tested, not demoed here), a small push lands"
+echo "through the PutPack spool under the 256 MiB floor cap while a --max-pack-size"
+echo "below the floor refuses to start the server, and zero .sc/tmp residue is"
+echo "left anywhere. OK"
