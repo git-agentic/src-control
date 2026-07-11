@@ -1210,8 +1210,9 @@ isolation," and a compile-time pin locks in that `scl_crypto::open`'s
 `OsString` child-env hand-off. **Two accepted boundaries, unchanged by
 design:** convergent encryption stays equality-confirmable (ADR-0014 —
 **closed for new content in P33/ADR-0043**, which seals all new protected
-content randomized; the caveat holds only for pre-P33 convergent ciphertext in
-history until `sc rewrap` upgrades it); the secret's child-env
+content randomized; the caveat holds forever for pre-P33 convergent ciphertext
+in history — `sc rewrap` only stops it propagating into future snapshots,
+rotation ≠ erasure per ADR-0019); the secret's child-env
 copy is fundamental and un-zeroizable (fd/stdin injection is deferred, not
 a bug) — the parent's own decrypted buffer is what gets zeroized. Every
 prior demo stays green plus new pinned regression tests across all four

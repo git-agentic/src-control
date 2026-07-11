@@ -58,8 +58,11 @@ makes the same plaintext encrypt to different ciphertext every commit — new
   is documented so users with low-entropy secret files choose Phase 2 secrets
   instead. **Superseded for newly sealed content by ADR-0043 (P33):** all
   content sealed from P33 on uses a fresh random DEK + nonce, closing this
-  oracle; convergent dual-read is retained, so the caveat remains true for
-  pre-P33 ciphertext still in history until a `sc rewrap` upgrades the tip.
+  oracle; convergent dual-read is retained, so the caveat remains true forever
+  for pre-P33 ciphertext in history — `sc rewrap` re-seals the live tip, which
+  stops the convergent form propagating into future snapshots, but the
+  historical convergent objects stay reachable and confirmable (rotation ≠
+  erasure, ADR-0019).
 - Reuses `scl-crypto` and the recipient model wholesale; no new crypto primitives.
 - The protection policy is a snapshot-level object like the secrets registry, so
   it versions and travels with the code.

@@ -50,8 +50,9 @@ too, not just the src-control-side metadata.
 
 - **Defends:** read-confidentiality of designated file content for a chosen
   recipient set; an unauthorized clone gets ciphertext it cannot read.
-- **Equality-confirmation oracle — closed for new content (P33, ADR-0043),
-  still true for pre-P33 history until rewrapped.** Protected paths *used to*
+- **Equality-confirmation oracle — closed for new content (P33, ADR-0043);
+  pre-P33 convergent ciphertext in history stays confirmable forever
+  (rotation ≠ erasure, ADR-0019).** Protected paths *used to*
   use *convergent encryption* (DEK and nonce derive from `BLAKE3(plaintext)`),
   so identical plaintext dedups to identical ciphertext and an observer could
   confirm that two protected files are identical, or that a protected file
