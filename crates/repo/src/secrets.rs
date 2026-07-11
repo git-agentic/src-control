@@ -91,6 +91,7 @@ impl Repo {
         value: &[u8],
         recipients: &[PublicKey],
     ) -> Result<ObjectId> {
+        self.refuse_on_private("sc secret add")?;
         // P19-I1: policy ops that move the branch tip via `commit_registry`
         // had no in-progress guard of their own, letting them silently
         // discard a stopped merge/pick/rebase's pending resolution. Same
@@ -128,6 +129,7 @@ impl Repo {
         authorized: &SecretKey,
         new: &PublicKey,
     ) -> Result<ObjectId> {
+        self.refuse_on_private("sc secret grant")?;
         // P21: `secret_grant` also moves the branch tip via `commit_registry`
         // (confirmed by inspection per the P21 brief) — same guard trio as
         // `secret_add`/`secret_rotate`.
@@ -169,6 +171,7 @@ impl Repo {
 
     /// Revoke a recipient from `name` (metadata-only re-wrap).
     pub fn secret_revoke(&self, name: &str, recipient: &RecipientId) -> Result<ObjectId> {
+        self.refuse_on_private("sc secret revoke")?;
         // P21: `secret_revoke` also moves the branch tip via `commit_registry`
         // (confirmed by inspection per the P21 brief) — same guard trio as
         // `secret_add`/`secret_rotate`.
@@ -231,6 +234,7 @@ impl Repo {
         recipients: &[PublicKey],
         identity: Option<&SecretKey>,
     ) -> Result<ObjectId> {
+        self.refuse_on_private("sc secret rotate")?;
         // P21: same in-progress guard as `secret_add` — see its comment.
         if crate::merge_state::in_progress(self.layout()) {
             return Err(Error::MergeInProgress);
@@ -308,6 +312,7 @@ impl Repo {
 
     /// List secrets at HEAD with recipient counts.
     pub fn secret_list(&self) -> Result<Vec<SecretInfo>> {
+        self.refuse_on_private("sc secret list")?;
         let reg = self.registry()?;
         let mut out = Vec::new();
         for (name, id) in reg {
@@ -393,6 +398,7 @@ impl Repo {
     /// stderr warning; a corrupt/tampered secret is a hard error. Returns the
     /// child's exit code.
     pub fn run(&self, identity: &SecretKey, cmd: &[String]) -> Result<i32> {
+        self.refuse_on_private("sc run")?;
         let envs = self.secret_env(identity, false)?;
         let (exe, args) = cmd
             .split_first()

@@ -188,6 +188,28 @@ pub fn reachable_objects_filtered(
     while let Some(sid) = snapshots.pop_front() {
         let snap = match src.get(&sid)? {
             Object::Snapshot(s) => s,
+            // A private branch's tip (P34, ADR-0044): the manifest's flat
+            // closure list IS the reachability rule — every sealed id it
+            // names is included as an opaque leaf (never decoded), the
+            // public base and the superseded-manifest chain are walked like
+            // parents. Sealed content cannot be path-filtered (that opacity
+            // is the feature), so the closure is included whole even under a
+            // filter; filtered CLONES exclude private refs at the want level
+            // instead (`filter_manifest_wants`).
+            Object::Manifest(m) => {
+                for id in &m.closure {
+                    included.insert(*id);
+                }
+                if included.insert(m.base) {
+                    snapshots.push_back(m.base);
+                }
+                if let Some(prev) = m.prev {
+                    if included.insert(prev) {
+                        snapshots.push_back(prev);
+                    }
+                }
+                continue;
+            }
             _ => return Err(Error::BadRef(format!("expected snapshot {sid}"))),
         };
         for p in &snap.parents {
@@ -212,6 +234,29 @@ pub fn reachable_objects_filtered(
     // always wins. See the disjointness note on `Reachable`.
     gaps.retain(|id| !included.contains(id));
     Ok(Reachable { included, gaps })
+}
+
+/// Filtered clones exclude private branches entirely (ADR-0044): sealed
+/// content cannot be path-filtered, so under an active filter any want that
+/// resolves to a branch manifest is dropped before the reachability walk.
+/// Both pack builders (local transport + wire server) call this so the rule
+/// holds on every transport. With no filter, wants pass through untouched.
+pub fn filter_manifest_wants(
+    src: &mut impl ObjectSource,
+    wants: &[ObjectId],
+    filter_active: bool,
+) -> Result<Vec<ObjectId>> {
+    if !filter_active {
+        return Ok(wants.to_vec());
+    }
+    let mut out = Vec::with_capacity(wants.len());
+    for w in wants {
+        match src.get(w) {
+            Ok(Object::Manifest(_)) => continue,
+            _ => out.push(*w),
+        }
+    }
+    Ok(out)
 }
 
 /// Path-tracking tree descent shared by [`walk_tree`] (filter = None) and

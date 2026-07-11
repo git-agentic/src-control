@@ -230,6 +230,7 @@ impl Repo {
     /// working tree are never touched. One workspace's failure (agent exit,
     /// scanner rejection, harvest error) never aborts its siblings.
     pub fn work(&self, opts: WorkOptions) -> Result<Vec<WorkspaceOutcome>> {
+        self.refuse_on_private("sc work")?;
         if opts.agents == 0 {
             return Err(Error::InvalidArgument("agents must be >= 1".into()));
         }

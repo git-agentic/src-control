@@ -139,6 +139,7 @@ impl Repo {
 
     /// Scan the current working tree for plaintext secrets (read-only).
     pub fn scan_worktree(&self) -> Result<crate::scanner::ScanReport> {
+        self.refuse_on_private("sc scan")?;
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
         self.scan_files(&files)
     }
@@ -750,6 +751,11 @@ impl Repo {
         if crate::rebase_state::in_progress(&self.layout) {
             return Err(Error::RebaseInProgress);
         }
+        // A private branch commits through `commit_private` (P34) — it needs
+        // a recipient identity this signature doesn't carry.
+        if let Some((branch, _, _)) = self.head_private()? {
+            return Err(Error::PrivateNoAccess(branch));
+        }
         let head = refs::current_branch(&self.layout)?;
         let before = refs::read_branch_tip(&self.layout, &head)?;
         let tip = self.head_tip()?;
@@ -866,6 +872,7 @@ impl Repo {
     /// restores the old tip. No pushed-commit guard — sc has no
     /// authoritative record of remote observers (ADR-0029).
     pub fn amend(&self, author: &str, message: Option<&str>) -> Result<ObjectId> {
+        self.refuse_on_private("sc amend")?;
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -987,6 +994,11 @@ impl Repo {
 
     /// Working-tree status against HEAD, plus merge-in-progress info.
     pub fn status(&self) -> Result<Status> {
+        // A private HEAD needs a recipient identity even to know what the
+        // tree contains — `status_private` (P34) is the covering call.
+        if let Some((branch, _, _)) = self.head_private()? {
+            return Err(Error::PrivateNoAccess(branch));
+        }
         let (head_root, protection) = match self.head_tip()? {
             Some(tip) => {
                 let snap = self.snapshot(&tip)?;
@@ -1010,6 +1022,7 @@ impl Repo {
     /// The working-tree file paths (repo-relative, sorted) that `commit` would
     /// snapshot — the same set `sc protect` encrypts when they match a prefix.
     pub fn worktree_paths(&self) -> Result<Vec<String>> {
+        self.refuse_on_private("this operation")?;
         Ok(
             worktree::read_worktree(&self.layout, &self.tracked_paths()?)?
                 .into_iter()
@@ -1032,6 +1045,9 @@ impl Repo {
     /// out-of-sparse subtree as deleted.
     pub fn diff_unified(&self) -> Result<String> {
         use scl_core::PROTECTED;
+        if let Some((branch, _, _)) = self.head_private()? {
+            return Err(Error::PrivateNoAccess(branch));
+        }
         let sparse = self.sparse_spec()?;
         let head_root = self
             .head_tip()?
@@ -1216,6 +1232,11 @@ impl Repo {
         author: &str,
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<(ObjectId, Vec<String>)> {
+        // On a private branch, merging FROM a public branch is the one legal
+        // integration direction — route to the private machinery (P34).
+        if self.head_private()?.is_some() {
+            return self.merge_into_private(branch, author, identity);
+        }
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -1235,6 +1256,11 @@ impl Repo {
         let before = refs::read_branch_tip(&self.layout, &head)?;
         let theirs = refs::resolve_tip(&self.layout, branch)?
             .ok_or_else(|| Error::NoSuchBranch(branch.to_string()))?;
+        // Private → public integration is refused unconditionally: the only
+        // sanctioned path to plaintext is `sc branch publish` (P34).
+        if self.manifest_at(&theirs)?.is_some() {
+            return Err(Error::PrivateIntegration(branch.to_string()));
+        }
         let ours = match self.head_tip()? {
             Some(ours) => ours,
             None => {
@@ -1661,6 +1687,9 @@ impl Repo {
 
     /// Snapshots from the current tip back through parents (newest first).
     pub fn log(&self) -> Result<Vec<(ObjectId, Snapshot)>> {
+        if let Some((branch, _, _)) = self.head_private()? {
+            return Err(Error::PrivateNoAccess(branch));
+        }
         let mut out = Vec::new();
         let mut next = self.head_tip()?;
         while let Some(id) = next {
@@ -1693,6 +1722,9 @@ impl Repo {
 
     /// Create `name` pointing at the current tip (errors if unborn or exists).
     pub fn branch(&self, name: &str) -> Result<()> {
+        // Two branch refs sharing one manifest would fork the private index
+        // in place — refuse rather than corrupt (P34).
+        self.refuse_on_private("sc branch (creating a branch from a private tip)")?;
         validate_branch_name(name)?;
         if self.layout.ref_path(name).exists() {
             return Err(Error::BadRef(format!("branch already exists: {name}")));
@@ -1747,7 +1779,13 @@ impl Repo {
         // The protection-aware dirty check (status) already treats unchanged
         // decrypted protected files and skipped/absent protected files as clean,
         // so a reported modification/deletion is a genuine uncommitted change.
-        let dirty = self.status()?;
+        // Leaving a PRIVATE branch needs the private status (the identity
+        // gates even knowing what the tree contains — P34).
+        let head_priv = self.head_private()?;
+        let dirty = match &head_priv {
+            Some(_) => self.status_private(identity)?,
+            None => self.status()?,
+        };
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
             return Err(Error::InvalidArgument(
                 "working tree has uncommitted changes; commit before switching".into(),
@@ -1755,12 +1793,40 @@ impl Repo {
         }
         let target_tip = refs::read_branch_tip(&self.layout, name)?
             .ok_or_else(|| Error::NoSuchBranch(name.to_string()))?;
-        let old_root = self.head_root()?;
+        // Paths tracked by the branch being LEFT (for the removal pass).
+        let old_paths: std::collections::BTreeSet<String> = match &head_priv {
+            Some(_) => self.private_tracked_paths(identity)?,
+            None => self.tracked_paths()?,
+        };
+        // Switching TO a private branch takes the private materialize path.
+        if let Some(m) = self.manifest_at(&target_tip)? {
+            return self.switch_to_private(name, target_tip, m, identity, &old_paths);
+        }
+        // Public target. When leaving a private branch there is no public
+        // old root to hand `materialize` — the stale-path removal below uses
+        // `old_paths` directly instead.
+        let old_root = match &head_priv {
+            Some(_) => None,
+            None => self.head_root()?,
+        };
         let (target_root, target_protection) = {
             let store_arc = self.vfs.store();
             let snap = store_arc.lock().unwrap().get_snapshot(&target_tip)?;
             (snap.root, snap.protection)
         };
+        if head_priv.is_some() {
+            // Remove private-tip paths the public target doesn't track,
+            // BEFORE materialize lays the target down.
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let target_paths = worktree::tree_file_entries_with_perms(&mut store, target_root)?;
+            for p in &old_paths {
+                if !target_paths.contains_key(p) {
+                    let full = worktree::safe_join(&self.layout.root, p)?;
+                    let _ = std::fs::remove_file(full);
+                }
+            }
+        }
         // Cache hoisted above the block so its save follows the ref move
         // (`write_head` below), matching commit/amend's discipline (P33 Task 7).
         let mut cache = self.open_protected_cache()?;
@@ -1822,8 +1888,9 @@ pub(crate) fn unix_now() -> i64 {
 }
 
 /// Append one file's diff to `out`: unified hunks for text, a one-line notice
-/// for binary content (NUL byte on either side).
-fn push_file_diff(out: &mut String, path: &str, old: &[u8], new: &[u8]) {
+/// for binary content (NUL byte on either side). `pub(crate)` so the private-
+/// branch diff (P34, `private.rs`) renders identically.
+pub(crate) fn push_file_diff(out: &mut String, path: &str, old: &[u8], new: &[u8]) {
     if old.contains(&0) || new.contains(&0) {
         out.push_str(&format!("Binary files a/{path} and b/{path} differ\n"));
         return;

@@ -44,6 +44,7 @@ impl Repo {
         known_keys: &[PublicKey],
         dry_run: bool,
     ) -> Result<RewrapReport> {
+        self.refuse_on_private("sc rewrap")?;
         // Refuse mid-merge/mid-pick: completion unions the OLD wraps back in
         // over rewrap's cutover, silently resurrecting a stripped recipient
         // at the tip (final-review I1). Checked even on --dry-run — a

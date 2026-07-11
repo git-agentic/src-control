@@ -33,6 +33,7 @@ impl Repo {
         recipients: &[scl_crypto::PublicKey],
         _identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<ObjectId> {
+        self.refuse_on_private("sc protect")?;
         use scl_core::ProtectPrefix;
         // `protect`'s first write is a policy-only commit_snapshot, which
         // (unlike `commit`) has no in-progress guard of its own — the P19-I1
@@ -140,6 +141,7 @@ impl Repo {
         authorized: &scl_crypto::SecretKey,
         new: &scl_crypto::PublicKey,
     ) -> Result<ObjectId> {
+        self.refuse_on_private("sc grant")?;
         // P21: same in-progress guard as `protect` — see its comment.
         if crate::merge_state::in_progress(self.layout()) {
             return Err(Error::MergeInProgress);
@@ -219,6 +221,7 @@ impl Repo {
     /// such prefix. Does not rotate content (a prior holder kept any plaintext
     /// already checked out — see the secrets-revoke rationale in ADR-0008).
     pub fn revoke(&self, prefix: &str, recipient_id: &scl_crypto::RecipientId) -> Result<ObjectId> {
+        self.refuse_on_private("sc revoke")?;
         // P21: same in-progress guard as `protect` — see its comment.
         if crate::merge_state::in_progress(self.layout()) {
             return Err(Error::MergeInProgress);
@@ -300,6 +303,7 @@ impl Repo {
     /// List the tip's protected prefixes with every recipient register —
     /// tombstones included, so a post-merge listing shows revocations holding.
     pub fn protected_prefixes(&self) -> Result<Vec<(String, Vec<PrefixRecipient>)>> {
+        self.refuse_on_private("sc protect --list")?;
         let protection = match self.head_tip()? {
             Some(t) => self.snapshot(&t)?.protection,
             None => Protection::default(),

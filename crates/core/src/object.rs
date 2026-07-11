@@ -17,6 +17,8 @@ const TAG_SECRET: u8 = 3;
 const TAG_SNAPSHOT: u8 = 4;
 const TAG_SIGNATURE: u8 = 5;
 const TAG_TRANSCRIPT: u8 = 6;
+const TAG_SEALED: u8 = 7;
+const TAG_MANIFEST: u8 = 8;
 
 /// Perms-byte bit: this blob entry holds a `nonce‖ciphertext` envelope (an
 /// encrypted file), not plaintext. Set on protected-path entries (P7).
@@ -211,6 +213,47 @@ pub struct Transcript {
     pub wrapped_keys: Vec<WrappedKey>,
 }
 
+/// A sealed private-branch object (P34, ADR-0044): the canonical encoding of
+/// some inner object (snapshot, tree, or blob) encrypted under a fresh random
+/// per-object DEK — payload is `nonce(24) ‖ AEAD ciphertext`. Which inner kind
+/// it holds, and the DEK that opens it, live only in the branch manifest's
+/// encrypted index; to everyone else this is opaque bytes with a random-looking
+/// content address. A distinct tag (not `Blob`) so ciphertext can never be
+/// misread as plaintext file content.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SealedObj {
+    pub payload: Arc<[u8]>,
+}
+
+/// A private branch's manifest (P34, ADR-0044) — the object a private branch's
+/// ref points at instead of a snapshot. Plaintext *structure*, sealed content:
+/// keyless parties (gc, transports) get exactly what they need — the closure
+/// list and the public base — and nothing else.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BranchManifest {
+    /// The public fork-point snapshot. Kept plaintext so gc can keep the base
+    /// (and its closure) alive even if the public branch later rewrites it
+    /// away — publish and merge-base walks need it present. This is a
+    /// deliberate, documented metadata leak (the fork point is visible).
+    pub base: ObjectId,
+    /// The manifest this one supersedes (`None` at branch creation). Manifests
+    /// form the private branch's meta-history the way parents do for
+    /// snapshots: the fast-forward check on push walks this chain, and gc
+    /// keeps superseded manifests (and their closures) reachable exactly as
+    /// it keeps ancestor snapshots.
+    pub prev: Option<ObjectId>,
+    /// Every sealed object id in the branch's closure, sorted (canonical).
+    /// gc: manifest reachable ⇒ all listed ids reachable. Transport: diff this
+    /// flat list against the peer's haves. Leaks count + sizes by design.
+    pub closure: Vec<ObjectId>,
+    /// The branch index — `inner id -> (sealed id, DEK)` plus the inner tip —
+    /// encrypted under the branch KEK (`nonce ‖ AEAD`). Opaque to `core`;
+    /// `crates/crypto` owns the index codec and the KEK envelope.
+    pub index_ct: Vec<u8>,
+    /// The branch KEK wrapped per recipient (and escrow), P2-shape envelope.
+    pub kek_wraps: Vec<WrappedKey>,
+}
+
 /// Any object the store can hold. Blob bytes are `Arc`-shared so forking many
 /// worktrees off one snapshot never copies file content.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -221,6 +264,8 @@ pub enum Object {
     Secret(Secret),
     Signature(SignatureObj),
     Transcript(Transcript),
+    Sealed(SealedObj),
+    Manifest(BranchManifest),
 }
 
 impl Object {
@@ -228,10 +273,13 @@ impl Object {
         Object::Blob(Arc::from(bytes.into().into_boxed_slice()))
     }
 
-    /// Bytes counted against the store's blob budget (0 for non-blobs).
+    /// Bytes counted against the store's blob budget (0 for small resident
+    /// kinds). Sealed payloads are blob-sized ciphertext and get the same
+    /// budget/eviction treatment as plaintext blobs.
     pub fn blob_size(&self) -> usize {
         match self {
             Object::Blob(b) => b.len(),
+            Object::Sealed(s) => s.payload.len(),
             _ => 0,
         }
     }
@@ -244,6 +292,8 @@ impl Object {
             Object::Secret(_) => "secret",
             Object::Signature(_) => "signature",
             Object::Transcript(_) => "transcript",
+            Object::Sealed(_) => "sealed",
+            Object::Manifest(_) => "manifest",
         }
     }
 
@@ -348,6 +398,35 @@ impl Object {
                 for wk in &t.wrapped_keys {
                     w.str(&wk.recipient_id);
                     w.bytes(&wk.wrapped_dek);
+                }
+            }
+            Object::Sealed(s) => {
+                w.tag(TAG_SEALED);
+                w.raw(&s.payload);
+            }
+            Object::Manifest(m) => {
+                w.tag(TAG_MANIFEST);
+                w.id(&m.base);
+                match &m.prev {
+                    Some(p) => {
+                        w.u8(1);
+                        w.id(p);
+                    }
+                    None => w.u8(0),
+                }
+                // Sort the closure so the same logical set hashes identically
+                // regardless of insertion order.
+                let mut closure = m.closure.clone();
+                closure.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                w.u32(closure.len() as u32);
+                for id in &closure {
+                    w.id(id);
+                }
+                w.bytes(&m.index_ct);
+                w.u32(m.kek_wraps.len() as u32);
+                for k in &m.kek_wraps {
+                    w.str(&k.recipient_id);
+                    w.bytes(&k.wrapped_dek);
                 }
             }
         }
@@ -518,6 +597,40 @@ impl Object {
                     nonce,
                     ciphertext,
                     wrapped_keys,
+                })
+            }
+            TAG_SEALED => Object::Sealed(SealedObj {
+                payload: Arc::from(r.rest()),
+            }),
+            TAG_MANIFEST => {
+                let base = r.id()?;
+                let prev = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.id()?),
+                    b => return Err(Error::Malformed(format!("bad manifest prev marker {b}"))),
+                };
+                let nc = r.count()?;
+                let mut closure = Vec::with_capacity(nc);
+                for _ in 0..nc {
+                    closure.push(r.id()?);
+                }
+                let index_ct = r.bytes()?;
+                let nk = r.count()?;
+                let mut kek_wraps = Vec::with_capacity(nk);
+                for _ in 0..nk {
+                    let recipient_id = r.str()?;
+                    let wrapped_dek = r.bytes()?;
+                    kek_wraps.push(WrappedKey {
+                        recipient_id,
+                        wrapped_dek,
+                    });
+                }
+                Object::Manifest(BranchManifest {
+                    base,
+                    prev,
+                    closure,
+                    index_ct,
+                    kek_wraps,
                 })
             }
             t => return Err(Error::Malformed(format!("unknown object tag {t}"))),
@@ -1026,6 +1139,67 @@ mod tests {
         assert_eq!(rule.recipients.len(), 2);
         assert_eq!(rule.granted_keys(), vec![[1; 32]]);
         assert_eq!(rule.next_epoch(), 3);
+    }
+
+    #[test]
+    fn sealed_object_roundtrips_and_differs_from_blob() {
+        let payload: Vec<u8> = (0..64).collect();
+        let sealed = Object::Sealed(SealedObj {
+            payload: Arc::from(payload.clone().into_boxed_slice()),
+        });
+        assert_eq!(sealed, Object::decode(&sealed.encode()).unwrap());
+        assert_eq!(sealed.kind_name(), "sealed");
+        assert_eq!(sealed.blob_size(), 64, "sealed bytes are budget-counted");
+        // Same bytes as a plain blob must hash to a DIFFERENT id: the tag is
+        // part of the encoding, so ciphertext can never collide with a
+        // plaintext blob's address.
+        assert_ne!(sealed.id(), Object::blob(payload).id());
+    }
+
+    #[test]
+    fn manifest_roundtrips_and_closure_is_order_independent() {
+        let a = ObjectId::from_bytes([1; 32]);
+        let b = ObjectId::from_bytes([2; 32]);
+        let mk = |closure: Vec<ObjectId>| {
+            Object::Manifest(BranchManifest {
+                base: ObjectId::from_bytes([9; 32]),
+                prev: Some(ObjectId::from_bytes([8; 32])),
+                closure,
+                index_ct: vec![7; 40],
+                kek_wraps: vec![WrappedKey {
+                    recipient_id: "rid".into(),
+                    wrapped_dek: vec![5; 80],
+                }],
+            })
+        };
+        let m1 = mk(vec![a, b]);
+        let m2 = mk(vec![b, a]);
+        assert_eq!(m1.id(), m2.id(), "closure order must not change the id");
+        let decoded = Object::decode(&m1.encode()).unwrap();
+        let Object::Manifest(back) = decoded else {
+            panic!("not a manifest")
+        };
+        assert_eq!(back.base, ObjectId::from_bytes([9; 32]));
+        assert_eq!(back.closure, vec![a, b], "decoded closure is sorted");
+        assert_eq!(back.index_ct, vec![7; 40]);
+        assert_eq!(back.kek_wraps.len(), 1);
+    }
+
+    #[test]
+    fn manifest_decode_rejects_fabricated_counts() {
+        const HUGE: u32 = 0xFFFF_FFFF;
+        // TAG_MANIFEST + base(32) + closure-count(fabricated), nothing follows.
+        let mut buf = vec![TAG_MANIFEST];
+        buf.extend_from_slice(&[0u8; 32]);
+        buf.extend_from_slice(&HUGE.to_be_bytes());
+        assert!(matches!(Object::decode(&buf), Err(Error::Malformed(_))));
+        // Same for the kek-wrap count after an empty closure + empty index.
+        let mut buf = vec![TAG_MANIFEST];
+        buf.extend_from_slice(&[0u8; 32]);
+        buf.extend_from_slice(&0u32.to_be_bytes()); // closure count
+        buf.extend_from_slice(&0u32.to_be_bytes()); // index_ct len
+        buf.extend_from_slice(&HUGE.to_be_bytes()); // kek wrap count
+        assert!(matches!(Object::decode(&buf), Err(Error::Malformed(_))));
     }
 
     #[test]

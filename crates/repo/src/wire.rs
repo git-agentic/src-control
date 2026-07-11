@@ -21,8 +21,11 @@ use crate::error::{Error, Result};
 /// `filter: Vec<String>` field (empty = no filter, full transfer) — a v2
 /// peer's decoder doesn't know to read that trailing field, so the versions
 /// are wire-incompatible for `GetPack` even though every other verb's
-/// encoding is unchanged.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// encoding is unchanged. Bumped 3 -> 4 in P34 (ADR-0044): two additive
+/// object kinds (sealed object, branch manifest) now cross the wire inside
+/// packs — a v3 peer's `Object::decode` would hit an unknown tag deep in
+/// pack ingest, so the mismatch is refused cleanly at the handshake instead.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // Request opcodes (one per Transport verb, plus session control).
 const OP_HELLO: u8 = 0x01;

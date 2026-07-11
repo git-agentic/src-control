@@ -119,10 +119,28 @@ impl Repo {
 
         // Copy branches + HEAD, and seed origin/* remote-tracking refs so
         // `merge origin/<branch>` resolves immediately and `fetch` has a baseline.
+        // Filtered clones exclude private branches entirely (ADR-0044): the
+        // server dropped manifest wants from the pack, so a private ref's
+        // target never landed — skip the ref rather than minting a dangling
+        // one. Full clones carry private refs (ciphertext + manifest) intact.
         for (branch, tip) in &remote_refs {
+            if filter.is_some() && !dst_repo.vfs.store().lock().unwrap().contains(tip) {
+                continue;
+            }
             refs::write_branch_tip(&dst_repo.layout, branch, tip)?;
             refs::write_remote_tip(&dst_repo.layout, "origin", branch, tip)?;
         }
+        // The remote's HEAD branch may itself have been excluded (private):
+        // fall back to any branch that survived.
+        let head_branch = if dst_repo.layout.ref_path(&head_branch).exists() {
+            head_branch
+        } else {
+            dst_repo
+                .branches()?
+                .first()
+                .map(|(n, _)| n.clone())
+                .unwrap_or(head_branch)
+        };
         refs::write_head(&dst_repo.layout, &head_branch)?;
 
         // Record origin.
@@ -149,7 +167,13 @@ impl Repo {
         // Materialize HEAD into the working tree. No identity is available at
         // clone time, so PROTECTED files are skipped (ciphertext stays in objects
         // but plaintext is not written to disk — correct for unauthorized clones).
+        // A private HEAD branch (manifest tip, ADR-0044) is not materialized at
+        // all: checkout needs a recipient identity — `sc switch <branch>
+        // --identity <key>` after the clone.
         if let Some(head_tip) = dst_repo.head_tip()? {
+            if dst_repo.manifest_at(&head_tip)?.is_some() {
+                return Ok(dst_repo);
+            }
             let store_arc = dst_repo.vfs.store();
             let mut store = store_arc.lock().unwrap();
             let head_snap = store.get_snapshot(&head_tip)?;

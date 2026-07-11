@@ -207,6 +207,9 @@ impl Repo {
         body: &[u8],
         recipients: &[scl_crypto::PublicKey],
     ) -> Result<ObjectId> {
+        if self.manifest_at(&snapshot)?.is_some() {
+            return Err(Error::PrivateUnsupported("sc transcript attach".into()));
+        }
         crate::secrets::require_recipients(recipients)?;
 
         // P5 scan-and-WARN (never reject): the body is about to be sealed,

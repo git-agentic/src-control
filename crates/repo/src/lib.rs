@@ -15,6 +15,7 @@ pub mod merge;
 pub mod merge_state;
 pub mod oplog;
 pub mod pick_state;
+pub mod private;
 pub mod promisor;
 pub mod protect;
 pub mod protect_ops;

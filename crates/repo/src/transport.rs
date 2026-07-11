@@ -130,16 +130,22 @@ impl LocalTransport {
         // (the remote) store. `haves` the remote doesn't have are skipped.
         let promisor_filter =
             filter.map(|prefixes| crate::promisor::Promisor::new(String::new(), prefixes.to_vec()));
+        // Filtered transfers exclude private branches entirely (ADR-0044):
+        // a want that resolves to a branch manifest is dropped before the
+        // walk. Serves both transports — the wire server's GetPack delegates
+        // here.
+        let wants =
+            crate::reachable::filter_manifest_wants(&mut *store, wants, promisor_filter.is_some())?;
         let mut want_set = match &promisor_filter {
             Some(pf) => {
                 crate::reachable::reachable_objects_filtered(
                     &mut *store,
-                    wants,
+                    &wants,
                     Some(pf as &dyn crate::reachable::PrefixFilter),
                 )?
                 .included
             }
-            None => crate::reachable::reachable_objects(&mut *store, wants)?,
+            None => crate::reachable::reachable_objects(&mut *store, &wants)?,
         };
 
         let mut have_set: BTreeSet<ObjectId> = BTreeSet::new();

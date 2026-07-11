@@ -60,6 +60,23 @@ pub enum Error {
     PartialCloneUnsupported(String),
     #[error("already up to date")]
     UpToDate,
+    /// The named branch is private and the caller either provided no identity
+    /// or one that is not a recipient of the branch KEK (P34, ADR-0044).
+    #[error("branch {0} is private; provide a recipient --identity to access it")]
+    PrivateNoAccess(String),
+    /// An operation that is not supported on a private branch (P34). `{0}` is
+    /// the operation name; the covering flows are `sc branch publish` (make
+    /// it public) or performing the operation on a public branch.
+    #[error("{0} is not supported on a private branch (publish it first: `sc branch publish`)")]
+    PrivateUnsupported(String),
+    /// Integrating FROM a private branch INTO a public one is always refused:
+    /// decrypting sealed content into public objects is publishing, and the
+    /// only sanctioned path to that is the one loudly-named command (P34).
+    #[error("cannot integrate private branch {0} into a public branch; use `sc branch publish {0}` to make it public first")]
+    PrivateIntegration(String),
+    /// A `sc branch grant/revoke/publish` target that is not a private branch.
+    #[error("branch {0} is not private")]
+    NotPrivateBranch(String),
     #[error("{0}")]
     SecretDetected(crate::scanner::ScanReport),
     #[error("non-fast-forward: the remote has commits you don't have; fetch + merge first")]

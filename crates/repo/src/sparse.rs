@@ -143,6 +143,7 @@ impl Repo {
         prefixes: &[String],
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<Vec<String>> {
+        self.refuse_on_private("sc sparse set")?;
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -209,6 +210,7 @@ impl Repo {
     /// the same reason (the write loop rewrites every in-sparse target entry
     /// unconditionally).
     pub fn disable_sparse(&self, identity: Option<&scl_crypto::SecretKey>) -> Result<Vec<String>> {
+        self.refuse_on_private("sc sparse disable")?;
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }

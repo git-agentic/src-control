@@ -331,6 +331,12 @@ impl Repo {
         identity: Option<&scl_crypto::SecretKey>,
         mainline: Option<u32>,
     ) -> Result<PickResult> {
+        self.refuse_on_private("cherry-pick")?;
+        if let Some(t) = crate::refs::resolve_tip(&self.layout, refname)? {
+            if self.manifest_at(&t)?.is_some() {
+                return Err(Error::PrivateIntegration(refname.to_string()));
+            }
+        }
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -672,6 +678,12 @@ impl Repo {
         author: &str,
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<RebaseResult> {
+        self.refuse_on_private("rebase")?;
+        if let Some(t) = crate::refs::resolve_tip(&self.layout, target)? {
+            if self.manifest_at(&t)?.is_some() {
+                return Err(Error::PrivateIntegration(target.to_string()));
+            }
+        }
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }

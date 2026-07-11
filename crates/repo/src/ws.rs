@@ -200,6 +200,7 @@ impl Repo {
         author: &str,
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<WsSession> {
+        self.refuse_on_private("sc ws fork")?;
         if agents == 0 {
             return Err(Error::InvalidArgument("agents must be >= 1".into()));
         }

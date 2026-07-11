@@ -35,18 +35,51 @@ pub fn merge_base(store: &mut Store, a: ObjectId, b: ObjectId) -> Result<Option<
 }
 
 /// Whether `anc` is an ancestor of (or equal to) `desc`.
+///
+/// Private branches (P34): a branch manifest's "parents" are its superseded
+/// manifest (`prev`) plus its public base, so the push fast-forward check
+/// works over manifest chains unchanged. One extra rule covers the publish
+/// transition: a manifest `anc` also counts as an ancestor of a snapshot
+/// `desc` when its BASE is — publishing rewrites the branch to plaintext
+/// snapshots forked at that base, and a remote holding the pre-publish
+/// manifest must accept the published tip as a forward move.
 pub fn is_ancestor(store: &mut Store, anc: ObjectId, desc: ObjectId) -> Result<bool> {
-    Ok(ancestors(store, desc)?.contains(&anc))
+    let desc_anc = ancestors(store, desc)?;
+    if desc_anc.contains(&anc) {
+        return Ok(true);
+    }
+    // Publish transition ONLY: `desc` must be a snapshot. Between two
+    // manifests, ancestry is exclusively the prev chain (already covered
+    // above) — treating "shares my base" as ancestry there would let a
+    // stale manifest fast-forward over a newer one, rolling back grants/
+    // revokes/commits.
+    if let Ok(Object::Manifest(m)) = store.get(&anc) {
+        if matches!(store.get(&desc), Ok(Object::Snapshot(_))) {
+            return Ok(desc_anc.contains(&m.base));
+        }
+    }
+    Ok(false)
 }
 
-/// All ancestors of `id`, inclusive.
+/// All ancestors of `id`, inclusive. Kind-aware: snapshots contribute their
+/// parents, branch manifests their `prev` chain + public base.
 fn ancestors(store: &mut Store, id: ObjectId) -> Result<BTreeSet<ObjectId>> {
     let mut set = BTreeSet::new();
     let mut q = VecDeque::new();
     q.push_back(id);
     set.insert(id);
     while let Some(cur) = q.pop_front() {
-        for p in store.get_snapshot(&cur)?.parents {
+        let parents: Vec<ObjectId> = match store.get(&cur)? {
+            Object::Snapshot(s) => s.parents,
+            Object::Manifest(m) => m.prev.into_iter().chain(std::iter::once(m.base)).collect(),
+            other => {
+                return Err(Error::BadRef(format!(
+                    "expected snapshot or manifest at {cur}, found {}",
+                    other.kind_name()
+                )))
+            }
+        };
+        for p in parents {
             if set.insert(p) {
                 q.push_back(p);
             }
