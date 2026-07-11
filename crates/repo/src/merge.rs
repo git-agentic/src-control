@@ -988,10 +988,17 @@ mod tests {
             "identical plaintexts merge to v2 with no conflict"
         );
         assert!(f.needs_encrypt, "merged plaintext pending re-encryption");
+        // `three_way_files` never surfaces RANDOMIZED here: for a
+        // needs_encrypt entry the caller (repo.rs's completion path) reads
+        // `f.bytes`/`f.mode`/the matched rule's recipients, never `f.perms`
+        // — the RANDOMIZED bit is applied downstream by `encrypt_protected`
+        // at actual re-encryption time, not by this merge step. `f.perms`
+        // here only ever carries the PROTECTED marker bit (see the mask at
+        // the content-divergent match arm above).
         assert_eq!(
-            f.perms,
-            PROTECTED | RANDOMIZED,
-            "content-divergent re-seal path pins the RANDOMIZED bit"
+            f.perms, PROTECTED,
+            "three_way_files marks the path PROTECTED; RANDOMIZED is applied \
+             at downstream re-encryption, not surfaced here"
         );
     }
 
