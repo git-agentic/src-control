@@ -4,7 +4,7 @@ This document consolidates, in one place, the **deliberate security boundaries**
 of src-control's cryptographic features — the things it does *not* defend against
 by design. They are drawn from the per-phase ADRs (linked below); this page
 exists so a newcomer evaluating whether to trust real data to the system does not
-have to read 40 ADRs to find the caveats.
+have to read 44 ADRs to find the caveats.
 
 > **Status: pre-1.0, not independently audited.** These are MVP implementations
 > reviewed by the project's own process only. Do not commit production secrets to
