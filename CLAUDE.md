@@ -168,6 +168,9 @@ cargo run --bin sc -- revoke <prefix> --recipient-id <id>                # path-
                                              # NB: top-level grant/revoke act on protected
                                              # path prefixes; `secret grant/revoke` act on
                                              # named secrets — two different surfaces
+bash demo/run_protect_demo.sh                # encrypted-paths proof (P7): protected path commits
+                                             # as ciphertext, unreadable in a keyless clone,
+                                             # decrypts only for the recipient
 cargo run --bin sc -- secret add <name> --to <recipient> --value <val>
                                              # omit --value to read the secret from stdin
                                              # (keeps it out of `ps` and shell history);
