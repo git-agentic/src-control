@@ -2,7 +2,7 @@
 
 A next-generation version control system built around a snapshot-and-tag model
 (Jujutsu-inspired), with per-file permissions, native committed secrets, and
-in-memory clones as the long-term thesis. Across 33 shipped phases, this
+in-memory clones as the long-term thesis. Across 34 shipped phases, this
 repository now proves that thesis end to end:
 
 1. **In-memory virtual worktrees** (the agent wedge) — fork N parallel worktrees
@@ -11,17 +11,19 @@ repository now proves that thesis end to end:
 2. **Native committed secrets** — env vars / keys committed into repo state,
    encrypted at rest and in transit, decrypted only in an authorized execution
    context. **Implemented (Phase 2).**
-3. **Per-file permissions** — individual paths encrypted to a chosen set of
-   recipients (randomized sealing since Phase 33, with dual-read of older
-   convergent ciphertext), merged/replayed/revoked/rewrapped without ever
-   writing plaintext to the object store. **Implemented (Phase 7, hardened
-   through Phases 15-17 and 33.)**
+3. **Per-file and per-branch permissions** — individual paths encrypted to a
+   chosen set of recipients (randomized sealing since Phase 33, with dual-read
+   of older convergent ciphertext), merged/replayed/revoked/rewrapped without
+   ever writing plaintext to the object store; and whole **private branches**
+   (Phase 34) whose commits, trees, file paths, and messages are all sealed —
+   opaque to non-recipients until an atomic `sc branch publish`. **Implemented
+   (Phase 7, hardened through Phases 15-17 and 33; per-branch in Phase 34.)**
 4. **A full persistent collaborative VCS** on top of those three pillars:
    durable `.sc/` repos, branches, three-way merge, history editing
    (cherry-pick/rebase/amend/undo), durable multi-invocation agent sessions,
    signed commits with session-transcript provenance, sparse and partial
    checkouts, and local/ssh/HTTP+TLS/Git network transports. **Implemented
-   (Phases 3-33.)**
+   (Phases 3-34.)**
 
 The system builds on / interoperates with Git rather than replacing it: it
 imports an existing Git repo's `HEAD` in-process (via `gix`), exports history
@@ -143,9 +145,10 @@ auto-merge, a commit-time secret scanner, secret/permission lifecycle
 (rotation, escrow, revocation tombstones, bulk rewrap), signed commits with
 sealed session-transcript provenance, sparse and partial checkouts, and local,
 ssh-native, sc-native HTTP/TLS (with bearer-token auth and listener resource
-limits), and Git (including hosted GitHub) network transports. All 33 phases
-are implemented and tested; `demo/` holds 25 independent end-to-end proofs,
-one per major capability. Remaining follow-ons (transparent lazy-fetch,
+limits), and Git (including hosted GitHub) network transports, plus private
+branches sealed to a recipient set until publish. All 34 phases are
+implemented and tested; `demo/` holds 26 independent end-to-end proofs, one
+per major capability. Remaining follow-ons (transparent lazy-fetch,
 per-case gap-tolerant merge on partial clones, CA-path validation alongside
 TOFU pinning, rotate-for-paths, and similar hardening items) are tracked in
 [ROADMAP.md](ROADMAP.md)'s Deferred section rather than being open MVP scope.
