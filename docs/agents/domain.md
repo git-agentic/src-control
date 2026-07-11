@@ -8,11 +8,13 @@ This repo has **no `CONTEXT.md`** (yet). Its domain language and conventions
 currently live in two root files — treat them as the glossary/context source:
 
 - **`CLAUDE.md`** at the repo root — the working guide: what this project is,
-  the crate layout + dependency rule, the core invariants, and a per-phase
-  changelog (each `**Phase N is built.**` paragraph is authoritative domain
-  vocabulary). `AGENTS.md` is a parallel copy of the same guidance.
+  the crate layout + dependency rule, the core invariants, the command surface,
+  and a condensed capability map (one entry per phase, linking to the ADR that
+  carries the authoritative domain vocabulary for that area). `AGENTS.md` is a
+  pointer to it. The full per-phase narrative log is archived at
+  `docs/archive/claude-md-phase-log-2026-07.md`.
 - **`ARCHITECTURE.md`** at the repo root — the full design and rationale.
-- **`docs/adr/`** — 37+ ADRs (0001…) recording every significant decision;
+- **`docs/adr/`** — 43+ ADRs (0001…) recording every significant decision;
   read the ADRs that touch the area you're about to work in. This is a
   single-context repo, so there are no per-crate `crates/<name>/docs/adr/`
   dirs — all decisions live in the one root `docs/adr/`.
@@ -29,13 +31,13 @@ Single-context repo:
 
 ```
 /
-├── CLAUDE.md        ← working guide + per-phase domain vocabulary (also AGENTS.md)
+├── CLAUDE.md        ← working guide + capability map (AGENTS.md points here)
 ├── ARCHITECTURE.md  ← full design + rationale
-├── docs/adr/        ← 0001…0037+ architectural decisions (one root collection)
-└── crates/          ← core, vfs, gitio, crypto, repo, cli (one cohesive VCS domain)
+├── docs/adr/        ← 0001…0043+ architectural decisions (one root collection)
+└── crates/          ← core, vfs, gitio, crypto, tlsio, repo, cli (one cohesive VCS domain)
 ```
 
-(This is a six-crate Rust workspace but **one** domain — a next-gen VCS — so a
+(This is a seven-crate Rust workspace but **one** domain — a next-gen VCS — so a
 single context, not a multi-context `CONTEXT-MAP.md` layout.)
 
 ## Use the project's vocabulary

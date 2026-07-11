@@ -848,8 +848,8 @@ for the first time.
 After the `200` status, the raw `TcpStream` goes straight to `wire::serve` —
 no HTTP framing wraps the P25 chunk stream. Zero new dependencies
 (`std::net`/`std::io` only). Standing boundaries stated plainly: plaintext
-only (no TLS), unauthenticated (closed in P29), not proxy/CDN-safe. See
-ADR-0036.
+only (no TLS — closed in P32, `sc+https://`), unauthenticated (closed in
+P29), not proxy/CDN-safe (still open). See ADR-0036.
 
 ## Phase 27 — partial clone (built)
 
@@ -922,3 +922,70 @@ gc` roots live transcript ids into reachability before signature pruning
 runs, so a signed transcript survives exactly as long as the transcript
 itself does. `sc export --to <git-repo>` drops transcripts (no Git-native
 form exists) and reports a count. See ADR-0038.
+
+## Phase 31 — listener resource limits (built)
+
+Closes ADR-0036's three named-but-open accepted consequences plus a fourth
+gap this phase's own research pass (`docs/research/bounded-server-patterns.md`)
+first named: the aggregate incoming-pack spool was unbounded on both
+transports. `sc serve --http` gains `--max-connections` (default 32; at the
+limit a new connection gets an immediate busy status at the pre-handshake
+opening seam and closes — no queuing), `--timeout` (default 300s; read+write
+timeouts now persist for the whole session instead of being cleared after the
+opening, connection-fatal on trip since a mid-stream abort desyncs the frame
+stream), and `--max-pack-size` (default 16 GiB, floor 256 MiB =
+`MAX_OBJECT_SIZE`; lives in the shared `WirePolicy`, so it applies to both
+`--http` and `--stdio`; a counted mid-stream abort replies `EC_TOO_LARGE`).
+
+The read-only pre-drain is capped at 8 MiB (`RO_DRAIN_CAP`), and the accept
+loop gained a hardcoded Go-`net/http`-shaped exponential backoff around fd
+exhaustion (5ms doubling to 1s, reset on success). `PROTOCOL_VERSION` stays
+3 — none of the bounds touch the wire protocol. Zero new dependencies.
+Proven by `demo/run_limits_demo.sh`. See ADR-0041.
+
+## Phase 32 — in-binary TLS: sc+https:// (built)
+
+A new leaf crate, `crates/tlsio` (`scl-tlsio`), is the only crate linking
+rustls/rcgen/`ring` — extending the dependency rule to `cli → repo → {vfs,
+gitio, crypto, tlsio} → core` while leaving the RustCrypto quarantine in
+`crates/crypto` untouched. Two seam functions grow a TLS wrap and nothing
+else changes: the client wraps the `TcpStream` before the opening write when
+the URL is `sc+https://`; the server wraps before the opening read when
+`--tls` is set. The opening codec, `wire.rs`, and the P31 bounds are
+byte-for-byte unchanged; `PROTOCOL_VERSION` stays 3.
+
+Trust is accept-new TOFU, the SSH `known_hosts` shape: the client pins
+`SHA-256(SPKI DER)` per host in `~/.config/sc/known_hosts`
+(`SC_HTTPS_KNOWN_HOSTS` overrides; `SC_HTTPS_FINGERPRINT` pre-pins for CI;
+`SC_HTTPS_STRICT=1` refuses unknown hosts). A pin mismatch always
+hard-fails. The server auto-mints a self-signed identity into
+`.sc/serve-tls/` (key `0600`) unless PEM is supplied; `sc serve fingerprint`
+prints the pin an operator distributes out-of-band. **Gate change:** a
+non-loopback bind now requires `--read-only`, `--allow-public`, or (`--tls`
+AND ≥1 token) — P29's "tokens alone justify a public bind" is narrowed,
+since a token protecting only a plaintext channel was never the guarantee
+its wording implied. Proven by `demo/run_tls_demo.sh`. See ADR-0042.
+
+## Phase 33 — randomized protected-path encryption (built)
+
+Closes ADR-0014's convergent equality-confirmation oracle for all new
+content: every new protected seal uses a fresh random DEK + nonce, so two
+seals of the same plaintext yield different ciphertext ids. The format tag
+is a `RANDOMIZED` perms bit on the tree entry (not a blob-layout change), so
+dual-read of pre-P33 convergent ciphertext needs zero read-path code and no
+snapshot-tag or protocol bump. Commit's per-path rule is format-dispatched:
+a convergent prior keeps re-encrypt-and-compare, a randomized prior consults
+a per-checkout keyed-PRF stat cache under a never-committed `.sc/local-key`
+(the keyed tag is authoritative on every lookup — the stat hit is never
+trusted alone, closing the git racy-stat class), and a new path seals
+randomized.
+
+`sc rewrap` eagerly upgrades any still-convergent blob to randomized as it
+re-wraps the tip, so an upgrading rewrap is no longer tree-identical, while
+a second rewrap over an all-randomized tip converges back to policy-only.
+Accepted costs landed as predicted: identical independent edits on two
+branches now conflict, and identical plaintext at two paths no longer
+dedups. The historical caveat stands forever: pre-P33 convergent ciphertext
+already in history stays equality-confirmable (rotation ≠ erasure,
+ADR-0019). See ADR-0043 and the crypto sections above, which describe the
+current sealing model in full.
