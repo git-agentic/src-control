@@ -38,27 +38,23 @@ pub fn merge_base(store: &mut Store, a: ObjectId, b: ObjectId) -> Result<Option<
 ///
 /// Private branches (P34): a branch manifest's "parents" are its superseded
 /// manifest (`prev`) plus its public base, so the push fast-forward check
-/// works over manifest chains unchanged. One extra rule covers the publish
-/// transition: a manifest `anc` also counts as an ancestor of a snapshot
-/// `desc` when its BASE is — publishing rewrites the branch to plaintext
-/// snapshots forked at that base, and a remote holding the pre-publish
-/// manifest must accept the published tip as a forward move.
+/// works over manifest chains unchanged (`ancestors` walks the `prev` chain).
+///
+/// **Publish is NOT a fast-forward** (ADR-0044): publishing rewrites the
+/// branch to plaintext snapshots whose ids cannot equal any sealed id (a
+/// sealed id is BLAKE3(ciphertext), a public id BLAKE3(plaintext) — equal
+/// ids would reopen the P33 oracle), so the published snapshot carries no
+/// structural link back to the manifest it replaced. A "manifest `anc` is an
+/// ancestor of any snapshot sharing its base" rule would be unsound: it can't
+/// distinguish the legitimate published tip from a *rollback* — an older
+/// manifest (same fork point) re-published to clobber a newer remote
+/// manifest's grants/revokes/commits. So a push of a published branch over a
+/// remote that still holds the private manifest is a genuine non-fast-forward
+/// (the remote fetches the publish, or the operator force-pushes) — the same
+/// rewrite posture `amend`/`rebase` already have. No manifest→snapshot
+/// special case exists here.
 pub fn is_ancestor(store: &mut Store, anc: ObjectId, desc: ObjectId) -> Result<bool> {
-    let desc_anc = ancestors(store, desc)?;
-    if desc_anc.contains(&anc) {
-        return Ok(true);
-    }
-    // Publish transition ONLY: `desc` must be a snapshot. Between two
-    // manifests, ancestry is exclusively the prev chain (already covered
-    // above) — treating "shares my base" as ancestry there would let a
-    // stale manifest fast-forward over a newer one, rolling back grants/
-    // revokes/commits.
-    if let Ok(Object::Manifest(m)) = store.get(&anc) {
-        if matches!(store.get(&desc), Ok(Object::Snapshot(_))) {
-            return Ok(desc_anc.contains(&m.base));
-        }
-    }
-    Ok(false)
+    Ok(ancestors(store, desc)?.contains(&anc))
 }
 
 /// All ancestors of `id`, inclusive. Kind-aware: snapshots contribute their

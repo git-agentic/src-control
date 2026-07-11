@@ -3959,13 +3959,18 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
     // served by `sc secret` than convergent `sc protect` (ADR-0014's
     // equality-confirmability caveat). Never blocks; protect proceeds
     // regardless.
-    let boundary_prefix = prefix.trim_end_matches('/');
-    let boundary_dir_prefix = format!("{boundary_prefix}/");
-    if let Some(path) = repo.worktree_paths()?.into_iter().find(|path| {
-        (path == boundary_prefix || path.starts_with(&boundary_dir_prefix))
-            && looks_like_low_entropy_secret(path.rsplit('/').next().unwrap_or(path))
-    }) {
-        eprintln!("warning: {path} looks like a low-entropy secret; convergent encryption (sc protect) is equality-confirmable — prefer 'sc secret' for API keys / .env / credentials (see ADR-0014).");
+    // The nudge is cosmetic and reads the working tree; skip it on a private
+    // branch (where `worktree_paths` can't read a sealed tree). `repo.protect`
+    // below then refuses with the authoritative "sc protect" message.
+    if repo.head_private()?.is_none() {
+        let boundary_prefix = prefix.trim_end_matches('/');
+        let boundary_dir_prefix = format!("{boundary_prefix}/");
+        if let Some(path) = repo.worktree_paths()?.into_iter().find(|path| {
+            (path == boundary_prefix || path.starts_with(&boundary_dir_prefix))
+                && looks_like_low_entropy_secret(path.rsplit('/').next().unwrap_or(path))
+        }) {
+            eprintln!("warning: {path} looks like a low-entropy secret; convergent encryption (sc protect) is equality-confirmable — prefer 'sc secret' for API keys / .env / credentials (see ADR-0014).");
+        }
     }
 
     let recipients_path = repo.layout().dot_sc.join("recipients.toml");

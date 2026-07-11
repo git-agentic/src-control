@@ -2278,7 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_ancestry_ff_chain_and_publish_transition() {
+    fn manifest_ancestry_is_prev_chain_and_publish_is_not_a_fast_forward() {
         let (root, repo, (alice_sk, _), (_, bob_pk)) = setup("ancestry");
         repo.branch_private("fix", &alice_sk, &[], &[]).unwrap();
         let (m1, _) = repo.branch_manifest("fix").unwrap().unwrap();
@@ -2288,15 +2288,22 @@ mod tests {
         let store_arc = repo.vfs().store();
         {
             let mut store = store_arc.lock().unwrap();
-            // Push's ff check: the superseded manifest is an ancestor of its
-            // successor (the prev chain), never the reverse.
+            // Push's ff check runs over the manifest prev chain: the
+            // superseded manifest is an ancestor of its successor, never the
+            // reverse (a stale manifest can't ff over a newer one).
             assert!(crate::merge::is_ancestor(&mut store, m1, m2).unwrap());
             assert!(!crate::merge::is_ancestor(&mut store, m2, m1).unwrap());
         }
 
-        // Publish transition: the (pre-publish) manifest counts as an
-        // ancestor of the published tip, so a remote holding the manifest
-        // accepts the published branch as a fast-forward.
+        // Publish is a REWRITE, not a fast-forward: the published snapshot
+        // shares no structural link with the manifest it replaced (ids differ
+        // by construction), so the pre-publish manifest is NOT an ancestor of
+        // the published tip. This is what makes a rollback-republish over a
+        // newer remote manifest a non-ff (refused) instead of a silent
+        // clobber of grants/revokes/commits — the Copilot-review data-loss
+        // hole. A publish-push over a remote still holding the private
+        // manifest is a genuine non-ff: the remote fetches, or the operator
+        // force-pushes (same posture as amend/rebase).
         repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
         write(&root, "fix.txt", "v1\n");
         repo.commit_private("alice", "c1", Some(&alice_sk)).unwrap();
@@ -2304,7 +2311,14 @@ mod tests {
         let (published, _) = repo.branch_publish("fix", &alice_sk).unwrap();
         {
             let mut store = store_arc.lock().unwrap();
-            assert!(crate::merge::is_ancestor(&mut store, m3, published).unwrap());
+            assert!(
+                !crate::merge::is_ancestor(&mut store, m3, published).unwrap(),
+                "publish must not read as a fast-forward over the private manifest"
+            );
+            // And crucially: a ROLLED-BACK older manifest is likewise not an
+            // ancestor of a published tip that shares its base — the specific
+            // hole the reviewer flagged.
+            assert!(!crate::merge::is_ancestor(&mut store, m1, published).unwrap());
         }
 
         drop(repo);

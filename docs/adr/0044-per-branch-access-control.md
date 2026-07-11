@@ -318,6 +318,20 @@ The decision shipped as designed; the concrete shape settled as follows.
   files **outside** the working tree — a key committed under a private
   branch is sealed into it and vanishes from disk on the next switch (the
   standing [[scanner-false-positive-own-keys]] hazard).
+- **Publish is a non-fast-forward, enforced (Copilot review).** An earlier
+  build gave `is_ancestor` a manifest→snapshot special case ("a manifest is
+  an ancestor of any snapshot sharing its `base`") so a remote holding the
+  pre-publish manifest would accept the published tip as a fast-forward. That
+  was unsound and contradicted this ADR's own Decision §4 ("peers see a
+  non-fast-forward ref move"): publish severs the id chain by construction,
+  so the rule couldn't distinguish the legitimate published tip from a
+  *rollback* — an older manifest (same fork point) re-published to clobber a
+  newer remote manifest's grants/revokes/commits (silent data loss). The
+  special case is removed; `is_ancestor` is purely the `prev`-chain walk, so
+  a publish-push over a remote still holding the private manifest is a
+  genuine non-ff (the remote fetches, or the operator force-pushes — the same
+  posture as `amend`/`rebase`). Pinned by
+  `manifest_ancestry_is_prev_chain_and_publish_is_not_a_fast_forward`.
 - **Reachability anchors for merged-in public content (review Critical).**
   `merge_into_private` carries the merged public tip's objects into the
   sealed inner tree as **unsealed public references** (copy-on-write — they

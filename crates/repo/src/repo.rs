@@ -1022,7 +1022,10 @@ impl Repo {
     /// The working-tree file paths (repo-relative, sorted) that `commit` would
     /// snapshot — the same set `sc protect` encrypts when they match a prefix.
     pub fn worktree_paths(&self) -> Result<Vec<String>> {
-        self.refuse_on_private("this operation")?;
+        // A private branch's tree is sealed — there is no plaintext working
+        // set to enumerate without decrypting. Callers that need one on a
+        // private branch must publish first.
+        self.refuse_on_private("listing the working-tree paths")?;
         Ok(
             worktree::read_worktree(&self.layout, &self.tracked_paths()?)?
                 .into_iter()
