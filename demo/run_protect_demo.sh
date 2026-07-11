@@ -45,11 +45,11 @@ cd "$W"
 "$SC" clone "$A" "$B" >/dev/null
 
 [ -f "$B/secret/db.txt" ] && fail "unauthorized clone wrote the protected file to disk"
-# But the ciphertext blob did travel: every object reachable in A is present in B,
-# and none of B's objects expose the plaintext.
-for obj in "$A"/.sc/objects/*; do
-  [ -f "$B/.sc/objects/$(basename "$obj")" ] || fail "clone dropped object $(basename "$obj")"
-done
+# But the ciphertext blob did travel: the clone's object store matches the
+# origin's exactly, and none of B's objects expose the plaintext.
+diff <(cd "$A" && find .sc/objects -type f | sort) \
+     <(cd "$B" && find .sc/objects -type f | sort) \
+  || fail "clone object store differs from origin"
 grep -raq "$SECRET_PLAINTEXT" "$B/.sc/objects" \
   && fail "plaintext leaked into the unauthorized clone's objects"
 echo "B (no key): protected file ABSENT from checkout, ciphertext present in objects ✔"
