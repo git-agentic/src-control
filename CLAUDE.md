@@ -118,7 +118,35 @@ cargo run --bin sc -- log                    # history: id, date, author, messag
                                              # (--json for scripts; also on secret list)
                                              # commit/merge author: --author > $SC_AUTHOR > OS user
 cargo run --bin sc -- branch <name>          # create a new branch at current tip
-cargo run --bin sc -- switch <name>          # switch branch + materialize working tree
+cargo run --bin sc -- branch <name> --private --to <recipient>... [--identity <key>]
+                                             # create a PRIVATE branch (P34): commits/trees/
+                                             # blobs sealed to the recipient set (creator +
+                                             # escrow always wrapped in); opaque to non-
+                                             # recipients until publish; flat name only
+                                             # (grammar unchanged); KEEP identity files OUTSIDE
+                                             # the working tree (a committed key is sealed in
+                                             # and vanishes on the next switch)
+cargo run --bin sc -- branch grant <name> --to <recipient> --identity <key>   # wrap the branch
+                                             # KEK for another recipient — O(1), no object churn
+cargo run --bin sc -- branch revoke <name> --recipient-id <id> --identity <key>   # revoke +
+                                             # atomically rotate the KEK + rewrap for everyone
+                                             # remaining (zero content plaintext, zero id churn;
+                                             # a revoked recipient keeps what they already
+                                             # fetched — rotation ≠ erasure)
+cargo run --bin sc -- branch publish <name> --identity <key>   # replay the sealed history as
+                                             # PUBLIC commits (messages/authors kept, new ids by
+                                             # construction, published commits start unsigned);
+                                             # scanner runs over decrypted content before any
+                                             # public write; branch becomes ordinary + public
+cargo run --bin sc -- branch list [--json] [--identity <key>]   # list branches; private ones
+                                             # marked (private) / (private, no access)
+cargo run --bin sc -- switch <name> [--identity <key>]   # switch branch + materialize working
+                                             # tree; a private branch needs a recipient --identity
+cargo run --bin sc -- status --identity <key>   # (and diff/log) need --identity on a private branch
+cargo run --bin sc -- merge <public-branch> --identity <key>   # ON a private branch: merges the
+                                             # public branch IN (keeps an embargo current); the
+                                             # reverse (merge/cherry-pick/rebase FROM a private
+                                             # branch) is refused — publish first
 cargo run --bin sc -- merge <ref> [--identity <key>]   # three-way merge (ff when possible; exits
                                              # 1 on conflicts; --identity only needed when a
                                              # protected path diverged in content on both sides)
@@ -384,6 +412,17 @@ cargo run --bin sc -- clone sc+https://host[:port]/repo <dst>   # TLS clone (P32
 bash demo/run_tls_demo.sh                     # sc+https proof (P32): TLS round trip w/ signed
                                               # chunked blob, TOFU pin/mismatch/strict/pre-pin,
                                               # tightened plaintext gate — run twice
+bash demo/run_private_branch_demo.sh          # private branch proof (P34): alice stages an
+                                              # embargoed fix on a private branch, keeps it
+                                              # current by merging main IN; a keyless clone gets
+                                              # ciphertext + a name marker only (content/paths/
+                                              # message opaque, every read surface refuses);
+                                              # grant admits bob, revoke rotates the KEK so a
+                                              # post-revoke clone can't open it while bob's pre-
+                                              # revoke clone still can (rotation ≠ erasure);
+                                              # private→public integration + git export refuse;
+                                              # publish flips it public atomically — run twice,
+                                              # zero residue
 ```
 
 Set `CARGO_TARGET_DIR` to a path outside this folder to keep `target/` out of
@@ -391,7 +430,7 @@ the project tree if desired.
 
 ## Capability map (what's built, by phase)
 
-All 33 phases are built and tested. One line of current fact per phase; the
+All 34 phases are built and tested. One line of current fact per phase; the
 authoritative rationale and full semantics live in the linked ADR, the design
 in `ARCHITECTURE.md`. The old per-phase narrative log this table replaced is
 archived verbatim at `docs/archive/claude-md-phase-log-2026-07.md` — do not
@@ -433,6 +472,7 @@ the code, those win.
 | P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff | [0041](docs/adr/0041-listener-resource-limits.md) |
 | P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md) |
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
+| P34 | Private branches: ref points at a sealed-branch manifest; every commit/tree/blob individually sealed (copy-on-write) under a per-branch KEK wrapped per recipient + escrow; `sc branch --private/grant/revoke/publish`; opaque to non-recipients (content, paths, messages); grant O(1), revoke rotates the KEK; publish replays to public with a scanner gate; git bridge + private→public integration refused; `PROTOCOL_VERSION` 4 | [0044](docs/adr/0044-per-branch-access-control.md) |
 
 ## Standing boundaries & gotchas
 
@@ -440,7 +480,8 @@ Cross-cutting current facts that bite. Security boundaries are consolidated in
 `docs/THREAT-MODEL.md` — read it before touching anything crypto- or
 transport-adjacent. The rest, imperatively:
 
-- **Wire protocol is version 3.** `MAX_OBJECT_SIZE` (256 MiB) guards the
+- **Wire protocol is version 4** (bumped from 3 in P34 for the two additive
+  sealed-branch object kinds). `MAX_OBJECT_SIZE` (256 MiB) guards the
   transfer path only — a larger blob commits locally but fails every
   subsequent push/fetch/clone at the receiver.
 - **Partial clones refuse merge, cherry-pick/rebase, `sc ws fork`/`harvest`,
@@ -467,7 +508,22 @@ transport-adjacent. The rest, imperatively:
   fetch/push/clone. `sc undo` twice = redo; undoing the initial commit is
   refused.
 - **Local branch names are flat** — the ref grammar reserves `name/branch` for
-  remote-tracking refs.
+  remote-tracking refs. (Private branches obey the same grammar — the demo
+  uses `hotfix-CVE-1234`, not `hotfix/CVE-1234`.)
+- **Private branches (P34) are the one branch kind whose ref points at a
+  manifest, not a snapshot.** They are opaque to non-recipients (content,
+  paths, messages, DAG shape); only the branch name, sealed-object count/
+  sizes, recipient ids, and public fork point leak. `commit`/`status`/`diff`/
+  `log`/`switch` need `--identity`; every snapshot-assuming op (`amend`,
+  `protect`, `secret *`, `rewrap`, `sparse *`, `ws`/`work`, `transcript
+  attach`, `sign`, creating a child branch) refuses on a private branch; and
+  integrating a private branch INTO a public one (merge/cherry-pick/rebase
+  from it, or git export/push) is refused everywhere except `sc branch
+  publish`. Merging a public branch IN is allowed (keeps an embargo current).
+  `sc branch revoke` rotates the KEK but a recipient who already fetched keeps
+  the old manifest (rotation ≠ erasure). **Keep identity files outside the
+  working tree** — a key committed under a private branch is sealed in and
+  vanishes on the next switch.
 - **A signature binds identity to a snapshot id, not a branch position.**
   `amend`/`rebase`/`merge` results start unsigned by design — re-sign after
   (`sc sign <ref>`).

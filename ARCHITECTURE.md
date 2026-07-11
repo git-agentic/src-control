@@ -989,3 +989,41 @@ dedups. The historical caveat stands forever: pre-P33 convergent ciphertext
 already in history stays equality-confirmable (rotation ≠ erasure,
 ADR-0019). See ADR-0043 and the crypto sections above, which describe the
 current sealing model in full.
+
+## Phase 34 — per-branch access control: private branches (built)
+
+The last thesis pillar: staging a fix (canonically an embargoed CVE) on a
+branch that is fully opaque to non-recipients until a coordinated release.
+Where P7/P33 seal blob *content*, a private branch seals *everything* the
+branch introduces — snapshots, trees (so file paths), and blobs — as
+individually-encrypted `Object::Sealed` bodies (fresh random DEK each,
+distinct AAD from path blobs), and the branch ref points at a
+`BranchManifest` rather than a snapshot. The manifest's only plaintext is
+structural: a flat sorted list of the sealed-object ids in the branch's
+closure, the public fork point, and the KEK wraps — so gc and both
+transports get one rule each ("manifest reachable ⇒ every listed sealed id
+reachable"; "diff the flat list against the peer's haves") without ever
+decrypting. Everything else — the `inner id → (sealed id, DEK)` map and the
+inner tip — lives in a `BranchIndex` encrypted under a per-branch KEK, itself
+wrapped per recipient + escrow with the P2 X25519 envelope.
+
+Sealing is **copy-on-write**: an inner id absent from the index resolves to a
+public object read straight from the store, so a branch forked from `main`
+seals nothing at creation and reseals only what actually changes — an
+unchanged subtree keeps its public id. Grant is one KEK wrap (no object
+churn); revoke mints a fresh KEK, re-encrypts the index, and rewraps for the
+remaining recipients — zero content plaintext, zero sealed-object churn — but
+a recipient who already fetched keeps the old manifest (rotation ≠ erasure,
+the ADR-0019 boundary). Publish replays the sealed history as plaintext
+public snapshots (messages/authors/timestamps preserved, parents remapped,
+fork point unchanged) and moves the ref to the published tip; object ids
+necessarily change on publish (a sealed id is BLAKE3(ciphertext), a public id
+BLAKE3(plaintext) — equal ids would reopen the P33 oracle), so published
+commits start unsigned, and the P5 scanner runs over all decrypted content
+before any public object is written. The git bridge refuses private branches
+unconditionally (there is no git structure to export — it is what's sealed),
+integrating a private branch into a public one is refused everywhere except
+publish, and filtered clones exclude private branches (sealed trees can't be
+path-filtered). Two additive object tags cross the wire, so
+`PROTOCOL_VERSION` bumps 3 → 4; no existing object's format changes. See
+ADR-0044.

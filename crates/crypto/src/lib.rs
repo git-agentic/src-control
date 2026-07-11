@@ -12,6 +12,7 @@
 pub mod envelope;
 pub mod error;
 pub mod key;
+pub mod private;
 pub mod provider;
 pub mod signing;
 
@@ -21,6 +22,9 @@ pub use envelope::{
 };
 pub use error::{Error, Result};
 pub use key::{generate_keypair, PublicKey, RecipientId, SecretKey};
+pub use private::{
+    generate_kek, open_object, seal_object, unwrap_kek_with, wrap_kek_for, BranchIndex, IndexEntry,
+};
 pub use provider::{FileKeyProvider, KeyProvider};
 pub use signing::{
     generate_identity_v2, parse_identity, sign_snapshot_id, sign_transcript_id,

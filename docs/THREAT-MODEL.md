@@ -81,6 +81,56 @@ too, not just the src-control-side metadata.
   is rotation (`sc rewrap` on the live tip), not revoke, and history keeps the old
   wraps regardless.
 
+## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
+
+- **Defends:** the full content of a private branch — file bytes, **file
+  paths**, commit messages, authors, timestamps, and inner DAG shape — against
+  any party lacking a recipient (or escrow) key. Every object a private commit
+  introduces is individually sealed (`Object::Sealed`, fresh random DEK per
+  object) under a per-branch KEK; the ref points at a manifest whose only
+  plaintext is structural (a flat sealed-object id list + the public fork
+  point). An unauthorized clone, the hosting server, and every transport
+  (plaintext `sc+http://` included) see **ciphertext only** — verified by
+  `demo/run_private_branch_demo.sh` and by the wire-pack decode test in
+  `crates/repo/src/private.rs` (the honest structural check a shell grep
+  cannot make: it decodes every non-sealed object off the wire and asserts no
+  private plaintext).
+- **Leaks by design (accepted metadata):** a private branch's **existence and
+  name** (name blandly — `hotfix-CVE-1234` in a ref itself discloses), the
+  sealed-object **count and sizes**, closure **growth over time** (commit
+  activity is observable as count deltas), the **recipient ids** (in the
+  manifest's KEK wraps), the **public fork point**, and **which public commits
+  were merged in** (both plaintext reachability anchors in the manifest — the
+  fork point plus the tips of any public branch merged in to keep the embargo
+  current, so the sealed trees' references stay transferable). No content,
+  path, or message is among these.
+- **Revoke is a KEK rotation, not erasure:** `sc branch revoke` mints a fresh
+  KEK, re-encrypts the index, and rewraps for the remaining recipients — with
+  zero content plaintext written and zero sealed-object id churn. A revoked
+  recipient who **already fetched** the branch keeps the old manifest + old KEK
+  and can decrypt everything sealed *before* the revoke, forever (the same
+  rotation ≠ erasure boundary ADR-0019 names for secrets — content addressing
+  keeps the old manifest reachable in any clone that has it). The rotation
+  guarantees they can read nothing sealed *after*. Real cutover of already-
+  disclosed content also means rotating the underlying credential.
+- **Escrow holders can read pre-publish:** the branch KEK is wrapped to the
+  configured escrow set at creation (and re-wrapped on every membership
+  change), so break-glass holders can open an embargoed branch — the standing
+  meaning of escrow, applied consistently.
+- **Publish makes intermediate commit messages public** and gives every
+  published commit a **new snapshot id** (a sealed id is BLAKE3(ciphertext), a
+  public id is BLAKE3(plaintext) — equal ids would be the very oracle P33
+  closed), so **published commits start unsigned** (re-sign with `sc sign`).
+  Publish re-runs the P5 secret scanner over all decrypted content **before**
+  writing any public object, so a secret committed under seal cannot sail into
+  plaintext history at release.
+- **Does NOT defend:** a malicious *recipient* (any key-holder can read,
+  commit, grant, or publish); the git bridge carries private branches **not at
+  all** (export/push refuse unconditionally — `--include-encrypted` does not
+  apply, ADR-0044 §7); and integrating a private branch *into* a public one is
+  refused everywhere except `sc branch publish` — the one loudly-named,
+  atomic, scanner-gated crossing.
+
 ## Signed commits & provenance (`sc commit --sign` / `sc verify`) — ADR-0032
 
 - **Defends:** history rewriting (an `amend`/`rebase`/`merge`-attack in a clone or

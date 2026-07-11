@@ -369,7 +369,25 @@ impl Repo {
             Some((_, before, after)) => (before != after, *before),
             None => (false, refs::read_branch_tip(&self.layout, &restored_head)?),
         };
-        let rematerialize = rec.head_before != rec.head_after || moves_current_tip;
+        let mut rematerialize = rec.head_before != rec.head_after || moves_current_tip;
+
+        // Private branches (P34): undo carries no identity, and a manifest
+        // tip cannot be decoded (let alone materialized) without one. When
+        // the current tip or the restored tip is a branch manifest, restore
+        // the refs but skip the dirty check + rematerialize — the working
+        // tree goes stale until `sc switch <branch> --identity` re-lays it,
+        // which the CLI surfaces. Never touches the worktree, so nothing can
+        // be clobbered.
+        let cur_tip = refs::read_branch_tip(&self.layout, &refs::current_branch(&self.layout)?)?;
+        let tip_is_manifest = |t: Option<ObjectId>| -> Result<bool> {
+            Ok(match t {
+                Some(id) => self.manifest_at(&id)?.is_some(),
+                None => false,
+            })
+        };
+        if tip_is_manifest(cur_tip)? || tip_is_manifest(will_be_tip)? {
+            rematerialize = false;
+        }
 
         if rematerialize && will_be_tip.is_none() {
             return Err(Error::InvalidArgument(

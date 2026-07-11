@@ -898,6 +898,22 @@ scale-&-reach horizon):
   `sc remote add` parse-validating `sc+http(s)://` URLs at add time, the
   way `ssh://` already does, instead of deferring the parse to first use.
 
+- **P34 follow-ons (private branches, ADR-0044).** Deferred rather than
+  built: (1) `sc branch publish --squash` — collapse the sealed history into
+  one public commit at release, hiding intermediate (embargoed) commit
+  messages that publish otherwise makes public; (2) `--no-escrow` at
+  private-branch creation, for an operator who deliberately wants no
+  break-glass reader of an embargo; (3) sealing the manifest's currently-
+  plaintext metadata (recipient ids and the public fork point) — needs an
+  anonymous-recipient KEK-wrap scheme, a real design effort; (4) manifest
+  scalability past hotfix-scale closures (the flat closure list is rewritten
+  per commit — fine for a short embargo branch, not for a long-lived one);
+  (5) slash-names for local branches so `hotfix/CVE-1234` parses (an
+  independent ref-grammar change, unrelated to access control); and (6) a
+  fetch-time freshness attestation so a hostile remote can't re-serve a
+  stale pre-revoke manifest — the same gittuf-shaped signed-ref effort the
+  P22 provenance boundary already defers.
+
 ## How a phase gets built
 
 1. Focused brainstorm for the phase (this skill) → phase spec.

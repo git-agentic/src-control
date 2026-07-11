@@ -262,6 +262,9 @@ impl Repo {
         snapshot: ObjectId,
         identity: &scl_crypto::Identity,
     ) -> Result<ObjectId> {
+        if self.manifest_at(&snapshot)?.is_some() {
+            return Err(Error::PrivateUnsupported("sc sign".into()));
+        }
         let signing = identity.signing.as_ref().ok_or_else(|| {
             Error::InvalidArgument(
                 "identity has no signing half (v1 identity); signing requires a v2 (scl-id-) \

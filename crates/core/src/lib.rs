@@ -25,7 +25,8 @@ pub const MAX_OBJECT_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 pub use error::{Error, Result};
 pub use id::ObjectId;
 pub use object::{
-    EntryKind, FileMode, Object, ProtectPrefix, Protection, RecipientEntry, RecipientState, Secret,
-    SignatureObj, Snapshot, Transcript, Tree, TreeEntry, WrappedKey, PROTECTED, RANDOMIZED,
+    BranchManifest, EntryKind, FileMode, Object, ProtectPrefix, Protection, RecipientEntry,
+    RecipientState, SealedObj, Secret, SignatureObj, Snapshot, Transcript, Tree, TreeEntry,
+    WrappedKey, PROTECTED, RANDOMIZED,
 };
 pub use store::{Backend, SpillPolicy, Store, StoreConfig, StoreStats};

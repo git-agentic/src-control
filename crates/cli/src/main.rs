@@ -84,17 +84,50 @@ enum Cmd {
         /// Emit machine-readable JSON instead of the human listing.
         #[arg(long)]
         json: bool,
+        /// Recipient identity — required when the current branch is private
+        /// (default `--identity`/`SC_IDENTITY`/`~/.sc/identity`).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
     /// Show line-level working-tree changes against HEAD (unified diff).
-    Diff,
+    Diff {
+        /// Recipient identity — required when the current branch is private
+        /// (default `--identity`/`SC_IDENTITY`/`~/.sc/identity`).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
     /// Show commit history from HEAD.
     Log {
         /// Emit machine-readable JSON instead of the human listing.
         #[arg(long)]
         json: bool,
+        /// Recipient identity — required when the current branch is private
+        /// (default `--identity`/`SC_IDENTITY`/`~/.sc/identity`).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
-    /// Create a new branch at the current tip.
-    Branch { name: String },
+    /// Create a new branch at the current tip (add --private to seal it to a
+    /// recipient set, ADR-0044), or manage private branches via subcommands.
+    #[command(args_conflicts_with_subcommands = true)]
+    Branch {
+        #[command(subcommand)]
+        op: Option<BranchOp>,
+        /// Branch name to create.
+        name: Option<String>,
+        /// Create a PRIVATE branch: commits/trees/blobs sealed to the
+        /// recipient set; opaque to everyone else until `sc branch publish`.
+        #[arg(long, requires = "name")]
+        private: bool,
+        /// Recipient names (from `.sc/recipients.toml`) to seal the branch
+        /// to. The creator's identity is always wrapped in; so is the
+        /// configured escrow set.
+        #[arg(long, value_delimiter = ',', requires = "private")]
+        to: Vec<String>,
+        /// Creator identity for --private (default
+        /// `--identity`/`SC_IDENTITY`/`~/.sc/identity`).
+        #[arg(long, requires = "private")]
+        identity: Option<PathBuf>,
+    },
     /// Switch HEAD to a branch and materialize it. Protected files decrypt when
     /// the resolved identity is a recipient, and are skipped otherwise.
     Switch {
@@ -682,6 +715,61 @@ enum ServeTokenOp {
 }
 
 #[derive(Subcommand)]
+enum BranchOp {
+    /// Wrap the private branch's KEK for additional recipients — O(1) per
+    /// recipient, no object churn (P34, ADR-0044).
+    Grant {
+        /// The private branch.
+        name: String,
+        /// Recipient names (from `.sc/recipients.toml`).
+        #[arg(long, value_delimiter = ',')]
+        to: Vec<String>,
+        /// An authorized recipient identity (required).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Revoke a recipient AND atomically rotate the branch KEK + rewrap for
+    /// everyone remaining — zero content plaintext, zero object-id churn.
+    /// A revoked recipient keeps what they already fetched (rotation ≠
+    /// erasure); they can read nothing sealed after this.
+    Revoke {
+        /// The private branch.
+        name: String,
+        /// Recipient id (from `sc keygen` / `sc branch list`).
+        #[arg(long)]
+        recipient_id: String,
+        /// An authorized recipient identity (required — the rewrap must
+        /// unwrap the old KEK).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// Replay the private branch's history as plaintext public commits
+    /// (messages/authors/timestamps preserved, new snapshot ids by
+    /// construction) and move the branch ref to the published tip. The
+    /// secret scanner runs over all decrypted content BEFORE anything
+    /// public is written. Published commits start unsigned — re-sign after.
+    Publish {
+        /// The private branch.
+        name: String,
+        /// A recipient identity (required — publish decrypts everything).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+    /// List branches; private ones are marked `(private)` or
+    /// `(private, no access)` depending on whether the resolved identity
+    /// can open them.
+    List {
+        /// Emit machine-readable JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
+        /// Identity used only to test access for the marker (default
+        /// `--identity`/`SC_IDENTITY`/`~/.sc/identity`; missing is fine).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SecretOp {
     /// Seal a value (read from --value or stdin) to named recipients.
     Add {
@@ -787,10 +875,16 @@ fn main() -> Result<()> {
             sign,
             identity,
         } => run_amend(&resolve_author(author), message, sign, identity),
-        Cmd::Status { json } => run_status(json),
-        Cmd::Diff => run_diff(),
-        Cmd::Log { json } => run_log(json),
-        Cmd::Branch { name } => run_branch(&name),
+        Cmd::Status { json, identity } => run_status(json, identity),
+        Cmd::Diff { identity } => run_diff(identity),
+        Cmd::Log { json, identity } => run_log(json, identity),
+        Cmd::Branch {
+            op,
+            name,
+            private,
+            to,
+            identity,
+        } => run_branch(op, name, private, &to, identity),
         Cmd::Switch { name, identity } => run_switch(&name, identity),
         Cmd::Conflicts {
             path,
@@ -1620,6 +1714,28 @@ fn sign_and_report(
 
 fn run_commit(author: &str, message: &str, sign: bool, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
+    if repo.head_private()?.is_some() {
+        // Private branch (P34): the commit seals through the branch KEK.
+        if sign {
+            anyhow::bail!(
+                "--sign is not supported on a private branch (signatures bind public \
+                 snapshot ids; publish first, then `sc sign`)"
+            );
+        }
+        let sk = resolve_identity_opt(identity)?;
+        match repo.commit_private(author, message, sk.as_ref()) {
+            Ok(id) => {
+                println!("committed {} (private)", id.short());
+                return Ok(());
+            }
+            Err(scl_repo::Error::SecretDetected(report)) => {
+                drop(repo);
+                eprint!("{report}");
+                std::process::exit(1);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     match repo.commit(author, message) {
         Ok(id) => {
             println!("committed {}", id.short());
@@ -1681,10 +1797,10 @@ fn run_scan() -> Result<()> {
     std::process::exit(1);
 }
 
-fn run_status(json: bool) -> Result<()> {
+fn run_status(json: bool, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
     if json {
-        let s = repo.status()?;
+        let s = repo_status(&repo, identity.clone())?;
         let conflicts = conflicts_json(&repo)?;
         let sparse = repo.sparse_spec()?;
         println!(
@@ -1749,7 +1865,7 @@ fn run_status(json: bool) -> Result<()> {
             }
         }
     }
-    let s = repo.status()?;
+    let s = repo_status(&repo, identity)?;
     let sparse = repo.sparse_spec()?;
     if !sparse.prefixes().is_empty() {
         println!("sparse: {}", sparse.prefixes().join(", "));
@@ -2157,9 +2273,14 @@ fn render_transcript_marker_line(
     }
 }
 
-fn run_log(json: bool) -> Result<()> {
+fn run_log(json: bool, identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
-    let entries = repo.log()?;
+    let entries = if repo.head_private()?.is_some() {
+        let sk = resolve_identity_opt(identity)?;
+        repo.log_private(sk.as_ref())?
+    } else {
+        repo.log()?
+    };
     let trust = load_trust_map(&repo.layout().dot_sc.join("recipients.toml"))?;
     // Pre-compute every commit's signature status up front, before any
     // printing starts. `sig_status` does disk I/O against the signature
@@ -2239,10 +2360,26 @@ fn print_line(line: &str) {
 }
 
 /// Show line-level working-tree changes against HEAD.
-fn run_diff() -> Result<()> {
+fn run_diff(identity: Option<PathBuf>) -> Result<()> {
     let repo = open_repo()?;
-    print!("{}", repo.diff_unified()?);
+    if repo.head_private()?.is_some() {
+        let sk = resolve_identity_opt(identity)?;
+        print!("{}", repo.diff_unified_private(sk.as_ref())?);
+    } else {
+        print!("{}", repo.diff_unified()?);
+    }
     Ok(())
+}
+
+/// Status, dispatching to the private-branch variant (which needs a
+/// recipient identity) when HEAD is private.
+fn repo_status(repo: &scl_repo::Repo, identity: Option<PathBuf>) -> Result<scl_repo::Status> {
+    if repo.head_private()?.is_some() {
+        let sk = resolve_identity_opt(identity)?;
+        Ok(repo.status_private(sk.as_ref())?)
+    } else {
+        Ok(repo.status()?)
+    }
 }
 
 /// Resolve the commit/merge author: explicit `--author`, then `$SC_AUTHOR`,
@@ -2287,9 +2424,168 @@ fn fmt_utc(ts: i64) -> String {
     )
 }
 
-fn run_branch(name: &str) -> Result<()> {
-    open_repo()?.branch(name)?;
-    println!("created branch {name}");
+fn run_branch(
+    op: Option<BranchOp>,
+    name: Option<String>,
+    private: bool,
+    to: &[String],
+    identity: Option<PathBuf>,
+) -> Result<()> {
+    match op {
+        Some(BranchOp::Grant { name, to, identity }) => run_branch_grant(&name, &to, identity),
+        Some(BranchOp::Revoke {
+            name,
+            recipient_id,
+            identity,
+        }) => run_branch_revoke(&name, &recipient_id, identity),
+        Some(BranchOp::Publish { name, identity }) => run_branch_publish(&name, identity),
+        Some(BranchOp::List { json, identity }) => run_branch_list(json, identity),
+        None => {
+            let name = name.ok_or_else(|| anyhow::anyhow!("branch name required"))?;
+            if !private {
+                open_repo()?.branch(&name)?;
+                println!("created branch {name}");
+                return Ok(());
+            }
+            let repo = open_repo()?;
+            let sk = load_identity(identity)?;
+            let recipients_path = repo.layout().dot_sc.join("recipients.toml");
+            // A missing recipients file is fine when --to is empty (creator-
+            // only branch); resolving names of course still needs it.
+            let pks = if to.is_empty() {
+                Vec::new()
+            } else {
+                let dir = load_recipients(&recipients_path)?;
+                resolve_names(&dir, to)?
+            };
+            let escrows = load_escrows(&recipients_path)?;
+            let mid = repo.branch_private(&name, &sk, &pks, &escrows)?;
+            let mut ids: Vec<String> = vec![sk.public().recipient_id().to_string()];
+            for pk in pks.iter().chain(escrows.iter()) {
+                let id = pk.recipient_id().to_string();
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            println!(
+                "created PRIVATE branch {name} (manifest {}, sealed to {} key(s) incl. creator + escrow)",
+                mid.short(),
+                ids.len()
+            );
+            println!("note: content is opaque to non-recipients until `sc branch publish {name}`");
+            Ok(())
+        }
+    }
+}
+
+fn run_branch_grant(name: &str, to: &[String], identity: Option<PathBuf>) -> Result<()> {
+    let repo = open_repo()?;
+    let sk = load_identity(identity)?;
+    let recipients_path = repo.layout().dot_sc.join("recipients.toml");
+    let dir = load_recipients(&recipients_path)?;
+    let pks = resolve_names(&dir, to)?;
+    if pks.is_empty() {
+        anyhow::bail!("pass at least one recipient with --to");
+    }
+    for pk in &pks {
+        repo.branch_grant(name, &sk, pk)?;
+        println!("granted {} on {name}", pk.recipient_id());
+    }
+    Ok(())
+}
+
+fn run_branch_revoke(name: &str, recipient_id: &str, identity: Option<PathBuf>) -> Result<()> {
+    let repo = open_repo()?;
+    let sk = load_identity(identity)?;
+    let revoked = scl_crypto::RecipientId::from_hex(recipient_id)
+        .map_err(|_| anyhow::anyhow!("bad recipient id: {recipient_id}"))?;
+    // The rewrap needs a public key for every remaining recipient: pool the
+    // recipients file, the escrow set, and the caller's own identity, then
+    // resolve the manifest's current wrap list (minus the revoked id)
+    // against it. An unresolvable id is a loud error in `branch_revoke`,
+    // never silent access loss.
+    let (_, manifest) = repo
+        .branch_manifest(name)?
+        .ok_or_else(|| anyhow::anyhow!("branch {name} is not private"))?;
+    let recipients_path = repo.layout().dot_sc.join("recipients.toml");
+    let mut pool: Vec<scl_crypto::PublicKey> = load_recipients(&recipients_path)
+        .map(|m| m.into_values().collect())
+        .unwrap_or_default();
+    pool.extend(load_escrows(&recipients_path)?);
+    pool.push(sk.public());
+    let mut remaining: Vec<scl_crypto::PublicKey> = Vec::new();
+    for wrap_id in manifest
+        .kek_wraps
+        .iter()
+        .map(|w| w.recipient_id.as_str())
+        .filter(|id| *id != revoked.as_str())
+    {
+        if let Some(pk) = pool.iter().find(|pk| pk.recipient_id().as_str() == wrap_id) {
+            if !remaining
+                .iter()
+                .any(|k| k.recipient_id() == pk.recipient_id())
+            {
+                remaining.push(pk.clone());
+            }
+        }
+    }
+    repo.branch_revoke(name, &sk, &revoked, &remaining)?;
+    println!(
+        "revoked {recipient_id} on {name}; branch KEK rotated + rewrapped for {} remaining key(s)",
+        remaining.len()
+    );
+    println!("note: a revoked recipient keeps what they already fetched (rotation != erasure)");
+    Ok(())
+}
+
+fn run_branch_publish(name: &str, identity: Option<PathBuf>) -> Result<()> {
+    let repo = open_repo()?;
+    let sk = load_identity(identity)?;
+    let (tip, resealed) = repo.branch_publish(name, &sk)?;
+    println!("published {name} at {}", tip.short());
+    if resealed > 0 {
+        println!("re-sealed {resealed} protected-path file(s) into public form");
+    }
+    println!("note: published commits start unsigned — `sc sign {name}` to attest them");
+    Ok(())
+}
+
+fn run_branch_list(json: bool, identity: Option<PathBuf>) -> Result<()> {
+    let repo = open_repo()?;
+    let sk = resolve_identity_opt(identity)?;
+    let mut rows = Vec::new();
+    for (name, is_current) in repo.branches()? {
+        let (private, access) = match repo.branch_manifest(&name) {
+            Ok(Some(_)) => {
+                let ok = repo.can_open_private(&name, sk.as_ref()).unwrap_or(false);
+                (true, ok)
+            }
+            _ => (false, true),
+        };
+        rows.push((name, is_current, private, access));
+    }
+    if json {
+        let arr: Vec<_> = rows
+            .iter()
+            .map(|(name, current, private, access)| {
+                serde_json::json!({
+                    "name": name, "current": current,
+                    "private": private, "access": access,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!(arr));
+        return Ok(());
+    }
+    for (name, current, private, access) in rows {
+        let star = if current { "*" } else { " " };
+        let marker = match (private, access) {
+            (false, _) => String::new(),
+            (true, true) => " (private)".into(),
+            (true, false) => " (private, no access)".into(),
+        };
+        println!("{star} {name}{marker}");
+    }
     Ok(())
 }
 
@@ -3444,7 +3740,19 @@ fn run_push(remote: &str, include_encrypted: bool) -> Result<()> {
     let repo = open_repo()?;
     let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
     match cfg.kind(remote) {
-        Some(scl_repo::RemoteKind::Git) => run_push_git(&repo, remote, include_encrypted),
+        Some(scl_repo::RemoteKind::Git) => {
+            // The git bridge NEVER carries a private branch (ADR-0044 §7):
+            // there is no git structure to write — the structure is what's
+            // sealed — and `--include-encrypted` does not apply.
+            let branch = scl_repo::refs::current_branch(repo.layout())?;
+            if repo.is_private_branch(&branch)? {
+                anyhow::bail!(
+                    "branch {branch} is private and cannot cross the git bridge; \
+                     `sc branch publish {branch}` first"
+                );
+            }
+            run_push_git(&repo, remote, include_encrypted)
+        }
         _ => {
             let tip = repo.push(remote)?;
             println!("pushed to {remote}: {}", tip.short());
@@ -3651,13 +3959,18 @@ fn run_protect(prefix: Option<String>, to: Vec<String>, list: bool, json: bool) 
     // served by `sc secret` than convergent `sc protect` (ADR-0014's
     // equality-confirmability caveat). Never blocks; protect proceeds
     // regardless.
-    let boundary_prefix = prefix.trim_end_matches('/');
-    let boundary_dir_prefix = format!("{boundary_prefix}/");
-    if let Some(path) = repo.worktree_paths()?.into_iter().find(|path| {
-        (path == boundary_prefix || path.starts_with(&boundary_dir_prefix))
-            && looks_like_low_entropy_secret(path.rsplit('/').next().unwrap_or(path))
-    }) {
-        eprintln!("warning: {path} looks like a low-entropy secret; convergent encryption (sc protect) is equality-confirmable — prefer 'sc secret' for API keys / .env / credentials (see ADR-0014).");
+    // The nudge is cosmetic and reads the working tree; skip it on a private
+    // branch (where `worktree_paths` can't read a sealed tree). `repo.protect`
+    // below then refuses with the authoritative "sc protect" message.
+    if repo.head_private()?.is_none() {
+        let boundary_prefix = prefix.trim_end_matches('/');
+        let boundary_dir_prefix = format!("{boundary_prefix}/");
+        if let Some(path) = repo.worktree_paths()?.into_iter().find(|path| {
+            (path == boundary_prefix || path.starts_with(&boundary_dir_prefix))
+                && looks_like_low_entropy_secret(path.rsplit('/').next().unwrap_or(path))
+        }) {
+            eprintln!("warning: {path} looks like a low-entropy secret; convergent encryption (sc protect) is equality-confirmable — prefer 'sc secret' for API keys / .env / credentials (see ADR-0014).");
+        }
     }
 
     let recipients_path = repo.layout().dot_sc.join("recipients.toml");
@@ -3715,6 +4028,15 @@ fn run_export(to: PathBuf, ref_name: Option<String>, include_encrypted: bool) ->
         );
     }
     let branch = scl_repo::refs::current_branch(repo.layout())?;
+    // Private branches never export (ADR-0044 §7) — there is no git
+    // structure to write, and `--include-encrypted` does not apply (that
+    // flag covers protected paths, where the exported repo stays coherent).
+    if repo.is_private_branch(&branch)? {
+        anyhow::bail!(
+            "branch {branch} is private and cannot be exported to git; \
+             `sc branch publish {branch}` first"
+        );
+    }
     let tip = repo
         .head_tip()?
         .ok_or_else(|| anyhow::anyhow!("branch is unborn — nothing to export"))?;
