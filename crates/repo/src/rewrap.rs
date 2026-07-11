@@ -14,6 +14,9 @@ use crate::repo::Repo;
 pub struct RewrapReport {
     pub secrets_rewrapped: Vec<String>,
     pub blobs_rewrapped: usize,
+    /// Convergent (pre-P33) protected blobs eagerly re-sealed randomized
+    /// (fresh DEK + nonce, new ciphertext id) during this run (P33 Task 10).
+    pub blobs_resealed: usize,
     /// (entry label e.g. "secret db-pass" / "path secret/db.txt", reason)
     pub skipped: Vec<(String, String)>,
     /// The commit id; None on --dry-run or when nothing needed rewrapping.
@@ -24,10 +27,16 @@ impl Repo {
     /// Re-seal every secret (fresh DEK, current recipients + escrow) and
     /// replace every protected blob's wrap list (rule's granted set + escrow)
     /// at the tip, as ONE commit and ONE oplog record. Entries `identity`
-    /// cannot open are skipped and reported. Policy/registry-only: the root
-    /// tree id is untouched. Cuts the LIVE TIP only — history keeps old wraps
-    /// and old secret objects (content addressing; same boundary as rotation,
-    /// ADR-0019).
+    /// cannot open are skipped and reported. Still-convergent (pre-P33)
+    /// protected blobs are eagerly upgraded while we're here: decrypted with
+    /// the unwrapped DEK, re-sealed randomized (`encrypt_path_randomized`),
+    /// and the tree entry retargeted to the new ciphertext id with the
+    /// `RANDOMIZED` perms bit — so the root tree changes exactly when an
+    /// upgrade happened. Once every entry is randomized the run is
+    /// policy/registry-only again and the root tree id is untouched (the P17
+    /// property). Cuts the LIVE TIP only — history keeps old wraps, old
+    /// convergent ciphertext, and old secret objects (content addressing;
+    /// same boundary as rotation, ADR-0019).
     pub fn rewrap(
         &self,
         identity: &SecretKey,
@@ -121,19 +130,45 @@ impl Repo {
             new_secret_objs.push((name, Object::Secret(sealed)));
         }
 
-        // ---- Paths half: replace wrap lists with granted + escrow. ----
+        // ---- Paths half: replace wrap lists with granted + escrow; eagerly
+        // upgrade still-convergent (pre-P33) blobs to randomized. ----
         let mut protection = snap.protection.clone();
         let mut blobs_rewrapped = 0usize;
+        let mut blobs_resealed = 0usize;
+        // path -> (new blob id, new perms) for eagerly-upgraded entries; the
+        // commit tail rebuilds the root iff this is non-empty.
+        let mut retargets: std::collections::BTreeMap<String, (ObjectId, u8)> =
+            std::collections::BTreeMap::new();
+        // Old convergent blob ids some path upgraded FROM. Their wrap-map
+        // entries are removed only AFTER the loop, and only if no tree entry
+        // still references them (review Critical): two paths can share ONE
+        // convergent blob id (pre-P33 dedup of identical plaintext), and
+        // removing the shared entry inside the loop stripped the wraps out
+        // from under the second path — it was then skipped with "no wrapped
+        // DEKs recorded for blob" and left pointing at a wrap-orphaned blob
+        // at the tip: silent access loss no re-run could repair.
+        let mut upgraded_from: std::collections::BTreeSet<ObjectId> =
+            std::collections::BTreeSet::new();
+        // Main-tree protected cache: recording (path, plaintext, new id) for
+        // each upgraded path is what keeps the next `sc status`/`commit`
+        // quiet — rewrap never rematerializes the working tree, so the
+        // on-disk plaintext (and its stat) is untouched while its sealed id
+        // changes. Never opened on dry-run (no mutation, nothing to record).
+        let mut main_cache = if dry_run {
+            None
+        } else {
+            Some(self.open_protected_cache()?)
+        };
         let entries = {
             let arc = self.store_arc();
             let mut store = arc.lock().unwrap();
             crate::worktree::tree_file_entries_with_perms(&mut store, snap.root)?
         };
-        for (path, (blob_id, _mode, perms)) in entries {
+        for (path, (blob_id, _mode, perms)) in &entries {
             if perms & scl_core::PROTECTED == 0 {
                 continue;
             }
-            let Some(rule) = crate::protect::matching_prefix(&protection, &path) else {
+            let Some(rule) = crate::protect::matching_prefix(&protection, path) else {
                 skipped.push((
                     format!("path {path}"),
                     "no governing rule (bit/rule mismatch)".into(),
@@ -149,7 +184,7 @@ impl Repo {
                 ));
                 continue;
             }
-            let Some(wks) = protection.wrapped.get(&blob_id) else {
+            let Some(wks) = protection.wrapped.get(blob_id) else {
                 skipped.push((
                     format!("path {path}"),
                     "no wrapped DEKs recorded for blob".into(),
@@ -171,15 +206,8 @@ impl Repo {
                     continue;
                 }
             };
-            if dry_run {
-                blobs_rewrapped += 1;
-                continue;
-            }
-            // Rebuild the wrap list: exactly granted + escrow, reusing prior
-            // wrap bytes for recipients already present (id-stability), fresh
-            // wraps for the rest. Tombstoned/stale wraps are dropped.
-            let prior = wks.clone();
-            let mut new_wks: Vec<WrappedKey> = Vec::new();
+            // The target recipient set — exactly granted + escrow — shared
+            // by both arms below.
             let mut target_pks: Vec<PublicKey> =
                 granted.iter().map(|b| PublicKey::from_bytes(*b)).collect();
             for e in escrows {
@@ -190,6 +218,79 @@ impl Repo {
                     target_pks.push(e.clone());
                 }
             }
+            if perms & scl_core::RANDOMIZED == 0 {
+                // Convergent (pre-P33): eager upgrade. Decrypt with the DEK
+                // we just unwrapped, re-seal randomized, retarget the tree
+                // entry + wraps to the fresh ciphertext id.
+                let cipher = {
+                    let arc = self.store_arc();
+                    let obj = arc.lock().unwrap().get(blob_id)?;
+                    match obj {
+                        Object::Blob(b) => b.to_vec(),
+                        _ => {
+                            skipped
+                                .push((format!("path {path}"), "tree entry is not a blob".into()));
+                            continue;
+                        }
+                    }
+                };
+                let pt = match scl_crypto::decrypt_path(&cipher, &dek) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Corruption-shaped, not an authorization failure
+                        // (the wrap itself opened): named, not fatal.
+                        skipped.push((
+                            format!("path {path}"),
+                            format!("ciphertext failed to open: {e}"),
+                        ));
+                        continue;
+                    }
+                };
+                if dry_run {
+                    blobs_resealed += 1;
+                    continue;
+                }
+                let (new_cipher, new_dek) = scl_crypto::encrypt_path_randomized(&pt);
+                let new_id = {
+                    let arc = self.store_arc();
+                    let i = arc.lock().unwrap().put(Object::blob(new_cipher))?;
+                    i
+                };
+                let mut new_wks: Vec<WrappedKey> = target_pks
+                    .iter()
+                    .map(|pk| scl_crypto::wrap_dek_for(&new_dek, pk))
+                    .collect();
+                new_wks.sort_by(|a, b| a.recipient_id.cmp(&b.recipient_id));
+                // The OLD id's wrap entry is NOT removed here — another tree
+                // path may share this convergent blob id and still needs the
+                // wraps to upgrade itself (or, if it skips, to stay
+                // decryptable). Deferred cleanup below the loop.
+                protection.wrapped.insert(new_id, new_wks);
+                upgraded_from.insert(*blob_id);
+                retargets.insert(
+                    path.clone(),
+                    (new_id, scl_core::PROTECTED | scl_core::RANDOMIZED),
+                );
+                if let Some(c) = main_cache.as_mut() {
+                    // Recorded unconditionally for upgraded paths: if the
+                    // working file diverged locally, the keyed tag simply
+                    // won't match its plaintext — a benign spurious reseal
+                    // at the next commit, never incorrectness.
+                    c.record(path, &pt, new_id);
+                }
+                blobs_resealed += 1;
+                continue;
+            }
+            if dry_run {
+                blobs_rewrapped += 1;
+                continue;
+            }
+            // Randomized: rebuild the wrap list only — exactly granted +
+            // escrow, reusing prior wrap bytes for recipients already
+            // present (id-stability), fresh wraps for the rest.
+            // Tombstoned/stale wraps are dropped. Ciphertext id unchanged.
+            let prior = wks.clone();
+            let mut new_wks: Vec<WrappedKey> = Vec::new();
             for pk in &target_pks {
                 let rid = pk.recipient_id().to_string();
                 match prior.iter().find(|w| w.recipient_id == rid) {
@@ -198,17 +299,39 @@ impl Repo {
                 }
             }
             new_wks.sort_by(|a, b| a.recipient_id.cmp(&b.recipient_id));
-            protection.wrapped.insert(blob_id, new_wks);
+            protection.wrapped.insert(*blob_id, new_wks);
             blobs_rewrapped += 1;
+        }
+
+        // Deferred old-id wrap cleanup: drop an upgraded-from convergent id's
+        // wrap entry only when NO tree entry still points at it after the
+        // retargets are applied — a path that shared the blob but was skipped
+        // (no rule / not a recipient / …) keeps its wraps, so no entry is
+        // ever left wrap-orphaned at the tip.
+        if !upgraded_from.is_empty() {
+            let still_referenced: std::collections::BTreeSet<ObjectId> = entries
+                .iter()
+                .filter(|(p, _)| !retargets.contains_key(p.as_str()))
+                .map(|(_, (id, _, _))| *id)
+                .collect();
+            for old in &upgraded_from {
+                if !still_referenced.contains(old) {
+                    protection.wrapped.remove(old);
+                }
+            }
         }
 
         // ---- Nothing to do / dry-run: report only. ----
         if dry_run
-            || (secrets_rewrapped.is_empty() && new_secret_objs.is_empty() && blobs_rewrapped == 0)
+            || (secrets_rewrapped.is_empty()
+                && new_secret_objs.is_empty()
+                && blobs_rewrapped == 0
+                && blobs_resealed == 0)
         {
             return Ok(RewrapReport {
                 secrets_rewrapped,
                 blobs_rewrapped,
+                blobs_resealed,
                 skipped,
                 commit: None,
             });
@@ -224,15 +347,52 @@ impl Repo {
             registry.insert(name.clone(), id);
             secrets_rewrapped.push(name);
         }
+        // Rebuild the root tree iff any convergent blob was re-sealed: walk
+        // the tip's entries again, swapping in each retargeted path's new
+        // ciphertext id + `RANDOMIZED` perms and keeping every other entry's
+        // bytes/mode/perms verbatim. With no retargets the root is untouched
+        // byte-for-byte (policy-only, the P17 property — a second rewrap
+        // converges back to tree-identical).
+        let new_root = if retargets.is_empty() {
+            snap.root
+        } else {
+            let mut all: Vec<(String, Vec<u8>, scl_core::FileMode, u8)> =
+                Vec::with_capacity(entries.len());
+            {
+                let arc = self.store_arc();
+                let mut store = arc.lock().unwrap();
+                for (path, (blob_id, mode, perms)) in &entries {
+                    let (id, p) = match retargets.get(path) {
+                        Some((new_id, new_perms)) => (*new_id, *new_perms),
+                        None => (*blob_id, *perms),
+                    };
+                    let bytes = match store.get(&id)? {
+                        Object::Blob(b) => b.to_vec(),
+                        _ => return Err(Error::CorruptObject(id)),
+                    };
+                    all.push((path.clone(), bytes, *mode, p));
+                }
+                // Store lock dropped here: write_tree_with_perms locks it.
+            }
+            self.vfs.write_tree_with_perms(&all)?
+        };
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
-        let msg = format!(
-            "rewrap: {} secret(s), {} blob(s)",
-            secrets_rewrapped.len(),
-            blobs_rewrapped
-        );
-        let id =
-            self.commit_snapshot(snap.root, vec![tip], registry, protection, "system", &msg)?;
+        let msg = if blobs_resealed > 0 {
+            format!(
+                "rewrap: {} secret(s), {} blob(s), {} re-sealed randomized",
+                secrets_rewrapped.len(),
+                blobs_rewrapped,
+                blobs_resealed
+            )
+        } else {
+            format!(
+                "rewrap: {} secret(s), {} blob(s)",
+                secrets_rewrapped.len(),
+                blobs_rewrapped
+            )
+        };
+        let id = self.commit_snapshot(new_root, vec![tip], registry, protection, "system", &msg)?;
         crate::oplog::record(
             self.layout(),
             "rewrap",
@@ -240,9 +400,18 @@ impl Repo {
             &head,
             &[(head.clone(), before, Some(id))],
         )?;
+        // Persist the cache only after the commit has landed (never `?` a
+        // save — cache trouble must not fail a rewrap that already
+        // succeeded; worst case is a spurious reseal next commit).
+        if !retargets.is_empty() {
+            if let Some(c) = &main_cache {
+                c.save_best_effort();
+            }
+        }
         Ok(RewrapReport {
             secrets_rewrapped,
             blobs_rewrapped,
+            blobs_resealed,
             skipped,
             commit: Some(id),
         })
@@ -496,6 +665,312 @@ mod tests {
             report.skipped[0].1.contains("sc grant"),
             "reason must point at sc grant"
         );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- P33 Task 10: eager convergent → randomized upgrade ----
+
+    use scl_core::{
+        FileMode, Object, ObjectId, ProtectPrefix, Protection, RecipientEntry, RecipientState,
+        PROTECTED, RANDOMIZED,
+    };
+
+    /// Seed the tip with pre-P33 CONVERGENT protected entries under
+    /// `secret/`. The CLI can no longer mint convergent ciphertext (commit
+    /// seals randomized since Task 6), so this seals via the low-level
+    /// `encrypt_path` and writes the tree + protection registry directly.
+    /// Each entry: (path, plaintext, recipient the DEK is wrapped for,
+    /// wrap_wrong_dek — when true, the wrap holds a DEK that does NOT open
+    /// the ciphertext, simulating corruption the unwrap can't detect).
+    fn seed_convergent_tip(
+        repo: &Repo,
+        rule_pk: &scl_crypto::PublicKey,
+        entries: &[(&str, &[u8], &scl_crypto::PublicKey, bool)],
+    ) {
+        let mut prot = Protection::default();
+        prot.prefixes.push(ProtectPrefix {
+            prefix: "secret/".into(),
+            recipients: vec![RecipientEntry {
+                key: rule_pk.to_bytes(),
+                epoch: 1,
+                state: RecipientState::Granted,
+            }],
+        });
+        let mut files = Vec::new();
+        for (path, pt, pk, wrap_wrong) in entries {
+            let (cipher, dek) = scl_crypto::encrypt_path(pt);
+            let id = Object::blob(cipher.clone()).id();
+            let wrapped_dek = if *wrap_wrong {
+                let (_c, other) = scl_crypto::encrypt_path(b"a different plaintext entirely");
+                other
+            } else {
+                dek
+            };
+            // One wrap per recipient per blob id, as a real pre-P33 commit's
+            // reuse_prior_wraps produced — identical plaintext at two paths
+            // dedups to ONE shared blob id with ONE wrap list.
+            let wks = prot.wrapped.entry(id).or_default();
+            let rid = pk.recipient_id().to_string();
+            if !wks.iter().any(|w| w.recipient_id == rid) {
+                wks.push(scl_crypto::wrap_dek_for(&wrapped_dek, pk));
+            }
+            files.push((path.to_string(), cipher, FileMode::FILE, PROTECTED));
+        }
+        let root = repo.vfs.write_tree_with_perms(&files).unwrap();
+        let parents = repo.head_tip().unwrap().into_iter().collect();
+        repo.commit_snapshot(
+            root,
+            parents,
+            Default::default(),
+            prot,
+            "test",
+            "seed convergent",
+        )
+        .unwrap();
+    }
+
+    /// The tip tree's (blob id, perms) at `path`.
+    fn entry_at(repo: &Repo, tip: ObjectId, path: &str) -> (ObjectId, u8) {
+        let snap = repo.snapshot(&tip).unwrap();
+        let arc = repo.store_arc();
+        let mut store = arc.lock().unwrap();
+        let entries = crate::worktree::tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+        let (id, _mode, perms) = *entries.get(path).expect("entry present");
+        (id, perms)
+    }
+
+    /// Decrypt `path`'s ciphertext at `tip` via wrap presence (as `sc run`/
+    /// `decrypt_with` do): unwrap the DEK with `sk`, open the blob.
+    fn decrypt_at(repo: &Repo, tip: ObjectId, path: &str, sk: &scl_crypto::SecretKey) -> Vec<u8> {
+        let snap = repo.snapshot(&tip).unwrap();
+        let (id, _perms) = entry_at(repo, tip, path);
+        let wks = snap.protection.wrapped.get(&id).expect("wraps recorded");
+        let me = sk.public().recipient_id().to_string();
+        let wk = wks
+            .iter()
+            .find(|w| w.recipient_id == me)
+            .expect("identity has a wrap");
+        let dek = scl_crypto::unwrap_dek_with(wk, sk).unwrap();
+        let cipher = {
+            let arc = repo.store_arc();
+            let obj = arc.lock().unwrap().get(&id).unwrap();
+            match obj {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("tree entry is not a blob"),
+            }
+        };
+        scl_crypto::decrypt_path(&cipher, &dek).unwrap().to_vec()
+    }
+
+    #[test]
+    fn rewrap_upgrades_convergent_blobs_and_second_run_is_policy_only() {
+        let root = tmp_root("upgrade");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        seed_convergent_tip(
+            &repo,
+            &alice_pk,
+            &[("secret/x", b"top secret", &alice_pk, false)],
+        );
+        let tip0 = repo.head_tip().unwrap().unwrap();
+        let (old_id, old_perms) = entry_at(&repo, tip0, "secret/x");
+        assert_eq!(old_perms, PROTECTED, "fixture must be convergent");
+        let known = [alice_pk.clone()];
+
+        // Dry-run counts the upgrade without mutating anything.
+        let dry = repo.rewrap(&alice_sk, &[], &known, true).unwrap();
+        assert_eq!(dry.blobs_resealed, 1, "dry-run still REPORTS the upgrade");
+        assert!(dry.commit.is_none());
+        assert_eq!(repo.head_tip().unwrap().unwrap(), tip0, "tip must not move");
+
+        let r1 = repo.rewrap(&alice_sk, &[], &known, false).unwrap();
+        assert_eq!(r1.blobs_resealed, 1);
+        assert!(r1.skipped.is_empty());
+        let tip1 = repo.head_tip().unwrap().unwrap();
+        let (id1, perms1) = entry_at(&repo, tip1, "secret/x");
+        assert!(perms1 & RANDOMIZED != 0, "entry must be flagged randomized");
+        assert!(perms1 & PROTECTED != 0, "entry must stay protected");
+        assert_ne!(id1, old_id, "randomized reseal mints a fresh ciphertext id");
+        assert_eq!(
+            decrypt_at(&repo, tip1, "secret/x", &alice_sk),
+            b"top secret".to_vec()
+        );
+        // Old convergent id's wrap entry is dropped from the live tip; the
+        // new id carries the fresh wraps.
+        let snap1 = repo.snapshot(&tip1).unwrap();
+        assert!(!snap1.protection.wrapped.contains_key(&old_id));
+        assert!(snap1.protection.wrapped.contains_key(&id1));
+
+        let r2 = repo.rewrap(&alice_sk, &[], &known, false).unwrap();
+        assert_eq!(r2.blobs_resealed, 0, "second rewrap is policy-only again");
+        if r2.commit.is_some() {
+            let tip2 = repo.head_tip().unwrap().unwrap();
+            assert_eq!(
+                entry_at(&repo, tip2, "secret/x").0,
+                id1,
+                "ciphertext id stable"
+            );
+            assert_eq!(
+                repo.snapshot(&tip2).unwrap().root,
+                snap1.root,
+                "root untouched byte-for-byte (P17 policy-only property)"
+            );
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rewrap_upgrades_two_paths_sharing_one_convergent_blob() {
+        // Review Critical: identical plaintext at two paths pre-P33 dedups
+        // to ONE convergent blob id shared by both tree entries. The old
+        // in-loop wrap removal stripped the shared entry after the FIRST
+        // path upgraded, so the second was skipped ("no wrapped DEKs") and
+        // left pointing at a wrap-orphaned blob — silent access loss no
+        // re-run could repair. Both paths must upgrade, decryptable, and no
+        // tree entry may reference a wrapless blob at the new tip.
+        let root = tmp_root("shared-blob");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        seed_convergent_tip(
+            &repo,
+            &alice_pk,
+            &[
+                ("secret/a", b"same plaintext", &alice_pk, false),
+                ("secret/b", b"same plaintext", &alice_pk, false),
+            ],
+        );
+        let tip0 = repo.head_tip().unwrap().unwrap();
+        let (old_a, _) = entry_at(&repo, tip0, "secret/a");
+        let (old_b, _) = entry_at(&repo, tip0, "secret/b");
+        assert_eq!(old_a, old_b, "fixture must share ONE convergent blob id");
+
+        let known = [alice_pk.clone()];
+        let report = repo.rewrap(&alice_sk, &[], &known, false).unwrap();
+        assert!(report.skipped.is_empty(), "got {:?}", report.skipped);
+        assert_eq!(report.blobs_resealed, 2, "both paths re-sealed");
+
+        let tip1 = repo.head_tip().unwrap().unwrap();
+        let snap1 = repo.snapshot(&tip1).unwrap();
+        let (id_a, perms_a) = entry_at(&repo, tip1, "secret/a");
+        let (id_b, perms_b) = entry_at(&repo, tip1, "secret/b");
+        assert!(perms_a & RANDOMIZED != 0 && perms_b & RANDOMIZED != 0);
+        assert_ne!(
+            id_a, id_b,
+            "per-path randomized reseal also closes the intra-tip equality oracle"
+        );
+        assert_eq!(
+            decrypt_at(&repo, tip1, "secret/a", &alice_sk),
+            b"same plaintext".to_vec()
+        );
+        assert_eq!(
+            decrypt_at(&repo, tip1, "secret/b", &alice_sk),
+            b"same plaintext".to_vec()
+        );
+        // The shared old id is unreferenced after both retargets → removed.
+        assert!(!snap1.protection.wrapped.contains_key(&old_a));
+        // Invariant the Critical violated: every PROTECTED tree entry's id
+        // has wraps at the tip — nothing is wrap-orphaned.
+        let arc = repo.store_arc();
+        let entries = {
+            let mut store = arc.lock().unwrap();
+            crate::worktree::tree_file_entries_with_perms(&mut store, snap1.root).unwrap()
+        };
+        for (p, (id, _m, perms)) in &entries {
+            if perms & PROTECTED != 0 {
+                assert!(
+                    snap1.protection.wrapped.contains_key(id),
+                    "{p} points at a wrap-orphaned blob"
+                );
+            }
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn undo_of_reseal_commit_restores_convergent_tip_without_spurious_status() {
+        // Minor (same review): `sc undo` of a reseal commit must restore the
+        // convergent tip and report a clean status — the convergent diff
+        // branch re-encrypts the on-disk plaintext keylessly, so it needs no
+        // cache entry, and the stale randomized cache tag is harmless.
+        let root = tmp_root("undo-reseal");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), b"top secret").unwrap();
+        seed_convergent_tip(
+            &repo,
+            &alice_pk,
+            &[("secret/x", b"top secret", &alice_pk, false)],
+        );
+        let tip0 = repo.head_tip().unwrap().unwrap();
+        let known = [alice_pk.clone()];
+
+        let r = repo.rewrap(&alice_sk, &[], &known, false).unwrap();
+        assert_eq!(r.blobs_resealed, 1);
+        // Post-reseal, the cache keeps the untouched on-disk plaintext quiet.
+        let s = repo.status().unwrap();
+        assert!(s.modified.is_empty(), "post-reseal: got {:?}", s.modified);
+
+        repo.undo().unwrap();
+        assert_eq!(
+            repo.head_tip().unwrap().unwrap(),
+            tip0,
+            "one undo reverts the whole reseal commit"
+        );
+        let (_id, perms) = entry_at(&repo, tip0, "secret/x");
+        assert_eq!(perms & RANDOMIZED, 0, "tip entry is convergent again");
+        let s = repo.status().unwrap();
+        assert!(s.modified.is_empty(), "post-undo: got {:?}", s.modified);
+        assert!(s.added.is_empty(), "post-undo: got {:?}", s.added);
+        assert!(s.deleted.is_empty(), "post-undo: got {:?}", s.deleted);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rewrap_skips_unopenable_convergent_blob_and_upgrades_the_rest() {
+        // Skip-and-report for the new decrypt step: a convergent blob whose
+        // wrap opens but whose ciphertext does NOT (corruption-shaped) lands
+        // in `skipped`, named; the openable one still upgrades; the run
+        // still commits (existing partial-success semantics).
+        let root = tmp_root("convergent-skip");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        seed_convergent_tip(
+            &repo,
+            &alice_pk,
+            &[
+                ("secret/good", b"ok", &alice_pk, false),
+                ("secret/bad", b"nope", &alice_pk, true),
+            ],
+        );
+        let known = [alice_pk.clone()];
+        let report = repo.rewrap(&alice_sk, &[], &known, false).unwrap();
+        assert_eq!(report.blobs_resealed, 1, "the openable blob still upgrades");
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].0.contains("secret/bad"));
+        assert!(
+            report.skipped[0].1.contains("ciphertext failed to open"),
+            "got {:?}",
+            report.skipped[0]
+        );
+        assert!(report.commit.is_some(), "partial success still commits");
+        let tip = repo.head_tip().unwrap().unwrap();
+        let (_gid, gperms) = entry_at(&repo, tip, "secret/good");
+        assert!(gperms & RANDOMIZED != 0);
+        // The unopenable entry is left exactly as it was: convergent, same
+        // id, wraps intact — nothing silently dropped.
+        let (bid, bperms) = entry_at(&repo, tip, "secret/bad");
+        assert_eq!(bperms & RANDOMIZED, 0);
+        assert!(repo
+            .snapshot(&tip)
+            .unwrap()
+            .protection
+            .wrapped
+            .contains_key(&bid));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

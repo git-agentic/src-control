@@ -428,6 +428,7 @@ impl Repo {
                 &protection,
                 None,
                 &self.sparse_spec()?,
+                None,
             )?
         } else {
             Vec::new()

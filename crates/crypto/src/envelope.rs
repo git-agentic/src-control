@@ -136,8 +136,10 @@ const PATH_AAD: &[u8] = b"scl-path-v1";
 
 /// Convergent file encryption: the data key and nonce are derived from the
 /// plaintext, so identical plaintext yields identical `nonce‖ciphertext` bytes
-/// (stable content-addressed id, perfect dedup). Returns the blob bytes and the
-/// DEK (to be wrapped per recipient and stored in the snapshot policy).
+/// (stable content-addressed id, perfect dedup). Legacy convergent format — kept
+/// for dual-read comparison only; new seals use `encrypt_path_randomized` (P33).
+/// Returns the blob bytes and the DEK (to be wrapped per recipient and stored
+/// in the snapshot policy).
 pub fn encrypt_path(plaintext: &[u8]) -> (Vec<u8>, Zeroizing<[u8; DEK_LEN]>) {
     let hash = blake3::hash(plaintext);
     let mut ikm = Zeroizing::new([0u8; 32]);
@@ -149,6 +151,42 @@ pub fn encrypt_path(plaintext: &[u8]) -> (Vec<u8>, Zeroizing<[u8; DEK_LEN]>) {
     let mut nonce = [0u8; NONCE_LEN];
     hk.expand(b"scl-path-nonce-v1", &mut nonce)
         .expect("24-byte okm");
+
+    let cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).expect("32-byte DEK");
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: PATH_AAD,
+            },
+        )
+        .expect("aead encrypt is infallible for valid inputs");
+
+    let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ciphertext);
+    (blob, dek)
+}
+
+/// Randomized file encryption (P33): fresh random DEK + random nonce per
+/// seal, so identical plaintext yields different ciphertext every time —
+/// the ADR-0014 equality oracle is closed for content sealed this way.
+/// Blob layout and AAD are identical to `encrypt_path` (`nonce ‖ ct`,
+/// `PATH_AAD`), so `decrypt_path` opens both formats unchanged (dual-read).
+pub fn encrypt_path_randomized(plaintext: &[u8]) -> (Vec<u8>, Zeroizing<[u8; DEK_LEN]>) {
+    encrypt_path_randomized_with_rng(plaintext, &mut OsRng)
+}
+
+/// `encrypt_path_randomized` with a caller-supplied RNG (deterministic in tests).
+pub fn encrypt_path_randomized_with_rng<R: RngCore + CryptoRng>(
+    plaintext: &[u8],
+    rng: &mut R,
+) -> (Vec<u8>, Zeroizing<[u8; DEK_LEN]>) {
+    let mut dek = Zeroizing::new([0u8; DEK_LEN]);
+    rng.fill_bytes(dek.as_mut_slice());
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill_bytes(&mut nonce);
 
     let cipher = XChaCha20Poly1305::new_from_slice(dek.as_slice()).expect("32-byte DEK");
     let ciphertext = cipher
@@ -402,5 +440,27 @@ mod tests {
         assert_eq!(got.as_slice(), dek.as_slice());
         let (other_sk, _) = generate_keypair_with_rng(&mut ChaCha20Rng::seed_from_u64(2));
         assert!(unwrap_dek_with(&wk, &other_sk).is_err());
+    }
+
+    #[test]
+    fn randomized_seal_roundtrips_and_closes_the_oracle() {
+        let pt = b"the database password is hunter2";
+        let (blob1, dek1) = encrypt_path_randomized(pt);
+        let (blob2, dek2) = encrypt_path_randomized(pt);
+        // THE phase invariant: same plaintext, different ciphertext bytes.
+        assert_ne!(blob1, blob2, "equality oracle must be closed");
+        assert_ne!(dek1.as_slice(), dek2.as_slice());
+        // Dual-read: the unchanged decrypt_path opens a randomized blob.
+        assert_eq!(&decrypt_path(&blob1, &dek1).unwrap()[..], pt);
+        assert_eq!(&decrypt_path(&blob2, &dek2).unwrap()[..], pt);
+    }
+
+    #[test]
+    fn randomized_seal_is_deterministic_under_a_seeded_rng() {
+        let mut r1 = rng(7);
+        let mut r2 = rng(7);
+        let (b1, _) = encrypt_path_randomized_with_rng(b"x", &mut r1);
+        let (b2, _) = encrypt_path_randomized_with_rng(b"x", &mut r2);
+        assert_eq!(b1, b2);
     }
 }

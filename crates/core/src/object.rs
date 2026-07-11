@@ -22,6 +22,12 @@ const TAG_TRANSCRIPT: u8 = 6;
 /// encrypted file), not plaintext. Set on protected-path entries (P7).
 pub const PROTECTED: u8 = 0b0000_0001;
 
+/// Perms flag: this PROTECTED entry was sealed with a fresh random DEK+nonce
+/// (P33) rather than convergently. Always set together with `PROTECTED`.
+/// Format identification for dual-read lives here, in the tree entry, so no
+/// caller ever needs to fetch blob bytes to know the seal format.
+pub const RANDOMIZED: u8 = 0b0000_0010;
+
 /// A recipient's standing on a protected prefix: active or tombstoned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecipientState {
@@ -1020,5 +1026,14 @@ mod tests {
         assert_eq!(rule.recipients.len(), 2);
         assert_eq!(rule.granted_keys(), vec![[1; 32]]);
         assert_eq!(rule.next_epoch(), 3);
+    }
+
+    #[test]
+    fn randomized_bit_is_distinct_from_protected() {
+        assert_eq!(PROTECTED & RANDOMIZED, 0, "flags must not overlap");
+        assert_ne!(RANDOMIZED, 0);
+        // A randomized entry is always also protected.
+        let perms = PROTECTED | RANDOMIZED;
+        assert!(perms & PROTECTED != 0 && perms & RANDOMIZED != 0);
     }
 }

@@ -5,6 +5,7 @@ use std::path::Path;
 
 use scl_core::{EntryKind, FileMode, Object, ObjectId, Protection, Store, Tree, PROTECTED};
 
+use crate::cache::ProtectedCache;
 use crate::error::{Error, Result};
 use crate::ignore::Ignore;
 use crate::layout::Layout;
@@ -449,9 +450,16 @@ pub struct Diff {
 /// path:
 /// - absent on disk => CLEAN (the expected state for an unauthorized/skipped
 ///   checkout — not a user deletion);
-/// - present on disk => re-encrypt the disk bytes convergently (`encrypt_path`
-///   is a pure, keyless function) and compare the resulting ciphertext blob id
-///   to the stored one: equal => CLEAN, different => MODIFIED (a genuine edit).
+/// - present on disk, format dispatches on the `RANDOMIZED` bit (P33):
+///   - clear (convergent/legacy) => re-encrypt the disk bytes convergently
+///     (`encrypt_path` is a pure, keyless function) and compare the
+///     resulting ciphertext blob id to the stored one: equal => CLEAN,
+///     different => MODIFIED (a genuine edit). Unchanged from pre-P33.
+///   - set (randomized) => re-encryption proves nothing (a fresh seal never
+///     matches the old ciphertext even for identical plaintext), so the only
+///     public-key-free unchanged proof is the local stat cache
+///     (`cache::unchanged`, Task 3): a hit reports CLEAN, a miss/disagreement
+///     reports MODIFIED — spurious-but-safe, never incorrect.
 ///
 /// Non-protected paths use the usual plaintext-blob-id comparison.
 ///
@@ -474,7 +482,7 @@ pub struct Diff {
 /// `disable_sparse`'s preflight), so this walk never touches a gapped
 /// out-of-filter object — an out-of-filter path was never materialized to
 /// disk either, so it's expected-absent, not a deletion.
-pub fn diff_worktree(
+pub(crate) fn diff_worktree(
     layout: &Layout,
     store: &mut Store,
     head_root: Option<ObjectId>,
@@ -483,6 +491,7 @@ pub fn diff_worktree(
     // a future richer diff (e.g. prefix-aware reporting) needs no signature change.
     _protection: &Protection,
     sparse: &Sparse,
+    cache: Option<&ProtectedCache>,
 ) -> Result<Diff> {
     let head = match head_root {
         Some(root) => tree_file_entries_with_perms_sparse(store, root, sparse)?,
@@ -499,8 +508,24 @@ pub fn diff_worktree(
             None => diff.added.push(p.clone()),
             Some((hid, _mode, perms)) => {
                 let disk_id = if perms & PROTECTED != 0 {
-                    // Convergent re-encryption yields the same id as the commit did.
-                    Object::blob(scl_crypto::encrypt_path(bytes).0).id()
+                    if perms & scl_core::RANDOMIZED == 0 {
+                        // Convergent (legacy) entry: re-encryption yields the same
+                        // id as the commit did — still exact, no cache needed.
+                        Object::blob(scl_crypto::encrypt_path(bytes).0).id()
+                    } else {
+                        // Randomized entry (P33): re-encrypting proves nothing. The
+                        // stat cache (stat hit, then keyed-tag fallback) is the only
+                        // public-key-free unchanged proof; a missing entry reports
+                        // modified — spurious-but-safe, never incorrect. The cache
+                        // resolves the abs stat path against its own checkout root.
+                        match cache.and_then(|c| c.unchanged(p, bytes)) {
+                            Some(id) => id,
+                            None => {
+                                diff.modified.push(p.clone());
+                                continue;
+                            }
+                        }
+                    }
                 } else {
                     Object::blob(bytes.clone()).id()
                 };
@@ -570,7 +595,7 @@ pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
 /// paths `sparse` no longer matches. This closes the crash a bare
 /// `set_sparse`/`disable_sparse` narrowing (or a `switch`) used to hit on
 /// any partial clone with a genuine out-of-filter gap elsewhere in the tree.
-pub fn materialize(
+pub(crate) fn materialize(
     layout: &Layout,
     store: &mut Store,
     target_root: ObjectId,
@@ -578,6 +603,7 @@ pub fn materialize(
     protection: &Protection,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
+    mut cache: Option<&mut ProtectedCache>,
 ) -> Result<Vec<String>> {
     // Gap-tolerant when sparse is active (P27 Task 4): a promisor-filtered
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
@@ -637,6 +663,19 @@ pub fn materialize(
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(&full, &pt[..])?;
+                    // Record a randomized entry's cache entry right after the
+                    // write (P33): without this, the next `diff_worktree`/
+                    // `status` on this exact, unmodified plaintext has no
+                    // stat-hit or keyed-tag to match and spuriously reports
+                    // it as modified — since re-encryption can't prove
+                    // unchanged-ness for a randomized seal. Mirrors the
+                    // record call `commit`'s carry/fresh-seal paths already
+                    // make (`repo.rs`'s `snapshot_files`).
+                    if perms & scl_core::RANDOMIZED != 0 {
+                        if let Some(c) = cache.as_deref_mut() {
+                            c.record(path, &pt, *blob_id);
+                        }
+                    }
                     // `pt` (Zeroizing<Vec<u8>>) is dropped and zeroed here.
                 }
                 None => {
@@ -744,6 +783,7 @@ mod tests {
             &Default::default(),
             None,
             &Sparse::default(),
+            None,
         );
 
         // Restore perms before asserting so cleanup always works.
@@ -782,6 +822,7 @@ mod tests {
             &Default::default(),
             None,
             &Sparse::default(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, crate::error::Error::BadRef(_)), "got {err:?}");
@@ -810,11 +851,161 @@ mod tests {
             None,
             &Default::default(),
             None,
-            &Sparse::default()
+            &Sparse::default(),
+            None
         )
         .is_err());
 
         drop(store);
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn diff_dispatches_randomized_entries_through_the_cache() {
+        let (layout, mut store) = tmp_objects("p33-diff");
+        // Build a HEAD tree with one RANDOMIZED protected entry whose plaintext
+        // sits on disk, exactly as an authorized checkout leaves it.
+        let pt = b"top secret".to_vec();
+        let (cipher, _dek) = scl_crypto::encrypt_path_randomized(&pt);
+        let blob = Object::blob(cipher.clone());
+        let blob_id = blob.id();
+        store.put(blob).unwrap();
+        let inner = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "x".into(),
+                kind: EntryKind::Blob,
+                id: blob_id,
+                mode: FileMode::FILE,
+                perms: PROTECTED | scl_core::RANDOMIZED,
+            }])))
+            .unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "secret".into(),
+                kind: EntryKind::Tree,
+                id: inner,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+
+        let abs = layout.root.join("secret/x");
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, &pt).unwrap();
+
+        let key = crate::cache::local_key(&layout).unwrap();
+        let mut cache = crate::cache::ProtectedCache::open(key, layout.root.clone(), None);
+
+        // No cache entry: spurious-but-safe MODIFIED.
+        let d = diff_worktree(
+            &layout,
+            &mut store,
+            Some(root),
+            &Protection::default(),
+            &Sparse::default(),
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(d.modified, vec!["secret/x"]);
+
+        // Recorded: provably clean.
+        cache.record("secret/x", &pt, blob_id);
+        let d = diff_worktree(
+            &layout,
+            &mut store,
+            Some(root),
+            &Protection::default(),
+            &Sparse::default(),
+            Some(&cache),
+        )
+        .unwrap();
+        assert!(d.modified.is_empty() && d.added.is_empty() && d.deleted.is_empty());
+
+        // Genuine edit: modified again (tag mismatch).
+        std::fs::write(&abs, b"edited").unwrap();
+        let d = diff_worktree(
+            &layout,
+            &mut store,
+            Some(root),
+            &Protection::default(),
+            &Sparse::default(),
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(d.modified, vec!["secret/x"]);
+
+        drop(store);
+        std::fs::remove_dir_all(&layout.root).unwrap();
+        assert!(!layout.root.exists());
+    }
+
+    #[test]
+    fn materialize_populates_the_cache_for_decrypted_files() {
+        // P33 Task 7 Step 1 pin: materializing a RANDOMIZED protected entry
+        // for an authorized identity must record the decrypted plaintext into
+        // the threaded cache, so the very next `unchanged` on the untouched
+        // on-disk plaintext proves it clean (a randomized seal can't be proven
+        // unchanged by re-encrypting).
+        let (layout, mut store) = tmp_objects("p33-mat-cache");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        let pt = b"top secret".to_vec();
+        let (cipher, dek) = scl_crypto::encrypt_path_randomized(&pt);
+        let blob = Object::blob(cipher);
+        let blob_id = blob.id();
+        store.put(blob).unwrap();
+        let inner = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "x".into(),
+                kind: EntryKind::Blob,
+                id: blob_id,
+                mode: FileMode::FILE,
+                perms: PROTECTED | scl_core::RANDOMIZED,
+            }])))
+            .unwrap();
+        let root = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "secret".into(),
+                kind: EntryKind::Tree,
+                id: inner,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+
+        let mut wrapped = BTreeMap::new();
+        wrapped.insert(blob_id, vec![scl_crypto::wrap_dek_for(&dek, &pk)]);
+        let prot = Protection {
+            prefixes: Vec::new(),
+            wrapped,
+        };
+
+        let key = crate::cache::local_key(&layout).unwrap();
+        let mut cache = crate::cache::ProtectedCache::open(key, layout.root.clone(), None);
+        let skipped = materialize(
+            &layout,
+            &mut store,
+            root,
+            None,
+            &prot,
+            Some(&sk),
+            &Sparse::default(),
+            Some(&mut cache),
+        )
+        .unwrap();
+        assert!(
+            skipped.is_empty(),
+            "authorized identity decrypts, nothing skipped"
+        );
+        assert_eq!(
+            std::fs::read(layout.root.join("secret/x")).unwrap(),
+            pt,
+            "plaintext materialized on disk"
+        );
+        // The cache now proves the untouched plaintext unchanged.
+        assert_eq!(cache.unchanged("secret/x", &pt), Some(blob_id));
+
+        drop(store);
+        std::fs::remove_dir_all(&layout.root).unwrap();
+        assert!(!layout.root.exists());
     }
 }

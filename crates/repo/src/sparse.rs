@@ -181,7 +181,8 @@ impl Repo {
         let snap = self.snapshot(&tip)?;
         let store_arc = self.vfs().store();
         let mut s = store_arc.lock().unwrap();
-        crate::worktree::materialize(
+        let mut cache = self.open_protected_cache()?;
+        let skipped = crate::worktree::materialize(
             self.layout(),
             &mut s,
             snap.root,
@@ -189,7 +190,14 @@ impl Repo {
             &snap.protection,
             identity,
             &spec,
-        )
+            Some(&mut cache),
+        )?;
+        // The sparse spec (the operation's durable commit point) is already
+        // persisted above; this re-lay moves no branch ref, so the cache save
+        // is best-effort — never abort a sparse change on cache trouble
+        // (P33 Task 7).
+        cache.save_best_effort();
+        Ok(skipped)
     }
 
     /// Disable sparse checkout: clear the persisted spec and re-materialize
@@ -238,7 +246,8 @@ impl Repo {
         let snap = self.snapshot(&tip)?;
         let store_arc = self.vfs().store();
         let mut s = store_arc.lock().unwrap();
-        crate::worktree::materialize(
+        let mut cache = self.open_protected_cache()?;
+        let skipped = crate::worktree::materialize(
             self.layout(),
             &mut s,
             snap.root,
@@ -246,7 +255,12 @@ impl Repo {
             &snap.protection,
             identity,
             &Sparse::default(),
-        )
+            Some(&mut cache),
+        )?;
+        // Best-effort: the cleared sparse spec is already persisted above and
+        // this re-lay moves no branch ref (P33 Task 7).
+        cache.save_best_effort();
+        Ok(skipped)
     }
 }
 

@@ -116,12 +116,16 @@ pub(crate) fn decrypt_with(
     Err(Error::NotAuthorized(path.to_string()))
 }
 
-/// Convergently encrypt `plaintexts` (path, bytes, mode, rule recipients),
-/// wrapping each fresh DEK to its recipients. Returns the ciphertext write-set
-/// entries (PROTECTED perms) and fresh wraps keyed by ciphertext blob id.
-/// Errors `InvalidArgument` if any file's recipient list is empty: a rule whose
-/// every recipient is tombstoned (e.g. crossed revokes merged together) must fail
-/// the seal loudly — sealing to nobody mints permanently unreadable ciphertext.
+/// Randomized encryption (P33, ADR-0043): each file seals under a fresh
+/// random DEK+nonce, wrapping that DEK to its rule's recipients. Returns the
+/// ciphertext write-set entries (PROTECTED | RANDOMIZED perms) and fresh
+/// wraps keyed by ciphertext blob id. Because the seal is randomized, the
+/// blob id is fresh on every call — identical plaintext no longer dedups
+/// across paths or across re-seals of the same content; that oracle-closing
+/// trade is deliberate (accepted cost 4c). Errors `InvalidArgument` if any
+/// file's recipient list is empty: a rule whose every recipient is
+/// tombstoned (e.g. crossed revokes merged together) must fail the seal
+/// loudly — sealing to nobody mints permanently unreadable ciphertext.
 pub(crate) fn encrypt_protected(
     plaintexts: Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)>,
 ) -> Result<(
@@ -138,7 +142,7 @@ pub(crate) fn encrypt_protected(
                  (all revoked?); run `sc grant` before committing under this prefix"
             )));
         }
-        let (blob_bytes, dek) = scl_crypto::encrypt_path(&bytes);
+        let (blob_bytes, dek) = scl_crypto::encrypt_path_randomized(&bytes);
         // Build the blob object once for its id; `write_tree_with_perms` does
         // the (idempotent) store insert below — no second explicit `put`.
         let blob_id = Object::blob(blob_bytes.clone()).id();
@@ -147,7 +151,12 @@ pub(crate) fn encrypt_protected(
             .map(|pk| scl_crypto::wrap_dek_for(&dek, &scl_crypto::PublicKey::from_bytes(*pk)))
             .collect();
         fresh_wrapped.insert(blob_id, wks);
-        all.push((path, blob_bytes, mode, scl_core::PROTECTED));
+        all.push((
+            path,
+            blob_bytes,
+            mode,
+            scl_core::PROTECTED | scl_core::RANDOMIZED,
+        ));
     }
     Ok((all, fresh_wrapped))
 }
@@ -155,6 +164,10 @@ pub(crate) fn encrypt_protected(
 /// Prior-wrap reuse: for each (blob_id, recipient_id) already wrapped in
 /// `prior`, keep the prior wrap bytes so unchanged content's protection
 /// encoding (and thus snapshot ids) stays stable. Mutates `fresh` in place.
+/// Since P33 (ADR-0043), `encrypt_protected`'s seals are randomized, so a
+/// freshly sealed blob's id is never a key in `prior` — this only fires for
+/// the carried, id-stable case (Task 5's carry-forward of unchanged
+/// protected content), never for a genuinely new seal.
 pub(crate) fn reuse_prior_wraps(
     fresh: &mut BTreeMap<ObjectId, Vec<WrappedKey>>,
     prior: &BTreeMap<ObjectId, Vec<WrappedKey>>,
@@ -174,6 +187,27 @@ pub(crate) fn reuse_prior_wraps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypt_protected_seals_randomized() {
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        let f = |v: &[u8]| {
+            encrypt_protected(vec![(
+                "secret/x".into(),
+                v.to_vec(),
+                FileMode::FILE,
+                vec![pk.to_bytes()],
+            )])
+            .unwrap()
+        };
+        let (a1, _) = f(b"same");
+        let (a2, _) = f(b"same");
+        assert_ne!(
+            a1[0].1, a2[0].1,
+            "two seals of one plaintext must differ (oracle closed)"
+        );
+        assert_eq!(a1[0].3, scl_core::PROTECTED | scl_core::RANDOMIZED);
+    }
 
     fn prot(prefixes: &[&str]) -> Protection {
         Protection {

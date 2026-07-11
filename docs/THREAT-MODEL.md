@@ -46,17 +46,34 @@ too, not just the src-control-side metadata.
   revoke` is metadata-only. Real security requires rotating the underlying
   external credential.
 
-## Protected paths (`sc protect`) — ADR-0014/0026/0027
+## Protected paths (`sc protect`) — ADR-0014/0026/0027/0043
 
 - **Defends:** read-confidentiality of designated file content for a chosen
   recipient set; an unauthorized clone gets ciphertext it cannot read.
-- **Does NOT defend — equality is confirmable:** protected paths use *convergent
-  encryption* (DEK and nonce derive from `BLAKE3(plaintext)`), so identical
-  plaintext dedups to identical ciphertext. An observer of the ciphertext can
-  therefore confirm that two protected files are identical, or that a protected
-  file matches a **guessed** plaintext. This is a deliberate tradeoff for dedup,
-  documented in ADR-0014. Low-entropy secrets (API keys, `.env`) belong in
-  `sc secret`, not `sc protect` — `sc protect` prints a nudge to that effect.
+- **Equality-confirmation oracle — closed for new content (P33, ADR-0043);
+  pre-P33 convergent ciphertext in history stays confirmable forever
+  (rotation ≠ erasure, ADR-0019).** Protected paths *used to*
+  use *convergent encryption* (DEK and nonce derive from `BLAKE3(plaintext)`),
+  so identical plaintext dedups to identical ciphertext and an observer could
+  confirm that two protected files are identical, or that a protected file
+  matches a **guessed** plaintext. As of P33, **all content sealed from this
+  phase on uses a fresh random DEK + random nonce** — two seals of the same
+  plaintext yield different ciphertext ids, closing the oracle. Convergent
+  ciphertext already written into history stays readable (dual-read) and
+  remains equality-confirmable **forever** to anyone holding a clone — this is
+  the same rotation ≠ erasure boundary ADR-0019 already names for secrets:
+  content addressing means the old convergent object stays reachable in
+  history regardless of what happens at the tip. `sc rewrap` re-seals a
+  still-convergent blob randomized **at the live tip**, which stops that
+  plaintext's convergent form from propagating into *future* snapshots built
+  on top — it does not erase the historical convergent object, which any clone
+  that already fetched it (or fetches it later) can still equality-confirm
+  against. Real cutover of guessable content means changing the content (or
+  underlying credential) itself, not just re-sealing at the tip. Low-entropy
+  secrets (API keys, `.env`) still belong in `sc secret`, not `sc protect` —
+  `sc protect` prints a nudge to that effect, and the P28 rationale is
+  unchanged (governed secret lifecycle beats a protected file even with
+  randomized sealing).
 - **Revocation is durable but not retroactive:** `sc revoke` survives merges of
   pre-revoke branches (revocation tombstones, ADR-0026), so a revoked recipient
   never seals a *fresh* DEK again. But a recipient who already held a wrap can

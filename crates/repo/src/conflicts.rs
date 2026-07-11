@@ -221,6 +221,10 @@ impl Repo {
             ResolveSide::Ours => versions.ours,
             ResolveSide::Theirs => versions.theirs,
         };
+        // Computed once and reused below for the sidecar-cleanup check too —
+        // `conflict_kind` re-derives from the DAG and is safe to call before
+        // the write.
+        let kind = self.conflict_kind(path)?;
 
         let full = safe_join(&self.layout.root, path)?;
         match chosen {
@@ -229,6 +233,42 @@ impl Repo {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&full, &bytes)?;
+
+                // P33 Task 8: a resolved PROTECTED path's plaintext is now
+                // sitting on disk exactly as the chosen side's ciphertext
+                // decrypted it — record it in the main-tree cache regardless
+                // of which side was chosen. This only pays off for an
+                // `--ours` resolution: completion's format-dispatched carry
+                // (`snapshot_files`) consults the cache against the prior
+                // TIP entry's blob id, so an `--ours` recording matches and
+                // the completing `sc commit`/`sc rebase --continue` carries
+                // the existing ciphertext instead of re-sealing under a
+                // fresh random nonce. A `--theirs` recording keys the cache
+                // to a blob id completion never looks up against (the tip is
+                // still ours), so it goes unmatched and completion re-seals
+                // randomized anyway — spurious cache-population, but benign
+                // (never incorrect, just a wasted write). Plain paths never
+                // touch the cache — it exists only to skip re-sealing
+                // convergent-free randomized ciphertext.
+                if kind == ConflictKind::Protected {
+                    let triple = self.op_triple()?;
+                    let chosen_snapshot = match side {
+                        ResolveSide::Ours => triple.ours,
+                        ResolveSide::Theirs => triple.theirs,
+                    };
+                    let store_arc = self.vfs.store();
+                    let blob_id = {
+                        let mut store = store_arc.lock().unwrap();
+                        let snap = store.get_snapshot(&chosen_snapshot)?;
+                        let entries = tree_file_entries_with_perms(&mut store, snap.root)?;
+                        entries.get(path).map(|(id, _, _)| *id)
+                    };
+                    if let Some(blob_id) = blob_id {
+                        let mut cache = self.open_protected_cache()?;
+                        cache.record(path, &bytes, blob_id);
+                        cache.save_best_effort();
+                    }
+                }
             }
             Side::Absent => match std::fs::remove_file(&full) {
                 Ok(()) => {}
@@ -255,7 +295,7 @@ impl Repo {
         // remove it when it is NOT a tracked path — a genuine sidecar is
         // untracked scratch by construction, so a tracked `{path}.theirs`
         // must be a user's real file and is left alone.
-        if self.conflict_kind(path)? != ConflictKind::Text {
+        if kind != ConflictKind::Text {
             let theirs_sidecar_path = format!("{path}.theirs");
             if !self.tracked_paths()?.contains(&theirs_sidecar_path) {
                 let sidecar = safe_join(&self.layout.root, &theirs_sidecar_path)?;
@@ -1000,6 +1040,56 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(root.join("secret/a.txt")).unwrap(), b"ours\n");
         assert!(repo.active_conflicts().unwrap().is_empty());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_ours_records_protected_content_in_main_cache() {
+        let root = tmp_root("resolve-cache");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours edits secret").unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"theirs\n").unwrap();
+        repo.commit("me", "theirs edits secret").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        let err = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+
+        repo.resolve_path("secret/a.txt", ResolveSide::Ours, Some(&alice_sk))
+            .unwrap();
+
+        // The ours-side ciphertext blob id, re-derived straight from the DAG
+        // (HEAD is still the "ours" commit — a merge in progress never moves
+        // it) — this is what the cache must map "ours\n" to.
+        let ours_tip = repo.head_tip().unwrap().unwrap();
+        let ours_blob_id = {
+            let store_arc = repo.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            let snap = store.get_snapshot(&ours_tip).unwrap();
+            let entries = tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+            entries.get("secret/a.txt").unwrap().0
+        };
+
+        let cache = repo.open_protected_cache().unwrap();
+        assert_eq!(
+            cache.unchanged("secret/a.txt", b"ours\n"),
+            Some(ours_blob_id),
+            "resolve must record the resolved plaintext -> chosen ciphertext id in the main cache"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).ok();

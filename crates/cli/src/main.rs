@@ -3825,6 +3825,17 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool) -> Result<()> {
         report.secrets_rewrapped.len(),
         report.blobs_rewrapped
     );
+    if report.blobs_resealed > 0 {
+        let reseal_verb = if dry_run {
+            "would re-seal"
+        } else {
+            "re-sealed"
+        };
+        println!(
+            "{reseal_verb} {} convergent blob(s) → randomized",
+            report.blobs_resealed
+        );
+    }
     if let Some(id) = &report.commit {
         println!("commit: {}", id.short());
     }

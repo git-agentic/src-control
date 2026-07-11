@@ -105,8 +105,10 @@ a retired pre-P16 snapshot encoding, refused with a clear error):
 - **Blob** — raw file contents.
 - **Tree** — a sorted directory listing mapping a name to `(kind, ObjectId,
   mode, permissions)`. The per-entry `permissions` byte carries the `PROTECTED`
-  bit (P7): a protected entry's blob is convergently-encrypted ciphertext, and
-  the bit is what makes "protected" and "ciphertext" synonymous in every tree.
+  bit (P7): a protected entry's blob is encrypted ciphertext — convergent for
+  pre-P33 seals, randomized (a companion `RANDOMIZED` bit, P33/ADR-0043) for
+  new ones — and the bit is what makes "protected" and "ciphertext" synonymous
+  in every tree.
 - **Snapshot** — the Jujutsu-inspired analogue of a commit: a root tree id plus
   metadata (parent snapshot ids, author, timestamp, message), a `secrets`
   side-registry (name → secret-object id, so secrets are env vars, not files),
@@ -202,8 +204,9 @@ transport: `repo` speaks a framed wire protocol over ssh:// (P12) and sc+http://
 
 All cryptography is quarantined in `crates/crypto`; `core` and `repo` see only
 opaque bytes. The crate owns three surfaces, all built on the RustCrypto stack:
-**envelope encryption** (secrets, below), **convergent encryption** for protected
-paths, and **Ed25519 signing** for provenance.
+**envelope encryption** (secrets, below), **encryption for protected paths**
+(randomized DEK/nonce for new content since P33, convergent dual-read for
+pre-P33 history — see below), and **Ed25519 signing** for provenance.
 
 Committed secrets use **envelope encryption**. Each secret object carries
 ciphertext encrypted under a fresh per-secret data-encryption key (DEK) using
@@ -231,14 +234,27 @@ does not require rotating the secret itself. This is the same envelope model use
 by age and cloud KMS, chosen because it is well-understood and auditable.
 
 **Protected paths (P7)** encrypt designated file *content* rather than named
-env-var secrets. They use **convergent encryption** — the DEK and nonce derive
-from `BLAKE3(plaintext)` — so identical protected content dedups and an
-unauthorized clone gets ciphertext it cannot read. The tradeoff (equality is
-confirmable) is deliberate and documented; the `sc protect` CLI nudges genuine
-low-entropy secrets toward `sc secret` instead (P28). Per-prefix recipient rules
-are last-writer-wins epoch registers so a revoke is durable across merges (P16),
-and `sc grant`/`revoke`/`rewrap` manage the recipient set without re-encrypting
-convergent content. See ADR-0014/0026.
+env-var secrets. As of **P33 (ADR-0043)** all new protected content is sealed
+under a **fresh random DEK + random nonce** (`RANDOMIZED` perms bit alongside
+`PROTECTED`), so two seals of the same plaintext yield different ciphertext ids
+— closing the convergent equality-confirmation oracle for everything sealed
+from P33 on. The store is **dual-read, randomized-write**: pre-P33 *convergent*
+ciphertext (DEK/nonce derived from `BLAKE3(plaintext)`) still decrypts through
+the unchanged `decrypt_path`, so no snapshot-tag bump and no forced migration —
+a pre-P33 store reads byte-for-byte identically. Commit's per-path rule is
+**format-dispatched** on the prior tip entry (convergent → re-encrypt-and-
+compare, carry-if-unchanged; randomized → keyed-PRF stat cache under a never-
+committed `.sc/local-key`; new → seal randomized), so unchanged convergent
+content stays convergent until an edit or an explicit `sc rewrap` upgrades it.
+An unauthorized clone still gets ciphertext it cannot read; the `sc protect` CLI
+still nudges genuine low-entropy secrets toward `sc secret` (P28). Per-prefix
+recipient rules are last-writer-wins epoch registers so a revoke is durable
+across merges (P16). `sc grant`/`revoke` manage the recipient set without
+touching ciphertext; **`sc rewrap` now eagerly re-seals still-convergent blobs
+randomized** as it re-wraps the tip — so a rewrap that upgrades content is no
+longer tree-identical (a convergent→randomized reseal changes the blob id),
+though a second rewrap over an all-randomized tip converges back to policy-only.
+See ADR-0014/0026/0043.
 
 **Lifecycle (P11/P17):** `sc secret rotate` re-seals a secret under a fresh DEK
 (the real cryptographic cutover, distinct from metadata-only revoke); `sc escrow`
@@ -476,12 +492,15 @@ is recovered via `--identity` and re-sealed. Recipients default to the
 secret's current set (reverse `recipient_id` lookup against
 `.sc/recipients.toml`), overridable with `--to`.
 
-Rotation is **secrets-only**: protected paths use convergent encryption
-(`DEK = HKDF(BLAKE3(plaintext))`), so a recipient who checked the file out can
-re-derive the key — "rotating" a path's DEK is either dedup-breaking or
-security-meaningless. Path lifecycle stays on recipient re-wrap
-(`grant`/`revoke`). `sc secret revoke` remains metadata-only and now hints to
-run `rotate` for the actual cryptographic cutover.
+Rotation is **secrets-only**: pre-P33 protected paths used convergent
+encryption (`DEK = HKDF(BLAKE3(plaintext))`), so a recipient who checked the
+file out could re-derive the key — "rotating" a convergent path's DEK is either
+dedup-breaking or security-meaningless. Path lifecycle stays on recipient
+re-wrap (`grant`/`revoke`). `sc secret revoke` remains metadata-only and now
+hints to run `rotate` for the actual cryptographic cutover. (**P33/ADR-0043:**
+the security-meaningless objection dissolves for **randomized** content — a
+random DEK is independent of the plaintext — so a genuine rotate-for-paths
+cutover is now coherent and recorded as an unlocked follow-on, not yet built.)
 
 `sc escrow set <pubkey-or-name>` / `sc escrow show` configure a single
 break-glass recipient key (`[escrow]` in `.sc/recipients.toml`) that is
@@ -566,7 +585,10 @@ three-way cases resolve on ciphertext ids alone: unchanged, one-side-changed,
 and clean-delete protected paths merge with no identity at all, carrying
 ciphertext blobs plus a union of wrapped DEKs. Only a **content-divergent**
 protected path — both sides edited the plaintext — needs an authorized
-`--identity`: the two plaintexts are decrypted, diff3-merged, and the result
+`--identity` (**→ P33/ADR-0043 adjustment:** under randomized sealing, both
+sides editing to even *identical* plaintext no longer id-match, so that case
+now also conflicts and needs an identity — accepted cost 4a): the two
+plaintexts are decrypted, diff3-merged, and the result
 is re-encrypted through the same `encrypt_protected`/`reuse_prior_wraps`
 helpers `commit` already used (extracted, single-sourced), so plaintext is
 never written to the CAS — conflict markers and sidecars for protected paths

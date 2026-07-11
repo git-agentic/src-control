@@ -110,4 +110,22 @@ impl Layout {
     pub fn serve_tokens_path(&self) -> PathBuf {
         self.dot_sc.join("serve-tokens.toml")
     }
+
+    /// `.sc/local-key` — per-repo random key for the P33 unchanged-detection
+    /// cache's keyed hashes. Never committed, never transferred.
+    pub fn local_key_path(&self) -> PathBuf {
+        self.dot_sc.join("local-key")
+    }
+
+    /// `.sc/protected-cache` — the main working tree's P33 stat cache.
+    pub fn protected_cache_path(&self) -> PathBuf {
+        self.dot_sc.join("protected-cache")
+    }
+
+    /// `.sc/ws/cache-<i>` — workspace `i`'s P33 stat cache. Lives BESIDE the
+    /// checkout dir (`.sc/ws/<i>/`), never inside it, so harvest's worktree
+    /// read can't pick it up as an untracked file.
+    pub fn ws_cache_path(&self, i: usize) -> PathBuf {
+        self.dot_sc.join("ws").join(format!("cache-{i}"))
+    }
 }

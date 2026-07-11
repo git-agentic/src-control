@@ -1,6 +1,7 @@
 //! `scl-repo` — the durable on-disk repository: `.sc/` layout, refs/HEAD,
 //! named branches, a git-like working tree, and commit/secret orchestration.
 
+pub(crate) mod cache;
 pub(crate) mod conflicts;
 pub mod diff3;
 pub mod error;

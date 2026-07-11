@@ -76,6 +76,23 @@ impl Repo {
         &self.layout
     }
 
+    /// Open this repo's main-checkout P33 unchanged-detection cache
+    /// (`.sc/protected-cache`), keyed by `.sc/local-key`. Every
+    /// `worktree::materialize` call against the host working tree opens one
+    /// of these and saves it right after materializing, so a randomized
+    /// protected file just decrypted to disk is recognized as unchanged by
+    /// the very next `status`/`diff` — without this, `diff_worktree`'s
+    /// randomized-entry branch has no stat-hit or keyed-tag to match and
+    /// spuriously reports the untouched file as modified.
+    pub(crate) fn open_protected_cache(&self) -> Result<crate::cache::ProtectedCache> {
+        let key = crate::cache::local_key(&self.layout)?;
+        Ok(crate::cache::ProtectedCache::open(
+            key,
+            self.layout.root.clone(),
+            Some(self.layout.protected_cache_path()),
+        ))
+    }
+
     /// The tip snapshot of the current branch (None if unborn).
     pub fn head_tip(&self) -> Result<Option<ObjectId>> {
         refs::head_tip(&self.layout)
@@ -191,7 +208,14 @@ impl Repo {
         message: &str,
     ) -> Result<ObjectId> {
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths_at(Some(parent))?)?;
-        self.snapshot_files(
+        // Pick/rebase completion opens its own main cache. It saves right
+        // after `snapshot_files` (before the caller moves the ref): the sealed
+        // blobs are already in the store via `write_tree_with_perms`, so a
+        // recorded-but-unlanded id is benign (the cache degradation contract),
+        // and both callers (`commit`'s pick arm, `rebase_continue`) move the
+        // ref immediately after a successful return.
+        let mut cache = self.open_protected_cache()?;
+        let id = self.snapshot_files(
             files,
             Some(parent),
             None,
@@ -200,9 +224,16 @@ impl Repo {
             pick_registry_base,
             None,
             &self.sparse_spec()?,
+            Some(&mut cache),
             author,
             message,
-        )
+        )?;
+        // Best-effort (P33 Task 7): this function does not own the ref move
+        // (both callers move it right after a successful return), and its
+        // save-before-ref is already justified above — a recorded-but-unlanded
+        // id is benign. Never let cache trouble abort the completion.
+        cache.save_best_effort();
+        Ok(id)
     }
 
     /// The commit pipeline minus ref movement: split protected/plaintext files,
@@ -263,6 +294,7 @@ impl Repo {
         pick_registry_base: Option<ObjectId>,
         parents_override: Option<Vec<ObjectId>>,
         sparse: &crate::sparse::Sparse,
+        mut cache: Option<&mut crate::cache::ProtectedCache>,
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
@@ -353,11 +385,143 @@ impl Repo {
             return Err(Error::SecretDetected(report));
         }
 
-        // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
+        // Plaintext files land first (perms 0); protected files are decided
+        // per-path below (carry vs. seal) and appended.
         let mut all: Vec<(String, Vec<u8>, scl_core::FileMode, u8)> =
             plain.into_iter().map(|(p, b, m)| (p, b, m, 0u8)).collect();
-        let (protected_all, mut fresh_wrapped) = crate::protect::encrypt_protected(protected)?;
+        let mut fresh_wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
+
+        // Partial-clone context is needed here now (the P33 dispatch flattens
+        // the tip tree, which must stay gap-tolerant on a partial clone) and
+        // again in the absent-path carry block below — computed once.
+        let promisor = self.promisor()?;
+        let partial = promisor.is_some();
+        // Merge/pick completion guard (P27 Task 5, T5-I4): `graft_out_of_sparse`
+        // below only splices out-of-filter subtrees back in for a plain
+        // single-tip commit (`decided_root.is_none() && merge_head.is_none()`).
+        // A merge (`merge_head: Some`) or a CONFLICTED pick/rebase completion
+        // (`decided_root: Some`) builds `all`/`root` purely from in-filter
+        // content on a partial clone — with no graft to follow, that would
+        // silently DROP every out-of-filter subtree from the new snapshot.
+        // Refuse loudly instead of ever letting that happen; a clean
+        // (non-conflicted) pick/rebase fold still has `decided_root: None`
+        // and keeps using the single-tip graft path, unaffected.
+        if partial && (decided_root.is_some() || merge_head.is_some()) {
+            return Err(crate::promisor::partial_clone_unsupported(
+                "merge/pick completion",
+            ));
+        }
+
+        // P33 format-dispatched carry (ADR-0043): decide per protected path
+        // whether the tip already holds this exact content — carry the prior
+        // ciphertext id verbatim (quiet history, no reseal) — or it must be
+        // sealed fresh. A CONVERGENT prior (no `RANDOMIZED` bit) uses the exact
+        // re-encrypt-and-compare proof and needs no cache: this is what keeps
+        // the format upgrade non-mandatory (unchanged legacy content stays
+        // convergent forever). A RANDOMIZED prior can't be compared by
+        // re-encrypting (a fresh seal differs every time), so it consults the
+        // `.sc`-local stat/tag cache; a lost/stale cache degrades to a spurious
+        // reseal, never to incorrectness. Everything else seals.
+        let tip_entries: BTreeMap<String, (ObjectId, scl_core::FileMode, u8)> = match tip {
+            Some(t) => {
+                let store_arc = self.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                let parent_root = store.get_snapshot(&t)?.root;
+                if partial {
+                    worktree::tree_file_entries_with_perms_sparse(&mut store, parent_root, sparse)?
+                } else {
+                    worktree::tree_file_entries_with_perms(&mut store, parent_root)?
+                }
+            }
+            None => BTreeMap::new(),
+        };
+
+        let mut to_seal: Vec<ProtectedFile> = Vec::new();
+        // (path, plaintext) for each sealed path, so its fresh blob id can be
+        // recorded into the cache after `encrypt_protected` returns.
+        let mut sealed_plaintexts: Vec<(String, Vec<u8>)> = Vec::new();
+        for (path, bytes, mode, granted) in protected {
+            // Decide carry (Some(prior blob id + perms)) vs. seal (None).
+            let carry: Option<(ObjectId, u8)> = match tip_entries.get(&path) {
+                Some((blob_id, _m, perms)) if perms & scl_core::PROTECTED != 0 => {
+                    let unchanged = if perms & scl_core::RANDOMIZED == 0 {
+                        // Convergent prior: exact re-encrypt-and-compare.
+                        Object::blob(scl_crypto::encrypt_path(&bytes).0).id() == *blob_id
+                    } else {
+                        // Randomized prior: the local stat/tag cache is the only
+                        // way to prove "same plaintext". Carry iff the cached id
+                        // matches the prior tip id (double-checked: same content
+                        // AND same recorded seal). The cache resolves the abs
+                        // stat path against its own checkout root (P33 Task 7),
+                        // so a workspace commit stats the workspace file, not
+                        // the host's.
+                        cache.as_deref().and_then(|c| c.unchanged(&path, &bytes)) == Some(*blob_id)
+                    };
+                    if unchanged {
+                        Some((*blob_id, *perms))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            match carry {
+                Some((blob_id, perms)) => {
+                    // Carry the prior ciphertext + perms verbatim (same
+                    // mechanics as the absent-path carry below).
+                    let cipher = {
+                        let store_arc = self.vfs.store();
+                        let mut store = store_arc.lock().unwrap();
+                        match store.get(&blob_id)? {
+                            Object::Blob(b) => Some(b.to_vec()),
+                            _ => None,
+                        }
+                    };
+                    match cipher {
+                        Some(cipher) => {
+                            all.push((path.clone(), cipher, mode, perms));
+                            if let Some(prior_wks) = protection.wrapped.get(&blob_id) {
+                                fresh_wrapped
+                                    .entry(blob_id)
+                                    .or_insert_with(|| prior_wks.clone());
+                            }
+                            // Refresh a carried randomized path's cache entry so
+                            // the next commit gets a fast stat hit (optimization
+                            // only; the caller persists after the ref moves).
+                            if perms & scl_core::RANDOMIZED != 0 {
+                                if let Some(c) = cache.as_deref_mut() {
+                                    c.record(&path, &bytes, blob_id);
+                                }
+                            }
+                        }
+                        // Prior blob unexpectedly absent (e.g. not a blob) —
+                        // fall back to sealing rather than dropping content.
+                        None => {
+                            sealed_plaintexts.push((path.clone(), bytes.clone()));
+                            to_seal.push((path, bytes, mode, granted));
+                        }
+                    }
+                }
+                None => {
+                    sealed_plaintexts.push((path.clone(), bytes.clone()));
+                    to_seal.push((path, bytes, mode, granted));
+                }
+            }
+        }
+
+        let (protected_all, sealed_wrapped) = crate::protect::encrypt_protected(to_seal)?;
+        // Record every freshly sealed path's new blob id into the cache; the
+        // committing caller persists it only after the ref actually moves.
+        if let Some(c) = cache {
+            for (path, cipher, _mode, _perms) in &protected_all {
+                if let Some((_, pt)) = sealed_plaintexts.iter().find(|(p, _)| p == path) {
+                    c.record(path, pt, Object::blob(cipher.clone()).id());
+                }
+            }
+        }
         all.extend(protected_all);
+        fresh_wrapped.extend(sealed_wrapped);
 
         // Safe-by-default: carry forward still-protected files that are absent
         // from the working tree. `commit` cannot distinguish "absent because the
@@ -415,23 +579,8 @@ impl Repo {
         // with an active sparse spec still has every object, and its
         // per-blob byte-carry below (the existing P24 mechanism) must stay
         // exactly as it was to avoid any behavior change for that case.
-        let promisor = self.promisor()?;
-        let partial = promisor.is_some();
-        // Merge/pick completion guard (P27 Task 5, T5-I4): `graft_out_of_sparse`
-        // below only splices out-of-filter subtrees back in for a plain
-        // single-tip commit (`decided_root.is_none() && merge_head.is_none()`).
-        // A merge (`merge_head: Some`) or a CONFLICTED pick/rebase completion
-        // (`decided_root: Some`) builds `all`/`root` purely from in-filter
-        // content on a partial clone — with no graft to follow, that would
-        // silently DROP every out-of-filter subtree from the new snapshot.
-        // Refuse loudly instead of ever letting that happen; a clean
-        // (non-conflicted) pick/rebase fold still has `decided_root: None`
-        // and keeps using the single-tip graft path, unaffected.
-        if partial && (decided_root.is_some() || merge_head.is_some()) {
-            return Err(crate::promisor::partial_clone_unsupported(
-                "merge/pick completion",
-            ));
-        }
+        // (`promisor`/`partial` and the merge/pick-completion partial-clone
+        // guard were hoisted above the P33 dispatch, which needs them too.)
         {
             let mut on_disk: std::collections::BTreeSet<String> =
                 all.iter().map(|(p, _, _, _)| p.clone()).collect();
@@ -538,11 +687,14 @@ impl Repo {
                 // here is still the tip's own full map (`prior` is taken
                 // below, after this point) and already carries every wrap
                 // the tip itself could offer; union in any entry
-                // `fresh_wrapped` doesn't already know about. Convergent
-                // encryption keeps a blob's id stable regardless of who
-                // grafted it, so reusing the prior wrap bytes verbatim is
-                // correct, not just convenient — no re-encryption, no key
-                // material touched.
+                // `fresh_wrapped` doesn't already know about. The graft
+                // splices the subtree in BY ID and never re-derives or
+                // touches the blob's DEK, so reusing the prior wrap bytes
+                // verbatim is correct — this holds for a RANDOMIZED blob
+                // exactly as it does for a convergent one (carry-by-id, not
+                // convergent-id-stability, is the load-bearing property; a
+                // randomized blob's id is just as stable across a
+                // by-id graft as a convergent one's).
                 for (id, wks) in &protection.wrapped {
                     fresh_wrapped.entry(*id).or_insert_with(|| wks.clone());
                 }
@@ -555,8 +707,24 @@ impl Repo {
         // `wrap_dek_for` randomizes its ephemeral key — re-wrapping every commit
         // would change the `protection` encoding (and thus the snapshot id) for
         // identical content, breaking "same content -> stable history". Carrying the
-        // prior wrap forward keeps it stable; only a newly-added recipient (or a new
-        // blob) gets a fresh wrap, and a revoked recipient is already absent here.
+        // prior wrap forward keeps it stable.
+        //
+        // P33 wrap-lifecycle note: a SEALED blob (new or edited content) wraps
+        // for exactly `granted_keys()`, so a revoked recipient is absent from
+        // its fresh wraps as before. A CARRIED blob (P33 unchanged-content
+        // dispatch above), however, keeps the tip's prior wrap list VERBATIM —
+        // it never re-derives from `granted_keys()`. That matches how the P15
+        // absent-path carry has always behaved, and it is correct: `revoke`
+        // itself eagerly strips the revoked wrap from the tip
+        // (`protect_ops::revoke`), so an ordinary post-revoke commit on
+        // unchanged content carries the already-stripped list. The one place
+        // carry diverges from the old always-reseal behavior is the ADR-0026
+        // corollary — merging a pre-revoke branch re-attaches a revoked
+        // recipient's old wraps as historical facts; the old reseal stripped
+        // them back to `granted_keys()` on the next commit, whereas carry
+        // preserves them on unchanged content. This is not a new disclosure
+        // (the recipient already holds the key; the ciphertext is unchanged)
+        // and `sc rewrap` remains the deliberate cutover, per ADR-0027.
         let prior = std::mem::take(&mut protection.wrapped);
         crate::protect::reuse_prior_wraps(&mut fresh_wrapped, &prior);
         protection.wrapped = fresh_wrapped;
@@ -617,9 +785,14 @@ impl Repo {
         let merging = merge_head.is_some();
         let picking = pick_head.is_some();
         // Pick completion (no merge in progress) is the extracted assembly
-        // (P19 Task 2 groundwork), shared with `rebase_continue`. Every
-        // other case (plain commit, merge completion) still calls
-        // `snapshot_files` directly with a freshly read working tree.
+        // (P19 Task 2 groundwork), shared with `rebase_continue`; it manages
+        // its own protected-path cache internally. Every other case (plain
+        // commit, merge completion) calls `snapshot_files` directly with a
+        // freshly read working tree and a cache this function opens here and
+        // saves only after the ref moves below — the P33 discipline. `None`
+        // in the pick arm avoids double-managing (and clobbering) the cache
+        // `assemble_completion_snapshot` already saved.
+        let mut cache: Option<crate::cache::ProtectedCache> = None;
         let id = match (tip, merge_head, pick_head) {
             (Some(t), None, Some(ph)) => self.assemble_completion_snapshot(
                 t,
@@ -631,7 +804,8 @@ impl Repo {
             )?,
             _ => {
                 let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
-                self.snapshot_files(
+                let mut c = self.open_protected_cache()?;
+                let id = self.snapshot_files(
                     files,
                     tip,
                     merge_head,
@@ -640,14 +814,23 @@ impl Repo {
                     pick_registry_base,
                     None,
                     &self.sparse_spec()?,
+                    Some(&mut c),
                     author,
                     message,
-                )?
+                )?;
+                cache = Some(c);
+                id
             }
         };
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
         crate::pick_state::clear(&self.layout)?;
+        // The ref moved: persist the cache best-effort (no-op in the pick arm,
+        // which manages its own). Cache trouble must never abort a commit
+        // whose ref already moved (P33 Task 7).
+        if let Some(c) = cache {
+            c.save_best_effort();
+        }
         let label = if merging {
             "commit (merge)"
         } else if picking {
@@ -702,6 +885,7 @@ impl Repo {
         let before = refs::read_branch_tip(&self.layout, &head)?;
 
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
+        let mut cache = self.open_protected_cache()?;
         let id = self.snapshot_files(
             files,
             Some(tip),
@@ -711,11 +895,13 @@ impl Repo {
             None,
             Some(tip_snap.parents.clone()),
             &self.sparse_spec()?,
+            Some(&mut cache),
             author,
             &msg,
         )?;
 
         refs::write_branch_tip(&self.layout, &head, &id)?;
+        cache.save_best_effort();
         crate::oplog::record(
             &self.layout,
             "amend",
@@ -810,12 +996,14 @@ impl Repo {
         };
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
+        let cache = self.open_protected_cache()?;
         worktree::diff_worktree(
             &self.layout,
             &mut store,
             head_root,
             &protection,
             &self.sparse_spec()?,
+            Some(&cache),
         )
     }
 
@@ -850,6 +1038,18 @@ impl Repo {
             .map(|t| self.snapshot(&t))
             .transpose()?
             .map(|s| s.root);
+        // Randomized (P33) protected entries need the local unchanged-cache to
+        // report clean at all (re-encryption proves nothing for them). A
+        // failure to load/mint `.sc/local-key` degrades to `None` here rather
+        // than failing the whole diff — spurious-but-safe: every randomized
+        // entry just reports "changed" instead of the diff erroring out.
+        let cache = crate::cache::local_key(&self.layout).ok().map(|key| {
+            crate::cache::ProtectedCache::open(
+                key,
+                self.layout.root.clone(),
+                Some(self.layout.protected_cache_path()),
+            )
+        });
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         let head = match head_root {
@@ -881,8 +1081,18 @@ impl Repo {
                 Some((blob_id, _mode, perms)) if *perms & PROTECTED != 0 => {
                     // Never show protected content; report the change status only.
                     if let Some(bytes) = disk {
-                        let disk_id = Object::blob(scl_crypto::encrypt_path(bytes).0).id();
-                        if disk_id != *blob_id {
+                        let changed = if *perms & scl_core::RANDOMIZED == 0 {
+                            // Convergent (legacy): re-encryption yields an exact
+                            // compare, unchanged from pre-P33.
+                            Object::blob(scl_crypto::encrypt_path(bytes).0).id() != *blob_id
+                        } else {
+                            // Randomized (P33): re-encryption proves nothing; the
+                            // cache is the only public-key-free unchanged proof.
+                            // A miss/disagreement/absent cache reports changed —
+                            // spurious-but-safe, never incorrect.
+                            cache.as_ref().and_then(|c| c.unchanged(path, bytes)) != Some(*blob_id)
+                        };
+                        if changed {
                             out.push_str(&format!(
                                 "protected file changed: {path} (content not shown)\n"
                             ));
@@ -1034,6 +1244,7 @@ impl Repo {
                 let theirs_snap = store.get_snapshot(&theirs)?;
                 let theirs_root = theirs_snap.root;
                 let theirs_protection = theirs_snap.protection;
+                let mut cache = self.open_protected_cache()?;
                 let skipped = worktree::materialize(
                     &self.layout,
                     &mut store,
@@ -1042,9 +1253,11 @@ impl Repo {
                     &theirs_protection,
                     identity,
                     &self.sparse_spec()?,
+                    Some(&mut cache),
                 )?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
+                cache.save_best_effort();
                 crate::oplog::record(
                     &self.layout,
                     &format!("merge {branch} (adopt)"),
@@ -1069,6 +1282,7 @@ impl Repo {
                 let theirs_root = theirs_snap.root;
                 let theirs_protection = theirs_snap.protection;
                 let ours_root = store.get_snapshot(&ours)?.root;
+                let mut cache = self.open_protected_cache()?;
                 let skipped = worktree::materialize(
                     &self.layout,
                     &mut store,
@@ -1077,9 +1291,11 @@ impl Repo {
                     &theirs_protection,
                     identity,
                     &self.sparse_spec()?,
+                    Some(&mut cache),
                 )?;
                 drop(store);
                 refs::write_branch_tip(&self.layout, &head, &theirs)?;
+                cache.save_best_effort();
                 crate::oplog::record(
                     &self.layout,
                     &format!("merge {branch} (ff)"),
@@ -1254,6 +1470,10 @@ impl Repo {
         // a merged PROTECTED entry decrypts for `identity` when possible, else
         // is skipped (never writes ciphertext to disk) and reported to the
         // caller. (Sidecars exist only on the conflict path, handled above.)
+        // The cache is hoisted above the block so its save can follow the ref
+        // move (`commit_snapshot` below), matching commit/amend's discipline
+        // (P33 Task 7).
+        let mut cache = self.open_protected_cache()?;
         let skipped = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
@@ -1265,6 +1485,7 @@ impl Repo {
                 &merged_protection,
                 identity,
                 &self.sparse_spec()?,
+                Some(&mut cache),
             )?
         };
 
@@ -1278,6 +1499,7 @@ impl Repo {
             author,
             &format!("merge {branch}"),
         )?;
+        cache.save_best_effort();
         crate::oplog::record(
             &self.layout,
             &format!("merge {branch}"),
@@ -1357,6 +1579,7 @@ impl Repo {
             // completion commit's decided-tree carry-forward preserves
             // skipped content, so nothing is lost by not surfacing the list
             // here (the `Err`/`Stopped` return can't carry it).
+            let mut cache = self.open_protected_cache()?;
             let _skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1365,7 +1588,11 @@ impl Repo {
                 conflict_prot,
                 identity,
                 &self.sparse_spec()?,
+                Some(&mut cache),
             )?;
+            // Conflict materialization moves no branch ref; best-effort save
+            // so cache trouble never aborts the conflict write-out (P33 Task 7).
+            cache.save_best_effort();
         }
         for (path, bytes, _mode, _recipients) in to_encrypt {
             let full = worktree::safe_join(&self.layout.root, path)?;
@@ -1413,7 +1640,10 @@ impl Repo {
             let ours_root = ours_snap.root;
             let ours_protection = ours_snap.protection;
             let theirs_root = store.get_snapshot(&theirs_id)?.root;
-            // No identity at abort time: protected files in ours are skipped (not decrypted).
+            // No identity at abort time: protected files in ours are skipped
+            // (not decrypted). With nothing decrypted, `materialize` records
+            // nothing into a cache, so pass `None` — no cache to open or save
+            // (P33 Task 7 item 7).
             skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1422,6 +1652,7 @@ impl Repo {
                 &ours_protection,
                 None,
                 &self.sparse_spec()?,
+                None,
             )?;
         }
         crate::merge_state::clear(&self.layout)?;
@@ -1530,6 +1761,9 @@ impl Repo {
             let snap = store_arc.lock().unwrap().get_snapshot(&target_tip)?;
             (snap.root, snap.protection)
         };
+        // Cache hoisted above the block so its save follows the ref move
+        // (`write_head` below), matching commit/amend's discipline (P33 Task 7).
+        let mut cache = self.open_protected_cache()?;
         let skipped = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
@@ -1541,9 +1775,11 @@ impl Repo {
                 &target_protection,
                 identity,
                 &self.sparse_spec()?,
+                Some(&mut cache),
             )?
         };
         refs::write_head(&self.layout, name)?;
+        cache.save_best_effort();
         crate::oplog::record(
             &self.layout,
             &format!("switch {name}"),
@@ -2646,13 +2882,20 @@ mod tests {
     }
 
     #[test]
-    fn convergent_merge_ids_are_stable_across_repos() {
+    fn merge_ids_no_longer_converge_across_repos() {
+        // P33/ADR-0043: `encrypt_protected`'s seals are now randomized, so
+        // this pre-P33 test's premise ("identical merged plaintext converges
+        // to the same blob id across independent repos") is deliberately
+        // broken — the oracle that convergence gave an equality-testing
+        // observer is exactly what randomization closes (accepted cost 4c).
+        // Renamed and inverted to pin the NEW behavior: two independent
+        // repos building the identical protected divergence and
+        // content-merging it now produce DIFFERENT ciphertext blob ids for
+        // the same plaintext.
+        //
         // Two independent repos build the identical protected divergence
         // (same base plaintext, same edits on both sides) and content-merge
-        // with their own (distinct) recipient identity. Convergent encryption
-        // means the merged plaintext is identical, so the resulting ciphertext
-        // blob id must be IDENTICAL across the two repos — merge output is
-        // deterministic content addressing, not per-repo randomness.
+        // with their own (distinct) recipient identity.
         fn build(tag: &str) -> (Repo, std::path::PathBuf, ObjectId, ObjectId) {
             let root = tmp_root(tag);
             let repo = Repo::init(&root).unwrap();
@@ -2684,9 +2927,9 @@ mod tests {
 
         let (repo1, root1, _id1, blob1) = build("p15-merge-convergent-a");
         let (repo2, root2, _id2, blob2) = build("p15-merge-convergent-b");
-        assert_eq!(
+        assert_ne!(
             blob1, blob2,
-            "identical merged plaintext must converge to the same blob id"
+            "randomized seals must NOT converge across independent repos (oracle closed, P33)"
         );
         drop(repo1);
         drop(repo2);
@@ -3443,6 +3686,146 @@ mod tests {
         // bob now has a wrapped DEK for the protected blob.
         let any = snap2.protection.wrapped.values().next().unwrap();
         assert_eq!(any.len(), 2, "alice + bob");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- P33 Task 5: format-dispatched carry in the commit pipeline ----
+
+    /// The ciphertext blob id recorded for `path` in `commit`'s tree.
+    fn p33_entry_id(repo: &Repo, commit: &ObjectId, path: &str) -> ObjectId {
+        let store_arc = repo.vfs.store();
+        let mut s = store_arc.lock().unwrap();
+        let root = s.get_snapshot(commit).unwrap().root;
+        let entries = worktree::tree_file_entries_with_perms(&mut s, root).unwrap();
+        entries[path].0
+    }
+
+    fn p33_blob_bytes(repo: &Repo, id: &ObjectId) -> Vec<u8> {
+        let store_arc = repo.vfs.store();
+        let mut s = store_arc.lock().unwrap();
+        match s.get(id).unwrap() {
+            Object::Blob(b) => b.to_vec(),
+            _ => panic!("expected Blob"),
+        }
+    }
+
+    #[test]
+    fn commit_carries_unchanged_convergent_content_without_reseal() {
+        // A pre-P33-style store: protect + commit mints a CONVERGENT protected
+        // entry. This pins the carry rule by blob-id stability across an
+        // unrelated commit — the protected file is never re-touched, so it
+        // must carry (not re-seal). (Under Task 5 carry and re-seal both yield
+        // the same convergent id, so this is a regression guard that survives
+        // the Task 6 seal flip precisely because unchanged content carries.)
+        let root = tmp_root("p33-conv-carry");
+        let repo = Repo::init(&root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        let c1 = repo.commit("alice", "one").unwrap();
+        let id1 = p33_entry_id(&repo, &c1, "secret/db.txt");
+
+        // Unrelated edit; the protected file is untouched on disk.
+        std::fs::write(root.join("readme.md"), b"hello").unwrap();
+        let c2 = repo.commit("alice", "two").unwrap();
+        let id2 = p33_entry_id(&repo, &c2, "secret/db.txt");
+        assert_eq!(
+            id1, id2,
+            "unchanged protected content must carry, not re-seal"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn commit_randomized_carry_via_cache_and_reseal_on_lost_cache() {
+        // Build a tip whose protected entry is `PROTECTED | RANDOMIZED` (as a
+        // post-Task-6 authorized checkout leaves it), record the plaintext in
+        // the on-disk cache, and prove: (a) a cache hit CARRIES the randomized
+        // blob id verbatim; (b) losing the cache degrades to a spurious
+        // re-seal (different id) — never to incorrectness (still decrypts).
+        let root = tmp_root("p33-rand-carry");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
+
+        // Seal a randomized protected entry and install it as the branch tip,
+        // keeping the `secret/` rule from the protect commit so the next
+        // commit routes `secret/x` through the protected split, not `plain`.
+        let pt = b"top secret".to_vec();
+        let (cipher, dek) = scl_crypto::encrypt_path_randomized(&pt);
+        let randomized_id = Object::blob(cipher.clone()).id();
+        let wks = vec![scl_crypto::wrap_dek_for(&dek, &alice_pk)];
+
+        let tip = repo.head_tip().unwrap().unwrap();
+        let tip_snap = repo.snapshot(&tip).unwrap();
+        let mut protection = tip_snap.protection.clone();
+        protection.wrapped.insert(randomized_id, wks);
+        let tree = repo
+            .vfs
+            .write_tree_with_perms(&[(
+                "secret/x".to_string(),
+                cipher.clone(),
+                scl_core::FileMode::FILE,
+                scl_core::PROTECTED | scl_core::RANDOMIZED,
+            )])
+            .unwrap();
+        let rand_tip = repo
+            .commit_snapshot(
+                tree,
+                vec![tip],
+                tip_snap.secrets.clone(),
+                protection,
+                "system",
+                "randomized tip",
+            )
+            .unwrap();
+        assert_eq!(repo.head_tip().unwrap(), Some(rand_tip));
+
+        // Materialize the plaintext on disk and record it in the on-disk cache.
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), &pt).unwrap();
+        {
+            let key = crate::cache::local_key(repo.layout()).unwrap();
+            let mut cache = crate::cache::ProtectedCache::open(
+                key,
+                repo.layout().root.clone(),
+                Some(repo.layout().protected_cache_path()),
+            );
+            cache.record("secret/x", &pt, randomized_id);
+            cache.save().unwrap();
+        }
+
+        // Unrelated edit; the randomized protected file is untouched.
+        std::fs::write(root.join("readme.md"), b"hello").unwrap();
+        let c2 = repo.commit("alice", "unrelated").unwrap();
+        assert_eq!(
+            p33_entry_id(&repo, &c2, "secret/x"),
+            randomized_id,
+            "cache hit carries"
+        );
+
+        // Lose the cache: the next commit cannot prove unchanged, so it re-seals.
+        std::fs::remove_file(repo.layout().protected_cache_path()).unwrap();
+        std::fs::write(root.join("readme.md"), b"more").unwrap();
+        let c3 = repo.commit("alice", "unrelated2").unwrap();
+        let id3 = p33_entry_id(&repo, &c3, "secret/x");
+        assert_ne!(
+            id3, randomized_id,
+            "lost cache degrades to a spurious re-seal"
+        );
+        // Never incorrectness: the re-sealed blob still decrypts to the plaintext.
+        let bytes = p33_blob_bytes(&repo, &id3);
+        let snap3 = repo.snapshot(&c3).unwrap();
+        let got =
+            crate::protect::decrypt_with(&bytes, &id3, &[&snap3.protection], &alice_sk, "secret/x")
+                .unwrap();
+        assert_eq!(&got[..], b"top secret");
+
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -5572,6 +5955,7 @@ mod tests {
                 None,
                 None,
                 &dst.sparse_spec().unwrap(),
+                None,
                 "t",
                 "msg",
             )
