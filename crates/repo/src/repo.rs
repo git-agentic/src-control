@@ -455,10 +455,7 @@ impl Repo {
                         // stat path against its own checkout root (P33 Task 7),
                         // so a workspace commit stats the workspace file, not
                         // the host's.
-                        cache
-                            .as_deref()
-                            .and_then(|c| c.unchanged(&path, &bytes))
-                            == Some(*blob_id)
+                        cache.as_deref().and_then(|c| c.unchanged(&path, &bytes)) == Some(*blob_id)
                     };
                     if unchanged {
                         Some((*blob_id, *perms))
@@ -3731,7 +3728,10 @@ mod tests {
         std::fs::write(root.join("readme.md"), b"hello").unwrap();
         let c2 = repo.commit("alice", "two").unwrap();
         let id2 = p33_entry_id(&repo, &c2, "secret/db.txt");
-        assert_eq!(id1, id2, "unchanged protected content must carry, not re-seal");
+        assert_eq!(
+            id1, id2,
+            "unchanged protected content must carry, not re-seal"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -3811,18 +3811,16 @@ mod tests {
         std::fs::write(root.join("readme.md"), b"more").unwrap();
         let c3 = repo.commit("alice", "unrelated2").unwrap();
         let id3 = p33_entry_id(&repo, &c3, "secret/x");
-        assert_ne!(id3, randomized_id, "lost cache degrades to a spurious re-seal");
+        assert_ne!(
+            id3, randomized_id,
+            "lost cache degrades to a spurious re-seal"
+        );
         // Never incorrectness: the re-sealed blob still decrypts to the plaintext.
         let bytes = p33_blob_bytes(&repo, &id3);
         let snap3 = repo.snapshot(&c3).unwrap();
-        let got = crate::protect::decrypt_with(
-            &bytes,
-            &id3,
-            &[&snap3.protection],
-            &alice_sk,
-            "secret/x",
-        )
-        .unwrap();
+        let got =
+            crate::protect::decrypt_with(&bytes, &id3, &[&snap3.protection], &alice_sk, "secret/x")
+                .unwrap();
         assert_eq!(&got[..], b"top secret");
 
         drop(repo);

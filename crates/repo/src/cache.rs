@@ -136,7 +136,15 @@ impl ProtectedCache {
                         let size: u64 = it.next()?.parse().ok()?;
                         let tag: [u8; 32] = hex::decode(it.next()?).ok()?.try_into().ok()?;
                         let blob_id = ObjectId::from_str(it.next()?).ok()?;
-                        Some((it.next()?.to_string(), CacheEntry { mtime_ns, size, tag, blob_id }))
+                        Some((
+                            it.next()?.to_string(),
+                            CacheEntry {
+                                mtime_ns,
+                                size,
+                                tag,
+                                blob_id,
+                            },
+                        ))
                     })();
                     match parsed {
                         Some((path, e)) => {
@@ -151,7 +159,12 @@ impl ProtectedCache {
                 }
             }
         }
-        ProtectedCache { key, root, path, entries }
+        ProtectedCache {
+            key,
+            root,
+            path,
+            entries,
+        }
     }
 
     fn tag(&self, plaintext: &[u8]) -> [u8; 32] {
@@ -186,8 +199,15 @@ impl ProtectedCache {
     pub(crate) fn record(&mut self, rel: &str, plaintext: &[u8], blob_id: ObjectId) {
         if let Some((mtime_ns, size)) = Self::stat(&self.root.join(rel)) {
             let tag = self.tag(plaintext);
-            self.entries
-                .insert(rel.to_string(), CacheEntry { mtime_ns, size, tag, blob_id });
+            self.entries.insert(
+                rel.to_string(),
+                CacheEntry {
+                    mtime_ns,
+                    size,
+                    tag,
+                    blob_id,
+                },
+            );
         }
     }
 
@@ -195,7 +215,9 @@ impl ProtectedCache {
     /// rename + fsync parent dir, no residue on failure); no-op for an
     /// ephemeral cache.
     pub(crate) fn save(&self) -> Result<()> {
-        let Some(path) = &self.path else { return Ok(()) };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         let mut out = String::new();
         for (p, e) in &self.entries {
             out.push_str(&format!(
@@ -270,8 +292,11 @@ mod tests {
         std::fs::write(&abs, b"v1").unwrap();
         let id = ObjectId::of(b"cipher-of-v1");
 
-        let mut c =
-            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        let mut c = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
         assert_eq!(c.unchanged("secret.txt", b"v1"), None, "empty cache misses");
         c.record("secret.txt", b"v1", id);
 
@@ -302,8 +327,11 @@ mod tests {
         let id = ObjectId::of(b"cipher-of-aaaa");
         let original_mtime = std::fs::metadata(&abs).unwrap().modified().unwrap();
 
-        let mut c =
-            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        let mut c = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
         c.record("secret.txt", b"aaaa", id);
 
         // Overwrite with same-length content, then force the racy condition
@@ -333,19 +361,28 @@ mod tests {
         std::fs::write(&abs, b"v").unwrap();
         let id = ObjectId::of(b"c");
 
-        let mut c =
-            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        let mut c = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
         c.record("a b/spaced name.txt", b"v", id);
         c.save().unwrap();
 
-        let c2 =
-            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        let c2 = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
         assert_eq!(c2.unchanged("a b/spaced name.txt", b"v"), Some(id));
 
         // Corrupt file: degrades to empty, never errors.
         std::fs::write(layout.protected_cache_path(), b"garbage\nlines\n").unwrap();
-        let c3 =
-            ProtectedCache::open(key, layout.root.clone(), Some(layout.protected_cache_path()));
+        let c3 = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
         assert_eq!(c3.unchanged("a b/spaced name.txt", b"v"), None);
         cleanup(&layout);
     }

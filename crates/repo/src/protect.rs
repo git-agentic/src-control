@@ -151,7 +151,12 @@ pub(crate) fn encrypt_protected(
             .map(|pk| scl_crypto::wrap_dek_for(&dek, &scl_crypto::PublicKey::from_bytes(*pk)))
             .collect();
         fresh_wrapped.insert(blob_id, wks);
-        all.push((path, blob_bytes, mode, scl_core::PROTECTED | scl_core::RANDOMIZED));
+        all.push((
+            path,
+            blob_bytes,
+            mode,
+            scl_core::PROTECTED | scl_core::RANDOMIZED,
+        ));
     }
     Ok((all, fresh_wrapped))
 }
@@ -197,7 +202,10 @@ mod tests {
         };
         let (a1, _) = f(b"same");
         let (a2, _) = f(b"same");
-        assert_ne!(a1[0].1, a2[0].1, "two seals of one plaintext must differ (oracle closed)");
+        assert_ne!(
+            a1[0].1, a2[0].1,
+            "two seals of one plaintext must differ (oracle closed)"
+        );
         assert_eq!(a1[0].3, scl_core::PROTECTED | scl_core::RANDOMIZED);
     }
 

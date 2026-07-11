@@ -742,18 +742,13 @@ impl Repo {
                     });
                 }
                 crate::workspace::HarvestResult::Unchanged => {
-                    // `ws_changed_for` already confirmed a diff above, and
-                    // `harvest_workspace` re-diffs independently against its
-                    // own `tip` argument (session.base_snapshot, same value
-                    // here) using the SAME per-workspace cache — so the two
-                    // checks agree in the common case, but this arm is
-                    // genuinely reachable: a cold or lost cache (e.g. this
-                    // workspace's cache file was never written, or the host's
-                    // `.sc/local-key` changed) can make `ws_changed_for`
-                    // spuriously report "changed" for an untouched
-                    // RANDOMIZED protected path while `harvest_workspace`'s
-                    // own diff — same inputs, same cache lookup — still
-                    // resolves it as unchanged. Handled, not a panic guard.
+                    // Unreachable in practice: `ws_changed_for` already
+                    // confirmed a diff above, and `harvest_workspace`
+                    // re-diffs moments later against the SAME persisted
+                    // cache state (same `tip` argument, same per-workspace
+                    // cache, no intervening write) — the two checks cannot
+                    // disagree. Kept for match exhaustiveness, not as a
+                    // reachable panic guard.
                     resolve_and_teardown(self.layout(), &mut session, i, &dir, None)?;
                     outcomes.push(WsHarvestOutcome::Unchanged { index: i });
                 }

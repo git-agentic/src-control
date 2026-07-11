@@ -74,6 +74,10 @@ run_demo() {
   alice_out=$("$SC" keygen --out "$keys/alice")
   alice_pk=$(echo "$alice_out" | grep 'public key' | awk '{print $3}')
 
+  # NB: the RETURN trap above removes $work (and therefore $repo, our new
+  # cwd) on function exit, so every path used below this point must stay
+  # absolute — a relative path minted here would resolve against a
+  # directory that's already gone by the time it's read.
   cd "$repo"
   "$SC" init >/dev/null
   printf '[recipients]\nalice = "%s"\n' "$alice_pk" > .sc/recipients.toml

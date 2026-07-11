@@ -992,7 +992,10 @@ mod tests {
             Some(&mut cache),
         )
         .unwrap();
-        assert!(skipped.is_empty(), "authorized identity decrypts, nothing skipped");
+        assert!(
+            skipped.is_empty(),
+            "authorized identity decrypts, nothing skipped"
+        );
         assert_eq!(
             std::fs::read(layout.root.join("secret/x")).unwrap(),
             pt,

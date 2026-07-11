@@ -414,9 +414,15 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        let skipped =
-            materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default(), None)
-                .unwrap();
+        let skipped = materialize_workspace(
+            &repo,
+            tip,
+            &dir,
+            None,
+            &crate::sparse::Sparse::default(),
+            None,
+        )
+        .unwrap();
         assert!(skipped.is_empty());
         assert_eq!(
             std::fs::read_to_string(dir.join("a.txt")).unwrap(),
@@ -456,7 +462,15 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default(), None).unwrap();
+        materialize_workspace(
+            &repo,
+            tip,
+            &dir,
+            None,
+            &crate::sparse::Sparse::default(),
+            None,
+        )
+        .unwrap();
         let res = harvest_workspace(
             &repo,
             tip,
@@ -483,7 +497,15 @@ mod tests {
         let repo = Repo::open(&root).unwrap();
         let tip = repo.head_tip().unwrap().unwrap();
         let dir = scratch.join("ws1");
-        materialize_workspace(&repo, tip, &dir, None, &crate::sparse::Sparse::default(), None).unwrap();
+        materialize_workspace(
+            &repo,
+            tip,
+            &dir,
+            None,
+            &crate::sparse::Sparse::default(),
+            None,
+        )
+        .unwrap();
         // An AWS-style key id trips the P5 pattern rules.
         std::fs::write(dir.join("leak.txt"), "AKIAIOSFODNN7EXAMPLE\n").unwrap();
         let res = harvest_workspace(

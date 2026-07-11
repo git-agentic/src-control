@@ -948,7 +948,10 @@ mod tests {
         let cb = enc_file_rand(&mut bp, &alice_pk, b"v1\n");
         let co = enc_file_rand(&mut op, &alice_pk, b"v2\n");
         let ct = enc_file_rand(&mut tp, &alice_pk, b"v2\n");
-        assert_ne!(co, ct, "independent randomized seals of identical plaintext differ");
+        assert_ne!(
+            co, ct,
+            "independent randomized seals of identical plaintext differ"
+        );
 
         let repo = VfsRepo::new(Store::with_budget(1 << 20));
         let base = tree_with_perms(&repo, &[("secret/a.txt", cb, PROTECTED | RANDOMIZED)]);
@@ -980,9 +983,16 @@ mod tests {
         assert_eq!(fm.files.len(), 1);
         let f = &fm.files[0];
         assert_eq!(f.path, "secret/a.txt");
-        assert_eq!(f.bytes, b"v2\n", "identical plaintexts merge to v2 with no conflict");
+        assert_eq!(
+            f.bytes, b"v2\n",
+            "identical plaintexts merge to v2 with no conflict"
+        );
         assert!(f.needs_encrypt, "merged plaintext pending re-encryption");
-        assert!(f.perms & PROTECTED != 0);
+        assert_eq!(
+            f.perms,
+            PROTECTED | RANDOMIZED,
+            "content-divergent re-seal path pins the RANDOMIZED bit"
+        );
     }
 
     #[test]
@@ -1043,7 +1053,11 @@ mod tests {
         let plain = fm.files.iter().find(|f| f.path == "plain.txt").unwrap();
         assert_eq!(plain.bytes, b"p2\n", "ours' plain edit wins");
 
-        let conv = fm.files.iter().find(|f| f.path == "secret/conv.txt").unwrap();
+        let conv = fm
+            .files
+            .iter()
+            .find(|f| f.path == "secret/conv.txt")
+            .unwrap();
         assert_eq!(conv.bytes, conv_theirs, "convergent entry takes theirs' id");
         assert!(conv.perms & PROTECTED != 0);
         let conv_theirs_id = Object::blob(conv_theirs).id();
@@ -1052,7 +1066,11 @@ mod tests {
             "surviving convergent blob's wraps carried"
         );
 
-        let rand = fm.files.iter().find(|f| f.path == "secret/rand.txt").unwrap();
+        let rand = fm
+            .files
+            .iter()
+            .find(|f| f.path == "secret/rand.txt")
+            .unwrap();
         assert_eq!(
             rand.bytes, rand_base,
             "untouched randomized entry carries its exact blob id"
