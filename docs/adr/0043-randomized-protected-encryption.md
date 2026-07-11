@@ -90,8 +90,10 @@ Commit still needs only **public keys** — it never decrypts to decide whether 
 file changed. Detection is a per-checkout stat cache (`crates/repo/src/cache.rs`):
 
 - `.sc/local-key`: 32 random bytes, mode **0600 from first byte** (via
-  `atomic_write_durable`), created lazily, **never committed, never
-  transferred**.
+  `OpenOptions::create_new` + `mode(0o600)`, so the file is never briefly
+  world-readable between creation and permission-setting), created lazily,
+  **never committed, never transferred**. The per-checkout cache file itself
+  (below) is written via `atomic_write_durable`.
 - Per-checkout cache files: `.sc/protected-cache` for the main working tree;
   `.sc/ws/cache-<i>` per ws workspace (see below). Each entry is
   `path → (mtime, size, keyed_tag, blob_id)` where
@@ -161,9 +163,15 @@ and in `ROADMAP.md`, **not built** in this phase.
 ## Consequences
 
 - The convergent-equality oracle (ADR-0014) is closed for all content sealed
-  from P33 on; it remains a true property of pre-P33 convergent ciphertext in
-  history until a `sc rewrap` upgrades that tip. THREAT-MODEL and ARCHITECTURE
-  are updated to state this split honestly.
+  from P33 on; pre-P33 convergent ciphertext already in history stays
+  equality-confirmable **forever** to anyone holding a clone — the same
+  rotation ≠ erasure boundary ADR-0019 names for secrets, since content
+  addressing keeps the old object reachable regardless of what happens at the
+  tip. `sc rewrap` stops a still-convergent blob's plaintext from propagating
+  into *future* snapshots at the live tip; it does not erase the historical
+  convergent object. Real cutover of guessable content means changing the
+  content (or underlying credential) itself. THREAT-MODEL and ARCHITECTURE are
+  updated to state this split honestly.
 - Zero new dependencies: `blake3`/`hex` were already workspace deps; `scl-repo`
   now links `blake3` directly for the keyed cache tag.
 - Old binaries reading a new store mask-check `PROTECTED` and would misreport
@@ -265,10 +273,15 @@ claim below is checked against the shipped code, not the plan.
    an untouched file, preserving P20's clean-auto-merge and crash-recovery
    `UpToDate` idempotency.
 
-5. **All production cache saves are best-effort and ordered after ref moves.**
-   A cache save never gates a commit or a ref update: the ref move is the atomic
-   commit point (unchanged from every prior phase), and the cache is refreshed
-   afterward on a best-effort basis (a save failure warns on stderr, never
-   errors). Combined with the 0600-from-first-byte local key and the keyed-PRF
-   tag, this is why the cache is pure optimization — its worst failure mode is a
-   spurious re-seal, never a lost edit or a leaked oracle.
+5. **A cache save never gates an operation, and the ref move stays the commit
+   point.** This is not "every save is strictly ordered after every ref move"
+   — `assemble_completion_snapshot` deliberately saves the cache *before* its
+   callers move the ref (documented in-code; benign, since a crash between the
+   two just costs a spurious re-seal next time, not a lost edit) and several
+   call sites move no ref at all. The property that actually holds everywhere:
+   a cache save is best-effort (a save failure warns on stderr, never errors)
+   and never blocks or gates the operation it's attached to, while the ref
+   move — wherever one occurs — remains the sole atomic commit point, unchanged
+   from every prior phase. Combined with the 0600-from-first-byte local key and
+   the keyed-PRF tag, this is why the cache is pure optimization — its worst
+   failure mode is a spurious re-seal, never a lost edit or a leaked oracle.

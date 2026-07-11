@@ -687,11 +687,14 @@ impl Repo {
                 // here is still the tip's own full map (`prior` is taken
                 // below, after this point) and already carries every wrap
                 // the tip itself could offer; union in any entry
-                // `fresh_wrapped` doesn't already know about. Convergent
-                // encryption keeps a blob's id stable regardless of who
-                // grafted it, so reusing the prior wrap bytes verbatim is
-                // correct, not just convenient — no re-encryption, no key
-                // material touched.
+                // `fresh_wrapped` doesn't already know about. The graft
+                // splices the subtree in BY ID and never re-derives or
+                // touches the blob's DEK, so reusing the prior wrap bytes
+                // verbatim is correct — this holds for a RANDOMIZED blob
+                // exactly as it does for a convergent one (carry-by-id, not
+                // convergent-id-stability, is the load-bearing property; a
+                // randomized blob's id is just as stable across a
+                // by-id graft as a convergent one's).
                 for (id, wks) in &protection.wrapped {
                     fresh_wrapped.entry(*id).or_insert_with(|| wks.clone());
                 }

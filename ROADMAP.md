@@ -749,6 +749,26 @@ scale-&-reach horizon):
   `sc protect … rotate`-style genuine per-path cryptographic cutover — the
   protected-path analogue of `sc secret rotate` — is now coherent. Recorded in
   ADR-0043, not built.
+- **`sc rewrap` on partial clones (P33 final-review follow-on).** `sc rewrap`
+  loads each protected plaintext whole into RAM and has no
+  `PartialCloneUnsupported` guard, unlike merge/rebase/ws-fork/ws-harvest/`sc
+  work` (P27); a paths-only/streaming tree rebuild (or the same refusal-first
+  posture) is the follow-on.
+- **Protected-cache hygiene (P33 final-review follow-on).** `.sc/protected-cache`
+  and `.sc/ws/cache-<i>` entries for a deleted or renamed path are never
+  pruned — unbounded but benign growth (a stale entry just goes unmatched).
+  Periodic or commit-time pruning of dead entries is the follow-on.
+- **Theirs-side resolve carry (P33 final-review follow-on).** `sc resolve
+  --theirs` on a PROTECTED path records into the main-tree cache today, but
+  completion's format-dispatched carry only consults the cache against the
+  prior TIP (ours') entry, so a theirs-side recording never matches and
+  completion re-seals randomized anyway (spurious-but-safe). Extending the
+  carry-candidate map to also check `merge_head`/decided-root entries would
+  let a theirs-side resolution skip the re-seal too.
+- **Non-unix local-key fallback (P33 final-review follow-on).** `.sc/local-key`
+  is minted 0600-from-first-byte via a unix-only `OpenOptions::mode` call;
+  there is no non-unix fallback today, so the key file is left world-readable
+  on a non-unix target. A non-unix permission-hardening path is deferred.
 - **fd/stdin secret injection (P28).** `sc run` hands decrypted secrets to
   the child via its environment — observable by same-user processes,
   crash dumps, and shell wrappers, per the tightened threat-model wording.

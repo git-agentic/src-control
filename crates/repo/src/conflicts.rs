@@ -236,13 +236,20 @@ impl Repo {
 
                 // P33 Task 8: a resolved PROTECTED path's plaintext is now
                 // sitting on disk exactly as the chosen side's ciphertext
-                // decrypted it — record it in the main-tree cache so the
-                // completing `sc commit`/`sc rebase --continue` recognizes it
-                // as unchanged (`unchanged(path, plaintext) == Some(blob_id)`)
-                // and carries the existing ciphertext instead of re-sealing
-                // under a fresh random nonce. Plain paths never touch the
-                // cache — it exists only to skip re-sealing convergent-free
-                // randomized ciphertext.
+                // decrypted it — record it in the main-tree cache regardless
+                // of which side was chosen. This only pays off for an
+                // `--ours` resolution: completion's format-dispatched carry
+                // (`snapshot_files`) consults the cache against the prior
+                // TIP entry's blob id, so an `--ours` recording matches and
+                // the completing `sc commit`/`sc rebase --continue` carries
+                // the existing ciphertext instead of re-sealing under a
+                // fresh random nonce. A `--theirs` recording keys the cache
+                // to a blob id completion never looks up against (the tip is
+                // still ours), so it goes unmatched and completion re-seals
+                // randomized anyway — spurious cache-population, but benign
+                // (never incorrect, just a wasted write). Plain paths never
+                // touch the cache — it exists only to skip re-sealing
+                // convergent-free randomized ciphertext.
                 if kind == ConflictKind::Protected {
                     let triple = self.op_triple()?;
                     let chosen_snapshot = match side {
