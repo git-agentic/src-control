@@ -200,8 +200,17 @@ pub fn reachable_objects_filtered(
                 for id in &m.closure {
                     included.insert(*id);
                 }
-                if included.insert(m.base) {
-                    snapshots.push_back(m.base);
+                // `base` and every merged-in public `anchor` are walked as
+                // snapshot roots: the sealed inner trees carry unsealed public
+                // references to content reachable from these (copy-on-write),
+                // which a keyless party can't discover by walking sealed
+                // objects. Without anchoring the merged-in tips, a private
+                // branch that merged a public branch in would be
+                // non-transferable to a peer lacking those public commits.
+                for root in std::iter::once(m.base).chain(m.anchors.iter().copied()) {
+                    if included.insert(root) {
+                        snapshots.push_back(root);
+                    }
                 }
                 if let Some(prev) = m.prev {
                     if included.insert(prev) {

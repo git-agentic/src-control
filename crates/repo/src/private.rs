@@ -338,6 +338,7 @@ impl Repo {
         let manifest = BranchManifest {
             base: tip,
             prev: None,
+            anchors: Vec::new(),
             closure: Vec::new(),
             index_ct: index.encrypt(&kek),
             kek_wraps,
@@ -760,9 +761,13 @@ impl Repo {
             protection, author, message,
         )?;
 
+        // Carry anchors forward; a merge-completion commit adds the public
+        // merge head (its objects were carried into the sealed tree).
+        let anchors = extend_anchors(&ctx.manifest.anchors, merge_head.into_iter());
         let new_manifest = BranchManifest {
             base: ctx.manifest.base,
             prev: Some(ctx.manifest_id),
+            anchors,
             closure: index.entries.values().map(|e| e.sealed).collect(),
             index_ct: index.encrypt(&ctx.kek),
             kek_wraps: ctx.manifest.kek_wraps.clone(),
@@ -991,6 +996,21 @@ fn public_tree_ids(store: &mut Store, root: ObjectId) -> Result<BTreeSet<ObjectI
     Ok(out)
 }
 
+/// Merge new public reachability anchors into a manifest's existing set,
+/// deduped and sorted (canonical). Anchors are cumulative across a branch's
+/// history; a redundant anchor (already reachable from `base` or another
+/// anchor) is harmless — the reachability walk is idempotent — so no store
+/// walk is needed here to prune, and the growth is bounded by the number of
+/// merges (a documented manifest-scalability boundary, ADR-0044 deferred).
+pub(crate) fn extend_anchors(
+    existing: &[ObjectId],
+    new: impl Iterator<Item = ObjectId>,
+) -> Vec<ObjectId> {
+    let mut set: BTreeSet<ObjectId> = existing.iter().copied().collect();
+    set.extend(new);
+    set.into_iter().collect()
+}
+
 /// Escrow/recipient sets must never be empty on a rewrap (seal-to-zero
 /// footgun — the same rule `secrets::require_recipients` enforces).
 pub(crate) fn require_nonempty_recipients(keys: &[PublicKey], what: &str) -> Result<()> {
@@ -1032,6 +1052,7 @@ impl Repo {
         let manifest = BranchManifest {
             base: ctx.manifest.base,
             prev: Some(ctx.manifest_id),
+            anchors: ctx.manifest.anchors.clone(),
             closure: ctx.manifest.closure.clone(),
             index_ct: ctx.manifest.index_ct.clone(),
             kek_wraps,
@@ -1091,6 +1112,7 @@ impl Repo {
         let manifest = BranchManifest {
             base: ctx.manifest.base,
             prev: Some(ctx.manifest_id),
+            anchors: ctx.manifest.anchors.clone(),
             closure: ctx.manifest.closure.clone(),
             index_ct: ctx.index.encrypt(&new_kek),
             kek_wraps,
@@ -1185,9 +1207,14 @@ impl Repo {
             // public tip as its inner tip; nothing needs sealing.
             let mut index = ctx.index.clone();
             index.inner_tip = Some(theirs);
+            // The inner tip is now a public snapshot descended from `base`
+            // (not reachable from it) — anchor it so the manifest stays
+            // self-contained and transferable.
+            let anchors = extend_anchors(&ctx.manifest.anchors, std::iter::once(theirs));
             let new_manifest = BranchManifest {
                 base: ctx.manifest.base,
                 prev: Some(ctx.manifest_id),
+                anchors,
                 closure: ctx.manifest.closure.clone(),
                 index_ct: index.encrypt(&ctx.kek),
                 kek_wraps: ctx.manifest.kek_wraps.clone(),
@@ -1347,9 +1374,13 @@ impl Repo {
             author,
             &format!("merge {branch}"),
         )?;
+        // Anchor the merged-in public tip: its objects were carried into the
+        // sealed tree as unsealed public references (copy-on-write).
+        let anchors = extend_anchors(&ctx.manifest.anchors, std::iter::once(theirs));
         let new_manifest = BranchManifest {
             base: ctx.manifest.base,
             prev: Some(ctx.manifest_id),
+            anchors,
             closure: index.entries.values().map(|e| e.sealed).collect(),
             index_ct: index.encrypt(&ctx.kek),
             kek_wraps: ctx.manifest.kek_wraps.clone(),
@@ -1960,6 +1991,108 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merged_in_private_branch_is_self_contained_for_transfer() {
+        // Regression (advisor review): a public commit merged INTO a private
+        // branch is carried into the sealed tree as an unsealed public
+        // reference (copy-on-write). Without a reachability anchor on the
+        // manifest, pushing only the private branch to a peer lacking that
+        // public commit would strand the sealed tree. The manifest's closure
+        // walk MUST reach the merged-in public blob.
+        let (root, repo, (alice_sk, _), _bob) = setup("selfcontained");
+        repo.branch_private("fix", &alice_sk, &[], &[]).unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        write(&root, "fix.txt", "private\n");
+        repo.commit_private("alice", "c1", Some(&alice_sk)).unwrap();
+
+        // main gains a NEW file after the fork, then merge it in.
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        write(&root, "main-only.txt", "public-after-fork\n");
+        repo.commit("tester", "b2").unwrap();
+        let main_blob = Object::blob("public-after-fork\n".as_bytes().to_vec()).id();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        repo.merge_into_private("main", "alice", Some(&alice_sk))
+            .unwrap();
+
+        let (mid, _) = repo.branch_manifest("fix").unwrap().unwrap();
+        // The crisp discriminator: reachability from the manifest tip ALONE
+        // (a keyless transfer's want set) must contain the merged-in blob.
+        let store_arc = repo.vfs().store();
+        let reachable = {
+            let mut store = store_arc.lock().unwrap();
+            crate::reachable::reachable_objects(&mut *store, &[mid]).unwrap()
+        };
+        assert!(
+            reachable.contains(&main_blob),
+            "merged-in public blob must be reachable from the private manifest \
+             (else the branch is non-transferable)"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn recipient_opens_a_merged_branch_cloned_without_the_public_source() {
+        // The transfer-level twin: clone ONLY the private branch's closure
+        // into a fresh peer that never received the public branch the merge
+        // pulled from, and assert a recipient can still switch onto it. Built
+        // by copying exactly the manifest's reachable set (what a filtered
+        // want for that ref would transfer) into a fresh store.
+        let (root, repo, (alice_sk, _), _bob) = setup("mergeclone");
+        repo.branch_private("fix", &alice_sk, &[], &[]).unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        write(&root, "fix.txt", "private\n");
+        repo.commit_private("alice", "c1", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        write(&root, "main-only.txt", "public-after-fork\n");
+        repo.commit("tester", "b2").unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        repo.merge_into_private("main", "alice", Some(&alice_sk))
+            .unwrap();
+        let (mid, _) = repo.branch_manifest("fix").unwrap().unwrap();
+
+        // Peer repo: copy the manifest's reachable closure only (no `main`
+        // ref, no oplog), point `fix` at the manifest, and open it.
+        let peer_root = tmp_root("mergeclone-peer");
+        let peer = Repo::init(&peer_root).unwrap();
+        {
+            let src_arc = repo.vfs().store();
+            let mut src = src_arc.lock().unwrap();
+            let reachable = crate::reachable::reachable_objects(&mut *src, &[mid]).unwrap();
+            let dst_arc = peer.vfs().store();
+            let mut dst = dst_arc.lock().unwrap();
+            for id in &reachable {
+                let obj = src.get(id).unwrap();
+                dst.put(obj).unwrap();
+            }
+        }
+        crate::refs::write_branch_tip(peer.layout(), "fix", &mid).unwrap();
+        // Leave HEAD on the unborn default (like a fresh clone) so the switch
+        // is a genuine cross-branch materialize, not a same-branch no-op that
+        // would dirty-check an unmaterialized tree.
+
+        // The recipient opens the merged branch on a peer that never had `main`.
+        let skipped = peer
+            .switch_with_identity("fix", Some(&alice_sk))
+            .expect("recipient must open a merged branch cloned without the public source");
+        assert!(skipped.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(peer_root.join("main-only.txt")).unwrap(),
+            "public-after-fork\n",
+            "the merged-in public file must materialize on the peer"
+        );
+        assert_eq!(
+            std::fs::read_to_string(peer_root.join("fix.txt")).unwrap(),
+            "private\n"
+        );
+
+        drop(repo);
+        drop(peer);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&peer_root).unwrap();
     }
 
     #[test]

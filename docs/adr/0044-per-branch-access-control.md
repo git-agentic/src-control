@@ -318,6 +318,23 @@ The decision shipped as designed; the concrete shape settled as follows.
   files **outside** the working tree — a key committed under a private
   branch is sealed into it and vanishes from disk on the next switch (the
   standing [[scanner-false-positive-own-keys]] hazard).
+- **Reachability anchors for merged-in public content (review Critical).**
+  `merge_into_private` carries the merged public tip's objects into the
+  sealed inner tree as **unsealed public references** (copy-on-write — they
+  are already public, resealing them would waste space and fight dedup). But
+  a keyless party can't walk a sealed tree to discover those references, and
+  the manifest's `base` only anchors the *fork point* — so a public object
+  added *after* the fork and merged in was reachable through no root a
+  transfer or gc could follow. Pushing just the private branch to a peer
+  lacking those commits would strand the sealed tree (`NotFound` on the
+  recipient's `switch`). Fixed by a cumulative plaintext `anchors: Vec<
+  ObjectId>` on the manifest — the merged-in public tips — walked as
+  reachability roots alongside `base`. Costs one metadata leak (*which*
+  public commits were merged in), the same class as `base` leaking the fork
+  point. Pinned by `merged_in_private_branch_is_self_contained_for_transfer`
+  (reachability from the manifest alone includes the merged blob) and
+  `recipient_opens_a_merged_branch_cloned_without_the_public_source` (a peer
+  that never received the public branch still opens the merged private one).
 
 ## Deferred (to ROADMAP.md)
 

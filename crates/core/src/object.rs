@@ -242,6 +242,18 @@ pub struct BranchManifest {
     /// keeps superseded manifests (and their closures) reachable exactly as
     /// it keeps ancestor snapshots.
     pub prev: Option<ObjectId>,
+    /// Public snapshot roots the sealed trees reference but that are NOT
+    /// reachable from `base` — the tips merged in from public branches by
+    /// `merge_into_private` (P34). A merged-in public object is carried into
+    /// the sealed inner tree as an unsealed public reference (copy-on-write,
+    /// never re-sealed — it's already public), so without an explicit
+    /// reachability anchor a keyless party walking the manifest could never
+    /// reach it (it can't walk the sealed tree), and pushing just the private
+    /// branch to a peer lacking those public commits would strand the tree.
+    /// Cumulative across the branch's history and sorted (canonical). Leaks
+    /// which public commits were merged in — the same class of metadata as
+    /// `base` already leaking the fork point.
+    pub anchors: Vec<ObjectId>,
     /// Every sealed object id in the branch's closure, sorted (canonical).
     /// gc: manifest reachable ⇒ all listed ids reachable. Transport: diff this
     /// flat list against the peer's haves. Leaks count + sizes by design.
@@ -414,8 +426,14 @@ impl Object {
                     }
                     None => w.u8(0),
                 }
-                // Sort the closure so the same logical set hashes identically
-                // regardless of insertion order.
+                // Sort anchors then closure so the same logical set hashes
+                // identically regardless of insertion order.
+                let mut anchors = m.anchors.clone();
+                anchors.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                w.u32(anchors.len() as u32);
+                for id in &anchors {
+                    w.id(id);
+                }
                 let mut closure = m.closure.clone();
                 closure.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
                 w.u32(closure.len() as u32);
@@ -609,6 +627,11 @@ impl Object {
                     1 => Some(r.id()?),
                     b => return Err(Error::Malformed(format!("bad manifest prev marker {b}"))),
                 };
+                let na = r.count()?;
+                let mut anchors = Vec::with_capacity(na);
+                for _ in 0..na {
+                    anchors.push(r.id()?);
+                }
                 let nc = r.count()?;
                 let mut closure = Vec::with_capacity(nc);
                 for _ in 0..nc {
@@ -628,6 +651,7 @@ impl Object {
                 Object::Manifest(BranchManifest {
                     base,
                     prev,
+                    anchors,
                     closure,
                     index_ct,
                     kek_wraps,
@@ -1164,6 +1188,7 @@ mod tests {
             Object::Manifest(BranchManifest {
                 base: ObjectId::from_bytes([9; 32]),
                 prev: Some(ObjectId::from_bytes([8; 32])),
+                anchors: vec![ObjectId::from_bytes([7; 32])],
                 closure,
                 index_ct: vec![7; 40],
                 kek_wraps: vec![WrappedKey {
@@ -1188,14 +1213,17 @@ mod tests {
     #[test]
     fn manifest_decode_rejects_fabricated_counts() {
         const HUGE: u32 = 0xFFFF_FFFF;
-        // TAG_MANIFEST + base(32) + closure-count(fabricated), nothing follows.
+        // TAG_MANIFEST + base(32) + prev(0) + anchor-count(fabricated).
         let mut buf = vec![TAG_MANIFEST];
         buf.extend_from_slice(&[0u8; 32]);
+        buf.push(0u8); // prev marker: none
         buf.extend_from_slice(&HUGE.to_be_bytes());
         assert!(matches!(Object::decode(&buf), Err(Error::Malformed(_))));
-        // Same for the kek-wrap count after an empty closure + empty index.
+        // Same for the kek-wrap count after empty anchors + closure + index.
         let mut buf = vec![TAG_MANIFEST];
         buf.extend_from_slice(&[0u8; 32]);
+        buf.push(0u8); // prev marker: none
+        buf.extend_from_slice(&0u32.to_be_bytes()); // anchor count
         buf.extend_from_slice(&0u32.to_be_bytes()); // closure count
         buf.extend_from_slice(&0u32.to_be_bytes()); // index_ct len
         buf.extend_from_slice(&HUGE.to_be_bytes()); // kek wrap count
