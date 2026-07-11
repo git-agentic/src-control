@@ -8,7 +8,7 @@ what you need to get a change merged cleanly.
 
 - Read [`CLAUDE.md`](CLAUDE.md) — it is the working guide: what the project is, the
   crate layout, and the **core invariants that must not break**. (`AGENTS.md` is a
-  byte-identical copy for tooling that looks for it.)
+  pointer to it, for tooling that looks for that filename.)
 - Read [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design, and skim
   [`docs/adr/`](docs/adr/) for the decision records behind each subsystem.
 - For anything security-relevant, read [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md)
@@ -37,10 +37,12 @@ CI runs `fmt --check`, `clippy -D warnings`, `cargo test --workspace`, and
    tests` next to the code. A test that materializes to disk must clean up after
    itself and assert the path is gone.
 2. **Respect the dependency rule and quarantines** (enforced socially, not just by
-   the compiler): `cli → repo → {vfs, gitio, crypto} → core`. `core` never depends
-   on Git, worktrees, or crypto. **`gix` stays in `gitio` only**; **RustCrypto
-   stays in `crypto` only**. If you find yourself reaching for `gix` or a
-   RustCrypto type elsewhere, add a function to `gitio`/`crypto` instead.
+   the compiler): `cli → repo → {vfs, gitio, crypto, tlsio} → core` (`tlsio` is a
+   leaf with no workspace deps). `core` never depends on Git, worktrees, or
+   crypto. **`gix` stays in `gitio` only**; **RustCrypto stays in `crypto`
+   only**; **rustls/rcgen stay in `tlsio` only**. If you find yourself reaching
+   for `gix`, a RustCrypto type, or TLS elsewhere, add a function to
+   `gitio`/`crypto`/`tlsio` instead.
 3. **Do not break the [core invariants in `CLAUDE.md`](CLAUDE.md#core-invariants-do-not-break)** —
    content addressing (`BLAKE3(canonical_encoding)`), `Arc<[u8]>`-shared blobs, the
    mode-scoped disk invariant (ephemeral = zero residue), and "never silently drop
