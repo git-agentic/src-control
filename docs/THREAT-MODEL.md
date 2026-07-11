@@ -98,9 +98,12 @@ too, not just the src-control-side metadata.
 - **Leaks by design (accepted metadata):** a private branch's **existence and
   name** (name blandly — `hotfix-CVE-1234` in a ref itself discloses), the
   sealed-object **count and sizes**, closure **growth over time** (commit
-  activity is observable as count deltas), and the **recipient ids** (in the
-  manifest's KEK wraps) and the **public fork point** (plaintext in the
-  manifest). No content, path, or message is among these.
+  activity is observable as count deltas), the **recipient ids** (in the
+  manifest's KEK wraps), the **public fork point**, and **which public commits
+  were merged in** (both plaintext reachability anchors in the manifest — the
+  fork point plus the tips of any public branch merged in to keep the embargo
+  current, so the sealed trees' references stay transferable). No content,
+  path, or message is among these.
 - **Revoke is a KEK rotation, not erasure:** `sc branch revoke` mints a fresh
   KEK, re-encrypts the index, and rewraps for the remaining recipients — with
   zero content plaintext written and zero sealed-object id churn. A revoked

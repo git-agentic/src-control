@@ -1960,9 +1960,13 @@ mod tests {
         assert_opaque(&repo, b"private line");
 
         // Conflicting edits on BOTH sides stop with markers + merge state.
+        // `whichpub.txt` is a public file added alongside the conflict — the
+        // conflict-completion path must anchor it just like the clean path.
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
         write(&root, "shared.txt", "base\n");
+        write(&root, "whichpub.txt", "public-conflict-era\n");
         repo.commit("tester", "add shared").unwrap();
+        let pub_blob = Object::blob("public-conflict-era\n".as_bytes().to_vec()).id();
         repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
         repo.merge_into_private("main", "alice", Some(&alice_sk))
             .unwrap();
@@ -1988,6 +1992,19 @@ mod tests {
         assert_eq!(log[0].0, completed);
         assert_eq!(log[0].1.parents.len(), 2, "completion records both parents");
         assert!(!crate::merge_state::in_progress(repo.layout()));
+        // The CONFLICT-completion path anchors merged-in public content too:
+        // a public file brought in alongside the conflict stays reachable
+        // from the manifest alone (transferable), same as the clean path.
+        let (mid, _) = repo.branch_manifest("fix").unwrap().unwrap();
+        let reachable = {
+            let store_arc = repo.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            crate::reachable::reachable_objects(&mut *store, &[mid]).unwrap()
+        };
+        assert!(
+            reachable.contains(&pub_blob),
+            "conflict-completed merge must anchor its merged-in public blob"
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
