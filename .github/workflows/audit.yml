@@ -21,6 +21,9 @@ on:
 permissions:
   contents: read
   checks: write
+  # Scheduled runs file findings as GitHub issues; without this the action
+  # fails with "Resource not accessible by integration" after a clean audit.
+  issues: write
 
 jobs:
   audit:
@@ -31,3 +34,7 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # proc-macro-error2 (unmaintained) reaches the lockfile only via
+          # gix -> gix-date -> jiff -> defmt, an optional jiff feature we never
+          # compile; unactionable here until upstream migrates off it.
+          ignore: RUSTSEC-2026-0173
