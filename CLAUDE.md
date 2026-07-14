@@ -47,7 +47,7 @@ apps/desktop/src       → bundled TypeScript presentation (typed IPC only)
 ```
 
 Strict dependency direction: top-level adapters `{cli, desktop} → repo →
-{vfs, gitio, crypto, tlsio} → core`
+{vfs, gitio, crypto} → core`, with the separate leaf edge `repo → tlsio`
 (`tlsio` is a leaf — it depends on no other workspace crate, not even `core`).
 **`core` must never depend on Git, worktrees, or crypto.** **`gix` must stay
 quarantined in `gitio`** — if you find yourself reaching for `gix` elsewhere,

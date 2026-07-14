@@ -50,6 +50,7 @@ export interface HistoryView {
 export type ContentView =
   | { state: "text"; text: string; size: number }
   | { state: "binary"; size: number }
+  | { state: "too_large"; size: number }
   | { state: "protected_locked" }
   | { state: "unavailable"; reason: string };
 
@@ -58,11 +59,16 @@ export interface FileView {
   content: ContentView;
 }
 
+export type TreeContentState =
+  | "public_available"
+  | "protected_locked"
+  | "unavailable";
+
 export interface TreeFileView {
   path: string;
   name: string;
   mode: number;
-  contentState: ContentView["state"] | "public_available";
+  contentState: TreeContentState;
   size?: number;
 }
 

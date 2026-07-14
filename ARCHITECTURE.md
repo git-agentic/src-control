@@ -62,8 +62,8 @@ to reason about — which is exactly the property Phase 1 is meant to demonstrat
 ## System overview
 
 The codebase is a Cargo workspace of eight Rust crates with a strict dependency
-direction (top-level adapters `{cli, desktop} → repo → {vfs, gitio, crypto,
-tlsio} → core`):
+direction (top-level adapters `{cli, desktop} → repo → {vfs, gitio, crypto}
+→ core`, with the separate leaf edge `repo → tlsio`):
 
 ```
 src-control/
@@ -954,8 +954,8 @@ Proven by `demo/run_limits_demo.sh`. See ADR-0041.
 ## Phase 32 — in-binary TLS: sc+https:// (built)
 
 A new leaf crate, `crates/tlsio` (`scl-tlsio`), is the only crate linking
-rustls/rcgen/`ring` — extending the dependency rule to `cli → repo → {vfs,
-gitio, crypto, tlsio} → core` while leaving the RustCrypto quarantine in
+rustls/rcgen/`ring` — extending the dependency rule with the separate leaf edge
+`repo → tlsio` while leaving `repo → {vfs, gitio, crypto} → core` and the RustCrypto quarantine in
 `crates/crypto` untouched. Two seam functions grow a TLS wrap and nothing
 else changes: the client wraps the `TcpStream` before the opening write when
 the URL is `sc+https://`; the server wraps before the opening read when

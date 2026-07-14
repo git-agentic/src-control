@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use scl_core::{FileMode, Object, ObjectId, Snapshot, PROTECTED};
 use scl_repo::{refs, Repo, SigStatus};
@@ -35,7 +36,14 @@ impl ReadModelError {
             scl_repo::Error::Core(scl_core::Error::NotFound(_)) => "unavailable_object",
             _ => "repository_error",
         };
-        Self::new(kind, error.to_string())
+        let message = match kind {
+            "not_a_repository" => "The selected directory is not a src-control repository.",
+            "repository_busy" => "The repository is busy in another src-control process.",
+            "corrupt_repository" => "The repository contains invalid or corrupt native data.",
+            "unavailable_object" => "A required object is unavailable in this repository.",
+            _ => "The repository could not be read.",
+        };
+        Self::new(kind, message)
     }
 }
 
@@ -130,6 +138,7 @@ pub struct HistoryView {
 pub enum ContentView {
     Text { text: String, size: usize },
     Binary { size: usize },
+    TooLarge { size: usize },
     ProtectedLocked,
     Unavailable { reason: String },
 }
@@ -207,19 +216,27 @@ pub struct SnapshotDetails {
 #[derive(Clone, Debug)]
 pub struct DesktopRepository {
     root: PathBuf,
+    /// Public snapshots already exposed by a selected history. Clones share
+    /// this session cache so subsequent file and diff reads stay O(1) without
+    /// weakening the public-reachability check.
+    reachable: Arc<RwLock<HashSet<ObjectId>>>,
 }
 
 impl DesktopRepository {
     /// Validate and remember an existing native `.sc` repository.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReadModelError> {
         let repo = Repo::open(path).map_err(ReadModelError::from_repo)?;
-        let root = repo
-            .layout()
-            .root
-            .canonicalize()
-            .map_err(|error| ReadModelError::new("repository_error", error.to_string()))?;
+        let root = repo.layout().root.canonicalize().map_err(|_error| {
+            ReadModelError::new(
+                "repository_error",
+                "The repository path could not be resolved.",
+            )
+        })?;
         drop(repo);
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            reachable: Arc::new(RwLock::new(HashSet::new())),
+        })
     }
 
     /// Canonical repository root retained in backend state.
@@ -303,6 +320,15 @@ impl DesktopRepository {
                 &trust,
             )?);
         }
+        self.reachable
+            .write()
+            .map_err(|_| {
+                ReadModelError::new(
+                    "repository_error",
+                    "repository session state is unavailable",
+                )
+            })?
+            .extend(seen);
         Ok(HistoryView {
             reference,
             snapshots,
@@ -397,6 +423,19 @@ impl DesktopRepository {
         let wanted = snapshot_id.parse::<ObjectId>().map_err(|_| {
             ReadModelError::new("invalid_selection", "snapshot id is not a native object id")
         })?;
+        if self
+            .reachable
+            .read()
+            .map_err(|_| {
+                ReadModelError::new(
+                    "repository_error",
+                    "repository session state is unavailable",
+                )
+            })?
+            .contains(&wanted)
+        {
+            return Ok(wanted);
+        }
         let current = refs::current_branch(repo.layout()).map_err(ReadModelError::from_repo)?;
         let references = collect_references(repo, &current)?;
         let mut stack = Vec::new();
@@ -414,6 +453,15 @@ impl DesktopRepository {
                 continue;
             }
             if id == wanted {
+                self.reachable
+                    .write()
+                    .map_err(|_| {
+                        ReadModelError::new(
+                            "repository_error",
+                            "repository session state is unavailable",
+                        )
+                    })?
+                    .extend(seen);
                 return Ok(id);
             }
             stack.extend(get_snapshot(repo, &id)?.parents);
@@ -471,6 +519,10 @@ fn content_view(repo: &Repo, entry: &FileEntry) -> Result<ContentView, ReadModel
         Err(error) => return Err(ReadModelError::from_repo(error.into())),
     };
     let size = bytes.len();
+    const MAX_RENDER_BYTES: usize = 4 * 1024 * 1024;
+    if size > MAX_RENDER_BYTES {
+        return Ok(ContentView::TooLarge { size });
+    }
     if bytes.contains(&0) {
         return Ok(ContentView::Binary { size });
     }
@@ -482,6 +534,10 @@ fn content_view(repo: &Repo, entry: &FileEntry) -> Result<ContentView, ReadModel
 
 fn tree_view(repo: &Repo, snapshot: &Snapshot) -> Result<Vec<TreeFileView>, ReadModelError> {
     let entries = file_entries(repo, snapshot.root)?;
+    let store = repo.store();
+    let store = store.lock().map_err(|_| {
+        ReadModelError::new("repository_error", "repository object cache is unavailable")
+    })?;
     entries
         .into_iter()
         .map(|(path, entry)| {
@@ -490,6 +546,8 @@ fn tree_view(repo: &Repo, snapshot: &Snapshot) -> Result<Vec<TreeFileView>, Read
             // loaded by this adapter.
             let content_state = if entry.2 & PROTECTED != 0 {
                 ContentState::ProtectedLocked
+            } else if !store.contains(&entry.0) {
+                ContentState::Unavailable
             } else {
                 ContentState::PublicAvailable
             };
@@ -582,6 +640,7 @@ fn validate_relative_path(path: &str) -> Result<(), ReadModelError> {
     let valid = !path.is_empty()
         && !path.starts_with('/')
         && !path.contains('\\')
+        && !path.contains('\0')
         && path
             .split('/')
             .all(|component| !component.is_empty() && component != "." && component != "..");
@@ -748,12 +807,17 @@ fn load_trust_map(path: &Path) -> Result<HashMap<[u8; 32], String>, ReadModelErr
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(error) => return Err(ReadModelError::new("repository_error", error.to_string())),
+        Err(_error) => {
+            return Err(ReadModelError::new(
+                "repository_error",
+                "The public signer configuration could not be read.",
+            ));
+        }
     };
-    let config: PublicTrustConfig = toml::from_str(&text).map_err(|error| {
+    let config: PublicTrustConfig = toml::from_str(&text).map_err(|_error| {
         ReadModelError::new(
             "corrupt_repository",
-            format!("invalid public signer configuration: {error}"),
+            "The public signer configuration is invalid.",
         )
     })?;
     let mut trust = HashMap::new();
@@ -929,6 +993,96 @@ mod tests {
                 .kind,
             "invalid_selection"
         );
+        let nul_error = desktop
+            .read_file(&tip.to_hex(), "public\0.txt")
+            .unwrap_err();
+        assert_eq!(nul_error.kind, "invalid_selection");
+        assert_eq!(
+            nul_error.message,
+            "file path is not a canonical repository-relative path"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_partial_clone_blob_is_visible_before_selection() {
+        let root = temp_root("partial-tree-state");
+        let repo = scl_repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("missing.txt"), "promised elsewhere\n").unwrap();
+        let tip = repo.commit("Ada", "partial content").unwrap();
+        let snapshot = repo.store().lock().unwrap().get_snapshot(&tip).unwrap();
+        let blob = scl_repo::worktree::tree_file_entries_with_perms(
+            &mut repo.store().lock().unwrap(),
+            snapshot.root,
+        )
+        .unwrap()["missing.txt"]
+            .0;
+        repo.store().lock().unwrap().delete(&blob).unwrap();
+        drop(repo);
+
+        let desktop = DesktopRepository::open(&root).unwrap();
+        let details = desktop.snapshot_details(&tip.to_hex()).unwrap();
+        assert_eq!(
+            details
+                .tree
+                .iter()
+                .find(|file| file.path == "missing.txt")
+                .unwrap()
+                .content_state,
+            ContentState::Unavailable
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_text_is_not_sent_to_the_renderer_or_diff_surface() {
+        let root = temp_root("oversized-render-content");
+        let repo = scl_repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("large.txt"), "small\n").unwrap();
+        repo.commit("Ada", "small file").unwrap();
+        let oversized = vec![b'a'; 4 * 1024 * 1024 + 1];
+        std::fs::write(root.join("large.txt"), &oversized).unwrap();
+        let tip = repo.commit("Ada", "large file").unwrap();
+        drop(repo);
+
+        let desktop = DesktopRepository::open(&root).unwrap();
+        assert_eq!(
+            desktop
+                .read_file(&tip.to_hex(), "large.txt")
+                .unwrap()
+                .content,
+            ContentView::TooLarge {
+                size: oversized.len()
+            }
+        );
+        assert_eq!(
+            desktop
+                .compare_first_parent(&tip.to_hex(), "large.txt")
+                .unwrap()
+                .after,
+            Some(ContentView::TooLarge {
+                size: oversized.len()
+            })
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_public_trust_configuration_is_not_silently_untrusted() {
+        let root = temp_root("malformed-trust");
+        let repo = scl_repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("README.md"), "native model\n").unwrap();
+        repo.commit("Ada", "snapshot").unwrap();
+        std::fs::write(repo.layout().dot_sc.join("recipients.toml"), "[signers\n").unwrap();
+        drop(repo);
+
+        let desktop = DesktopRepository::open(&root).unwrap();
+        let error = desktop.select_reference("local:main").unwrap_err();
+        assert_eq!(error.kind, "corrupt_repository");
+        assert!(error.message.contains("public signer configuration"));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -55,7 +55,7 @@ The DTOs use tagged unions for every confidentiality-sensitive state:
 ```text
 ReferenceAccess = public | private_opaque
 TreeState       = public_available | protected_locked | unavailable
-ContentState    = text | binary | protected_locked | unavailable
+ContentState    = text | binary | too_large | protected_locked | unavailable
 SignatureState  = trusted | untrusted | invalid | unsigned
 ```
 
@@ -78,7 +78,8 @@ The renderer receives presentation-ready, immutable records:
   state (public-available, locked, or unavailable);
 - metadata-only first-parent changes classified as added, modified, deleted, or
   protected, with content fetched only for the selected path;
-- file content classified as UTF-8 text, binary, locked, or unavailable.
+- file content classified as UTF-8 text, binary, too large for the renderer,
+  locked, or unavailable. Text and diff bodies are capped at 4 MiB per side.
 
 The model is intentionally small and replaceable. `@pierre/trees` and
 `@pierre/diffs` are renderer-only dependencies; their props are built from the

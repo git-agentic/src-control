@@ -48,6 +48,15 @@ function ContentState({ path, content }: FileView) {
       </div>
     );
   }
+  if (content.state === "too_large") {
+    return (
+      <div className="locked-content" role="status">
+        <span aria-hidden="true">◫</span>
+        <strong>File is too large to display</strong>
+        <p>{formatBytes(content.size)} · the native object remains unchanged.</p>
+      </div>
+    );
+  }
   return (
     <div className="locked-content" role="status">
       <span aria-hidden="true">○</span>
@@ -76,11 +85,12 @@ function ChangeSurface({ change }: { change: FileChangeView }) {
     (change.before && change.before.state !== "text") ||
     (change.after && change.after.state !== "text")
   ) {
+    const tooLarge = change.before?.state === "too_large" || change.after?.state === "too_large";
     return (
       <div className="locked-content" role="status">
         <span aria-hidden="true">◫</span>
-        <strong>Binary change</strong>
-        <p>The snapshot records a binary change; no textual diff is available.</p>
+        <strong>{tooLarge ? "Change is too large to display" : "Binary change"}</strong>
+        <p>{tooLarge ? "The snapshot records a large change; no textual diff is loaded." : "The snapshot records a binary change; no textual diff is available."}</p>
       </div>
     );
   }
@@ -101,5 +111,6 @@ function ChangeSurface({ change }: { change: FileChangeView }) {
 
 function formatBytes(size: number) {
   if (size < 1024) return `${size} B`;
+  if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
   return `${(size / 1024).toFixed(1)} KB`;
 }

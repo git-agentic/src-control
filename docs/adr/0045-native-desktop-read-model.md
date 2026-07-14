@@ -29,7 +29,7 @@ directly. Domain crates do not depend on Tauri or frontend packages.
 The backend exposes only repository selection, reference history, snapshot
 details, public file reads, and per-path first-parent comparison. Tree and
 change-list responses contain metadata only; file and diff bodies are loaded
-lazily after an explicit path selection. The chosen repository
+lazily after an explicit path selection and capped at 4 MiB per side. The chosen repository
 root remains in Rust-managed state; later calls accept only native ids and
 repo-relative paths. No generic filesystem, shell, URL, or object-store command
 is exposed.
@@ -64,6 +64,7 @@ run on the same machine.
 - A compromised renderer can query only the repository the user selected and
   cannot turn IPC into arbitrary filesystem or shell access.
 - Protected/private plaintext cannot enter frontend state in this phase.
+- Oversized public blobs remain native objects but do not enter frontend state.
 - Opening a query briefly acquires the repository's existing single-writer
   lock; a future long-lived read handle needs its own concurrency ADR.
 - Mutation and authorized decryption remain future slices with separate threat

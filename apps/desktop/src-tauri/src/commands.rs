@@ -10,6 +10,9 @@ use crate::read_model::{
 
 #[derive(Default)]
 struct AppState {
+    // This mutex protects only replacement of the selected repository. Reads
+    // clone the PathBuf-backed adapter and release the guard before any I/O,
+    // so repository traversals do not serialize on it.
     repository: Mutex<Option<DesktopRepository>>,
 }
 
@@ -32,10 +35,10 @@ fn selected_repository(state: &State<'_, AppState>) -> Result<DesktopRepository,
     guard.as_ref().cloned().ok_or_else(no_repository)
 }
 
-fn task_error(error: impl std::fmt::Display) -> ReadModelError {
+fn task_error(_error: impl std::fmt::Display) -> ReadModelError {
     ReadModelError {
         kind: "repository_error".into(),
-        message: format!("Desktop repository query failed: {error}"),
+        message: "The desktop repository query could not be completed.".into(),
     }
 }
 
@@ -55,9 +58,9 @@ async fn choose_repository(
     let Some(selected) = selected else {
         return Ok(None);
     };
-    let path = selected.into_path().map_err(|error| ReadModelError {
+    let path = selected.into_path().map_err(|_error| ReadModelError {
         kind: "invalid_selection".into(),
-        message: error.to_string(),
+        message: "The selected folder could not be opened.".into(),
     })?;
     let (repository, overview) = tauri::async_runtime::spawn_blocking(move || {
         let repository = DesktopRepository::open(path)?;

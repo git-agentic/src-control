@@ -543,7 +543,8 @@ across every phase.
   all-parent snapshot DAG, provenance, public files, and first-parent diffs.
   Protected files are explicit lock states and unauthorized private branches
   remain opaque; the slice has no mutation, decryption, or general filesystem
-  IPC. (ADR-0045.)
+  IPC. `@pierre/trees` remains exact-pinned to its current beta and should be
+  reconsidered when its stable release is published. (ADR-0045.)
 
 ## Active
 

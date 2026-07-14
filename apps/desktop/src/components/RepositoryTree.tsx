@@ -10,6 +10,10 @@ interface RepositoryTreeProps {
 export function RepositoryTree({ files, onSelect }: RepositoryTreeProps) {
   const paths = useMemo(() => files.map((file) => file.path), [files]);
   const filePaths = useMemo(() => new Set(paths), [paths]);
+  const filesByPath = useMemo(
+    () => new Map(files.map((file) => [file.path, file])),
+    [files],
+  );
   const { model } = useFileTree({
     paths,
     initialExpansion: 1,
@@ -21,12 +25,12 @@ export function RepositoryTree({ files, onSelect }: RepositoryTreeProps) {
       if (path && filePaths.has(path)) onSelect(path);
     },
     renderRowDecoration({ item }) {
-      const file = files.find((candidate) => candidate.path === item.path);
+      const file = filesByPath.get(item.path);
       if (file?.contentState === "protected_locked") {
         return { text: "locked", title: "Protected content is locked" };
       }
-      if (file?.contentState === "binary") {
-        return { text: "binary" };
+      if (file?.contentState === "unavailable") {
+        return { text: "unavailable", title: "Object is not available locally" };
       }
       return null;
     },

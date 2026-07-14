@@ -54,7 +54,10 @@ return a fieldless `protected_locked` state, private refs stop at public manifes
 metadata, and transcript bodies are not part of the read model. The WebView has
 no filesystem or shell capability and all scripts are bundled.
 
-`@pierre/trees` and `@pierre/diffs` are presentation adapters only. Their input
+`@pierre/trees` and `@pierre/diffs` are public npm packages installed from the
+default npm registry and are presentation adapters only. `@pierre/trees` is
+exact-pinned to its current beta until the package publishes a stable release.
+Their input
 is mapped from local DTOs in `src/components/`, keeping both packages
 replaceable without changing the native read model.
 

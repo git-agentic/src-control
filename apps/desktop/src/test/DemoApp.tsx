@@ -94,11 +94,15 @@ export function DemoApp() {
       return () => window.clearTimeout(timer);
     }
     if (mode === "locked") {
+      let changeTimer: number | undefined;
       const timer = window.setTimeout(() => {
         Array.from(document.querySelectorAll<HTMLButtonElement>("[role=tab]")).find((button) => button.textContent === "changes")?.click();
-        window.setTimeout(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".change-pane button")).find((button) => button.textContent?.includes("release.env"))?.click(), 100);
+        changeTimer = window.setTimeout(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".change-pane button")).find((button) => button.textContent?.includes("release.env"))?.click(), 100);
       }, 250);
-      return () => window.clearTimeout(timer);
+      return () => {
+        window.clearTimeout(timer);
+        if (changeTimer !== undefined) window.clearTimeout(changeTimer);
+      };
     }
   }, []);
   return <App api={demoApi} autoOpen />;

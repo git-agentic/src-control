@@ -13,7 +13,7 @@ describe("Pierre presentation dependencies", () => {
             path: "src/main.ts",
             name: "main.ts",
             mode: 0o644,
-            contentState: "text",
+            contentState: "public_available",
             size: 12,
           },
         ]}
@@ -41,5 +41,12 @@ describe("Pierre presentation dependencies", () => {
     );
     expect(screen.getByText(/protected content is locked/i)).toBeInTheDocument();
     expect(document.querySelector("[data-pierre-file]")).not.toBeInTheDocument();
+
+    rerender(
+      <FileSurface
+        file={{ path: "large.txt", content: { state: "too_large", size: 5_000_000 } }}
+      />,
+    );
+    expect(screen.getByText(/too large to display/i)).toBeInTheDocument();
   });
 });
