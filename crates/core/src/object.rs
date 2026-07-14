@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::id::ObjectId;
 
 /// Object kind tags, written as the first byte of every encoding.
-const TAG_BLOB: u8 = 0;
+pub(crate) const TAG_BLOB: u8 = 0;
 const TAG_TREE: u8 = 1;
 const TAG_SNAPSHOT_LEGACY: u8 = 2; // pre-P16 encoding; refused with a clear error
 const TAG_SECRET: u8 = 3;

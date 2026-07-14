@@ -497,12 +497,29 @@ fn content_view(repo: &Repo, entry: &FileEntry) -> Result<ContentView, ReadModel
         return Ok(ContentView::ProtectedLocked);
     }
     let store = repo.store();
-    let object = store
-        .lock()
-        .map_err(|_| {
-            ReadModelError::new("repository_error", "repository object cache is unavailable")
-        })?
-        .get(id);
+    let mut store = store.lock().map_err(|_| {
+        ReadModelError::new("repository_error", "repository object cache is unavailable")
+    })?;
+    let size = match store.blob_size(id) {
+        Ok(size) => size,
+        Err(scl_core::Error::NotFound(_)) => {
+            return Ok(ContentView::Unavailable {
+                reason: "This object is not available in the partial repository.".into(),
+            });
+        }
+        Err(scl_core::Error::WrongKind(_, _)) => {
+            return Err(ReadModelError::new(
+                "corrupt_repository",
+                format!("file object {id} is not a blob"),
+            ));
+        }
+        Err(error) => return Err(ReadModelError::from_repo(error.into())),
+    };
+    const MAX_RENDER_BYTES: usize = 4 * 1024 * 1024;
+    if size > MAX_RENDER_BYTES {
+        return Ok(ContentView::TooLarge { size });
+    }
+    let object = store.get(id);
     let bytes = match object {
         Ok(Object::Blob(bytes)) => bytes,
         Ok(_) => {
@@ -518,11 +535,7 @@ fn content_view(repo: &Repo, entry: &FileEntry) -> Result<ContentView, ReadModel
         }
         Err(error) => return Err(ReadModelError::from_repo(error.into())),
     };
-    let size = bytes.len();
-    const MAX_RENDER_BYTES: usize = 4 * 1024 * 1024;
-    if size > MAX_RENDER_BYTES {
-        return Ok(ContentView::TooLarge { size });
-    }
+    debug_assert_eq!(bytes.len(), size);
     if bytes.contains(&0) {
         return Ok(ContentView::Binary { size });
     }
