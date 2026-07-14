@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  ComparisonView,
+  FileChangeView,
   FileView,
   HistoryView,
   RepositoryOverview,
@@ -12,7 +12,7 @@ export interface DesktopApi {
   selectReference(referenceId: string): Promise<HistoryView>;
   snapshotDetails(snapshotId: string): Promise<SnapshotDetails>;
   readFile(snapshotId: string, path: string): Promise<FileView>;
-  compareFirstParent(snapshotId: string): Promise<ComparisonView>;
+  compareFirstParent(snapshotId: string, path: string): Promise<FileChangeView>;
 }
 
 export const desktopApi: DesktopApi = {
@@ -23,6 +23,6 @@ export const desktopApi: DesktopApi = {
     invoke("snapshot_details", { snapshotId }),
   readFile: (snapshotId, path) =>
     invoke("read_file", { snapshotId, path }),
-  compareFirstParent: (snapshotId) =>
-    invoke("compare_first_parent", { snapshotId }),
+  compareFirstParent: (snapshotId, path) =>
+    invoke("compare_first_parent", { snapshotId, path }),
 };

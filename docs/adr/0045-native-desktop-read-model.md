@@ -27,7 +27,9 @@ directly. Domain crates do not depend on Tauri or frontend packages.
 ### Typed IPC
 
 The backend exposes only repository selection, reference history, snapshot
-details, public file reads, and first-parent comparison. The chosen repository
+details, public file reads, and per-path first-parent comparison. Tree and
+change-list responses contain metadata only; file and diff bodies are loaded
+lazily after an explicit path selection. The chosen repository
 root remains in Rust-managed state; later calls accept only native ids and
 repo-relative paths. No generic filesystem, shell, URL, or object-store command
 is exposed.
@@ -49,8 +51,10 @@ not. Private-key bytes have no IPC type.
 
 ### WebView boundary
 
-The frontend is bundled with a deny-by-default CSP and no remote scripts. Tauri
-capabilities are minimal. Repository text is rendered as text, not trusted HTML.
+The frontend is bundled with a deny-by-default production CSP and no remote
+scripts; a distinct development CSP permits only the local Vite origin. Tauri
+capabilities are minimal, and repository reads run on its blocking pool.
+Repository text is rendered as text, not trusted HTML.
 The WebView is treated as less trusted than the Rust backend even though both
 run on the same machine.
 

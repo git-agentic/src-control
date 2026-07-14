@@ -39,12 +39,12 @@ The renderer can invoke only five repository operations:
   state, and returns `RepositoryOverview`.
 - `select_reference(reference_id)` returns the selected public ref's reachable
   snapshot history, or an explicit opaque private-branch result.
-- `snapshot_details(snapshot_id)` returns metadata, tree entries, and changed
+- `snapshot_details(snapshot_id)` returns metadata-only tree entries and changed
   file summaries for a snapshot already reachable from the selected repository.
 - `read_file(snapshot_id, path)` returns public text/binary content or an
   explicit locked/unavailable result.
-- `compare_first_parent(snapshot_id)` returns public file changes against the
-  first parent; a root snapshot compares against an empty tree.
+- `compare_first_parent(snapshot_id, path)` lazily returns one public file change
+  against the first parent; a root snapshot compares against an empty tree.
 
 Repository paths never enter ordinary IPC calls. Snapshot ids and file paths are
 validated against native reachable objects before use. There is no arbitrary
@@ -54,6 +54,7 @@ The DTOs use tagged unions for every confidentiality-sensitive state:
 
 ```text
 ReferenceAccess = public | private_opaque
+TreeState       = public_available | protected_locked | unavailable
 ContentState    = text | binary | protected_locked | unavailable
 SignatureState  = trusted | untrusted | invalid | unsigned
 ```
@@ -73,9 +74,10 @@ The renderer receives presentation-ready, immutable records:
 - local and remote-tracking refs, current-ref marker, tip id, and access state;
 - DAG nodes with all parent ids, author, timestamp, message, merge marker,
   signature status, transcript count, and ref labels;
-- a hierarchical public tree containing path, mode, size when available, and
-  content state;
-- first-parent changes classified as added, modified, deleted, or protected;
+- a hierarchical public tree containing path, mode, and a metadata-only access
+  state (public-available, locked, or unavailable);
+- metadata-only first-parent changes classified as added, modified, deleted, or
+  protected, with content fetched only for the selected path;
 - file content classified as UTF-8 text, binary, locked, or unavailable.
 
 The model is intentionally small and replaceable. `@pierre/trees` and
@@ -106,7 +108,8 @@ Phase 35 is keyless and never decrypts.
 ## Tauri/WebView trust boundary
 
 The WebView is an untrusted presentation process relative to the Rust core.
-The frontend is fully bundled, CSP denies remote script/content execution, and
+The frontend is fully bundled, the production CSP denies remote script/content
+execution (a separate development CSP permits only the local Vite server), and
 the Tauri capability grants only the core window/event functionality needed by
 the app. Directory selection is initiated by a Rust command, so no general
 dialog or filesystem capability is exposed to frontend JavaScript.
@@ -114,6 +117,8 @@ dialog or filesystem capability is exposed to frontend JavaScript.
 Repository Markdown and HTML are displayed as plain text. File text is rendered
 as text, never injected HTML. Errors are sanitized for display and no repository
 bytes, identities, environment variables, or IPC payloads are logged.
+Repository reads run on Tauri's blocking pool so native object traversal does
+not stall IPC dispatch or WebView event handling.
 
 ## Test seams
 

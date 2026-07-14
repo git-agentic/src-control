@@ -4,7 +4,7 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::read_model::{
-    ComparisonView, DesktopRepository, FileView, HistoryView, ReadModelError, RepositoryOverview,
+    DesktopRepository, FileChangeView, FileView, HistoryView, ReadModelError, RepositoryOverview,
     SnapshotDetails,
 };
 
@@ -27,12 +27,16 @@ fn no_repository() -> ReadModelError {
     }
 }
 
-fn with_repository<T>(
-    state: &State<'_, AppState>,
-    read: impl FnOnce(&DesktopRepository) -> Result<T, ReadModelError>,
-) -> Result<T, ReadModelError> {
+fn selected_repository(state: &State<'_, AppState>) -> Result<DesktopRepository, ReadModelError> {
     let guard = state.repository.lock().map_err(|_| state_error())?;
-    read(guard.as_ref().ok_or_else(no_repository)?)
+    guard.as_ref().cloned().ok_or_else(no_repository)
+}
+
+fn task_error(error: impl std::fmt::Display) -> ReadModelError {
+    ReadModelError {
+        kind: "repository_error".into(),
+        message: format!("Desktop repository query failed: {error}"),
+    }
 }
 
 #[tauri::command]
@@ -40,11 +44,14 @@ async fn choose_repository(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<RepositoryOverview>, ReadModelError> {
-    let selected = app
-        .dialog()
+    let (sender, mut receiver) = tauri::async_runtime::channel(1);
+    app.dialog()
         .file()
         .set_title("Open src-control repository")
-        .blocking_pick_folder();
+        .pick_folder(move |selected| {
+            let _ = sender.try_send(selected);
+        });
+    let selected = receiver.recv().await.flatten();
     let Some(selected) = selected else {
         return Ok(None);
     };
@@ -52,43 +59,63 @@ async fn choose_repository(
         kind: "invalid_selection".into(),
         message: error.to_string(),
     })?;
-    let repository = DesktopRepository::open(path)?;
-    let overview = repository.overview()?;
+    let (repository, overview) = tauri::async_runtime::spawn_blocking(move || {
+        let repository = DesktopRepository::open(path)?;
+        let overview = repository.overview()?;
+        Ok::<_, ReadModelError>((repository, overview))
+    })
+    .await
+    .map_err(task_error)??;
     *state.repository.lock().map_err(|_| state_error())? = Some(repository);
     Ok(Some(overview))
 }
 
 #[tauri::command]
-fn select_reference(
+async fn select_reference(
     state: State<'_, AppState>,
     reference_id: String,
 ) -> Result<HistoryView, ReadModelError> {
-    with_repository(&state, |repo| repo.select_reference(&reference_id))
+    let repository = selected_repository(&state)?;
+    tauri::async_runtime::spawn_blocking(move || repository.select_reference(&reference_id))
+        .await
+        .map_err(task_error)?
 }
 
 #[tauri::command]
-fn snapshot_details(
+async fn snapshot_details(
     state: State<'_, AppState>,
     snapshot_id: String,
 ) -> Result<SnapshotDetails, ReadModelError> {
-    with_repository(&state, |repo| repo.snapshot_details(&snapshot_id))
+    let repository = selected_repository(&state)?;
+    tauri::async_runtime::spawn_blocking(move || repository.snapshot_details(&snapshot_id))
+        .await
+        .map_err(task_error)?
 }
 
 #[tauri::command]
-fn read_file(
+async fn read_file(
     state: State<'_, AppState>,
     snapshot_id: String,
     path: String,
 ) -> Result<FileView, ReadModelError> {
-    with_repository(&state, |repo| repo.read_file(&snapshot_id, &path))
+    let repository = selected_repository(&state)?;
+    tauri::async_runtime::spawn_blocking(move || repository.read_file(&snapshot_id, &path))
+        .await
+        .map_err(task_error)?
 }
 
 #[tauri::command]
-fn compare_first_parent(
+async fn compare_first_parent(
     state: State<'_, AppState>,
     snapshot_id: String,
-) -> Result<ComparisonView, ReadModelError> {
-    with_repository(&state, |repo| repo.compare_first_parent(&snapshot_id))
+    path: String,
+) -> Result<FileChangeView, ReadModelError> {
+    let repository = selected_repository(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        repository.compare_first_parent(&snapshot_id, &path)
+    })
+    .await
+    .map_err(task_error)?
 }
 
 /// Build and run the Tauri shell with the narrow Phase 35 command set.

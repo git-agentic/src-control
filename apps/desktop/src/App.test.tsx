@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { DesktopApi } from "./api";
@@ -66,7 +66,11 @@ function api(overrides: Partial<DesktopApi> = {}): DesktopApi {
     }),
     snapshotDetails: vi.fn().mockResolvedValue(details),
     readFile: vi.fn(),
-    compareFirstParent: vi.fn(),
+    compareFirstParent: vi.fn().mockResolvedValue({
+      path: "config/release.env",
+      kind: "protected",
+      after: { state: "protected_locked" },
+    }),
     ...overrides,
   };
 }
@@ -154,6 +158,88 @@ describe("desktop repository flow", () => {
     await user.keyboard("{ArrowDown}");
 
     expect(desktop.snapshotDetails).toHaveBeenLastCalledWith(second.id);
+  });
+
+  it("draws DAG edges only between the snapshot's actual parents", async () => {
+    const parent = { ...snapshot, id: "b".repeat(64), message: "First parent", parents: [] };
+    const mergeParent = { ...snapshot, id: "c".repeat(64), message: "Merge parent", parents: [] };
+    const merge = { ...snapshot, parents: [parent.id, mergeParent.id], isMerge: true };
+    const desktop = api({
+      selectReference: vi.fn().mockResolvedValue({
+        reference: overview.references[0],
+        snapshots: [merge, parent, mergeParent],
+      }),
+    });
+    const user = userEvent.setup();
+    render(<App api={desktop} />);
+
+    await user.click(screen.getByRole("button", { name: /open repository/i }));
+    await screen.findByRole("option", { name: /first parent/i });
+
+    expect(document.querySelector(`path[data-child="${merge.id}"][data-parent="${parent.id}"]`)).toBeInTheDocument();
+    expect(document.querySelector(`path[data-child="${merge.id}"][data-parent="${mergeParent.id}"]`)).toBeInTheDocument();
+  });
+
+  it("shows an explicit empty history instead of a permanent loading skeleton", async () => {
+    const desktop = api();
+    const user = userEvent.setup();
+    render(<App api={desktop} />);
+
+    await user.click(screen.getByRole("button", { name: /open repository/i }));
+
+    expect(await screen.findByText(/no snapshots on this branch yet/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/loading snapshot history/i)).not.toBeInTheDocument();
+  });
+
+  it("renders corrupt timestamps safely", async () => {
+    const invalid = { ...snapshot, timestamp: Number.MAX_SAFE_INTEGER };
+    const desktop = api({
+      selectReference: vi.fn().mockResolvedValue({
+        reference: overview.references[0],
+        snapshots: [invalid],
+      }),
+      snapshotDetails: vi.fn().mockResolvedValue({ ...details, snapshot: invalid }),
+    });
+    const user = userEvent.setup();
+    render(<App api={desktop} />);
+
+    await user.click(screen.getByRole("button", { name: /open repository/i }));
+
+    expect(await screen.findAllByText(/invalid timestamp/i)).not.toHaveLength(0);
+  });
+
+  it("ignores a stale comparison response after a newer file is selected", async () => {
+    let resolveOld!: (value: Awaited<ReturnType<DesktopApi["compareFirstParent"]>>) => void;
+    const oldResponse = new Promise<Awaited<ReturnType<DesktopApi["compareFirstParent"]>>>((resolve) => { resolveOld = resolve; });
+    const twoChanges: SnapshotDetails = {
+      ...details,
+      comparison: {
+        ...details.comparison,
+        changes: [
+          { path: "config/old.env", kind: "protected" },
+          { path: "src/new.ts", kind: "modified" },
+        ],
+      },
+    };
+    const desktop = api({
+      selectReference: vi.fn().mockResolvedValue({ reference: overview.references[0], snapshots: [snapshot] }),
+      snapshotDetails: vi.fn().mockResolvedValue(twoChanges),
+      compareFirstParent: vi.fn().mockImplementation((_snapshotId: string, path: string) => path === "config/old.env"
+        ? oldResponse
+        : Promise.resolve({ path, kind: "modified", after: { state: "text", text: "new content", size: 11 } })),
+    });
+    const user = userEvent.setup();
+    render(<App api={desktop} />);
+    await user.click(screen.getByRole("button", { name: /open repository/i }));
+    await user.click(await screen.findByRole("tab", { name: /changes/i }));
+    await user.click(screen.getByRole("button", { name: /config\/old.env/i }));
+    await user.click(screen.getByRole("button", { name: /src\/new.ts/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /src\/new.ts/i })).toHaveAttribute("data-selected"));
+
+    resolveOld({ path: "config/old.env", kind: "protected", after: { state: "protected_locked" } });
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /src\/new.ts/i })).toHaveAttribute("data-selected"));
+    expect(screen.queryByText(/protected change/i)).not.toBeInTheDocument();
   });
 
   it("keeps an unauthorized private branch opaque", async () => {

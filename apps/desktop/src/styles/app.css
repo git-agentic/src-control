@@ -87,14 +87,13 @@ button:focus-visible, [tabindex]:focus-visible {
 .opaque-state p { margin: 0; }
 .opaque-state small { display: block; margin-top: 16px; color: var(--muted); }
 .lock-icon { color: var(--accent); font-size: 26px; }
-.snapshot-list { list-style: none; margin: 0; padding: 10px 10px 24px; }
-.snapshot-row { min-height: 94px; display: grid; grid-template-columns: 32px minmax(0, 1fr); position: relative; }
+.snapshot-list { position: relative; list-style: none; margin: 0; padding: 10px 10px 24px; }
+.snapshot-row { min-height: 94px; display: grid; grid-template-columns: 48px minmax(0, 1fr); position: relative; }
+.dag-edges { position: absolute; z-index: 0; top: 10px; left: 10px; width: 48px; height: calc(100% - 34px); overflow: visible; pointer-events: none; }
+.dag-edges path { fill: none; stroke: var(--line-strong); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.snapshot-row[data-merge] .dag-rail i { background: #9b7650; box-shadow: 0 0 0 1px #9b7650; }
 .dag-rail { position: relative; display: block; }
-.dag-rail::before { content: ""; position: absolute; inset: 0 auto 0 15px; width: 2px; background: var(--line-strong); }
-.snapshot-row:first-child .dag-rail::before { top: 22px; }
-.snapshot-row:last-child .dag-rail::before { bottom: calc(100% - 24px); }
 .dag-rail i { position: absolute; z-index: 1; top: 17px; left: 10px; width: 12px; height: 12px; border: 3px solid var(--panel-muted); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
-.dag-rail b { position: absolute; top: 23px; left: 15px; width: 16px; height: 30px; border-right: 2px solid #9b7650; border-bottom: 2px solid #9b7650; border-radius: 0 0 12px; }
 .snapshot-option { min-width: 0; margin: 3px 0 5px; padding: 10px 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 10px; border: 1px solid transparent; border-radius: 9px; background: transparent; text-align: left; cursor: pointer; }
 .snapshot-option:hover { background: color-mix(in srgb, var(--panel) 68%, transparent); }
 .snapshot-option[aria-selected="true"] { border-color: var(--line-strong); background: var(--panel); box-shadow: 0 4px 16px rgba(20, 24, 21, .05); }
@@ -139,8 +138,8 @@ button:focus-visible, [tabindex]:focus-visible {
 }
 
 @media (max-width: 860px) {
-  .three-panel { grid-template-columns: 190px minmax(360px, 1fr); }
-  .detail-panel { display: none; }
+  .three-panel { grid-template-columns: 190px minmax(360px, 1fr); grid-template-rows: minmax(360px, 55vh) minmax(420px, 1fr); overflow: auto; }
+  .detail-panel { display: block; grid-column: 1 / -1; border-top: 1px solid var(--line); }
   .repository-path { display: none; }
 }
 

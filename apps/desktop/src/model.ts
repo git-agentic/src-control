@@ -62,7 +62,7 @@ export interface TreeFileView {
   path: string;
   name: string;
   mode: number;
-  contentState: ContentView["state"];
+  contentState: ContentView["state"] | "public_available";
   size?: number;
 }
 

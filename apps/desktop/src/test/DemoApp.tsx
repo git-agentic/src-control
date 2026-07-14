@@ -32,6 +32,17 @@ const earlier: SnapshotNode = {
   labels: [],
 };
 
+const mergeSource: SnapshotNode = {
+  ...earlier,
+  id: current.parents[1],
+  author: "Margaret Hamilton <margaret@src-control.dev>",
+  timestamp: 1_783_748_400,
+  message: "Capture the desktop provenance transcript",
+  parents: earlier.parents,
+  signature: { status: "untrusted", signer: "margaret" },
+  transcriptCount: 1,
+};
+
 const overview: RepositoryOverview = {
   root: "/Users/ada/Developer/src-control",
   name: "src-control",
@@ -47,16 +58,16 @@ const overview: RepositoryOverview = {
 const details: SnapshotDetails = {
   snapshot: current,
   tree: [
-    { path: "README.md", name: "README.md", mode: 0o644, contentState: "text", size: 1832 },
-    { path: "apps/desktop/src/App.tsx", name: "App.tsx", mode: 0o644, contentState: "text", size: 12840 },
+    { path: "README.md", name: "README.md", mode: 0o644, contentState: "public_available" },
+    { path: "apps/desktop/src/App.tsx", name: "App.tsx", mode: 0o644, contentState: "public_available" },
     { path: "config/release.env", name: "release.env", mode: 0o644, contentState: "protected_locked" },
   ],
   comparison: {
     snapshotId: tip,
     parentId: parent,
     changes: [
-      { path: "apps/desktop/src/App.tsx", kind: "modified", before: { state: "text", text: "export function App() {\n  return null;\n}\n", size: 43 }, after: { state: "text", text: "export function App() {\n  return <NativeBrowser />;\n}\n", size: 57 } },
-      { path: "config/release.env", kind: "protected", after: { state: "protected_locked" } },
+      { path: "apps/desktop/src/App.tsx", kind: "modified" },
+      { path: "config/release.env", kind: "protected" },
     ],
   },
 };
@@ -67,11 +78,13 @@ const demoApi: DesktopApi = {
   chooseRepository: async () => overview,
   selectReference: async (referenceId) => {
     const reference = overview.references.find((candidate) => candidate.id === referenceId)!;
-    return { reference, snapshots: reference.access === "public" ? (reference.tip === tip ? [current, earlier] : [earlier]) : [] };
+    return { reference, snapshots: reference.access === "public" ? (reference.tip === tip ? [current, earlier, mergeSource] : [earlier]) : [] };
   },
   snapshotDetails: async () => details,
   readFile: async (_snapshotId, path) => ({ path, content: path === "config/release.env" ? { state: "protected_locked" } : { state: "text", text: "# src-control\n\nA native snapshot-and-tag version control system.\n", size: 65 } }),
-  compareFirstParent: async () => details.comparison,
+  compareFirstParent: async (_snapshotId, path) => path === "config/release.env"
+    ? { path, kind: "protected", after: { state: "protected_locked" } }
+    : { path, kind: "modified", before: { state: "text", text: "export function App() {\n  return null;\n}\n", size: 43 }, after: { state: "text", text: "export function App() {\n  return <NativeBrowser />;\n}\n", size: 57 } },
 };
 
 export function DemoApp() {

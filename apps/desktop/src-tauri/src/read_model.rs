@@ -138,8 +138,7 @@ pub enum ContentView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentState {
-    Text,
-    Binary,
+    PublicAvailable,
     ProtectedLocked,
     Unavailable,
 }
@@ -368,11 +367,26 @@ impl DesktopRepository {
     pub fn compare_first_parent(
         &self,
         snapshot_id: &str,
-    ) -> Result<ComparisonView, ReadModelError> {
+        path: &str,
+    ) -> Result<FileChangeView, ReadModelError> {
+        validate_relative_path(path)?;
         let repo = self.repo()?;
         let id = self.reachable_snapshot(&repo, snapshot_id)?;
         let snapshot = get_snapshot(&repo, &id)?;
-        comparison_view(&repo, id, &snapshot)
+        let after = file_entries(&repo, snapshot.root)?;
+        let before = match snapshot.parents.first().copied() {
+            Some(parent) => file_entries(&repo, get_snapshot(&repo, &parent)?.root)?,
+            None => Default::default(),
+        };
+        let old = before.get(path);
+        let new = after.get(path);
+        if old == new {
+            return Err(ReadModelError::new(
+                "invalid_selection",
+                "file is not changed from the snapshot's first parent",
+            ));
+        }
+        file_change_view(&repo, path, old, new, true)
     }
 
     fn reachable_snapshot(
@@ -471,12 +485,13 @@ fn tree_view(repo: &Repo, snapshot: &Snapshot) -> Result<Vec<TreeFileView>, Read
     entries
         .into_iter()
         .map(|(path, entry)| {
-            let content = content_view(repo, &entry)?;
-            let (content_state, size) = match content {
-                ContentView::Text { size, .. } => (ContentState::Text, Some(size)),
-                ContentView::Binary { size } => (ContentState::Binary, Some(size)),
-                ContentView::ProtectedLocked => (ContentState::ProtectedLocked, None),
-                ContentView::Unavailable { .. } => (ContentState::Unavailable, None),
+            // Tree enumeration is metadata-only. Public blob bytes are loaded
+            // only after the user selects one file; protected bytes are never
+            // loaded by this adapter.
+            let content_state = if entry.2 & PROTECTED != 0 {
+                ContentState::ProtectedLocked
+            } else {
+                ContentState::PublicAvailable
             };
             let name = path
                 .rsplit('/')
@@ -488,7 +503,7 @@ fn tree_view(repo: &Repo, snapshot: &Snapshot) -> Result<Vec<TreeFileView>, Read
                 name,
                 mode: entry.1 .0,
                 content_state,
-                size,
+                size: None,
             })
         })
         .collect()
@@ -514,29 +529,52 @@ fn comparison_view(
         if old == new {
             continue;
         }
-        let protected = old.is_some_and(|entry| entry.2 & PROTECTED != 0)
-            || new.is_some_and(|entry| entry.2 & PROTECTED != 0);
-        let kind = if protected {
-            ChangeKind::Protected
-        } else {
-            match (old, new) {
-                (None, Some(_)) => ChangeKind::Added,
-                (Some(_), None) => ChangeKind::Deleted,
-                (Some(_), Some(_)) => ChangeKind::Modified,
-                (None, None) => unreachable!("path came from one of the two maps"),
-            }
-        };
-        changes.push(FileChangeView {
-            path: path.clone(),
-            kind,
-            before: old.map(|entry| content_view(repo, entry)).transpose()?,
-            after: new.map(|entry| content_view(repo, entry)).transpose()?,
-        });
+        changes.push(file_change_view(repo, path, old, new, false)?);
     }
     Ok(ComparisonView {
         snapshot_id: id.to_hex(),
         parent_id: parent_id.map(|parent| parent.to_hex()),
         changes,
+    })
+}
+
+fn file_change_view(
+    repo: &Repo,
+    path: &str,
+    old: Option<&FileEntry>,
+    new: Option<&FileEntry>,
+    include_content: bool,
+) -> Result<FileChangeView, ReadModelError> {
+    let protected = old.is_some_and(|entry| entry.2 & PROTECTED != 0)
+        || new.is_some_and(|entry| entry.2 & PROTECTED != 0);
+    let kind = if protected {
+        ChangeKind::Protected
+    } else {
+        match (old, new) {
+            (None, Some(_)) => ChangeKind::Added,
+            (Some(_), None) => ChangeKind::Deleted,
+            (Some(_), Some(_)) => ChangeKind::Modified,
+            (None, None) => {
+                return Err(ReadModelError::new(
+                    "invalid_selection",
+                    "file is absent from both sides of the comparison",
+                ))
+            }
+        }
+    };
+    Ok(FileChangeView {
+        path: path.to_string(),
+        kind,
+        before: if include_content {
+            old.map(|entry| content_view(repo, entry)).transpose()?
+        } else {
+            None
+        },
+        after: if include_content {
+            new.map(|entry| content_view(repo, entry)).transpose()?
+        } else {
+            None
+        },
     })
 }
 
@@ -925,18 +963,15 @@ mod tests {
         let locked = desktop.read_file(&tip.to_hex(), "locked.txt").unwrap();
         assert_eq!(locked.content, ContentView::ProtectedLocked);
 
-        let comparison = desktop.compare_first_parent(&tip.to_hex()).unwrap();
-        assert!(comparison.changes.iter().any(|change| {
-            change.path == "locked.txt"
-                && change.kind == ChangeKind::Protected
-                && change.after == Some(ContentView::ProtectedLocked)
-        }));
-        // The first parent still held an ordinary public version, so it may be
-        // shown as `before`; the protected `after` side has no byte field.
-        let protected_change = comparison
+        let comparison = desktop.snapshot_details(&tip.to_hex()).unwrap().comparison;
+        assert!(comparison
             .changes
             .iter()
-            .find(|change| change.path == "locked.txt")
+            .any(|change| { change.path == "locked.txt" && change.kind == ChangeKind::Protected }));
+        // The first parent still held an ordinary public version, so it may be
+        // shown as `before`; the protected `after` side has no byte field.
+        let protected_change = desktop
+            .compare_first_parent(&tip.to_hex(), "locked.txt")
             .unwrap();
         assert_eq!(protected_change.after, Some(ContentView::ProtectedLocked));
         assert_ne!(first, tip);

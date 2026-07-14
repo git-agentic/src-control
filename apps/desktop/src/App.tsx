@@ -46,11 +46,13 @@ export function App({ api = desktopApi, autoOpen = false }: AppProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<ReadModelError | null>(null);
   const requestSequence = useRef(0);
+  const contentSequence = useRef(0);
   const didAutoOpen = useRef(false);
 
   const selectSnapshot = useCallback(
     async (snapshot: SnapshotNode) => {
       const request = ++requestSequence.current;
+      contentSequence.current += 1;
       setBusy(true);
       setError(null);
       setFile(null);
@@ -70,6 +72,7 @@ export function App({ api = desktopApi, autoOpen = false }: AppProps) {
   const selectReference = useCallback(
     async (reference: ReferenceView) => {
       const request = ++requestSequence.current;
+      contentSequence.current += 1;
       setBusy(true);
       setError(null);
       setDetails(null);
@@ -92,11 +95,13 @@ export function App({ api = desktopApi, autoOpen = false }: AppProps) {
   );
 
   const openRepository = useCallback(async () => {
+    const request = ++requestSequence.current;
+    contentSequence.current += 1;
     setBusy(true);
     setError(null);
     try {
       const selected = await api.chooseRepository();
-      if (!selected) return;
+      if (!selected || request !== requestSequence.current) return;
       setRepository(selected);
       setHistory(null);
       setDetails(null);
@@ -105,9 +110,9 @@ export function App({ api = desktopApi, autoOpen = false }: AppProps) {
         selected.references[0];
       if (initial) await selectReference(initial);
     } catch (reason) {
-      setError(asError(reason));
+      if (request === requestSequence.current) setError(asError(reason));
     } finally {
-      setBusy(false);
+      if (request === requestSequence.current) setBusy(false);
     }
   }, [api, selectReference]);
 
@@ -121,12 +126,33 @@ export function App({ api = desktopApi, autoOpen = false }: AppProps) {
   const readFile = useCallback(
     async (path: string) => {
       if (!details) return;
+      const request = ++contentSequence.current;
+      const snapshotId = details.snapshot.id;
       setError(null);
       setChange(null);
       try {
-        setFile(await api.readFile(details.snapshot.id, path));
+        const selected = await api.readFile(snapshotId, path);
+        if (request === contentSequence.current) setFile(selected);
       } catch (reason) {
-        setError(asError(reason));
+        if (request === contentSequence.current) setError(asError(reason));
+      }
+    },
+    [api, details],
+  );
+
+  const readChange = useCallback(
+    async (summary: FileChangeView) => {
+      if (!details) return;
+      const request = ++contentSequence.current;
+      const snapshotId = details.snapshot.id;
+      setError(null);
+      setFile(null);
+      setChange(summary);
+      try {
+        const selected = await api.compareFirstParent(snapshotId, summary.path);
+        if (request === contentSequence.current) setChange(selected);
+      } catch (reason) {
+        if (request === contentSequence.current) setError(asError(reason));
       }
     },
     [api, details],
@@ -193,15 +219,21 @@ export function App({ api = desktopApi, autoOpen = false }: AppProps) {
             <SnapshotGraph snapshots={history.snapshots} selectedId={details?.snapshot.id} onSelect={selectSnapshot} />
           ) : history ? (
             <div className="empty-panel">No snapshots on this branch yet.</div>
-          ) : (
+          ) : busy ? (
             <div className="loading-list" aria-label="Loading snapshot history"><i /><i /><i /></div>
+          ) : error ? (
+            <div className="empty-panel">Snapshot history is unavailable. Choose a branch or open another repository.</div>
+          ) : repository.references.length ? (
+            <div className="empty-panel">Select a branch to load its snapshot history.</div>
+          ) : (
+            <div className="empty-panel">This repository has no branches to browse.</div>
           )}
         </section>
         <aside className="detail-panel" aria-label="Snapshot details">
           <PanelHeading label="Inspector" />
           {details ? (
             <>
-              <InspectorTabs selected={tab} onSelect={(next) => { setTab(next); setFile(null); setChange(null); }} />
+              <InspectorTabs selected={tab} onSelect={(next) => { contentSequence.current += 1; setTab(next); setFile(null); setChange(null); }} />
               {tab === "details" && <Metadata details={details} />}
               {tab === "files" && (
                 <div className="browser-split">
@@ -211,7 +243,7 @@ export function App({ api = desktopApi, autoOpen = false }: AppProps) {
               )}
               {tab === "changes" && (
                 <div className="browser-split">
-                  <ChangeList changes={details.comparison.changes} selected={change} onSelect={(selected) => { setFile(null); setChange(selected); }} />
+                  <ChangeList changes={details.comparison.changes} selected={change} onSelect={readChange} />
                   <div className="content-pane"><FileSurface change={change} /></div>
                 </div>
               )}
@@ -257,9 +289,10 @@ function SnapshotGraph({ snapshots, selectedId, onSelect }: { snapshots: Snapsho
   };
   return (
     <ol className="snapshot-list" role="listbox" aria-label="Native snapshot DAG">
+      <DagEdges snapshots={snapshots} />
       {snapshots.map((snapshot, index) => (
         <li key={snapshot.id} className="snapshot-row" data-merge={snapshot.isMerge || undefined}>
-          <span className="dag-rail" aria-hidden="true"><i />{snapshot.isMerge && <b />}</span>
+          <span className="dag-rail" aria-hidden="true"><i /></span>
           <button
             ref={(node) => { refs.current[index] = node; }}
             type="button"
@@ -285,6 +318,30 @@ function SnapshotGraph({ snapshots, selectedId, onSelect }: { snapshots: Snapsho
   );
 }
 
+function DagEdges({ snapshots }: { snapshots: SnapshotNode[] }) {
+  const rowHeight = 94;
+  const nodeY = (index: number) => index * rowHeight + 23;
+  const indices = new Map(snapshots.map((snapshot, index) => [snapshot.id, index]));
+  const edges = snapshots.flatMap((snapshot, childIndex) =>
+    snapshot.parents.flatMap((parent, parentIndex) => {
+      const targetIndex = indices.get(parent);
+      if (targetIndex === undefined) return [];
+      const fromY = nodeY(childIndex);
+      const toY = nodeY(targetIndex);
+      const lane = parentIndex === 0 ? 16 : Math.min(42, 29 + parentIndex * 7);
+      const path = parentIndex === 0
+        ? `M 16 ${fromY} L 16 ${toY}`
+        : `M 16 ${fromY} C ${lane} ${fromY}, ${lane} ${fromY + 12}, ${lane} ${fromY + 20} L ${lane} ${toY - 12} C ${lane} ${toY - 4}, ${lane} ${toY}, 16 ${toY}`;
+      return [<path key={`${snapshot.id}:${parent}`} d={path} data-child={snapshot.id} data-parent={parent} />];
+    }),
+  );
+  return (
+    <svg className="dag-edges" aria-hidden="true" viewBox={`0 0 48 ${Math.max(rowHeight, snapshots.length * rowHeight)}`} preserveAspectRatio="none">
+      {edges}
+    </svg>
+  );
+}
+
 function InspectorTabs({ selected, onSelect }: { selected: InspectorTab; onSelect: (tab: InspectorTab) => void }) {
   return (
     <div className="inspector-tabs" role="tablist" aria-label="Snapshot views">
@@ -297,6 +354,7 @@ function InspectorTabs({ selected, onSelect }: { selected: InspectorTab; onSelec
 
 function Metadata({ details }: { details: SnapshotDetails }) {
   const { snapshot } = details;
+  const date = timestampDate(snapshot.timestamp);
   return (
     <div className="metadata-pane">
       <p className="snapshot-message">{snapshot.message || "Untitled snapshot"}</p>
@@ -304,7 +362,7 @@ function Metadata({ details }: { details: SnapshotDetails }) {
       <dl>
         <dt>ID</dt><dd><code>{snapshot.id}</code></dd>
         <dt>Author</dt><dd>{snapshot.author}</dd>
-        <dt>Timestamp</dt><dd><time dateTime={new Date(snapshot.timestamp * 1000).toISOString()}>{formatTimestamp(snapshot.timestamp)}</time></dd>
+        <dt>Timestamp</dt><dd><time dateTime={date?.toISOString()}>{formatTimestamp(snapshot.timestamp)}</time></dd>
         <dt>Parents</dt><dd>{snapshot.parents.length ? snapshot.parents.map((parent) => <code key={parent}>{shortId(parent)}</code>) : "Root snapshot"}</dd>
         <dt>Topology</dt><dd>{snapshot.isMerge ? "Merge snapshot" : "Snapshot"}</dd>
       </dl>
@@ -323,7 +381,7 @@ function ProvenanceBadges({ snapshot, compact = false }: { snapshot: SnapshotNod
     <div className={`provenance-badges${compact ? " compact" : ""}`}>
       <span data-status={snapshot.signature.status}>{compact ? compactSignature : signature}</span>
       <span>{compact ? `transcript ×${snapshot.transcriptCount}` : `${snapshot.transcriptCount} ${snapshot.transcriptCount === 1 ? "transcript" : "transcripts"}`}</span>
-      {snapshot.secretCount > 0 && <span>{snapshot.secretCount} protected {snapshot.secretCount === 1 ? "path" : "paths"}</span>}
+      {snapshot.secretCount > 0 && <span>{snapshot.secretCount} committed {snapshot.secretCount === 1 ? "secret" : "secrets"}</span>}
       {snapshot.isMerge && <span>merge</span>}
     </div>
   );
@@ -343,6 +401,17 @@ function ChangeList({ changes, selected, onSelect }: { changes: FileChangeView[]
 }
 
 function shortId(id: string) { return id.slice(0, 10); }
+function timestampDate(timestamp: number) {
+  if (!Number.isSafeInteger(timestamp)) return null;
+  const date = new Date(timestamp * 1000);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
 function formatTimestamp(timestamp: number) {
-  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(timestamp * 1000));
+  const date = timestampDate(timestamp);
+  if (!date) return "Invalid timestamp";
+  try {
+    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+  } catch {
+    return "Invalid timestamp";
+  }
 }
