@@ -22,6 +22,8 @@ recorded as an ADR in `docs/adr/`. Keep them in sync when the design changes.
 ## Stack & tooling
 
 - **Language:** Rust (stable). Rationale in ARCHITECTURE.md ("Why Rust").
+- **Desktop:** Tauri v2 + React/TypeScript under `apps/desktop/`; frontend
+  dependencies are bundled and remain presentation-only.
 - **Edition:** 2021, inherited via `[workspace.package]`.
 - **Key deps (pin latest stable; no LTS concept in Rust/crates):**
   `blake3`, `thiserror`, `hex`, `gix` (Git interop only), `clap`, `anyhow`.
@@ -40,9 +42,12 @@ crates/crypto → envelope encryption (depends on core; ONLY crate linking RustC
 crates/tlsio  → TLS for sc+https (depends on nothing; ONLY crate linking rustls/rcgen)
 crates/repo   → persistent .sc/ repo: objects, refs, branches, working tree (depends on core/vfs/crypto/tlsio)
 crates/cli    → `sc` binary (depends on repo + vfs + gitio + crypto + core)
+apps/desktop/src-tauri → Tauri read-only adapter (depends on repo + core + crypto)
+apps/desktop/src       → bundled TypeScript presentation (typed IPC only)
 ```
 
-Strict dependency direction: `cli → repo → {vfs, gitio, crypto, tlsio} → core`
+Strict dependency direction: top-level adapters `{cli, desktop} → repo →
+{vfs, gitio, crypto, tlsio} → core`
 (`tlsio` is a leaf — it depends on no other workspace crate, not even `core`).
 **`core` must never depend on Git, worktrees, or crypto.** **`gix` must stay
 quarantined in `gitio`** — if you find yourself reaching for `gix` elsewhere,
@@ -96,6 +101,10 @@ snapshots down; `repo` stays Git-agnostic.
 
 ```sh
 cargo test                                   # whole workspace
+cd apps/desktop && npm ci                    # desktop JS dependencies
+cd apps/desktop && npm run tauri dev         # native desktop development app
+cd apps/desktop && npm run typecheck && npm test
+cd apps/desktop && npm run tauri build -- --bundles app  # validated macOS production bundle
 cargo run --bin sc -- demo --agents 4        # parallel-agent demo
 cargo run --bin sc -- demo --agents 6 --budget-mb 4 --spill   # exercise eviction
 cargo run --bin sc -- import --repo <path>   # import a Git repo's HEAD
@@ -433,7 +442,7 @@ the project tree if desired.
 
 ## Capability map (what's built, by phase)
 
-All 34 phases are built and tested. One line of current fact per phase; the
+All 35 phases are built and tested. One line of current fact per phase; the
 authoritative rationale and full semantics live in the linked ADR, the design
 in `ARCHITECTURE.md`. The old per-phase narrative log this table replaced is
 archived verbatim at `docs/archive/claude-md-phase-log-2026-07.md` — do not
@@ -476,6 +485,7 @@ the code, those win.
 | P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md) |
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
 | P34 | Private branches: ref points at a sealed-branch manifest; every commit/tree/blob individually sealed (copy-on-write) under a per-branch KEK wrapped per recipient + escrow; `sc branch --private/grant/revoke/publish`; opaque to non-recipients (content, paths, messages); grant O(1), revoke rotates the KEK; publish replays to public with a scanner gate; git bridge + private→public integration refused; `PROTOCOL_VERSION` 4 | [0044](docs/adr/0044-per-branch-access-control.md) |
+| P35 | Native Tauri desktop browser: opens `.sc` repositories through `scl-repo`, shows local/remote refs, all-parent snapshot DAG + provenance, public trees and first-parent diffs; protected content is locked and private branches remain opaque; no mutation or identity surface | [0045](docs/adr/0045-native-desktop-read-model.md) |
 
 ## Standing boundaries & gotchas
 
@@ -487,6 +497,10 @@ transport-adjacent. The rest, imperatively:
   sealed-branch object kinds). `MAX_OBJECT_SIZE` (256 MiB) guards the
   transfer path only — a larger blob commits locally but fails every
   subsequent push/fetch/clone at the receiver.
+- **The P35 desktop app is a keyless, read-only top-level adapter.** Its
+  renderer has five typed repository commands, no general filesystem/shell
+  capability, and no DTO field capable of carrying protected ciphertext or
+  identity material.
 - **Partial clones refuse merge, cherry-pick/rebase, `sc ws fork`/`harvest`,
   `sc work`, `sc export`, and `sparse disable`.** `sc backfill --all` converts
   to a genuine full clone and re-enables them.

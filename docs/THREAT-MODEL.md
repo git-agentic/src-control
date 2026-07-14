@@ -131,6 +131,25 @@ too, not just the src-control-side metadata.
   refused everywhere except `sc branch publish` — the one loudly-named,
   atomic, scanner-gated crossing.
 
+## Desktop WebView (`apps/desktop`) — ADR-0045
+
+- **Defends:** the Rust backend constrains the renderer to five typed,
+  read-only repository queries. The selected root stays in backend state;
+  snapshot ids must be reachable from public refs and paths must be canonical
+  repository-relative paths. The bundled WebView has no general filesystem,
+  shell, URL, process, or object-store command and remote scripts are denied.
+- **Protected and private data fail closed:** protected entries become a
+  fieldless `protected_locked` DTO without loading their blobs; private refs
+  stop at accepted manifest metadata. Private paths, messages, authors,
+  timestamps, inner DAG shape, transcript bodies, ciphertext, and identity
+  material have no renderer DTO representation.
+- **Does NOT defend:** public repository content against a compromised local
+  WebView after the user opens that repository; metadata already accepted as
+  public by ADR-0044 (private-branch name/existence, recipient/count/fork-point
+  structure); or plaintext copied elsewhere by another authorized local tool.
+  Phase 35 has no identity import or decryption path, so adding either requires
+  a new threat-model review rather than widening these commands in place.
+
 ## Signed commits & provenance (`sc commit --sign` / `sc verify`) — ADR-0032
 
 - **Defends:** history rewriting (an `amend`/`rebase`/`merge`-attack in a clone or

@@ -54,6 +54,8 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0041](0041-listener-resource-limits.md) | Listener resource limits (connection cap, session timeout, spool cap, accept backoff) | Accepted | 31 |
 | [0042](0042-in-binary-tls-sc-https.md) | In-binary TLS — `sc+https://` via rustls | Accepted | 32 |
 | [0043](0043-randomized-protected-encryption.md) | Randomized protected-path encryption (dual-read, randomized-write) | Accepted | 33 |
+| [0044](0044-per-branch-access-control.md) | Per-branch access control with opaque private branches | Accepted | 34 |
+| [0045](0045-native-desktop-read-model.md) | Native desktop adapter and keyless read model | Accepted | 35 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
