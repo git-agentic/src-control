@@ -61,8 +61,9 @@ to reason about — which is exactly the property Phase 1 is meant to demonstrat
 
 ## System overview
 
-The codebase is a Cargo workspace of six crates with a strict dependency
-direction (`cli → repo → {vfs, gitio, crypto} → core`):
+The codebase is a Cargo workspace of eight Rust crates with a strict dependency
+direction (top-level adapters `{cli, desktop} → repo → {vfs, gitio, crypto}
+→ core`, with the separate leaf edge `repo → tlsio`):
 
 ```
 src-control/
@@ -79,6 +80,8 @@ src-control/
 │   │             sc+http://), protection + secret lifecycle, GC, sparse & partial clone,
 │   │             signatures & session transcripts, agent workspaces
 │   └── cli/      `sc` binary — the full ~42-command surface (see CLAUDE.md)
+├── apps/desktop/ Tauri v2 top-level adapter + bundled TypeScript renderer;
+│                 native read model only, with no UI dependency in domain crates
 └── ARCHITECTURE.md
 ```
 
@@ -90,6 +93,11 @@ on-disk layout and all repo orchestration; it is deliberately **Git-agnostic**
 (it never links `gitio`) — `cli` links both `repo` and `gitio` and passes
 imported snapshots down. This matters because the long-term plan is to own the
 object format outright; Git is an import/export peer, not a foundation.
+
+The desktop backend is a peer of the CLI, not a layer beneath `repo`. It calls
+the same public Rust APIs and maps them to a narrow immutable read model. Its
+WebView never receives a repository root for general use, filesystem or shell
+authority, private keys, protected blob bytes, or private-branch internals.
 
 ## Content-addressed snapshot model
 
@@ -946,8 +954,8 @@ Proven by `demo/run_limits_demo.sh`. See ADR-0041.
 ## Phase 32 — in-binary TLS: sc+https:// (built)
 
 A new leaf crate, `crates/tlsio` (`scl-tlsio`), is the only crate linking
-rustls/rcgen/`ring` — extending the dependency rule to `cli → repo → {vfs,
-gitio, crypto, tlsio} → core` while leaving the RustCrypto quarantine in
+rustls/rcgen/`ring` — extending the dependency rule with the separate leaf edge
+`repo → tlsio` while leaving `repo → {vfs, gitio, crypto} → core` and the RustCrypto quarantine in
 `crates/crypto` untouched. Two seam functions grow a TLS wrap and nothing
 else changes: the client wraps the `TcpStream` before the opening write when
 the URL is `sc+https://`; the server wraps before the opening read when
@@ -1027,3 +1035,28 @@ publish, and filtered clones exclude private branches (sealed trees can't be
 path-filtered). Two additive object tags cross the wire, so
 `PROTOCOL_VERSION` bumps 3 → 4; no existing object's format changes. See
 ADR-0044.
+
+## Phase 35 — native desktop read-only browser (built)
+
+`apps/desktop/` proves the native object model can directly power a product
+surface. A Tauri v2 Rust adapter retains the user-selected canonical repository
+root and exposes five typed queries: choose repository, select reference,
+snapshot details, public file read, and first-parent comparison. Each requested
+snapshot must be reachable from a current public ref and each path must be a
+canonical repository-relative path. The adapter walks every parent for the DAG,
+uses native tree/diff objects, verifies signatures against public trust config,
+and reads transcript presence without opening transcript bodies.
+
+The renderer is a bundled React/TypeScript three-panel browser. Local and
+remote-tracking branches sit beside the all-parent snapshot graph; provenance is
+visible on each snapshot; the inspector shows metadata, a public repository
+tree, and first-parent changes. `@pierre/trees` and `@pierre/diffs` passed a
+Tauri/Vite integration spike and are isolated in renderer components so they
+remain replaceable presentation dependencies.
+
+This slice is deliberately keyless and read-only. A protected entry becomes a
+fieldless `protected_locked` DTO before its blob is loaded. A private ref stops
+at accepted `BranchManifest` metadata and becomes `private_opaque`; authors,
+messages, paths, timestamps, and inner topology never cross IPC. The WebView has
+no generic dialog, filesystem, URL, process, or object-store command. See
+ADR-0045.

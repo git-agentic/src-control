@@ -16,3 +16,8 @@ target/
 .vscode/
 
 # Note: Cargo.lock IS committed for this workspace (it ships a binary).
+
+# Desktop frontend/build artifacts
+apps/desktop/node_modules/
+apps/desktop/dist/
+apps/desktop/src-tauri/gen/

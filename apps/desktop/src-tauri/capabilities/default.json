@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Minimal capability for the bundled src-control main window.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

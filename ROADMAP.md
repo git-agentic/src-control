@@ -533,11 +533,22 @@ across every phase.
   rewrap policy-only on an all-randomized tip — run twice); dual-read of pre-P33
   convergent stores and the convergent→randomized rewrap upgrade are unit-pinned
   (the current binary can no longer write a convergent blob). (ADR-0043.)
+- **Phase 34 — Private branches.** A private ref points to a public structural
+  manifest while snapshots, trees, paths, messages, and blobs introduced on the
+  branch remain individually sealed under a branch KEK. Grant is O(1), revoke
+  rotates the KEK, and publish atomically replays scanner-gated public history.
+  (ADR-0044.)
+- **Phase 35 — Native desktop browser.** A bundled Tauri v2 application opens
+  `.sc` repositories through the Rust crates and renders local/remote refs, the
+  all-parent snapshot DAG, provenance, public files, and first-parent diffs.
+  Protected files are explicit lock states and unauthorized private branches
+  remain opaque; the slice has no mutation, decryption, or general filesystem
+  IPC. `@pierre/trees` remains exact-pinned to its current beta and should be
+  reconsidered when its stable release is published. (ADR-0045.)
 
 ## Active
 
-**None.** The agent/workspace-depth horizon opened by P30 is complete; P32
-closed the standalone TLS gap the P25–P31 horizon left open; the next
+**None.** Phase 35 completed the first native desktop vertical slice; the next
 horizon is TBD.
 
 ## Completed phases (usability-first ordering)
@@ -573,6 +584,9 @@ horizon is TBD.
 | **P30 — Agent session transcripts** | Attach a sealed, provenance-checked agent-session record to a commit | `sc transcript attach <ref> <file> --agent claude --sign`; a keyless clone gets ciphertext only, the recipient's identity decrypts byte-exact; `sc log` shows a non-decrypting presence marker; `sc gc` prunes a transcript once its only snapshot is unreachable; proven by `demo/run_transcript_demo.sh` | [0038](docs/adr/0038-agent-session-transcripts.md) |
 | **P31 — Listener resource limits** | Bound `sc serve --http`/`--stdio` against a hostile or overloaded peer | `--max-connections`/`--timeout`/`--max-pack-size` close ADR-0036's three named-but-open accepted consequences plus an aggregate-pack-spool gap this phase's own research pass found; busy-status-and-close at the connection cap, connection-fatal session timeout, `EC_TOO_LARGE` mid-stream abort on both transports, capped read-only pre-drain, Go-shaped exponential accept backoff; proven by `demo/run_limits_demo.sh` plus unit-test-proven timeout/backoff | [0041](docs/adr/0041-listener-resource-limits.md) |
 | **P32 — In-binary TLS (`sc+https://`)** | Confidential `sc+http` transport without a reverse proxy | `sc serve --http <addr> <path> --tls` auto-mints (or loads PEM) a serve identity; `sc clone sc+https://host/repo` with accept-new TOFU pinning into `~/.config/sc/known_hosts`; gate tightened so a plaintext public bind can no longer be justified by tokens alone (`--tls` + ≥1 token now required); proven by `demo/run_tls_demo.sh` (signed chunked blob over TLS, pin/mismatch/strict/pre-pin, tightened plaintext gate) | [0042](docs/adr/0042-in-binary-tls-sc-https.md) |
+| **P33 — Randomized protected encryption** | Close equality confirmation for new protected content | fresh DEK + nonce per seal, dual-read/randomized-write, keyed local stat cache, rewrap upgrade | [0043](docs/adr/0043-randomized-protected-encryption.md) |
+| **P34 — Private branches** | Keep an entire branch opaque before publication | sealed object closure behind a manifest; O(1) grant, KEK-rotating revoke, scanner-gated publish | [0044](docs/adr/0044-per-branch-access-control.md) |
+| **P35 — Native desktop browser** | Prove native `.sc` objects can power a polished visual tool | Tauri app opens a repository and browses refs, snapshot DAG/provenance, public trees, and first-parent diffs while locked/private states remain safe | [0045](docs/adr/0045-native-desktop-read-model.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3

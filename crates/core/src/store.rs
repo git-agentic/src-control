@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 use crate::id::ObjectId;
-use crate::object::Object;
+use crate::object::{Object, TAG_BLOB};
 
 /// zstd level for on-disk object payloads. 3 is the zstd default: fast, solid
 /// ratio. The level is a storage detail — it never affects the content address,
@@ -253,6 +253,53 @@ impl Store {
             return true;
         }
         self.existing_loose_path(id).is_some() || self.pack_index.contains_key(id)
+    }
+
+    /// Return a blob's logical byte length without admitting its contents to
+    /// the resident object cache. Persistent payloads are verified while they
+    /// are streamed through a fixed-size buffer, allowing callers to enforce
+    /// tighter read limits before materializing blob bytes.
+    pub fn blob_size(&self, id: &ObjectId) -> Result<usize> {
+        if let Some(resident) = self.resident.get(id) {
+            return match &resident.obj {
+                Object::Blob(bytes) => Ok(bytes.len()),
+                _ => Err(Error::WrongKind(*id, "blob")),
+            };
+        }
+        if let Some(size) = self.spilled.get(id) {
+            return Ok(*size);
+        }
+
+        if let Some(path) = self.existing_loose_path(id) {
+            use std::io::{BufReader, Read};
+
+            const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+            let mut file = std::fs::File::open(&path)?;
+            let mut prefix = [0_u8; 4];
+            let read = file.read(&mut prefix)?;
+            drop(file);
+            if read == prefix.len() && prefix == ZSTD_MAGIC {
+                let decoder =
+                    zstd::stream::read::Decoder::new(BufReader::new(std::fs::File::open(path)?))?;
+                return measure_blob(decoder, id);
+            }
+            return measure_blob(BufReader::new(std::fs::File::open(path)?), id);
+        }
+
+        if let Some(loc) = self.pack_index.get(id) {
+            use std::io::{BufReader, Read, Seek, SeekFrom};
+
+            let mut file = std::fs::File::open(&loc.pack_path)?;
+            file.seek(SeekFrom::Start(loc.offset))?;
+            let mut len_buf = [0_u8; 4];
+            file.read_exact(&mut len_buf)?;
+            let compressed_len = u32::from_le_bytes(len_buf) as u64;
+            let decoder =
+                zstd::stream::read::Decoder::new(BufReader::new(file.take(compressed_len)))?;
+            return measure_blob(decoder, id);
+        }
+
+        Err(Error::NotFound(*id))
     }
 
     // ---- typed convenience helpers -----------------------------------------
@@ -671,6 +718,38 @@ impl Store {
     }
 }
 
+fn measure_blob(mut reader: impl std::io::Read, id: &ObjectId) -> Result<usize> {
+    let mut hasher = blake3::Hasher::new();
+    let mut total = 0_usize;
+    let mut first = None;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if first.is_none() {
+            first = Some(buffer[0]);
+        }
+        total = total
+            .checked_add(read)
+            .ok_or_else(|| Error::Malformed("object length overflow".into()))?;
+        hasher.update(&buffer[..read]);
+    }
+    let actual = ObjectId::from_bytes(*hasher.finalize().as_bytes());
+    if actual != *id {
+        return Err(Error::Malformed(format!(
+            "object {id} failed hash verification on read"
+        )));
+    }
+    if first != Some(TAG_BLOB) {
+        return Err(Error::WrongKind(*id, "blob"));
+    }
+    total
+        .checked_sub(1)
+        .ok_or_else(|| Error::Malformed("blob has no canonical payload".into()))
+}
+
 impl Drop for Store {
     fn drop(&mut self) {
         // Remove the spill directory so a session leaves zero residual files.
@@ -773,6 +852,23 @@ mod tests {
         assert!(matches!(s2.get(&snap_id).unwrap(), Object::Snapshot(_)));
         drop(s2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_blob_size_streams_without_rehydrating() {
+        let dir = temp_objects_dir("blob-size");
+        let _ = std::fs::remove_dir_all(&dir);
+        let id = {
+            let mut store = Store::open_persistent(&dir, 8 * 1024 * 1024).unwrap();
+            store.put(blob(5 * 1024 * 1024, 0xAB)).unwrap()
+        };
+
+        let store = Store::open_persistent(&dir, 8 * 1024 * 1024).unwrap();
+        assert_eq!(store.stats().resident_blob_bytes, 0);
+        assert_eq!(store.blob_size(&id).unwrap(), 5 * 1024 * 1024);
+        assert_eq!(store.stats().resident_blob_bytes, 0);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

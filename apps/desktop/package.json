@@ -1,0 +1,43 @@
+{
+  "name": "@src-control/desktop",
+  "version": "0.1.0",
+  "description": "Native read-only browser for src-control repositories",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "tauri"
+  },
+  "keywords": [
+    "src-control",
+    "tauri",
+    "desktop"
+  ],
+  "author": "Toni Bergholm <toni@git-agentic.com>",
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": {
+    "@pierre/diffs": "^1.2.12",
+    "@pierre/trees": "1.0.0-beta.5",
+    "@tauri-apps/api": "^2.11.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^26.1.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "jsdom": "^29.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.4",
+    "vitest": "^4.1.10"
+  }
+}
