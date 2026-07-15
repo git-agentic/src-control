@@ -1,6 +1,9 @@
 // Take a look at the license at the top of the repository in the LICENSE file.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Cargo caps lints for registry dependencies but not for this vendored path
+// dependency. Preserve upstream dependency semantics under workspace -D warnings.
+#![allow(warnings)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(renamed_and_removed_lints)]
 #![doc = include_str!("../README.md")]
