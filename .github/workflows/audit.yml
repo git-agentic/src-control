@@ -6,11 +6,13 @@ on:
     paths:
       - "**/Cargo.toml"
       - "Cargo.lock"
+      - "vendor/glib-0.18.5-patched/**"
       - ".github/workflows/audit.yml"
   pull_request:
     paths:
       - "**/Cargo.toml"
       - "Cargo.lock"
+      - "vendor/glib-0.18.5-patched/**"
       - ".github/workflows/audit.yml"
   schedule:
     # Daily: the advisory database is deliberately fetched live each run, so
@@ -34,7 +36,13 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # proc-macro-error2 (unmaintained) reaches the lockfile only via
-          # gix -> gix-date -> jiff -> defmt, an optional jiff feature we never
-          # compile; unactionable here until upstream migrates off it.
-          ignore: RUSTSEC-2026-0173
+          # Accepted transitive advisories, each with a concrete removal gate:
+          # - GTK3 + proc-macro-error are required by Tauri 2 on Linux; remove
+          #   their exceptions when Tauri 3 moves the stack to GTK4.
+          # - rust-unic reaches us through Tauri's urlpattern 0.3 pin; remove
+          #   those exceptions when Tauri adopts urlpattern 0.6+ (ICU-based).
+          # - glib 0.18.5 is patched in-tree for RUSTSEC-2024-0429; cargo-audit
+          #   matches versions only, so remove this exception with that patch.
+          # - proc-macro-error2 reaches the lockfile only through an optional
+          #   gix -> jiff -> defmt feature we never compile; remove upstream.
+          ignore: RUSTSEC-2024-0416,RUSTSEC-2024-0412,RUSTSEC-2024-0418,RUSTSEC-2024-0411,RUSTSEC-2024-0417,RUSTSEC-2024-0414,RUSTSEC-2024-0415,RUSTSEC-2024-0420,RUSTSEC-2024-0419,RUSTSEC-2024-0370,RUSTSEC-2025-0081,RUSTSEC-2025-0075,RUSTSEC-2025-0080,RUSTSEC-2025-0100,RUSTSEC-2025-0098,RUSTSEC-2024-0429,RUSTSEC-2026-0173
