@@ -1,0 +1,19 @@
+- name: OSSF Scorecard action
+  # You may pin to the exact commit or the version.
+  # uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a
+  uses: ossf/scorecard-action@v2.4.3
+  with:
+    # OUTPUT: Path to file to store results
+    results_file: 
+    # OUTPUT: format of the results [json, sarif]
+    results_format: 
+    # INPUT: GitHub token with read access
+    repo_token: # optional, default is ${{ github.token }}
+    # INPUT: Publish results
+    publish_results: # optional
+    # INPUT: Method to fetch files from GitHub
+    file_mode: # optional, default is archive
+    # INPUT: Base URL for publishing results. Used for testing.
+    internal_publish_base_url: # optional, default is https://api.scorecard.dev
+    # INPUT: Default GitHub token. (Internal purpose only, not intended for developers to set. Used for pull requests configured with a PAT).
+    internal_default_token: # optional, default is ${{ github.token }}
