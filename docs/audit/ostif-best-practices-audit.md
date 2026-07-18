@@ -3,7 +3,7 @@ title: "Gap Analysis: src-control vs OSTIF Security Best Practices Guide"
 comparison_direction: "src-control repository (current state) -> OSTIF/Least Authority Security Best Practices Guide (desired state)"
 scope: "The whole repository (code, CI, docs, GitHub configuration via live API) compared against all six OSTIF practice areas; the guide's missing 08-what-next.md chapter and the external git-agentic.com website were excluded."
 generated: "2026-07-18"
-updated: "2026-07-18 — fourth round: Now + Soon tiers remediated (PRs #76–#87); code-scanning down from 17 open alerts to 3, all tracing to one deferred item (required human approvals) plus an optional badge"
+updated: "2026-07-18 — fifth round: second maintainer + required PR approvals enabled, closing G-032/T-16; code-scanning now 1 open alert (the optional OpenSSF badge). Every non-deferred gap is resolved."
 generated_by: "han:gap-analysis"
 sections_included:
   - executive_summary
@@ -40,9 +40,9 @@ Every gap has a stable ID. Sections 3–5 reference those IDs. The full evidence
 
 > This section was added after the gap analysis was acted on. Sections 1–5 below describe the repository **as first audited**; this section records what has since been fixed. Where they differ, this section is current.
 
-**Both actionable tiers of the work plan are done.** The Now tier (T-1…T-9, T-26) and the Soon tier (T-10…T-21) all shipped across pull requests #76–#87, plus repository-settings changes and an organization-wide two-factor-authentication requirement. Only the **Deferred tier (T-22…T-25)** remains — OSS-Fuzz enrollment, reproducible builds, a release pipeline with supply-chain attestations, and a hardening guide for people who run the server component — and every one of those is deliberately parked behind a trigger that hasn't happened yet: the project still distributes nothing for a consumer to verify.
+**Both actionable tiers of the work plan are done, and the one item that had been deferred for lack of a second reviewer is now also closed.** The Now tier (T-1…T-9, T-26) and the Soon tier (T-10…T-21) all shipped across pull requests #76–#87, plus repository-settings changes, an organization-wide two-factor-authentication requirement, and — as of later on 2026-07-18 — a second maintainer and required pull-request approvals (closing G-032/T-16). Only the **Deferred tier (T-22…T-25)** remains — OSS-Fuzz enrollment, reproducible builds, a release pipeline with supply-chain attestations, and a hardening guide for people who run the server component — and every one of those is deliberately parked behind a trigger that hasn't happened yet: the project still distributes nothing for a consumer to verify.
 
-**The independent security scorecard tells the story in numbers: 17 open findings became 3.**
+**The independent security scorecard tells the story in numbers: 17 open findings became 3, and after required reviews were enabled only 1 remains — the optional badge.**
 
 | Scorecard finding (first run) | Now/Soon fix | Status |
 |---|---|---|
@@ -55,10 +55,13 @@ Every gap has a stable ID. Sections 3–5 reference those IDs. The full evidence
 
 The **automated code analysis is fully clean** — zero open findings — and now covers the desktop application's language as well as the core (T-3).
 
-**The 3 remaining findings are not new gaps and not oversights — they are one already-tracked deferred item plus one optional extra:**
+**Update (2026-07-18, later the same day): the two review-related findings are now resolved.** A second maintainer account was added, and the trunk protection was set to require **1 approval** from someone other than the last pusher, with stale approvals dismissed on push and last-push approval required. That closes gap G-032 / todo T-16 — it was the only remaining non-deferred gap — and the two Scorecard findings it drove (required review approvals, and branch-protection completeness) clear on the next weekly scan. Nobody self-merges now; the two admin accounts review each other's pull requests.
 
-- **Two findings (required review approvals, and branch-protection completeness) share a single root cause: review approvals are set to zero.** This is gap G-032 / todo T-16 in the plan, and it is deliberately held: under the hosting platform's rules a lone maintainer cannot approve their own change, so requiring approvals needs a second reviewer to exist first. Note the branch-protection finding already *improved* once merge-gating on passing checks landed (T-9); the rest of it unlocks together the day a second reviewer is added and approvals can be required.
-- **One finding is an optional best-practices badge**, now showing "in progress." Completing it is nice-to-have, not a gap the guide requires.
+**That leaves one open code-scanning finding, and it is optional:**
+
+- **An optional best-practices badge**, now showing "in progress." Completing it is nice-to-have, not a gap the guide requires.
+
+*(For the audit trail: these findings originally shared the root cause "review approvals set to zero," which was deliberately held because a lone maintainer cannot approve their own change under the platform's rules. Adding a second reviewer removed that blocker. The branch-protection finding had already improved once merge-gating on passing checks landed via T-9.)*
 
 **Two closing items still need a human and cannot be done from the repository:** deploying the machine-readable security-contact file to the project website (`/.well-known/security.txt`), and the maintainer personally confirming the security-feed subscriptions the documentation now lists. Both are noted in Section 5.
 
@@ -717,6 +720,7 @@ The prioritized work plan, consolidated by the project-manager synthesis from th
 5. **The two corrected over-credits** (dead private-reporting channel; CI runs-but-does-not-gate) are already reflected in Section 1 of this report.
 6. **(Third round) The Scorecard `VulnerabilitiesID` alert (#18) will not close by fixing anything** — 17 of its 18 advisories are documented accepted risks and the 18th becomes one via T-26; its OSV check does not honor cargo-audit ignores, so expect to dismiss it with a comment pointing at `audit.yml`'s removal gates (or live with a standing 0-score on that check until the GTK4 migration).
 7. **(Third round) Do not treat the same-day scorecard PRs (#74/#75) as closing T-1's intent** — the forcing function only works if someone actually triages what it surfaces; 17 alerts are open and this report's todo mapping is the triage.
+8. **(Fifth round) Required approvals are now on — no self-merge.** Every PR needs 1 approval from a principal other than the last pusher, with last-push approval; the two admin accounts (`tonibergholm`, `tonibergholm-codento`) review each other's work. Automation and agents cannot merge their own PRs. This closed G-032/T-16.
 
 ---
 
