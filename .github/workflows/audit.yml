@@ -22,15 +22,19 @@ on:
 
 permissions:
   contents: read
-  checks: write
-  # Scheduled runs file findings as GitHub issues; without this the action
-  # fails with "Resource not accessible by integration" after a clean audit.
-  issues: write
 
 jobs:
   audit:
     name: cargo audit (RustSec advisories)
     runs-on: ubuntu-latest
+    # Write scopes are job-scoped, not workflow-level (Scorecard
+    # Token-Permissions; OSTIF audit T-20): audit-check writes check runs on
+    # PRs, and scheduled runs file findings as GitHub issues — without
+    # issues:write it fails with "Resource not accessible by integration".
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2

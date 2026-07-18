@@ -1,0 +1,59 @@
+name: sbom
+
+# Two-ecosystem CycloneDX SBOMs as CI artifacts (OSTIF audit T-10, G-005).
+# Weekly + on lockfile change; not a PR gate. Attach to releases when a
+# release pipeline exists (audit T-24).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "apps/desktop/package-lock.json"
+      - ".github/workflows/sbom.yml"
+      - ".github/scripts/annotate_sbom_glib.py"
+  schedule:
+    # Weekly on Saturdays.
+    - cron: "41 6 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    name: generate SBOMs (CycloneDX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96.1
+        with:
+          toolchain: 1.96.1
+      - name: install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version 0.5.9
+      - name: rust SBOMs (binaries, all target platforms)
+        # --target all so the Linux-only GTK stack (incl. the vendored glib)
+        # is represented regardless of runner OS.
+        run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target all
+      - name: annotate vendored-patched glib (audit G-033)
+        # Cargo.lock says plain "glib 0.18.5"; the build actually uses the
+        # in-tree patched fork. Record the patch as pedigree so SBOM
+        # consumers don't misread it as unpatched upstream. Fails loudly if
+        # glib is gone — then remove this step and the script together.
+        run: python3 .github/scripts/annotate_sbom_glib.py apps/desktop/src-tauri/scl-desktop_bin.cdx.json
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: npm SBOM (desktop frontend, from lockfile)
+        working-directory: apps/desktop
+        run: npm sbom --sbom-format cyclonedx --package-lock-only > desktop-frontend.cdx.json
+      - name: collect
+        run: |
+          mkdir -p sbom-out
+          cp crates/cli/sc_bin.cdx.json sbom-out/
+          cp apps/desktop/src-tauri/scl-desktop_bin.cdx.json sbom-out/
+          cp apps/desktop/desktop-frontend.cdx.json sbom-out/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-cyclonedx
+          path: sbom-out/
+          retention-days: 90

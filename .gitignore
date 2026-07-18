@@ -21,3 +21,6 @@ target/
 apps/desktop/node_modules/
 apps/desktop/dist/
 apps/desktop/src-tauri/gen/
+
+# Generated SBOMs (CI artifacts, never committed)
+*.cdx.json
