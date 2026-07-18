@@ -607,3 +607,64 @@ family (RUSTSEC-2024-0413/`atk`), surfaced by independent-scanner disagreement**
 | Divergent | 2 | — | 2 |
 | Implicit | 5 | — | 5 |
 | **Total** | **34** | **+1** | **35** |
+
+## Fourth-round delta: remediation + post-fix code-scanning (2026-07-18)
+
+After the report was rendered and reviewed, the Now-tier and Soon-tier todos
+were implemented across PRs #76–#87 (plus repo-settings toggles and org 2FA).
+The user then asked for the current live code-scanning state. Re-queried via
+`gh api repos/git-agentic/src-control/code-scanning/{alerts,analyses}`.
+
+### Remediation shipped (gap → PR)
+
+- Now tier: G-004/T-1 (scorecard, #74/#75), G-029/T-2 (SHA-pins, #78),
+  G-028/T-3 (CodeQL JS, #78), G-006/T-4 + G-027/T-5 (desktop CI + dependabot
+  npm, #78), G-008/T-6 · G-007/T-7 (settings toggles), G-014/019/015/017/018/T-8
+  (SECURITY.md, #79), G-009/T-9 (required status checks, ruleset),
+  G-035/T-26 (atk advisory, #78).
+- Soon tier: G-005+G-033/T-10 (SBOM + glib pedigree, #85), G-020+G-033/T-11
+  (inventory, #83), G-001/T-12 (proptest, #84), G-001/T-13 (cargo-fuzz,
+  #86 — verified 12m52s libFuzzer run, no crash), G-012/T-14 (ACCESS.md,
+  #83), G-022/T-15 (CONTRIBUTING triggers, #83), G-010/031/032/T-16 +
+  G-011/030/T-17 + G-021/T-18 + G-013/T-19 (security docs, #83),
+  G-025/T-20 (opsec baseline + job-scoped audit token + org 2FA enforced,
+  #83/#85/#87), G-016/T-21 (security.txt template, #83).
+
+### Post-fix code-scanning surface (verified live)
+
+- **Open alerts: 17 → 3.** Twelve auto-closed on re-scan after the fixes
+  merged: 8× `PinnedDependenciesID` (#6–#13, closed by T-2), `TokenPermissionsID`
+  (#5, T-20), `FuzzingID` (#19, T-13 registers a fuzzer integration),
+  `SASTID` (#17) and `CITestsID` (#20) improved to passing. Two were dismissed
+  with rationale during round 3: `VulnerabilitiesID` (#18, the GAP-033
+  false positive) and `MaintainedID` (#15, repo-age informational).
+- **CodeQL: zero open alerts, now covering three languages** — the live
+  `analyses` list includes `/language:rust`, `/language:actions`, AND
+  `/language:javascript-typescript` (GAP-028/T-3 confirmed in effect; the
+  round-3 note that JS-TS was absent is now superseded).
+- **The 3 remaining open alerts all trace to one deferred item plus one
+  optional extra:**
+  - `CodeReviewID` (#14, high, "0/25 approved changesets") and
+    `BranchProtectionID` (#4, high) share the single root cause
+    `required_approving_review_count: 0` — this is GAP-032/T-16, deliberately
+    held until a second reviewing principal exists (a solo maintainer cannot
+    self-approve). #4 already **improved from score 3 → 4**: T-9's required
+    status checks cleared its "no status checks found to merge" warning; the
+    residual warnings (require approvers, codeowners, stale-review-dismissal,
+    last-push-approval) all unlock together when approvals can be required.
+  - `CIIBestPracticesID` (#16) moved score 0 → 2 ("InProgress") — the optional
+    OpenSSF best-practices badge, noted under T-1. Not a guide-required gap.
+
+### Status by tier
+
+| Tier | Todos | State |
+|---|---|---|
+| Now | T-1…T-9, T-26 | Done (PRs #76–#79, #85, #87 + settings) |
+| Soon | T-10…T-21 | Done (PRs #83–#87) |
+| Deferred | T-22…T-25 | Open by design — each gated on a first distribution channel that does not exist yet |
+
+Two closing items are human/out-of-repo, not code: deploy `security.txt` to
+`git-agentic.com/.well-known/` (T-21 tail), and the maintainer confirming the
+feed subscriptions listed in `docs/security/subscriptions.md` (G-024 tail).
+No gap was withdrawn; the gap set stands at 35 and the report's Section 0
+carries the remediation status.

@@ -3,7 +3,7 @@ title: "Gap Analysis: src-control vs OSTIF Security Best Practices Guide"
 comparison_direction: "src-control repository (current state) -> OSTIF/Least Authority Security Best Practices Guide (desired state)"
 scope: "The whole repository (code, CI, docs, GitHub configuration via live API) compared against all six OSTIF practice areas; the guide's missing 08-what-next.md chapter and the external git-agentic.com website were excluded."
 generated: "2026-07-18"
-updated: "2026-07-18 — third evidence round: live code-scanning surface (Scorecard + CodeQL alerts) folded in; G-004 recategorized, G-035 added"
+updated: "2026-07-18 — fourth round: Now + Soon tiers remediated (PRs #76–#87); code-scanning down from 17 open alerts to 3, all tracing to one deferred item (required human approvals) plus an optional badge"
 generated_by: "han:gap-analysis"
 sections_included:
   - executive_summary
@@ -19,11 +19,12 @@ sections_included:
 
 This report compares **the src-control repository** (what exists today) against **the OSTIF Security Best Practices Guide** (what is expected). It is layered, so you can stop at any section and still have a complete picture at that level of detail:
 
-- **Section 1 — Executive Summary.** The shape and magnitude of the gap in plain language. Read this if you have two minutes.
+- **Section 0 — Remediation Status.** What has been fixed since the audit ran. Read this first if you want the current state rather than the original findings.
+- **Section 1 — Executive Summary.** The shape and magnitude of the gap in plain language, *as first audited*. Read this if you have two minutes.
 - **Section 2 — Indexed Gaps.** Every gap, individually titled and explained in plain language, with a stable ID (e.g., `G-007`) you can cite in tickets, threads, and follow-up work.
 - **Section 3 — Technical Details.** Engineering-grade fidelity for each gap: where it lives, what would need to change, and how to act on it.
 - **Section 4 — Swarm Findings.** Confidence signals, contradictions, and augmentations from a panel of five secondary analyses. Read this to know which gaps are most certain.
-- **Section 5 — Actionable TODO List.** The prioritized work plan (T-1 … T-25) mapping every gap to a concrete action, effort estimate, and tier. **If you act on only one section, act on this one.**
+- **Section 5 — Actionable TODO List.** The prioritized work plan (T-1 … T-26) mapping every gap to a concrete action, effort estimate, and tier. **Now and Soon tiers are done (see Section 0); the Deferred tier remains.**
 
 Every gap has a stable ID. Sections 3–5 reference those IDs. The full evidence trail (verbatim analyzer findings, GAP-NNN ↔ G-NNN maps 1:1) is in `docs/audit/gap-analysis-source.md`.
 
@@ -35,11 +36,41 @@ Every gap has a stable ID. Sections 3–5 reference those IDs. The full evidence
 
 ---
 
+## 0. Remediation Status (as of 2026-07-18)
+
+> This section was added after the gap analysis was acted on. Sections 1–5 below describe the repository **as first audited**; this section records what has since been fixed. Where they differ, this section is current.
+
+**Both actionable tiers of the work plan are done.** The Now tier (T-1…T-9, T-26) and the Soon tier (T-10…T-21) all shipped across pull requests #76–#87, plus repository-settings changes and an organization-wide two-factor-authentication requirement. Only the **Deferred tier (T-22…T-25)** remains — OSS-Fuzz enrollment, reproducible builds, a release pipeline with supply-chain attestations, and a hardening guide for people who run the server component — and every one of those is deliberately parked behind a trigger that hasn't happened yet: the project still distributes nothing for a consumer to verify.
+
+**The independent security scorecard tells the story in numbers: 17 open findings became 3.**
+
+| Scorecard finding (first run) | Now/Soon fix | Status |
+|---|---|---|
+| 8 × building-blocks-not-pinned-by-fingerprint | T-2 (SHA-pinning) | ✅ auto-closed |
+| Automation token over-permissioned | T-20 (job-scoped token) | ✅ auto-closed |
+| Not fuzzed | T-13 (nightly fuzzer) | ✅ auto-closed |
+| Static-analysis / CI-test coverage | T-3, T-4 | ✅ improved to passing |
+| Dependency reported vulnerable (the patched-component trap) | G-033 annotation + rationale | ✅ dismissed with documented reason |
+| Repository younger than 90 days (informational) | — | ✅ dismissed (self-resolves with age) |
+
+The **automated code analysis is fully clean** — zero open findings — and now covers the desktop application's language as well as the core (T-3).
+
+**The 3 remaining findings are not new gaps and not oversights — they are one already-tracked deferred item plus one optional extra:**
+
+- **Two findings (required review approvals, and branch-protection completeness) share a single root cause: review approvals are set to zero.** This is gap G-032 / todo T-16 in the plan, and it is deliberately held: under the hosting platform's rules a lone maintainer cannot approve their own change, so requiring approvals needs a second reviewer to exist first. Note the branch-protection finding already *improved* once merge-gating on passing checks landed (T-9); the rest of it unlocks together the day a second reviewer is added and approvals can be required.
+- **One finding is an optional best-practices badge**, now showing "in progress." Completing it is nice-to-have, not a gap the guide requires.
+
+**Two closing items still need a human and cannot be done from the repository:** deploying the machine-readable security-contact file to the project website (`/.well-known/security.txt`), and the maintainer personally confirming the security-feed subscriptions the documentation now lists. Both are noted in Section 5.
+
+---
+
 ## 1. Executive Summary
+
+> **Historical.** The summary below describes the repository as first audited, before any remediation. See Section 0 for current status.
 
 **Bottom line:** The project is substantially ahead of the guide in the areas it has invested in deliberately — a detailed living threat model, daily automated vulnerability scanning of its core dependencies, automated code analysis of its core language, and an already-drafted plan for a professional audit. But the audit found **35 gaps**, and they cluster in places the project has not yet looked: platform-level protections that are switched off, a security policy document that has drifted out of date and points reporters at a channel that does not work, a desktop application that sits entirely outside every automated safety net, and internal security processes that exist as habit but not as written policy.
 
-**Same-day update:** the security scorecard the audit recommended (G-004) was added and run before this report was even finished — it now runs weekly, and its first run independently confirmed five of this report's findings at the exact predicted locations, demonstrated the bundled-component misrepresentation trap (G-033) live, and surfaced one new discrepancy (G-035). Its 17 open findings await triage.
+**Same-day update:** the security scorecard the audit recommended (G-004) was added and run before this report was even finished — it now runs weekly, and its first run independently confirmed five of this report's findings at the exact predicted locations, demonstrated the bundled-component misrepresentation trap (G-033) live, and surfaced one new discrepancy (G-035). Its 17 open findings then dropped to 3 as remediation shipped — see **Section 0** for current status.
 
 **Magnitude at a glance:**
 
@@ -624,9 +655,11 @@ After the swarm ran and the report was first rendered, the live code-scanning su
 
 ## 5. Actionable TODO List
 
-The prioritized work plan, consolidated by the project-manager synthesis from the devops ranking, the security severity notes, and the actor sweep's premature-until-distribution flags, updated in the third evidence round. Every one of the 35 gaps traces to a todo or to the explicit "not an engineering task" list at the end.
+The prioritized work plan, consolidated by the project-manager synthesis from the devops ranking, the security severity notes, and the actor sweep's premature-until-distribution flags. Every one of the 35 gaps traces to a todo or to the explicit "not an engineering task" list at the end.
 
-### Tier: Now — small effort, high value, actionable on a source-only repo today
+> **Status (2026-07-18, see Section 0):** the **Now** and **Soon** tiers below are ✅ **done** (PRs #76–#87). The **Deferred** tier is open by design. Rows are left as written for the audit trail; the checkmarks record what shipped.
+
+### Tier: Now ✅ done — small effort, high value, actionable on a source-only repo today
 
 | # | Closes | Action | Effort |
 |---|--------|--------|--------|
@@ -641,7 +674,7 @@ The prioritized work plan, consolidated by the project-manager synthesis from th
 | T-9 | G-009 | Extend the `main` ruleset with required status checks (`ci`, `codeql`; branches up to date). Hold required-approval count at 0 until a second reviewing principal exists (see T-16). **Reverify live ruleset state first.** Closes the substantive half of Scorecard alerts #4/#14. | Small |
 | T-26 | G-035 | Add `RUSTSEC-2024-0413` (`atk`, GTK3-unmaintained family) to `audit.yml`'s `ignore:` list under the existing GTK3 removal-gate comment, so cargo-audit and Scorecard tell one consistent story. | Trivial |
 
-### Tier: Soon — small-to-medium; auditor and documentation value now
+### Tier: Soon ✅ done — small-to-medium; auditor and documentation value now
 
 | # | Closes | Action | Effort |
 |---|--------|--------|--------|
@@ -658,7 +691,7 @@ The prioritized work plan, consolidated by the project-manager synthesis from th
 | T-20 | G-025 | Record the CI/infra opsec baseline (ephemeral hosted runners, `GITHUB_TOKEN` only), confirm org 2FA, and scope `audit.yml`'s write permissions from workflow-level to job/step. | Small |
 | T-21 | G-016 | Add an RFC 9116 `security.txt` template; deploying to `/.well-known/` is a website task (pairs with the G-023 manual check). | Trivial |
 
-### Tier: Deferred — disproportionate now; reopen on a concrete trigger
+### Tier: Deferred ⏳ open by design — disproportionate now; reopen on a concrete trigger
 
 | # | Closes | Action | Effort | Reopen trigger |
 |---|--------|--------|--------|----------------|
