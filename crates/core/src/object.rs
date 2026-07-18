@@ -1239,3 +1239,231 @@ mod tests {
         assert!(perms & PROTECTED != 0 && perms & RANDOMIZED != 0);
     }
 }
+
+/// Property tests for the canonical encoding — the content-addressing
+/// invariant (same logical content ⇒ same id on any machine) and decode
+/// totality on attacker-supplied bytes. `encode` canonicalizes (sorts
+/// protection registers, manifest anchors/closure), so the load-bearing
+/// property is encode-stability through a decode round trip, not strict
+/// struct equality.
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_id() -> impl Strategy<Value = ObjectId> {
+        any::<[u8; 32]>().prop_map(ObjectId::from_bytes)
+    }
+
+    fn arb_wrapped_key() -> impl Strategy<Value = WrappedKey> {
+        (".{0,16}", proptest::collection::vec(any::<u8>(), 0..64)).prop_map(
+            |(recipient_id, wrapped_dek)| WrappedKey {
+                recipient_id,
+                wrapped_dek,
+            },
+        )
+    }
+
+    fn arb_tree() -> impl Strategy<Value = Tree> {
+        proptest::collection::vec(
+            (
+                ".{0,12}",
+                any::<bool>(),
+                arb_id(),
+                any::<u32>(),
+                any::<u8>(),
+            ),
+            0..8,
+        )
+        .prop_map(|es| {
+            Tree::new(
+                es.into_iter()
+                    .map(|(name, is_tree, id, mode, perms)| TreeEntry {
+                        name,
+                        kind: if is_tree {
+                            EntryKind::Tree
+                        } else {
+                            EntryKind::Blob
+                        },
+                        id,
+                        mode: FileMode(mode),
+                        perms,
+                    })
+                    .collect(),
+            )
+        })
+    }
+
+    fn arb_protection() -> impl Strategy<Value = Protection> {
+        (
+            proptest::collection::vec(
+                (
+                    ".{0,12}",
+                    proptest::collection::vec(
+                        (any::<[u8; 32]>(), any::<u32>(), any::<bool>()),
+                        0..4,
+                    ),
+                ),
+                0..4,
+            ),
+            proptest::collection::btree_map(
+                arb_id(),
+                proptest::collection::vec(arb_wrapped_key(), 0..3),
+                0..4,
+            ),
+        )
+            .prop_map(|(prefixes, wrapped)| Protection {
+                prefixes: prefixes
+                    .into_iter()
+                    .map(|(prefix, recipients)| ProtectPrefix {
+                        prefix,
+                        recipients: recipients
+                            .into_iter()
+                            .map(|(key, epoch, granted)| RecipientEntry {
+                                key,
+                                epoch,
+                                state: if granted {
+                                    RecipientState::Granted
+                                } else {
+                                    RecipientState::Revoked
+                                },
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                wrapped,
+            })
+    }
+
+    fn arb_snapshot() -> impl Strategy<Value = Snapshot> {
+        (
+            arb_id(),
+            proptest::collection::vec(arb_id(), 0..4),
+            ".{0,20}",
+            any::<i64>(),
+            ".{0,40}",
+            proptest::collection::btree_map(".{0,12}", arb_id(), 0..4),
+            arb_protection(),
+        )
+            .prop_map(
+                |(root, parents, author, timestamp, message, secrets, protection)| Snapshot {
+                    root,
+                    parents,
+                    author,
+                    timestamp,
+                    message,
+                    secrets,
+                    protection,
+                },
+            )
+    }
+
+    fn arb_manifest() -> impl Strategy<Value = BranchManifest> {
+        (
+            arb_id(),
+            proptest::option::of(arb_id()),
+            proptest::collection::vec(arb_id(), 0..4),
+            proptest::collection::vec(arb_id(), 0..6),
+            proptest::collection::vec(any::<u8>(), 0..64),
+            proptest::collection::vec(arb_wrapped_key(), 0..3),
+        )
+            .prop_map(|(base, prev, anchors, closure, index_ct, kek_wraps)| {
+                BranchManifest {
+                    base,
+                    prev,
+                    anchors,
+                    closure,
+                    index_ct,
+                    kek_wraps,
+                }
+            })
+    }
+
+    fn arb_object() -> impl Strategy<Value = Object> {
+        prop_oneof![
+            proptest::collection::vec(any::<u8>(), 0..256).prop_map(Object::blob),
+            arb_tree().prop_map(Object::Tree),
+            arb_snapshot().prop_map(Object::Snapshot),
+            (
+                ".{0,16}",
+                proptest::collection::vec(any::<u8>(), 0..32),
+                proptest::collection::vec(any::<u8>(), 0..128),
+                proptest::collection::vec(arb_wrapped_key(), 0..3),
+            )
+                .prop_map(|(name, nonce, ciphertext, wrapped_keys)| {
+                    Object::Secret(Secret {
+                        name,
+                        nonce,
+                        ciphertext,
+                        wrapped_keys,
+                    })
+                }),
+            (arb_id(), any::<[u8; 32]>(), any::<[u8; 64]>()).prop_map(|(snapshot, signer, sig)| {
+                Object::Signature(SignatureObj {
+                    snapshot,
+                    signer,
+                    sig,
+                })
+            }),
+            (
+                arb_id(),
+                ".{0,12}",
+                ".{0,12}",
+                proptest::collection::vec(any::<u8>(), 0..32),
+                proptest::collection::vec(any::<u8>(), 0..128),
+                proptest::collection::vec(arb_wrapped_key(), 0..3),
+            )
+                .prop_map(
+                    |(snapshot, agent, session, nonce, ciphertext, wrapped_keys)| {
+                        Object::Transcript(Transcript {
+                            snapshot,
+                            agent,
+                            session,
+                            nonce,
+                            ciphertext,
+                            wrapped_keys,
+                        })
+                    }
+                ),
+            proptest::collection::vec(any::<u8>(), 0..256).prop_map(|p| Object::Sealed(
+                SealedObj {
+                    payload: Arc::from(p.into_boxed_slice()),
+                }
+            )),
+            arb_manifest().prop_map(Object::Manifest),
+        ]
+    }
+
+    proptest! {
+        /// decode(encode(o)) succeeds, re-encodes to the identical bytes, and
+        /// keeps the content address — the core invariant in CLAUDE.md.
+        #[test]
+        fn decode_of_own_encoding_is_id_stable(o in arb_object()) {
+            let bytes = o.encode();
+            let decoded = Object::decode(&bytes).expect("own encoding must decode");
+            prop_assert_eq!(decoded.encode(), bytes);
+            prop_assert_eq!(decoded.id(), o.id());
+        }
+
+        /// decode is total on arbitrary bytes: Ok or Err, never a panic —
+        /// this is the path attacker-supplied wire/pack data reaches.
+        #[test]
+        fn decode_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let _ = Object::decode(&bytes);
+        }
+
+        /// decode is total on truncations of valid encodings — the malformed
+        /// input most likely to occur in practice (cut-off transfers).
+        #[test]
+        fn decode_never_panics_on_truncated_encodings(
+            o in arb_object(),
+            cut in any::<prop::sample::Index>()
+        ) {
+            let bytes = o.encode();
+            let cut = cut.index(bytes.len() + 1);
+            let _ = Object::decode(&bytes[..cut.min(bytes.len())]);
+        }
+    }
+}
