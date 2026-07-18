@@ -91,3 +91,15 @@ offered. Reports are credited in the disclosure and in release notes.
 Reports about the documented, deliberate boundaries above are welcome as
 hardening suggestions, but they are known limitations rather than
 vulnerabilities.
+
+## Internal process and further reading
+
+How reports are handled internally, how incidents are managed, and what the
+project stores and can never delete are documented in
+[`docs/security/`](docs/security/): [vulnerability
+response](docs/security/vulnerability-response.md) · [incident
+response](docs/security/incident-response.md) · [data handling &
+retention](docs/security/data-handling.md) · [third-party
+inventory](docs/security/third-party-inventory.md) · [opsec
+baseline](docs/security/opsec-baseline.md). The access inventory lives at
+[`docs/agents/ACCESS.md`](docs/agents/ACCESS.md).

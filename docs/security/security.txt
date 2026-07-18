@@ -1,0 +1,9 @@
+# RFC 9116 security.txt — deploy to https://git-agentic.com/.well-known/security.txt
+# (website is hosted outside this repository; keep this template and the live
+# file in sync — OSTIF-audit T-21/G-016. Refresh Expires at least yearly.)
+Contact: mailto:toni@git-agentic.com
+Contact: https://github.com/git-agentic/src-control/security/advisories/new
+Expires: 2027-07-18T00:00:00.000Z
+Policy: https://github.com/git-agentic/src-control/blob/main/SECURITY.md
+Preferred-Languages: en, fi
+Canonical: https://git-agentic.com/.well-known/security.txt
