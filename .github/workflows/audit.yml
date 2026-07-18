@@ -32,8 +32,8 @@ jobs:
     name: cargo audit (RustSec advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # Accepted transitive advisories, each with a concrete removal gate:
@@ -45,4 +45,8 @@ jobs:
           #   matches versions only, so remove this exception with that patch.
           # - proc-macro-error2 reaches the lockfile only through an optional
           #   gix -> jiff -> defmt feature we never compile; remove upstream.
-          ignore: RUSTSEC-2024-0416,RUSTSEC-2024-0412,RUSTSEC-2024-0418,RUSTSEC-2024-0411,RUSTSEC-2024-0417,RUSTSEC-2024-0414,RUSTSEC-2024-0415,RUSTSEC-2024-0420,RUSTSEC-2024-0419,RUSTSEC-2024-0370,RUSTSEC-2025-0081,RUSTSEC-2025-0075,RUSTSEC-2025-0080,RUSTSEC-2025-0100,RUSTSEC-2025-0098,RUSTSEC-2024-0429,RUSTSEC-2026-0173
+          # - RUSTSEC-2024-0413 (atk) is the same GTK3-unmaintained family as
+          #   0411/0412/0414-0420; it was missing from this list (invisible
+          #   because unmaintained advisories only warn) until Scorecard's OSV
+          #   check counted it — OSTIF audit G-035. Same GTK4 removal gate.
+          ignore: RUSTSEC-2024-0416,RUSTSEC-2024-0412,RUSTSEC-2024-0413,RUSTSEC-2024-0418,RUSTSEC-2024-0411,RUSTSEC-2024-0417,RUSTSEC-2024-0414,RUSTSEC-2024-0415,RUSTSEC-2024-0420,RUSTSEC-2024-0419,RUSTSEC-2024-0370,RUSTSEC-2025-0081,RUSTSEC-2025-0075,RUSTSEC-2025-0080,RUSTSEC-2025-0100,RUSTSEC-2025-0098,RUSTSEC-2024-0429,RUSTSEC-2026-0173

@@ -28,6 +28,15 @@ updates:
       - dependency-name: "rand_chacha"
         update-types: ["version-update:semver-major"]
 
+  - package-ecosystem: npm
+    directory: "/apps/desktop"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

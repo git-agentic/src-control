@@ -27,9 +27,13 @@ jobs:
             build-mode: none
           - language: actions
             build-mode: none
+          # The desktop renderer (apps/desktop/src) is where untrusted repo
+          # content crosses the Tauri IPC boundary into a WebView; analyze it.
+          - language: javascript-typescript
+            build-mode: none
     steps:
-      - uses: actions/checkout@v7
-      - uses: github/codeql-action/init@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -39,6 +43,6 @@ jobs:
           config: |
             paths-ignore:
               - vendor/glib-0.18.5-patched/**
-      - uses: github/codeql-action/analyze@v4
+      - uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
         with:
           category: "/language:${{ matrix.language }}"
