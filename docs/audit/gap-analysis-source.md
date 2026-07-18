@@ -668,3 +668,27 @@ Two closing items are human/out-of-repo, not code: deploy `security.txt` to
 feed subscriptions listed in `docs/security/subscriptions.md` (G-024 tail).
 No gap was withdrawn; the gap set stands at 35 and the report's Section 0
 carries the remediation status.
+
+## Fifth-round delta: required reviews enabled (2026-07-18)
+
+Later the same day the maintainer added a second admin account
+(`tonibergholm-codento`) and tightened the `main` ruleset. Verified live via
+`gh api repos/git-agentic/src-control/rulesets/18739705`: the `pull_request`
+rule now has `required_approving_review_count: 1`,
+`dismiss_stale_reviews_on_push: true`, and `require_last_push_approval: true`.
+
+- **GAP-032/T-16 is now fully closed.** It was the last non-deferred gap and
+  had been held only because a lone maintainer cannot approve their own PR; a
+  second reviewing principal now exists and approvals are required repo-wide.
+- **Scorecard consequence:** `CodeReviewID` (#14) and `BranchProtectionID`
+  (#4) will improve/close on the next weekly scan (approvals now recorded;
+  the branch-protection warnings for require-approvers, stale-dismissal, and
+  last-push-approval are all now satisfied — `require_code_owner_review`
+  stays false, a minor residual). The only remaining open code-scanning
+  finding is the optional `CIIBestPracticesID` badge (#16).
+- **Operational note:** no principal — human, automation, or agent — can
+  self-merge anymore; the two admin accounts review each other's PRs.
+
+Every non-deferred gap in the 35-gap set is now resolved. Remaining: the
+Deferred tier T-22…T-25 (gated on a first distribution channel) and the two
+human/out-of-repo tails (`security.txt` deploy, subscription confirmation).
