@@ -15,7 +15,7 @@ it as the revocation checklist. Written as OSTIF-audit follow-up T-14 (G-012).
 
 | Privilege | Holder | Notes |
 |---|---|---|
-| GitHub org owner (`git-agentic`) | Toni Bergholm | Org 2FA requirement **not yet enforced** (pending — see [`opsec-baseline.md`](../security/opsec-baseline.md)). |
+| GitHub org owner (`git-agentic`) | Toni Bergholm | Org 2FA requirement **enforced** since 2026-07-18 (see [`opsec-baseline.md`](../security/opsec-baseline.md)). |
 | Repo admin (`git-agentic/src-control`) | Toni Bergholm | Controls rulesets, security toggles, secrets. |
 | `git-agentic.com` DNS/registrar | Toni Bergholm | Out-of-repo credential. |
 | crates.io publish rights | — (N/A) | Workspace is `publish = false`; no crates.io tokens exist. Revisit at first release (audit T-24 trigger). |

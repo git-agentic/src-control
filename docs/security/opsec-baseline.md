@@ -22,11 +22,9 @@ T-20 (G-025).
 
 ## Accounts and devices
 
-- **Org 2FA requirement: PENDING.** `two_factor_requirement_enabled` is
-  currently `false` on the `git-agentic` org. Maintainer action: enable it in
-  org settings (Settings → Authentication security) after confirming the owner
-  account has 2FA. ☐ done as of ____. (An automated attempt was intentionally
-  not forced through — org-wide auth policy is a human call.)
+- **Org 2FA requirement: ENFORCED.** `two_factor_requirement_enabled` was
+  enabled on the `git-agentic` org by the maintainer and verified via the API.
+  ☑ done as of 2026-07-18. Any future member must have 2FA before joining.
 - Maintainer GitHub account uses 2FA and per-device SSH keys; identity/signing
   keys for `scl` live outside any working tree (see ACCESS.md).
 - Development machines: full-disk encryption and OS auto-update expected; no
