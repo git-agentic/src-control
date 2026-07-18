@@ -1,0 +1,30 @@
+[package]
+name = "scl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Its own workspace: fuzz targets need nightly + libFuzzer and must not join
+# the stable root workspace (root Cargo.toml excludes this directory).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+scl-core = { path = "../crates/core" }
+scl-repo = { path = "../crates/repo" }
+
+[patch.crates-io]
+glib = { path = "../vendor/glib-0.18.5-patched" }
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
