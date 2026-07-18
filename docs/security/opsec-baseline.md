@@ -18,10 +18,11 @@ T-20 (G-025).
 - **Third-party actions are SHA-pinned** with a version comment; Dependabot
   maintains the pins (audit T-2). New actions enter SHA-pinned or not at all.
 - **Merges to `main` are ruleset-gated**: PR required, **1 required approval**
-  from a principal other than the last pusher (since 2026-07-18), stale
-  approvals dismissed on push, last-push approval required, four required
-  status checks, up-to-date branch, no force-push/deletion, no bypass actors.
-  Nobody self-merges — the two admin accounts review each other's PRs.
+  from a principal other than the last pusher (since 2026-07-18), **code-owner
+  review required** (`.github/CODEOWNERS`), stale approvals dismissed on push,
+  last-push approval required, four required status checks, up-to-date branch,
+  no force-push/deletion, no bypass actors. Nobody self-merges — the two admin
+  accounts review each other's PRs.
 
 ## Accounts and devices
 
