@@ -683,11 +683,19 @@ rule now has `required_approving_review_count: 1`,
 - **Scorecard consequence:** `CodeReviewID` (#14) and `BranchProtectionID`
   (#4) will improve/close on the next weekly scan (approvals now recorded;
   the branch-protection warnings for require-approvers, stale-dismissal, and
-  last-push-approval are all now satisfied — `require_code_owner_review`
-  stays false, a minor residual). The only remaining open code-scanning
-  finding is the optional `CIIBestPracticesID` badge (#16).
+  last-push-approval are all now satisfied). The only remaining open
+  code-scanning finding is the optional `CIIBestPracticesID` badge (#16).
 - **Operational note:** no principal — human, automation, or agent — can
   self-merge anymore; the two admin accounts review each other's PRs.
+
+**Follow-up (same day): `.github/CODEOWNERS` added and code-owner review
+required.** The one residual branch-protection sub-item — `codeowners review
+is not required` — is now closed: `.github/CODEOWNERS` names both admin
+accounts as owners of everything (with explicit callouts for
+`crates/crypto`, `crates/tlsio`, `.github`, and the security docs), and the
+ruleset's `require_code_owner_review` was set to `true` (verified live). The
+`BranchProtectionID` check now has no residual warnings to raise. Only the
+optional OpenSSF badge remains.
 
 Every non-deferred gap in the 35-gap set is now resolved. Remaining: the
 Deferred tier T-22…T-25 (gated on a first distribution channel) and the two

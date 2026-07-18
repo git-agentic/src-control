@@ -1,0 +1,17 @@
+# Code owners for src-control (OSTIF audit follow-up; completes the
+# branch-protection control — the `main` ruleset requires code-owner review).
+# Order matters: the LAST matching pattern for a path wins. Every listed owner
+# must have write access, or the entry is silently ignored by GitHub.
+
+# Default: both maintainers own everything.
+*                       @tonibergholm @tonibergholm-codento
+
+# Security-critical surfaces called out for documentation value (the owners are
+# the same, but this records that these paths carry extra review weight —
+# changes here also hit the CONTRIBUTING.md "Security-review triggers" list).
+/crates/crypto/         @tonibergholm @tonibergholm-codento
+/crates/tlsio/          @tonibergholm @tonibergholm-codento
+/.github/               @tonibergholm @tonibergholm-codento
+/docs/security/         @tonibergholm @tonibergholm-codento
+/docs/THREAT-MODEL.md   @tonibergholm @tonibergholm-codento
+/SECURITY.md            @tonibergholm @tonibergholm-codento
