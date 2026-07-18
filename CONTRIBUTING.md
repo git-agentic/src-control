@@ -51,6 +51,33 @@ CI runs `fmt --check`, `clippy -D warnings`, `cargo test --workspace`, and
 5. **Keep the demos honest.** `sc demo` must still end by proving zero residue, and
    any new capability that warrants it gets a `demo/run_*.sh` proof.
 
+## Security-review triggers
+
+Some changes get a security pass before merge as standing policy, not ad-hoc
+judgment. If your PR does any of the following, say so in the PR description
+and walk the checklist:
+
+- **Touches `crates/crypto`, `crates/tlsio`, or any transport/wire code** →
+  re-read the relevant [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) section;
+  state in the PR whether any documented boundary moves. If one does, the PR
+  must also update `THREAT-MODEL.md` (and add an ADR if the decision changes).
+- **Adds or swaps a dependency (cargo or npm)** → the daily/PR advisory scans
+  must be green against it; add it to
+  [`docs/security/third-party-inventory.md`](docs/security/third-party-inventory.md)
+  in the same PR; vendored or patched copies additionally need a
+  `PROVENANCE.md` and an inventory annotation.
+- **Adds a CI workflow, action, permission, or secret** → SHA-pin the action,
+  keep write permissions job-scoped, and update
+  [`docs/agents/ACCESS.md`](docs/agents/ACCESS.md)
+  (see [`docs/security/opsec-baseline.md`](docs/security/opsec-baseline.md)).
+- **Is a security fix** → follow
+  [`docs/security/vulnerability-response.md`](docs/security/vulnerability-response.md):
+  tracked in a draft advisory, human review distinct from the author, no
+  public vulnerability detail before disclosure.
+- **First release / publish channel (future)** → reopens the deferred audit
+  items (reproducible builds, SLSA provenance, published SBOM) — see
+  `docs/audit/ostif-best-practices-audit.md` §5, T-22…T-24.
+
 ## Larger design changes
 
 The project records significant decisions as ADRs (`docs/adr/`, Nygard format:
