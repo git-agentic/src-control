@@ -1,0 +1,57 @@
+name: fuzz
+
+# Nightly libFuzzer run on the remote-facing decode surface (OSTIF audit
+# T-13, G-001): the framed wire protocol `sc serve` parses from untrusted
+# peers, its body decoders, and canonical object decoding. Runs on a
+# schedule, never as a PR gate — nightly + sanitizers don't belong in the
+# merge path. A crash uploads its reproducer input as an artifact.
+on:
+  schedule:
+    # Nightly, before the 06:23 audit run.
+    - cron: "17 3 * * *"
+  # Build + short run when the fuzz surface itself changes, so a broken
+  # harness is caught in the PR that breaks it (not a required check).
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wire-decode:
+    name: cargo fuzz (wire_decode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The repo-root rust-toolchain.toml pins stable 1.96.1 and overrides the
+      # installed rustup default; libFuzzer needs nightly, and this env var
+      # outranks the toolchain file.
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # dtolnay/rust-toolchain encodes the toolchain in the tag the SHA pins
+      # (there is no `toolchain` input at these commits) — this is the
+      # `nightly` tag's commit.
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: build fuzz target
+        run: cargo fuzz build wire_decode
+      - name: fuzz for 10 minutes
+        # rss_limit above MAX_OBJECT_SIZE-sized legitimate allocations so the
+        # documented frame-length pre-allocation (ADR-0039 deferred item)
+        # doesn't false-positive; a real runaway still trips it.
+        run: cargo fuzz run wire_decode -- -max_total_time=600 -rss_limit_mb=4096
+      - name: upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

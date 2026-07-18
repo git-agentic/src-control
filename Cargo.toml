@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/vfs", "crates/gitio", "crates/crypto", "crates/repo", "crates/cli", "crates/tlsio", "apps/desktop/src-tauri"]
-exclude = ["vendor/glib-0.18.5-patched"]
+exclude = ["vendor/glib-0.18.5-patched", "fuzz"]
 
 # Tauri 2's Linux GTK3 stack is pinned to glib 0.18.5, whose VariantStrIter
 # implementation contains RUSTSEC-2024-0429. This published-source copy carries
