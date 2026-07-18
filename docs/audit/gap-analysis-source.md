@@ -689,13 +689,30 @@ rule now has `required_approving_review_count: 1`,
   self-merge anymore; the two admin accounts review each other's PRs.
 
 **Follow-up (same day): `.github/CODEOWNERS` added and code-owner review
-required.** The one residual branch-protection sub-item — `codeowners review
-is not required` — is now closed: `.github/CODEOWNERS` names both admin
-accounts as owners of everything (with explicit callouts for
-`crates/crypto`, `crates/tlsio`, `.github`, and the security docs), and the
-ruleset's `require_code_owner_review` was set to `true` (verified live). The
-`BranchProtectionID` check now has no residual warnings to raise. Only the
-optional OpenSSF badge remains.
+required.** `.github/CODEOWNERS` names both admin accounts as owners of
+everything (with explicit callouts for `crates/crypto`, `crates/tlsio`,
+`.github`, and the security docs), and the ruleset's
+`require_code_owner_review` was set to `true` (verified live; PR #91).
+
+**Actual post-remediation Scorecard scores (verified after the re-scan on the
+#91 merge commit — corrects the earlier "will clear on next scan" projection):**
+
+- `BranchProtectionID` (#4): **score 3 → 8.** All configurable protections are
+  on; the single remaining warning is "required approving review count is 1" —
+  Scorecard reserves the top score for **≥2** required reviewers, which for a
+  two-maintainer team would force every PR through both people. 8/10 is the
+  sensible ceiling here, not an unmet gap. The config is complete.
+- `CodeReviewID` (#14): **score 0, "2/25 approved changesets."** This is a
+  *trailing* metric over the last 25 merged PRs, not a config switch: only the
+  PRs merged under the new required-approval rule carry approvals, so it climbs
+  on its own as reviewed PRs accumulate. Nothing left to configure.
+- `CIIBestPracticesID` (#16): optional OpenSSF badge, "InProgress" — not a
+  guide-required gap.
+
+Net: the branch-protection/code-review **configuration** is complete and
+correct (G-032/T-16 closed); the three still-open alerts are a team-size
+scoring artifact, a self-healing history metric, and an optional badge —
+none require further change.
 
 Every non-deferred gap in the 35-gap set is now resolved. Remaining: the
 Deferred tier T-22…T-25 (gated on a first distribution channel) and the two

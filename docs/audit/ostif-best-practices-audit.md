@@ -3,7 +3,7 @@ title: "Gap Analysis: src-control vs OSTIF Security Best Practices Guide"
 comparison_direction: "src-control repository (current state) -> OSTIF/Least Authority Security Best Practices Guide (desired state)"
 scope: "The whole repository (code, CI, docs, GitHub configuration via live API) compared against all six OSTIF practice areas; the guide's missing 08-what-next.md chapter and the external git-agentic.com website were excluded."
 generated: "2026-07-18"
-updated: "2026-07-18 — fifth round: second maintainer + required PR approvals enabled, closing G-032/T-16; code-scanning now 1 open alert (the optional OpenSSF badge). Every non-deferred gap is resolved."
+updated: "2026-07-18 — sixth round: CODEOWNERS + code-owner review added (#91); every non-deferred gap resolved. 3 Scorecard alerts remain open, all non-gaps — branch-protection at 8/10 (capped by 2-reviewer scoring), a self-healing code-review history metric, and the optional OpenSSF badge."
 generated_by: "han:gap-analysis"
 sections_included:
   - executive_summary
@@ -42,7 +42,7 @@ Every gap has a stable ID. Sections 3–5 reference those IDs. The full evidence
 
 **Both actionable tiers of the work plan are done, and the one item that had been deferred for lack of a second reviewer is now also closed.** The Now tier (T-1…T-9, T-26) and the Soon tier (T-10…T-21) all shipped across pull requests #76–#87, plus repository-settings changes, an organization-wide two-factor-authentication requirement, and — as of later on 2026-07-18 — a second maintainer and required pull-request approvals (closing G-032/T-16). Only the **Deferred tier (T-22…T-25)** remains — OSS-Fuzz enrollment, reproducible builds, a release pipeline with supply-chain attestations, and a hardening guide for people who run the server component — and every one of those is deliberately parked behind a trigger that hasn't happened yet: the project still distributes nothing for a consumer to verify.
 
-**The independent security scorecard tells the story in numbers: 17 open findings became 3, and after required reviews were enabled only 1 remains — the optional badge.**
+**The independent security scorecard tells the story in numbers: 17 open findings became 3, and every one of those 3 is now a non-gap** — see the update at the end of this section for what each represents after required reviews and code-owner review were enabled.
 
 | Scorecard finding (first run) | Now/Soon fix | Status |
 |---|---|---|
@@ -55,13 +55,15 @@ Every gap has a stable ID. Sections 3–5 reference those IDs. The full evidence
 
 The **automated code analysis is fully clean** — zero open findings — and now covers the desktop application's language as well as the core (T-3).
 
-**Update (2026-07-18, later the same day): the two review-related findings are now resolved.** A second maintainer account was added, and the trunk protection was set to require **1 approval** from someone other than the last pusher, with stale approvals dismissed on push and last-push approval required. That closes gap G-032 / todo T-16 — it was the only remaining non-deferred gap — and the two Scorecard findings it drove (required review approvals, and branch-protection completeness) clear on the next weekly scan. Nobody self-merges now; the two admin accounts review each other's pull requests.
+**Update (2026-07-18, later the same day): the review-related gap is fully closed and the protection is complete.** A second maintainer account was added, and the trunk protection was set to require **1 approval** from someone other than the last pusher, plus code-owner review (a `CODEOWNERS` file naming both accounts), with stale approvals dismissed on push and last-push approval required. That closes gap G-032 / todo T-16 — the only remaining non-deferred gap — and nobody self-merges now; the two admin accounts review each other's pull requests.
 
-**That leaves one open code-scanning finding, and it is optional:**
+**Three code-scanning findings remain open after the re-scan, and none is an unmet gap:**
 
-- **An optional best-practices badge**, now showing "in progress." Completing it is nice-to-have, not a gap the guide requires.
+- **Branch protection scored 3 → 8 of 10.** Every configurable protection is on; the top two points are reserved for *two or more* required reviewers, which for a two-person team would force every change through both people. 8/10 is the sensible ceiling, not a gap — the configuration is complete.
+- **Code-review coverage is a trailing history metric**, counting approvals across the most recent merged changes. It climbs on its own as reviewed changes accumulate; only the ones merged under the new rule carry approvals yet. Nothing left to configure.
+- **An optional best-practices badge**, showing "in progress." Nice-to-have, not required by the guide.
 
-*(For the audit trail: these findings originally shared the root cause "review approvals set to zero," which was deliberately held because a lone maintainer cannot approve their own change under the platform's rules. Adding a second reviewer removed that blocker. The branch-protection finding had already improved once merge-gating on passing checks landed via T-9.)*
+*(For the audit trail: the first two findings originally shared the root cause "review approvals set to zero," deliberately held because a lone maintainer cannot approve their own change under the platform's rules. Adding a second reviewer removed that blocker; the branch-protection finding had also improved earlier once merge-gating on passing checks landed via T-9. An earlier draft of this section projected both would "clear on the next scan" — the configuration did complete, but the two findings persist as a team-size scoring cap and a self-healing history metric respectively, which is why this note states the outcome precisely.)*
 
 **Two closing items still need a human and cannot be done from the repository:** deploying the machine-readable security-contact file to the project website (`/.well-known/security.txt`), and the maintainer personally confirming the security-feed subscriptions the documentation now lists. Both are noted in Section 5.
 
