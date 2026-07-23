@@ -42,8 +42,8 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      # The Rust toolchain is pinned deliberately in rust-toolchain.toml and the
-      # ci.yml action ref; a major bump there would silently change the CI Rust
-      # version and can introduce new clippy lints. Bump it intentionally.
+      # dtolnay/rust-toolchain encodes the toolchain in the pinned ref, so ANY
+      # automated ref update can silently change the toolchain a workflow
+      # installs (PR #99 replaced the fuzz workflow's nightly pin with the
+      # 1.96.1 branch head). Toolchain pins are bumped intentionally, by hand.
       - dependency-name: "dtolnay/rust-toolchain"
-        update-types: ["version-update:semver-major"]
