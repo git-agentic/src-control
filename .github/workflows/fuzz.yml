@@ -35,7 +35,7 @@ jobs:
       # dtolnay/rust-toolchain encodes the toolchain in the tag the SHA pins
       # (there is no `toolchain` input at these commits) — this is the
       # `nightly` tag's commit.
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # nightly
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: fuzz
