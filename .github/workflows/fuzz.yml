@@ -36,7 +36,7 @@ jobs:
       # (there is no `toolchain` input at these commits) — this is the
       # `nightly` tag's commit.
       - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
         with:
           workspaces: fuzz
       - name: install cargo-fuzz
