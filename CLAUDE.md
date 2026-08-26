@@ -36,16 +36,19 @@ recorded as an ADR in `docs/adr/`. Keep them in sync when the design changes.
 
 Crate roles are what `ls crates/` + each `Cargo.toml` say; the rules are what
 matters. Strict dependency direction: top-level adapters `{cli, desktop} → repo →
-{vfs, gitio, crypto} → core`, with the separate leaf edge `repo → tlsio`
-(`tlsio` is a leaf — it depends on no other workspace crate, not even `core`).
-**`core` must never depend on Git, worktrees, or crypto.** **`gix` must stay
-quarantined in `gitio`** — if you find yourself reaching for `gix` elsewhere,
-add a function to `gitio` instead. **RustCrypto must stay quarantined in
-`crypto`** — if you find yourself reaching for it elsewhere, add a function to
-`crypto` instead. **rustls/rcgen must stay quarantined in `tlsio`** — if you
-find yourself reaching for TLS elsewhere, add a function to `tlsio` instead.
-**`repo` must not depend on `gitio`** — `cli` links both and passes imported
-snapshots down; `repo` stays Git-agnostic.
+{vfs, gitio, crypto} → core`, with the separate leaf edges `repo → tlsio`
+**and `repo → objio`** (`tlsio` and `objio` are leaves — each depends on no
+other workspace crate, not even `core`). **`core` must never depend on Git,
+worktrees, or crypto.** **`gix` must stay quarantined in `gitio`** — if you
+find yourself reaching for `gix` elsewhere, add a function to `gitio`
+instead. **RustCrypto must stay quarantined in `crypto`** — if you find
+yourself reaching for it elsewhere, add a function to `crypto` instead.
+**rustls/rcgen must stay quarantined in `tlsio`** — if you find yourself
+reaching for TLS elsewhere, add a function to `tlsio` instead. **Object-store
+SDKs must stay quarantined in `objio`** — if you find yourself reaching for
+S3 elsewhere, add a function to `objio` instead. **`repo` must not depend on
+`gitio`** — `cli` links both and passes imported snapshots down; `repo` stays
+Git-agnostic.
 
 ## Core invariants (do not break)
 
@@ -103,7 +106,7 @@ the project tree if desired.
 
 ## Capability map (what's built, by phase)
 
-All 35 phases are built and tested. One line of current fact per phase; the
+All 36 phases are built and tested. One line of current fact per phase; the
 authoritative rationale and full semantics live in the linked ADR, the design
 in `ARCHITECTURE.md`. The old per-phase narrative log this table replaced is
 archived verbatim at `docs/archive/claude-md-phase-log-2026-07.md` — do not
@@ -147,6 +150,7 @@ the code, those win.
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
 | P34 | Private branches: ref points at a sealed-branch manifest; every commit/tree/blob individually sealed (copy-on-write) under a per-branch KEK wrapped per recipient + escrow; `sc branch --private/grant/revoke/publish`; opaque to non-recipients (content, paths, messages); grant O(1), revoke rotates the KEK; publish replays to public with a scanner gate; git bridge + private→public integration refused; `PROTOCOL_VERSION` 4 | [0044](docs/adr/0044-per-branch-access-control.md) |
 | P35 | Native Tauri desktop browser: opens `.sc` repositories through `scl-repo`, shows local/remote refs, all-parent snapshot DAG + provenance, public trees and first-parent diffs; protected content is locked and private branches remain opaque; no mutation or identity surface | [0045](docs/adr/0045-native-desktop-read-model.md) |
+| P36 | P36a built: bucket WAL remotes (sc+wal://, sc+s3://) — immutable packs + CAS'd manifest, multi-writer safe, no coordinator; checkpoints (P36b) and bucket-backed serve (P36c) pending | [0046](docs/adr/0046-wal-bucket-remotes.md) |
 
 ## Standing boundaries & gotchas
 
@@ -165,6 +169,9 @@ transport-adjacent. The rest, imperatively:
 - **Partial clones refuse merge, cherry-pick/rebase, `sc ws fork`/`harvest`,
   `sc work`, `sc export`, and `sparse disable`.** `sc backfill --all` converts
   to a genuine full clone and re-enables them.
+- **Bucket remotes hold public content plaintext at rest** — bucket ACL is
+  the perimeter (sealed content stays ciphertext, unchanged); partial-clone
+  `filter` against bucket remotes is refused.
 - **Protected sealing is randomized since P33.** Pre-P33 convergent ciphertext
   dual-reads forever and stays equality-confirmable forever (rotation ≠
   erasure). Identical independent edits on two branches now genuinely
