@@ -78,7 +78,79 @@ fn capped(what: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Which bucket backend a [`BucketUrl`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketScheme {
+    /// `sc+wal://` — a local directory used as the test/demo backend.
+    Wal,
+    /// `sc+s3://` — an S3-compatible object store.
+    S3,
+}
+
+/// A parsed `sc+wal://<dir>` or `sc+s3://<bucket>/<prefix…>` remote URL.
+/// `sc+wal` treats everything after the scheme as a directory path (so
+/// `sc+wal:///abs/path` and `sc+wal://rel/path` both work); `sc+s3` splits
+/// the first path component off as the bucket name and keeps the remainder
+/// (possibly empty) as the key prefix.
+pub struct BucketUrl {
+    pub scheme: BucketScheme,
+    pub bucket: String,
+    pub prefix: String,
+}
+
+impl BucketUrl {
+    /// Parse a bucket URL; anything malformed is `InvalidArgument` with a
+    /// message naming the URL, so `remote add` can fail fast — including
+    /// embedded CR/LF, which would otherwise smuggle extra "lines" into
+    /// anything that later logs or shells out with the raw URL.
+    pub fn parse(url: &str) -> Result<BucketUrl> {
+        let (scheme, rest) = if let Some(r) = url.strip_prefix("sc+wal://") {
+            (BucketScheme::Wal, r)
+        } else if let Some(r) = url.strip_prefix("sc+s3://") {
+            (BucketScheme::S3, r)
+        } else {
+            return Err(Error::InvalidArgument(format!(
+                "not an sc+wal:// or sc+s3:// url: {url}"
+            )));
+        };
+        if rest.is_empty() || rest.chars().any(|c| c == '\r' || c == '\n') {
+            return Err(Error::InvalidArgument(format!("bad bucket url: {url}")));
+        }
+        Ok(match scheme {
+            BucketScheme::Wal => BucketUrl {
+                scheme,
+                bucket: rest.to_string(),
+                prefix: String::new(),
+            },
+            BucketScheme::S3 => {
+                let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+                if bucket.is_empty() {
+                    return Err(Error::InvalidArgument(format!("bad bucket url: {url}")));
+                }
+                BucketUrl {
+                    scheme,
+                    bucket: bucket.to_string(),
+                    prefix: prefix.trim_matches('/').to_string(),
+                }
+            }
+        })
+    }
+}
+
 impl BucketTransport {
+    /// Open the right bucket backend for a bucket URL (`sc+wal://` opens a
+    /// local-directory test/demo backend, `sc+s3://` opens the real
+    /// S3-compatible backend), then wrap it as a `Transport` the same way
+    /// [`BucketTransport::from_bucket`] does.
+    pub fn open(url: &str) -> Result<BucketTransport> {
+        let parsed = BucketUrl::parse(url)?;
+        let bucket: Box<dyn Bucket> = match parsed.scheme {
+            BucketScheme::Wal => Box::new(scl_objio::DirBucket::open(&parsed.bucket)?),
+            BucketScheme::S3 => Box::new(scl_objio::S3Bucket::open(&parsed.bucket, &parsed.prefix)?),
+        };
+        BucketTransport::from_bucket(bucket)
+    }
+
     /// Open a transport directly over an already-constructed bucket backend.
     /// Fails only if the initial `refresh` (a conditional GET of the
     /// manifest plus a walk of its parent chain) errors — an entirely empty
@@ -756,5 +828,62 @@ mod tests {
         drop(t);
         std::fs::remove_dir_all(&broot).unwrap();
         assert!(!broot.exists());
+    }
+
+    #[test]
+    fn clone_push_fetch_round_trip_over_sc_wal_url() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-e2e-bucket-{pid}"));
+        let a_root = std::env::temp_dir().join(format!("scl-bt-e2e-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-bt-e2e-b-{pid}"));
+        for d in [&broot, &a_root, &b_root] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        std::fs::create_dir_all(&a_root).unwrap();
+        let url = format!("sc+wal://{}", broot.display());
+
+        // A: init, commit, add bucket remote, push (creates the bucket repo)
+        let a = crate::repo::Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f.txt"), b"one").unwrap();
+        let tip1 = a.commit("t", "c1").unwrap();
+        a.remote_add("origin", &url).unwrap();
+        assert_eq!(a.push("origin").unwrap(), tip1);
+
+        // B: clone from the bucket
+        let b = crate::repo::Repo::clone_url(&url, &b_root).unwrap();
+        assert_eq!(b.head_tip().unwrap(), Some(tip1));
+        assert_eq!(std::fs::read(b_root.join("f.txt")).unwrap(), b"one");
+
+        // B commits and pushes; A fetches and sees it
+        std::fs::write(b_root.join("g.txt"), b"two").unwrap();
+        let tip2 = b.commit("t", "c2").unwrap();
+        b.push("origin").unwrap();
+        drop(b);
+        let fetched = a.fetch("origin").unwrap();
+        assert!(fetched.iter().any(|(br, id)| br == "main" && *id == tip2));
+
+        // stale push from A (still at tip1 + its own commit) => NonFastForward
+        std::fs::write(a_root.join("h.txt"), b"three").unwrap();
+        a.commit("t", "c3").unwrap();
+        assert!(matches!(a.push("origin"), Err(Error::NonFastForward)));
+        drop(a);
+        for d in [&broot, &a_root, &b_root] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn bucket_url_parses_and_rejects() {
+        let u = BucketUrl::parse("sc+s3://mybucket/team/repo").unwrap();
+        assert!(matches!(u.scheme, BucketScheme::S3));
+        assert_eq!(u.bucket, "mybucket");
+        assert_eq!(u.prefix, "team/repo");
+        let u = BucketUrl::parse("sc+s3://mybucket").unwrap();
+        assert_eq!(u.prefix, "");
+        let u = BucketUrl::parse("sc+wal:///tmp/x").unwrap();
+        assert!(matches!(u.scheme, BucketScheme::Wal));
+        assert!(BucketUrl::parse("sc+s3://").is_err());
+        assert!(BucketUrl::parse("sc+s3://b\nad/x").is_err());
+        assert!(BucketUrl::parse("http://nope").is_err());
     }
 }
