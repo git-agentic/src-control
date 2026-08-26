@@ -4,7 +4,9 @@
 
 use crate::error::{Error, Result};
 use crate::transport::Transport;
-use crate::walfmt::{idx_key, log_key, pack_key, LogEntry, Manifest, RefUpdate};
+use crate::walfmt::{
+    checkpoint_key, idx_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, RefUpdate,
+};
 use scl_core::pack::{parse_index, read_object_at_bounded, IndexEntry, PackWriter};
 use scl_core::{Object, ObjectId};
 use scl_objio::{Bucket, Fetched};
@@ -25,6 +27,11 @@ struct WalView {
     refs: BTreeMap<String, ObjectId>,
     /// object id -> (pack hash, offset, length), from every on-chain pack's idx.
     index: BTreeMap<ObjectId, (String, u64, u64)>,
+    /// Every on-chain pack hash in chain order (checkpoint fold first, then
+    /// the tail) — retained so a checkpoint fold (P36b Task 3, bucket-side
+    /// checkpoint writer) is a pure copy. Not yet read anywhere in this task.
+    #[allow(dead_code)]
+    packs: Vec<String>,
 }
 
 /// A [`Transport`] whose object graph and refs live entirely in an
@@ -183,9 +190,43 @@ impl BucketTransport {
             Fetched::New { bytes, tag } => {
                 let bytes = capped("manifest", bytes)?;
                 let manifest = Manifest::decode(&bytes)?;
+                let stop = manifest.checkpoint_seq;
+                // Seed from the checkpoint when the manifest names one. The
+                // checkpoint is untrusted input like everything else here.
+                let (mut refs, mut packs): (BTreeMap<String, ObjectId>, Vec<String>) = if stop != 0
+                {
+                    let ck_bytes = match self.bucket.get(&checkpoint_key(stop), None)? {
+                        Fetched::New { bytes, .. } => capped("checkpoint", bytes)?,
+                        _ => {
+                            return Err(Error::Wal(format!(
+                                "checkpoint {stop} referenced by manifest but absent"
+                            )))
+                        }
+                    };
+                    let ck = Checkpoint::decode(&ck_bytes)?;
+                    if ck.seq != stop {
+                        return Err(Error::Wal(format!(
+                            "checkpoint at {stop} claims seq {}",
+                            ck.seq
+                        )));
+                    }
+                    let mut refs = BTreeMap::new();
+                    for (branch, id) in &ck.refs {
+                        crate::refs::validate_branch_name(branch)?;
+                        refs.insert(branch.clone(), *id);
+                    }
+                    (refs, ck.packs)
+                } else {
+                    (BTreeMap::new(), Vec::new())
+                };
                 let mut entries = Vec::new();
                 let mut seq = manifest.head_seq;
-                while seq != 0 {
+                while seq != stop {
+                    if seq < stop {
+                        return Err(Error::Wal(format!(
+                            "log chain bypasses checkpoint {stop} (reached {seq})"
+                        )));
+                    }
                     let Fetched::New { bytes, .. } = self.bucket.get(&log_key(seq), None)? else {
                         return Err(Error::Wal(format!(
                             "log entry {seq} referenced by chain but absent"
@@ -208,22 +249,25 @@ impl BucketTransport {
                     entries.push(e);
                 }
                 entries.reverse(); // oldest first
-                let mut refs = BTreeMap::new();
-                let mut index = BTreeMap::new();
                 for e in &entries {
                     for u in &e.updates {
                         crate::refs::validate_branch_name(&u.branch)?;
                         refs.insert(u.branch.clone(), u.new);
                     }
                     for hash in &e.packs {
-                        let Fetched::New { bytes, .. } = self.bucket.get(&idx_key(hash), None)?
-                        else {
-                            return Err(Error::Wal(format!("pack {hash} on chain but idx absent")));
-                        };
-                        let bytes = capped("pack idx", bytes)?;
-                        for IndexEntry { id, offset, length } in parse_index(&bytes)? {
-                            index.insert(id, (hash.clone(), offset, length));
-                        }
+                        packs.push(hash.clone());
+                    }
+                }
+                // Index build: over the FULL cumulative pack list (checkpoint
+                // packs + tail packs), fetching each idx exactly as today.
+                let mut index = BTreeMap::new();
+                for hash in &packs {
+                    let Fetched::New { bytes, .. } = self.bucket.get(&idx_key(hash), None)? else {
+                        return Err(Error::Wal(format!("pack {hash} on chain but idx absent")));
+                    };
+                    let bytes = capped("pack idx", bytes)?;
+                    for IndexEntry { id, offset, length } in parse_index(&bytes)? {
+                        index.insert(id, (hash.clone(), offset, length));
                     }
                 }
                 *self.view.borrow_mut() = Some(WalView {
@@ -231,6 +275,7 @@ impl BucketTransport {
                     manifest,
                     refs,
                     index,
+                    packs,
                 });
                 Ok(())
             }
@@ -515,7 +560,9 @@ impl Transport for BucketTransport {
 mod tests {
     use super::*;
     use crate::transport::Transport;
-    use crate::walfmt::{idx_key, log_key, pack_key, LogEntry, Manifest, RefUpdate};
+    use crate::walfmt::{
+        checkpoint_key, idx_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, RefUpdate,
+    };
     use scl_core::ObjectId;
     use scl_objio::{Bucket, DirBucket};
 
@@ -1166,5 +1213,213 @@ mod tests {
         std::fs::remove_dir_all(&broot).unwrap();
         std::fs::remove_dir_all(&a_root).unwrap();
         assert!(!broot.exists() && !a_root.exists());
+    }
+
+    /// Hand-build a WAL with `n` single-branch pushes; returns (bucket root,
+    /// final tip per branch map as Vec sorted, all pack hashes in order).
+    /// Each push i creates branch "b-<i>" pointing at a distinct object.
+    fn hand_built_wal(
+        tag: &str,
+        n: u64,
+    ) -> (std::path::PathBuf, Vec<(String, ObjectId)>, Vec<String>) {
+        let broot = std::env::temp_dir().join(format!("scl-bt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broot);
+        let bucket = DirBucket::open(&broot).unwrap();
+        let mut refs = Vec::new();
+        let mut packs = Vec::new();
+        for i in 1..=n {
+            let obj = Object::blob(format!("wal-entry-{i}").into_bytes());
+            let id = obj.id();
+            let (hash, pack, idx) = pack_of(&[(id, obj.encode())]);
+            bucket.put_new(&pack_key(&hash), &pack).unwrap();
+            bucket.put_new(&idx_key(&hash), &idx).unwrap();
+            let entry = LogEntry {
+                seq: i,
+                parent_seq: i - 1,
+                packs: vec![hash.clone()],
+                updates: vec![RefUpdate {
+                    branch: format!("b-{i}"),
+                    old: None,
+                    new: id,
+                }],
+            };
+            bucket.put_new(&log_key(i), &entry.encode()).unwrap();
+            refs.push((format!("b-{i}"), id));
+            packs.push(hash);
+        }
+        let m = Manifest {
+            head_seq: n,
+            checkpoint_seq: 0,
+            head_branch: "b-1".into(),
+        };
+        bucket
+            .put_if_tag("manifest", &m.encode(), None)
+            .unwrap()
+            .unwrap();
+        refs.sort();
+        (broot, refs, packs)
+    }
+
+    #[test]
+    fn view_via_checkpoint_equals_full_replay_and_skips_folded_entries() {
+        let (broot, expected_refs, packs) = hand_built_wal("ckpt-eq", 6);
+        let bucket = DirBucket::open(&broot).unwrap();
+        // fold through seq 4 by hand
+        let full =
+            BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let full_refs = full.list_refs().unwrap();
+        let ck = Checkpoint {
+            seq: 4,
+            refs: expected_refs
+                .iter()
+                .filter(|(b, _)| {
+                    let i: u64 = b.strip_prefix("b-").unwrap().parse().unwrap();
+                    i <= 4
+                })
+                .cloned()
+                .collect(),
+            packs: packs[..4].to_vec(),
+        };
+        bucket.put_new(&checkpoint_key(4), &ck.encode()).unwrap();
+        let Fetched::New { bytes, tag } = bucket.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let mut m = Manifest::decode(&bytes).unwrap();
+        m.checkpoint_seq = 4;
+        bucket
+            .put_if_tag("manifest", &m.encode(), Some(&tag))
+            .unwrap()
+            .unwrap();
+
+        // DELETE the folded log entries: a checkpoint-aware reader must not
+        // need them. (Direct file removal = simulated compaction.)
+        for seq in 1..=4u64 {
+            std::fs::remove_file(broot.join(log_key(seq))).unwrap();
+        }
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        assert_eq!(t.list_refs().unwrap(), full_refs);
+        // objects from folded packs still readable (index seeded from checkpoint.packs)
+        let (b1, id1) = &expected_refs[0];
+        assert!(b1.starts_with("b-"));
+        assert!(t.has_object(id1).unwrap());
+        drop((t, full));
+        std::fs::remove_dir_all(&broot).unwrap();
+    }
+
+    #[test]
+    fn corrupt_or_bypassing_checkpoints_fail_closed() {
+        let (broot, _refs, packs) = hand_built_wal("ckpt-bad", 3);
+        let bucket = DirBucket::open(&broot).unwrap();
+        // (a) manifest names a checkpoint that does not exist
+        let Fetched::New { bytes, tag } = bucket.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let mut m = Manifest::decode(&bytes).unwrap();
+        m.checkpoint_seq = 2;
+        let tag = bucket
+            .put_if_tag("manifest", &m.encode(), Some(&tag))
+            .unwrap()
+            .unwrap();
+        assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).is_err());
+        // (b) checkpoint exists but its seq field lies
+        let ck = Checkpoint {
+            seq: 1,
+            refs: vec![],
+            packs: packs[..2].to_vec(),
+        };
+        bucket.put_new(&checkpoint_key(2), &ck.encode()).unwrap();
+        assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).is_err());
+        // (c) chain bypasses the checkpoint: entry at seq 3 has parent 1 (< 2)
+        let obj_end = {
+            // repair (b) first so the error is unambiguously the bypass
+            std::fs::remove_file(broot.join(checkpoint_key(2))).unwrap();
+            let good = Checkpoint {
+                seq: 2,
+                refs: vec![],
+                packs: packs[..2].to_vec(),
+            };
+            bucket.put_new(&checkpoint_key(2), &good.encode()).unwrap();
+            let bad_entry = LogEntry {
+                seq: 3,
+                parent_seq: 1,
+                packs: vec![],
+                updates: vec![],
+            };
+            std::fs::remove_file(broot.join(log_key(3))).unwrap();
+            bucket.put_new(&log_key(3), &bad_entry.encode()).unwrap()
+        };
+        assert!(obj_end);
+        assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).is_err());
+        let _ = tag;
+        std::fs::remove_dir_all(&broot).unwrap();
+
+        // (d) checkpoint's refs carry a branch name the ref grammar rejects
+        // ("a/b" is proven invalid by repo.rs's own switch()/validate tests).
+        let (broot2, refs2, packs2) = hand_built_wal("ckpt-badname", 2);
+        let bucket2 = DirBucket::open(&broot2).unwrap();
+        let bad_id = refs2[0].1;
+        let Fetched::New { bytes, tag } = bucket2.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let mut m2 = Manifest::decode(&bytes).unwrap();
+        m2.checkpoint_seq = 2;
+        bucket2
+            .put_if_tag("manifest", &m2.encode(), Some(&tag))
+            .unwrap()
+            .unwrap();
+        let bad_ck = Checkpoint {
+            seq: 2,
+            refs: vec![("a/b".to_string(), bad_id)],
+            packs: packs2,
+        };
+        bucket2
+            .put_new(&checkpoint_key(2), &bad_ck.encode())
+            .unwrap();
+        assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot2).unwrap())).is_err());
+        std::fs::remove_dir_all(&broot2).unwrap();
+    }
+
+    #[test]
+    fn update_ref_preserves_checkpoint_seq_across_a_push() {
+        // A push against a bucket that already has a checkpoint must not
+        // reset `manifest.checkpoint_seq` back to 0 — that would strand the
+        // checkpoint (its packs/refs still readable) while the very next
+        // cold `refresh()` walked the *full* chain looking for now-compacted
+        // log entries, reproducing the failure the equals test above guards.
+        let (broot, _refs, packs) = hand_built_wal("ckpt-carry", 3);
+        let bucket = DirBucket::open(&broot).unwrap();
+        let ck = Checkpoint {
+            seq: 3,
+            refs: vec![],
+            packs: packs.clone(),
+        };
+        bucket.put_new(&checkpoint_key(3), &ck.encode()).unwrap();
+        let Fetched::New { bytes, tag } = bucket.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let mut m = Manifest::decode(&bytes).unwrap();
+        m.checkpoint_seq = 3;
+        bucket
+            .put_if_tag("manifest", &m.encode(), Some(&tag))
+            .unwrap()
+            .unwrap();
+
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let obj = Object::blob(b"carry-push".to_vec());
+        let (tip, bytes) = (obj.id(), obj.encode());
+        t.put_object(&tip, &bytes).unwrap();
+        t.update_ref("carried", &tip, None).unwrap();
+        drop(t);
+
+        let bucket2 = DirBucket::open(&broot).unwrap();
+        let Fetched::New { bytes, .. } = bucket2.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let after = Manifest::decode(&bytes).unwrap();
+        assert_eq!(
+            after.checkpoint_seq, 3,
+            "checkpoint_seq must survive a push"
+        );
+        std::fs::remove_dir_all(&broot).unwrap();
     }
 }
