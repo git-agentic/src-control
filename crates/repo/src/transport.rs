@@ -227,9 +227,17 @@ impl TempPackGuard {
     /// file itself is not created here — callers open/create it themselves
     /// (as a writer for a fresh spill, or a reader once written).
     pub(crate) fn new(layout: &Layout) -> Result<TempPackGuard> {
+        Self::new_in(&layout.tmp_dir())
+    }
+
+    /// Like [`TempPackGuard::new`], but reserves the path directly under an
+    /// arbitrary directory rather than deriving it from a repo `Layout` — the
+    /// seam a bucket-backed serve session (P36c) uses, since a bucket remote
+    /// has no `.sc/tmp/` of its own to spool into and spills instead into an
+    /// RAII scratch dir for the session's lifetime.
+    pub(crate) fn new_in(dir: &std::path::Path) -> Result<TempPackGuard> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let dir = layout.tmp_dir();
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(dir)?;
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!("pack-{}-{n}.tmp", std::process::id()));
         Ok(TempPackGuard { path })

@@ -621,7 +621,8 @@ pub fn decode_refs_body(b: &[u8]) -> Result<Vec<(String, ObjectId)>> {
     Ok(out)
 }
 
-use crate::transport::{LocalTransport, Transport};
+use crate::bucket_transport::BucketTransport;
+use crate::transport::{LocalTransport, TempPackGuard, Transport};
 
 /// Default cap on an incoming `PutPack` spool when no operator override is
 /// configured (P31): 16 GiB. Threaded through [`WirePolicy::max_pack_size`];
@@ -676,6 +677,128 @@ pub fn validate_max_pack_size(max: u64) -> Result<()> {
     Ok(())
 }
 
+/// Read and validate the session's opening `HELLO` frame — shared by
+/// [`serve_with_policy`] and [`serve_bucket_with_policy`] regardless of which
+/// backend ends up serving the session: version skew or a non-`HELLO` first
+/// frame get a typed error reply here, before either backend is ever opened.
+/// Returns `Ok(true)` when the caller should proceed to open its transport;
+/// `Ok(false)` when the session is already fully handled (an error was
+/// replied, or the peer hung up immediately) and the caller should return
+/// `Ok(())` without touching a transport at all.
+fn handshake_hello(r: &mut impl Read, w: &mut impl Write) -> Result<bool> {
+    let first = match read_frame_opt(r)? {
+        Some(f) => f,
+        None => return Ok(false), // peer connected and immediately hung up
+    };
+    match Request::decode(&first) {
+        Ok(Request::Hello { version }) if version == PROTOCOL_VERSION => Ok(true),
+        Ok(Request::Hello { version }) => {
+            write_err(
+                w,
+                EC_PROTOCOL,
+                &format!(
+                    "unsupported protocol version {version} (server speaks {PROTOCOL_VERSION})"
+                ),
+            )?;
+            Ok(false)
+        }
+        Ok(_) | Err(_) => {
+            write_err(w, EC_PROTOCOL, "expected HELLO as the first request")?;
+            Ok(false)
+        }
+    }
+}
+
+/// RAII scratch dir for a bucket-backed serve session's pack spills (P36c).
+/// A bucket remote has no `.sc/tmp/` of its own to spool into, so a bucket
+/// session gets one disposable directory under `std::env::temp_dir()` for its
+/// lifetime instead — removed (best-effort) on drop, so the ephemeral-mode
+/// disk invariant (zero residue after the session ends) holds for
+/// bucket-backed serve exactly as it does for every other ephemeral session.
+pub(crate) struct TempServeDir(std::path::PathBuf);
+
+impl TempServeDir {
+    fn create() -> Result<TempServeDir> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sc-serve-bucket-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(TempServeDir(dir))
+    }
+}
+
+impl Drop for TempServeDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The two transports [`serve_session`] can sit on (P36c). Every verb except
+/// the pack pair dispatches identically through the `Transport` trait (via
+/// [`ServeTransport::as_transport`]); `GetPack`/`PutPack` diverge because
+/// `LocalTransport` has its own bounded tempfile fast paths
+/// (`build_pack_tempfile`/`ingest_from`, sharing the repo's own `.sc/tmp/`)
+/// while a bucket only exposes the trait's streaming `get_pack`/`put_pack`,
+/// spooling through its own [`TempServeDir`] instead — so those two verbs are
+/// handled per-variant in `serve_session`.
+pub(crate) enum ServeTransport {
+    Local(LocalTransport),
+    Bucket {
+        transport: BucketTransport,
+        tmp: TempServeDir,
+    },
+}
+
+impl ServeTransport {
+    fn as_transport(&self) -> &dyn Transport {
+        match self {
+            ServeTransport::Local(t) => t,
+            ServeTransport::Bucket { transport, .. } => transport,
+        }
+    }
+
+    /// Scratch dir this session's pack spills go into: the repo's own
+    /// `.sc/tmp/` for a local transport, this session's [`TempServeDir`] for
+    /// a bucket one.
+    fn tmp_dir(&self) -> std::path::PathBuf {
+        match self {
+            ServeTransport::Local(t) => t.layout().tmp_dir(),
+            ServeTransport::Bucket { tmp, .. } => tmp.0.clone(),
+        }
+    }
+}
+
+/// Bucket twin of `LocalTransport::build_pack_tempfile`: builds a `GetPack`
+/// response's temp pack file so the same "fully succeeded before any wire
+/// byte" invariant (the comment on the `GetPack` arm in [`serve_session`])
+/// holds regardless of backend — just built from the trait's streaming
+/// `get_pack` (spooled into a fresh guard under the session's
+/// [`TempServeDir`]) instead of a local store's own reachability walk.
+fn bucket_get_pack_tempfile(
+    bt: &BucketTransport,
+    tmp_dir: &std::path::Path,
+    wants: &[ObjectId],
+    haves: &[ObjectId],
+    filter: Option<&[String]>,
+) -> Result<TempPackGuard> {
+    let guard = TempPackGuard::new_in(tmp_dir)?;
+    let mut f = std::fs::File::create(guard.path())?;
+    bt.get_pack(wants, haves, filter, &mut f)?;
+    Ok(guard)
+}
+
+/// Bucket twin of `LocalTransport::ingest_from`: hand the already-spilled
+/// pack file (produced by [`spill_pack_stream`]) to the trait's `put_pack`,
+/// which re-verifies every record and uploads a fresh pack to the bucket —
+/// mirroring the local path's own re-verify-then-ingest contract.
+fn bucket_put_pack_from_file(
+    bt: &BucketTransport,
+    path: &std::path::Path,
+) -> Result<Vec<ObjectId>> {
+    let mut f = std::fs::File::open(path)?;
+    bt.put_pack(&mut f)
+}
+
 /// Serve the repo at `root` to one wire-protocol peer until `Bye`/EOF.
 ///
 /// This is the whole server: every verb dispatches onto [`LocalTransport`],
@@ -697,28 +820,50 @@ pub fn serve_with_policy(
 ) -> Result<()> {
     // Handshake: HELLO must come first, and versions must match, before any
     // repo access happens.
-    let first = match read_frame_opt(r)? {
-        Some(f) => f,
-        None => return Ok(()), // peer connected and immediately hung up
-    };
-    match Request::decode(&first) {
-        Ok(Request::Hello { version }) if version == PROTOCOL_VERSION => {}
-        Ok(Request::Hello { version }) => {
-            write_err(
-                w,
-                EC_PROTOCOL,
-                &format!(
-                    "unsupported protocol version {version} (server speaks {PROTOCOL_VERSION})"
-                ),
-            )?;
-            return Ok(());
-        }
-        Ok(_) | Err(_) => {
-            write_err(w, EC_PROTOCOL, "expected HELLO as the first request")?;
-            return Ok(());
-        }
+    if !handshake_hello(r, w)? {
+        return Ok(());
     }
     let transport = match LocalTransport::open(root) {
+        Ok(t) => {
+            write_ok(w, &u32_body(PROTOCOL_VERSION))?;
+            ServeTransport::Local(t)
+        }
+        Err(e) => {
+            let (code, msg) = err_to_wire(&e);
+            write_err(w, code, &msg)?;
+            return Ok(());
+        }
+    };
+    serve_session(transport, r, w, policy)
+}
+
+/// Open a [`BucketTransport`] plus this session's [`TempServeDir`] as one
+/// [`ServeTransport::Bucket`] — a single fallible step so
+/// [`serve_bucket_with_policy`] only needs one match to decide whether to
+/// reply OK or a typed error.
+fn open_bucket_serve_transport(store_url: &str) -> Result<ServeTransport> {
+    let transport = BucketTransport::open(store_url)?;
+    let tmp = TempServeDir::create()?;
+    Ok(ServeTransport::Bucket { transport, tmp })
+}
+
+/// Serve a bucket WAL (`sc+wal://`/`sc+s3://`) over the same wire protocol
+/// `serve_with_policy` speaks for a local repo (P36c): same handshake, same
+/// `PROTOCOL_VERSION`, same read-only gate and pack-spool caps — every verb
+/// except the pack pair goes through [`Transport`] identically either way.
+/// All durable state lives in the bucket; this process holds only an RAII
+/// scratch dir ([`TempServeDir`]) for pack spills, removed when the session
+/// ends.
+pub fn serve_bucket_with_policy(
+    store_url: &str,
+    r: &mut impl Read,
+    w: &mut impl Write,
+    policy: WirePolicy,
+) -> Result<()> {
+    if !handshake_hello(r, w)? {
+        return Ok(());
+    }
+    let transport = match open_bucket_serve_transport(store_url) {
         Ok(t) => {
             write_ok(w, &u32_body(PROTOCOL_VERSION))?;
             t
@@ -729,7 +874,21 @@ pub fn serve_with_policy(
             return Ok(());
         }
     };
+    serve_session(transport, r, w, policy)
+}
 
+/// Serve one wire-protocol peer over an already-opened [`ServeTransport`]
+/// until `Bye`/EOF — the shared body of [`serve_with_policy`] and
+/// [`serve_bucket_with_policy`] once each has finished its own handshake and
+/// opened its own backend. See `serve_with_policy`'s doc comment for the
+/// full verb-by-verb contract (read-only gate, pack spool caps); it applies
+/// identically here no matter which transport variant is behind it.
+fn serve_session(
+    transport: ServeTransport,
+    r: &mut impl Read,
+    w: &mut impl Write,
+    policy: WirePolicy,
+) -> Result<()> {
     loop {
         let frame = match read_frame_opt(r)? {
             Some(f) => f,
@@ -766,7 +925,7 @@ pub fn serve_with_policy(
                     // the normal arm's larger `max_pack_size` — a read-only
                     // push is discarded regardless, so there's no reason to
                     // spool an attacker-sized pack just to reject it.
-                    match spill_pack_stream(r, transport.layout(), policy.ro_drain_cap) {
+                    match spill_pack_stream(r, &transport.tmp_dir(), policy.ro_drain_cap) {
                         Ok(guard) => {
                             drop(guard);
                             let (code, msg) = err_to_wire(&Error::ReadOnly);
@@ -806,13 +965,22 @@ pub fn serve_with_policy(
                 } else {
                     Some(filter.as_slice())
                 };
-                match transport.build_pack_tempfile(&wants, &haves, filter_opt) {
+                let result = match &transport {
+                    ServeTransport::Local(t) => t.build_pack_tempfile(&wants, &haves, filter_opt),
+                    ServeTransport::Bucket { transport: bt, tmp } => {
+                        bucket_get_pack_tempfile(bt, &tmp.0, &wants, &haves, filter_opt)
+                    }
+                };
+                match result {
                     Ok(guard) => {
                         // Building the temp pack file (bounded RAM: one
-                        // object at a time via PackWriter) fully succeeded
-                        // before any wire byte for this response was sent,
-                        // so an OK/ERR split here is still clean — no
-                        // partial stream can ever follow an ERR.
+                        // object at a time) fully succeeded before any wire
+                        // byte for this response was sent, so an OK/ERR
+                        // split here is still clean — no partial stream can
+                        // ever follow an ERR. True for both variants: Local's
+                        // `build_pack_tempfile` and the bucket path's
+                        // `bucket_get_pack_tempfile` each finish writing (and
+                        // return Err on any failure) before we touch `w`.
                         write_ok(w, &[])?; // empty body: "stream follows"
                         let mut f = std::fs::File::open(guard.path())?;
                         write_pack_stream(w, &mut f, pack_chunk_size())?;
@@ -825,9 +993,15 @@ pub fn serve_with_policy(
                 }
             }
             Request::PutPack => {
-                match spill_pack_stream(r, transport.layout(), policy.max_pack_size) {
+                match spill_pack_stream(r, &transport.tmp_dir(), policy.max_pack_size) {
                     Ok(guard) => {
-                        match transport.ingest_from(guard.path()) {
+                        let ingest_result = match &transport {
+                            ServeTransport::Local(t) => t.ingest_from(guard.path()),
+                            ServeTransport::Bucket { transport: bt, .. } => {
+                                bucket_put_pack_from_file(bt, guard.path())
+                            }
+                        };
+                        match ingest_result {
                             Ok(ids) => write_ok(w, &ids_body(&ids))?,
                             Err(e) => {
                                 let (code, msg) = err_to_wire(&e);
@@ -859,18 +1033,27 @@ pub fn serve_with_policy(
                     Request::Hello { .. } => {
                         Err(Error::Protocol("unexpected HELLO mid-session".into()))
                     }
-                    Request::ListRefs => transport.list_refs().map(|refs| refs_body(&refs)),
-                    Request::HeadBranch => transport.head_branch().map(|s| str_body(&s)),
-                    Request::HasObject(id) => transport.has_object(&id).map(bool_body),
-                    Request::GetObject(id) => transport.get_object(&id),
-                    Request::PutObject { id, bytes } => {
-                        transport.put_object(&id, &bytes).map(|()| Vec::new())
+                    Request::ListRefs => transport
+                        .as_transport()
+                        .list_refs()
+                        .map(|refs| refs_body(&refs)),
+                    Request::HeadBranch => {
+                        transport.as_transport().head_branch().map(|s| str_body(&s))
                     }
+                    Request::HasObject(id) => {
+                        transport.as_transport().has_object(&id).map(bool_body)
+                    }
+                    Request::GetObject(id) => transport.as_transport().get_object(&id),
+                    Request::PutObject { id, bytes } => transport
+                        .as_transport()
+                        .put_object(&id, &bytes)
+                        .map(|()| Vec::new()),
                     Request::UpdateRef {
                         branch,
                         id,
                         expected_old,
                     } => transport
+                        .as_transport()
                         .update_ref(&branch, &id, expected_old.as_ref())
                         .map(|()| Vec::new()),
                     Request::Bye | Request::GetPack { .. } | Request::PutPack => {
@@ -903,13 +1086,15 @@ pub fn serve(root: &std::path::Path, r: &mut impl Read, w: &mut impl Write) -> R
 /// created before any read, so a stream that errors partway (a malformed
 /// frame, a dropped connection) still leaves nothing behind — `Drop` removes
 /// whatever was written so far. `max_bytes` bounds the spool (0 = unlimited,
-/// P31) — see [`read_pack_stream`].
+/// P31) — see [`read_pack_stream`]. `tmp_dir` (P36c) is the caller's scratch
+/// dir — a repo's `.sc/tmp/` for a local serve session, a [`TempServeDir`]
+/// for a bucket one — so this function itself stays backend-agnostic.
 fn spill_pack_stream(
     r: &mut impl Read,
-    layout: &crate::layout::Layout,
+    tmp_dir: &std::path::Path,
     max_bytes: u64,
-) -> Result<crate::transport::TempPackGuard> {
-    let guard = crate::transport::TempPackGuard::new(layout)?;
+) -> Result<TempPackGuard> {
+    let guard = TempPackGuard::new_in(tmp_dir)?;
     let mut f = std::fs::File::create(guard.path())?;
     read_pack_stream(r, &mut f, max_bytes)?;
     Ok(guard)
@@ -1586,5 +1771,102 @@ mod tests {
         let tmp = root.join(".sc").join("tmp");
         assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Mint a one-commit object set the same way
+    /// `bucket_transport::tests::tiny_history` does (blob -> tree -> snapshot
+    /// via a real scratch repo), returning `(tip, objects)`. `tag`
+    /// disambiguates the scratch repo path between call sites sharing this
+    /// process id.
+    fn tiny_history_for_bucket(tag: &str, content: &[u8]) -> (ObjectId, Vec<(ObjectId, Vec<u8>)>) {
+        let root =
+            std::env::temp_dir().join(format!("scl-wire-bkhist-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("f.txt"), content).unwrap();
+        let tip = repo.commit("t", "c").unwrap();
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let ids = crate::reachable::reachable_objects(&mut *store, &[tip]).unwrap();
+        let objects: Vec<(ObjectId, Vec<u8>)> = ids
+            .iter()
+            .map(|id| (*id, store.get(id).unwrap().encode()))
+            .collect();
+        drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+        (tip, objects)
+    }
+
+    /// `serve_bucket_with_policy` speaks the exact same wire protocol as
+    /// `serve_with_policy` against a bucket WAL instead of a local `.sc/`:
+    /// handshake, `ListRefs`, a streamed `GetPack`, and a `PutPack` +
+    /// `UpdateRef` that lands a second commit — verified by a fresh
+    /// `BucketTransport::open` on the bucket after the session ends.
+    #[test]
+    fn bucket_stdio_serve_round_trips_refs_and_packs() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-wire-bucket-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        let url = format!("sc+wal://{}", broot.display());
+
+        // Seed a one-commit bucket WAL directly via BucketTransport — same
+        // shape as bucket_transport::tests::push_via_trait_round_trips_into_a_fresh_bucket.
+        let (tip, objects) = tiny_history_for_bucket("seed", b"hello wal");
+        {
+            let t = crate::bucket_transport::BucketTransport::open(&url).unwrap();
+            let (pack, _idx) = scl_core::pack::build_pack(&objects).unwrap();
+            t.put_pack(&mut std::io::Cursor::new(pack)).unwrap();
+            t.update_ref("main", &tip, None).unwrap();
+        }
+
+        // Serve it over an in-memory duplex, exactly like the local serve
+        // tests' `spawn_wire_pair_with_policy` pipe setup.
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let url_for_server = url.clone();
+        let srv = std::thread::spawn(move || {
+            serve_bucket_with_policy(
+                &url_for_server,
+                &mut server_read,
+                &mut server_write,
+                WirePolicy::default(),
+            )
+        });
+        let client =
+            crate::stdio_transport::WireClient::handshake(client_read, client_write).unwrap();
+
+        let refs = client.list_refs().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "main");
+        assert_eq!(refs[0].1, tip);
+
+        // GetPack streams a nonempty pack covering the tip's full closure.
+        let mut out = Vec::new();
+        client.get_pack(&[tip], &[], None, &mut out).unwrap();
+        assert!(!out.is_empty());
+        let got = scl_core::pack::parse_pack(&out).unwrap();
+        assert_eq!(got.len(), objects.len());
+
+        // PutPack + UpdateRef land a second commit through the same session.
+        let (tip2, objects2) = tiny_history_for_bucket("seed2", b"second commit");
+        let (pack2, _idx2) = scl_core::pack::build_pack(&objects2).unwrap();
+        let ids2 = client.put_pack(&mut std::io::Cursor::new(pack2)).unwrap();
+        assert_eq!(ids2.len(), objects2.len());
+        client.update_ref("main", &tip2, Some(&tip)).unwrap();
+
+        client.bye().unwrap();
+        drop(client);
+        srv.join().unwrap().unwrap();
+
+        // A fresh BucketTransport sees the moved tip.
+        let t2 = crate::bucket_transport::BucketTransport::open(&url).unwrap();
+        assert_eq!(t2.list_refs().unwrap(), vec![("main".to_string(), tip2)]);
+        drop(t2);
+
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
     }
 }
