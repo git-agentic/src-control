@@ -711,17 +711,30 @@ fn handshake_hello(r: &mut impl Read, w: &mut impl Write) -> Result<bool> {
 
 /// RAII scratch dir for a bucket-backed serve session's pack spills (P36c).
 /// A bucket remote has no `.sc/tmp/` of its own to spool into, so a bucket
-/// session gets one disposable directory under `std::env::temp_dir()` for its
-/// lifetime instead — removed (best-effort) on drop, so the ephemeral-mode
-/// disk invariant (zero residue after the session ends) holds for
-/// bucket-backed serve exactly as it does for every other ephemeral session.
+/// session gets one disposable directory under the serve HOME's own
+/// `.sc/tmp/` for its lifetime instead — matching CLAUDE.md's and
+/// THREAT-MODEL.md's documented "pack-spool scratch lives in the serve
+/// home" contract (and local-mode's own `.sc/tmp` convention) rather than
+/// the process-wide `std::env::temp_dir()`, which is shared, unbounded, and
+/// not scoped to this repo's access control at all. Removed (best-effort)
+/// on drop, so the ephemeral-mode disk invariant (zero residue after the
+/// session ends) holds for bucket-backed serve exactly as it does for every
+/// other ephemeral session.
 pub(crate) struct TempServeDir(std::path::PathBuf);
 
 impl TempServeDir {
-    fn create() -> Result<TempServeDir> {
+    /// Create the scratch dir under `<home>/.sc/tmp/serve-bucket-<pid>-<n>`.
+    /// `home` is the serve session's HOME directory (the same `path` a local
+    /// `serve_with_policy` session materializes into) — callers must have
+    /// already confirmed it has a `.sc/` (the same gate `handle_http_connection`
+    /// and `LocalTransport::open` apply) before calling this.
+    fn create_in(home: &std::path::Path) -> Result<TempServeDir> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sc-serve-bucket-{}-{n}", std::process::id()));
+        let dir = home
+            .join(".sc")
+            .join("tmp")
+            .join(format!("serve-bucket-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         Ok(TempServeDir(dir))
     }
@@ -840,10 +853,12 @@ pub fn serve_with_policy(
 /// Open a [`BucketTransport`] plus this session's [`TempServeDir`] as one
 /// [`ServeTransport::Bucket`] — a single fallible step so
 /// [`serve_bucket_with_policy`] only needs one match to decide whether to
-/// reply OK or a typed error.
-fn open_bucket_serve_transport(store_url: &str) -> Result<ServeTransport> {
+/// reply OK or a typed error. `home` is the serve session's HOME directory
+/// (see [`TempServeDir::create_in`]) — the spool dir is created under its
+/// `.sc/tmp/`, not the process-wide temp dir.
+fn open_bucket_serve_transport(store_url: &str, home: &std::path::Path) -> Result<ServeTransport> {
     let transport = BucketTransport::open(store_url)?;
-    let tmp = TempServeDir::create()?;
+    let tmp = TempServeDir::create_in(home)?;
     Ok(ServeTransport::Bucket { transport, tmp })
 }
 
@@ -852,10 +867,17 @@ fn open_bucket_serve_transport(store_url: &str) -> Result<ServeTransport> {
 /// `PROTOCOL_VERSION`, same read-only gate and pack-spool caps — every verb
 /// except the pack pair goes through [`Transport`] identically either way.
 /// All durable state lives in the bucket; this process holds only an RAII
-/// scratch dir ([`TempServeDir`]) for pack spills, removed when the session
-/// ends.
+/// scratch dir ([`TempServeDir`]) for pack spills, created under `home`'s own
+/// `.sc/tmp/` (CLAUDE.md / THREAT-MODEL.md's "pack-spool scratch lives in the
+/// serve home" contract) and removed when the session ends. `home` is the
+/// same serve-HOME directory `serve_with_policy` materializes a local repo
+/// into — callers must have already confirmed it has a `.sc/` before calling
+/// this (both current callers, `handle_http_connection` and the CLI's
+/// `--stdio` path, already do, via the same gate `LocalTransport::open`
+/// would apply).
 pub fn serve_bucket_with_policy(
     store_url: &str,
+    home: &std::path::Path,
     r: &mut impl Read,
     w: &mut impl Write,
     policy: WirePolicy,
@@ -863,7 +885,7 @@ pub fn serve_bucket_with_policy(
     if !handshake_hello(r, w)? {
         return Ok(());
     }
-    let transport = match open_bucket_serve_transport(store_url) {
+    let transport = match open_bucket_serve_transport(store_url, home) {
         Ok(t) => {
             write_ok(w, &u32_body(PROTOCOL_VERSION))?;
             t
@@ -1804,13 +1826,19 @@ mod tests {
     /// `serve_with_policy` against a bucket WAL instead of a local `.sc/`:
     /// handshake, `ListRefs`, a streamed `GetPack`, and a `PutPack` +
     /// `UpdateRef` that lands a second commit — verified by a fresh
-    /// `BucketTransport::open` on the bucket after the session ends.
+    /// `BucketTransport::open` on the bucket after the session ends. Also
+    /// pins the fix for a review finding: the session's pack-spool scratch
+    /// dir must live under the serve HOME's own `.sc/tmp/`, not the
+    /// process-wide `std::env::temp_dir()` — asserted below by checking that
+    /// `home/.sc/tmp/` is the only place a `serve-bucket-*` dir ever
+    /// appears, and that it's gone again once the session ends.
     #[test]
     fn bucket_stdio_serve_round_trips_refs_and_packs() {
         let pid = std::process::id();
         let broot = std::env::temp_dir().join(format!("scl-wire-bucket-{pid}"));
         let _ = std::fs::remove_dir_all(&broot);
         let url = format!("sc+wal://{}", broot.display());
+        let home = tmp_repo("bucket-serve-home"); // an sc repo used only as the serve HOME
 
         // Seed a one-commit bucket WAL directly via BucketTransport — same
         // shape as bucket_transport::tests::push_via_trait_round_trips_into_a_fresh_bucket.
@@ -1827,9 +1855,11 @@ mod tests {
         let (client_read, mut server_write) = std::io::pipe().unwrap();
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let url_for_server = url.clone();
+        let home_for_server = home.clone();
         let srv = std::thread::spawn(move || {
             serve_bucket_with_policy(
                 &url_for_server,
+                &home_for_server,
                 &mut server_read,
                 &mut server_write,
                 WirePolicy::default(),
@@ -1866,7 +1896,41 @@ mod tests {
         assert_eq!(t2.list_refs().unwrap(), vec![("main".to_string(), tip2)]);
         drop(t2);
 
+        // The session's TempServeDir (which the PutPack/GetPack verbs above
+        // spooled through) has already been dropped by the time `srv.join`
+        // returned — zero residue under the serve HOME, same ephemeral-mode
+        // guarantee as every other session kind.
+        let home_tmp = home.join(".sc").join("tmp");
+        assert!(
+            !home_tmp.exists() || std::fs::read_dir(&home_tmp).unwrap().next().is_none(),
+            "no serve-bucket-* spool dir may survive the session"
+        );
+
         std::fs::remove_dir_all(&broot).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
         assert!(!broot.exists());
+    }
+
+    /// Regression for a review finding: a bucket-backed serve session's pack
+    /// spool dir must live under the serve HOME's own `.sc/tmp/`, not the
+    /// process-wide `std::env::temp_dir()` (CLAUDE.md / THREAT-MODEL.md's
+    /// "pack-spool scratch lives in the serve home" contract) — and must be
+    /// removed again on drop, exactly like every other ephemeral scratch dir
+    /// in this codebase.
+    #[test]
+    fn temp_serve_dir_lives_under_home_sc_tmp_and_is_removed_on_drop() {
+        let home = tmp_repo("bucket-tmpdir-home");
+        let path = {
+            let guard = TempServeDir::create_in(&home).unwrap();
+            let p = guard.0.clone();
+            assert!(
+                p.starts_with(home.join(".sc").join("tmp")),
+                "spool dir {p:?} must live under the serve home's .sc/tmp/"
+            );
+            assert!(p.is_dir());
+            p
+        };
+        assert!(!path.exists(), "TempServeDir must be removed on drop");
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

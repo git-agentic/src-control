@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use crate::transport::Transport;
 use crate::walfmt::{
-    checkpoint_key, idx_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, RefUpdate,
+    checkpoint_key, idx_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, RefUpdate, MAX_LIST,
 };
 use scl_core::pack::{parse_index, read_object_at_bounded, IndexEntry, PackWriter};
 use scl_core::{Object, ObjectId};
@@ -37,11 +37,14 @@ struct WalView {
 /// A [`Transport`] whose object graph and refs live entirely in an
 /// object-storage bucket (S3-compatible or a local directory), read through
 /// the parent-linked WAL log format `walfmt` defines. Readers walk the log
-/// backward from the manifest's `head_seq` via `parent_seq` links — a log
-/// entry's own claimed `seq` is never trusted for reachability, only for
-/// self-consistency (it must match the slot it was read from and its parent
-/// must strictly precede it). An entry not on that chain (e.g. a losing
-/// racer's orphaned append) is invisible to every read method here, by
+/// backward from the manifest's `head_seq` via `parent_seq` links, stopping
+/// at `checkpoint_seq` (seeded from the checkpoint object it names, P36b) —
+/// a cold start no longer replays to `0`, only the tail past the last fold.
+/// A log entry's own claimed `seq` is never trusted for reachability, only
+/// for self-consistency (it must match the slot it was read from and its
+/// parent must strictly precede it, down to `checkpoint_seq`). An entry not
+/// on that chain (e.g. a losing racer's orphaned append) is invisible to
+/// every read method here, by
 /// construction.
 pub struct BucketTransport {
     bucket: Box<dyn Bucket>,
@@ -88,6 +91,16 @@ fn capped(what: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
 /// Fold a checkpoint once the log tail exceeds this many entries past the
 /// last checkpoint (spec: "default 64 entries, one tunable constant").
 const CHECKPOINT_INTERVAL: u64 = 64;
+
+/// True when a checkpoint fold of `nrefs` refs and `npacks` packs would
+/// exceed `walfmt::MAX_LIST` on either axis — i.e. would write a checkpoint
+/// object `Checkpoint::decode` then refuses to read back. Pure predicate
+/// (no bucket I/O) so `maybe_fold_checkpoint`'s guard can be unit-tested
+/// directly against the exact boundary `Checkpoint::decode` enforces,
+/// without constructing a real 65536+-ref/pack `WalView` end to end.
+fn fold_would_overflow(nrefs: usize, npacks: usize) -> bool {
+    nrefs > MAX_LIST || npacks > MAX_LIST
+}
 
 /// Which bucket backend a [`BucketUrl`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,8 +194,10 @@ impl BucketTransport {
     }
 
     /// One conditional GET of the manifest; on change, rebuild refs + index
-    /// by walking parent links head -> 0 (seq numbers are claims; the chain
-    /// is the truth — off-chain entries are garbage).
+    /// by walking parent links from `head_seq` down to `checkpoint_seq`
+    /// (P36b) — seeded from that checkpoint's own `refs`/`packs` rather than
+    /// replayed from `0` — then folding the tail entries on top (seq numbers
+    /// are claims; the chain is the truth — off-chain entries are garbage).
     fn refresh(&self) -> Result<()> {
         let cached_tag = self.view.borrow().as_ref().map(|v| v.tag.clone());
         match self.bucket.get("manifest", cached_tag.as_deref())? {
@@ -373,12 +388,45 @@ impl BucketTransport {
         if head_seq - checkpoint_seq <= CHECKPOINT_INTERVAL {
             return Ok(());
         }
+        // Two pushers landing identical packs (e.g. two racers whose staged
+        // objects happened to build the same pack bytes) leave duplicate
+        // hashes in the cumulative `packs` list; don't copy the duplicates
+        // forward into every future checkpoint. Order-preserving: chain
+        // order (oldest first) has no semantic meaning here, but there's no
+        // reason to churn it either.
+        let mut seen = std::collections::HashSet::new();
+        let packs: Vec<String> = packs
+            .into_iter()
+            .filter(|h| seen.insert(h.clone()))
+            .collect();
+        if fold_would_overflow(refs.len(), packs.len()) {
+            // A fold at or under `walfmt::MAX_LIST` on both axes round-trips
+            // through `Checkpoint::decode` cleanly. One that overflows would
+            // write a checkpoint object that decode then REFUSES to read
+            // back — bricking the remote: every subsequent `refresh` by any
+            // reader (every client and every `serve` instance, including
+            // this same process) fails closed on `Manifest.checkpoint_seq`
+            // naming an undecodable checkpoint, with no way back short of
+            // hand-editing the bucket. Skip the fold instead — it is
+            // best-effort by design (see the doc above) — and let every
+            // reader keep doing the slower but correct full-tail walk back
+            // to the last checkpoint that DID fit. Durable relief is
+            // compaction (ROADMAP "Bucket compaction/gc"), which can retire
+            // refs/packs instead of letting them accumulate into ever-larger
+            // checkpoints forever.
+            return Ok(());
+        }
         let ck = Checkpoint {
             seq: head_seq,
             refs,
             packs,
         };
-        // Claim the object first (idempotent), then point the manifest at it.
+        // Claim the object first (idempotent), then point the manifest at
+        // it. `put_new`'s discarded `bool` (already-existed vs. freshly
+        // written) is safe to ignore here: two racing folds off the SAME
+        // head hold byte-identical views (same refs, same deduped packs,
+        // same `head_seq`), so a colliding claim is content-identical, not
+        // a conflict — there is nothing to redo either way.
         self.bucket
             .put_new(&checkpoint_key(head_seq), &ck.encode())?;
         let manifest = Manifest {
@@ -1571,6 +1619,91 @@ mod tests {
             (CHECKPOINT_INTERVAL + 2) as usize
         );
         drop((t, t2));
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    /// Boundary-exact unit test for the fold guard's pure predicate: it must
+    /// agree exactly with `Checkpoint::decode`'s own cap (`nrefs`/`npacks`
+    /// each allowed up to and including `MAX_LIST`, refused strictly above
+    /// it) — a fold that passes this guard must always be decodable, and a
+    /// fold that would overflow must always be caught before it ever reaches
+    /// the bucket.
+    #[test]
+    fn fold_would_overflow_matches_checkpoint_decodes_cap_exactly() {
+        assert!(!fold_would_overflow(0, 0));
+        assert!(!fold_would_overflow(MAX_LIST, 0));
+        assert!(!fold_would_overflow(0, MAX_LIST));
+        assert!(!fold_would_overflow(MAX_LIST, MAX_LIST));
+        assert!(fold_would_overflow(MAX_LIST + 1, 0));
+        assert!(fold_would_overflow(0, MAX_LIST + 1));
+        assert!(fold_would_overflow(MAX_LIST + 1, MAX_LIST + 1));
+    }
+
+    /// Regression for the "over-cap fold bricks the remote" review finding:
+    /// `maybe_fold_checkpoint` must skip the fold (return `Ok`, write
+    /// nothing) once the view it would fold exceeds `walfmt::MAX_LIST` on
+    /// either axis, rather than writing a checkpoint object
+    /// `Checkpoint::decode` then refuses to read back.
+    ///
+    /// Driving this through real traffic would need 65537+ actual pushes —
+    /// far too slow for a unit test, and the boundary case is exercised
+    /// precisely above. Instead this hand-builds an over-cap `WalView`
+    /// directly (this test module is `bucket_transport::tests`, a
+    /// descendant of the defining module, so it may reach `BucketTransport`'s
+    /// private `view` field and construct a `WalView` — the same private
+    /// types `refresh()` itself builds) and calls the private
+    /// `maybe_fold_checkpoint` method directly, proving the guard fires
+    /// before any bucket write — no checkpoint object lands and the
+    /// manifest is untouched. `pushes_past_the_interval_fold_a_checkpoint_and_cold_start_uses_it`
+    /// above is the complementary proof that an ordinary (under-cap) fold
+    /// still happens.
+    #[test]
+    fn fold_is_skipped_and_the_triggering_push_still_succeeds_when_the_view_exceeds_the_cap() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-foldcap-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+
+        // Hand-build a view whose ref count exceeds MAX_LIST — the exact
+        // shape `refresh()` would eventually produce after enough real
+        // pushes, minus actually performing 65537 of them.
+        let mut refs = BTreeMap::new();
+        for i in 0..=MAX_LIST {
+            let branch = format!("b-{i}");
+            refs.insert(branch.clone(), ObjectId::of(branch.as_bytes()));
+        }
+        *t.view.borrow_mut() = Some(WalView {
+            tag: "fake-tag".to_string(),
+            manifest: Manifest {
+                head_seq: CHECKPOINT_INTERVAL + 100, // well past the fold threshold
+                checkpoint_seq: 0,
+                head_branch: "main".to_string(),
+            },
+            refs,
+            index: BTreeMap::new(),
+            packs: Vec::new(),
+        });
+
+        // The triggering push's own commit already landed (that's what put
+        // this over-cap view in place); the fold itself must be a no-op —
+        // best-effort by design — not an error.
+        t.maybe_fold_checkpoint().unwrap();
+
+        // Nothing was written: no checkpoint object, and (since we never
+        // actually pushed the fake manifest to the bucket, only mutated the
+        // in-memory view) the manifest key is still absent.
+        let bucket = DirBucket::open(&broot).unwrap();
+        assert!(matches!(
+            bucket.get("manifest", None).unwrap(),
+            Fetched::Absent
+        ));
+        assert!(
+            bucket.list("checkpoints/").unwrap().is_empty(),
+            "an over-cap fold must not write any checkpoint object"
+        );
+
+        drop(t);
         std::fs::remove_dir_all(&broot).unwrap();
         assert!(!broot.exists());
     }

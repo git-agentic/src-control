@@ -9,7 +9,12 @@ const ENTRY_MAGIC: &[u8; 4] = b"SCWE";
 const CHECKPOINT_MAGIC: &[u8; 4] = b"SCWC";
 const VERSION: u32 = 1;
 const MAX_NAME: usize = 4096;
-const MAX_LIST: usize = 65536;
+/// Cap on the number of entries in any length-prefixed list this format
+/// encodes (a `LogEntry`'s `packs`/`updates`, a `Checkpoint`'s `refs`/
+/// `packs`). `pub(crate)` so `bucket_transport`'s checkpoint fold can check
+/// against the same cap `Checkpoint::decode` enforces, rather than
+/// duplicating the literal — see `maybe_fold_checkpoint`'s guard.
+pub(crate) const MAX_LIST: usize = 65536;
 const MAX_HASH: usize = 128;
 
 /// A bounds-checked cursor over a decode buffer. Every read either advances

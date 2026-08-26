@@ -3530,9 +3530,13 @@ fn run_serve(
             let mut stdin = std::io::stdin().lock();
             let mut stdout = std::io::stdout().lock();
             match &store {
-                Some(url) => {
-                    scl_repo::wire::serve_bucket_with_policy(url, &mut stdin, &mut stdout, policy)?
-                }
+                Some(url) => scl_repo::wire::serve_bucket_with_policy(
+                    url,
+                    &path,
+                    &mut stdin,
+                    &mut stdout,
+                    policy,
+                )?,
                 None => scl_repo::wire::serve_with_policy(&path, &mut stdin, &mut stdout, policy)?,
             }
             Ok(())

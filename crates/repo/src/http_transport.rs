@@ -1063,7 +1063,9 @@ fn handle_http_connection(
         ro_drain_cap: crate::wire::RO_DRAIN_CAP,
     };
     match store {
-        Some(url) => crate::wire::serve_bucket_with_policy(url, &mut reader, &mut writer, policy),
+        Some(url) => {
+            crate::wire::serve_bucket_with_policy(url, root, &mut reader, &mut writer, policy)
+        }
         None => crate::wire::serve_with_policy(root, &mut reader, &mut writer, policy),
     }
 }

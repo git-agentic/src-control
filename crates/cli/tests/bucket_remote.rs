@@ -139,6 +139,7 @@ fn serve_store_serves_a_bucket_and_second_instance_sees_pushes() {
     assert!(sc(&dst, &["commit", "-m", "c2"]).status.success());
     assert!(sc(&dst, &["push", "origin"]).status.success());
     child.kill().ok();
+    let _ = child.wait();
     let (mut child2, addr2) = spawn_http_server_with(&home, &["--store", &store]);
     let parent2 = tmp("srv-clone2");
     let d2 = parent2.join("d2");
@@ -154,6 +155,7 @@ fn serve_store_serves_a_bucket_and_second_instance_sees_pushes() {
     .success());
     assert_eq!(std::fs::read(d2.join("g.txt")).unwrap(), b"hop");
     child2.kill().ok();
+    let _ = child2.wait();
 
     for p in [&bucket, &home, &seed, &parent, &parent2] {
         std::fs::remove_dir_all(p).unwrap();

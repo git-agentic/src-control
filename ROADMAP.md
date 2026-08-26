@@ -934,7 +934,12 @@ scale-&-reach horizon):
   latest checkpoint (P36b) instead of walking to `0`, but no log entry,
   checkpoint, or superseded pack is ever actually removed from the bucket.
   Deferred until a safe pruning cutoff (e.g. "no reader can still need
-  anything before checkpoint N") is designed.
+  anything before checkpoint N") is designed. Compaction is also what
+  relieves `walfmt::MAX_LIST` (65536): a checkpoint fold with more refs or
+  packs than that cap is skipped outright (`maybe_fold_checkpoint`'s guard,
+  P36b review) rather than writing an object `Checkpoint::decode` would then
+  refuse to read back, so a remote whose live ref/pack count grows past the
+  cap loses folding entirely until compaction can retire entries below it.
 - **Leases (P36a follow-on).** The only cross-writer coordination today is
   the manifest's compare-and-swap; there is no lease/TTL primitive for
   operations that need to hold exclusive intent across more than one bucket
