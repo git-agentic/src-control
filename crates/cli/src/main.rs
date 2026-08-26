@@ -3520,6 +3520,24 @@ fn run_serve(
                     "--tls applies only to --http (ssh already provides --stdio's confidential channel)"
                 );
             }
+            // `--http`'s `handle_http_connection` gates on `.sc/` presence
+            // unconditionally (404 before any dispatch, store mode included).
+            // `--stdio` has no such gate upstream — enforce it here, before
+            // touching stdin, so a `--store` session never auto-vivifies
+            // `<path>/.sc/tmp/` under an uninitialized directory (which
+            // `TempServeDir::create_in` would otherwise do via
+            // `create_dir_all`) and never leaves an empty `.sc/tmp/` behind
+            // after teardown (its `Drop` only removes the leaf spool dir).
+            // Local (non-`--store`) `--stdio` needs no separate check here:
+            // `LocalTransport::open` already fails closed on a missing
+            // `.sc/` inside `serve_with_policy` itself.
+            if store.is_some() && !path.join(".sc").is_dir() {
+                anyhow::bail!(
+                    "sc serve --store requires an initialized serve home (run `sc init` in {} first): \
+                     tokens, TLS identity, and pack spills live under its .sc/",
+                    path.display()
+                );
+            }
             let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
             scl_repo::wire::validate_max_pack_size(max_pack)?;
             let policy = scl_repo::wire::WirePolicy {

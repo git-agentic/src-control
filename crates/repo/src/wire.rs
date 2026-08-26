@@ -871,10 +871,15 @@ fn open_bucket_serve_transport(store_url: &str, home: &std::path::Path) -> Resul
 /// `.sc/tmp/` (CLAUDE.md / THREAT-MODEL.md's "pack-spool scratch lives in the
 /// serve home" contract) and removed when the session ends. `home` is the
 /// same serve-HOME directory `serve_with_policy` materializes a local repo
-/// into — callers must have already confirmed it has a `.sc/` before calling
-/// this (both current callers, `handle_http_connection` and the CLI's
-/// `--stdio` path, already do, via the same gate `LocalTransport::open`
-/// would apply).
+/// into — callers MUST have already confirmed it has a `.sc/` before calling
+/// this, or [`TempServeDir::create_in`] will silently `create_dir_all` one
+/// into existence under an uninitialized directory. Both current callers do:
+/// `handle_http_connection` gates unconditionally on `.sc/` presence (a 404
+/// before any dispatch, store mode included) and the CLI's `run_serve`
+/// checks `path.join(".sc").is_dir()` itself before reaching this function
+/// (P36c review — `--stdio` has no upstream gate the way `--http` does, so
+/// it cannot lean on `LocalTransport::open`'s own check the way a
+/// non-`--store` `--stdio` session implicitly does).
 pub fn serve_bucket_with_policy(
     store_url: &str,
     home: &std::path::Path,

@@ -162,3 +162,49 @@ fn serve_store_serves_a_bucket_and_second_instance_sees_pushes() {
         assert!(!p.exists());
     }
 }
+
+/// Regression (P36c review): `sc serve --stdio --store <url> <path>` must
+/// fail closed when `<path>` has no `.sc/` yet, exactly like the `--http`
+/// path's unconditional 404 gate — not silently `create_dir_all` one into
+/// existence via `TempServeDir::create_in`'s spool-dir creation and leave an
+/// empty `.sc/tmp/` behind after teardown. The check runs before any stdin
+/// read, so the child exits immediately on its own (no hang, no need to
+/// feed it a HELLO frame).
+#[test]
+fn stdio_serve_with_store_refuses_an_uninitialized_serve_home() {
+    let bucket = tmp("stdio-uninit-bucket");
+    let store = format!("sc+wal://{}", bucket.display());
+    // `tmp()` creates the directory itself but never runs `sc init` in it —
+    // exactly the "uninitialized dir" this gate must reject.
+    let home = tmp("stdio-uninit-home");
+    assert!(!home.join(".sc").exists());
+
+    let out = sc(
+        &home,
+        &[
+            "serve",
+            "--stdio",
+            "--store",
+            &store,
+            home.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "must refuse an uninitialized serve home: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("serve home"),
+        "stderr must name the serve home as the problem: {stderr}"
+    );
+    assert!(
+        !home.join(".sc").exists(),
+        "refusing must never auto-vivify .sc/ under the uninitialized home"
+    );
+
+    for p in [&bucket, &home] {
+        std::fs::remove_dir_all(p).unwrap();
+        assert!(!p.exists());
+    }
+}
