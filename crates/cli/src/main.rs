@@ -3542,6 +3542,7 @@ fn run_serve(
                 allow_public,
                 limits,
                 tls_mode,
+                None,
             )?;
             Ok(())
         }
