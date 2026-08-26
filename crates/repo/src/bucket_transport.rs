@@ -1079,4 +1079,88 @@ mod tests {
         std::fs::remove_dir_all(&broot).unwrap();
         assert!(!broot.exists());
     }
+
+    fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(walkdir_files(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// True if `marker` appears as a contiguous byte run anywhere under `dir`.
+    fn any_bucket_file_contains(dir: &std::path::Path, marker: &[u8]) -> bool {
+        walkdir_files(dir).into_iter().any(|p| {
+            std::fs::read(&p)
+                .map(|bytes| bytes.windows(marker.len()).any(|w| w == marker))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Pins the headline security claim bucket-specifically: sealed content
+    /// pushed to a `sc+wal://` bucket remote must never appear in plaintext
+    /// among the raw files the bucket backend writes to disk. `protect`
+    /// convergently encrypts matching working-tree files before `commit`
+    /// snapshots them, so the pushed pack/log/manifest bytes should carry
+    /// only ciphertext for `secret/a.txt` — walk every file the DirBucket
+    /// wrote and assert the plaintext marker appears nowhere.
+    ///
+    /// Alongside the protected file, an unprotected `public.txt` carrying a
+    /// second, distinct marker is committed and pushed too. That marker
+    /// MUST be found by the exact same walk-and-search: without that
+    /// positive control, a negative result on the secret marker would be
+    /// equally consistent with "sealing worked" and with "the search can't
+    /// see plaintext in bucket files at all" (e.g. because pack bodies are
+    /// compressed, or the walk misses the relevant files) — either of which
+    /// would make the assertion vacuous.
+    #[test]
+    fn protected_content_ciphertext_never_appears_in_bucket_files() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-protect-bucket-{pid}"));
+        let a_root = std::env::temp_dir().join(format!("scl-bt-protect-a-{pid}"));
+        for d in [&broot, &a_root] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        std::fs::create_dir_all(&a_root).unwrap();
+        let url = format!("sc+wal://{}", broot.display());
+
+        let a = crate::repo::Repo::init(&a_root).unwrap();
+        let (_alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        a.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(a_root.join("secret")).unwrap();
+        let secret_marker = b"SC-PLAINTEXT-MARKER-3b8f1c2a9d47";
+        let public_marker = b"SC-PUBLIC-CONTROL-MARKER-7e91a0c5";
+        std::fs::write(a_root.join("secret/a.txt"), secret_marker).unwrap();
+        std::fs::write(a_root.join("public.txt"), public_marker).unwrap();
+        a.commit("me", "protect secret/a.txt, add public.txt").unwrap();
+        a.remote_add("origin", &url).unwrap();
+        a.push("origin").unwrap();
+        drop(a);
+
+        // Positive control first: if this fails, the walk-and-search can't
+        // see plaintext in bucket files at all, and the negative assertion
+        // below would be meaningless.
+        assert!(
+            any_bucket_file_contains(&broot, public_marker),
+            "positive control failed: unprotected public.txt's marker was not \
+             found anywhere under the bucket root, so this search method \
+             cannot detect plaintext in bucket files — the negative assertion \
+             below would be vacuous"
+        );
+        assert!(
+            !any_bucket_file_contains(&broot, secret_marker),
+            "plaintext marker for protected secret/a.txt leaked into a bucket file"
+        );
+
+        std::fs::remove_dir_all(&broot).unwrap();
+        std::fs::remove_dir_all(&a_root).unwrap();
+        assert!(!broot.exists() && !a_root.exists());
+    }
 }

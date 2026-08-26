@@ -71,6 +71,21 @@ impl Bucket for S3Bucket {
                     .unwrap_or_default();
                 match (code, status) {
                     (_, Some(304)) => Ok(Fetched::Unchanged),
+                    // Checked before the bare-404 fallback below because a
+                    // missing bucket surfaces as 404 too. When the backend
+                    // supplies the body error code, a missing bucket is a
+                    // hard config error, not an absent object — without this
+                    // arm it would fall through to `Fetched::Absent` and make
+                    // a typo'd/nonexistent bucket look like a real, empty
+                    // remote (`sc fetch` "succeeds" against nothing). Some
+                    // S3-compatibles omit the code on a 404 entirely; those
+                    // still classify as `Absent` here (bare-404 fallback,
+                    // unchanged) — distinguishing that case needs a
+                    // `HeadBucket` probe, not attempted here.
+                    ("NoSuchBucket", _) => Err(Error::Backend(format!(
+                        "s3 bucket {} does not exist (check the sc+s3:// url)",
+                        self.bucket
+                    ))),
                     ("NoSuchKey", _) | (_, Some(404)) => Ok(Fetched::Absent),
                     _ => Err(Error::Backend(format!("s3 get {k}: {e}"))),
                 }

@@ -928,11 +928,11 @@ scale-&-reach horizon):
   stale pre-revoke manifest — the same gittuf-shaped signed-ref effort the
   P22 provenance boundary already defers.
 
-- **Bucket compaction/gc (P36a follow-on).** The WAL log
-  (`log/<seq>.pb`-equivalent entries) grows unboundedly with no compaction —
-  every reader walks the full parent chain back from `head_seq`, and no
-  entry or superseded pack is ever removed. Deferred until checkpointing
-  (below) gives a safe compaction cutoff.
+- **Bucket compaction/gc (P36a follow-on).** The WAL log (`log/<seq>` keys,
+  each a hand-rolled versioned binary `walfmt` entry, not protobuf) grows
+  unboundedly with no compaction — every reader walks the full parent chain
+  back from `head_seq`, and no entry or superseded pack is ever removed.
+  Deferred until checkpointing (below) gives a safe compaction cutoff.
 - **Leases (P36a follow-on).** The only cross-writer coordination today is
   the manifest's compare-and-swap; there is no lease/TTL primitive for
   operations that need to hold exclusive intent across more than one bucket
@@ -964,6 +964,17 @@ scale-&-reach horizon):
   individually, but a transfer moves a whole pack at a time, so memory use
   is pack-sized, not object-sized. Streaming the S3 request/response bodies
   instead of buffering them whole is deferred.
+- **Incremental `refresh()` for bucket remotes (P36a follow-on).**
+  `BucketTransport::refresh` short-circuits on an unchanged manifest tag,
+  but whenever the manifest *has* changed it re-walks the full parent chain
+  from `head_seq` and re-fetches every `idx_key` on that chain from
+  scratch — O(chain) GETs per manifest change, which gets expensive under
+  fleet-frequency pushes. An incremental refresh that picks up from the
+  last-seen manifest/seq instead of re-walking from scratch is deferred.
+- **Bucket-aware push negotiation (P36a follow-on).** Push negotiation today
+  issues a `has_object` round trip per object over S3; batching those probes
+  into one `refresh()` plus local index lookups (instead of one S3 round
+  trip per object) is deferred.
 
 ## How a phase gets built
 
