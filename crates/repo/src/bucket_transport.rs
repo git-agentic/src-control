@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use crate::transport::Transport;
 use crate::walfmt::{idx_key, log_key, pack_key, LogEntry, Manifest};
-use scl_core::pack::{parse_index, read_object_at, IndexEntry, PackWriter};
+use scl_core::pack::{parse_index, read_object_at_bounded, IndexEntry, PackWriter};
 use scl_core::{Object, ObjectId};
 use scl_objio::{Bucket, Fetched};
 use std::cell::RefCell;
@@ -50,13 +50,13 @@ pub struct BucketTransport {
 /// manifest, log entry, idx — larger than `MAX_OBJECT_SIZE` before decoding.
 /// Pack bodies are exempt from this particular guard (they may legitimately
 /// exceed it), but are not unguarded: `object_bytes` reads a pack body via
-/// `scl_core::pack::read_object_at`, which itself caps both the compressed
-/// record length and the decompressed output at `MAX_OBJECT_SIZE` (hardened
-/// to mirror `parse_pack_reader`'s bounded decode specifically because this
-/// module is `read_object_at`'s first caller to feed it attacker-controlled,
-/// bucket-served bytes — every other caller reads packs the local `Store`
-/// wrote itself). A hostile bucket pack therefore cannot mount a
-/// decompression-bomb DoS against `get_object`/`get_pack`.
+/// `scl_core::pack::read_object_at_bounded` (not the unbounded
+/// `read_object_at` — that path is reserved for `Store`'s own
+/// already-verified on-disk packs per ADR-0039's explicit trust split),
+/// which caps both the compressed record length and the decompressed output
+/// at `MAX_OBJECT_SIZE`, mirroring `parse_pack_reader`'s bounded decode. A
+/// hostile bucket pack therefore cannot mount a decompression-bomb DoS
+/// against `get_object`/`get_pack`.
 fn capped(what: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
     if bytes.len() > scl_core::MAX_OBJECT_SIZE {
         return Err(Error::Wal(format!(
@@ -170,7 +170,7 @@ impl BucketTransport {
             *cache = Some((hash.clone(), bytes));
         }
         let (_, pack) = cache.as_ref().unwrap();
-        Ok(read_object_at(pack, offset, id)?.encode())
+        Ok(read_object_at_bounded(pack, offset, id, scl_core::MAX_OBJECT_SIZE)?.encode())
     }
 }
 

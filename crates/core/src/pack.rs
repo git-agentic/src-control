@@ -198,21 +198,62 @@ pub fn parse_index(idx: &[u8]) -> Result<Vec<IndexEntry>> {
 }
 
 /// Read the record at `offset` from `pack`, decompress, verify it hashes to
-/// `id`, and decode it. Bounds both the compressed record length and the
-/// decompressed output at `MAX_OBJECT_SIZE`, mirroring `parse_pack_reader`'s
-/// guard (P28) — this function's `pack` byte slice may come from an
-/// untrusted source (e.g. a bucket remote, P36a), unlike `Store`'s own
-/// self-written packs, so it cannot assume a well-behaved producer either.
+/// `id`, and decode it. **Trusted-path, unbounded by design** (ADR-0039's
+/// explicit scoping: "the cap is transfer-path only, not a local-commit
+/// limit... `read_object_at`'s local already-verified on-disk pack is
+/// untouched"). `Store::read_pack_object` is this function's one caller
+/// (`crates/core/src/store.rs`), reading packs `sc gc`'s own repack wrote to
+/// this process's `.sc/objects/`: `write_pack` performs no size validation,
+/// so a locally-committed blob legitimately larger than `MAX_OBJECT_SIZE`
+/// ("committable but not transferable", per ADR-0039's final-review
+/// addendum) must still round-trip through a repack, or `sc gc` would
+/// silently make that blob permanently unreadable. Do **not** add a length
+/// or decompressed-size cap here. Reading pack bytes from an UNTRUSTED
+/// source (a bucket remote, a wire peer) must go through
+/// [`read_object_at_bounded`] instead.
 pub fn read_object_at(pack: &[u8], offset: u64, id: &ObjectId) -> Result<Object> {
+    let (start, end) = record_bounds(pack, offset, None)?;
+    decompress_and_decode(&pack[start..end], id, None)
+}
+
+/// Like [`read_object_at`], but for pack bytes read from an **untrusted**
+/// source (P36a's bucket remotes are the one caller today,
+/// `crates/repo/src/bucket_transport.rs`): caps both the compressed record
+/// length and the decompressed output at `max`, mirroring
+/// `parse_pack_reader`'s decode-WITH-LIMIT guard (ADR-0039) — a hostile pack
+/// cannot claim an oversized record, nor mount a "zstd bomb" (a small
+/// compressed payload that decompresses to gigabytes), against a caller that
+/// has no other reason to trust the bytes it was handed. Callers reading a
+/// pack this process wrote and already verified itself (a local on-disk
+/// repack) should use [`read_object_at`] instead — capping that path too
+/// would make a legitimately-committed `>max` blob permanently unreadable
+/// after `sc gc` (see that function's doc comment).
+pub fn read_object_at_bounded(
+    pack: &[u8],
+    offset: u64,
+    id: &ObjectId,
+    max: usize,
+) -> Result<Object> {
+    let (start, end) = record_bounds(pack, offset, Some(max))?;
+    decompress_and_decode(&pack[start..end], id, Some(max))
+}
+
+/// Shared bounds-check for one record's `[compressed_len:4][data:N]` framing.
+/// `max`, when `Some`, rejects a compressed length prefix over the cap
+/// before it's ever used to slice `pack` — shared by [`read_object_at`]
+/// (`max = None`) and [`read_object_at_bounded`] (`max = Some(cap)`).
+fn record_bounds(pack: &[u8], offset: u64, max: Option<usize>) -> Result<(usize, usize)> {
     let off = offset as usize;
     if off + 4 > pack.len() {
         return Err(Error::PackCorrupt(format!("offset {offset} past end")));
     }
     let len = u32::from_le_bytes(pack[off..off + 4].try_into().unwrap()) as usize;
-    if len > crate::MAX_OBJECT_SIZE {
-        return Err(Error::PackCorrupt(format!(
-            "record compressed length {len} exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit"
-        )));
+    if let Some(max) = max {
+        if len > max {
+            return Err(Error::PackCorrupt(format!(
+                "record compressed length {len} exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit"
+            )));
+        }
     }
     let start = off + 4;
     let end = start + len;
@@ -221,29 +262,38 @@ pub fn read_object_at(pack: &[u8], offset: u64, id: &ObjectId) -> Result<Object>
             "record at {offset} runs past end"
         )));
     }
-    decompress_and_decode(&pack[start..end], id)
+    Ok((start, end))
 }
 
-/// Decompress one record payload, verify against `id`, decode. Bounds the
-/// decompressed output at `MAX_OBJECT_SIZE`: a small compressed payload can
+/// Decompress one record payload, verify against `id`, decode. `max`, when
+/// `Some`, bounds the decompressed output: a small compressed payload can
 /// still decompress to an enormous plaintext (a "zstd bomb"), so this reads
-/// at most `MAX_OBJECT_SIZE + 1` bytes from the decoder — enough to detect
-/// and reject an over-cap output without ever materializing it in full
-/// (same `take`-bounded pattern as `parse_pack_reader`).
-fn decompress_and_decode(payload: &[u8], id: &ObjectId) -> Result<Object> {
-    let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(payload))
-        .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-    let mut canonical = Vec::new();
-    decoder
-        .by_ref()
-        .take(crate::MAX_OBJECT_SIZE as u64 + 1)
-        .read_to_end(&mut canonical)
-        .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-    if canonical.len() > crate::MAX_OBJECT_SIZE {
-        return Err(Error::PackCorrupt(
-            "decompressed object exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit".into(),
-        ));
-    }
+/// at most `max + 1` bytes from the decoder — enough to detect and reject an
+/// over-cap output without ever materializing it in full (same
+/// `take`-bounded pattern as `parse_pack_reader`). `max = None` (the
+/// trusted [`read_object_at`] path) decompresses in one unbounded shot, by
+/// design — see that function's doc comment.
+fn decompress_and_decode(payload: &[u8], id: &ObjectId, max: Option<usize>) -> Result<Object> {
+    let canonical = match max {
+        None => zstd::decode_all(std::io::Cursor::new(payload))
+            .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?,
+        Some(max) => {
+            let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(payload))
+                .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+            let mut canonical = Vec::new();
+            decoder
+                .by_ref()
+                .take(max as u64 + 1)
+                .read_to_end(&mut canonical)
+                .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+            if canonical.len() > max {
+                return Err(Error::PackCorrupt(
+                    "decompressed object exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit".into(),
+                ));
+            }
+            canonical
+        }
+    };
     if ObjectId::of(&canonical) != *id {
         return Err(Error::Malformed(format!(
             "packed object {id} failed hash verification"
@@ -570,28 +620,30 @@ mod tests {
     }
 
     #[test]
-    fn read_object_at_rejects_over_cap_compressed_length() {
-        // `read_object_at` is the random-access counterpart to
+    fn read_object_at_bounded_rejects_over_cap_compressed_length() {
+        // `read_object_at_bounded` is the random-access counterpart to
         // `pack_record_over_cap_rejected` above: its own compressed-length
         // prefix must be capped too, since `BucketTransport::object_bytes`
         // (P36a) feeds it bytes fetched straight from a remote bucket —
-        // untrusted input, unlike every other caller (`Store`'s own
-        // self-written packs).
+        // untrusted input, unlike `read_object_at`'s one caller (`Store`'s
+        // own self-written packs, ADR-0039's explicit unbounded carve-out).
         let id = ObjectId::of(b"whatever");
         let over = (crate::MAX_OBJECT_SIZE + 1) as u32;
         let mut pack = Vec::new();
-        pack.extend_from_slice(&over.to_le_bytes()); // the length prefix `read_object_at` reads at offset 0
-        let err = read_object_at(&pack, 0, &id).unwrap_err();
+        pack.extend_from_slice(&over.to_le_bytes()); // the length prefix read at offset 0
+        let err = read_object_at_bounded(&pack, 0, &id, crate::MAX_OBJECT_SIZE).unwrap_err();
         assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
     }
 
     #[test]
-    fn read_object_at_zstd_bomb_rejected() {
-        // Mirrors `zstd_bomb_rejected`, but through `read_object_at`'s own
-        // decode path (`decompress_and_decode`), which used unbounded
-        // `zstd::decode_all` before this was hardened — a hostile
-        // bucket-served pack (P36a) could otherwise OOM
-        // `BucketTransport::object_bytes` on a single `get_object` call.
+    fn read_object_at_bounded_zstd_bomb_rejected() {
+        // Mirrors `zstd_bomb_rejected`, but through `read_object_at_bounded`'s
+        // decode path — the bounded sibling `BucketTransport::object_bytes`
+        // (P36a) calls, since a hostile bucket-served pack could otherwise
+        // OOM it on a single `get_object` call. `read_object_at` itself (the
+        // trusted, unbounded path) deliberately does NOT get this guard —
+        // see `read_object_at_reads_a_legitimately_oversized_local_record`
+        // below for the regression that pins the other side of that split.
         let bomb_plain = vec![0u8; crate::MAX_OBJECT_SIZE + 1024];
         let compressed =
             zstd::encode_all(std::io::Cursor::new(&bomb_plain[..]), COMPRESSION_LEVEL).unwrap();
@@ -607,8 +659,29 @@ mod tests {
         pack.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         pack.extend_from_slice(&compressed);
 
-        let err = read_object_at(&pack, 0, &id).unwrap_err();
+        let err = read_object_at_bounded(&pack, 0, &id, crate::MAX_OBJECT_SIZE).unwrap_err();
         assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_object_at_reads_a_legitimately_oversized_local_record() {
+        // ADR-0039's explicit scope: "the cap is transfer-path only, not a
+        // local-commit limit... read_object_at's local already-verified
+        // on-disk pack is untouched" — a locally-committed blob legitimately
+        // larger than MAX_OBJECT_SIZE ("committable but not transferable")
+        // must still round-trip through `sc gc`'s repack, since `write_pack`
+        // performs no size validation and a cap here would surface as
+        // silent, permanent unreadability on the next read. This is the
+        // regression pin: if `read_object_at` ever regains a cap (as it
+        // briefly did in an earlier, incorrect fix for the zstd-bomb
+        // finding), this test catches it directly, without relying only on
+        // the doc-comment contract.
+        let big = Object::blob(vec![7u8; crate::MAX_OBJECT_SIZE + 4096]);
+        let (id, bytes) = enc(&big);
+        let (pack, idx) = build_pack(&[(id, bytes.clone())]).unwrap();
+        let e = parse_index(&idx).unwrap().pop().unwrap();
+        let got = read_object_at(&pack, e.offset, &id).unwrap();
+        assert_eq!(got.encode(), bytes);
     }
 
     #[test]
