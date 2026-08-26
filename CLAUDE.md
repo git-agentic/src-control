@@ -150,7 +150,7 @@ the code, those win.
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
 | P34 | Private branches: ref points at a sealed-branch manifest; every commit/tree/blob individually sealed (copy-on-write) under a per-branch KEK wrapped per recipient + escrow; `sc branch --private/grant/revoke/publish`; opaque to non-recipients (content, paths, messages); grant O(1), revoke rotates the KEK; publish replays to public with a scanner gate; git bridge + private→public integration refused; `PROTOCOL_VERSION` 4 | [0044](docs/adr/0044-per-branch-access-control.md) |
 | P35 | Native Tauri desktop browser: opens `.sc` repositories through `scl-repo`, shows local/remote refs, all-parent snapshot DAG + provenance, public trees and first-parent diffs; protected content is locked and private branches remain opaque; no mutation or identity surface | [0045](docs/adr/0045-native-desktop-read-model.md) |
-| P36 | P36a built: bucket WAL remotes (sc+wal://, sc+s3://) — immutable packs + CAS'd manifest, multi-writer safe, no coordinator; checkpoints (P36b) and bucket-backed serve (P36c) pending | [0046](docs/adr/0046-wal-bucket-remotes.md) |
+| P36 | Bucket WAL remotes (sc+wal://, sc+s3://): immutable packs + CAS'd manifest, checkpoints + log-tail cold start, bucket-backed `sc serve --store` with disposable instances | [0046](docs/adr/0046-wal-bucket-remotes.md) |
 
 ## Standing boundaries & gotchas
 
@@ -172,6 +172,9 @@ transport-adjacent. The rest, imperatively:
 - **Bucket remotes hold public content plaintext at rest** — bucket ACL is
   the perimeter (sealed content stays ciphertext, unchanged); partial-clone
   `filter` against bucket remotes is refused.
+- **`sc serve --store` still requires a local serve home with `.sc/`** —
+  tokens, TLS identity, and pack spills live there; the bucket holds all
+  served content.
 - **Protected sealing is randomized since P33.** Pre-P33 convergent ciphertext
   dual-reads forever and stays equality-confirmable forever (rotation ≠
   erasure). Identical independent edits on two branches now genuinely

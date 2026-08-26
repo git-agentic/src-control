@@ -352,12 +352,25 @@ too, not just the src-control-side metadata.
   controls — but a bucket has no `sc`-native access-control layer at all
   (no bearer tokens, no `--read-only`, no loopback-bind gate). **Bucket ACL
   is the entire confidentiality perimeter for public content on a bucket
-  remote**; an operator who needs `sc`-native read/write scoping for public
-  content should use `sc serve --http`/`--https` instead.
+  remote** written to directly by `sc push`/`sc fetch`; an operator who
+  needs `sc`-native read/write scoping for public content should front it
+  with `sc serve --http`/`--https` (including via `--store`, serving that
+  very bucket — see below).
 - **Partial clone (`--filter`) against a bucket remote is refused**, not
   silently ignored — the WAL format has no per-prefix negotiation yet, so
   there is no partial-fetch code path to reason about for a bucket remote at
   all.
+- **`sc serve --store <bucket-url>` (P36c) splits content from
+  access-control state.** The bucket holds all served content; the serve
+  **home** (`path`, still a plain `.sc/` directory) holds tokens, TLS
+  identity/pins, and pack-spool scratch. A bucket-backed serve instance
+  enforces the exact same P29/P31 gates against its clients as a
+  local-store instance — bearer tokens, `--read-only`, the loopback-bind
+  default, connection/timeout/pack-size limits — while itself trusting the
+  bucket no further than any other reader does: every object's BLAKE3 id is
+  re-verified and the WAL metadata is strict-decoded fail-closed exactly as
+  described above, so a hostile or corrupted bucket gets no more leverage
+  against a serve instance than it would against a direct `sc` client.
 
 ## Untrusted-input hardening (DoS) — ADR-0039
 
