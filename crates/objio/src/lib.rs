@@ -6,6 +6,8 @@
 
 mod dir;
 pub use dir::DirBucket;
+mod s3;
+pub use s3::S3Bucket;
 
 /// Errors from the object-storage bucket layer. Variants indicate key
 /// validation failure, I/O errors from the backing store, or backend-specific
