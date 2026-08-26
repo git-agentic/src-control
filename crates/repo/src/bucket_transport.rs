@@ -886,4 +886,197 @@ mod tests {
         assert!(BucketUrl::parse("sc+s3://b\nad/x").is_err());
         assert!(BucketUrl::parse("http://nope").is_err());
     }
+
+    /// P36a acceptance proof #1: two threads race `update_ref("main", ..)`
+    /// from the same `expected_old`, targeting different (fake) tips. The
+    /// bucket's `put_if_tag` CAS is the only serialization point — exactly
+    /// one racer must win and the other must see a clean `NonFastForward`,
+    /// never a deadlock, a double-commit, or a corrupt manifest.
+    #[test]
+    fn racing_pushes_same_branch_one_wins_one_gets_non_fast_forward() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-race-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        // seed: one commit on main
+        let t0 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let (base, objects) = tiny_history("race-seed");
+        let (pack, _) = scl_core::pack::build_pack(&objects).unwrap();
+        t0.put_pack(&mut std::io::Cursor::new(pack)).unwrap();
+        t0.update_ref("main", &base, None).unwrap();
+        drop(t0);
+
+        // two threads race an update from the same expected_old to different tips.
+        // A barrier forces both threads into `update_ref` at the same instant —
+        // without it, the OS could simply run racer-a to completion before
+        // racer-b's thread is even scheduled, and the (1, 1) result below
+        // would hold trivially with the manifest CAS never actually contended.
+        let mk_tip = |tag: &[u8]| {
+            let obj = Object::blob(tag.to_vec()); // any distinct object works as a fake tip
+            (obj.id(), obj.encode())
+        };
+        let gate = std::sync::Barrier::new(2);
+        let results: Vec<Result<()>> = std::thread::scope(|s| {
+            let handles: Vec<_> = [b"racer-a".as_slice(), b"racer-b".as_slice()]
+                .into_iter()
+                .map(|tag| {
+                    let broot = broot.clone();
+                    let gate = &gate;
+                    s.spawn(move || {
+                        let t = BucketTransport::from_bucket(Box::new(
+                            DirBucket::open(&broot).unwrap(),
+                        ))
+                        .unwrap();
+                        let (tip, bytes) = mk_tip(tag);
+                        t.put_object(&tip, &bytes).unwrap();
+                        gate.wait();
+                        t.update_ref("main", &tip, Some(&base))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let wins = results.iter().filter(|r| r.is_ok()).count();
+        let nffs = results
+            .iter()
+            .filter(|r| matches!(r, Err(Error::NonFastForward)))
+            .count();
+        assert_eq!(
+            (wins, nffs),
+            (1, 1),
+            "exactly one winner and one clean refusal: {results:?}"
+        );
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    /// P36a acceptance proof #2: 8 threads push to 8 *distinct* branches
+    /// concurrently with no external coordinator. Contention is at the
+    /// manifest-CAS level only (every push races the same `manifest` key even
+    /// though the branches don't conflict), so every push must eventually
+    /// land via the retry loop.
+    #[test]
+    fn fleet_hammer_distinct_branches_all_land_without_coordinator() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-fleet-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        const N: usize = 8;
+        // A barrier forces all N threads to call `update_ref` at essentially
+        // the same instant — without it, short-lived threads could finish
+        // one at a time with the OS never actually overlapping them, and
+        // "all N land" would hold even against a broken retry loop that was
+        // never exercised under real contention.
+        let gate = std::sync::Barrier::new(N);
+        std::thread::scope(|s| {
+            for i in 0..N {
+                let broot = broot.clone();
+                let gate = &gate;
+                s.spawn(move || {
+                    let t = BucketTransport::from_bucket(Box::new(
+                        DirBucket::open(&broot).unwrap(),
+                    ))
+                    .unwrap();
+                    let obj = Object::blob(format!("agent-{i}").into_bytes());
+                    t.put_object(&obj.id(), &obj.encode()).unwrap();
+                    gate.wait();
+                    // distinct branches: contention is manifest-level only, so
+                    // every one must eventually land via CAS retry.
+                    t.update_ref(&format!("work-{i}"), &obj.id(), None).unwrap();
+                });
+            }
+        });
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let refs = t.list_refs().unwrap();
+        assert_eq!(refs.len(), N, "all {N} agent branches present: {refs:?}");
+        drop(t);
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    /// P36a acceptance proof #3: a pusher that died after writing its pack +
+    /// log entry, but before the manifest CAS, leaves debris that must be
+    /// invisible to every reader (the manifest never points at it) — and a
+    /// later, live push must step over the claimed seq rather than colliding
+    /// with it.
+    #[test]
+    fn crash_debris_before_the_cas_is_invisible_and_later_pushes_step_over_it() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-crash-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        let bucket = DirBucket::open(&broot).unwrap();
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let (tip, objects) = tiny_history("crash-seed");
+        let (pack, _) = scl_core::pack::build_pack(&objects).unwrap();
+        t.put_pack(&mut std::io::Cursor::new(pack)).unwrap();
+        t.update_ref("main", &tip, None).unwrap();
+
+        // simulate a pusher that died after pack + log entry, before the CAS:
+        let orphan_obj = Object::blob(b"never committed".to_vec());
+        let (opack, oidx) =
+            scl_core::pack::build_pack(&[(orphan_obj.id(), orphan_obj.encode())]).unwrap();
+        let ohash = hex::encode(blake3::hash(&opack).as_bytes());
+        bucket.put_new(&pack_key(&ohash), &opack).unwrap();
+        bucket.put_new(&idx_key(&ohash), &oidx).unwrap();
+        bucket
+            .put_new(
+                &log_key(2),
+                &LogEntry {
+                    seq: 2,
+                    parent_seq: 1,
+                    packs: vec![ohash],
+                    updates: vec![RefUpdate {
+                        branch: "doomed".into(),
+                        old: None,
+                        new: orphan_obj.id(),
+                    }],
+                }
+                .encode(),
+            )
+            .unwrap();
+
+        // invisible to readers…
+        let t2 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        assert_eq!(t2.list_refs().unwrap(), vec![("main".to_string(), tip)]);
+        assert!(!t2.has_object(&orphan_obj.id()).unwrap());
+        // …and a live push steps over the claimed seq 2 (lands at 3+) and works.
+        let next = Object::blob(b"after crash".to_vec());
+        t2.put_object(&next.id(), &next.encode()).unwrap();
+        t2.update_ref("recovered", &next.id(), None).unwrap();
+        let t3 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let refs = t3.list_refs().unwrap();
+        assert!(refs.contains(&("recovered".to_string(), next.id())));
+        assert!(!refs.iter().any(|(b, _)| b == "doomed"));
+
+        // Prove the "steps over" part directly, not just its visible effect:
+        // the live push's claim loop must have found `log/2` already taken
+        // by the orphan (a real collision) and landed at seq 3+ instead of
+        // silently overwriting it — inspect the bucket straight, independent
+        // of the transport's own (already-passing) read half.
+        let inspect = DirBucket::open(&broot).unwrap();
+        let Fetched::New { bytes, .. } = inspect.get("manifest", None).unwrap() else {
+            panic!("manifest must exist after the live push")
+        };
+        let manifest = Manifest::decode(&bytes).unwrap();
+        assert!(
+            manifest.head_seq >= 3,
+            "live push must claim a seq past the crashed pusher's seq 2, got {}",
+            manifest.head_seq
+        );
+        let Fetched::New { bytes, .. } = inspect.get(&log_key(2), None).unwrap() else {
+            panic!("the orphan's log/2 entry must still be present, untouched, as off-chain garbage")
+        };
+        let untouched = LogEntry::decode(&bytes).unwrap();
+        assert_eq!(
+            untouched.updates,
+            vec![RefUpdate {
+                branch: "doomed".into(),
+                old: None,
+                new: orphan_obj.id(),
+            }],
+            "the live push must never overwrite the claimed-but-uncommitted log/2 slot"
+        );
+
+        drop((t, t2, t3));
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
 }
