@@ -1304,6 +1304,7 @@ mod tests {
         assert!(t.has_object(id1).unwrap());
         drop((t, full));
         std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
     }
 
     #[test]
@@ -1352,6 +1353,7 @@ mod tests {
         assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).is_err());
         let _ = tag;
         std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
 
         // (d) checkpoint's refs carry a branch name the ref grammar rejects
         // ("a/b" is proven invalid by repo.rs's own switch()/validate tests).
@@ -1377,6 +1379,7 @@ mod tests {
             .unwrap();
         assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot2).unwrap())).is_err());
         std::fs::remove_dir_all(&broot2).unwrap();
+        assert!(!broot2.exists());
     }
 
     #[test]
@@ -1421,5 +1424,6 @@ mod tests {
             "checkpoint_seq must survive a push"
         );
         std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
     }
 }
