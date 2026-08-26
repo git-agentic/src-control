@@ -28,9 +28,9 @@ struct WalView {
     /// object id -> (pack hash, offset, length), from every on-chain pack's idx.
     index: BTreeMap<ObjectId, (String, u64, u64)>,
     /// Every on-chain pack hash in chain order (checkpoint fold first, then
-    /// the tail) — retained so a checkpoint fold (P36b Task 3, bucket-side
-    /// checkpoint writer) is a pure copy. Not yet read anywhere in this task.
-    #[allow(dead_code)]
+    /// the tail) — retained so a checkpoint fold (`maybe_fold_checkpoint`)
+    /// is a pure copy: it never needs to re-walk the log or re-derive the
+    /// pack list, just snapshot this field into the new checkpoint object.
     packs: Vec<String>,
 }
 
@@ -84,6 +84,10 @@ fn capped(what: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
+/// Fold a checkpoint once the log tail exceeds this many entries past the
+/// last checkpoint (spec: "default 64 entries, one tunable constant").
+const CHECKPOINT_INTERVAL: u64 = 64;
 
 /// Which bucket backend a [`BucketUrl`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +345,58 @@ impl BucketTransport {
             }
         }
     }
+
+    /// Opportunistic, coordinator-free checkpoint fold. Called after a
+    /// successful commit; every failure path is deliberately non-fatal —
+    /// the checkpoint is derived data any reader can rebuild from the log,
+    /// a lost CAS just means a racing pusher's fold (or push) won, and the
+    /// next over-threshold push retries. The push that triggered this has
+    /// already durably landed.
+    fn maybe_fold_checkpoint(&self) -> Result<()> {
+        let (head_seq, checkpoint_seq, head_branch, tag, refs, packs) = {
+            let view = self.view.borrow();
+            let Some(v) = view.as_ref() else {
+                return Ok(());
+            };
+            (
+                v.manifest.head_seq,
+                v.manifest.checkpoint_seq,
+                v.manifest.head_branch.clone(),
+                v.tag.clone(),
+                v.refs
+                    .iter()
+                    .map(|(b, id)| (b.clone(), *id))
+                    .collect::<Vec<_>>(),
+                v.packs.clone(),
+            )
+        };
+        if head_seq - checkpoint_seq <= CHECKPOINT_INTERVAL {
+            return Ok(());
+        }
+        let ck = Checkpoint {
+            seq: head_seq,
+            refs,
+            packs,
+        };
+        // Claim the object first (idempotent), then point the manifest at it.
+        self.bucket
+            .put_new(&checkpoint_key(head_seq), &ck.encode())?;
+        let manifest = Manifest {
+            head_seq,
+            checkpoint_seq: head_seq,
+            head_branch,
+        };
+        // CAS from the tag our fresh post-commit view carries. A loss means
+        // someone advanced the WAL meanwhile — their problem to fold later.
+        if self
+            .bucket
+            .put_if_tag("manifest", &manifest.encode(), Some(&tag))?
+            .is_some()
+        {
+            self.refresh()?;
+        }
+        Ok(())
+    }
 }
 
 /// `ObjectSource` over the bucket for reachability walks (`get_pack`'s
@@ -539,6 +595,7 @@ impl Transport for BucketTransport {
                 // pull the fresh view (cheap: one conditional GET, since our
                 // own write just changed the tag).
                 self.refresh()?;
+                let _ = self.maybe_fold_checkpoint(); // best-effort by design (see its doc)
                 return Ok(());
             }
             // Lost the manifest CAS: someone else's append won the race. Our
@@ -1423,6 +1480,97 @@ mod tests {
             after.checkpoint_seq, 3,
             "checkpoint_seq must survive a push"
         );
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    #[test]
+    fn pushes_past_the_interval_fold_a_checkpoint_and_cold_start_uses_it() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-fold-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let n = CHECKPOINT_INTERVAL + 2;
+        for i in 0..n {
+            let obj = Object::blob(format!("fold-{i}").into_bytes());
+            t.put_object(&obj.id(), &obj.encode()).unwrap();
+            t.update_ref(&format!("w-{i}"), &obj.id(), None).unwrap();
+        }
+        // the bucket now carries a manifest whose checkpoint_seq > 0 and the
+        // matching checkpoints/<seq> object
+        let bucket = DirBucket::open(&broot).unwrap();
+        let Fetched::New { bytes, .. } = bucket.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let m = Manifest::decode(&bytes).unwrap();
+        assert!(m.checkpoint_seq > 0, "no fold happened after {n} pushes");
+        let Fetched::New { bytes, .. } =
+            bucket.get(&checkpoint_key(m.checkpoint_seq), None).unwrap()
+        else {
+            panic!(
+                "manifest names checkpoint {} but object absent",
+                m.checkpoint_seq
+            )
+        };
+        let ck = Checkpoint::decode(&bytes).unwrap();
+        assert_eq!(ck.seq, m.checkpoint_seq);
+        assert!(!ck.refs.is_empty() && !ck.packs.is_empty());
+        // cold start through it sees all n branches
+        let t2 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        assert_eq!(t2.list_refs().unwrap().len(), n as usize);
+        drop((t, t2));
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    /// A bucket whose checkpoint writes always fail must not fail pushes.
+    struct FoldHostileBucket(DirBucket);
+    impl Bucket for FoldHostileBucket {
+        fn get(&self, key: &str, tag: Option<&str>) -> scl_objio::Result<Fetched> {
+            self.0.get(key, tag)
+        }
+        fn put_new(&self, key: &str, bytes: &[u8]) -> scl_objio::Result<bool> {
+            if key.starts_with("checkpoints/") {
+                return Err(scl_objio::Error::Backend(
+                    "injected checkpoint write failure".into(),
+                ));
+            }
+            self.0.put_new(key, bytes)
+        }
+        fn put_if_tag(
+            &self,
+            key: &str,
+            bytes: &[u8],
+            tag: Option<&str>,
+        ) -> scl_objio::Result<Option<String>> {
+            self.0.put_if_tag(key, bytes, tag)
+        }
+        fn list(&self, prefix: &str) -> scl_objio::Result<Vec<String>> {
+            self.0.list(prefix)
+        }
+    }
+
+    #[test]
+    fn fold_failure_never_fails_the_push() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-foldfail-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(FoldHostileBucket(
+            DirBucket::open(&broot).unwrap(),
+        )))
+        .unwrap();
+        for i in 0..(CHECKPOINT_INTERVAL + 2) {
+            let obj = Object::blob(format!("foldfail-{i}").into_bytes());
+            t.put_object(&obj.id(), &obj.encode()).unwrap();
+            t.update_ref(&format!("w-{i}"), &obj.id(), None).unwrap(); // must all be Ok
+        }
+        // no checkpoint could land; manifest still says 0 and reads still work
+        let t2 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        assert_eq!(
+            t2.list_refs().unwrap().len(),
+            (CHECKPOINT_INTERVAL + 2) as usize
+        );
+        drop((t, t2));
         std::fs::remove_dir_all(&broot).unwrap();
         assert!(!broot.exists());
     }
