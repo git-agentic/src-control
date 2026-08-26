@@ -4,7 +4,7 @@
 
 use crate::error::{Error, Result};
 use crate::transport::Transport;
-use crate::walfmt::{idx_key, log_key, pack_key, LogEntry, Manifest};
+use crate::walfmt::{idx_key, log_key, pack_key, LogEntry, Manifest, RefUpdate};
 use scl_core::pack::{parse_index, read_object_at_bounded, IndexEntry, PackWriter};
 use scl_core::{Object, ObjectId};
 use scl_objio::{Bucket, Fetched};
@@ -43,7 +43,16 @@ pub struct BucketTransport {
     /// and repeated `get_object` calls tend to hit the same pack back to
     /// back, so caching the last one avoids re-fetching it byte for byte).
     pack_cache: RefCell<Option<(String, Vec<u8>)>>,
-    // Task 5 adds: staged objects + pending pack hashes.
+    /// Objects staged by `put_object`, flushed into one pack the next time
+    /// `update_ref` is called (mirrors `LocalTransport`'s contract: `put_pack`
+    /// writes objects up front, but `put_object` callers stage one at a time
+    /// and expect the ref move to be what makes them durable-and-visible).
+    staged: RefCell<Vec<(ObjectId, Vec<u8>)>>,
+    /// Hashes of packs already uploaded (via `put_pack` or a `put_object`
+    /// flush) that the next `update_ref`'s log entry must reference. Survives
+    /// a lost CAS race so a retry's fresh log entry still cites them —
+    /// packs are content-addressed, so nothing is re-uploaded.
+    pending_packs: RefCell<Vec<String>>,
 }
 
 /// Untrusted-length guard (P28 parity): refuse any WAL metadata value —
@@ -76,6 +85,8 @@ impl BucketTransport {
             bucket,
             view: RefCell::new(None),
             pack_cache: RefCell::new(None),
+            staged: RefCell::new(Vec::new()),
+            pending_packs: RefCell::new(Vec::new()),
         };
         t.refresh()?;
         Ok(t)
@@ -172,6 +183,31 @@ impl BucketTransport {
         let (_, pack) = cache.as_ref().unwrap();
         Ok(read_object_at_bounded(pack, offset, id, scl_core::MAX_OBJECT_SIZE)?.encode())
     }
+
+    /// Upload one pack (+ its idx) content-addressed by BLAKE3 of the pack
+    /// bytes, so two callers who happen to pack the identical object set
+    /// converge on the same key. `put_new`'s "key already exists" outcome is
+    /// success here, not a conflict — identical content, nothing to redo.
+    fn upload_pack(&self, objects: &[(ObjectId, Vec<u8>)]) -> Result<(String, Vec<ObjectId>)> {
+        let (pack, idx) = scl_core::pack::build_pack(objects)?;
+        let hash = hex::encode(blake3::hash(&pack).as_bytes());
+        self.bucket.put_new(&pack_key(&hash), &pack)?;
+        self.bucket.put_new(&idx_key(&hash), &idx)?;
+        Ok((hash, objects.iter().map(|(id, _)| *id).collect()))
+    }
+
+    /// Pack and upload everything `put_object` has staged since the last
+    /// flush, recording the resulting pack hash as pending. A no-op when
+    /// nothing is staged (the common case for a `put_pack`-only caller).
+    fn flush_staged(&self) -> Result<()> {
+        let staged = std::mem::take(&mut *self.staged.borrow_mut());
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let (hash, _) = self.upload_pack(&staged)?;
+        self.pending_packs.borrow_mut().push(hash);
+        Ok(())
+    }
 }
 
 /// `ObjectSource` over the bucket for reachability walks (`get_pack`'s
@@ -254,19 +290,108 @@ impl Transport for BucketTransport {
         Ok(())
     }
 
-    fn put_object(&self, _id: &ObjectId, _bytes: &[u8]) -> Result<()> {
-        Err(Error::Wal("bucket write half lands in Task 5".into()))
+    fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
+        if ObjectId::of(bytes) != *id {
+            return Err(Error::CorruptObject(*id));
+        }
+        self.staged.borrow_mut().push((*id, bytes.to_vec()));
+        Ok(())
     }
-    fn update_ref(
-        &self,
-        _branch: &str,
-        _id: &ObjectId,
-        _expected_old: Option<&ObjectId>,
-    ) -> Result<()> {
-        Err(Error::Wal("bucket write half lands in Task 5".into()))
+
+    fn put_pack(&self, src: &mut dyn std::io::Read) -> Result<Vec<ObjectId>> {
+        // Never trust a live incoming stream (P25/ADR-0039 pattern): verify
+        // every record's hash as it streams in via the bounded reader parser,
+        // then rebuild our own pack from the verified objects rather than
+        // uploading the caller's bytes verbatim. `build_pack`'s output is
+        // pinned byte-stable for a given object set (core), so the rebuilt
+        // pack still content-addresses identically for identical input.
+        let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+        scl_core::pack::parse_pack_reader(src, |id, obj| {
+            objects.push((id, obj.encode()));
+            Ok(())
+        })?;
+        let (hash, ids) = self.upload_pack(&objects)?;
+        self.pending_packs.borrow_mut().push(hash);
+        Ok(ids)
     }
-    fn put_pack(&self, _src: &mut dyn std::io::Read) -> Result<Vec<ObjectId>> {
-        Err(Error::Wal("bucket write half lands in Task 5".into()))
+
+    fn update_ref(&self, branch: &str, id: &ObjectId, expected_old: Option<&ObjectId>) -> Result<()> {
+        crate::refs::validate_branch_name(branch)?;
+        // Everything staged since the last flush becomes one more pending
+        // pack before we even look at the manifest, so a retry below never
+        // has to re-stage or re-upload it.
+        self.flush_staged()?;
+        const MAX_CAS_RETRIES: u32 = 16;
+        for _ in 0..MAX_CAS_RETRIES {
+            self.refresh()?;
+            let (current, prev_tag, head_seq, checkpoint_seq, head_branch) = {
+                let view = self.view.borrow();
+                match view.as_ref() {
+                    Some(v) => (
+                        v.refs.get(branch).copied(),
+                        Some(v.tag.clone()),
+                        v.manifest.head_seq,
+                        v.manifest.checkpoint_seq,
+                        v.manifest.head_branch.clone(),
+                    ),
+                    None => (None, None, 0, 0, branch.to_string()),
+                }
+            };
+            // Trait doc: setting the ref to the value it already has
+            // succeeds regardless of `expected_old` — check this before the
+            // fast-forward comparison below.
+            if current.as_ref() == Some(id) {
+                self.pending_packs.borrow_mut().clear();
+                return Ok(());
+            }
+            if current.as_ref() != expected_old {
+                return Err(Error::NonFastForward);
+            }
+            // Claim a log slot for this attempt. `put_new` on `log/<seq>` is
+            // the claim: if another writer already landed that seq, we didn't
+            // win it and try the next one — the entry we didn't win becomes
+            // permanent off-chain garbage (never referenced by any manifest,
+            // never read by `refresh`), which is fine, it costs one object.
+            let entry = LogEntry {
+                seq: 0, // overwritten per candidate in the claim loop below
+                parent_seq: head_seq,
+                packs: self.pending_packs.borrow().clone(),
+                updates: vec![RefUpdate { branch: branch.to_string(), old: current, new: *id }],
+            };
+            let mut try_seq = head_seq + 1;
+            let seq = loop {
+                let mut candidate = entry.clone();
+                candidate.seq = try_seq;
+                if self.bucket.put_new(&log_key(try_seq), &candidate.encode())? {
+                    break try_seq;
+                }
+                try_seq += 1;
+            };
+            let manifest = Manifest { head_seq: seq, checkpoint_seq, head_branch };
+            if self
+                .bucket
+                .put_if_tag("manifest", &manifest.encode(), prev_tag.as_deref())?
+                .is_some()
+            {
+                // Committed. The log entry we just claimed is now on-chain;
+                // clear pendings and pull the fresh view (cheap: one
+                // conditional GET, since our own write just changed the tag).
+                self.pending_packs.borrow_mut().clear();
+                self.refresh()?;
+                return Ok(());
+            }
+            // Lost the manifest CAS: someone else's append won the race. Our
+            // just-claimed log entry is now off-chain garbage too (it chains
+            // from a parent that's no longer the head). Loop back to
+            // `refresh()`: if this branch's tip moved off `expected_old` we
+            // hit `NonFastForward` above; otherwise (a different branch or an
+            // unrelated pack landed) we retry with a fresh entry claimed
+            // under the new parent — `pending_packs` still lists our packs,
+            // so nothing is re-uploaded.
+        }
+        Err(Error::Remote(
+            "manifest cas contention: gave up after 16 attempts".into(),
+        ))
     }
 }
 
@@ -427,5 +552,64 @@ mod tests {
         drop(t);
         std::fs::remove_dir_all(&broot).unwrap();
         assert!(!broot.exists());
+    }
+
+    #[test]
+    fn push_via_trait_round_trips_into_a_fresh_bucket() {
+        let broot = std::env::temp_dir().join(format!("scl-bt-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+
+        let (tip, objects) = tiny_history("write");
+        // exactly what sync::push does: pack, then CAS'd ref update
+        let (pack, _idx) = scl_core::pack::build_pack(&objects).unwrap();
+        let ids = t.put_pack(&mut std::io::Cursor::new(pack)).unwrap();
+        assert_eq!(ids.len(), objects.len());
+        t.update_ref("main", &tip, None).unwrap();
+
+        // a second transport sees it
+        let t2 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        assert_eq!(t2.list_refs().unwrap(), vec![("main".to_string(), tip)]);
+        assert_eq!(t2.head_branch().unwrap(), "main");
+        assert!(t2.has_object(&tip).unwrap());
+        drop((t, t2));
+        std::fs::remove_dir_all(&broot).unwrap();
+    }
+
+    #[test]
+    fn update_ref_honors_expected_old_semantics() {
+        let broot = std::env::temp_dir().join(format!("scl-bt-cas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let (tip, objects) = tiny_history("cas");
+        let (pack, _) = scl_core::pack::build_pack(&objects).unwrap();
+        t.put_pack(&mut std::io::Cursor::new(pack)).unwrap();
+        t.update_ref("main", &tip, None).unwrap();
+        // stale expected_old (None while the branch exists) => NonFastForward
+        let other = ObjectId::of(b"not the tip");
+        assert!(matches!(t.update_ref("main", &other, None), Err(Error::NonFastForward)));
+        // setting to the value it already has succeeds regardless of expected_old (trait doc)
+        t.update_ref("main", &tip, None).unwrap();
+        t.update_ref("main", &tip, Some(&other)).unwrap();
+        drop(t);
+        std::fs::remove_dir_all(&broot).unwrap();
+    }
+
+    #[test]
+    fn put_object_stages_and_update_ref_commits_them() {
+        let broot = std::env::temp_dir().join(format!("scl-bt-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let (tip, objects) = tiny_history("stage");
+        for (id, bytes) in &objects {
+            t.put_object(id, bytes).unwrap();
+        }
+        // corrupt bytes are rejected at staging time
+        assert!(t.put_object(&tip, b"garbage").is_err());
+        t.update_ref("main", &tip, None).unwrap();
+        let t2 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        assert!(t2.has_object(&tip).unwrap());
+        drop((t, t2));
+        std::fs::remove_dir_all(&broot).unwrap();
     }
 }
