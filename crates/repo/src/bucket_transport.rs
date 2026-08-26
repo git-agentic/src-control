@@ -204,9 +204,20 @@ impl BucketTransport {
         if staged.is_empty() {
             return Ok(());
         }
-        let (hash, _) = self.upload_pack(&staged)?;
-        self.pending_packs.borrow_mut().push(hash);
-        Ok(())
+        // On upload failure (a real bucket can fail transiently: network,
+        // 5xx, auth), put the objects back rather than dropping them — a
+        // caller that retries `update_ref` must still see them staged, or
+        // they'd be silently lost (CLAUDE.md: never silently drop data).
+        match self.upload_pack(&staged) {
+            Ok((hash, _)) => {
+                self.pending_packs.borrow_mut().push(hash);
+                Ok(())
+            }
+            Err(e) => {
+                *self.staged.borrow_mut() = staged;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -315,7 +326,12 @@ impl Transport for BucketTransport {
         Ok(ids)
     }
 
-    fn update_ref(&self, branch: &str, id: &ObjectId, expected_old: Option<&ObjectId>) -> Result<()> {
+    fn update_ref(
+        &self,
+        branch: &str,
+        id: &ObjectId,
+        expected_old: Option<&ObjectId>,
+    ) -> Result<()> {
         crate::refs::validate_branch_name(branch)?;
         // Everything staged since the last flush becomes one more pending
         // pack before we even look at the manifest, so a retry below never
@@ -356,18 +372,29 @@ impl Transport for BucketTransport {
                 seq: 0, // overwritten per candidate in the claim loop below
                 parent_seq: head_seq,
                 packs: self.pending_packs.borrow().clone(),
-                updates: vec![RefUpdate { branch: branch.to_string(), old: current, new: *id }],
+                updates: vec![RefUpdate {
+                    branch: branch.to_string(),
+                    old: current,
+                    new: *id,
+                }],
             };
             let mut try_seq = head_seq + 1;
             let seq = loop {
                 let mut candidate = entry.clone();
                 candidate.seq = try_seq;
-                if self.bucket.put_new(&log_key(try_seq), &candidate.encode())? {
+                if self
+                    .bucket
+                    .put_new(&log_key(try_seq), &candidate.encode())?
+                {
                     break try_seq;
                 }
                 try_seq += 1;
             };
-            let manifest = Manifest { head_seq: seq, checkpoint_seq, head_branch };
+            let manifest = Manifest {
+                head_seq: seq,
+                checkpoint_seq,
+                head_branch,
+            };
             if self
                 .bucket
                 .put_if_tag("manifest", &manifest.encode(), prev_tag.as_deref())?
@@ -574,6 +601,7 @@ mod tests {
         assert!(t2.has_object(&tip).unwrap());
         drop((t, t2));
         std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
     }
 
     #[test]
@@ -587,12 +615,16 @@ mod tests {
         t.update_ref("main", &tip, None).unwrap();
         // stale expected_old (None while the branch exists) => NonFastForward
         let other = ObjectId::of(b"not the tip");
-        assert!(matches!(t.update_ref("main", &other, None), Err(Error::NonFastForward)));
+        assert!(matches!(
+            t.update_ref("main", &other, None),
+            Err(Error::NonFastForward)
+        ));
         // setting to the value it already has succeeds regardless of expected_old (trait doc)
         t.update_ref("main", &tip, None).unwrap();
         t.update_ref("main", &tip, Some(&other)).unwrap();
         drop(t);
         std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
     }
 
     #[test]
@@ -611,5 +643,6 @@ mod tests {
         assert!(t2.has_object(&tip).unwrap());
         drop((t, t2));
         std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
     }
 }
