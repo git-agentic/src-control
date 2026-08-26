@@ -56,7 +56,10 @@ impl<'a> Cursor<'a> {
 
     fn done(&self) -> Result<()> {
         if self.at != self.buf.len() {
-            return Err(Error::Wal(format!("{} trailing bytes", self.buf.len() - self.at)));
+            return Err(Error::Wal(format!(
+                "{} trailing bytes",
+                self.buf.len() - self.at
+            )));
         }
         Ok(())
     }
@@ -115,7 +118,11 @@ impl Manifest {
         let checkpoint_seq = c.u64()?;
         let head_branch = c.string(MAX_NAME)?;
         c.done()?;
-        Ok(Manifest { head_seq, checkpoint_seq, head_branch })
+        Ok(Manifest {
+            head_seq,
+            checkpoint_seq,
+            head_branch,
+        })
     }
 }
 
@@ -187,7 +194,9 @@ impl LogEntry {
 
         let nupdates = c.u32()? as usize;
         if nupdates > MAX_LIST {
-            return Err(Error::Wal(format!("{nupdates} updates exceeds cap {MAX_LIST}")));
+            return Err(Error::Wal(format!(
+                "{nupdates} updates exceeds cap {MAX_LIST}"
+            )));
         }
         let mut updates = Vec::with_capacity(nupdates);
         for _ in 0..nupdates {
@@ -203,7 +212,12 @@ impl LogEntry {
         }
 
         c.done()?;
-        Ok(LogEntry { seq, parent_seq, packs, updates })
+        Ok(LogEntry {
+            seq,
+            parent_seq,
+            packs,
+            updates,
+        })
     }
 }
 
@@ -236,7 +250,11 @@ mod tests {
 
     #[test]
     fn manifest_round_trips_and_rejects_garbage() {
-        let m = Manifest { head_seq: 7, checkpoint_seq: 0, head_branch: "main".into() };
+        let m = Manifest {
+            head_seq: 7,
+            checkpoint_seq: 0,
+            head_branch: "main".into(),
+        };
         let bytes = m.encode();
         let back = Manifest::decode(&bytes).unwrap();
         assert_eq!(back.head_seq, 7);
@@ -260,8 +278,16 @@ mod tests {
             parent_seq: 2,
             packs: vec!["ab12".into()],
             updates: vec![
-                RefUpdate { branch: "main".into(), old: Some(some_id(1)), new: some_id(2) },
-                RefUpdate { branch: "feat".into(), old: None, new: some_id(3) },
+                RefUpdate {
+                    branch: "main".into(),
+                    old: Some(some_id(1)),
+                    new: some_id(2),
+                },
+                RefUpdate {
+                    branch: "feat".into(),
+                    old: None,
+                    new: some_id(3),
+                },
             ],
         };
         let back = LogEntry::decode(&e.encode()).unwrap();
@@ -277,7 +303,12 @@ mod tests {
     #[test]
     fn decode_caps_hostile_lengths() {
         // a length prefix claiming 1 GiB must fail fast, not allocate
-        let mut evil = Manifest { head_seq: 1, checkpoint_seq: 0, head_branch: "m".into() }.encode();
+        let mut evil = Manifest {
+            head_seq: 1,
+            checkpoint_seq: 0,
+            head_branch: "m".into(),
+        }
+        .encode();
         let n = evil.len();
         evil[n - 2..].copy_from_slice(&[0xFF, 0xFF]); // corrupt branch length tail
         assert!(Manifest::decode(&evil).is_err());

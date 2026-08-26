@@ -146,7 +146,9 @@ impl BucketTransport {
         let parsed = BucketUrl::parse(url)?;
         let bucket: Box<dyn Bucket> = match parsed.scheme {
             BucketScheme::Wal => Box::new(scl_objio::DirBucket::open(&parsed.bucket)?),
-            BucketScheme::S3 => Box::new(scl_objio::S3Bucket::open(&parsed.bucket, &parsed.prefix)?),
+            BucketScheme::S3 => {
+                Box::new(scl_objio::S3Bucket::open(&parsed.bucket, &parsed.prefix)?)
+            }
         };
         BucketTransport::from_bucket(bucket)
     }
@@ -971,10 +973,9 @@ mod tests {
                 let broot = broot.clone();
                 let gate = &gate;
                 s.spawn(move || {
-                    let t = BucketTransport::from_bucket(Box::new(
-                        DirBucket::open(&broot).unwrap(),
-                    ))
-                    .unwrap();
+                    let t =
+                        BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap()))
+                            .unwrap();
                     let obj = Object::blob(format!("agent-{i}").into_bytes());
                     t.put_object(&obj.id(), &obj.encode()).unwrap();
                     gate.wait();
@@ -1062,7 +1063,9 @@ mod tests {
             manifest.head_seq
         );
         let Fetched::New { bytes, .. } = inspect.get(&log_key(2), None).unwrap() else {
-            panic!("the orphan's log/2 entry must still be present, untouched, as off-chain garbage")
+            panic!(
+                "the orphan's log/2 entry must still be present, untouched, as off-chain garbage"
+            )
         };
         let untouched = LogEntry::decode(&bytes).unwrap();
         assert_eq!(
@@ -1139,7 +1142,8 @@ mod tests {
         let public_marker = b"SC-PUBLIC-CONTROL-MARKER-7e91a0c5";
         std::fs::write(a_root.join("secret/a.txt"), secret_marker).unwrap();
         std::fs::write(a_root.join("public.txt"), public_marker).unwrap();
-        a.commit("me", "protect secret/a.txt, add public.txt").unwrap();
+        a.commit("me", "protect secret/a.txt, add public.txt")
+            .unwrap();
         a.remote_add("origin", &url).unwrap();
         a.push("origin").unwrap();
         drop(a);

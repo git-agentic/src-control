@@ -46,7 +46,12 @@ pub trait Bucket: Send {
     /// Compare-and-swap overwrite. `expected_tag: None` = create-new.
     /// `Ok(None)` = precondition failed (someone else won); `Ok(Some(tag))`
     /// = committed, with the new value's tag.
-    fn put_if_tag(&self, key: &str, bytes: &[u8], expected_tag: Option<&str>) -> Result<Option<String>>;
+    fn put_if_tag(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        expected_tag: Option<&str>,
+    ) -> Result<Option<String>>;
     /// Keys under `prefix`, sorted.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
@@ -56,7 +61,9 @@ pub(crate) fn validate_key(key: &str) -> Result<()> {
     if key.is_empty()
         || key.starts_with('/')
         || key.contains('\\')
-        || key.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+        || key
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
         || key.chars().any(|c| c.is_whitespace() || c.is_control())
     {
         return Err(Error::BadKey(format!("{key:?}")));
@@ -70,26 +77,45 @@ pub fn contract_suite(b: &dyn Bucket) {
     // absent key
     assert!(matches!(b.get("manifest", None).unwrap(), Fetched::Absent));
     // put_if_tag with expected None = create; returns the new tag
-    let t1 = b.put_if_tag("manifest", b"v1", None).unwrap().expect("create succeeds");
+    let t1 = b
+        .put_if_tag("manifest", b"v1", None)
+        .unwrap()
+        .expect("create succeeds");
     // create again must fail (precondition)
     assert!(b.put_if_tag("manifest", b"v1x", None).unwrap().is_none());
     // conditional get: matching tag => Unchanged; stale/no tag => New with same tag
-    assert!(matches!(b.get("manifest", Some(&t1)).unwrap(), Fetched::Unchanged));
-    let Fetched::New { bytes, tag } = b.get("manifest", None).unwrap() else { panic!("expected New") };
+    assert!(matches!(
+        b.get("manifest", Some(&t1)).unwrap(),
+        Fetched::Unchanged
+    ));
+    let Fetched::New { bytes, tag } = b.get("manifest", None).unwrap() else {
+        panic!("expected New")
+    };
     assert_eq!(bytes, b"v1");
     assert_eq!(tag, t1);
     // CAS: wrong tag refused, right tag succeeds and returns a new tag
-    assert!(b.put_if_tag("manifest", b"v2", Some("bogus")).unwrap().is_none());
-    let t2 = b.put_if_tag("manifest", b"v2", Some(&t1)).unwrap().expect("cas succeeds");
+    assert!(b
+        .put_if_tag("manifest", b"v2", Some("bogus"))
+        .unwrap()
+        .is_none());
+    let t2 = b
+        .put_if_tag("manifest", b"v2", Some(&t1))
+        .unwrap()
+        .expect("cas succeeds");
     assert_ne!(t1, t2);
     // put_new: first write true, second false, content untouched
     assert!(b.put_new("log/1", b"entry-one").unwrap());
     assert!(!b.put_new("log/1", b"entry-two").unwrap());
-    let Fetched::New { bytes, .. } = b.get("log/1", None).unwrap() else { panic!() };
+    let Fetched::New { bytes, .. } = b.get("log/1", None).unwrap() else {
+        panic!()
+    };
     assert_eq!(bytes, b"entry-one");
     // list is prefix-scoped and sorted
     assert!(b.put_new("log/2", b"x").unwrap());
-    assert_eq!(b.list("log/").unwrap(), vec!["log/1".to_string(), "log/2".to_string()]);
+    assert_eq!(
+        b.list("log/").unwrap(),
+        vec!["log/1".to_string(), "log/2".to_string()]
+    );
     assert_eq!(b.list("packs/").unwrap(), Vec::<String>::new());
 }
 

@@ -22,7 +22,9 @@ impl S3Bucket {
             .enable_all()
             .build()
             .map_err(|e| Error::Backend(format!("tokio runtime: {e}")))?;
-        let conf = rt.block_on(aws_config::load_defaults(aws_config::BehaviorVersion::latest()));
+        let conf = rt.block_on(aws_config::load_defaults(
+            aws_config::BehaviorVersion::latest(),
+        ));
         Ok(S3Bucket {
             client: aws_sdk_s3::Client::new(&conf),
             rt,
@@ -34,7 +36,11 @@ impl S3Bucket {
     /// Validate `key` and join it onto this bucket's prefix.
     fn full_key(&self, key: &str) -> Result<String> {
         validate_key(key)?;
-        Ok(if self.prefix.is_empty() { key.to_string() } else { format!("{}/{key}", self.prefix) })
+        Ok(if self.prefix.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}/{key}", self.prefix)
+        })
     }
 }
 
@@ -109,9 +115,19 @@ impl Bucket for S3Bucket {
         }
     }
 
-    fn put_if_tag(&self, key: &str, bytes: &[u8], expected_tag: Option<&str>) -> Result<Option<String>> {
+    fn put_if_tag(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        expected_tag: Option<&str>,
+    ) -> Result<Option<String>> {
         let k = self.full_key(key)?;
-        let mut req = self.client.put_object().bucket(&self.bucket).key(&k).body(bytes.to_vec().into());
+        let mut req = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&k)
+            .body(bytes.to_vec().into());
         req = match expected_tag {
             Some(tag) => req.if_match(tag),
             None => req.if_none_match("*"),
@@ -128,14 +144,24 @@ impl Bucket for S3Bucket {
         let mut out = Vec::new();
         let mut cont: Option<String> = None;
         loop {
-            let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(format!("{full}/"));
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(format!("{full}/"));
             if let Some(c) = &cont {
                 req = req.continuation_token(c);
             }
-            let resp = self.rt.block_on(req.send()).map_err(|e| Error::Backend(format!("s3 list: {e}")))?;
+            let resp = self
+                .rt
+                .block_on(req.send())
+                .map_err(|e| Error::Backend(format!("s3 list: {e}")))?;
             for obj in resp.contents() {
                 if let Some(k) = obj.key() {
-                    let rel = k.strip_prefix(&self.prefix).unwrap_or(k).trim_start_matches('/');
+                    let rel = k
+                        .strip_prefix(&self.prefix)
+                        .unwrap_or(k)
+                        .trim_start_matches('/');
                     out.push(rel.to_string());
                 }
             }

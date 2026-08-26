@@ -32,7 +32,11 @@ impl DirBucket {
     fn lock(&self) -> Result<CasLock> {
         let path = self.root.join(".cas-lock");
         for _ in 0..2000 {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(_) => return Ok(CasLock { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -40,7 +44,10 @@ impl DirBucket {
                 Err(e) => return Err(e.into()),
             }
         }
-        Err(Error::Backend(format!("cas lock stuck (stale {} ?)", path.display())))
+        Err(Error::Backend(format!(
+            "cas lock stuck (stale {} ?)",
+            path.display()
+        )))
     }
 
     fn write_via_tmp(&self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -88,7 +95,12 @@ impl Bucket for DirBucket {
         Ok(true)
     }
 
-    fn put_if_tag(&self, key: &str, bytes: &[u8], expected_tag: Option<&str>) -> Result<Option<String>> {
+    fn put_if_tag(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        expected_tag: Option<&str>,
+    ) -> Result<Option<String>> {
         let path = self.key_path(key)?;
         let _lock = self.lock()?;
         let current = match std::fs::read(&path) {
@@ -122,7 +134,12 @@ impl Bucket for DirBucket {
                 if p.is_dir() {
                     walk(&p, root, out)?;
                 } else {
-                    out.push(p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"));
+                    out.push(
+                        p.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
                 }
             }
             Ok(())
