@@ -49,9 +49,12 @@ pub struct BucketTransport {
     /// and expect the ref move to be what makes them durable-and-visible).
     staged: RefCell<Vec<(ObjectId, Vec<u8>)>>,
     /// Hashes of packs already uploaded (via `put_pack` or a `put_object`
-    /// flush) that the next `update_ref`'s log entry must reference. Survives
-    /// a lost CAS race so a retry's fresh log entry still cites them —
-    /// packs are content-addressed, so nothing is re-uploaded.
+    /// flush) that the *next* `update_ref` call's log entry must reference.
+    /// `update_ref` takes this field's contents at the top of the call into
+    /// a call-local copy — it survives that one call's internal CAS retries,
+    /// but never leaks into a later, unrelated `update_ref` call on the same
+    /// (possibly long-lived, e.g. `wire::serve`-hosted) transport regardless
+    /// of whether this call succeeds or fails.
     pending_packs: RefCell<Vec<String>>,
 }
 
@@ -337,6 +340,20 @@ impl Transport for BucketTransport {
         // pack before we even look at the manifest, so a retry below never
         // has to re-stage or re-upload it.
         self.flush_staged()?;
+        // From here, the packs this call may commit are call-local: take them
+        // out of the shared field entirely rather than clearing it only on
+        // the success paths. A long-lived transport (e.g. `wire::serve` keeps
+        // one instance per session) can see this call fail — NonFastForward,
+        // or CAS exhaustion — and then be reused for an unrelated ref update;
+        // if `pending_packs` were only cleared on success, that later,
+        // unrelated call would commit a log entry citing packs this call
+        // never landed, violating the invariant that a log entry's `packs`
+        // list is exactly the packs its own ref updates need. Every exit from
+        // this function — success, failure, or the loop below — simply lets
+        // `pending` go out of scope; the packs themselves stay uploaded in
+        // the bucket regardless (content-addressed, inert orphan garbage if
+        // never referenced — correct per spec, compaction is a later phase).
+        let pending: Vec<String> = std::mem::take(&mut *self.pending_packs.borrow_mut());
         const MAX_CAS_RETRIES: u32 = 16;
         for _ in 0..MAX_CAS_RETRIES {
             self.refresh()?;
@@ -357,7 +374,6 @@ impl Transport for BucketTransport {
             // succeeds regardless of `expected_old` — check this before the
             // fast-forward comparison below.
             if current.as_ref() == Some(id) {
-                self.pending_packs.borrow_mut().clear();
                 return Ok(());
             }
             if current.as_ref() != expected_old {
@@ -371,7 +387,7 @@ impl Transport for BucketTransport {
             let entry = LogEntry {
                 seq: 0, // overwritten per candidate in the claim loop below
                 parent_seq: head_seq,
-                packs: self.pending_packs.borrow().clone(),
+                packs: pending.clone(),
                 updates: vec![RefUpdate {
                     branch: branch.to_string(),
                     old: current,
@@ -401,9 +417,8 @@ impl Transport for BucketTransport {
                 .is_some()
             {
                 // Committed. The log entry we just claimed is now on-chain;
-                // clear pendings and pull the fresh view (cheap: one
-                // conditional GET, since our own write just changed the tag).
-                self.pending_packs.borrow_mut().clear();
+                // pull the fresh view (cheap: one conditional GET, since our
+                // own write just changed the tag).
                 self.refresh()?;
                 return Ok(());
             }
@@ -413,8 +428,8 @@ impl Transport for BucketTransport {
             // `refresh()`: if this branch's tip moved off `expected_old` we
             // hit `NonFastForward` above; otherwise (a different branch or an
             // unrelated pack landed) we retry with a fresh entry claimed
-            // under the new parent — `pending_packs` still lists our packs,
-            // so nothing is re-uploaded.
+            // under the new parent — `pending` (this call's local copy)
+            // still lists our packs, so nothing is re-uploaded.
         }
         Err(Error::Remote(
             "manifest cas contention: gave up after 16 attempts".into(),
@@ -452,6 +467,34 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let repo = crate::repo::Repo::init(&root).unwrap();
         std::fs::write(root.join("f.txt"), b"hello wal").unwrap();
+        let tip = repo.commit("t", "c1").unwrap();
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let ids = crate::reachable::reachable_objects(&mut *store, &[tip]).unwrap();
+        let objects = ids
+            .iter()
+            .map(|id| (*id, store.get(id).unwrap().encode()))
+            .collect();
+        drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+        (tip, objects)
+    }
+
+    /// Like `tiny_history`, but with caller-chosen file content. `tiny_history`
+    /// hardcodes content/author/message, so two calls close enough in time to
+    /// land the same commit-timestamp second produce byte-identical Snapshot
+    /// objects (same root, same empty parents) — fine for the read-half tests
+    /// above, which only need *a* valid history, but wrong for a test that
+    /// needs two genuinely distinct object sets (and thus distinct pack
+    /// hashes) to tell "referenced" apart from "coincidentally identical".
+    fn tiny_history_distinct(tag: &str, content: &[u8]) -> (ObjectId, Vec<(ObjectId, Vec<u8>)>) {
+        let root = std::env::temp_dir().join(format!("scl-bt-hist-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("f.txt"), content).unwrap();
         let tip = repo.commit("t", "c1").unwrap();
         let store_arc = repo.vfs().store();
         let mut store = store_arc.lock().unwrap();
@@ -642,6 +685,75 @@ mod tests {
         let t2 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
         assert!(t2.has_object(&tip).unwrap());
         drop((t, t2));
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    #[test]
+    fn abandoned_pending_packs_do_not_leak_into_a_later_unrelated_update_ref() {
+        // Regression for a review finding: `pending_packs` must not survive
+        // a failed `update_ref` call into a later, unrelated `update_ref` on
+        // the same (long-lived, e.g. `wire::serve`-hosted) transport
+        // instance — the WAL's per-entry invariant is that a log entry's
+        // `packs` list is exactly the packs its own ref updates need.
+        let broot = std::env::temp_dir().join(format!("scl-bt-noleak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+
+        // Land "main" -> tip1 normally, so a later push to "main" can fail
+        // fast-forward.
+        let (tip1, objects1) = tiny_history_distinct("noleak-main", b"main content");
+        let (pack1, _) = scl_core::pack::build_pack(&objects1).unwrap();
+        t.put_pack(&mut std::io::Cursor::new(pack1)).unwrap();
+        t.update_ref("main", &tip1, None).unwrap();
+
+        // Stage a second, unrelated pack, then attempt an update to "main"
+        // that must fail NonFastForward *with pending packs non-empty* — the
+        // exact condition the existing tests never exercised (they only hit
+        // NonFastForward with nothing pending).
+        let (_tip2, objects2) = tiny_history_distinct("noleak-abandoned", b"abandoned content");
+        let (pack2, _) = scl_core::pack::build_pack(&objects2).unwrap();
+        let abandoned_hash = hex::encode(blake3::hash(&pack2).as_bytes());
+        t.put_pack(&mut std::io::Cursor::new(pack2)).unwrap();
+        let bogus = ObjectId::of(b"not the real tip");
+        assert!(matches!(
+            t.update_ref("main", &bogus, None),
+            Err(Error::NonFastForward)
+        ));
+
+        // A different, unrelated branch, on the SAME instance, with its own
+        // freshly-staged pack — this call must succeed and must commit only
+        // its own pack, never the one abandoned by the failed call above.
+        let (tip3, objects3) = tiny_history_distinct("noleak-other", b"other content");
+        let (pack3, _) = scl_core::pack::build_pack(&objects3).unwrap();
+        let other_hash = hex::encode(blake3::hash(&pack3).as_bytes());
+        t.put_pack(&mut std::io::Cursor::new(pack3)).unwrap();
+        t.update_ref("other", &tip3, None).unwrap();
+
+        // Decode the committed head log entry straight from the bucket and
+        // check its `packs` list directly, independent of the transport's
+        // own (already-passing) read half.
+        let inspect = DirBucket::open(&broot).unwrap();
+        let Fetched::New { bytes, .. } = inspect.get("manifest", None).unwrap() else {
+            panic!("manifest must exist after two successful update_ref calls")
+        };
+        let manifest = Manifest::decode(&bytes).unwrap();
+        let Fetched::New { bytes, .. } = inspect.get(&log_key(manifest.head_seq), None).unwrap()
+        else {
+            panic!("head log entry must exist")
+        };
+        let head_entry = LogEntry::decode(&bytes).unwrap();
+        assert!(
+            !head_entry.packs.contains(&abandoned_hash),
+            "committed entry must not reference the pack abandoned by the failed call"
+        );
+        assert_eq!(
+            head_entry.packs,
+            vec![other_hash],
+            "committed entry must reference exactly this call's own pack"
+        );
+
+        drop(t);
         std::fs::remove_dir_all(&broot).unwrap();
         assert!(!broot.exists());
     }
