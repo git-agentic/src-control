@@ -372,6 +372,10 @@ pub fn open_transport(url: &str) -> Result<Box<dyn Transport>> {
         Ok(Box::new(crate::http_transport::HttpTransport::connect(
             &parsed,
         )?))
+    } else if url.starts_with("sc+wal://") || url.starts_with("sc+s3://") {
+        Ok(Box::new(crate::bucket_transport::BucketTransport::open(
+            url,
+        )?))
     } else {
         Ok(Box::new(crate::transport::LocalTransport::open(url)?))
     }
