@@ -359,6 +359,13 @@ enum Cmd {
         /// --tls-cert (enforced in run_serve, not by clap).
         #[arg(long)]
         tls_key: Option<PathBuf>,
+        /// Serve a bucket WAL remote (`sc+wal://…` or `sc+s3://…`) instead of
+        /// this repo's own object store (P36c). `<path>` remains the serve
+        /// home: its `.sc/` still provides access tokens, the TLS identity,
+        /// and scratch space — but all served content lives in the bucket,
+        /// making this instance disposable.
+        #[arg(long)]
+        store: Option<String>,
         /// Repo root to serve (the directory containing `.sc/`). Required
         /// unless a `token`/`fingerprint` subcommand is used.
         path: Option<PathBuf>,
@@ -948,6 +955,7 @@ fn main() -> Result<()> {
             tls,
             tls_cert,
             tls_key,
+            store,
             path,
         } => match sub {
             Some(ServeSub::Token { op }) => run_serve_token(op),
@@ -975,6 +983,7 @@ fn main() -> Result<()> {
                     tls,
                     tls_cert,
                     tls_key,
+                    store,
                     path,
                 )
             }
@@ -3476,7 +3485,11 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
 /// `--read-only`/`--allow-public` are `--http`-only (P29): `--stdio`
 /// delegates auth/access entirely to ssh, so combining them is refused
 /// rather than silently ignored. `--max-connections`/`--timeout` are also
-/// `--http`-only (P31). `--max-pack-size` applies to both (P31).
+/// `--http`-only (P31). `--max-pack-size` applies to both (P31). `--store`
+/// (P36c) redirects served content to a bucket WAL remote; `path` remains
+/// the serve home (tokens/TLS identity/scratch) either way. A malformed
+/// `--store` URL is validated up front, before any bind — same fail-fast
+/// idiom as `run_remote`'s `BucketUrl::parse` check.
 fn run_serve(
     stdio: bool,
     http: Option<String>,
@@ -3488,8 +3501,12 @@ fn run_serve(
     tls: bool,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    store: Option<String>,
     path: PathBuf,
 ) -> Result<()> {
+    if let Some(url) = &store {
+        scl_repo::BucketUrl::parse(url)?; // fail fast on malformed URLs, before any bind
+    }
     match (stdio, http) {
         (true, None) => {
             if read_only || allow_public {
@@ -3512,7 +3529,12 @@ fn run_serve(
             };
             let mut stdin = std::io::stdin().lock();
             let mut stdout = std::io::stdout().lock();
-            scl_repo::wire::serve_with_policy(&path, &mut stdin, &mut stdout, policy)?;
+            match &store {
+                Some(url) => {
+                    scl_repo::wire::serve_bucket_with_policy(url, &mut stdin, &mut stdout, policy)?
+                }
+                None => scl_repo::wire::serve_with_policy(&path, &mut stdin, &mut stdout, policy)?,
+            }
             Ok(())
         }
         (false, Some(addr)) => {
@@ -3542,7 +3564,7 @@ fn run_serve(
                 allow_public,
                 limits,
                 tls_mode,
-                None,
+                store.as_deref(),
             )?;
             Ok(())
         }
