@@ -38,6 +38,7 @@ pub mod textdiff;
 pub mod tls_pins;
 pub mod transcripts;
 pub mod transport;
+pub mod walfmt;
 pub mod wire;
 pub mod workspace;
 pub mod worktree;

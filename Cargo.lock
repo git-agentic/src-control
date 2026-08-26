@@ -5417,6 +5417,7 @@ dependencies = [
  "regex",
  "scl-core",
  "scl-crypto",
+ "scl-objio",
  "scl-tlsio",
  "scl-vfs",
  "serde",

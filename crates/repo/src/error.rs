@@ -147,6 +147,13 @@ pub enum Error {
     /// `--max-connections` was reached (P31). Retryable.
     #[error("server busy (connection limit reached); retry later")]
     ServerBusy,
+    /// P36a: the bucket WAL is untrusted input; decode/consistency failures
+    /// are their own variant so callers can distinguish "bucket corrupt or
+    /// newer-format" from transport errors.
+    #[error("bucket wal: {0}")]
+    Wal(String),
+    #[error("bucket: {0}")]
+    ObjIo(#[from] scl_objio::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
