@@ -198,13 +198,22 @@ pub fn parse_index(idx: &[u8]) -> Result<Vec<IndexEntry>> {
 }
 
 /// Read the record at `offset` from `pack`, decompress, verify it hashes to
-/// `id`, and decode it.
+/// `id`, and decode it. Bounds both the compressed record length and the
+/// decompressed output at `MAX_OBJECT_SIZE`, mirroring `parse_pack_reader`'s
+/// guard (P28) — this function's `pack` byte slice may come from an
+/// untrusted source (e.g. a bucket remote, P36a), unlike `Store`'s own
+/// self-written packs, so it cannot assume a well-behaved producer either.
 pub fn read_object_at(pack: &[u8], offset: u64, id: &ObjectId) -> Result<Object> {
     let off = offset as usize;
     if off + 4 > pack.len() {
         return Err(Error::PackCorrupt(format!("offset {offset} past end")));
     }
     let len = u32::from_le_bytes(pack[off..off + 4].try_into().unwrap()) as usize;
+    if len > crate::MAX_OBJECT_SIZE {
+        return Err(Error::PackCorrupt(format!(
+            "record compressed length {len} exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit"
+        )));
+    }
     let start = off + 4;
     let end = start + len;
     if end > pack.len() {
@@ -215,10 +224,26 @@ pub fn read_object_at(pack: &[u8], offset: u64, id: &ObjectId) -> Result<Object>
     decompress_and_decode(&pack[start..end], id)
 }
 
-/// Decompress one record payload, verify against `id`, decode.
+/// Decompress one record payload, verify against `id`, decode. Bounds the
+/// decompressed output at `MAX_OBJECT_SIZE`: a small compressed payload can
+/// still decompress to an enormous plaintext (a "zstd bomb"), so this reads
+/// at most `MAX_OBJECT_SIZE + 1` bytes from the decoder — enough to detect
+/// and reject an over-cap output without ever materializing it in full
+/// (same `take`-bounded pattern as `parse_pack_reader`).
 fn decompress_and_decode(payload: &[u8], id: &ObjectId) -> Result<Object> {
-    let canonical = zstd::decode_all(std::io::Cursor::new(payload))
+    let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(payload))
         .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+    let mut canonical = Vec::new();
+    decoder
+        .by_ref()
+        .take(crate::MAX_OBJECT_SIZE as u64 + 1)
+        .read_to_end(&mut canonical)
+        .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+    if canonical.len() > crate::MAX_OBJECT_SIZE {
+        return Err(Error::PackCorrupt(
+            "decompressed object exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit".into(),
+        ));
+    }
     if ObjectId::of(&canonical) != *id {
         return Err(Error::Malformed(format!(
             "packed object {id} failed hash verification"
@@ -541,6 +566,48 @@ mod tests {
         buf.extend_from_slice(&compressed);
 
         let err = parse_pack_reader(&buf[..], |_id, _obj| Ok(())).unwrap_err();
+        assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_object_at_rejects_over_cap_compressed_length() {
+        // `read_object_at` is the random-access counterpart to
+        // `pack_record_over_cap_rejected` above: its own compressed-length
+        // prefix must be capped too, since `BucketTransport::object_bytes`
+        // (P36a) feeds it bytes fetched straight from a remote bucket —
+        // untrusted input, unlike every other caller (`Store`'s own
+        // self-written packs).
+        let id = ObjectId::of(b"whatever");
+        let over = (crate::MAX_OBJECT_SIZE + 1) as u32;
+        let mut pack = Vec::new();
+        pack.extend_from_slice(&over.to_le_bytes()); // the length prefix `read_object_at` reads at offset 0
+        let err = read_object_at(&pack, 0, &id).unwrap_err();
+        assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_object_at_zstd_bomb_rejected() {
+        // Mirrors `zstd_bomb_rejected`, but through `read_object_at`'s own
+        // decode path (`decompress_and_decode`), which used unbounded
+        // `zstd::decode_all` before this was hardened — a hostile
+        // bucket-served pack (P36a) could otherwise OOM
+        // `BucketTransport::object_bytes` on a single `get_object` call.
+        let bomb_plain = vec![0u8; crate::MAX_OBJECT_SIZE + 1024];
+        let compressed =
+            zstd::encode_all(std::io::Cursor::new(&bomb_plain[..]), COMPRESSION_LEVEL).unwrap();
+        assert!(
+            compressed.len() < bomb_plain.len() / 10,
+            "expected the all-zero payload to compress small"
+        );
+
+        // A wrong id is fine here — the size cap must fire before hash
+        // verification ever runs.
+        let id = ObjectId::of(b"whatever");
+        let mut pack = Vec::new();
+        pack.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        pack.extend_from_slice(&compressed);
+
+        let err = read_object_at(&pack, 0, &id).unwrap_err();
         assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
     }
 

@@ -48,15 +48,15 @@ pub struct BucketTransport {
 
 /// Untrusted-length guard (P28 parity): refuse any WAL metadata value —
 /// manifest, log entry, idx — larger than `MAX_OBJECT_SIZE` before decoding.
-/// Pack bodies are exempt (they may legitimately exceed it), but that leaves
-/// a known gap: `object_bytes` reads a pack body via `read_object_at`, whose
-/// `decompress_and_decode` calls `zstd::decode_all` with no output-size
-/// bound (unlike `parse_pack_reader`'s streaming decoder in
-/// `crates/core/src/pack.rs`, which caps both compressed and decompressed
-/// length at `MAX_OBJECT_SIZE`). A hostile bucket pack can therefore mount a
-/// decompression-bomb DoS against this transport's single-object reads. Out
-/// of scope for this task (would mean changing `core`); tracked in
-/// ROADMAP.md → Deferred.
+/// Pack bodies are exempt from this particular guard (they may legitimately
+/// exceed it), but are not unguarded: `object_bytes` reads a pack body via
+/// `scl_core::pack::read_object_at`, which itself caps both the compressed
+/// record length and the decompressed output at `MAX_OBJECT_SIZE` (hardened
+/// to mirror `parse_pack_reader`'s bounded decode specifically because this
+/// module is `read_object_at`'s first caller to feed it attacker-controlled,
+/// bucket-served bytes — every other caller reads packs the local `Store`
+/// wrote itself). A hostile bucket pack therefore cannot mount a
+/// decompression-bomb DoS against `get_object`/`get_pack`.
 fn capped(what: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
     if bytes.len() > scl_core::MAX_OBJECT_SIZE {
         return Err(Error::Wal(format!(
