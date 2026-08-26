@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 aws-config = "1.11.0"
-aws-sdk-s3 = "1.144.0"
+aws-sdk-s3 = { version = "1.144.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 blake3 = "1.8.7"
 hex = "0.4.3"
 thiserror = "2.0.18"
