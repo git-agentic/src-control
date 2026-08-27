@@ -1,6 +1,7 @@
 //! `scl-repo` — the durable on-disk repository: `.sc/` layout, refs/HEAD,
 //! named branches, a git-like working tree, and commit/secret orchestration.
 
+pub mod bucket_transport;
 pub(crate) mod cache;
 pub(crate) mod conflicts;
 pub mod diff3;
@@ -38,11 +39,13 @@ pub mod textdiff;
 pub mod tls_pins;
 pub mod transcripts;
 pub mod transport;
+pub mod walfmt;
 pub mod wire;
 pub mod workspace;
 pub mod worktree;
 pub(crate) mod ws;
 
+pub use bucket_transport::{BucketScheme, BucketTransport, BucketUrl};
 pub use conflicts::{ActiveOp, ConflictKind, ConflictVersions, ResolveSide, Side};
 pub use error::{Error, Result};
 pub use gc::GcStats;

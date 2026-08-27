@@ -308,6 +308,70 @@ too, not just the src-control-side metadata.
 - The ssh:// transport delegates authentication entirely to ssh (ADR-0022);
   `--max-pack-size` is the one P31 bound that also applies to `--stdio`.
 
+## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046
+
+- **The bucket is untrusted storage with cooperative writers, not a trusted
+  peer.** Unlike `sc serve`, no process authenticates a push or enforces
+  policy at write time — the bucket vendor's own IAM/ACL is the only gate on
+  who may call `put`/`get`/`list` against it. sc treats every byte read back
+  from the bucket as untrusted input, symmetrically with how it already
+  treats bytes arriving over `ssh://`/`sc+http(s)://`.
+- **Write access is full authority over refs and history.** Anyone who can
+  write to the bucket's manifest key can move any branch to any commit —
+  fast-forward-only enforcement (the manifest compare-and-swap plus the
+  `Error::NonFastForward` check) is **cooperative**, honored by the `sc`
+  client, not cryptographically enforced by the bucket. A writer with raw
+  bucket access (outside the `sc` client) can bypass it entirely, the same
+  way a user with raw filesystem access to a git bare repo can force-move a
+  ref underneath git's own client-side checks. Scope bucket write credentials
+  accordingly — they are equivalent to `sc serve --http` write-token
+  authority, not read-only authority.
+- **Readers verify every object independently of the bucket's own
+  guarantees.** Every pack object's `BLAKE3` id is checked on read, exactly
+  as for local and served objects — a bucket that returns corrupted or
+  substituted bytes for a given key is caught, not trusted. The WAL metadata
+  (manifest, log entries, idx) is strict-decoded fail-closed
+  (`walfmt.rs`): unknown versions, bad magic, and any length that would
+  overrun the buffer are refused outright rather than best-effort parsed.
+  Untrusted-length caps apply throughout: manifest/log/idx bytes are capped
+  at `MAX_OBJECT_SIZE` before decode, and pack bodies are read through
+  `scl_core::pack::read_object_at_bounded` (not the unbounded
+  `read_object_at` the trusted local `Store` uses for its own already-
+  verified on-disk packs, per ADR-0039's explicit trust split) — capping
+  both the compressed record length and the decompressed output, so a
+  hostile or corrupted bucket cannot mount a decompression-bomb DoS via
+  `get_object`/`get_pack`.
+- **Sealed content stays end-to-end sealed, unchanged.** Protected-path
+  ciphertext (ADR-0014/0043) and committed secrets travel through a bucket
+  remote exactly as through any other transport: a bucket reader without the
+  recipient key receives intact ciphertext it cannot decrypt. Bucket
+  read/write access confers no additional decryption capability.
+- **Public (unprotected) content sits in the bucket as plaintext at rest.**
+  This is not a new exposure relative to a served remote's `.sc/objects/` —
+  both put unprotected object bytes on a disk or store the operator
+  controls — but a bucket has no `sc`-native access-control layer at all
+  (no bearer tokens, no `--read-only`, no loopback-bind gate). **Bucket ACL
+  is the entire confidentiality perimeter for public content on a bucket
+  remote** written to directly by `sc push`/`sc fetch`; an operator who
+  needs `sc`-native read/write scoping for public content should front it
+  with `sc serve --http`/`--https` (including via `--store`, serving that
+  very bucket — see below).
+- **Partial clone (`--filter`) against a bucket remote is refused**, not
+  silently ignored — the WAL format has no per-prefix negotiation yet, so
+  there is no partial-fetch code path to reason about for a bucket remote at
+  all.
+- **`sc serve --store <bucket-url>` (P36c) splits content from
+  access-control state.** The bucket holds all served content; the serve
+  **home** (`path`, still a plain `.sc/` directory) holds tokens, TLS
+  identity/pins, and pack-spool scratch. A bucket-backed serve instance
+  enforces the exact same P29/P31 gates against its clients as a
+  local-store instance — bearer tokens, `--read-only`, the loopback-bind
+  default, connection/timeout/pack-size limits — while itself trusting the
+  bucket no further than any other reader does: every object's BLAKE3 id is
+  re-verified and the WAL metadata is strict-decoded fail-closed exactly as
+  described above, so a hostile or corrupted bucket gets no more leverage
+  against a serve instance than it would against a direct `sc` client.
+
 ## Untrusted-input hardening (DoS) — ADR-0039
 
 - A single `MAX_OBJECT_SIZE` (256 MiB) caps every untrusted length: wire frames,

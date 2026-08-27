@@ -756,6 +756,7 @@ pub fn serve_http(
     allow_public: bool,
     limits: ServeLimits,
     tls: TlsMode,
+    store: Option<&str>,
 ) -> Result<()> {
     crate::wire::validate_max_pack_size(limits.max_pack_size)?;
     let tls_config = resolve_tls(root, &tls)?;
@@ -801,6 +802,7 @@ pub fn serve_http(
         mandatory_auth,
         limits,
         tls_config,
+        store.map(str::to_string),
     )
 }
 
@@ -830,6 +832,7 @@ pub fn serve_http_listener(
     mandatory_auth: bool,
     limits: ServeLimits,
     tls: Option<scl_tlsio::TlsServerConfig>,
+    store: Option<String>,
 ) -> Result<()> {
     let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut backoff = AcceptBackoff::new();
@@ -864,6 +867,7 @@ pub fn serve_http_listener(
         };
         let root = root.to_path_buf();
         let tls = tls.clone();
+        let store = store.clone();
         let spawn_result = std::thread::Builder::new().spawn(move || {
             let _guard = guard; // slot held for the connection's lifetime
             if let Err(e) = handle_http_connection(
@@ -873,6 +877,7 @@ pub fn serve_http_listener(
                 mandatory_auth,
                 limits,
                 tls.as_ref(),
+                store.as_deref(),
             ) {
                 eprintln!("sc serve --http: connection error: {e}");
             }
@@ -963,6 +968,7 @@ fn handle_http_connection(
     mandatory_auth: bool,
     limits: ServeLimits,
     tls: Option<&scl_tlsio::TlsServerConfig>,
+    store: Option<&str>,
 ) -> Result<()> {
     stream
         .set_read_timeout(Some(OPENING_READ_TIMEOUT))
@@ -1051,16 +1057,17 @@ fn handle_http_connection(
         .map_err(|e| Error::ConnectionLost(format!("sc+http set session timeouts: {e}")))?;
 
     let read_only = server_read_only || token_read_only;
-    crate::wire::serve_with_policy(
-        root,
-        &mut reader,
-        &mut writer,
-        crate::wire::WirePolicy {
-            read_only,
-            max_pack_size: limits.max_pack_size,
-            ro_drain_cap: crate::wire::RO_DRAIN_CAP,
-        },
-    )
+    let policy = crate::wire::WirePolicy {
+        read_only,
+        max_pack_size: limits.max_pack_size,
+        ro_drain_cap: crate::wire::RO_DRAIN_CAP,
+    };
+    match store {
+        Some(url) => {
+            crate::wire::serve_bucket_with_policy(url, root, &mut reader, &mut writer, policy)
+        }
+        None => crate::wire::serve_with_policy(root, &mut reader, &mut writer, policy),
+    }
 }
 
 #[cfg(test)]
@@ -1367,6 +1374,7 @@ mod tests {
                 mandatory_auth,
                 ServeLimits::default(),
                 None,
+                None,
             )
             .unwrap();
         });
@@ -1534,6 +1542,7 @@ mod tests {
             false,
             ServeLimits::default(),
             TlsMode::Off,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1863,7 +1872,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            let _ = serve_http_listener(listener, &root, false, false, limits, None);
+            let _ = serve_http_listener(listener, &root, false, false, limits, None, None);
         });
         addr
     }
@@ -2072,6 +2081,7 @@ mod tests {
                 false,
                 ServeLimits::default(),
                 Some(cfg),
+                None,
             );
         });
         (addr, spki)
@@ -2267,5 +2277,158 @@ mod tests {
         assert_eq!(t.head_branch().unwrap(), "main");
         let _ = std::fs::remove_file(&policy.known_hosts);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ── Task 5 (P36c): bucket-backed serve — the `store` parameter threads
+    // through unchanged gates (`.sc` presence, tokens, read-only floor, TLS,
+    // limits, timeouts) against `root` (the serve HOME), and only the final
+    // hand-off routes to `serve_bucket_with_policy` instead of
+    // `serve_with_policy`. The headline property: two disposable server
+    // instances, each with its own HOME, serving the SAME bucket, see each
+    // other's writes with no propagation delay (strict consistency — there
+    // is no "eventually" for a bucket WAL). ──
+
+    /// Seed a one-commit bucket WAL directly via `BucketTransport` — same
+    /// shape as `bucket_transport::tests::push_via_trait_round_trips_into_a_fresh_bucket`
+    /// and `wire::tests::bucket_stdio_serve_round_trips_refs_and_packs`'s
+    /// seeding: a scratch repo mints the objects, then a raw
+    /// `BucketTransport::open` pushes them in — never through an HTTP server.
+    fn seed_bucket_history(store: &str, tag: &str, content: &[u8]) -> ObjectId {
+        let root =
+            std::env::temp_dir().join(format!("scl-http-bkseed-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("f.txt"), content).unwrap();
+        let tip = repo.commit("t", "c").unwrap();
+        let store_arc = repo.vfs().store();
+        let mut objstore = store_arc.lock().unwrap();
+        let ids = crate::reachable::reachable_objects(&mut *objstore, &[tip]).unwrap();
+        let objects: Vec<(ObjectId, Vec<u8>)> = ids
+            .iter()
+            .map(|id| (*id, objstore.get(id).unwrap().encode()))
+            .collect();
+        drop(objstore);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let t = crate::bucket_transport::BucketTransport::open(store).unwrap();
+        let (pack, _idx) = scl_core::pack::build_pack(&objects).unwrap();
+        t.put_pack(&mut std::io::Cursor::new(pack)).unwrap();
+        t.update_ref("main", &tip, None).unwrap();
+        tip
+    }
+
+    /// Spawn a `serve_http_listener` whose `root` is a plain sc repo used
+    /// only as the serve HOME (`.sc` presence gate, tokens) while every
+    /// object read/write routes to `store` instead.
+    fn spawn_bucket_http_server_policy(
+        home: std::path::PathBuf,
+        store: String,
+        read_only: bool,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            serve_http_listener(
+                listener,
+                &home,
+                read_only,
+                false,
+                ServeLimits::default(),
+                None,
+                Some(store),
+            )
+            .unwrap();
+        });
+        port
+    }
+
+    fn spawn_bucket_http_server(home: std::path::PathBuf, store: String) -> u16 {
+        spawn_bucket_http_server_policy(home, store, false)
+    }
+
+    /// Two disposable server instances (`home_a`, `home_b`), each with its
+    /// own serve HOME, both serving the SAME bucket: a push landed through
+    /// instance A is visible through instance B on the very next connection
+    /// — no coordinator, no replication lag, no "eventually" (ADR-0046's
+    /// strict-consistency contract, now exercised end to end through the
+    /// HTTP server rather than just `BucketTransport`/`wire::serve_bucket_with_policy`).
+    #[test]
+    fn two_disposable_instances_serve_one_bucket_with_strict_consistency() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-http-bstore-{pid}"));
+        let home_a = tmp_repo("bstore-home-a"); // existing helper — an sc repo as serve home
+        let home_b = tmp_repo("bstore-home-b");
+        let _ = std::fs::remove_dir_all(&broot);
+        let store = format!("sc+wal://{}", broot.display());
+
+        // seed the bucket with one commit on "main"
+        let tip1 = seed_bucket_history(&store, "seed", b"first commit");
+
+        let port_a = spawn_bucket_http_server(home_a.clone(), store.clone());
+        let port_b = spawn_bucket_http_server(home_b.clone(), store.clone());
+
+        // clone through instance A
+        let dst = std::env::temp_dir().join(format!("scl-http-bstore-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&dst);
+        let dst_repo =
+            crate::repo::Repo::clone_url(&format!("sc+http://127.0.0.1:{port_a}/x"), &dst).unwrap();
+        assert_eq!(dst_repo.head_tip().unwrap(), Some(tip1));
+
+        // push through instance A…
+        std::fs::write(dst.join("f2.txt"), b"instance hop").unwrap();
+        let tip2 = dst_repo.commit("t", "c2").unwrap();
+        dst_repo.push("origin").unwrap();
+        drop(dst_repo);
+
+        // …and observe it through instance B with no propagation delay:
+        // strict consistency — "there is no eventually" (spec).
+        let dst2 = std::env::temp_dir().join(format!("scl-http-bstore-dst2-{pid}"));
+        let _ = std::fs::remove_dir_all(&dst2);
+        let d2 = crate::repo::Repo::clone_url(&format!("sc+http://127.0.0.1:{port_b}/x"), &dst2)
+            .unwrap();
+        assert_eq!(d2.head_tip().unwrap(), Some(tip2));
+        drop(d2);
+
+        for p in [&broot, &home_a, &home_b, &dst, &dst2] {
+            std::fs::remove_dir_all(p).unwrap();
+        }
+    }
+
+    /// The read-only floor (`server_read_only || token_read_only`) holds in
+    /// store mode exactly as it does for a local repo — mirrors
+    /// `server_read_only_floors_rw_token` (:1719), but the write attempt
+    /// goes through `Repo::push` against a bucket-backed server instead of a
+    /// raw `Transport::put_object` call: a push must fail with the wire
+    /// `ReadOnly` error while a plain clone still succeeds.
+    #[test]
+    fn read_only_floor_holds_in_store_mode() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-http-bstore-ro-{pid}"));
+        let home = tmp_repo("bstore-home-ro");
+        let _ = std::fs::remove_dir_all(&broot);
+        let store = format!("sc+wal://{}", broot.display());
+        let tip1 = seed_bucket_history(&store, "seed-ro", b"read-only seed");
+
+        let port = spawn_bucket_http_server_policy(home.clone(), store.clone(), true);
+
+        // clone still works under the read-only floor.
+        let dst = std::env::temp_dir().join(format!("scl-http-bstore-ro-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&dst);
+        let dst_repo =
+            crate::repo::Repo::clone_url(&format!("sc+http://127.0.0.1:{port}/x"), &dst).unwrap();
+        assert_eq!(dst_repo.head_tip().unwrap(), Some(tip1));
+
+        // a push is rejected with the wire ReadOnly error.
+        std::fs::write(dst.join("blocked.txt"), b"should never land").unwrap();
+        dst_repo.commit("t", "blocked commit").unwrap();
+        let err = dst_repo.push("origin").unwrap_err();
+        assert!(matches!(err, Error::ReadOnly), "{err:?}");
+        drop(dst_repo);
+
+        for p in [&broot, &home, &dst] {
+            std::fs::remove_dir_all(p).unwrap();
+        }
     }
 }
