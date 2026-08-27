@@ -147,3 +147,59 @@ round-trip, racing/fleet pushes, crash-mid-push recovery, and the
 `MAX_OBJECT_SIZE` cap. CLI plumbing (remote-add validation, push, clone,
 fetch through the real binary) proven in
 `crates/cli/tests/bucket_remote.rs`.
+
+## As built (P36b/P36c, 2026-08-26)
+
+**P36b — checkpoint fold.** `walfmt::Checkpoint` (magic `SCWC`; a `seq`, a
+sorted branch→tip `refs` list, and a cumulative `packs` hash list, all
+strict-decoded fail-closed like every other WAL record) and
+`checkpoint_key(seq)` join the existing `Manifest`/`LogEntry` kinds.
+`BucketTransport::refresh()` now seeds from `manifest.checkpoint_seq` when
+non-zero: it fetches that checkpoint, takes its refs/packs as the fold base,
+then walks only the log tail from `head_seq` down to `checkpoint_seq`
+(rather than to `0`) before rebuilding the object index over the
+checkpoint's cumulative packs plus the tail's. Every checkpoint input is
+untrusted like the rest of the WAL and fails closed: a manifest naming a
+checkpoint that's absent, a checkpoint object claiming a different `seq`
+than the key it was fetched at, and a log chain that steps past
+`checkpoint_seq` without landing on it exactly are all refused
+(`Error::Wal`), never best-effort recovered. After a successful commit,
+`maybe_fold_checkpoint` opportunistically folds once
+`head_seq - checkpoint_seq > CHECKPOINT_INTERVAL` (64): it claims
+`checkpoints/<head_seq>` via `put_new` (idempotent — a racing folder's
+duplicate claim is a no-op, not an error), then CASes the manifest to point
+at it. A lost manifest CAS (someone else advanced the WAL meanwhile) drops
+the fold silently — a checkpoint is derived data any reader can refold from
+the log later, so there is nothing to retry — and the push that triggered
+the fold attempt has already durably landed either way.
+
+**P36c — bucket-backed serve.** A new `wire::ServeTransport` enum
+(`Local(LocalTransport)` / `Bucket { transport: BucketTransport, tmp:
+TempServeDir }`) lets `serve_session` dispatch every verb except the
+`GetPack`/`PutPack` pair identically regardless of backend.
+`serve_bucket_with_policy(store_url, …)` mirrors `serve_with_policy`
+verb-for-verb — same handshake, same `PROTOCOL_VERSION`, same P29/P31
+read-only gate and pack-spool caps — but opens a `BucketTransport` instead
+of a local repo. `TempServeDir` is an RAII scratch directory under
+`std::env::temp_dir()` (created per session, removed best-effort on drop)
+standing in for a local repo's `.sc/tmp/`, since a bucket has no scratch directory of
+its own — this keeps the ephemeral-mode zero-residue invariant intact for
+bucket-backed serve too. `sc serve --http`/`--stdio` gained `--store <url>`:
+`path` remains the serve **home** (`.sc/` — tokens, TLS identity/pins,
+scratch), while served content routes to the bucket at `<url>` instead of
+the home's own object store. A malformed `--store` URL is rejected via
+`BucketUrl::parse` before any bind (`run_serve`'s fail-fast check, mirroring
+`run_remote`'s). Proven by `two_disposable_instances_serve_one_bucket_with_strict_consistency`
+and `read_only_floor_holds_in_store_mode` in
+`crates/repo/src/http_transport.rs` (two independent `sc serve --http
+--store` server instances, each with its own serve home, observe each
+other's pushes to the shared bucket with no propagation delay — the
+manifest-CAS strict-consistency contract from P36a, now exercised end to
+end over HTTP) and
+`serve_store_serves_a_bucket_and_second_instance_sees_pushes` in
+`crates/cli/tests/bucket_remote.rs` (the same property across two real,
+separately-spawned `sc` **processes**).
+
+This supersedes the two now-stale Consequences bullets above about
+checkpoint folding and `sc serve` being unable to host a bucket as its
+backing store — both are built as of P36b/P36c.

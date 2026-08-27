@@ -930,24 +930,20 @@ scale-&-reach horizon):
 
 - **Bucket compaction/gc (P36a follow-on).** The WAL log (`log/<seq>` keys,
   each a hand-rolled versioned binary `walfmt` entry, not protobuf) grows
-  unboundedly with no compaction — every reader walks the full parent chain
-  back from `head_seq`, and no entry or superseded pack is ever removed.
-  Deferred until checkpointing (below) gives a safe compaction cutoff.
+  unboundedly with no compaction — a cold-start reader now stops at the
+  latest checkpoint (P36b) instead of walking to `0`, but no log entry,
+  checkpoint, or superseded pack is ever actually removed from the bucket.
+  Deferred until a safe pruning cutoff (e.g. "no reader can still need
+  anything before checkpoint N") is designed. Compaction is also what
+  relieves `walfmt::MAX_LIST` (65536): a checkpoint fold with more refs or
+  packs than that cap is skipped outright (`maybe_fold_checkpoint`'s guard,
+  P36b review) rather than writing an object `Checkpoint::decode` would then
+  refuse to read back, so a remote whose live ref/pack count grows past the
+  cap loses folding entirely until compaction can retire entries below it.
 - **Leases (P36a follow-on).** The only cross-writer coordination today is
   the manifest's compare-and-swap; there is no lease/TTL primitive for
   operations that need to hold exclusive intent across more than one bucket
   round-trip (e.g. a long-running compaction). Deferred.
-- **Checkpoint fold (P36b, next).** `walfmt::Manifest.checkpoint_seq`
-  already reserves a field for a future compaction cutoff, but nothing
-  writes a `checkpoints/<seq>/` object yet — cold start is always a full
-  log walk from `head_seq`. Folding the log into a periodic ref snapshot so
-  cold start becomes snapshot + short tail is the next bucket-remote phase.
-- **Bucket-backed `sc serve` (P36c, next).** `sc serve` cannot host a
-  bucket as its backing store today — a bucket remote is written to
-  directly by every client's `sc push`/`sc fetch`, not brokered through a
-  server process. Wiring `BucketTransport` in as an `sc serve` backend
-  (so a bucket remote can also sit behind access control / resource limits
-  the way `.sc/` repos do via P29/P31) is deferred to a follow-on phase.
 - **Partial clone from bucket remotes (P36a follow-on).** `sc clone
   --filter` against `sc+wal://`/`sc+s3://` is refused outright
   (`BucketTransport` has no per-prefix negotiation); teaching the WAL format
@@ -964,17 +960,23 @@ scale-&-reach horizon):
   individually, but a transfer moves a whole pack at a time, so memory use
   is pack-sized, not object-sized. Streaming the S3 request/response bodies
   instead of buffering them whole is deferred.
-- **Incremental `refresh()` for bucket remotes (P36a follow-on).**
-  `BucketTransport::refresh` short-circuits on an unchanged manifest tag,
-  but whenever the manifest *has* changed it re-walks the full parent chain
-  from `head_seq` and re-fetches every `idx_key` on that chain from
-  scratch — O(chain) GETs per manifest change, which gets expensive under
-  fleet-frequency pushes. An incremental refresh that picks up from the
-  last-seen manifest/seq instead of re-walking from scratch is deferred.
+- **Incremental `refresh()` for bucket remotes (P36a follow-on, narrowed by
+  P36b).** `BucketTransport::refresh` short-circuits on an unchanged
+  manifest tag, but whenever the manifest *has* changed it re-walks the log
+  chain from `head_seq` back to the manifest's checkpoint (P36b bounds this
+  to the tail instead of the full chain to `0`) and still re-fetches every
+  `idx_key` in the cumulative pack list from scratch each time — expensive
+  under fleet-frequency pushes even with the checkpoint bound. An
+  incremental refresh that picks up from the last-seen manifest/seq instead
+  of rebuilding the whole index every time is deferred.
 - **Bucket-aware push negotiation (P36a follow-on).** Push negotiation today
   issues a `has_object` round trip per object over S3; batching those probes
   into one `refresh()` plus local index lookups (instead of one S3 round
   trip per object) is deferred.
+- **Serve-side persistent pack cache (P36c follow-on).** A bucket-backed
+  serve instance re-downloads packs per connection; a content-addressed
+  on-disk cache in the serve home would make warm instances cheap without
+  affecting correctness.
 
 ## How a phase gets built
 

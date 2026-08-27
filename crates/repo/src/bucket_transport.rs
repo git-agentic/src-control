@@ -4,7 +4,9 @@
 
 use crate::error::{Error, Result};
 use crate::transport::Transport;
-use crate::walfmt::{idx_key, log_key, pack_key, LogEntry, Manifest, RefUpdate};
+use crate::walfmt::{
+    checkpoint_key, idx_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, RefUpdate, MAX_LIST,
+};
 use scl_core::pack::{parse_index, read_object_at_bounded, IndexEntry, PackWriter};
 use scl_core::{Object, ObjectId};
 use scl_objio::{Bucket, Fetched};
@@ -25,16 +27,24 @@ struct WalView {
     refs: BTreeMap<String, ObjectId>,
     /// object id -> (pack hash, offset, length), from every on-chain pack's idx.
     index: BTreeMap<ObjectId, (String, u64, u64)>,
+    /// Every on-chain pack hash in chain order (checkpoint fold first, then
+    /// the tail) — retained so a checkpoint fold (`maybe_fold_checkpoint`)
+    /// is a pure copy: it never needs to re-walk the log or re-derive the
+    /// pack list, just snapshot this field into the new checkpoint object.
+    packs: Vec<String>,
 }
 
 /// A [`Transport`] whose object graph and refs live entirely in an
 /// object-storage bucket (S3-compatible or a local directory), read through
 /// the parent-linked WAL log format `walfmt` defines. Readers walk the log
-/// backward from the manifest's `head_seq` via `parent_seq` links — a log
-/// entry's own claimed `seq` is never trusted for reachability, only for
-/// self-consistency (it must match the slot it was read from and its parent
-/// must strictly precede it). An entry not on that chain (e.g. a losing
-/// racer's orphaned append) is invisible to every read method here, by
+/// backward from the manifest's `head_seq` via `parent_seq` links, stopping
+/// at `checkpoint_seq` (seeded from the checkpoint object it names, P36b) —
+/// a cold start no longer replays to `0`, only the tail past the last fold.
+/// A log entry's own claimed `seq` is never trusted for reachability, only
+/// for self-consistency (it must match the slot it was read from and its
+/// parent must strictly precede it, down to `checkpoint_seq`). An entry not
+/// on that chain (e.g. a losing racer's orphaned append) is invisible to
+/// every read method here, by
 /// construction.
 pub struct BucketTransport {
     bucket: Box<dyn Bucket>,
@@ -76,6 +86,20 @@ fn capped(what: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
         )));
     }
     Ok(bytes)
+}
+
+/// Fold a checkpoint once the log tail exceeds this many entries past the
+/// last checkpoint (spec: "default 64 entries, one tunable constant").
+const CHECKPOINT_INTERVAL: u64 = 64;
+
+/// True when a checkpoint fold of `nrefs` refs and `npacks` packs would
+/// exceed `walfmt::MAX_LIST` on either axis — i.e. would write a checkpoint
+/// object `Checkpoint::decode` then refuses to read back. Pure predicate
+/// (no bucket I/O) so `maybe_fold_checkpoint`'s guard can be unit-tested
+/// directly against the exact boundary `Checkpoint::decode` enforces,
+/// without constructing a real 65536+-ref/pack `WalView` end to end.
+fn fold_would_overflow(nrefs: usize, npacks: usize) -> bool {
+    nrefs > MAX_LIST || npacks > MAX_LIST
 }
 
 /// Which bucket backend a [`BucketUrl`] names.
@@ -170,8 +194,10 @@ impl BucketTransport {
     }
 
     /// One conditional GET of the manifest; on change, rebuild refs + index
-    /// by walking parent links head -> 0 (seq numbers are claims; the chain
-    /// is the truth — off-chain entries are garbage).
+    /// by walking parent links from `head_seq` down to `checkpoint_seq`
+    /// (P36b) — seeded from that checkpoint's own `refs`/`packs` rather than
+    /// replayed from `0` — then folding the tail entries on top (seq numbers
+    /// are claims; the chain is the truth — off-chain entries are garbage).
     fn refresh(&self) -> Result<()> {
         let cached_tag = self.view.borrow().as_ref().map(|v| v.tag.clone());
         match self.bucket.get("manifest", cached_tag.as_deref())? {
@@ -183,9 +209,43 @@ impl BucketTransport {
             Fetched::New { bytes, tag } => {
                 let bytes = capped("manifest", bytes)?;
                 let manifest = Manifest::decode(&bytes)?;
+                let stop = manifest.checkpoint_seq;
+                // Seed from the checkpoint when the manifest names one. The
+                // checkpoint is untrusted input like everything else here.
+                let (mut refs, mut packs): (BTreeMap<String, ObjectId>, Vec<String>) = if stop != 0
+                {
+                    let ck_bytes = match self.bucket.get(&checkpoint_key(stop), None)? {
+                        Fetched::New { bytes, .. } => capped("checkpoint", bytes)?,
+                        _ => {
+                            return Err(Error::Wal(format!(
+                                "checkpoint {stop} referenced by manifest but absent"
+                            )))
+                        }
+                    };
+                    let ck = Checkpoint::decode(&ck_bytes)?;
+                    if ck.seq != stop {
+                        return Err(Error::Wal(format!(
+                            "checkpoint at {stop} claims seq {}",
+                            ck.seq
+                        )));
+                    }
+                    let mut refs = BTreeMap::new();
+                    for (branch, id) in &ck.refs {
+                        crate::refs::validate_branch_name(branch)?;
+                        refs.insert(branch.clone(), *id);
+                    }
+                    (refs, ck.packs)
+                } else {
+                    (BTreeMap::new(), Vec::new())
+                };
                 let mut entries = Vec::new();
                 let mut seq = manifest.head_seq;
-                while seq != 0 {
+                while seq != stop {
+                    if seq < stop {
+                        return Err(Error::Wal(format!(
+                            "log chain bypasses checkpoint {stop} (reached {seq})"
+                        )));
+                    }
                     let Fetched::New { bytes, .. } = self.bucket.get(&log_key(seq), None)? else {
                         return Err(Error::Wal(format!(
                             "log entry {seq} referenced by chain but absent"
@@ -208,22 +268,25 @@ impl BucketTransport {
                     entries.push(e);
                 }
                 entries.reverse(); // oldest first
-                let mut refs = BTreeMap::new();
-                let mut index = BTreeMap::new();
                 for e in &entries {
                     for u in &e.updates {
                         crate::refs::validate_branch_name(&u.branch)?;
                         refs.insert(u.branch.clone(), u.new);
                     }
                     for hash in &e.packs {
-                        let Fetched::New { bytes, .. } = self.bucket.get(&idx_key(hash), None)?
-                        else {
-                            return Err(Error::Wal(format!("pack {hash} on chain but idx absent")));
-                        };
-                        let bytes = capped("pack idx", bytes)?;
-                        for IndexEntry { id, offset, length } in parse_index(&bytes)? {
-                            index.insert(id, (hash.clone(), offset, length));
-                        }
+                        packs.push(hash.clone());
+                    }
+                }
+                // Index build: over the FULL cumulative pack list (checkpoint
+                // packs + tail packs), fetching each idx exactly as today.
+                let mut index = BTreeMap::new();
+                for hash in &packs {
+                    let Fetched::New { bytes, .. } = self.bucket.get(&idx_key(hash), None)? else {
+                        return Err(Error::Wal(format!("pack {hash} on chain but idx absent")));
+                    };
+                    let bytes = capped("pack idx", bytes)?;
+                    for IndexEntry { id, offset, length } in parse_index(&bytes)? {
+                        index.insert(id, (hash.clone(), offset, length));
                     }
                 }
                 *self.view.borrow_mut() = Some(WalView {
@@ -231,6 +294,7 @@ impl BucketTransport {
                     manifest,
                     refs,
                     index,
+                    packs,
                 });
                 Ok(())
             }
@@ -295,6 +359,91 @@ impl BucketTransport {
                 Err(e)
             }
         }
+    }
+
+    /// Opportunistic, coordinator-free checkpoint fold. Called after a
+    /// successful commit; every failure path is deliberately non-fatal —
+    /// the checkpoint is derived data any reader can rebuild from the log,
+    /// a lost CAS just means a racing pusher's fold (or push) won, and the
+    /// next over-threshold push retries. The push that triggered this has
+    /// already durably landed.
+    fn maybe_fold_checkpoint(&self) -> Result<()> {
+        let (head_seq, checkpoint_seq, head_branch, tag, refs, packs) = {
+            let view = self.view.borrow();
+            let Some(v) = view.as_ref() else {
+                return Ok(());
+            };
+            (
+                v.manifest.head_seq,
+                v.manifest.checkpoint_seq,
+                v.manifest.head_branch.clone(),
+                v.tag.clone(),
+                v.refs
+                    .iter()
+                    .map(|(b, id)| (b.clone(), *id))
+                    .collect::<Vec<_>>(),
+                v.packs.clone(),
+            )
+        };
+        if head_seq - checkpoint_seq <= CHECKPOINT_INTERVAL {
+            return Ok(());
+        }
+        // Two pushers landing identical packs (e.g. two racers whose staged
+        // objects happened to build the same pack bytes) leave duplicate
+        // hashes in the cumulative `packs` list; don't copy the duplicates
+        // forward into every future checkpoint. Order-preserving: chain
+        // order (oldest first) has no semantic meaning here, but there's no
+        // reason to churn it either.
+        let mut seen = std::collections::HashSet::new();
+        let packs: Vec<String> = packs
+            .into_iter()
+            .filter(|h| seen.insert(h.clone()))
+            .collect();
+        if fold_would_overflow(refs.len(), packs.len()) {
+            // A fold at or under `walfmt::MAX_LIST` on both axes round-trips
+            // through `Checkpoint::decode` cleanly. One that overflows would
+            // write a checkpoint object that decode then REFUSES to read
+            // back — bricking the remote: every subsequent `refresh` by any
+            // reader (every client and every `serve` instance, including
+            // this same process) fails closed on `Manifest.checkpoint_seq`
+            // naming an undecodable checkpoint, with no way back short of
+            // hand-editing the bucket. Skip the fold instead — it is
+            // best-effort by design (see the doc above) — and let every
+            // reader keep doing the slower but correct full-tail walk back
+            // to the last checkpoint that DID fit. Durable relief is
+            // compaction (ROADMAP "Bucket compaction/gc"), which can retire
+            // refs/packs instead of letting them accumulate into ever-larger
+            // checkpoints forever.
+            return Ok(());
+        }
+        let ck = Checkpoint {
+            seq: head_seq,
+            refs,
+            packs,
+        };
+        // Claim the object first (idempotent), then point the manifest at
+        // it. `put_new`'s discarded `bool` (already-existed vs. freshly
+        // written) is safe to ignore here: two racing folds off the SAME
+        // head hold byte-identical views (same refs, same deduped packs,
+        // same `head_seq`), so a colliding claim is content-identical, not
+        // a conflict — there is nothing to redo either way.
+        self.bucket
+            .put_new(&checkpoint_key(head_seq), &ck.encode())?;
+        let manifest = Manifest {
+            head_seq,
+            checkpoint_seq: head_seq,
+            head_branch,
+        };
+        // CAS from the tag our fresh post-commit view carries. A loss means
+        // someone advanced the WAL meanwhile — their problem to fold later.
+        if self
+            .bucket
+            .put_if_tag("manifest", &manifest.encode(), Some(&tag))?
+            .is_some()
+        {
+            self.refresh()?;
+        }
+        Ok(())
     }
 }
 
@@ -494,6 +643,7 @@ impl Transport for BucketTransport {
                 // pull the fresh view (cheap: one conditional GET, since our
                 // own write just changed the tag).
                 self.refresh()?;
+                let _ = self.maybe_fold_checkpoint(); // best-effort by design (see its doc)
                 return Ok(());
             }
             // Lost the manifest CAS: someone else's append won the race. Our
@@ -515,7 +665,9 @@ impl Transport for BucketTransport {
 mod tests {
     use super::*;
     use crate::transport::Transport;
-    use crate::walfmt::{idx_key, log_key, pack_key, LogEntry, Manifest, RefUpdate};
+    use crate::walfmt::{
+        checkpoint_key, idx_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, RefUpdate,
+    };
     use scl_core::ObjectId;
     use scl_objio::{Bucket, DirBucket};
 
@@ -1166,5 +1318,393 @@ mod tests {
         std::fs::remove_dir_all(&broot).unwrap();
         std::fs::remove_dir_all(&a_root).unwrap();
         assert!(!broot.exists() && !a_root.exists());
+    }
+
+    /// Hand-build a WAL with `n` single-branch pushes; returns (bucket root,
+    /// final tip per branch map as Vec sorted, all pack hashes in order).
+    /// Each push i creates branch "b-<i>" pointing at a distinct object.
+    fn hand_built_wal(
+        tag: &str,
+        n: u64,
+    ) -> (std::path::PathBuf, Vec<(String, ObjectId)>, Vec<String>) {
+        let broot = std::env::temp_dir().join(format!("scl-bt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broot);
+        let bucket = DirBucket::open(&broot).unwrap();
+        let mut refs = Vec::new();
+        let mut packs = Vec::new();
+        for i in 1..=n {
+            let obj = Object::blob(format!("wal-entry-{i}").into_bytes());
+            let id = obj.id();
+            let (hash, pack, idx) = pack_of(&[(id, obj.encode())]);
+            bucket.put_new(&pack_key(&hash), &pack).unwrap();
+            bucket.put_new(&idx_key(&hash), &idx).unwrap();
+            let entry = LogEntry {
+                seq: i,
+                parent_seq: i - 1,
+                packs: vec![hash.clone()],
+                updates: vec![RefUpdate {
+                    branch: format!("b-{i}"),
+                    old: None,
+                    new: id,
+                }],
+            };
+            bucket.put_new(&log_key(i), &entry.encode()).unwrap();
+            refs.push((format!("b-{i}"), id));
+            packs.push(hash);
+        }
+        let m = Manifest {
+            head_seq: n,
+            checkpoint_seq: 0,
+            head_branch: "b-1".into(),
+        };
+        bucket
+            .put_if_tag("manifest", &m.encode(), None)
+            .unwrap()
+            .unwrap();
+        refs.sort();
+        (broot, refs, packs)
+    }
+
+    #[test]
+    fn view_via_checkpoint_equals_full_replay_and_skips_folded_entries() {
+        let (broot, expected_refs, packs) = hand_built_wal("ckpt-eq", 6);
+        let bucket = DirBucket::open(&broot).unwrap();
+        // fold through seq 4 by hand
+        let full =
+            BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let full_refs = full.list_refs().unwrap();
+        let ck = Checkpoint {
+            seq: 4,
+            refs: expected_refs
+                .iter()
+                .filter(|(b, _)| {
+                    let i: u64 = b.strip_prefix("b-").unwrap().parse().unwrap();
+                    i <= 4
+                })
+                .cloned()
+                .collect(),
+            packs: packs[..4].to_vec(),
+        };
+        bucket.put_new(&checkpoint_key(4), &ck.encode()).unwrap();
+        let Fetched::New { bytes, tag } = bucket.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let mut m = Manifest::decode(&bytes).unwrap();
+        m.checkpoint_seq = 4;
+        bucket
+            .put_if_tag("manifest", &m.encode(), Some(&tag))
+            .unwrap()
+            .unwrap();
+
+        // DELETE the folded log entries: a checkpoint-aware reader must not
+        // need them. (Direct file removal = simulated compaction.)
+        for seq in 1..=4u64 {
+            std::fs::remove_file(broot.join(log_key(seq))).unwrap();
+        }
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        assert_eq!(t.list_refs().unwrap(), full_refs);
+        // objects from folded packs still readable (index seeded from checkpoint.packs)
+        let (b1, id1) = &expected_refs[0];
+        assert!(b1.starts_with("b-"));
+        assert!(t.has_object(id1).unwrap());
+        drop((t, full));
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    #[test]
+    fn corrupt_or_bypassing_checkpoints_fail_closed() {
+        let (broot, _refs, packs) = hand_built_wal("ckpt-bad", 3);
+        let bucket = DirBucket::open(&broot).unwrap();
+        // (a) manifest names a checkpoint that does not exist
+        let Fetched::New { bytes, tag } = bucket.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let mut m = Manifest::decode(&bytes).unwrap();
+        m.checkpoint_seq = 2;
+        let tag = bucket
+            .put_if_tag("manifest", &m.encode(), Some(&tag))
+            .unwrap()
+            .unwrap();
+        assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).is_err());
+        // (b) checkpoint exists but its seq field lies
+        let ck = Checkpoint {
+            seq: 1,
+            refs: vec![],
+            packs: packs[..2].to_vec(),
+        };
+        bucket.put_new(&checkpoint_key(2), &ck.encode()).unwrap();
+        assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).is_err());
+        // (c) chain bypasses the checkpoint: entry at seq 3 has parent 1 (< 2)
+        let obj_end = {
+            // repair (b) first so the error is unambiguously the bypass
+            std::fs::remove_file(broot.join(checkpoint_key(2))).unwrap();
+            let good = Checkpoint {
+                seq: 2,
+                refs: vec![],
+                packs: packs[..2].to_vec(),
+            };
+            bucket.put_new(&checkpoint_key(2), &good.encode()).unwrap();
+            let bad_entry = LogEntry {
+                seq: 3,
+                parent_seq: 1,
+                packs: vec![],
+                updates: vec![],
+            };
+            std::fs::remove_file(broot.join(log_key(3))).unwrap();
+            bucket.put_new(&log_key(3), &bad_entry.encode()).unwrap()
+        };
+        assert!(obj_end);
+        assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).is_err());
+        let _ = tag;
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+
+        // (d) checkpoint's refs carry a branch name the ref grammar rejects
+        // ("a/b" is proven invalid by repo.rs's own switch()/validate tests).
+        let (broot2, refs2, packs2) = hand_built_wal("ckpt-badname", 2);
+        let bucket2 = DirBucket::open(&broot2).unwrap();
+        let bad_id = refs2[0].1;
+        let Fetched::New { bytes, tag } = bucket2.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let mut m2 = Manifest::decode(&bytes).unwrap();
+        m2.checkpoint_seq = 2;
+        bucket2
+            .put_if_tag("manifest", &m2.encode(), Some(&tag))
+            .unwrap()
+            .unwrap();
+        let bad_ck = Checkpoint {
+            seq: 2,
+            refs: vec![("a/b".to_string(), bad_id)],
+            packs: packs2,
+        };
+        bucket2
+            .put_new(&checkpoint_key(2), &bad_ck.encode())
+            .unwrap();
+        assert!(BucketTransport::from_bucket(Box::new(DirBucket::open(&broot2).unwrap())).is_err());
+        std::fs::remove_dir_all(&broot2).unwrap();
+        assert!(!broot2.exists());
+    }
+
+    #[test]
+    fn update_ref_preserves_checkpoint_seq_across_a_push() {
+        // A push against a bucket that already has a checkpoint must not
+        // reset `manifest.checkpoint_seq` back to 0 — that would strand the
+        // checkpoint (its packs/refs still readable) while the very next
+        // cold `refresh()` walked the *full* chain looking for now-compacted
+        // log entries, reproducing the failure the equals test above guards.
+        let (broot, _refs, packs) = hand_built_wal("ckpt-carry", 3);
+        let bucket = DirBucket::open(&broot).unwrap();
+        let ck = Checkpoint {
+            seq: 3,
+            refs: vec![],
+            packs: packs.clone(),
+        };
+        bucket.put_new(&checkpoint_key(3), &ck.encode()).unwrap();
+        let Fetched::New { bytes, tag } = bucket.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let mut m = Manifest::decode(&bytes).unwrap();
+        m.checkpoint_seq = 3;
+        bucket
+            .put_if_tag("manifest", &m.encode(), Some(&tag))
+            .unwrap()
+            .unwrap();
+
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let obj = Object::blob(b"carry-push".to_vec());
+        let (tip, bytes) = (obj.id(), obj.encode());
+        t.put_object(&tip, &bytes).unwrap();
+        t.update_ref("carried", &tip, None).unwrap();
+        drop(t);
+
+        let bucket2 = DirBucket::open(&broot).unwrap();
+        let Fetched::New { bytes, .. } = bucket2.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let after = Manifest::decode(&bytes).unwrap();
+        assert_eq!(
+            after.checkpoint_seq, 3,
+            "checkpoint_seq must survive a push"
+        );
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    #[test]
+    fn pushes_past_the_interval_fold_a_checkpoint_and_cold_start_uses_it() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-fold-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        let n = CHECKPOINT_INTERVAL + 2;
+        for i in 0..n {
+            let obj = Object::blob(format!("fold-{i}").into_bytes());
+            t.put_object(&obj.id(), &obj.encode()).unwrap();
+            t.update_ref(&format!("w-{i}"), &obj.id(), None).unwrap();
+        }
+        // the bucket now carries a manifest whose checkpoint_seq > 0 and the
+        // matching checkpoints/<seq> object
+        let bucket = DirBucket::open(&broot).unwrap();
+        let Fetched::New { bytes, .. } = bucket.get("manifest", None).unwrap() else {
+            panic!()
+        };
+        let m = Manifest::decode(&bytes).unwrap();
+        assert!(m.checkpoint_seq > 0, "no fold happened after {n} pushes");
+        let Fetched::New { bytes, .. } =
+            bucket.get(&checkpoint_key(m.checkpoint_seq), None).unwrap()
+        else {
+            panic!(
+                "manifest names checkpoint {} but object absent",
+                m.checkpoint_seq
+            )
+        };
+        let ck = Checkpoint::decode(&bytes).unwrap();
+        assert_eq!(ck.seq, m.checkpoint_seq);
+        assert!(!ck.refs.is_empty() && !ck.packs.is_empty());
+        // cold start through it sees all n branches
+        let t2 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        assert_eq!(t2.list_refs().unwrap().len(), n as usize);
+        drop((t, t2));
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    /// A bucket whose checkpoint writes always fail must not fail pushes.
+    struct FoldHostileBucket(DirBucket);
+    impl Bucket for FoldHostileBucket {
+        fn get(&self, key: &str, tag: Option<&str>) -> scl_objio::Result<Fetched> {
+            self.0.get(key, tag)
+        }
+        fn put_new(&self, key: &str, bytes: &[u8]) -> scl_objio::Result<bool> {
+            if key.starts_with("checkpoints/") {
+                return Err(scl_objio::Error::Backend(
+                    "injected checkpoint write failure".into(),
+                ));
+            }
+            self.0.put_new(key, bytes)
+        }
+        fn put_if_tag(
+            &self,
+            key: &str,
+            bytes: &[u8],
+            tag: Option<&str>,
+        ) -> scl_objio::Result<Option<String>> {
+            self.0.put_if_tag(key, bytes, tag)
+        }
+        fn list(&self, prefix: &str) -> scl_objio::Result<Vec<String>> {
+            self.0.list(prefix)
+        }
+    }
+
+    #[test]
+    fn fold_failure_never_fails_the_push() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-foldfail-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(FoldHostileBucket(
+            DirBucket::open(&broot).unwrap(),
+        )))
+        .unwrap();
+        for i in 0..(CHECKPOINT_INTERVAL + 2) {
+            let obj = Object::blob(format!("foldfail-{i}").into_bytes());
+            t.put_object(&obj.id(), &obj.encode()).unwrap();
+            t.update_ref(&format!("w-{i}"), &obj.id(), None).unwrap(); // must all be Ok
+        }
+        // no checkpoint could land; manifest still says 0 and reads still work
+        let t2 = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+        assert_eq!(
+            t2.list_refs().unwrap().len(),
+            (CHECKPOINT_INTERVAL + 2) as usize
+        );
+        drop((t, t2));
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+    }
+
+    /// Boundary-exact unit test for the fold guard's pure predicate: it must
+    /// agree exactly with `Checkpoint::decode`'s own cap (`nrefs`/`npacks`
+    /// each allowed up to and including `MAX_LIST`, refused strictly above
+    /// it) — a fold that passes this guard must always be decodable, and a
+    /// fold that would overflow must always be caught before it ever reaches
+    /// the bucket.
+    #[test]
+    fn fold_would_overflow_matches_checkpoint_decodes_cap_exactly() {
+        assert!(!fold_would_overflow(0, 0));
+        assert!(!fold_would_overflow(MAX_LIST, 0));
+        assert!(!fold_would_overflow(0, MAX_LIST));
+        assert!(!fold_would_overflow(MAX_LIST, MAX_LIST));
+        assert!(fold_would_overflow(MAX_LIST + 1, 0));
+        assert!(fold_would_overflow(0, MAX_LIST + 1));
+        assert!(fold_would_overflow(MAX_LIST + 1, MAX_LIST + 1));
+    }
+
+    /// Regression for the "over-cap fold bricks the remote" review finding:
+    /// `maybe_fold_checkpoint` must skip the fold (return `Ok`, write
+    /// nothing) once the view it would fold exceeds `walfmt::MAX_LIST` on
+    /// either axis, rather than writing a checkpoint object
+    /// `Checkpoint::decode` then refuses to read back.
+    ///
+    /// Driving this through real traffic would need 65537+ actual pushes —
+    /// far too slow for a unit test, and the boundary case is exercised
+    /// precisely above. Instead this hand-builds an over-cap `WalView`
+    /// directly (this test module is `bucket_transport::tests`, a
+    /// descendant of the defining module, so it may reach `BucketTransport`'s
+    /// private `view` field and construct a `WalView` — the same private
+    /// types `refresh()` itself builds) and calls the private
+    /// `maybe_fold_checkpoint` method directly, proving the guard fires
+    /// before any bucket write — no checkpoint object lands and the
+    /// manifest is untouched. `pushes_past_the_interval_fold_a_checkpoint_and_cold_start_uses_it`
+    /// above is the complementary proof that an ordinary (under-cap) fold
+    /// still happens.
+    #[test]
+    fn fold_is_skipped_and_the_triggering_push_still_succeeds_when_the_view_exceeds_the_cap() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-bt-foldcap-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
+
+        // Hand-build a view whose ref count exceeds MAX_LIST — the exact
+        // shape `refresh()` would eventually produce after enough real
+        // pushes, minus actually performing 65537 of them.
+        let mut refs = BTreeMap::new();
+        for i in 0..=MAX_LIST {
+            let branch = format!("b-{i}");
+            refs.insert(branch.clone(), ObjectId::of(branch.as_bytes()));
+        }
+        *t.view.borrow_mut() = Some(WalView {
+            tag: "fake-tag".to_string(),
+            manifest: Manifest {
+                head_seq: CHECKPOINT_INTERVAL + 100, // well past the fold threshold
+                checkpoint_seq: 0,
+                head_branch: "main".to_string(),
+            },
+            refs,
+            index: BTreeMap::new(),
+            packs: Vec::new(),
+        });
+
+        // The triggering push's own commit already landed (that's what put
+        // this over-cap view in place); the fold itself must be a no-op —
+        // best-effort by design — not an error.
+        t.maybe_fold_checkpoint().unwrap();
+
+        // Nothing was written: no checkpoint object, and (since we never
+        // actually pushed the fake manifest to the bucket, only mutated the
+        // in-memory view) the manifest key is still absent.
+        let bucket = DirBucket::open(&broot).unwrap();
+        assert!(matches!(
+            bucket.get("manifest", None).unwrap(),
+            Fetched::Absent
+        ));
+        assert!(
+            bucket.list("checkpoints/").unwrap().is_empty(),
+            "an over-cap fold must not write any checkpoint object"
+        );
+
+        drop(t);
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
     }
 }

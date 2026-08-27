@@ -2,8 +2,9 @@
 //! is proven in scl-repo's bucket_transport tests; this exercises CLI
 //! plumbing: remote add validation, push, clone, fetch.
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 
 fn sc(dir: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sc"));
@@ -16,6 +17,39 @@ fn tmp(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// Spawn `sc serve --http 127.0.0.1:0 <extra…> <path>` and return the child
+/// plus the OS-assigned `host:port` it reports on its first stdout line
+/// (`listening on <addr>`). Copied from `crates/cli/tests/http_remote.rs`'s
+/// `spawn_http_server` — same readiness contract (the announce line prints
+/// only after `TcpListener::bind` returns) — parameterized with `extra` so
+/// this file's tests can pass `--store <url>`.
+fn spawn_http_server_with(root: &Path, extra: &[&str]) -> (Child, String) {
+    let mut args = vec!["serve", "--http", "127.0.0.1:0"];
+    args.extend_from_slice(extra);
+    args.push(root.to_str().unwrap());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sc"))
+        .args(&args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn sc serve --http");
+    let stdout = child.stdout.take().expect("child stdout is piped");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .expect("read serve startup line");
+    if n == 0 {
+        let status = child.wait().ok();
+        panic!("sc serve --http exited before announcing a bound address: {status:?}");
+    }
+    let addr = line
+        .trim()
+        .strip_prefix("listening on ")
+        .unwrap_or_else(|| panic!("unexpected serve startup line: {line:?}"))
+        .to_string();
+    (child, addr)
 }
 
 #[test]
@@ -49,5 +83,128 @@ fn bucket_clone_push_fetch_round_trip_and_url_validation() {
     for d in [&a, &bucket, &parent] {
         std::fs::remove_dir_all(d).unwrap();
         assert!(!d.exists());
+    }
+}
+
+/// `sc serve --http --store <sc+wal://…>` serves a bucket instead of the
+/// serve-home's own object store (P36c): a repo pushed straight to the
+/// bucket is clonable through the server, and a push through the server is
+/// visible to a completely separate server instance pointed at the same
+/// bucket (proving durable state lives in the bucket, not the server
+/// process). A malformed `--store` URL must be refused before any bind.
+#[test]
+fn serve_store_serves_a_bucket_and_second_instance_sees_pushes() {
+    let bucket = tmp("srv-bucket");
+    let home = tmp("srv-home");
+    assert!(sc(&home, &["init"]).status.success());
+    let store = format!("sc+wal://{}", bucket.display());
+
+    // seed: a repo pushed straight to the bucket
+    let seed = tmp("srv-seed");
+    assert!(sc(&seed, &["init"]).status.success());
+    std::fs::write(seed.join("f.txt"), b"served from bucket").unwrap();
+    assert!(sc(&seed, &["commit", "-m", "c1"]).status.success());
+    assert!(sc(&seed, &["remote", "add", "origin", &store])
+        .status
+        .success());
+    assert!(sc(&seed, &["push", "origin"]).status.success());
+
+    // malformed store URL refused before binding
+    let bad = sc(
+        &home,
+        &[
+            "serve",
+            "--http",
+            "127.0.0.1:0",
+            "--store",
+            "sc+s3://",
+            home.to_str().unwrap(),
+        ],
+    );
+    assert!(!bad.status.success());
+
+    let (mut child, addr) = spawn_http_server_with(&home, &["--store", &store]);
+    let parent = tmp("srv-clone");
+    let dst = parent.join("d");
+    let url = format!("sc+http://{addr}/repo");
+    assert!(sc(&parent, &["clone", &url, dst.to_str().unwrap()])
+        .status
+        .success());
+    assert_eq!(
+        std::fs::read(dst.join("f.txt")).unwrap(),
+        b"served from bucket"
+    );
+    // push through the server, then read it back via a SECOND instance
+    std::fs::write(dst.join("g.txt"), b"hop").unwrap();
+    assert!(sc(&dst, &["commit", "-m", "c2"]).status.success());
+    assert!(sc(&dst, &["push", "origin"]).status.success());
+    child.kill().ok();
+    let _ = child.wait();
+    let (mut child2, addr2) = spawn_http_server_with(&home, &["--store", &store]);
+    let parent2 = tmp("srv-clone2");
+    let d2 = parent2.join("d2");
+    assert!(sc(
+        &parent2,
+        &[
+            "clone",
+            &format!("sc+http://{addr2}/repo"),
+            d2.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    assert_eq!(std::fs::read(d2.join("g.txt")).unwrap(), b"hop");
+    child2.kill().ok();
+    let _ = child2.wait();
+
+    for p in [&bucket, &home, &seed, &parent, &parent2] {
+        std::fs::remove_dir_all(p).unwrap();
+        assert!(!p.exists());
+    }
+}
+
+/// Regression (P36c review): `sc serve --stdio --store <url> <path>` must
+/// fail closed when `<path>` has no `.sc/` yet, exactly like the `--http`
+/// path's unconditional 404 gate — not silently `create_dir_all` one into
+/// existence via `TempServeDir::create_in`'s spool-dir creation and leave an
+/// empty `.sc/tmp/` behind after teardown. The check runs before any stdin
+/// read, so the child exits immediately on its own (no hang, no need to
+/// feed it a HELLO frame).
+#[test]
+fn stdio_serve_with_store_refuses_an_uninitialized_serve_home() {
+    let bucket = tmp("stdio-uninit-bucket");
+    let store = format!("sc+wal://{}", bucket.display());
+    // `tmp()` creates the directory itself but never runs `sc init` in it —
+    // exactly the "uninitialized dir" this gate must reject.
+    let home = tmp("stdio-uninit-home");
+    assert!(!home.join(".sc").exists());
+
+    let out = sc(
+        &home,
+        &[
+            "serve",
+            "--stdio",
+            "--store",
+            &store,
+            home.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "must refuse an uninitialized serve home: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("serve home"),
+        "stderr must name the serve home as the problem: {stderr}"
+    );
+    assert!(
+        !home.join(".sc").exists(),
+        "refusing must never auto-vivify .sc/ under the uninitialized home"
+    );
+
+    for p in [&bucket, &home] {
+        std::fs::remove_dir_all(p).unwrap();
+        assert!(!p.exists());
     }
 }

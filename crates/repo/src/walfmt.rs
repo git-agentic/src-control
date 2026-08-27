@@ -6,9 +6,15 @@ use scl_core::ObjectId;
 
 const MANIFEST_MAGIC: &[u8; 4] = b"SCWM";
 const ENTRY_MAGIC: &[u8; 4] = b"SCWE";
+const CHECKPOINT_MAGIC: &[u8; 4] = b"SCWC";
 const VERSION: u32 = 1;
 const MAX_NAME: usize = 4096;
-const MAX_LIST: usize = 65536;
+/// Cap on the number of entries in any length-prefixed list this format
+/// encodes (a `LogEntry`'s `packs`/`updates`, a `Checkpoint`'s `refs`/
+/// `packs`). `pub(crate)` so `bucket_transport`'s checkpoint fold can check
+/// against the same cap `Checkpoint::decode` enforces, rather than
+/// duplicating the literal — see `maybe_fold_checkpoint`'s guard.
+pub(crate) const MAX_LIST: usize = 65536;
 const MAX_HASH: usize = 128;
 
 /// A bounds-checked cursor over a decode buffer. Every read either advances
@@ -221,9 +227,80 @@ impl LogEntry {
     }
 }
 
+/// A fold of the WAL at `seq`: every branch tip and every on-chain pack hash
+/// accumulated from the chain's start through log entry `seq`. Cold start =
+/// this + the log tail after `seq`, instead of replaying the whole chain.
+/// Referenced (and made authoritative) only by `Manifest.checkpoint_seq`;
+/// an unreferenced checkpoint object is garbage like any off-chain key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub seq: u64,
+    /// branch -> tip pairs, sorted by branch (BTreeMap iteration order).
+    pub refs: Vec<(String, ObjectId)>,
+    /// Cumulative pack hashes in chain order (oldest first).
+    pub packs: Vec<String>,
+}
+
+impl Checkpoint {
+    /// Serialize to the on-bucket wire format: magic, version, then fields
+    /// in declaration order, all little-endian.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CHECKPOINT_MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(&(self.refs.len() as u32).to_le_bytes());
+        for (branch, id) in &self.refs {
+            push_string(&mut out, branch);
+            out.extend_from_slice(id.as_bytes());
+        }
+        out.extend_from_slice(&(self.packs.len() as u32).to_le_bytes());
+        for hash in &self.packs {
+            push_string(&mut out, hash);
+        }
+        out
+    }
+
+    /// Strictly decode a checkpoint: bad magic, unknown version, any length
+    /// that overruns the buffer, or trailing bytes are all refused.
+    pub fn decode(bytes: &[u8]) -> Result<Checkpoint> {
+        let mut c = header(bytes, CHECKPOINT_MAGIC, "checkpoint")?;
+        let seq = c.u64()?;
+        let nrefs = c.u32()? as usize;
+        if nrefs > MAX_LIST {
+            return Err(Error::Wal(format!(
+                "checkpoint ref count {nrefs} exceeds cap"
+            )));
+        }
+        let mut refs = Vec::with_capacity(nrefs);
+        for _ in 0..nrefs {
+            let branch = c.string(MAX_NAME)?;
+            let id = c.id()?;
+            refs.push((branch, id));
+        }
+        let npacks = c.u32()? as usize;
+        if npacks > MAX_LIST {
+            return Err(Error::Wal(format!(
+                "checkpoint pack count {npacks} exceeds cap"
+            )));
+        }
+        let mut packs = Vec::with_capacity(npacks);
+        for _ in 0..npacks {
+            packs.push(c.string(MAX_HASH)?);
+        }
+        c.done()?;
+        Ok(Checkpoint { seq, refs, packs })
+    }
+}
+
 /// `log/<seq>` zero-padded so lexical order == numeric order.
 pub fn log_key(seq: u64) -> String {
     format!("log/{seq:020}")
+}
+
+/// `checkpoints/<seq>` zero-padded so lexical order == numeric order.
+pub fn checkpoint_key(seq: u64) -> String {
+    format!("checkpoints/{seq:020}")
 }
 
 /// `packs/<hash>.pack` — the packfile object for a given content hash.
@@ -319,5 +396,55 @@ mod tests {
         assert_eq!(log_key(7), "log/00000000000000000007");
         assert_eq!(pack_key("abcd"), "packs/abcd.pack");
         assert_eq!(idx_key("abcd"), "packs/abcd.idx");
+    }
+
+    #[test]
+    fn checkpoint_round_trips_and_rejects_garbage() {
+        let c = Checkpoint {
+            seq: 64,
+            refs: vec![
+                ("feat".to_string(), some_id(2)),
+                ("main".to_string(), some_id(1)),
+            ],
+            packs: vec!["ab12".to_string(), "cd34".to_string()],
+        };
+        let bytes = c.encode();
+        assert_eq!(Checkpoint::decode(&bytes).unwrap(), c);
+        // wrong magic, truncated, future version, trailing junk: refused
+        assert!(Checkpoint::decode(b"XXXX").is_err());
+        assert!(Checkpoint::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut future = bytes.clone();
+        future[4] = 0xFF;
+        assert!(Checkpoint::decode(&future).is_err());
+        let mut junk = bytes.clone();
+        junk.push(0);
+        assert!(Checkpoint::decode(&junk).is_err());
+        // a log-entry buffer is not a checkpoint (magic mismatch, not a panic)
+        let entry = LogEntry {
+            seq: 1,
+            parent_seq: 0,
+            packs: vec![],
+            updates: vec![],
+        };
+        assert!(Checkpoint::decode(&entry.encode()).is_err());
+    }
+
+    #[test]
+    fn checkpoint_decode_caps_hostile_counts() {
+        // corrupt the refs count to u32::MAX: must fail fast, not allocate
+        let c = Checkpoint {
+            seq: 1,
+            refs: vec![("m".to_string(), some_id(1))],
+            packs: vec![],
+        };
+        let mut evil = c.encode();
+        // refs count sits right after magic(4)+version(4)+seq(8) = offset 16
+        evil[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Checkpoint::decode(&evil).is_err());
+    }
+
+    #[test]
+    fn checkpoint_key_is_stable() {
+        assert_eq!(checkpoint_key(64), "checkpoints/00000000000000000064");
     }
 }
