@@ -37,12 +37,9 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          # The vendored glib source is third-party code, byte-identical to the
-          # published crate except for the documented soundness backport and
-          # lint cap. Its upstream FFI triggers false-positive pointer alerts.
-          config: |
-            paths-ignore:
-              - vendor/glib-0.18.5-patched/**
+          # Path and rule exclusions, each with its reason, live in the config
+          # file so they are reviewable in one place.
+          config-file: ./.github/codeql/codeql-config.yml
       - uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
         with:
           category: "/language:${{ matrix.language }}"

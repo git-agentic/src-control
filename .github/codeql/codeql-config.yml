@@ -1,0 +1,32 @@
+# Shared CodeQL configuration for every language in .github/workflows/codeql.yml.
+# Scope suppressions as narrowly as the mechanism allows: prefer a rule-level
+# exclusion with a recorded reason over widening paths-ignore.
+
+name: src-control CodeQL config
+
+paths-ignore:
+  # The vendored glib source is third-party code, byte-identical to the
+  # published crate except for the documented soundness backport and lint cap.
+  # Its upstream FFI triggers false-positive pointer alerts.
+  - vendor/glib-0.18.5-patched/**
+
+query-filters:
+  # rust/cleartext-logging taints anything flowing out of a type or function
+  # whose name contains "Secret", then flags every println!/eprintln!
+  # downstream. In this codebase that is the entire secrets API by design, so
+  # the rule fires on metadata that is public by construction: file paths
+  # ("skipped (no key): {path}"), secret *names* from the public registry,
+  # snapshot ids, and TLS fingerprints. It produced 145 alerts, none of which
+  # printed plaintext.
+  #
+  # Secret plaintext has exactly one sanctioned egress — the child-process env
+  # injected by `sc run` (ADR-0008). There is no `sc secret show`; `sc secret
+  # list` emits names plus a recipient count. The one intentional plaintext
+  # print is `sc serve token add`, which prints a freshly minted token once and
+  # stores only its hash (ADR-0040). None of that is what this rule is for.
+  #
+  # If a real cleartext-logging egress is ever added, this exclusion hides it —
+  # so the compensating control is docs/THREAT-MODEL.md plus the commit-time
+  # secret scanner (P5), not this query.
+  - exclude:
+      id: rust/cleartext-logging
