@@ -9,7 +9,7 @@ publish.workspace = true
 blake3 = "1.8.5"
 thiserror = "2.0.18"
 hex = "0.4.3"
-zstd = "0.13.3"
+zstd = "0.14.0"
 
 [lints]
 workspace = true
