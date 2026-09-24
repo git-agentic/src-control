@@ -1,0 +1,31 @@
+name: vendor-provenance
+
+# Guards vendor/glib-0.18.5-patched/ against drift (issue #71): the vendored
+# crate is product code, and its PROVENANCE.md claim — published source plus a
+# pinned set of deltas — is enforced here rather than by review alone. Remove
+# together with the vendored directory (glib >= 0.20 removal gate).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "vendor/glib-0.18.5-patched/**"
+      - ".github/scripts/verify_glib_provenance.py"
+      - ".github/workflows/vendor-provenance.yml"
+  pull_request:
+    paths:
+      - "vendor/glib-0.18.5-patched/**"
+      - ".github/scripts/verify_glib_provenance.py"
+      - ".github/workflows/vendor-provenance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  glib:
+    name: vendored glib matches published crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: verify vendored glib against crates.io
+        run: python3 .github/scripts/verify_glib_provenance.py
