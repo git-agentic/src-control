@@ -50,7 +50,7 @@ pub(crate) fn import_tree(
     let mut entries: Vec<TreeEntry> = Vec::new();
 
     for entry in tree.iter() {
-        let entry = entry.context("decoding tree entry")?;
+        let entry = entry.map_err(|e| anyhow::anyhow!("decoding tree entry: {e}"))?;
         let name = entry.filename().to_string();
         let oid = entry.oid().to_owned();
 
