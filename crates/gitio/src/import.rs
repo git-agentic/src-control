@@ -76,7 +76,9 @@ pub fn import_history(
             .find_object(oid)
             .context("finding commit")?
             .into_commit();
-        let decoded = commit.decode().context("decoding commit")?;
+        let decoded = commit
+            .decode()
+            .map_err(|e| anyhow::anyhow!("decoding commit: {e}"))?;
         // Raw hex-hash parents in git parent order (gix validated them on parse).
         let parents: Vec<gix::ObjectId> = decoded.parents().collect();
 
@@ -88,7 +90,9 @@ pub fn import_history(
 
             // `author()` (not the raw `.author` field) returns a parsed,
             // whitespace-trimmed SignatureRef.
-            let sig = decoded.author().context("parsing commit author")?;
+            let sig = decoded
+                .author()
+                .map_err(|e| anyhow::anyhow!("parsing commit author: {e}"))?;
             let name = sig.name.to_string();
             let email = sig.email.to_string();
             let author = if email.is_empty() {

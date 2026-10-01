@@ -522,7 +522,7 @@ pub fn export_branch(
     let mut stale_marks = 0usize;
     for (sc_id, git_hex) in opts.known_git_commits {
         let g = gix::ObjectId::from_hex(git_hex.as_bytes())
-            .with_context(|| format!("bad git oid in marks for {sc_id}"))?;
+            .map_err(|e| anyhow::anyhow!("bad git oid in marks for {sc_id}: {e}"))?;
         if target.has_object(g) {
             commit_memo.insert(*sc_id, g);
         } else {
