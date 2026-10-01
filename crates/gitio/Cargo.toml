@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 scl-core = { path = "../core" }
-gix = "0.87.1"
+gix = "0.88.0"
 thiserror = "2.0.18"
 anyhow = "1.0.102"
 
