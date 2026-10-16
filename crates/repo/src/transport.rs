@@ -82,6 +82,28 @@ pub trait Transport {
     }
 }
 
+/// Canonical encoded size of `obj`, computed without copying a large payload:
+/// a blob or sealed object encodes as one tag byte plus its payload; the small
+/// structural kinds are encoded to measure them.
+fn encoded_len(obj: &Object) -> u64 {
+    match obj {
+        Object::Blob(b) => b.len() as u64 + 1,
+        Object::Sealed(s) => s.payload.len() as u64 + 1,
+        other => other.encode().len() as u64,
+    }
+}
+
+/// Refuse an object a receiver would reject anyway: `pack::parse_pack_reader`
+/// fails any record whose canonical encoding exceeds `MAX_OBJECT_SIZE`.
+fn check_servable_size(id: &ObjectId, len: u64) -> Result<()> {
+    if len > scl_core::MAX_OBJECT_SIZE as u64 {
+        return Err(Error::PackTooLarge(format!(
+            "object {id} exceeds MAX_OBJECT_SIZE and cannot be transferred"
+        )));
+    }
+    Ok(())
+}
+
 /// Object kinds a by-id read never serves (ADR-0047): sealed private-branch
 /// members and branch manifests. Filtered transfers already exclude them
 /// (`filter_manifest_wants`); this keeps the by-id verb consistent with that
@@ -120,11 +142,10 @@ impl LocalTransport {
     /// servable objects, returning `(not_sent, pack)` (P37, ADR-0047). The
     /// shared core of [`Transport::get_objects`] and `wire::serve`'s
     /// `GetObjects` arm. Duplicate ids are served once. `max_bytes` (0 =
-    /// unlimited) bounds the summed payload size (blob and sealed bytes; the
-    /// small structural kinds count as zero, which keeps this pass from
-    /// re-encoding every object just to measure it), and any single object
-    /// over `MAX_OBJECT_SIZE` is refused: every receiver would reject it. Both
-    /// fail with `PackTooLarge` before any pack byte is written.
+    /// unlimited) bounds the summed canonical encoded size, and any single
+    /// object over `MAX_OBJECT_SIZE` is refused (every receiver would reject
+    /// it). Both fail with `PackTooLarge` before any pack byte is written.
+    /// Blobs and sealed objects are measured without re-encoding them.
     pub(crate) fn build_objects_tempfile(
         &self,
         ids: &[ObjectId],
@@ -143,12 +164,8 @@ impl LocalTransport {
             match store.get(id) {
                 Ok(obj) if refused_by_id(&obj) => not_sent.push(*id),
                 Ok(obj) => {
-                    let size = obj.blob_size() as u64;
-                    if size > scl_core::MAX_OBJECT_SIZE as u64 {
-                        return Err(Error::PackTooLarge(format!(
-                            "object {id} exceeds MAX_OBJECT_SIZE and cannot be transferred"
-                        )));
-                    }
+                    let size = encoded_len(&obj);
+                    check_servable_size(id, size)?;
                     total = total.saturating_add(size);
                     if max_bytes > 0 && total > max_bytes {
                         return Err(Error::PackTooLarge(format!(
@@ -653,6 +670,62 @@ mod tests {
         assert_eq!(not_sent, vec![absent.id()]);
         assert!(scl_core::pack::parse_pack(&out).unwrap().is_empty());
 
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn encoded_len_matches_the_canonical_encoding_and_the_receiver_limit() {
+        let blob = Object::blob(vec![1u8; 300]);
+        let sealed = Object::Sealed(scl_core::SealedObj {
+            payload: std::sync::Arc::from(vec![2u8; 300].into_boxed_slice()),
+        });
+        let tree = Object::Tree(scl_core::Tree {
+            entries: vec![scl_core::TreeEntry {
+                name: "a.txt".into(),
+                kind: scl_core::EntryKind::Blob,
+                id: blob.id(),
+                mode: scl_core::FileMode(0o644),
+                perms: 0,
+            }],
+        });
+        for o in [&blob, &sealed, &tree] {
+            assert_eq!(encoded_len(o), o.encode().len() as u64, "{}", o.kind_name());
+        }
+        let id = blob.id();
+        // The receiver rejects a canonical encoding above MAX_OBJECT_SIZE, and
+        // the encoding of a blob is its payload plus one tag byte.
+        let max = scl_core::MAX_OBJECT_SIZE as u64;
+        assert!(check_servable_size(&id, max).is_ok());
+        assert!(matches!(
+            check_servable_size(&id, max + 1),
+            Err(Error::PackTooLarge(_))
+        ));
+        assert_eq!(encoded_len(&Object::blob(vec![0u8; 10])), 11);
+    }
+
+    #[test]
+    fn small_structural_objects_count_against_the_reply_cap() {
+        let layout = tmp_remote("getobjs-tree-cap");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let blob = Object::blob(b"x".to_vec());
+        let entries: Vec<scl_core::TreeEntry> = (0..20)
+            .map(|i| scl_core::TreeEntry {
+                name: format!("file-{i:02}.txt"),
+                kind: scl_core::EntryKind::Blob,
+                id: blob.id(),
+                mode: scl_core::FileMode(0o644),
+                perms: 0,
+            })
+            .collect();
+        let tree = Object::Tree(scl_core::Tree { entries });
+        t.put_object(&tree.id(), &tree.encode()).unwrap();
+        // A tree carries no blob payload but is several hundred bytes encoded;
+        // a 50-byte cap must refuse it.
+        assert!(matches!(
+            t.build_objects_tempfile(&[tree.id()], 50),
+            Err(Error::PackTooLarge(_))
+        ));
+        assert!(t.build_objects_tempfile(&[tree.id()], 0).is_ok());
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
