@@ -548,8 +548,12 @@ across every phase.
 
 ## Active
 
-**None.** Phase 35 completed the first native desktop vertical slice; the next
-horizon is TBD.
+**P37 — Want-by-id fetch and gap fill (proposed, not started).** Batched
+`GetObjects` verb + an explicit `fill_gaps` seam so partial clones can run
+merge/rebase/ws/work/export without `Store::get` ever touching the network;
+design in [ADR-0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md), prior art
+in `docs/research/scion-evaluation.md`. Phases: 37a (verb + read-only entry
+points), 37b (lift the P27 refusals).
 
 ## Completed phases (usability-first ordering)
 
@@ -739,6 +743,9 @@ scale-&-reach horizon):
   origin automatically on any gap, matching git's promisor default. Real
   scope/risk (offline breakage, surprise latency, fetch-during-gc), so it
   stays deferred, not accidentally missing.
+  **Now scoped as P37 (ADR-0047, Proposed):** an opt-in explicit `fill_gaps`
+  seam over a batched by-id `GetObjects` verb, keeping `Store::get`
+  network-free.
 - **Per-case gap-tolerant merge/rebase/ws-harvest/sc-work on a partial
   clone (P27).** These are refused entirely today
   (`Error::PartialCloneUnsupported`) rather than gap-tolerantly
@@ -944,6 +951,15 @@ scale-&-reach horizon):
   the manifest's compare-and-swap; there is no lease/TTL primitive for
   operations that need to hold exclusive intent across more than one bucket
   round-trip (e.g. a long-running compaction). Deferred.
+- **Derived-data layer (Scion-inspired, after P37).** Blame, path history,
+  commit-graph skip lists and copy-detection computed by one generic
+  recursive mechanism over snapshots, stored outside the CAS and rebuildable
+  (so no id/format change). Would speed merge-base/ancestry queries and feed
+  the desktop app. Needs its own ADR; see `docs/research/scion-evaluation.md`.
+- **Server-side history ops + ref-CAS commits (Scion-inspired, after P37).**
+  Server RPCs for log/diff/blame/merge so agents and CI need no local repo,
+  and a commit-by-ref-CAS path that skips push. Builds on P29 auth, P31
+  limits, and ADR-0047's by-id reads; a further wire bump.
 - **Partial clone from bucket remotes (P36a follow-on).** `sc clone
   --filter` against `sc+wal://`/`sc+s3://` is refused outright
   (`BucketTransport` has no per-prefix negotiation); teaching the WAL format
