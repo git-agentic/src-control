@@ -171,6 +171,10 @@ const GET_OBJECTS_RESPONSE_CAP: u64 = 1 << 30;
 pub struct StdioTransport {
     client: WireClient<std::io::BufReader<ChildStdout>, ChildStdin>,
     child: Child,
+    /// Set when a by-id reply was abandoned mid-stream. The child may be
+    /// blocked writing frames nobody will read, so `Drop` must kill it
+    /// instead of sending `Bye` and waiting.
+    desynced: std::cell::Cell<bool>,
 }
 
 impl StdioTransport {
@@ -188,7 +192,11 @@ impl StdioTransport {
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = std::io::BufReader::new(child.stdout.take().expect("stdout piped"));
         match WireClient::handshake(stdout, stdin) {
-            Ok(client) => Ok(StdioTransport { client, child }),
+            Ok(client) => Ok(StdioTransport {
+                client,
+                child,
+                desynced: std::cell::Cell::new(false),
+            }),
             Err(Error::ConnectionLost(msg)) => {
                 let stderr = reap_with_stderr(&mut child);
                 Err(Error::ConnectionLost(if stderr.is_empty() {
@@ -207,7 +215,13 @@ impl StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        let _ = self.client.bye(); // best-effort: the server exits its loop
+        if self.desynced.get() {
+            // The stream is out of sync and the child may be stuck writing
+            // into a pipe we no longer read; `Bye` would never be seen.
+            let _ = self.child.kill();
+        } else {
+            let _ = self.client.bye(); // best-effort: the server exits its loop
+        }
         let _ = self.child.wait();
     }
 }
@@ -260,7 +274,12 @@ impl Transport for StdioTransport {
         self.client.put_pack(src)
     }
     fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
-        self.client.get_objects(ids, out)
+        let r = self.client.get_objects(ids, out);
+        if r.is_err() {
+            // Any failure may have left unread reply frames on the pipe.
+            self.desynced.set(true);
+        }
+        r
     }
 }
 
@@ -663,6 +682,34 @@ mod tests {
             matches!(&err, Error::Protocol(m) if m.contains("more than once")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_desynced_stdio_transport_kills_a_child_that_never_exits_on_drop() {
+        // `sleep` ignores the wire protocol and never exits on its own, which
+        // is what a child blocked writing an abandoned reply looks like.
+        let mut child = Command::new("sleep")
+            .arg("600")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let t = StdioTransport {
+            client: WireClient {
+                rw: std::cell::RefCell::new((stdout, stdin)),
+            },
+            child,
+            desynced: std::cell::Cell::new(true),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(t);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("drop must kill the child instead of waiting for it");
     }
 
     #[test]
