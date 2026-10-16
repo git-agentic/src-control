@@ -150,7 +150,13 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
             &Request::GetObjects { ids: ids.to_vec() }.encode(),
         )?;
         let frame = wire::read_frame(&mut rw.0)?;
-        let not_sent = wire::decode_ids_body(&wire::parse_response(frame)?)?;
+        let not_sent = wire::decode_ids_body_capped(&wire::parse_response(frame)?, ids.len())?;
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(dup) = not_sent.iter().find(|id| !seen.insert(**id)) {
+            return Err(Error::Protocol(format!(
+                "reply lists object {dup} as not sent more than once"
+            )));
+        }
         wire::read_pack_stream(&mut rw.0, out, GET_OBJECTS_RESPONSE_CAP)?;
         Ok(not_sent)
     }
@@ -598,6 +604,65 @@ mod tests {
         let err = WireClient::handshake(client_read, client_write).unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
         server.join().unwrap();
+    }
+
+    /// A hostile server that answers a one-id `GetObjects` with `reply_ids`
+    /// as the not-sent list, then an empty pack stream.
+    fn get_objects_against_hostile_reply(reply_ids: Vec<scl_core::ObjectId>) -> Error {
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let f = wire::read_frame(&mut server_read).unwrap();
+            assert!(matches!(
+                wire::Request::decode(&f).unwrap(),
+                wire::Request::Hello { .. }
+            ));
+            wire::write_ok(&mut server_write, &wire::u32_body(wire::PROTOCOL_VERSION)).unwrap();
+            let f = wire::read_frame(&mut server_read).unwrap();
+            assert!(matches!(
+                wire::Request::decode(&f).unwrap(),
+                wire::Request::GetObjects { .. }
+            ));
+            wire::write_ok(&mut server_write, &wire::ids_body(&reply_ids)).unwrap();
+        });
+        let client = WireClient::handshake(client_read, client_write).unwrap();
+        let id = Object::blob(b"wanted".to_vec()).id();
+        let err = client.get_objects(&[id], &mut Vec::new()).unwrap_err();
+        server.join().unwrap();
+        err
+    }
+
+    #[test]
+    fn get_objects_rejects_a_not_sent_list_longer_than_the_request() {
+        let id = Object::blob(b"wanted".to_vec()).id();
+        let other = Object::blob(b"other".to_vec()).id();
+        let err = get_objects_against_hostile_reply(vec![id, other]);
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn get_objects_rejects_a_duplicated_not_sent_id() {
+        let id = Object::blob(b"wanted".to_vec()).id();
+        // Within the one-id cap this is still a duplicate once the list is
+        // asked to hold two copies of the same id.
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let _ = wire::read_frame(&mut server_read).unwrap();
+            wire::write_ok(&mut server_write, &wire::u32_body(wire::PROTOCOL_VERSION)).unwrap();
+            let _ = wire::read_frame(&mut server_read).unwrap();
+            wire::write_ok(&mut server_write, &wire::ids_body(&[id, id])).unwrap();
+        });
+        let client = WireClient::handshake(client_read, client_write).unwrap();
+        let other = Object::blob(b"other".to_vec()).id();
+        let err = client
+            .get_objects(&[id, other], &mut Vec::new())
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(&err, Error::Protocol(m) if m.contains("more than once")),
+            "got {err:?}"
+        );
     }
 
     #[test]

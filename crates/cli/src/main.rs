@@ -3421,6 +3421,19 @@ fn resolve_ids_to_pubkeys(
     Ok(out)
 }
 
+/// A relative local clone source is recorded as the remote and promisor
+/// origin; resolved from inside the clone it would name the wrong directory,
+/// so persist the absolute path. URLs (`ssh://`, `sc+http://`, ...) and paths
+/// that do not resolve are returned unchanged.
+fn absolute_local_source(src: String) -> String {
+    if src.contains("://") {
+        return src;
+    }
+    std::fs::canonicalize(&src)
+        .map(|p| p.display().to_string())
+        .unwrap_or(src)
+}
+
 fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>, lazy: bool) -> Result<()> {
     // Auto-detect unambiguous git URL forms (https/http, scp-style, file://):
     // those can never be sc-native, so no flag is needed. Bare `ssh://` is
@@ -3433,6 +3446,7 @@ fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>, lazy: bo
         }
         return run_clone_git(&src, &dst);
     }
+    let src = absolute_local_source(src);
     let filter_opt = (!filter.is_empty()).then_some(filter.as_slice());
     let repo = scl_repo::Repo::clone_url_filtered(&src, &dst, filter_opt)?;
     if lazy {
@@ -4656,6 +4670,21 @@ mod tests {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clone_source_is_recorded_as_an_absolute_path_but_urls_are_untouched() {
+        // A relative source would resolve against the clone's own directory
+        // once the user cd's into it, so the recorded origin must be absolute.
+        let abs = absolute_local_source(".".to_string());
+        assert!(std::path::Path::new(&abs).is_absolute(), "got {abs}");
+        for url in ["ssh://host/srv/repo", "sc+http://127.0.0.1:1/x"] {
+            assert_eq!(absolute_local_source(url.to_string()), url);
+        }
+        assert_eq!(
+            absolute_local_source("no/such/dir/anywhere".to_string()),
+            "no/such/dir/anywhere"
+        );
     }
 
     #[test]

@@ -108,7 +108,7 @@ not have. The rules for `GetObjects`:
 - Protected-path ciphertext is returned as-is, as in every pack:
   confidentiality rests on encryption, not on withholding.
 - Caps: 1024 ids per request (`MAX_GET_OBJECTS_IDS`, checked while decoding),
-  the server's `--max-pack-size` over the summed payload size of a reply and
+  the server's `--max-pack-size` over the summed canonical encoded size of a reply and
   `MAX_OBJECT_SIZE` per object (both `PackTooLarge`, before any pack byte is
   written), and a 1 GiB cap on the stream a client will read back. A client
   also stops reading a pack as soon as it holds more records than it

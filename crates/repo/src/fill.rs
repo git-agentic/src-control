@@ -12,6 +12,7 @@
 //! as they did before the fill; they simply find a few extra present objects.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use scl_core::{EntryKind, Object, ObjectId};
 
@@ -102,12 +103,12 @@ impl Repo {
     ///
     /// Refuses private branches and protected paths: this phase prints
     /// public plaintext only.
-    pub fn cat_at(&self, refname: &str, path: &str) -> Result<Vec<u8>> {
+    pub fn cat_at(&self, refname: &str, path: &str) -> Result<Arc<[u8]>> {
         Ok(self.cat_at_with_stats(refname, path)?.0)
     }
 
     /// [`Repo::cat_at`], also reporting what the fill cost.
-    pub fn cat_at_with_stats(&self, refname: &str, path: &str) -> Result<(Vec<u8>, FillStats)> {
+    pub fn cat_at_with_stats(&self, refname: &str, path: &str) -> Result<(Arc<[u8]>, FillStats)> {
         self.cat_at_impl(refname, path, crate::promisor::offline())
     }
 
@@ -118,7 +119,7 @@ impl Repo {
         refname: &str,
         path: &str,
         offline: bool,
-    ) -> Result<(Vec<u8>, FillStats)> {
+    ) -> Result<(Arc<[u8]>, FillStats)> {
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         if comps.is_empty() {
             return Err(Error::InvalidArgument("sc cat needs a file path".into()));
@@ -169,7 +170,7 @@ impl Repo {
                     let store_arc = self.vfs.store();
                     let mut store = store_arc.lock().unwrap();
                     return match store.get(&entry.id)? {
-                        Object::Blob(b) => Ok((b.to_vec(), filler.stats)),
+                        Object::Blob(b) => Ok((b, filler.stats)),
                         _ => Err(Error::InvalidArgument(format!("{path} is not a file"))),
                     };
                 }
@@ -327,7 +328,7 @@ mod tests {
             .is_err());
 
         let (bytes, stats) = dst.cat_at_with_stats("main", "docs/api/guide.md").unwrap();
-        assert_eq!(bytes, b"guide body");
+        assert_eq!(&bytes[..], b"guide body");
         // docs tree, docs/api tree, guide blob: one round trip each, nothing else.
         assert_eq!(
             stats,
@@ -355,7 +356,7 @@ mod tests {
         let fx = Fixture::new("infilter");
         let dst = fx.clone(true);
         let (bytes, stats) = dst.cat_at_with_stats("main", "src/a.txt").unwrap();
-        assert_eq!(bytes, b"src-one");
+        assert_eq!(&bytes[..], b"src-one");
         assert_eq!(stats, FillStats::default());
         fx.cleanup();
     }
@@ -390,7 +391,7 @@ mod tests {
         assert!(fx.has(&dst, &fx.docs_tree));
 
         let (bytes, stats) = dst.cat_at_with_stats("main", "docs/api/guide.md").unwrap();
-        assert_eq!(bytes, b"guide body");
+        assert_eq!(&bytes[..], b"guide body");
         assert_eq!(
             stats,
             FillStats {
@@ -478,7 +479,7 @@ mod tests {
             matches!(&err, Error::InvalidArgument(m) if m.contains("protected")),
             "got {err:?}"
         );
-        assert_eq!(repo.cat_at("main", "open.txt").unwrap(), b"public");
+        assert_eq!(&repo.cat_at("main", "open.txt").unwrap()[..], b"public");
 
         repo.branch_private("fix", &alice_sk, &[], &[]).unwrap();
         let err = repo.cat_at("fix", "open.txt").unwrap_err();

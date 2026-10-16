@@ -633,6 +633,21 @@ pub fn decode_ids_body(b: &[u8]) -> Result<Vec<ObjectId>> {
     Ok(ids)
 }
 
+/// Decode an id-list body that may name at most `max` ids. For a `GetObjects`
+/// reply `max` is the number of ids requested, so a hostile peer cannot make
+/// the client decode a list sized by the frame limit instead of the request.
+pub fn decode_ids_body_capped(b: &[u8], max: usize) -> Result<Vec<ObjectId>> {
+    let mut c = Cur::new(b);
+    let ids = c.ids_capped(max).map_err(|e| match e {
+        Error::PackTooLarge(_) => {
+            Error::Protocol(format!("reply lists more than the {max} id(s) requested"))
+        }
+        e => e,
+    })?;
+    c.done()?;
+    Ok(ids)
+}
+
 /// Response body for ListRefs: the remote's (branch, tip) pairs.
 pub fn refs_body(refs: &[(String, ObjectId)]) -> Vec<u8> {
     let mut b = Vec::new();
@@ -1414,6 +1429,11 @@ mod tests {
         assert!(!decode_bool_body(&bool_body(false)).unwrap());
         let ids = vec![some_id(1), some_id(2)];
         assert_eq!(decode_ids_body(&ids_body(&ids)).unwrap(), ids);
+        assert_eq!(decode_ids_body_capped(&ids_body(&ids), 2).unwrap(), ids);
+        assert!(matches!(
+            decode_ids_body_capped(&ids_body(&ids), 1),
+            Err(Error::Protocol(_))
+        ));
         let refs = vec![
             ("dev".to_string(), some_id(3)),
             ("main".to_string(), some_id(4)),
