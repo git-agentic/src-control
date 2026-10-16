@@ -132,7 +132,38 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
         let frame = wire::read_frame(&mut rw.0)?;
         wire::decode_ids_body(&wire::parse_response(frame)?)
     }
+
+    /// One round trip (P37, ADR-0047): the OK body lists the ids the server
+    /// will not send, and a chunk stream with the rest follows. The reply
+    /// stream is capped (`GET_OBJECTS_RESPONSE_CAP`) so a hostile server
+    /// cannot make a by-id fetch spool without bound.
+    fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
+        if ids.len() > wire::MAX_GET_OBJECTS_IDS {
+            return Err(Error::InvalidArgument(format!(
+                "by-id fetch takes at most {} ids per call",
+                wire::MAX_GET_OBJECTS_IDS
+            )));
+        }
+        let mut rw = self.rw.borrow_mut();
+        wire::write_frame(
+            &mut rw.1,
+            &Request::GetObjects { ids: ids.to_vec() }.encode(),
+        )?;
+        let frame = wire::read_frame(&mut rw.0)?;
+        let not_sent = wire::decode_ids_body_capped(&wire::parse_response(frame)?, ids.len())?;
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(dup) = not_sent.iter().find(|id| !seen.insert(**id)) {
+            return Err(Error::Protocol(format!(
+                "reply lists object {dup} as not sent more than once"
+            )));
+        }
+        wire::read_pack_stream(&mut rw.0, out, GET_OBJECTS_RESPONSE_CAP)?;
+        Ok(not_sent)
+    }
 }
+
+/// Most bytes a client accepts in one `GetObjects` reply stream (1 GiB).
+const GET_OBJECTS_RESPONSE_CAP: u64 = 1 << 30;
 
 /// A [`Transport`] whose far end is a child process speaking the wire protocol
 /// on its stdio — `ssh <host> sc serve --stdio <path>` for real remotes.
@@ -140,6 +171,10 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
 pub struct StdioTransport {
     client: WireClient<std::io::BufReader<ChildStdout>, ChildStdin>,
     child: Child,
+    /// Set when a by-id reply was abandoned mid-stream. The child may be
+    /// blocked writing frames nobody will read, so `Drop` must kill it
+    /// instead of sending `Bye` and waiting.
+    desynced: std::cell::Cell<bool>,
 }
 
 impl StdioTransport {
@@ -157,7 +192,11 @@ impl StdioTransport {
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = std::io::BufReader::new(child.stdout.take().expect("stdout piped"));
         match WireClient::handshake(stdout, stdin) {
-            Ok(client) => Ok(StdioTransport { client, child }),
+            Ok(client) => Ok(StdioTransport {
+                client,
+                child,
+                desynced: std::cell::Cell::new(false),
+            }),
             Err(Error::ConnectionLost(msg)) => {
                 let stderr = reap_with_stderr(&mut child);
                 Err(Error::ConnectionLost(if stderr.is_empty() {
@@ -176,7 +215,13 @@ impl StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        let _ = self.client.bye(); // best-effort: the server exits its loop
+        if self.desynced.get() {
+            // The stream is out of sync and the child may be stuck writing
+            // into a pipe we no longer read; `Bye` would never be seen.
+            let _ = self.child.kill();
+        } else {
+            let _ = self.client.bye(); // best-effort: the server exits its loop
+        }
         let _ = self.child.wait();
     }
 }
@@ -227,6 +272,14 @@ impl Transport for StdioTransport {
     }
     fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
         self.client.put_pack(src)
+    }
+    fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
+        let r = self.client.get_objects(ids, out);
+        if r.is_err() {
+            // Any failure may have left unread reply frames on the pipe.
+            self.desynced.set(true);
+        }
+        r
     }
 }
 
@@ -414,6 +467,44 @@ mod tests {
     }
 
     #[test]
+    fn wire_client_get_objects_round_trip_found_missing_and_refused() {
+        let root = tmp_repo("getobjs");
+        let (client, server) = connect(root.clone());
+
+        let blob = Object::blob(b"fetched by id".to_vec());
+        let sealed = Object::Sealed(scl_core::SealedObj {
+            payload: std::sync::Arc::from(b"ciphertext".to_vec().into_boxed_slice()),
+        });
+        let absent = Object::blob(b"not on the server".to_vec());
+        for o in [&blob, &sealed] {
+            client.put_object(&o.id(), &o.encode()).unwrap();
+        }
+
+        let mut out = Vec::new();
+        let not_sent = client
+            .get_objects(&[blob.id(), sealed.id(), absent.id()], &mut out)
+            .unwrap();
+        assert_eq!(not_sent, vec![sealed.id(), absent.id()]);
+        let got = scl_core::pack::parse_pack(&out).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, blob.id());
+
+        // The client refuses an oversize request without a round trip.
+        let too_many = vec![blob.id(); wire::MAX_GET_OBJECTS_IDS + 1];
+        assert!(matches!(
+            client.get_objects(&too_many, &mut Vec::new()),
+            Err(Error::InvalidArgument(_))
+        ));
+        // ...and the connection is still in sync afterwards.
+        assert!(client.has_object(&blob.id()).unwrap());
+
+        client.bye().unwrap();
+        drop(client);
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn wire_client_satisfies_the_transport_contract() {
         let root = tmp_repo("contract");
         std::fs::write(root.join("a.txt"), b"one").unwrap();
@@ -513,6 +604,112 @@ mod tests {
         assert!(matches!(err, Error::NotARepo), "got {err:?}");
         server.join().unwrap().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn handshake_rejects_v4_peer() {
+        // P37 bumped PROTOCOL_VERSION 4 -> 5 for the additive `GetObjects`
+        // verb: a v4 server cannot decode it, so refuse at the handshake.
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let f = wire::read_frame(&mut server_read).unwrap();
+            assert!(matches!(
+                wire::Request::decode(&f).unwrap(),
+                wire::Request::Hello { version: 5 }
+            ));
+            wire::write_ok(&mut server_write, &wire::u32_body(4)).unwrap();
+        });
+        let err = WireClient::handshake(client_read, client_write).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+        server.join().unwrap();
+    }
+
+    /// A hostile server that answers a one-id `GetObjects` with `reply_ids`
+    /// as the not-sent list, then an empty pack stream.
+    fn get_objects_against_hostile_reply(reply_ids: Vec<scl_core::ObjectId>) -> Error {
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let f = wire::read_frame(&mut server_read).unwrap();
+            assert!(matches!(
+                wire::Request::decode(&f).unwrap(),
+                wire::Request::Hello { .. }
+            ));
+            wire::write_ok(&mut server_write, &wire::u32_body(wire::PROTOCOL_VERSION)).unwrap();
+            let f = wire::read_frame(&mut server_read).unwrap();
+            assert!(matches!(
+                wire::Request::decode(&f).unwrap(),
+                wire::Request::GetObjects { .. }
+            ));
+            wire::write_ok(&mut server_write, &wire::ids_body(&reply_ids)).unwrap();
+        });
+        let client = WireClient::handshake(client_read, client_write).unwrap();
+        let id = Object::blob(b"wanted".to_vec()).id();
+        let err = client.get_objects(&[id], &mut Vec::new()).unwrap_err();
+        server.join().unwrap();
+        err
+    }
+
+    #[test]
+    fn get_objects_rejects_a_not_sent_list_longer_than_the_request() {
+        let id = Object::blob(b"wanted".to_vec()).id();
+        let other = Object::blob(b"other".to_vec()).id();
+        let err = get_objects_against_hostile_reply(vec![id, other]);
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn get_objects_rejects_a_duplicated_not_sent_id() {
+        let id = Object::blob(b"wanted".to_vec()).id();
+        // Within the one-id cap this is still a duplicate once the list is
+        // asked to hold two copies of the same id.
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let _ = wire::read_frame(&mut server_read).unwrap();
+            wire::write_ok(&mut server_write, &wire::u32_body(wire::PROTOCOL_VERSION)).unwrap();
+            let _ = wire::read_frame(&mut server_read).unwrap();
+            wire::write_ok(&mut server_write, &wire::ids_body(&[id, id])).unwrap();
+        });
+        let client = WireClient::handshake(client_read, client_write).unwrap();
+        let other = Object::blob(b"other".to_vec()).id();
+        let err = client
+            .get_objects(&[id, other], &mut Vec::new())
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(&err, Error::Protocol(m) if m.contains("more than once")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_desynced_stdio_transport_kills_a_child_that_never_exits_on_drop() {
+        // `sleep` ignores the wire protocol and never exits on its own, which
+        // is what a child blocked writing an abandoned reply looks like.
+        let mut child = Command::new("sleep")
+            .arg("600")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let t = StdioTransport {
+            client: WireClient {
+                rw: std::cell::RefCell::new((stdout, stdin)),
+            },
+            child,
+            desynced: std::cell::Cell::new(true),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(t);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("drop must kill the child instead of waiting for it");
     }
 
     #[test]

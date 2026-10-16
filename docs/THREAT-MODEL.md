@@ -372,6 +372,33 @@ too, not just the src-control-side metadata.
   described above, so a hostile or corrupted bucket gets no more leverage
   against a serve instance than it would against a direct `sc` client.
 
+## By-id object reads (`GetObjects`, `sc cat`) — ADR-0047
+
+- **A hash is not a capability.** Anyone who can reach a served repo and
+  knows (or guesses) an object id can ask for it by id. Reads are scoped by
+  who may connect (ADR-0040 tokens, `--read-only`), not by which ids they
+  name. This is no wider than `GetObject`, which already returns any stored
+  object by id.
+- **Sealed private-branch objects and manifests are refused by kind**
+  (`Object::Sealed`, `Object::Manifest`) and reported as "not sent", the same
+  reply as an absent id. This keeps `GetObjects` consistent with filtered
+  `GetPack`. It is **not** a confidentiality boundary: those objects are
+  ciphertext, an unfiltered fetch still serves them, and `HasObject` still
+  reveals whether an id exists. `GetObject` is unchanged and still serves any
+  kind; closing that is a tracked follow-on, not part of this phase.
+- **The client trusts nothing in the reply.** Every record is BLAKE3-verified,
+  and the reply must partition the request exactly (nothing unrequested,
+  nothing both sent and refused, nothing omitted) before any object is
+  written. A hostile remote can at worst answer "not sent"; it cannot plant an
+  object under another id or smuggle in extras. The reply stream a client will
+  read is capped at 1 GiB.
+- **Server cost is bounded per request:** 1024 ids (checked while decoding,
+  before any id is read), the server's `--max-pack-size` over the summed
+  encoded size, and `MAX_OBJECT_SIZE` per object.
+- **Laziness is a local opt-in.** `.sc/promisor-lazy` is never committed or
+  transferred; without it a partial clone never dials the remote after clone,
+  and `SC_OFFLINE=1` forces that per process.
+
 ## Untrusted-input hardening (DoS) — ADR-0039
 
 - A single `MAX_OBJECT_SIZE` (256 MiB) caps every untrusted length: wire frames,

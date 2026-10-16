@@ -303,6 +303,12 @@ enum Cmd {
         /// over a git-bridge remote.
         #[arg(long)]
         filter: Vec<String>,
+        /// Mark the partial clone lazy (P37): `sc cat` may fetch the trees
+        /// and blobs it needs from the promisor remote by object id, instead
+        /// of failing with a gap error. `SC_OFFLINE=1` turns it off per
+        /// process. Requires `--filter`.
+        #[arg(long, requires = "filter")]
+        lazy: bool,
     },
     /// Serve a repo to a remote `sc` client, either over stdin/stdout
     /// (invoked by `ssh` for ssh:// remotes) or over TCP (`sc+http://`
@@ -499,8 +505,22 @@ enum Cmd {
         /// and merge/pick/rebase/`ws harvest`/`sc work`/export/sparse
         /// disable all work again. Mutually exclusive with `prefixes`
         /// (P27 final review I2).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "lazy")]
         all: bool,
+        /// Mark this partial clone lazy (P37): `sc cat` may fetch missing
+        /// trees and blobs by object id (`SC_OFFLINE=1` disables it per
+        /// process). May be given with no prefixes.
+        #[arg(long)]
+        lazy: bool,
+    },
+    /// Print one file as of a ref: `sc cat <ref>:<path>` (P37). On a lazy
+    /// partial clone, missing trees and the blob are fetched by object id.
+    /// Public content only: protected paths and private branches are refused.
+    /// `<ref>` is a branch or remote-tracking ref (`main`, `origin/main`);
+    /// `HEAD` is not accepted.
+    Cat {
+        /// `<ref>:<path>`, e.g. `main:docs/api/guide.md`.
+        target: String,
     },
     /// Session transcript operations (P30): attach a sealed agent-session
     /// transcript to a commit, list/inspect them, and sign them.
@@ -942,7 +962,9 @@ fn main() -> Result<()> {
             dst,
             git,
             filter,
-        } => run_clone(src, dst, git, filter),
+            lazy,
+        } => run_clone(src, dst, git, filter, lazy),
+        Cmd::Cat { target } => run_cat(&target),
         Cmd::Serve {
             sub,
             stdio,
@@ -1022,7 +1044,11 @@ fn main() -> Result<()> {
         Cmd::Sign { r#ref, identity } => run_sign(&r#ref, identity),
         Cmd::Verify { r#ref, require } => run_verify(r#ref, require),
         Cmd::Sparse { op } => run_sparse(op),
-        Cmd::Backfill { prefixes, all } => run_backfill(prefixes, all),
+        Cmd::Backfill {
+            prefixes,
+            all,
+            lazy,
+        } => run_backfill(prefixes, all, lazy),
         Cmd::Transcript { op } => run_transcript(op),
     }
 }
@@ -3395,7 +3421,20 @@ fn resolve_ids_to_pubkeys(
     Ok(out)
 }
 
-fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>) -> Result<()> {
+/// A relative local clone source is recorded as the remote and promisor
+/// origin; resolved from inside the clone it would name the wrong directory,
+/// so persist the absolute path. URLs (`ssh://`, `sc+http://`, ...) and paths
+/// that do not resolve are returned unchanged.
+fn absolute_local_source(src: String) -> String {
+    if src.contains("://") {
+        return src;
+    }
+    std::fs::canonicalize(&src)
+        .map(|p| p.display().to_string())
+        .unwrap_or(src)
+}
+
+fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>, lazy: bool) -> Result<()> {
     // Auto-detect unambiguous git URL forms (https/http, scp-style, file://):
     // those can never be sc-native, so no flag is needed. Bare `ssh://` is
     // ambiguous — it means an sc-native remote (ADR-0022) unless `--git`
@@ -3407,8 +3446,12 @@ fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>) -> Resul
         }
         return run_clone_git(&src, &dst);
     }
+    let src = absolute_local_source(src);
     let filter_opt = (!filter.is_empty()).then_some(filter.as_slice());
     let repo = scl_repo::Repo::clone_url_filtered(&src, &dst, filter_opt)?;
+    if lazy {
+        scl_repo::promisor::set_lazy(repo.layout(), true)?;
+    }
     let n = repo.branches()?.len();
     if filter_opt.is_some() {
         println!(
@@ -3428,8 +3471,20 @@ fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>) -> Resul
 /// origin and widen `.sc/promisor`. Errors if this repo is not a partial
 /// clone. `--all` ignores `prefixes` and instead fetches every remaining
 /// object, then removes `.sc/promisor` entirely (P27 final review I2).
-fn run_backfill(prefixes: Vec<String>, all: bool) -> Result<()> {
+fn run_backfill(prefixes: Vec<String>, all: bool, lazy: bool) -> Result<()> {
     let repo = open_repo()?;
+    if lazy {
+        if repo.promisor()?.is_none() {
+            anyhow::bail!("not a partial clone (.sc/promisor absent); --lazy has nothing to mark");
+        }
+        if !prefixes.is_empty() {
+            repo.backfill(&prefixes)?;
+            println!("backfilled {} prefix(es)", prefixes.len());
+        }
+        scl_repo::promisor::set_lazy(repo.layout(), true)?;
+        println!("marked lazy: `sc cat` may fetch missing objects by id");
+        return Ok(());
+    }
     if all {
         if !prefixes.is_empty() {
             anyhow::bail!("--all fetches every remaining object; pass either --all or explicit prefixes, not both");
@@ -3442,6 +3497,20 @@ fn run_backfill(prefixes: Vec<String>, all: bool) -> Result<()> {
     }
     repo.backfill(&prefixes)?;
     println!("backfilled {} prefix(es)", prefixes.len());
+    Ok(())
+}
+
+/// `sc cat <ref>:<path>`: write one file's bytes to stdout. Branch names are
+/// flat (no `:`), so the first `:` splits ref from path.
+fn run_cat(target: &str) -> Result<()> {
+    let (refname, path) = target
+        .split_once(':')
+        .filter(|(r, p)| !r.is_empty() && !p.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("expected <ref>:<path>, got '{target}'"))?;
+    let repo = open_repo()?;
+    let bytes = repo.cat_at(refname, path)?;
+    use std::io::Write;
+    std::io::stdout().write_all(&bytes)?;
     Ok(())
 }
 
@@ -4586,6 +4655,7 @@ mod tests {
             dst.clone(),
             false,
             Vec::new(),
+            false,
         )
         .unwrap();
         let repo = scl_repo::Repo::open(&dst).unwrap();
@@ -4600,6 +4670,21 @@ mod tests {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clone_source_is_recorded_as_an_absolute_path_but_urls_are_untouched() {
+        // A relative source would resolve against the clone's own directory
+        // once the user cd's into it, so the recorded origin must be absolute.
+        let abs = absolute_local_source(".".to_string());
+        assert!(std::path::Path::new(&abs).is_absolute(), "got {abs}");
+        for url in ["ssh://host/srv/repo", "sc+http://127.0.0.1:1/x"] {
+            assert_eq!(absolute_local_source(url.to_string()), url);
+        }
+        assert_eq!(
+            absolute_local_source("no/such/dir/anywhere".to_string()),
+            "no/such/dir/anywhere"
+        );
     }
 
     #[test]
@@ -4620,6 +4705,7 @@ mod tests {
             root.join("cloned-ssh"),
             false,
             Vec::new(),
+            false,
         )
         .unwrap_err();
         std::env::remove_var("SC_SSH");

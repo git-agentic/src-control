@@ -296,6 +296,23 @@ cargo run --bin sc -- backfill --all          # fetch EVERY remaining object (no
                                               # genuine full clone and merge/pick/rebase/ws
                                               # fork/harvest/sc work/export/sparse disable all
                                               # work again (P27 final review I2)
+cargo run --bin sc -- clone --filter <prefix…> --lazy <src> <dst>
+                                              # lazy partial clone (P37): also writes
+                                              # .sc/promisor-lazy so `sc cat` may fetch missing
+                                              # trees/blobs by object id; requires --filter
+cargo run --bin sc -- backfill --lazy [prefix…]
+                                              # mark an existing partial clone lazy (P37); with
+                                              # prefixes, also backfills them; conflicts --all
+cargo run --bin sc -- cat <ref>:<path>        # print one file as of a ref (P37). On a lazy
+                                              # partial clone fetches only the absent trees and
+                                              # the blob on that path (one GetObjects round trip
+                                              # per level). SC_OFFLINE=1 forces the gap error.
+                                              # Refuses protected paths and private branches
+bash demo/run_lazy_fetch_demo.sh              # by-id fetch proof (P37a): cat of one path adds
+                                              # exactly 3 objects (2 trees + blob), the sibling
+                                              # stays unfetched, offline/non-lazy keep the gap
+                                              # error, and a read-only sc+http server answers
+                                              # GetObjects (protocol v5)
 bash demo/run_partial_clone_demo.sh           # partial clone proof (P27): sc clone --filter
                                               # src/ fetches fewer objects than a full clone
                                               # (object-store count + sc verify's gap report);

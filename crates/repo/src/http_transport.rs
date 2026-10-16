@@ -524,6 +524,9 @@ impl Transport for HttpTransport {
     fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
         self.client.put_pack(src)
     }
+    fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
+        self.client.get_objects(ids, out)
+    }
 }
 
 /// Bound on how long an accepted connection may take to send its HTTP
