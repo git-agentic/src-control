@@ -551,12 +551,12 @@ across every phase.
 **P37b — presence-based walks and the lifted P27 refusals (proposed).**
 P37a (built) added the batched `GetObjects` verb and `sc cat`; the remaining
 work needs push, verify and gc to ask "is this object present?" instead of "is
-this path in the filter?", then sparse widen over a filled prefix, then merge,
-rebase, `ws`, `work` and `export` on partial clones. Design (merge, replay and
-sessions are directions only), phasing
-(37b-i to 37b-v) and open questions in
-[ADR-0048](docs/adr/0048-presence-based-partial-clones.md); `export` and
-`sparse disable` are decided to stay refused.
+this path in the filter?" (37b-i, which also fixes gc and fast-forward failing
+after an ordinary fetch on a partial clone), then sparse widen over a filled
+prefix (37b-ii). Merge, rebase and sessions on partial clones are directions
+with constraints, each needing its own design record; `export` and `sparse
+disable` stay refused. Design and open questions in
+[ADR-0048](docs/adr/0048-presence-based-partial-clones.md).
 
 ## Completed phases (usability-first ordering)
 

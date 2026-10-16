@@ -23,7 +23,7 @@ therefore left out of the reply, and stays absent. Reproduced on main: the
 origin adds `docs/readme.txt`, the clone is made with `--filter src/`, the
 origin then adds an identical `src/readme.txt`, the clone fetches. `sc gc` and
 a fast-forward `sc merge` then fail with `object … not found`, while `sc
-verify` reports only the `docs/` gap. The cause is that the filtered walk
+verify` exits successfully and reports only the expected `docs/` gap. The cause is that the filtered walk
 never reads blobs (`reachable.rs:347`), so a missing in-filter blob is only
 found later, by `write_pack`.
 
@@ -54,11 +54,18 @@ A partial clone is a store plus one promise.
 > **Promise P.** Every object id referenced by an object reachable from a
 > local root that the store lacks is held by the origin.
 
-P holds after clone, after fetch (the origin built the reply from its own
-graph), after a fill, and after any local write that only carries ids read
+P holds after clone, after a fetch **from the origin** (it built the reply from
+its own graph), after a fill, and after any local write that only carries ids read
 from an existing tree entry (commit graft). Hash verification at ingest proves
 identity, not that the sender has a complete closure, so P is a statement about
-the origin, not something the client can prove locally. P can be broken by the
+the origin, not something the client can prove locally. P is about the
+promisor origin only. A fetch from any other remote can leave a gap that the
+origin does not hold (that remote subtracted the closure of a have it holds and
+the origin may not), and `Filler` only ever dials the origin. So **a partial
+clone fetches from its promisor origin only**: `sc fetch <other>` is refused on
+a partial clone in 37b-i, with a hint to fetch from the origin or `sc backfill
+--all` to convert to a full clone first. This is a behavior change and needs a
+test. P can be broken by the
 origin pruning history a clone still points at; that hazard is the same as in
 git partial clones and is out of scope.
 
@@ -77,8 +84,10 @@ Consequences:
 
 Add `reachable::reachable_objects_partial(store, tips)`. It descends every
 present tree and records an absent child as a gap with the tree that references
-it. It takes no filter. Snapshots, parents, secrets and transcripts stay
-strict: those are never gaps. A private branch's manifest keeps the handling
+it. It takes no filter. A snapshot's **root tree** can be absent too (a new
+commit that moves an old out-of-filter subtree to the root is omitted by the
+`haves` subtraction), so an absent root is a gap, not an error. Snapshots,
+parents, secrets and transcripts stay strict: those are never gaps. A private branch's manifest keeps the handling
 the filtered walk already gives it (the closure list, public base, anchors and
 superseded-manifest chain are walked, sealed ids are opaque leaves). Verdicts do not depend on path, so the ordinary
 bare-id expansion dedup applies (the path-keyed dedup of the filtered walk is
@@ -125,8 +134,8 @@ new tip before it moves a ref (cost proportional to the new objects) would
 close it and is open question 1.
 
 Scope: native remotes only (local path, ssh, http, bucket; a bucket supports
-the check through its committed object index). Git remotes bypass
-`Repo::push` and have no native-id check; a partial clone does not push to one.
+the check through its committed object index). Git remotes are refused up
+front for a partial clone (decision 6).
 
 Cost: one `has_object` per distinct gap id. The gap set is the cut of the
 present region (siblings along the paths to present prefixes), not the repo,
@@ -220,7 +229,10 @@ truth:
   passed in, not from the filter prefixes.
 
 `sc sparse disable` stays refused on a partial clone; whole history and a full
-tree stay `sc backfill --all`.
+tree stay `sc backfill --all`. A `sc sparse set` with no prefixes means a full
+checkout (it equals disable), so it is refused on a partial clone too, in
+37b-i; otherwise `ensure_view` would fill the whole tip and persist a full
+spec, bypassing the refusal.
 
 ### 5. Reply size limits
 
@@ -233,6 +245,9 @@ zstd framing). Decisions:
   `min(--max-pack-size, 512 MiB)` where a `--max-pack-size` of 0 means
   unlimited. Headroom to the client's 1 GiB read cap covers framing and
   incompressible data.
+- The cap applies to `LocalTransport::get_objects` as well, which today builds
+  with no limit (`build_objects_tempfile(ids, 0)`). A lazy clone whose promisor
+  is a local path would otherwise spool up to 1024 large blobs in one request.
 - The over-cap refusal happens before any pack byte is written, so the
   connection stays in sync. The client splits the batch in half and retries.
   A batch of one that is still refused is final and is returned as an error;
@@ -274,13 +289,19 @@ review established, as constraints on that work:
   partial clone instead of an explicit refusal (`rewrap.rs:166`,
   `protect_ops.rs:118`, switching away from a private branch at `repo.rs:1825`).
   They get the explicit refusal in 37b-i; lifting them is not planned.
+- `sc push` to a **git** remote bypasses `Repo::push` and `export` and reaches
+  `export_branch` without the partial-clone guard, so it would fail partway
+  through the export walk at the first absent object. 37b-i adds the same
+  up-front refusal that `sc export` has.
 
 ## Phasing
 
 - **37b-i, engine.** `reachable_objects_partial`; gc, push and verify on it;
   the push gap-edge check; graft authority for new names as the union;
   materialize takes the old spec; the `ensure_view` preflight at every
-  materializer site; explicit refusals for the commands above. Regression tests: the
+  materializer site; refusals for the commands above, for `sc push` to a git
+  remote, for `sc fetch` from a non-origin remote, and for a zero-prefix
+  `sc sparse set`. Regression tests: the
   fetch-then-gc repro from the Context, the filtered-`get_pack`-still-cuts
   test, a lost-local-object push that must refuse, a push to a non-mirror
   remote. Existing partial-clone demos stay green unchanged.
