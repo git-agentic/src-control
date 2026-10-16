@@ -753,6 +753,8 @@ scale-&-reach horizon):
   Threading gap-tolerance through `three_way`/replay/`ws::harvest`
   individually is the follow-on if the "backfill to a full clone first"
   workaround proves too coarse in practice.
+  **Now scoped as P37b (ADR-0047, Proposed):** lifted one operation at a
+  time on top of the P37a `fill_gaps` seam.
 - **Blob-size/object-count clone filters (P27).** `sc clone --filter` is
   prefix-only, matching the sparse path-boundary machinery already built;
   git's `--filter=blob:limit` size-based filtering is a separate axis,

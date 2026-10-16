@@ -50,21 +50,38 @@ operation entry points. `Store::get` stays network-free, permanently.
    filter *plans first*: it walks the trees it already holds, collects the
    absent child ids (the "frontier"), batches them into one `GetObjects`,
    verifies every returned object against the requested id and
-   `MAX_OBJECT_SIZE`, ingests atomically (the P25 two-pass
-   verify-then-commit), and repeats per tree depth until the plan is
-   satisfied. The operation then runs unchanged against a store that now has
-   what it needs. Cost: one round trip per directory depth, not per object.
-4. **Opt-in, not default.** `.sc/promisor` gains `lazy = true`, set by `sc
-   clone --filter <prefix…> --lazy` or `sc backfill --lazy`. Without it the
-   P27 behavior is byte-identical: the gap error with the `sc backfill` hint.
-   With it, the entry points below call `fill_gaps` before proceeding.
-   `SC_OFFLINE=1` (and `--offline`) force the gap error even when `lazy` is
-   set, so offline use stays predictable.
+   `MAX_OBJECT_SIZE`, and ingests each depth's batch verify-before-write (the
+   P25 two-pass: every record is checked before any is written). This is
+   integrity, **not** transactionality: objects are content-addressed and
+   immutable, so a batch that lands before a later depth fails is simply
+   retained, and a retry recomputes the frontier from *current presence* and
+   resumes where it stopped. An id the server reports missing that the plan
+   requires is terminal (the plan fails with the gap error; nothing dependent
+   runs). The dependent operation mutates only after the whole plan is
+   satisfied. Fetched objects are ordinary store objects, so GC reachability
+   treats them like any other; `fill_gaps` holds the repo lock across a plan
+   so a concurrent `sc gc` cannot prune a half-filled frontier. Cost: one
+   round trip per directory depth, not per object.
+4. **Opt-in, not default.** Laziness is recorded in a **separate marker file,
+   `.sc/promisor-lazy`** (local, uncommitted), set by `sc clone --filter
+   <prefix…> --lazy` or `sc backfill --lazy`. It is deliberately *not* a field
+   in `.sc/promisor`: that file's format is `origin <url>` followed by one
+   path prefix per line (`promisor::load`), and a prefix such as `lazy = true`
+   is a legal path, so a new field would silently reinterpret a legacy clone's
+   filter. Without the marker the P27 behavior is byte-identical: the gap
+   error with the `sc backfill` hint. With it, the entry points below call
+   `fill_gaps` before proceeding. `SC_OFFLINE=1` (and `--offline`) force the
+   gap error even when the marker is present, so offline use stays
+   predictable.
 5. **Entry points that may call `fill_gaps`** (an exhaustive allow-list,
-   pinned by a test that greps for the call): `diff`/`log -p`/`show` of
-   out-of-filter paths, `sparse set`/`disable` widening, `switch`/materialize
-   of a wider sparse view, and — in phase 37b — merge, cherry-pick/rebase,
-   `ws fork`/`harvest`, `work` and `export`. Everything else, including gc,
+   pinned by a test that greps for the call). In 37a, only operations that
+   exist today and can request an out-of-filter path: `sparse set`/`disable`
+   widening and the `switch`/materialize that follows it; plus one **new**
+   read surface scoped into 37a, `sc cat <ref>:<path>` (print one path at a
+   ref). Today's `sc diff` compares the working tree to HEAD only and `sc log`
+   has no patch output, so neither is an entry point until a later phase gives
+   them revision/path arguments. In 37b: merge, cherry-pick/rebase, `ws
+   fork`/`harvest`, `work` and `export`. Everything else, including gc,
    verify and the desktop read model (ADR-0045), never touches the network.
 6. **Gap semantics change from "out of filter" to "absent".** `sc verify`
    currently counts gaps by filter membership. Once fill-gap can fetch
@@ -80,10 +97,19 @@ have. Rules for `GetObjects`, in order of preference:
 
 - It is **read-scope**: a `--read-only` token (ADR-0040) may call it; no
   write verb is implied.
-- It **never returns private-branch objects** (ADR-0044) to a caller who could
-  not receive them through a filtered `GetPack` today — the same
-  `filter_manifest_wants` exclusion applies, so a sealed-branch manifest or
-  member id is reported "missing", indistinguishable from absent.
+- It **must not be a bypass of private-branch exclusion** (ADR-0044). Today a
+  filtered `GetPack` excludes private branches only by dropping wants that
+  resolve to a branch *manifest* (`filter_manifest_wants`); sealed *member*
+  objects are not recognized by that helper, and the existing single-object
+  `GetObject` verb (and `LocalTransport::get_object`) returns any stored
+  object by id. Reusing the manifest filter would therefore **not** protect
+  member ids. `GetObjects` (and `GetObject`, which has the same exposure
+  today) need a member-level authorization decision before 37a: either the
+  server recognizes sealed object kinds and answers "missing" for callers
+  outside the recipient set, or the policy is explicitly relaxed because
+  sealed members are ciphertext under a per-branch KEK. That choice, applied
+  uniformly to both verbs and to the default/local `get_objects`
+  implementation, is the first open question below and gates 37a.
 - Protected-path ciphertext is returned as-is, exactly as it already is in
   every pack: confidentiality rests on encryption, not on withholding.
 - Caps: ids per request, aggregate bytes per request (reusing
@@ -91,7 +117,7 @@ have. Rules for `GetObjects`, in order of preference:
   Over-limit requests fail with `EC_TOO_LARGE`; the client splits and retries.
 
 Whether to additionally require that a requested id be *reachable from a
-visible ref* (a walk, so not O(request)) is an open question — see below.
+visible ref* (a walk, so not O(request)) is part of open question 1 below.
 
 ## Consequences
 
@@ -113,7 +139,10 @@ visible ref* (a walk, so not O(request)) is an open question — see below.
 
 ## Open questions
 
-1. **Reachability check on by-id reads.** O(request) is the point of the verb;
+1. **Member-level authorization and reachability on by-id reads (gates
+   37a).** Choose between kind-based refusal of sealed members, a
+   visible-ref reachability check, or an explicit relaxation; apply it to
+   `GetObject` too. O(request) is the point of the verb;
    a reachability check undoes it. Candidate: cache a per-connection
    "visible set" from `ListRefs` tips and check membership lazily via the
    tree the id was named in. Decide with a threat-model pass before 37a lands.
@@ -143,9 +172,10 @@ visible ref* (a walk, so not O(request)) is an open question — see below.
 
 ## Phasing
 
-- **37a** — `GetObjects` verb, `Transport::get_objects`, `Repo::fill_gaps`,
-  `--lazy`/`SC_OFFLINE`, read-only entry points (diff/show/sparse-widen/
-  switch). Demo: `demo/run_lazy_fetch_demo.sh` counts objects fetched and
+- **37a** — gated on open question 1. `GetObjects` verb,
+  `Transport::get_objects`, `Repo::fill_gaps`, `--lazy` (the
+  `.sc/promisor-lazy` marker)/`SC_OFFLINE`, entry points: sparse widen +
+  switch, and the new `sc cat <ref>:<path>`. Demo: `demo/run_lazy_fetch_demo.sh` counts objects fetched and
   proves `Store::get` stays offline.
 - **37b** — lift the P27 refusals (merge, replay, ws, work, export), one
   operation per task.
