@@ -56,32 +56,38 @@ impl Repo {
 
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
-        let ingested = ingest_pack_file_checked(&self.layout, &mut store, guard.path(), |found| {
-            if let Some(id) = found.difference(&requested).next() {
-                return Err(Error::Protocol(format!(
-                    "remote sent unrequested object {id}"
-                )));
-            }
-            if let Some(id) = not_sent_set.difference(&requested).next() {
-                return Err(Error::Protocol(format!(
-                    "remote listed unrequested object {id} as not sent"
-                )));
-            }
-            if let Some(id) = found.intersection(&not_sent_set).next() {
-                return Err(Error::Protocol(format!(
-                    "remote both sent and refused object {id}"
-                )));
-            }
-            if let Some(id) = requested
-                .iter()
-                .find(|id| !found.contains(id) && !not_sent_set.contains(id))
-            {
-                return Err(Error::Protocol(format!(
-                    "remote neither sent nor refused object {id}"
-                )));
-            }
-            Ok(())
-        })?;
+        let ingested = ingest_pack_file_checked(
+            &self.layout,
+            &mut store,
+            guard.path(),
+            Some(requested.len()),
+            |found| {
+                if let Some(id) = found.difference(&requested).next() {
+                    return Err(Error::Protocol(format!(
+                        "remote sent unrequested object {id}"
+                    )));
+                }
+                if let Some(id) = not_sent_set.difference(&requested).next() {
+                    return Err(Error::Protocol(format!(
+                        "remote listed unrequested object {id} as not sent"
+                    )));
+                }
+                if let Some(id) = found.intersection(&not_sent_set).next() {
+                    return Err(Error::Protocol(format!(
+                        "remote both sent and refused object {id}"
+                    )));
+                }
+                if let Some(id) = requested
+                    .iter()
+                    .find(|id| !found.contains(id) && !not_sent_set.contains(id))
+                {
+                    return Err(Error::Protocol(format!(
+                        "remote neither sent nor refused object {id}"
+                    )));
+                }
+                Ok(())
+            },
+        )?;
         if let Some(id) = not_sent.first() {
             return Err(Error::Core(scl_core::Error::NotFound(*id)));
         }
@@ -297,8 +303,12 @@ mod tests {
         }
 
         fn cleanup(self) {
-            let _ = std::fs::remove_dir_all(&self.src_root);
-            let _ = std::fs::remove_dir_all(&self.dst_root);
+            for root in [&self.src_root, &self.dst_root] {
+                if root.exists() {
+                    std::fs::remove_dir_all(root).unwrap();
+                }
+                assert!(!root.exists(), "fixture {} must be removed", root.display());
+            }
         }
     }
 
@@ -433,6 +443,73 @@ mod tests {
         fx.cleanup();
     }
 
+    #[test]
+    fn verify_gap_count_is_unchanged_by_a_fill() {
+        let fx = Fixture::new("verify");
+        let dst = fx.clone(true);
+        let before = dst.partial_gap_count(&[fx.tip]).unwrap();
+        assert!(
+            before.is_some_and(|n| n > 0),
+            "docs/ is a gap before the fill"
+        );
+        dst.cat_at("main", "docs/api/guide.md").unwrap();
+        assert_eq!(
+            dst.partial_gap_count(&[fx.tip]).unwrap(),
+            before,
+            "a fill adds objects but never changes the filter, so the filter-scoped count is stable"
+        );
+        fx.cleanup();
+    }
+
+    #[test]
+    fn cat_refuses_protected_paths_and_private_branches() {
+        let root = std::env::temp_dir().join(format!("scl-fill-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"classified").unwrap();
+        std::fs::write(root.join("open.txt"), b"public").unwrap();
+        repo.commit("t", "base").unwrap();
+
+        let err = repo.cat_at("main", "secret/a.txt").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("protected")),
+            "got {err:?}"
+        );
+        assert_eq!(repo.cat_at("main", "open.txt").unwrap(), b"public");
+
+        repo.branch_private("fix", &alice_sk, &[], &[]).unwrap();
+        let err = repo.cat_at("fix", "open.txt").unwrap_err();
+        assert!(matches!(err, Error::PrivateUnsupported(_)), "got {err:?}");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// A transport that repeats one requested object many times, to prove the
+    /// receiver stops at the requested record count instead of decompressing
+    /// and hashing every duplicate.
+    #[test]
+    fn fetch_rejects_duplicate_records_before_processing_them_all() {
+        let fx = Fixture::new("dups");
+        let dst = fx.clone(true);
+        let want = Object::blob(b"wanted".to_vec());
+        let flood = Scripted {
+            send: vec![want.clone(); 50],
+            not_sent: vec![],
+        };
+        let err = dst.fetch_by_id_from(&flood, &[want.id()]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Core(scl_core::Error::PackCorrupt(m)) if m.contains("requested")),
+            "got {err:?}"
+        );
+        assert!(!fx.has(&dst, &want.id()), "a rejected pack lands nothing");
+        fx.cleanup();
+    }
+
     /// A transport whose `get_objects` replies with a scripted pack and
     /// not-sent list, to exercise the receiver's reply validation.
     struct Scripted {
@@ -490,12 +567,15 @@ mod tests {
         let other = Object::blob(b"also requested".to_vec());
         let store_has = |id: &ObjectId| fx.has(&dst, id);
 
-        // Unrequested object smuggled in.
+        // Unrequested object smuggled in, within the requested record count
+        // (a longer pack is caught earlier by the record bound).
         let liar = Scripted {
             send: vec![want.clone(), extra.clone()],
-            not_sent: vec![],
+            not_sent: vec![other.id()],
         };
-        let err = dst.fetch_by_id_from(&liar, &[want.id()]).unwrap_err();
+        let err = dst
+            .fetch_by_id_from(&liar, &[want.id(), other.id()])
+            .unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
         assert!(
             !store_has(&want.id()) && !store_has(&extra.id()),

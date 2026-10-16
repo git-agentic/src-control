@@ -115,9 +115,12 @@ while ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; do
 done
 HTTP="$W/http"
 "$SC" clone --filter src/ --lazy "sc+http://127.0.0.1:$PORT/repo" "$HTTP" >/dev/null
+HTTP_BEFORE=$(objects "$HTTP")
 (cd "$HTTP" && "$SC" cat main:docs/api/guide.bin) > "$W/http.out"
 cmp "$W/http.out" "$ORIGIN/docs/api/guide.bin" || fail "http cat must be byte-identical"
-echo "read-only sc+http server: lazy cat byte-identical ✔"
+[ "$(($(objects "$HTTP") - HTTP_BEFORE))" -eq 3 ] || fail "http cat must fetch exactly 3 objects, got $(($(objects "$HTTP") - HTTP_BEFORE))"
+[ "$(objects "$HTTP")" -lt "$FULL" ] || fail "http cat must leave the sibling blob unfetched"
+echo "read-only sc+http server: lazy cat byte-identical, +3 objects, sibling not fetched ✔"
 
 echo
 echo "RESULT: lazy by-id fetch verified (path-only fetch, offline/non-lazy gap errors, http v5)"

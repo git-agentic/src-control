@@ -516,6 +516,8 @@ enum Cmd {
     /// Print one file as of a ref: `sc cat <ref>:<path>` (P37). On a lazy
     /// partial clone, missing trees and the blob are fetched by object id.
     /// Public content only: protected paths and private branches are refused.
+    /// `<ref>` is a branch or remote-tracking ref (`main`, `origin/main`);
+    /// `HEAD` is not accepted.
     Cat {
         /// `<ref>:<path>`, e.g. `main:docs/api/guide.md`.
         target: String,

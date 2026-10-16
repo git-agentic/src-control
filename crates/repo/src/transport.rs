@@ -120,8 +120,11 @@ impl LocalTransport {
     /// servable objects, returning `(not_sent, pack)` (P37, ADR-0047). The
     /// shared core of [`Transport::get_objects`] and `wire::serve`'s
     /// `GetObjects` arm. Duplicate ids are served once. `max_bytes` (0 =
-    /// unlimited) bounds the summed encoded size, failing with
-    /// `PackTooLarge` before any pack byte is written.
+    /// unlimited) bounds the summed payload size (blob and sealed bytes; the
+    /// small structural kinds count as zero, which keeps this pass from
+    /// re-encoding every object just to measure it), and any single object
+    /// over `MAX_OBJECT_SIZE` is refused: every receiver would reject it. Both
+    /// fail with `PackTooLarge` before any pack byte is written.
     pub(crate) fn build_objects_tempfile(
         &self,
         ids: &[ObjectId],
@@ -140,7 +143,13 @@ impl LocalTransport {
             match store.get(id) {
                 Ok(obj) if refused_by_id(&obj) => not_sent.push(*id),
                 Ok(obj) => {
-                    total = total.saturating_add(obj.encode().len() as u64);
+                    let size = obj.blob_size() as u64;
+                    if size > scl_core::MAX_OBJECT_SIZE as u64 {
+                        return Err(Error::PackTooLarge(format!(
+                            "object {id} exceeds MAX_OBJECT_SIZE and cannot be transferred"
+                        )));
+                    }
+                    total = total.saturating_add(size);
                     if max_bytes > 0 && total > max_bytes {
                         return Err(Error::PackTooLarge(format!(
                             "by-id response exceeds the {max_bytes}-byte limit"
@@ -393,24 +402,36 @@ pub(crate) fn ingest_pack_file(
     store: &mut Store,
     path: &std::path::Path,
 ) -> Result<Vec<ObjectId>> {
-    ingest_pack_file_checked(layout, store, path, |_| Ok(()))
+    ingest_pack_file_checked(layout, store, path, None, |_| Ok(()))
 }
 
 /// [`ingest_pack_file`] with a gate between its two passes (P37): `check`
 /// sees the set of ids pass 1 verified and may veto the whole pack, so a
 /// receiver that knows what it asked for (`Repo`'s by-id fill) can reject
-/// unrequested objects before any of them is written.
+/// unrequested objects before any of them is written. `max_records` aborts
+/// pass 1 as soon as the pack holds more records than the caller asked for,
+/// so a peer cannot make the receiver decompress and hash the same large
+/// object over and over (a set of ids hides duplicate records).
 pub(crate) fn ingest_pack_file_checked(
     layout: &Layout,
     store: &mut Store,
     path: &std::path::Path,
+    max_records: Option<usize>,
     check: impl FnOnce(&std::collections::BTreeSet<ObjectId>) -> Result<()>,
 ) -> Result<Vec<ObjectId>> {
     // Pass 1: verify every record's hash; write nothing.
     {
         let f = std::fs::File::open(path)?;
         let mut seen = std::collections::BTreeSet::new();
+        let mut records = 0usize;
         scl_core::pack::parse_pack_reader(f, |id, _obj| {
+            records += 1;
+            if max_records.is_some_and(|max| records > max) {
+                return Err(scl_core::Error::PackCorrupt(format!(
+                    "pack holds more than the {} record(s) requested",
+                    max_records.unwrap_or(0)
+                )));
+            }
             seen.insert(id);
             Ok(())
         })?;
@@ -593,18 +614,35 @@ mod tests {
         let sealed = Object::Sealed(scl_core::SealedObj {
             payload: std::sync::Arc::from(b"ciphertext".to_vec().into_boxed_slice()),
         });
+        let manifest = Object::Manifest(scl_core::BranchManifest {
+            base: blob.id(),
+            prev: None,
+            anchors: vec![],
+            closure: vec![sealed.id()],
+            index_ct: vec![1, 2, 3],
+            kek_wraps: vec![],
+        });
         let absent = Object::blob(b"never stored".to_vec());
-        for o in [&blob, &sealed] {
+        for o in [&blob, &sealed, &manifest] {
             t.put_object(&o.id(), &o.encode()).unwrap();
         }
 
         let mut out = Vec::new();
         let not_sent = t
-            .get_objects(&[blob.id(), sealed.id(), absent.id(), blob.id()], &mut out)
+            .get_objects(
+                &[
+                    blob.id(),
+                    sealed.id(),
+                    manifest.id(),
+                    absent.id(),
+                    blob.id(),
+                ],
+                &mut out,
+            )
             .unwrap();
-        // Sealed is refused and absent is missing; the two are not
-        // distinguishable, and a duplicate request id is served once.
-        assert_eq!(not_sent, vec![sealed.id(), absent.id()]);
+        // Sealed and Manifest are refused and absent is missing; the three
+        // are not distinguishable, and a duplicate request id is served once.
+        assert_eq!(not_sent, vec![sealed.id(), manifest.id(), absent.id()]);
         let got = scl_core::pack::parse_pack(&out).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, blob.id());

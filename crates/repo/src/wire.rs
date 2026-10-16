@@ -208,9 +208,9 @@ impl<'a> Cur<'a> {
         let n = self.u32()? as usize;
         (0..n).map(|_| self.id()).collect()
     }
-    /// Like [`Cur::ids`], but rejects a count above `max` (and above what the
-    /// frame can hold) before decoding any id, so an oversize request is
-    /// refused without work proportional to its claimed length.
+    /// Like [`Cur::ids`], but rejects a count above `max` before decoding any
+    /// id, so an oversize request is refused without work proportional to its
+    /// claimed length. Nothing is pre-sized from the count.
     fn ids_capped(&mut self, max: usize) -> Result<Vec<ObjectId>> {
         let n = self.u32()? as usize;
         if n > max {
@@ -1917,6 +1917,8 @@ mod tests {
                 .encode(),
             )
             .unwrap();
+            // A follow-up request proves the session survives a capped reply.
+            write_frame(&mut input, &Request::HeadBranch.encode()).unwrap();
             let mut output = Vec::new();
             let policy = WirePolicy {
                 read_only: true,
@@ -1936,10 +1938,14 @@ mod tests {
         let mut pack = Vec::new();
         read_pack_stream(&mut rest, &mut pack, 0).unwrap();
         assert_eq!(scl_core::pack::parse_pack(&pack).unwrap().len(), 1);
+        let head = parse_response(read_frame_opt(&mut rest).unwrap().unwrap()).unwrap();
+        assert_eq!(decode_str_body(&head).unwrap(), "main");
 
         // A cap below the object's size fails the request, not the session.
-        let (reply, _) = run(100);
+        let (reply, mut rest) = run(100);
         assert!(matches!(reply.unwrap_err(), Error::PackTooLarge(_)));
+        let head = parse_response(read_frame_opt(&mut rest).unwrap().unwrap()).unwrap();
+        assert_eq!(decode_str_body(&head).unwrap(), "main");
         let _ = std::fs::remove_dir_all(&root);
     }
 

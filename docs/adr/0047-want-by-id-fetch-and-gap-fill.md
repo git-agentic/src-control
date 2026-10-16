@@ -108,9 +108,12 @@ not have. The rules for `GetObjects`:
 - Protected-path ciphertext is returned as-is, as in every pack:
   confidentiality rests on encryption, not on withholding.
 - Caps: 1024 ids per request (`MAX_GET_OBJECTS_IDS`, checked while decoding),
-  the server's `--max-pack-size` over the summed encoded size of a reply
-  (`PackTooLarge` before any pack byte is written), `MAX_OBJECT_SIZE` per
-  object, and a 1 GiB cap on the stream a client will read back.
+  the server's `--max-pack-size` over the summed payload size of a reply and
+  `MAX_OBJECT_SIZE` per object (both `PackTooLarge`, before any pack byte is
+  written), and a 1 GiB cap on the stream a client will read back. A client
+  also stops reading a pack as soon as it holds more records than it
+  requested, so repeating one large object cannot multiply the receiver's
+  decompress-and-hash work.
 
 ## Consequences
 
@@ -146,9 +149,14 @@ not have. The rules for `GetObjects`:
 3. **Merge on a partial clone** needs base, ours and theirs trees for only the
    conflicting paths. Whether tree ids alone suffice (identical ids need no
    fetch) or a server-assisted diff is needed is a 37b spike.
-4. **`GetObject` and unfiltered private transfers.** See the authorization
+4. **Reply size caps and batching.** The client reads at most 1 GiB per reply
+   while the server's default `--max-pack-size` is larger, so a batch that
+   crosses 1 GiB fails mid-stream and leaves that connection out of sync. 37a
+   sends one id per call so it cannot happen; 37b must split batches by size
+   or close the transport on that error.
+5. **`GetObject` and unfiltered private transfers.** See the authorization
    section.
-5. **Bucket remotes.** `sc+wal://` stores objects inside packs; by-id reads need
+6. **Bucket remotes.** `sc+wal://` stores objects inside packs; by-id reads need
    an object-to-pack index. Out of scope; partial clone from buckets stays
    refused.
 
