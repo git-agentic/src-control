@@ -6,6 +6,7 @@ pub(crate) mod cache;
 pub(crate) mod conflicts;
 pub mod diff3;
 pub mod error;
+pub mod fill;
 pub mod gc;
 pub mod git_marks;
 pub mod http_transport;

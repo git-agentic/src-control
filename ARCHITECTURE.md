@@ -1060,3 +1060,18 @@ at accepted `BranchManifest` metadata and becomes `private_opaque`; authors,
 messages, paths, timestamps, and inner topology never cross IPC. The WebView has
 no generic dialog, filesystem, URL, process, or object-store command. See
 ADR-0045.
+
+## Phase 37a — want-by-id fetch (built)
+
+A partial clone marked lazy (`.sc/promisor-lazy`) can read a path outside its
+fetch filter without `sc backfill`. `sc cat <ref>:<path>` walks from the ref's
+root tree; each absent tree, then the blob, is fetched with one `GetObjects`
+round trip (`PROTOCOL_VERSION` 5): the client names ids, the server answers
+with the objects it can serve plus the ids it will not send, with no haves and
+no reachability walk. `Store::get` stays network-free; the only code that dials
+the promisor after clone is `Repo::fetch_by_id_from` in `crates/repo/src/
+fill.rs`, which verifies the reply against the request before writing. A fill
+only adds objects, so push, gc and verify (filter-scoped walks) are unchanged.
+Sparse widening over a filled path and the lifted P27 refusals need
+presence-based walks and are phase 37b. See ADR-0047 and
+`docs/research/scion-evaluation.md`.

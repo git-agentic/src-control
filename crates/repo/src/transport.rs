@@ -64,6 +64,31 @@ pub trait Transport {
     /// each object into the store. Returns the contained ids. Refs are the
     /// caller's job.
     fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>>;
+
+    /// Batched by-id fetch (P37, ADR-0047): write a pack holding every object
+    /// of `ids` this remote can serve into `out`, and return the ids it did
+    /// NOT send, in request order. "Not sent" covers both an id the remote
+    /// lacks and an id it refuses to serve by id (sealed-branch objects), so
+    /// the two cannot be told apart. At most
+    /// [`crate::wire::MAX_GET_OBJECTS_IDS`] ids per call.
+    ///
+    /// The default refuses: only transports that can answer without a
+    /// reachability walk (local path, wire clients) implement it.
+    fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
+        let _ = (ids, out);
+        Err(Error::InvalidArgument(
+            "this remote does not support by-id object fetch".into(),
+        ))
+    }
+}
+
+/// Object kinds a by-id read never serves (ADR-0047): sealed private-branch
+/// members and branch manifests. Filtered transfers already exclude them
+/// (`filter_manifest_wants`); this keeps the by-id verb consistent with that
+/// rule. It is a consistency rule, not a confidentiality boundary: sealed
+/// objects are ciphertext and an unfiltered pack still serves them.
+fn refused_by_id(obj: &Object) -> bool {
+    matches!(obj, Object::Sealed(_) | Object::Manifest(_))
 }
 
 /// Transport over a remote `.sc/` directory on the local filesystem.
@@ -89,6 +114,46 @@ impl LocalTransport {
             layout,
             store: RefCell::new(store),
         })
+    }
+
+    /// Resolve a by-id request against this store into a temp pack of the
+    /// servable objects, returning `(not_sent, pack)` (P37, ADR-0047). The
+    /// shared core of [`Transport::get_objects`] and `wire::serve`'s
+    /// `GetObjects` arm. Duplicate ids are served once. `max_bytes` (0 =
+    /// unlimited) bounds the summed encoded size, failing with
+    /// `PackTooLarge` before any pack byte is written.
+    pub(crate) fn build_objects_tempfile(
+        &self,
+        ids: &[ObjectId],
+        max_bytes: u64,
+    ) -> Result<(Vec<ObjectId>, TempPackGuard)> {
+        use std::collections::BTreeSet;
+        let mut store = self.store.borrow_mut();
+        let mut seen = BTreeSet::new();
+        let mut found = Vec::new();
+        let mut not_sent = Vec::new();
+        let mut total: u64 = 0;
+        for id in ids {
+            if !seen.insert(*id) {
+                continue;
+            }
+            match store.get(id) {
+                Ok(obj) if refused_by_id(&obj) => not_sent.push(*id),
+                Ok(obj) => {
+                    total = total.saturating_add(obj.encode().len() as u64);
+                    if max_bytes > 0 && total > max_bytes {
+                        return Err(Error::PackTooLarge(format!(
+                            "by-id response exceeds the {max_bytes}-byte limit"
+                        )));
+                    }
+                    found.push(*id);
+                }
+                Err(scl_core::Error::NotFound(_)) => not_sent.push(*id),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let guard = write_ids_to_temp_pack(&self.layout, &mut store, &found)?;
+        Ok((not_sent, guard))
     }
 
     /// This transport's layout — `wire::serve` (a sibling module) needs it to
@@ -328,10 +393,28 @@ pub(crate) fn ingest_pack_file(
     store: &mut Store,
     path: &std::path::Path,
 ) -> Result<Vec<ObjectId>> {
+    ingest_pack_file_checked(layout, store, path, |_| Ok(()))
+}
+
+/// [`ingest_pack_file`] with a gate between its two passes (P37): `check`
+/// sees the set of ids pass 1 verified and may veto the whole pack, so a
+/// receiver that knows what it asked for (`Repo`'s by-id fill) can reject
+/// unrequested objects before any of them is written.
+pub(crate) fn ingest_pack_file_checked(
+    layout: &Layout,
+    store: &mut Store,
+    path: &std::path::Path,
+    check: impl FnOnce(&std::collections::BTreeSet<ObjectId>) -> Result<()>,
+) -> Result<Vec<ObjectId>> {
     // Pass 1: verify every record's hash; write nothing.
     {
         let f = std::fs::File::open(path)?;
-        scl_core::pack::parse_pack_reader(f, |_id, _obj| Ok(()))?;
+        let mut seen = std::collections::BTreeSet::new();
+        scl_core::pack::parse_pack_reader(f, |id, _obj| {
+            seen.insert(id);
+            Ok(())
+        })?;
+        check(&seen)?;
     }
     // Pass 2: every record verified in pass 1 — now write each into the store.
     let f = std::fs::File::open(path)?;
@@ -390,6 +473,19 @@ impl Transport for LocalTransport {
 
     fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
         Ok(self.store.borrow_mut().get(id)?.encode())
+    }
+
+    fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
+        if ids.len() > crate::wire::MAX_GET_OBJECTS_IDS {
+            return Err(Error::InvalidArgument(format!(
+                "by-id fetch takes at most {} ids per call",
+                crate::wire::MAX_GET_OBJECTS_IDS
+            )));
+        }
+        let (not_sent, guard) = self.build_objects_tempfile(ids, 0)?;
+        let mut f = std::fs::File::open(guard.path())?;
+        std::io::copy(&mut f, out)?;
+        Ok(not_sent)
     }
 
     fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
@@ -487,6 +583,57 @@ mod tests {
         std::fs::create_dir_all(layout.refs_heads_dir()).unwrap();
         crate::refs::write_head(&layout, "main").unwrap();
         layout
+    }
+
+    #[test]
+    fn local_get_objects_serves_found_and_reports_the_rest_not_sent() {
+        let layout = tmp_remote("getobjs");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let blob = Object::blob(b"servable".to_vec());
+        let sealed = Object::Sealed(scl_core::SealedObj {
+            payload: std::sync::Arc::from(b"ciphertext".to_vec().into_boxed_slice()),
+        });
+        let absent = Object::blob(b"never stored".to_vec());
+        for o in [&blob, &sealed] {
+            t.put_object(&o.id(), &o.encode()).unwrap();
+        }
+
+        let mut out = Vec::new();
+        let not_sent = t
+            .get_objects(&[blob.id(), sealed.id(), absent.id(), blob.id()], &mut out)
+            .unwrap();
+        // Sealed is refused and absent is missing; the two are not
+        // distinguishable, and a duplicate request id is served once.
+        assert_eq!(not_sent, vec![sealed.id(), absent.id()]);
+        let got = scl_core::pack::parse_pack(&out).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, blob.id());
+
+        // All-missing still yields a valid (empty) pack.
+        let mut out = Vec::new();
+        let not_sent = t.get_objects(&[absent.id()], &mut out).unwrap();
+        assert_eq!(not_sent, vec![absent.id()]);
+        assert!(scl_core::pack::parse_pack(&out).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn local_get_objects_enforces_the_size_cap_and_id_cap() {
+        let layout = tmp_remote("getobjs-cap");
+        let t = LocalTransport::open(&layout.root).unwrap();
+        let blob = Object::blob(vec![7u8; 4096]);
+        t.put_object(&blob.id(), &blob.encode()).unwrap();
+        assert!(matches!(
+            t.build_objects_tempfile(&[blob.id()], 100),
+            Err(Error::PackTooLarge(_))
+        ));
+        let too_many = vec![blob.id(); crate::wire::MAX_GET_OBJECTS_IDS + 1];
+        assert!(matches!(
+            t.get_objects(&too_many, &mut Vec::new()),
+            Err(Error::InvalidArgument(_))
+        ));
+        std::fs::remove_dir_all(&layout.root).unwrap();
     }
 
     #[test]

@@ -103,6 +103,13 @@ impl Layout {
     pub fn promisor_path(&self) -> PathBuf {
         self.dot_sc.join("promisor")
     }
+    /// `.sc/promisor-lazy` — empty marker (P37): this partial clone may fill
+    /// gaps from its promisor remote by object id (ADR-0047). A separate file,
+    /// not a field in `.sc/promisor`, because that file's lines after
+    /// `origin` are free-form path prefixes.
+    pub fn promisor_lazy_path(&self) -> PathBuf {
+        self.dot_sc.join("promisor-lazy")
+    }
     /// `.sc/serve-tokens.toml` — server access-control tokens (P29): each entry is
     /// `{label, hash = BLAKE3(raw token), scope}`. Presence of ≥1 entry turns on
     /// bearer auth for `sc serve --http`. Distinct from `recipients.toml`

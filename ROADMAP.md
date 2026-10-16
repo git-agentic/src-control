@@ -548,12 +548,12 @@ across every phase.
 
 ## Active
 
-**P37 — Want-by-id fetch and gap fill (proposed, not started).** Batched
-`GetObjects` verb + an explicit `fill_gaps` seam so partial clones can run
-merge/rebase/ws/work/export without `Store::get` ever touching the network;
-design in [ADR-0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md), prior art
-in `docs/research/scion-evaluation.md`. Phases: 37a (verb + read-only entry
-points), 37b (lift the P27 refusals).
+**P37b — presence-based walks and the lifted P27 refusals (proposed).**
+P37a (built) added the batched `GetObjects` verb and `sc cat`; the remaining
+work needs push, verify and gc to ask "is this object present?" instead of "is
+this path in the filter?", then sparse widen over a filled prefix, then merge,
+rebase, `ws`, `work` and `export` on partial clones. Design and open questions
+in [ADR-0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md).
 
 ## Completed phases (usability-first ordering)
 
@@ -591,6 +591,7 @@ points), 37b (lift the P27 refusals).
 | **P33 — Randomized protected encryption** | Close equality confirmation for new protected content | fresh DEK + nonce per seal, dual-read/randomized-write, keyed local stat cache, rewrap upgrade | [0043](docs/adr/0043-randomized-protected-encryption.md) |
 | **P34 — Private branches** | Keep an entire branch opaque before publication | sealed object closure behind a manifest; O(1) grant, KEK-rotating revoke, scanner-gated publish | [0044](docs/adr/0044-per-branch-access-control.md) |
 | **P35 — Native desktop browser** | Prove native `.sc` objects can power a polished visual tool | Tauri app opens a repository and browses refs, snapshot DAG/provenance, public trees, and first-parent diffs while locked/private states remain safe | [0045](docs/adr/0045-native-desktop-read-model.md) |
+| **P37a — Want-by-id fetch (`sc cat`)** | Read outside a partial clone's filter without backfilling everything | `sc clone --filter src/ --lazy`; `sc cat main:docs/api/guide.bin` fetches exactly the absent trees and the blob by object id (`GetObjects`, wire v5), sibling untouched; `SC_OFFLINE=1` and non-lazy clones keep the gap error; proven by `demo/run_lazy_fetch_demo.sh` | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -743,9 +744,9 @@ scale-&-reach horizon):
   origin automatically on any gap, matching git's promisor default. Real
   scope/risk (offline breakage, surprise latency, fetch-during-gc), so it
   stays deferred, not accidentally missing.
-  **Now scoped as P37 (ADR-0047, Proposed):** an opt-in explicit `fill_gaps`
-  seam over a batched by-id `GetObjects` verb, keeping `Store::get`
-  network-free.
+  **Now scoped as P37 (ADR-0047):** an opt-in `.sc/promisor-lazy` marker over a
+  batched by-id `GetObjects` verb, keeping `Store::get` network-free. P37a
+  (`sc cat`) is built; the rest is P37b.
 - **Per-case gap-tolerant merge/rebase/ws-harvest/sc-work on a partial
   clone (P27).** These are refused entirely today
   (`Error::PartialCloneUnsupported`) rather than gap-tolerantly
@@ -754,7 +755,7 @@ scale-&-reach horizon):
   individually is the follow-on if the "backfill to a full clone first"
   workaround proves too coarse in practice.
   **Now scoped as P37b (ADR-0047, Proposed):** lifted one operation at a
-  time on top of the P37a `fill_gaps` seam.
+  time once push, verify and gc are presence-based.
 - **Blob-size/object-count clone filters (P27).** `sc clone --filter` is
   prefix-only, matching the sparse path-boundary machinery already built;
   git's `--filter=blob:limit` size-based filtering is a separate axis,

@@ -132,7 +132,32 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
         let frame = wire::read_frame(&mut rw.0)?;
         wire::decode_ids_body(&wire::parse_response(frame)?)
     }
+
+    /// One round trip (P37, ADR-0047): the OK body lists the ids the server
+    /// will not send, and a chunk stream with the rest follows. The reply
+    /// stream is capped (`GET_OBJECTS_RESPONSE_CAP`) so a hostile server
+    /// cannot make a by-id fetch spool without bound.
+    fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
+        if ids.len() > wire::MAX_GET_OBJECTS_IDS {
+            return Err(Error::InvalidArgument(format!(
+                "by-id fetch takes at most {} ids per call",
+                wire::MAX_GET_OBJECTS_IDS
+            )));
+        }
+        let mut rw = self.rw.borrow_mut();
+        wire::write_frame(
+            &mut rw.1,
+            &Request::GetObjects { ids: ids.to_vec() }.encode(),
+        )?;
+        let frame = wire::read_frame(&mut rw.0)?;
+        let not_sent = wire::decode_ids_body(&wire::parse_response(frame)?)?;
+        wire::read_pack_stream(&mut rw.0, out, GET_OBJECTS_RESPONSE_CAP)?;
+        Ok(not_sent)
+    }
 }
+
+/// Most bytes a client accepts in one `GetObjects` reply stream (1 GiB).
+const GET_OBJECTS_RESPONSE_CAP: u64 = 1 << 30;
 
 /// A [`Transport`] whose far end is a child process speaking the wire protocol
 /// on its stdio — `ssh <host> sc serve --stdio <path>` for real remotes.
@@ -227,6 +252,9 @@ impl Transport for StdioTransport {
     }
     fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
         self.client.put_pack(src)
+    }
+    fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
+        self.client.get_objects(ids, out)
     }
 }
 
@@ -414,6 +442,44 @@ mod tests {
     }
 
     #[test]
+    fn wire_client_get_objects_round_trip_found_missing_and_refused() {
+        let root = tmp_repo("getobjs");
+        let (client, server) = connect(root.clone());
+
+        let blob = Object::blob(b"fetched by id".to_vec());
+        let sealed = Object::Sealed(scl_core::SealedObj {
+            payload: std::sync::Arc::from(b"ciphertext".to_vec().into_boxed_slice()),
+        });
+        let absent = Object::blob(b"not on the server".to_vec());
+        for o in [&blob, &sealed] {
+            client.put_object(&o.id(), &o.encode()).unwrap();
+        }
+
+        let mut out = Vec::new();
+        let not_sent = client
+            .get_objects(&[blob.id(), sealed.id(), absent.id()], &mut out)
+            .unwrap();
+        assert_eq!(not_sent, vec![sealed.id(), absent.id()]);
+        let got = scl_core::pack::parse_pack(&out).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, blob.id());
+
+        // The client refuses an oversize request without a round trip.
+        let too_many = vec![blob.id(); wire::MAX_GET_OBJECTS_IDS + 1];
+        assert!(matches!(
+            client.get_objects(&too_many, &mut Vec::new()),
+            Err(Error::InvalidArgument(_))
+        ));
+        // ...and the connection is still in sync afterwards.
+        assert!(client.has_object(&blob.id()).unwrap());
+
+        client.bye().unwrap();
+        drop(client);
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn wire_client_satisfies_the_transport_contract() {
         let root = tmp_repo("contract");
         std::fs::write(root.join("a.txt"), b"one").unwrap();
@@ -513,6 +579,25 @@ mod tests {
         assert!(matches!(err, Error::NotARepo), "got {err:?}");
         server.join().unwrap().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn handshake_rejects_v4_peer() {
+        // P37 bumped PROTOCOL_VERSION 4 -> 5 for the additive `GetObjects`
+        // verb: a v4 server cannot decode it, so refuse at the handshake.
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let f = wire::read_frame(&mut server_read).unwrap();
+            assert!(matches!(
+                wire::Request::decode(&f).unwrap(),
+                wire::Request::Hello { version: 5 }
+            ));
+            wire::write_ok(&mut server_write, &wire::u32_body(4)).unwrap();
+        });
+        let err = WireClient::handshake(client_read, client_write).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+        server.join().unwrap();
     }
 
     #[test]

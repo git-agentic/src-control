@@ -106,7 +106,7 @@ the project tree if desired.
 
 ## Capability map (what's built, by phase)
 
-All 36 phases are built and tested. One line of current fact per phase; the
+All 36 phases and P37a are built and tested. One line of current fact per phase; the
 authoritative rationale and full semantics live in the linked ADR, the design
 in `ARCHITECTURE.md`. The old per-phase narrative log this table replaced is
 archived verbatim at `docs/archive/claude-md-phase-log-2026-07.md` — do not
@@ -151,6 +151,7 @@ the code, those win.
 | P34 | Private branches: ref points at a sealed-branch manifest; every commit/tree/blob individually sealed (copy-on-write) under a per-branch KEK wrapped per recipient + escrow; `sc branch --private/grant/revoke/publish`; opaque to non-recipients (content, paths, messages); grant O(1), revoke rotates the KEK; publish replays to public with a scanner gate; git bridge + private→public integration refused; `PROTOCOL_VERSION` 4 | [0044](docs/adr/0044-per-branch-access-control.md) |
 | P35 | Native Tauri desktop browser: opens `.sc` repositories through `scl-repo`, shows local/remote refs, all-parent snapshot DAG + provenance, public trees and first-parent diffs; protected content is locked and private branches remain opaque; no mutation or identity surface | [0045](docs/adr/0045-native-desktop-read-model.md) |
 | P36 | Bucket WAL remotes (sc+wal://, sc+s3://): immutable packs + CAS'd manifest, checkpoints + log-tail cold start, bucket-backed `sc serve --store` with disposable instances | [0046](docs/adr/0046-wal-bucket-remotes.md) |
+| P37a | Want-by-id fetch: batched `GetObjects` verb (wire v5), opt-in `.sc/promisor-lazy`, `sc cat <ref>:<path>` fills only the absent trees and blob on its path; `Store::get` stays network-free; sealed objects refused by kind; sparse widen and the lifted P27 refusals are P37b | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
 
 ## Standing boundaries & gotchas
 
@@ -158,8 +159,8 @@ Cross-cutting current facts that bite. Security boundaries are consolidated in
 `docs/THREAT-MODEL.md` — read it before touching anything crypto- or
 transport-adjacent. The rest, imperatively:
 
-- **Wire protocol is version 4** (bumped from 3 in P34 for the two additive
-  sealed-branch object kinds). `MAX_OBJECT_SIZE` (256 MiB) guards the
+- **Wire protocol is version 5** (bumped from 4 in P37 for the additive
+  `GetObjects` verb; 3 to 4 in P34 for the sealed-branch object kinds). `MAX_OBJECT_SIZE` (256 MiB) guards the
   transfer path only — a larger blob commits locally but fails every
   subsequent push/fetch/clone at the receiver.
 - **The P35 desktop app is a keyless, read-only top-level adapter.** Its

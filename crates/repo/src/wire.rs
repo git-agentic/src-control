@@ -25,7 +25,11 @@ use crate::error::{Error, Result};
 /// object kinds (sealed object, branch manifest) now cross the wire inside
 /// packs — a v3 peer's `Object::decode` would hit an unknown tag deep in
 /// pack ingest, so the mismatch is refused cleanly at the handshake instead.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// Bumped 4 -> 5 in P37 (ADR-0047): the additive `GetObjects` verb (batched
+/// by-id object fetch) — a v4 server would answer its opcode with an
+/// "unknown opcode" protocol error mid-session, so the mismatch is refused at
+/// the handshake instead.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 // Request opcodes (one per Transport verb, plus session control).
 const OP_HELLO: u8 = 0x01;
@@ -38,6 +42,12 @@ const OP_PUT_OBJECT: u8 = 0x14;
 const OP_UPDATE_REF: u8 = 0x15;
 const OP_GET_PACK: u8 = 0x16;
 const OP_PUT_PACK: u8 = 0x17;
+const OP_GET_OBJECTS: u8 = 0x18;
+
+/// Most object ids one `GetObjects` request may carry (ADR-0047). Bounds the
+/// server's per-request work and the response a client must be ready to read;
+/// a client with a longer frontier splits it into several requests.
+pub const MAX_GET_OBJECTS_IDS: usize = 1024;
 
 // Response status bytes.
 const ST_OK: u8 = 0;
@@ -119,6 +129,13 @@ pub enum Request {
     /// (`write_pack_stream`); the receiver destreams them
     /// (`read_pack_stream`) before replying.
     PutPack,
+    /// Batched by-id object fetch (P37, ADR-0047): the server answers with an
+    /// OK frame whose body lists the ids it will NOT send (absent or
+    /// refused), then a chunk stream of the objects it found. At most
+    /// [`MAX_GET_OBJECTS_IDS`] ids.
+    GetObjects {
+        ids: Vec<ObjectId>,
+    },
 }
 
 // --- field encoding helpers (length-prefixed, matching core's canonical style) ---
@@ -189,6 +206,18 @@ impl<'a> Cur<'a> {
     }
     fn ids(&mut self) -> Result<Vec<ObjectId>> {
         let n = self.u32()? as usize;
+        (0..n).map(|_| self.id()).collect()
+    }
+    /// Like [`Cur::ids`], but rejects a count above `max` (and above what the
+    /// frame can hold) before decoding any id, so an oversize request is
+    /// refused without work proportional to its claimed length.
+    fn ids_capped(&mut self, max: usize) -> Result<Vec<ObjectId>> {
+        let n = self.u32()? as usize;
+        if n > max {
+            return Err(Error::PackTooLarge(format!(
+                "request names {n} ids, limit is {max}"
+            )));
+        }
         (0..n).map(|_| self.id()).collect()
     }
     /// Read a length prefix used to PRE-SIZE a collection, rejecting a fabricated
@@ -280,6 +309,10 @@ impl Request {
                 put_strs(&mut out, filter);
             }
             Request::PutPack => out.push(OP_PUT_PACK),
+            Request::GetObjects { ids } => {
+                out.push(OP_GET_OBJECTS);
+                put_ids(&mut out, ids);
+            }
         }
         out
     }
@@ -318,6 +351,9 @@ impl Request {
                 filter: c.strs()?,
             },
             OP_PUT_PACK => Request::PutPack,
+            OP_GET_OBJECTS => Request::GetObjects {
+                ids: c.ids_capped(MAX_GET_OBJECTS_IDS)?,
+            },
             op => return Err(Error::Protocol(format!("unknown opcode 0x{op:02x}"))),
         };
         c.done()?;
@@ -1019,6 +1055,30 @@ fn serve_session(
                     }
                 }
             }
+            Request::GetObjects { ids } => {
+                // Streams like GetPack, so it is handled inline. Bucket
+                // remotes refuse: they refuse partial clone (ADR-0046), and
+                // by-id reads exist only for partial clones.
+                let result = match &transport {
+                    ServeTransport::Local(t) => {
+                        t.build_objects_tempfile(&ids, policy.max_pack_size)
+                    }
+                    ServeTransport::Bucket { .. } => Err(Error::InvalidArgument(
+                        "bucket remotes do not support by-id object fetch".into(),
+                    )),
+                };
+                match result {
+                    Ok((not_sent, guard)) => {
+                        write_ok(w, &ids_body(&not_sent))?;
+                        let mut f = std::fs::File::open(guard.path())?;
+                        write_pack_stream(w, &mut f, pack_chunk_size())?;
+                    }
+                    Err(e) => {
+                        let (code, msg) = err_to_wire(&e);
+                        write_err(w, code, &msg)?;
+                    }
+                }
+            }
             Request::PutPack => {
                 match spill_pack_stream(r, &transport.tmp_dir(), policy.max_pack_size) {
                     Ok(guard) => {
@@ -1083,7 +1143,10 @@ fn serve_session(
                         .as_transport()
                         .update_ref(&branch, &id, expected_old.as_ref())
                         .map(|()| Vec::new()),
-                    Request::Bye | Request::GetPack { .. } | Request::PutPack => {
+                    Request::Bye
+                    | Request::GetPack { .. }
+                    | Request::PutPack
+                    | Request::GetObjects { .. } => {
                         unreachable!("handled above")
                     }
                 };
@@ -1163,6 +1226,27 @@ mod tests {
     }
 
     #[test]
+    fn get_objects_decode_rejects_more_than_the_id_cap() {
+        let ids: Vec<ObjectId> = (0..=MAX_GET_OBJECTS_IDS)
+            .map(|i| ObjectId::from_bytes([(i % 251) as u8; 32]))
+            .collect();
+        let bytes = Request::GetObjects { ids }.encode();
+        assert!(matches!(
+            Request::decode(&bytes),
+            Err(Error::PackTooLarge(_))
+        ));
+        // Exactly at the cap is fine.
+        let ids: Vec<ObjectId> = (0..MAX_GET_OBJECTS_IDS)
+            .map(|i| ObjectId::from_bytes([(i % 251) as u8; 32]))
+            .collect();
+        let bytes = Request::GetObjects { ids: ids.clone() }.encode();
+        assert_eq!(
+            Request::decode(&bytes).unwrap(),
+            Request::GetObjects { ids }
+        );
+    }
+
+    #[test]
     fn every_request_encodes_and_decodes_roundtrip() {
         let reqs = vec![
             Request::Hello {
@@ -1203,6 +1287,10 @@ mod tests {
                 filter: vec![],
             },
             Request::PutPack,
+            Request::GetObjects { ids: vec![] },
+            Request::GetObjects {
+                ids: vec![some_id(10), some_id(11)],
+            },
         ];
         for req in reqs {
             let bytes = req.encode();
@@ -1797,6 +1885,61 @@ mod tests {
         ));
         let tmp = root.join(".sc").join("tmp");
         assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `GetObjects` is a read verb: a read-only session serves it, and the
+    /// `max_pack_size` spool cap applies to its reply.
+    #[test]
+    fn readonly_session_serves_get_objects_and_caps_the_reply() {
+        let root = tmp_repo("ro-getobjs");
+        let blob = scl_core::Object::blob(vec![5u8; 4096]);
+        crate::transport::LocalTransport::open(&root)
+            .unwrap()
+            .put_object(&blob.id(), &blob.encode())
+            .unwrap();
+
+        let run = |max_pack_size: u64| {
+            let mut input = Vec::new();
+            write_frame(
+                &mut input,
+                &Request::Hello {
+                    version: PROTOCOL_VERSION,
+                }
+                .encode(),
+            )
+            .unwrap();
+            write_frame(
+                &mut input,
+                &Request::GetObjects {
+                    ids: vec![blob.id()],
+                }
+                .encode(),
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            let policy = WirePolicy {
+                read_only: true,
+                max_pack_size,
+                ro_drain_cap: 4096,
+            };
+            serve_with_policy(&root, &mut std::io::Cursor::new(input), &mut output, policy)
+                .unwrap();
+            let mut r = std::io::Cursor::new(output);
+            let _hello = parse_response(read_frame_opt(&mut r).unwrap().unwrap()).unwrap();
+            let reply = parse_response(read_frame_opt(&mut r).unwrap().unwrap());
+            (reply, r)
+        };
+
+        let (reply, mut rest) = run(0);
+        assert!(decode_ids_body(&reply.unwrap()).unwrap().is_empty());
+        let mut pack = Vec::new();
+        read_pack_stream(&mut rest, &mut pack, 0).unwrap();
+        assert_eq!(scl_core::pack::parse_pack(&pack).unwrap().len(), 1);
+
+        // A cap below the object's size fails the request, not the session.
+        let (reply, _) = run(100);
+        assert!(matches!(reply.unwrap_err(), Error::PackTooLarge(_)));
         let _ = std::fs::remove_dir_all(&root);
     }
 

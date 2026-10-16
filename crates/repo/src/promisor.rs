@@ -154,11 +154,38 @@ pub fn store(layout: &Layout, p: &Promisor) -> Result<()> {
 /// after independently confirming the object closure is actually
 /// complete — this function does not itself verify anything.
 pub fn remove(layout: &Layout) -> Result<()> {
+    set_lazy(layout, false)?;
     match std::fs::remove_file(layout.promisor_path()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// True when this partial clone has opted in to filling gaps by object id
+/// (ADR-0047). Absent marker, or no promisor at all, reads as `false`.
+pub fn is_lazy(layout: &Layout) -> bool {
+    layout.promisor_lazy_path().is_file()
+}
+
+/// Set or clear the lazy marker. Clearing an absent marker is a no-op.
+pub fn set_lazy(layout: &Layout, lazy: bool) -> Result<()> {
+    if lazy {
+        scl_core::fsutil::atomic_write_durable(&layout.promisor_lazy_path(), b"")?;
+        return Ok(());
+    }
+    match std::fs::remove_file(layout.promisor_lazy_path()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// True when the environment forces offline behavior (`SC_OFFLINE` set to
+/// anything but empty or `0`): a lazy clone then reports the gap error
+/// instead of dialing the promisor remote.
+pub fn offline() -> bool {
+    matches!(std::env::var("SC_OFFLINE"), Ok(v) if !v.is_empty() && v != "0")
 }
 
 impl Repo {
@@ -255,5 +282,38 @@ mod tests {
         // Widening with an already-present set is a no-op.
         p.widen(&["src/".into(), "docs/".into(), "tests/".into()]);
         assert_eq!(p.prefixes().len(), 3);
+    }
+
+    #[test]
+    fn lazy_marker_is_separate_from_the_filter_file() {
+        let layout = tmp_layout("lazy");
+        // A prefix that looks like a config line must stay a plain prefix:
+        // laziness lives in its own marker, never in `.sc/promisor`.
+        let p = Promisor::new("origin-url", vec!["lazy = true".into()]);
+        store(&layout, &p).unwrap();
+        assert!(!is_lazy(&layout));
+        assert_eq!(load(&layout).unwrap(), Some(p.clone()));
+
+        set_lazy(&layout, true).unwrap();
+        assert!(is_lazy(&layout));
+        assert_eq!(load(&layout).unwrap(), Some(p));
+
+        set_lazy(&layout, false).unwrap();
+        assert!(!is_lazy(&layout));
+        // Clearing an absent marker is a no-op.
+        set_lazy(&layout, false).unwrap();
+
+        std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn remove_clears_the_lazy_marker_too() {
+        let layout = tmp_layout("lazy-rm");
+        store(&layout, &Promisor::new("origin-url", vec!["src/".into()])).unwrap();
+        set_lazy(&layout, true).unwrap();
+        remove(&layout).unwrap();
+        assert!(!is_lazy(&layout));
+        assert!(!layout.promisor_lazy_path().exists());
+        std::fs::remove_dir_all(&layout.root).unwrap();
     }
 }
