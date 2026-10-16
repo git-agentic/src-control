@@ -205,6 +205,6 @@ them.
   `demo/run_lazy_fetch_demo.sh` (a path-only fetch of exactly three objects,
   sibling untouched, offline and non-lazy gap errors, a read-only `sc+http`
   server).
-- **37b (proposed).** Presence-based push, verify and gc; then sparse widen
-  over a filled prefix; then lift the P27 refusals (merge, replay, ws, work,
-  export), one operation per task.
+- **37b (proposed).** Designed in [ADR-0048](0048-presence-based-partial-clones.md):
+  presence-based push, verify and gc; sparse widen over a filled prefix; then
+  merge and replay on partial clones. Export and `sparse disable` stay refused.

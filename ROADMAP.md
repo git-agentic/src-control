@@ -552,8 +552,11 @@ across every phase.
 P37a (built) added the batched `GetObjects` verb and `sc cat`; the remaining
 work needs push, verify and gc to ask "is this object present?" instead of "is
 this path in the filter?", then sparse widen over a filled prefix, then merge,
-rebase, `ws`, `work` and `export` on partial clones. Design and open questions
-in [ADR-0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md).
+rebase, `ws`, `work` and `export` on partial clones. Design (merge, replay and
+sessions are directions only), phasing
+(37b-i to 37b-v) and open questions in
+[ADR-0048](docs/adr/0048-presence-based-partial-clones.md); `export` and
+`sparse disable` are decided to stay refused.
 
 ## Completed phases (usability-first ordering)
 
@@ -754,7 +757,7 @@ scale-&-reach horizon):
   Threading gap-tolerance through `three_way`/replay/`ws::harvest`
   individually is the follow-on if the "backfill to a full clone first"
   workaround proves too coarse in practice.
-  **Now scoped as P37b (ADR-0047, Proposed):** lifted one operation at a
+  **Now scoped as P37b (ADR-0048, Proposed):** lifted one operation at a
   time once push, verify and gc are presence-based.
 - **Blob-size/object-count clone filters (P27).** `sc clone --filter` is
   prefix-only, matching the sparse path-boundary machinery already built;
