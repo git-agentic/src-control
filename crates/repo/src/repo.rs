@@ -1814,6 +1814,7 @@ impl Repo {
         };
         // Switching TO a private branch takes the private materialize path.
         if let Some(m) = self.manifest_at(&target_tip)? {
+            self.refuse_on_partial("switching to a private branch")?;
             return self.switch_to_private(name, target_tip, m, identity, &old_paths);
         }
         // Leaving a private branch flattens the public target's whole tree
