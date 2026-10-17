@@ -688,3 +688,50 @@ fn every_materializer_call_site_fills_or_is_exempt() {
     }
     assert!(checked >= 15, "the scan found only {checked} call sites");
 }
+
+/// A private branch cannot be checked out on a partial clone (sealing and
+/// opening flatten whole trees), so creating or switching to one is refused
+/// explicitly instead of failing with a raw `NotFound` mid-switch.
+#[test]
+fn private_branches_are_refused_on_a_partial_clone() {
+    let (fx, clone) = Fx::new_in_sync("private");
+    let (sk, pk) = scl_crypto::generate_keypair();
+    let err = clone
+        .branch_private("secret-work", &sk, std::slice::from_ref(&pk), &[])
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::PartialCloneUnsupported(_)),
+        "got {err:?}"
+    );
+    assert!(!clone.layout().ref_path("secret-work").exists());
+
+    // A private ref that reached the clone some other way (a manifest tip) is
+    // refused at switch time, before anything is touched.
+    let full_root =
+        std::env::temp_dir().join(format!("scl-p37b-private-full-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&full_root);
+    let full = Repo::clone_to(&fx.origin_root, &full_root).unwrap();
+    let mid = full
+        .branch_private("secret-work", &sk, std::slice::from_ref(&pk), &[])
+        .unwrap();
+    {
+        let src = full.vfs().store();
+        let dst = clone.vfs().store();
+        let m = src.lock().unwrap().get(&mid).unwrap();
+        dst.lock().unwrap().put(m).unwrap();
+    }
+    refs::write_branch_tip(clone.layout(), "secret-work", &mid).unwrap();
+    let err = clone
+        .switch_with_identity("secret-work", Some(&sk))
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::PartialCloneUnsupported(_)),
+        "got {err:?}"
+    );
+    assert_eq!(refs::current_branch(clone.layout()).unwrap(), "main");
+    assert!(fx.clone_root.join("src/a.txt").exists());
+    drop(full);
+    std::fs::remove_dir_all(&full_root).unwrap();
+    drop(clone);
+    fx.cleanup();
+}

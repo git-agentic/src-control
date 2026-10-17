@@ -390,10 +390,11 @@ review established, as constraints on that work:
    Closed in 37b-ii for the files a narrowing would strand, by the
    `.sc/sparse-prev` marker (decision 4, as built). The in-view-reads-as-deleted
    half after a widen is unchanged.
-10. **Private branches on a partial clone** have no `ensure_view` or
-    preflight (`private.rs` materializes through its own path). Untested:
-    whether switching to one can hit a raw `NotFound` when public base
-    content is absent.
+10. **Private branches on a partial clone** (resolved after 37b-ii). Probing
+    showed that creating one succeeded and switching to it failed with a raw
+    `NotFound`, because opening a private branch flattens and seals whole
+    trees. `sc branch --private` and switching to a private branch are now
+    refused explicitly on a partial clone; `sc backfill --all` lifts it.
 
 ## Alternatives considered
 

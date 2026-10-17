@@ -295,6 +295,10 @@ impl Repo {
         recipients: &[PublicKey],
         escrows: &[PublicKey],
     ) -> Result<ObjectId> {
+        // A private branch is checked out by flattening and sealing whole
+        // trees, which a partial clone cannot do (ADR-0048). Refuse up front
+        // rather than create a branch that cannot be switched to.
+        self.refuse_on_partial("sc branch --private")?;
         crate::repo::validate_branch_name(name)?;
         if self.layout.ref_path(name).exists() {
             return Err(Error::BadRef(format!("branch already exists: {name}")));
