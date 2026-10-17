@@ -213,229 +213,314 @@ pub(crate) fn three_way_files(
     paths.extend(ours_f.keys().cloned());
     paths.extend(theirs_f.keys().cloned());
 
-    let mut files: Vec<MergedFile> = Vec::new();
-    let mut sidecars = Vec::new();
-    let mut conflicts = Vec::new();
-    let mut wrapped_carry: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
-
+    let mut acc = MergeAcc::default();
     for path in paths {
-        let b = base_f.get(&path).copied();
-        let o = ours_f.get(&path).copied();
-        let t = theirs_f.get(&path).copied();
+        let (b, o, t) = (
+            base_f.get(&path).copied(),
+            ours_f.get(&path).copied(),
+            theirs_f.get(&path).copied(),
+        );
+        merge_path(store, path, b, o, t, &prots, identity, &mut acc)?;
+    }
+    check_path_collisions(acc.files.iter().map(|f| f.path.as_str()))?;
+    Ok(acc.into())
+}
 
-        if ![b, o, t].iter().flatten().any(|e| e.2 & PROTECTED != 0) {
-            // ---- all-plain arm: pre-P15 logic verbatim ----
+/// Accumulated result of per-path resolution.
+#[derive(Default)]
+pub(crate) struct MergeAcc {
+    pub files: Vec<MergedFile>,
+    pub sidecars: Vec<(String, Vec<u8>)>,
+    pub conflicts: Vec<String>,
+    pub wrapped_carry: BTreeMap<ObjectId, Vec<WrappedKey>>,
+}
 
-            // Resolve by blob id first (cheap, covers unchanged/one-sided/delete).
-            let bo = b.map(|x| x.0);
-            let oo = o.map(|x| x.0);
-            let to = t.map(|x| x.0);
-
-            if oo == to {
-                // same on both sides (including both-deleted) — take ours if present
-                if let Some((id, mode, _)) = o {
-                    files.push(plain(path, mode, blob_bytes(store, id)?));
-                }
-                continue;
-            }
-            if oo == bo {
-                // only theirs changed -> take theirs (present or deleted)
-                if let Some((id, mode, _)) = t {
-                    files.push(plain(path, mode, blob_bytes(store, id)?));
-                }
-                continue;
-            }
-            if to == bo {
-                // only ours changed -> take ours
-                if let Some((id, mode, _)) = o {
-                    files.push(plain(path, mode, blob_bytes(store, id)?));
-                }
-                continue;
-            }
-
-            // Both sides changed differently.
-            match (o, t) {
-                (Some((oid, omode, _)), Some((tid, tmode, _))) => {
-                    // Mode resolves like Git: executable if either side is.
-                    let mode = if omode == FileMode::EXEC || tmode == FileMode::EXEC {
-                        FileMode::EXEC
-                    } else {
-                        FileMode::FILE
-                    };
-                    let ob = blob_bytes(store, oid)?;
-                    let tb = blob_bytes(store, tid)?;
-                    let bb = match b {
-                        Some((bid, _, _)) => blob_bytes(store, bid)?,
-                        None => Vec::new(),
-                    };
-                    match (std::str::from_utf8(&ob), std::str::from_utf8(&tb)) {
-                        (Ok(os), Ok(ts)) => {
-                            // A non-UTF-8 base falls back to an empty base (rare
-                            // encoding-change case): yields a conservative conflict,
-                            // never corruption.
-                            let base_text = std::str::from_utf8(&bb).unwrap_or("");
-                            let m = diff3::merge_lines(base_text, os, ts);
-                            if m.conflicted {
-                                conflicts.push(path.clone());
-                            }
-                            files.push(plain(path, mode, m.text.into_bytes()));
-                        }
-                        _ => {
-                            // binary conflict: keep ours, write theirs sidecar
-                            conflicts.push(path.clone());
-                            sidecars.push((format!("{path}.theirs"), tb));
-                            files.push(plain(path, mode, ob));
-                        }
-                    }
-                }
-                // delete/modify: one side deleted, the other modified -> conflict;
-                // keep the surviving (modified) content and mark conflicted.
-                (Some((oid, omode, _)), None) => {
-                    conflicts.push(path.clone());
-                    files.push(plain(path, omode, blob_bytes(store, oid)?));
-                }
-                (None, Some((tid, tmode, _))) => {
-                    conflicts.push(path.clone());
-                    files.push(plain(path, tmode, blob_bytes(store, tid)?));
-                }
-                (None, None) => unreachable!("oo==to already handled the both-absent case"),
-            }
-            continue;
+impl From<MergeAcc> for FileMerge {
+    fn from(a: MergeAcc) -> FileMerge {
+        FileMerge {
+            files: a.files,
+            sidecars: a.sidecars,
+            conflicts: a.conflicts,
+            wrapped_carry: a.wrapped_carry,
         }
+    }
+}
 
-        // ---- protected arm ----
-        // Fast paths compare (raw blob id, PROTECTED bit): the id logic of the
-        // plain arm transfers directly to ciphertext ids, but a PROTECTED-bit
-        // flip alone is also a change, so the bit joins the comparison key. Any
-        // resolution here carries the winner's raw bytes verbatim — ciphertext
-        // is never decrypted on a fast path, so no identity is needed.
-        let key = |e: Option<(ObjectId, FileMode, u8)>| e.map(|(id, _, p)| (id, p & PROTECTED));
-        let (bk, ok, tk) = (key(b), key(o), key(t));
+/// A tree entry viewed as a merge input: blob id, mode, perms.
+pub(crate) type FileEntry = (ObjectId, FileMode, u8);
 
-        let winner = if ok == tk {
+/// Merge one path's three versions into `acc`. Content resolves by blob id
+/// (and the `PROTECTED` bit for protected paths) exactly as before; the mode
+/// of the result is merged separately by [`merge_mode`] (ADR-0049). The same
+/// function serves the flatten merge and the tree-recursive engine, so the two
+/// cannot disagree on a leaf.
+pub(crate) fn merge_path(
+    store: &mut Store,
+    path: String,
+    b: Option<FileEntry>,
+    o: Option<FileEntry>,
+    t: Option<FileEntry>,
+    prots: &[&Protection; 3],
+    identity: Option<&scl_crypto::SecretKey>,
+    acc: &mut MergeAcc,
+) -> Result<()> {
+    let MergeAcc {
+        files,
+        sidecars,
+        conflicts,
+        wrapped_carry,
+    } = acc;
+    let prots = *prots;
+    let (bm, om, tm) = (b.map(|e| e.1), o.map(|e| e.1), t.map(|e| e.1));
+
+    if ![b, o, t].iter().flatten().any(|e| e.2 & PROTECTED != 0) {
+        // ---- all-plain arm: pre-P15 logic verbatim ----
+
+        // Resolve by blob id first (cheap, covers unchanged/one-sided/delete).
+        let bo = b.map(|x| x.0);
+        let oo = o.map(|x| x.0);
+        let to = t.map(|x| x.0);
+
+        if oo == to {
             // same on both sides (including both-deleted) — take ours if present
-            Some(o)
-        } else if ok == bk {
-            // only theirs changed -> take theirs (present or cleanly deleted)
-            Some(t)
-        } else if tk == bk {
-            // only ours changed -> take ours
-            Some(o)
-        } else {
-            None
-        };
-        if let Some(w) = winner {
-            if let Some((id, mode, perms)) = w {
-                if perms & PROTECTED != 0 {
-                    // Unioning wraps across ours/theirs/base means a wrap
-                    // revoked on only ONE side is resurrected for an unchanged
-                    // blob — consistent with P11's revoke-is-metadata-only
-                    // stance (ADR-0019): the old DEK was never secret from a
-                    // past recipient anyway; a cryptographic cutover requires
-                    // `secret rotate` / re-wrap, not a merge.
-                    let wraps = known_wraps(&prots, &id);
-                    if !wraps.is_empty() {
-                        wrapped_carry.insert(id, wraps);
-                    }
-                    // An empty union (no input protection knows this blob)
-                    // gets no wrapped_carry entry, not an error: the input was
-                    // already undecryptable on every side — the merge
-                    // preserves that state, it never worsens it.
-                }
-                files.push(MergedFile {
-                    path,
-                    mode,
-                    bytes: blob_bytes(store, id)?,
-                    perms,
-                    needs_encrypt: false,
-                });
+            if let Some((id, _, _)) = o {
+                files.push(plain(path, merge_mode(bm, om, tm), blob_bytes(store, id)?));
             }
-            continue;
+            return Ok(());
+        }
+        if oo == bo {
+            // only theirs changed -> take theirs (present or deleted)
+            if let Some((id, _, _)) = t {
+                files.push(plain(path, merge_mode(bm, om, tm), blob_bytes(store, id)?));
+            }
+            return Ok(());
+        }
+        if to == bo {
+            // only ours changed -> take ours
+            if let Some((id, _, _)) = o {
+                files.push(plain(path, merge_mode(bm, om, tm), blob_bytes(store, id)?));
+            }
+            return Ok(());
         }
 
-        // Content-divergent (both differ from base and each other; delete-vs-
-        // modify; or the PROTECTED bit itself differs between sides): protected
-        // inputs must be decrypted, which requires an identity — enforced
-        // inside `plain_input`, so a case that only touches plain inputs (e.g.
-        // delete-vs-modify with a plain survivor) still resolves without one.
+        // Both sides changed differently.
         match (o, t) {
-            (Some(oe), Some(te)) => {
-                // Mode resolves like Git: executable if either side is.
-                let mode = if oe.1 == FileMode::EXEC || te.1 == FileMode::EXEC {
-                    FileMode::EXEC
-                } else {
-                    FileMode::FILE
-                };
-                // The PROTECTED bit resolves like the exec bit: protected if
-                // either side is. (A protected base with two plain sides means
-                // the rule was removed on both — the output stays plain.)
-                let perms = (oe.2 | te.2) & PROTECTED;
-                let needs_encrypt = perms != 0;
-                // Decrypted inputs stay in `Zeroizing` until the final output
-                // copy; `bb` never leaves it — the base plaintext is only read
-                // for diff3 and is wiped when it drops.
-                let ob = plain_input(store, oe, &prots, identity, &path)?;
-                let tb = plain_input(store, te, &prots, identity, &path)?;
+            (Some((oid, _, _)), Some((tid, _, _))) => {
+                // Mode is merged separately from content (ADR-0049).
+                let mode = merge_mode(bm, om, tm);
+                let ob = blob_bytes(store, oid)?;
+                let tb = blob_bytes(store, tid)?;
                 let bb = match b {
-                    Some(be) => plain_input(store, be, &prots, identity, &path)?,
-                    None => scl_crypto::Zeroizing::new(Vec::new()),
+                    Some((bid, _, _)) => blob_bytes(store, bid)?,
+                    None => Vec::new(),
                 };
                 match (std::str::from_utf8(&ob), std::str::from_utf8(&tb)) {
                     (Ok(os), Ok(ts)) => {
-                        // Same non-UTF-8-base fallback as the plain arm.
+                        // A non-UTF-8 base falls back to an empty base (rare
+                        // encoding-change case): yields a conservative conflict,
+                        // never corruption.
                         let base_text = std::str::from_utf8(&bb).unwrap_or("");
                         let m = diff3::merge_lines(base_text, os, ts);
                         if m.conflicted {
                             conflicts.push(path.clone());
                         }
-                        files.push(MergedFile {
-                            path,
-                            mode,
-                            bytes: m.text.into_bytes(),
-                            perms,
-                            needs_encrypt,
-                        });
+                        files.push(plain(path, mode, m.text.into_bytes()));
                     }
                     _ => {
-                        // binary conflict: keep ours, write theirs sidecar —
-                        // both in plaintext, so the user can resolve.
+                        // binary conflict: keep ours, write theirs sidecar
                         conflicts.push(path.clone());
-                        sidecars.push((format!("{path}.theirs"), tb.to_vec()));
-                        files.push(MergedFile {
-                            path,
-                            mode,
-                            bytes: ob.to_vec(),
-                            perms,
-                            needs_encrypt,
-                        });
+                        sidecars.push((format!("{path}.theirs"), tb));
+                        files.push(plain(path, mode, ob));
                     }
                 }
             }
             // delete/modify: one side deleted, the other modified -> conflict;
-            // keep the surviving (modified) content — decrypted to plaintext
-            // when protected, so conflict resolution sees the real content.
-            (Some(oe), None) | (None, Some(oe)) => {
+            // keep the surviving (modified) content and mark conflicted.
+            (Some((oid, omode, _)), None) => {
                 conflicts.push(path.clone());
-                let perms = oe.2 & PROTECTED;
-                let bytes = plain_input(store, oe, &prots, identity, &path)?;
-                files.push(MergedFile {
-                    path,
-                    mode: oe.1,
-                    bytes: bytes.to_vec(),
-                    perms,
-                    needs_encrypt: perms != 0,
-                });
+                files.push(plain(path, omode, blob_bytes(store, oid)?));
             }
-            (None, None) => unreachable!("ok==tk already handled the both-absent case"),
+            (None, Some((tid, tmode, _))) => {
+                conflicts.push(path.clone());
+                files.push(plain(path, tmode, blob_bytes(store, tid)?));
+            }
+            (None, None) => unreachable!("oo==to already handled the both-absent case"),
         }
+        return Ok(());
     }
 
-    Ok(FileMerge {
-        files,
-        sidecars,
-        conflicts,
-        wrapped_carry,
-    })
+    // ---- protected arm ----
+    // Fast paths compare (raw blob id, PROTECTED bit): the id logic of the
+    // plain arm transfers directly to ciphertext ids, but a PROTECTED-bit
+    // flip alone is also a change, so the bit joins the comparison key. Any
+    // resolution here carries the winner's raw bytes verbatim — ciphertext
+    // is never decrypted on a fast path, so no identity is needed.
+    let key = |e: Option<(ObjectId, FileMode, u8)>| e.map(|(id, _, p)| (id, p & PROTECTED));
+    let (bk, ok, tk) = (key(b), key(o), key(t));
+
+    let winner = if ok == tk {
+        // same on both sides (including both-deleted) — take ours if present
+        Some(o)
+    } else if ok == bk {
+        // only theirs changed -> take theirs (present or cleanly deleted)
+        Some(t)
+    } else if tk == bk {
+        // only ours changed -> take ours
+        Some(o)
+    } else {
+        None
+    };
+    if let Some(w) = winner {
+        if let Some((id, _, perms)) = w {
+            let mode = merge_mode(bm, om, tm);
+            if perms & PROTECTED != 0 {
+                // Unioning wraps across ours/theirs/base means a wrap
+                // revoked on only ONE side is resurrected for an unchanged
+                // blob — consistent with P11's revoke-is-metadata-only
+                // stance (ADR-0019): the old DEK was never secret from a
+                // past recipient anyway; a cryptographic cutover requires
+                // `secret rotate` / re-wrap, not a merge.
+                let wraps = known_wraps(&prots, &id);
+                if !wraps.is_empty() {
+                    wrapped_carry.insert(id, wraps);
+                }
+                // An empty union (no input protection knows this blob)
+                // gets no wrapped_carry entry, not an error: the input was
+                // already undecryptable on every side — the merge
+                // preserves that state, it never worsens it.
+            }
+            files.push(MergedFile {
+                path,
+                mode,
+                bytes: blob_bytes(store, id)?,
+                perms,
+                needs_encrypt: false,
+            });
+        }
+        return Ok(());
+    }
+
+    // Content-divergent (both differ from base and each other; delete-vs-
+    // modify; or the PROTECTED bit itself differs between sides): protected
+    // inputs must be decrypted, which requires an identity — enforced
+    // inside `plain_input`, so a case that only touches plain inputs (e.g.
+    // delete-vs-modify with a plain survivor) still resolves without one.
+    match (o, t) {
+        (Some(oe), Some(te)) => {
+            // Mode is merged separately from content (ADR-0049).
+            let mode = merge_mode(bm, om, tm);
+            // The PROTECTED bit resolves like the exec bit: protected if
+            // either side is. (A protected base with two plain sides means
+            // the rule was removed on both — the output stays plain.)
+            let perms = (oe.2 | te.2) & PROTECTED;
+            let needs_encrypt = perms != 0;
+            // Decrypted inputs stay in `Zeroizing` until the final output
+            // copy; `bb` never leaves it — the base plaintext is only read
+            // for diff3 and is wiped when it drops.
+            let ob = plain_input(store, oe, &prots, identity, &path)?;
+            let tb = plain_input(store, te, &prots, identity, &path)?;
+            let bb = match b {
+                Some(be) => plain_input(store, be, &prots, identity, &path)?,
+                None => scl_crypto::Zeroizing::new(Vec::new()),
+            };
+            match (std::str::from_utf8(&ob), std::str::from_utf8(&tb)) {
+                (Ok(os), Ok(ts)) => {
+                    // Same non-UTF-8-base fallback as the plain arm.
+                    let base_text = std::str::from_utf8(&bb).unwrap_or("");
+                    let m = diff3::merge_lines(base_text, os, ts);
+                    if m.conflicted {
+                        conflicts.push(path.clone());
+                    }
+                    files.push(MergedFile {
+                        path,
+                        mode,
+                        bytes: m.text.into_bytes(),
+                        perms,
+                        needs_encrypt,
+                    });
+                }
+                _ => {
+                    // binary conflict: keep ours, write theirs sidecar —
+                    // both in plaintext, so the user can resolve.
+                    conflicts.push(path.clone());
+                    sidecars.push((format!("{path}.theirs"), tb.to_vec()));
+                    files.push(MergedFile {
+                        path,
+                        mode,
+                        bytes: ob.to_vec(),
+                        perms,
+                        needs_encrypt,
+                    });
+                }
+            }
+        }
+        // delete/modify: one side deleted, the other modified -> conflict;
+        // keep the surviving (modified) content — decrypted to plaintext
+        // when protected, so conflict resolution sees the real content.
+        (Some(oe), None) | (None, Some(oe)) => {
+            conflicts.push(path.clone());
+            let perms = oe.2 & PROTECTED;
+            let bytes = plain_input(store, oe, &prots, identity, &path)?;
+            files.push(MergedFile {
+                path,
+                mode: oe.1,
+                bytes: bytes.to_vec(),
+                perms,
+                needs_encrypt: perms != 0,
+            });
+        }
+        (None, None) => unreachable!("ok==tk already handled the both-absent case"),
+    }
+    Ok(())
+}
+
+/// Mode of a merged entry, merged as its own dimension (ADR-0049): content
+/// resolution keeps deciding which blob survives, and this decides the mode.
+/// Only entries that exist vote: a lone survivor (delete/modify, one-sided
+/// add) keeps its own mode; with two entries, equal modes win, a side equal to
+/// base yields to the side that changed, and when both changed differently
+/// (or both were added differently) executable wins, as it always has.
+pub(crate) fn merge_mode(
+    b: Option<FileMode>,
+    o: Option<FileMode>,
+    t: Option<FileMode>,
+) -> FileMode {
+    match (o, t) {
+        (Some(om), Some(tm)) => {
+            if om == tm {
+                om
+            } else if Some(om) == b {
+                tm
+            } else if Some(tm) == b {
+                om
+            } else if om == FileMode::EXEC || tm == FileMode::EXEC {
+                FileMode::EXEC
+            } else {
+                FileMode::FILE
+            }
+        }
+        (Some(m), None) | (None, Some(m)) => m,
+        (None, None) => FileMode::FILE,
+    }
+}
+
+/// Reject a merge whose resolved paths make a name both a file and a
+/// directory (`x` and `x/child`): the tree writer would emit a blob and a tree
+/// with the same name and materialization would fail after changing files.
+/// Checked before any output is written (ADR-0049).
+pub(crate) fn check_path_collisions<'a>(paths: impl Iterator<Item = &'a str>) -> Result<()> {
+    let set: BTreeSet<&str> = paths.collect();
+    for p in &set {
+        let mut idx = 0;
+        while let Some(i) = p[idx..].find('/') {
+            let ancestor = &p[..idx + i];
+            if set.contains(ancestor) {
+                return Err(Error::PathCollision(ancestor.to_string()));
+            }
+            idx += i + 1;
+        }
+    }
+    Ok(())
 }
 
 /// Shorthand for an unprotected [`MergedFile`].
@@ -1461,5 +1546,107 @@ mod tests {
         );
         assert!(m.files.iter().all(|f| !f.needs_encrypt && f.perms == 0));
         assert!(m.sidecars.is_empty());
+    }
+
+    // ---- ADR-0049: content and mode merge as separate dimensions ----------
+
+    fn mode_root(repo: &VfsRepo, files: &[(&str, &[u8], FileMode)]) -> ObjectId {
+        let v: Vec<(String, Vec<u8>, FileMode)> = files
+            .iter()
+            .map(|(p, b, m)| (p.to_string(), b.to_vec(), *m))
+            .collect();
+        repo.write_tree(&v).unwrap()
+    }
+
+    fn merged_mode(fm: &FileMerge, path: &str) -> FileMode {
+        fm.files.iter().find(|f| f.path == path).unwrap().mode
+    }
+
+    #[test]
+    fn mode_only_change_on_one_side_merges() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let base = mode_root(&repo, &[("run.sh", b"#!/bin/sh\n", FileMode::FILE)]);
+        let theirs = mode_root(&repo, &[("run.sh", b"#!/bin/sh\n", FileMode::EXEC)]);
+        let p = Protection::default();
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        // Theirs made it executable; ours left it alone: the chmod is kept.
+        let fm = three_way_files(&mut s, Some((base, &p)), (base, &p), (theirs, &p), None).unwrap();
+        assert!(fm.conflicts.is_empty());
+        assert_eq!(merged_mode(&fm, "run.sh"), FileMode::EXEC);
+        // And symmetrically when ours made the change.
+        let fm = three_way_files(&mut s, Some((base, &p)), (theirs, &p), (base, &p), None).unwrap();
+        assert_eq!(merged_mode(&fm, "run.sh"), FileMode::EXEC);
+    }
+
+    #[test]
+    fn removing_the_executable_bit_survives_a_content_change_on_the_other_side() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let base = mode_root(&repo, &[("run.sh", b"one\n", FileMode::EXEC)]);
+        let ours = mode_root(&repo, &[("run.sh", b"one\n", FileMode::FILE)]);
+        let theirs = mode_root(&repo, &[("run.sh", b"two\n", FileMode::EXEC)]);
+        let p = Protection::default();
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let fm = three_way_files(&mut s, Some((base, &p)), (ours, &p), (theirs, &p), None).unwrap();
+        assert!(fm.conflicts.is_empty());
+        let f = fm.files.iter().find(|f| f.path == "run.sh").unwrap();
+        assert_eq!(f.bytes, b"two\n", "theirs' content wins");
+        assert_eq!(f.mode, FileMode::FILE, "ours' executable removal is kept");
+    }
+
+    #[test]
+    fn identical_binary_content_with_different_modes_is_not_a_conflict() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let bin_a: &[u8] = &[0xff, 0xfe, 0x00, 0x01];
+        let bin_b: &[u8] = &[0xff, 0xfe, 0x00, 0x02];
+        let base = mode_root(&repo, &[("x.bin", bin_a, FileMode::FILE)]);
+        let ours = mode_root(&repo, &[("x.bin", bin_b, FileMode::FILE)]);
+        let theirs = mode_root(&repo, &[("x.bin", bin_b, FileMode::EXEC)]);
+        let p = Protection::default();
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let fm = three_way_files(&mut s, Some((base, &p)), (ours, &p), (theirs, &p), None).unwrap();
+        assert!(
+            fm.conflicts.is_empty(),
+            "same bytes on both sides: no conflict"
+        );
+        assert!(fm.sidecars.is_empty());
+        assert_eq!(merged_mode(&fm, "x.bin"), FileMode::EXEC);
+    }
+
+    #[test]
+    fn delete_modify_keeps_the_survivors_mode() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let base = mode_root(&repo, &[("f", b"one\n", FileMode::FILE)]);
+        let theirs = mode_root(&repo, &[("f", b"two\n", FileMode::FILE)]);
+        let ours = mode_root(&repo, &[("other", b"x\n", FileMode::FILE)]);
+        let p = Protection::default();
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let fm = three_way_files(&mut s, Some((base, &p)), (ours, &p), (theirs, &p), None).unwrap();
+        assert_eq!(fm.conflicts, vec!["f"]);
+        assert_eq!(merged_mode(&fm, "f"), FileMode::FILE);
+    }
+
+    #[test]
+    fn a_file_and_a_directory_with_the_same_name_is_rejected_before_any_output() {
+        let repo = VfsRepo::new(Store::with_budget(1 << 20));
+        let ours = mode_root(&repo, &[("x", b"file\n", FileMode::FILE)]);
+        let theirs = mode_root(&repo, &[("x/child", b"nested\n", FileMode::FILE)]);
+        let p = Protection::default();
+        let arc = repo.store();
+        let mut s = arc.lock().unwrap();
+        let err = three_way_files(&mut s, None, (ours, &p), (theirs, &p), None).unwrap_err();
+        assert!(
+            matches!(&err, Error::PathCollision(x) if x == "x"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn path_collision_check_finds_nested_ancestors_and_ignores_siblings() {
+        assert!(check_path_collisions(["a/b/c", "a/b", "z"].into_iter()).is_err());
+        assert!(check_path_collisions(["a", "a-b", "a.b/c", "ab/c"].into_iter()).is_ok());
     }
 }

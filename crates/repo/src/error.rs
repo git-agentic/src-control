@@ -76,6 +76,12 @@ pub enum Error {
     /// full clone (or a full backfill of every prefix), not one path.
     #[error("{0} is not supported on a partial clone; run `sc backfill --all` to convert to a full clone first")]
     PartialCloneUnsupported(String),
+    /// A merge result would make `{0}` both a file and a directory (one side
+    /// has a file where the other has a directory, or a file where the merged
+    /// result needs a directory). Detected before any output is written
+    /// (ADR-0049).
+    #[error("merge would make {0} both a file and a directory; resolve the collision on one branch first")]
+    PathCollision(String),
     #[error("already up to date")]
     UpToDate,
     /// The named branch is private and the caller either provided no identity
