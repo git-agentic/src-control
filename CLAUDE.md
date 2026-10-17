@@ -174,9 +174,10 @@ transport-adjacent. The rest, imperatively:
   `sc fetch` from any native remote but the promisor origin.** `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what
   a clone *asked for*, not what is present: after a fetch an in-filter object
-  can be absent, and a switch, fast-forward, undo or `sparse set` that needs it
-  fails with `GapInView` (nothing changed) and names the `sc backfill <prefix>`
-  that repairs it.
+  can be absent. On a lazy, online clone a switch, fast-forward, rebase, undo
+  or `sparse set` fetches what its view needs by id first; on a non-lazy or
+  offline clone it fails with `GapInView` (nothing changed) and names the
+  `sc backfill <prefix>` that repairs it.
 - **Bucket remotes hold public content plaintext at rest** — bucket ACL is
   the perimeter (sealed content stays ciphertext, unchanged); partial-clone
   `filter` against bucket remotes is refused.

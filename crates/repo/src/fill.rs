@@ -120,9 +120,11 @@ impl Repo {
         ids: &[ObjectId],
         stats: &mut FillStats,
     ) -> Result<()> {
+        // Every attempt is a network round trip, including one the server
+        // refuses as over its reply cap; only ingested objects are counted.
+        stats.requests += 1;
         match self.fetch_by_id_from(transport, ids) {
             Ok(n) => {
-                stats.requests += 1;
                 stats.objects += n;
                 Ok(())
             }
@@ -835,11 +837,11 @@ mod tests {
         };
         let mut stats = FillStats::default();
         dst.fetch_ids_batched(&capped, &ids, &mut stats).unwrap();
-        // 4 ids refused as one batch, then served as 2 + 2.
+        // 4 ids refused as one batch (still a round trip), then served as 2 + 2.
         assert_eq!(
             stats,
             FillStats {
-                requests: 2,
+                requests: 3,
                 objects: 4
             }
         );
