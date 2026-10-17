@@ -554,10 +554,17 @@ made push, verify and gc ask "is this object present?" instead of "is this
 path in the filter?", which also fixed gc and fast-forward failing after an
 ordinary fetch on a partial clone. 37b-ii (built) added sparse widen on a lazy
 clone: the view closure is filled by id before switch, fast-forward, undo and
-`sparse set`, and a by-id reply is capped and split on refusal. Merge, rebase and sessions on partial clones are directions
-with constraints, each needing its own design record; `export` and `sparse
-disable` stay refused. Design and open questions in
+`sparse set`, and a by-id reply is capped and split on refusal. `export` and
+`sparse disable` stay refused. Design and open questions in
 [ADR-0048](docs/adr/0048-presence-based-partial-clones.md).
+
+**P37c — merge on partial clones (proposed).** A tree-recursive three-way merge
+that carries a subtree by id where the three sides agree, checks protection
+rules before carrying, never drops wraps for subtrees it does not enumerate,
+and fills (lazy) or refuses (otherwise) the region where the sides differ,
+the region that intersects a protection rule, and the sparse view's closure. Clean merges first, then conflicts, then cherry-pick/rebase; sessions
+are undecided. Design in
+[ADR-0049](docs/adr/0049-merge-on-partial-clones.md).
 
 ## Completed phases (usability-first ordering)
 
@@ -758,8 +765,9 @@ scale-&-reach horizon):
   Threading gap-tolerance through `three_way`/replay/`ws::harvest`
   individually is the follow-on if the "backfill to a full clone first"
   workaround proves too coarse in practice.
-  **Now scoped as P37b (ADR-0048, Proposed):** lifted one operation at a
-  time once push, verify and gc are presence-based.
+  **Now scoped as P37b (ADR-0048) and P37c (ADR-0049, Proposed):** push,
+  verify and gc are presence-based (built); merge is designed in ADR-0049,
+  with replay following it and sessions undecided.
 - **Blob-size/object-count clone filters (P27).** `sc clone --filter` is
   prefix-only, matching the sparse path-boundary machinery already built;
   git's `--filter=blob:limit` size-based filtering is a separate axis,
