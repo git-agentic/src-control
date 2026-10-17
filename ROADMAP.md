@@ -561,8 +561,8 @@ clone: the view closure is filled by id before switch, fast-forward, undo and
 **P37c — merge on partial clones (proposed).** A tree-recursive three-way merge
 that carries a subtree by id where the three sides agree, checks protection
 rules before carrying, never drops wraps for subtrees it does not enumerate,
-and fills (lazy) or refuses (otherwise) only the region where all three sides
-differ. Clean merges first, then conflicts, then cherry-pick/rebase; sessions
+and fills (lazy) or refuses (otherwise) the region where the sides differ,
+the region that intersects a protection rule, and the sparse view's closure. Clean merges first, then conflicts, then cherry-pick/rebase; sessions
 are undecided. Design in
 [ADR-0049](docs/adr/0049-merge-on-partial-clones.md).
 
