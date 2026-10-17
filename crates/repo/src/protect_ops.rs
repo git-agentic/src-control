@@ -142,6 +142,7 @@ impl Repo {
         new: &scl_crypto::PublicKey,
     ) -> Result<ObjectId> {
         self.refuse_on_private("sc grant")?;
+        self.refuse_on_partial("sc grant")?;
         // P21: same in-progress guard as `protect` — see its comment.
         if crate::merge_state::in_progress(self.layout()) {
             return Err(Error::MergeInProgress);
@@ -222,6 +223,7 @@ impl Repo {
     /// already checked out — see the secrets-revoke rationale in ADR-0008).
     pub fn revoke(&self, prefix: &str, recipient_id: &scl_crypto::RecipientId) -> Result<ObjectId> {
         self.refuse_on_private("sc revoke")?;
+        self.refuse_on_partial("sc revoke")?;
         // P21: same in-progress guard as `protect` — see its comment.
         if crate::merge_state::in_progress(self.layout()) {
             return Err(Error::MergeInProgress);

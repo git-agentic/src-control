@@ -1805,6 +1805,11 @@ impl Repo {
         if let Some(m) = self.manifest_at(&target_tip)? {
             return self.switch_to_private(name, target_tip, m, identity, &old_paths);
         }
+        // Leaving a private branch flattens the public target's whole tree
+        // below, which a partial clone cannot do.
+        if head_priv.is_some() {
+            self.refuse_on_partial("switching away from a private branch")?;
+        }
         // Public target. When leaving a private branch there is no public
         // old root to hand `materialize` — the stale-path removal below uses
         // `old_paths` directly instead.

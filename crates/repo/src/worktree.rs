@@ -246,10 +246,11 @@ pub(crate) fn graft_out_of_sparse(
     // The I1 check inside the loop below only fires when the parent
     // already has a same-name entry there; this closes that gap by
     // scanning the built side for any survivor once up front, against the
-    // PROMISOR filter (not `sparse` — `sparse` can be narrower than the
-    // fetch filter, but never wider, since `set_sparse`/`disable_sparse`
-    // refuse widening past it; the filter is the actual "was this ever
-    // fetched?" authority). Refuse loudly rather than let it land in the
+    // UNION of the promisor filter and the sparse view (ADR-0048): the
+    // filter records what a clone asked for, and a widened view can reach
+    // paths the filter does not, so a path is refused only if it lies
+    // outside both. (Before widening existed `sparse` was never wider than
+    // the filter, so nothing is newly refused.) Refuse loudly rather than let it land in the
     // new root, where `sc gc` would classify it as an unreachable gap and
     // prune it — even though it's genuinely reachable and the origin never
     // had it (P27 Task 5 review Critical).
@@ -262,7 +263,7 @@ pub(crate) fn graft_out_of_sparse(
         } else {
             format!("{prefix}/{}", e.name)
         };
-        if !promisor.should_descend(&path) {
+        if !promisor.should_descend(&path) && !sparse.should_descend(&path) {
             return Err(Error::GappedPathContent(path));
         }
     }
@@ -377,7 +378,25 @@ pub(crate) fn tree_file_ids_sparse(
         return tree_file_ids(store, root);
     }
     let mut out = BTreeMap::new();
-    walk_tree_sparse(store, root, String::new(), sparse, &mut out)?;
+    walk_tree_sparse(store, root, String::new(), sparse, &mut out, false)?;
+    Ok(out)
+}
+
+/// Like [`tree_file_ids_sparse`], but skips a subtree the store lacks instead
+/// of failing. For `materialize`'s old-root removal walk on a partial clone:
+/// the old root was laid out under a preflighted view, so an absent subtree
+/// lay outside that view and has nothing on disk to remove. The promisor
+/// filter that bounds the walk is only a superset of the view, and a fetch can
+/// leave a tree inside the filter but outside the view absent (ADR-0048).
+fn tree_file_ids_sparse_present(
+    store: &mut Store,
+    root: ObjectId,
+    sparse: &Sparse,
+) -> Result<BTreeMap<String, ObjectId>> {
+    let mut out = BTreeMap::new();
+    if store.contains(&root) {
+        walk_tree_sparse(store, root, String::new(), sparse, &mut out, true)?;
+    }
     Ok(out)
 }
 
@@ -387,6 +406,7 @@ fn walk_tree_sparse(
     prefix: String,
     sparse: &Sparse,
     out: &mut BTreeMap<String, ObjectId>,
+    skip_absent: bool,
 ) -> Result<()> {
     let tree: Tree = store.get_tree(&tree_id)?;
     for e in tree.entries {
@@ -402,8 +422,8 @@ fn walk_tree_sparse(
                 }
             }
             EntryKind::Tree => {
-                if sparse.should_descend(&path) {
-                    walk_tree_sparse(store, e.id, path, sparse, out)?;
+                if sparse.should_descend(&path) && (!skip_absent || store.contains(&e.id)) {
+                    walk_tree_sparse(store, e.id, path, sparse, out, skip_absent)?;
                 }
             }
         }
@@ -571,6 +591,75 @@ pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<std::path::PathBuf> {
     Ok(root.join(rel))
 }
 
+/// Check, before anything is written, that every object the sparse view needs
+/// under `root` is in the store (ADR-0048, the view closure obligation). Only a
+/// partial clone can have such a gap, so a full clone returns immediately and
+/// keeps its existing behavior. On a gap this fails with
+/// [`Error::GapInView`], naming the path and the filter prefix `sc backfill`
+/// can repair, instead of the raw `NotFound` the write loop would raise after
+/// it had already rewritten part of the working tree. No network: filling the
+/// gap on a lazy clone is a separate, later step.
+pub(crate) fn preflight_view(
+    layout: &Layout,
+    store: &mut Store,
+    root: ObjectId,
+    sparse: &Sparse,
+) -> Result<()> {
+    let Some(promisor) = crate::promisor::load(layout)? else {
+        return Ok(());
+    };
+    let gap = |path: &str| {
+        let prefix = promisor
+            .prefixes()
+            .iter()
+            .find(|p| {
+                let bare = p.trim_end_matches('/');
+                path == bare || path.starts_with(&format!("{bare}/"))
+            })
+            .or_else(|| promisor.prefixes().first())
+            .cloned()
+            .unwrap_or_else(|| path.to_string());
+        Error::GapInView {
+            path: if path.is_empty() {
+                "(root tree)".to_string()
+            } else {
+                path.to_string()
+            },
+            prefix,
+        }
+    };
+    if !store.contains(&root) {
+        return Err(gap(""));
+    }
+    let mut stack = vec![(root, String::new())];
+    while let Some((tree_id, path)) = stack.pop() {
+        let tree: Tree = store.get_tree(&tree_id)?;
+        for e in tree.entries {
+            let child = if path.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{path}/{}", e.name)
+            };
+            match e.kind {
+                EntryKind::Blob => {
+                    if sparse.matches(&child) && !store.contains(&e.id) {
+                        return Err(gap(&child));
+                    }
+                }
+                EntryKind::Tree => {
+                    if sparse.should_descend(&child) {
+                        if !store.contains(&e.id) {
+                            return Err(gap(&child));
+                        }
+                        stack.push((e.id, child));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Materialize a snapshot's file tree into the working dir.
 ///
 /// `sparse` filters the disk view: a target entry outside `sparse` is never
@@ -605,6 +694,10 @@ pub(crate) fn materialize(
     sparse: &Sparse,
     mut cache: Option<&mut ProtectedCache>,
 ) -> Result<Vec<String>> {
+    // Fail before the first write if the view's closure is not all present
+    // (partial clones only; ADR-0048). The check lives here so every caller
+    // is covered and none can forget it.
+    preflight_view(layout, store, target_root, sparse)?;
     // Gap-tolerant when sparse is active (P27 Task 4): a promisor-filtered
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
     // walk here would `NotFound` on them.
@@ -622,11 +715,16 @@ pub(crate) fn materialize(
         // walking it would `NotFound`. A full (non-partial) repo keeps the
         // old unfiltered walk exactly (`Sparse::default()` falls back to
         // `tree_file_ids` inside `tree_file_ids_sparse`).
-        let old_walk_bound = match crate::promisor::load(layout)? {
-            Some(p) => Sparse::new(p.prefixes().to_vec()),
-            None => Sparse::default(),
+        let (old_walk_bound, partial) = match crate::promisor::load(layout)? {
+            Some(p) => (Sparse::new(p.prefixes().to_vec()), true),
+            None => (Sparse::default(), false),
         };
-        for p in tree_file_ids_sparse(store, old, &old_walk_bound)?.keys() {
+        let old_files = if partial {
+            tree_file_ids_sparse_present(store, old, &old_walk_bound)?
+        } else {
+            tree_file_ids_sparse(store, old, &old_walk_bound)?
+        };
+        for p in old_files.keys() {
             if !target.contains_key(p) || !sparse.matches(p) {
                 let full = safe_join(&layout.root, p)?;
                 let _ = std::fs::remove_file(full);

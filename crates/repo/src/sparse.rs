@@ -160,6 +160,16 @@ impl Repo {
         // Preflight — before any disk write (the spec file or the working
         // tree) — so a refused widen leaves nothing partially written.
         if let Some(promisor) = self.promisor()? {
+            // No prefixes means a full checkout, which is what `sparse
+            // disable` is, and that is refused on a partial clone.
+            if prefixes.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "cannot set an empty sparse spec (a full checkout) on a partial clone: \
+                     only [{}] was fetched; run `sc backfill --all` to convert to a full \
+                     clone first, or name a prefix within it",
+                    promisor.prefixes().join(", ")
+                )));
+            }
             for p in prefixes {
                 let bare = p.trim_end_matches('/');
                 if !promisor.matches(bare) {
@@ -175,11 +185,24 @@ impl Repo {
             ));
         }
         let spec = Sparse::new(prefixes.to_vec());
+        let tip = self.head_tip()?;
+        let snap = match tip {
+            Some(tip) => Some(self.snapshot(&tip)?),
+            None => None,
+        };
+        // Check the PROPOSED view's closure against HEAD before the spec is
+        // stored: once it is stored the previous view cannot be recovered and
+        // a failure below would leave the new spec over a tree that cannot be
+        // laid out (ADR-0048).
+        if let Some(snap) = &snap {
+            let store_arc = self.vfs().store();
+            let mut s = store_arc.lock().unwrap();
+            crate::worktree::preflight_view(self.layout(), &mut s, snap.root, &spec)?;
+        }
         store(self.layout(), &spec)?;
-        let Some(tip) = self.head_tip()? else {
+        let Some(snap) = snap else {
             return Ok(Vec::new());
         };
-        let snap = self.snapshot(&tip)?;
         let store_arc = self.vfs().store();
         let mut s = store_arc.lock().unwrap();
         let mut cache = self.open_protected_cache()?;

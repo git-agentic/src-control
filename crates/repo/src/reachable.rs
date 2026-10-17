@@ -2,7 +2,7 @@
 //! snapshot tips. Parameterized by an `ObjectSource` so it walks either the
 //! local `Store` (push) or a remote `Transport` (clone/fetch). Reused by P8 gc.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use scl_core::{EntryKind, Object, ObjectId, Store};
 
@@ -64,57 +64,6 @@ pub(crate) fn walk_tree(
     walk_tree_filtered(src, root, seen, &mut gaps, None, &mut expanded)
 }
 
-/// Like [`walk_tree`], but tolerant of an absent child: a missing tree or
-/// blob id is simply not inserted into `seen` and not descended into,
-/// instead of erroring (P27 final review I1). Used only by gc's
-/// defense-in-depth walk-in of a PRESENT gap-frontier tree
-/// (`gc.rs::run`): `ingest_pack_file`'s write pass is not all-or-nothing,
-/// so a crash-interrupted `sc backfill` (Ctrl-C, power loss) can leave a
-/// gap-frontier tree present locally while one of its children never
-/// landed. The strict [`walk_tree`] would `get()` that missing child and
-/// hard-error, bricking `sc gc` on a partial clone — which this walk-in
-/// exists specifically to prevent. Presence is also checked BEFORE
-/// inserting an id into `seen` (not just before recursing into it):
-/// `gc::run`'s next step, `Store::write_pack`, `get()`s every id in the
-/// reachable set it's handed, so an absent id smuggled into `seen` here
-/// would just move the same hard error one step later. A present child
-/// below an absent one is intentionally NOT reached (matches the
-/// documented nuance that gc only protects content connected to the local
-/// graph — see ADR-0037's gc section). Takes `&mut Store` directly (not
-/// the generic `ObjectSource`) since gc always walks the local store.
-pub(crate) fn walk_tree_present_only(
-    store: &mut Store,
-    root: ObjectId,
-    seen: &mut BTreeSet<ObjectId>,
-) -> Result<()> {
-    if !store.contains(&root) || !seen.insert(root) {
-        return Ok(());
-    }
-    let mut stack = vec![root];
-    while let Some(tree_id) = stack.pop() {
-        let tree = match Store::get(store, &tree_id)? {
-            Object::Tree(t) => t,
-            _ => return Err(Error::BadRef(format!("expected tree {tree_id}"))),
-        };
-        for e in tree.entries {
-            if !store.contains(&e.id) {
-                continue;
-            }
-            match e.kind {
-                EntryKind::Blob => {
-                    seen.insert(e.id);
-                }
-                EntryKind::Tree => {
-                    if seen.insert(e.id) {
-                        stack.push(e.id);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// The prefix predicate a filtered reachability/tree walk needs. Implemented
 /// by [`crate::promisor::Promisor`] (P27 Task 1); `crate::sparse::Sparse`
 /// could implement it too, but that wiring is not required by this task. A
@@ -169,14 +118,7 @@ pub fn reachable_objects_filtered(
     tips: &[ObjectId],
     filter: Option<&dyn PrefixFilter>,
 ) -> Result<Reachable> {
-    let mut included = BTreeSet::new();
     let mut gaps = BTreeSet::new();
-    let mut snapshots: VecDeque<ObjectId> = VecDeque::new();
-    for t in tips {
-        if included.insert(*t) {
-            snapshots.push_back(*t);
-        }
-    }
     // (id, path) pairs already pushed for expansion, under a filter only.
     // Hoisted to span EVERY snapshot's walk in this call (not just one), so
     // a later snapshot whose ROOT tree dedups to an already-expanded
@@ -185,6 +127,37 @@ pub fn reachable_objects_filtered(
     // comment for why a bare-id gate on the root is wrong under a filter
     // (C1, P27 final review).
     let mut expanded: HashSet<(ObjectId, String)> = HashSet::new();
+    let mut included = walk_snapshots(src, tips, |src, _snapshot, root, included| {
+        walk_tree_filtered(src, root, included, &mut gaps, filter, &mut expanded)
+    })?;
+    // A byte-identical subtree can be gapped at one path and included at
+    // another (same id, different filter verdict per path) — included
+    // always wins. See the disjointness note on `Reachable`.
+    gaps.retain(|id| !included.contains(id));
+    Ok(Reachable {
+        included: std::mem::take(&mut included),
+        gaps,
+    })
+}
+
+/// The snapshot-level walk shared by the filtered and the presence-based
+/// reachability: every tip, its parents, its `secrets` registry objects, and
+/// a private branch's manifest closure. `walk_root` is called once per
+/// snapshot with that snapshot's id and root tree id, and owns the tree
+/// descent (and so the gap policy). Snapshots, parents and manifests are
+/// always read strictly — they are never gaps.
+fn walk_snapshots<S: ObjectSource>(
+    src: &mut S,
+    tips: &[ObjectId],
+    mut walk_root: impl FnMut(&mut S, ObjectId, ObjectId, &mut BTreeSet<ObjectId>) -> Result<()>,
+) -> Result<BTreeSet<ObjectId>> {
+    let mut included = BTreeSet::new();
+    let mut snapshots: VecDeque<ObjectId> = VecDeque::new();
+    for t in tips {
+        if included.insert(*t) {
+            snapshots.push_back(*t);
+        }
+    }
     while let Some(sid) = snapshots.pop_front() {
         let snap = match src.get(&sid)? {
             Object::Snapshot(s) => s,
@@ -229,20 +202,89 @@ pub fn reachable_objects_filtered(
         for id in snap.secrets.values() {
             included.insert(*id);
         }
-        walk_tree_filtered(
-            src,
-            snap.root,
-            &mut included,
-            &mut gaps,
-            filter,
-            &mut expanded,
-        )?;
+        walk_root(src, sid, snap.root, &mut included)?;
     }
-    // A byte-identical subtree can be gapped at one path and included at
-    // another (same id, different filter verdict per path) — included
-    // always wins. See the disjointness note on `Reachable`.
-    gaps.retain(|id| !included.contains(id));
-    Ok(Reachable { included, gaps })
+    Ok(included)
+}
+
+/// The result of a presence-based walk (ADR-0048): `present` are the tree and
+/// blob objects the walk reached and the store holds, plus the snapshot-level
+/// ids it takes without a presence check, as the strict walk does (manifest
+/// closure ids and secrets); `gaps` maps every absent object that
+/// a present tree (or snapshot, for a root tree) references to its referrer.
+/// The two are disjoint by construction, since an id is either in the store
+/// or not.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PartialReach {
+    pub present: BTreeSet<ObjectId>,
+    pub gaps: BTreeMap<ObjectId, ObjectId>,
+}
+
+/// Presence-based reachability for a partial clone's own store (ADR-0048).
+/// Unlike [`reachable_objects_filtered`], this takes no filter: it descends
+/// every tree the store holds and records an absent child as a gap together
+/// with the tree that references it, never reading it. The promisor filter
+/// says what a clone *asked for*, not what is present (an ordinary `fetch`
+/// can leave an in-filter object absent), so every client-side decision —
+/// what gc keeps, what push sends, what verify reports — asks the store.
+///
+/// A snapshot's root tree can be absent too (a commit that moves an old
+/// out-of-filter subtree to the root is dropped by the fetch's `haves`
+/// subtraction), so an absent root is a gap, not an error. Snapshots,
+/// parents, secrets and manifests stay strict. Verdicts depend only on
+/// presence, never on path, so the ordinary bare-id expansion dedup applies.
+pub fn reachable_objects_partial(store: &mut Store, tips: &[ObjectId]) -> Result<PartialReach> {
+    let mut gaps = BTreeMap::new();
+    let present = walk_snapshots(store, tips, |store, snapshot, root, present| {
+        walk_tree_partial(store, snapshot, root, present, &mut gaps)
+    })?;
+    Ok(PartialReach { present, gaps })
+}
+
+/// Presence-based descent from one tree `root`, recording what it reaches in
+/// `present` and what it finds absent in `gaps` (id to the referrer, the
+/// first one seen). `referrer` is whatever names `root`: the snapshot for a
+/// snapshot root, or `root` itself for a decided-root tree. `pub(crate)` so
+/// gc can protect an in-progress operation's decided tree with the same
+/// gap policy.
+pub(crate) fn walk_tree_partial(
+    store: &mut Store,
+    referrer: ObjectId,
+    root: ObjectId,
+    present: &mut BTreeSet<ObjectId>,
+    gaps: &mut BTreeMap<ObjectId, ObjectId>,
+) -> Result<()> {
+    if !store.contains(&root) {
+        gaps.entry(root).or_insert(referrer);
+        return Ok(());
+    }
+    if !present.insert(root) {
+        return Ok(());
+    }
+    let mut stack = vec![root];
+    while let Some(tree_id) = stack.pop() {
+        let tree = match Store::get(store, &tree_id)? {
+            Object::Tree(t) => t,
+            _ => return Err(Error::BadRef(format!("expected tree {tree_id}"))),
+        };
+        for e in tree.entries {
+            if !store.contains(&e.id) {
+                gaps.entry(e.id).or_insert(tree_id);
+                continue;
+            }
+            match e.kind {
+                EntryKind::Blob => {
+                    present.insert(e.id);
+                }
+                EntryKind::Tree => {
+                    if present.insert(e.id) {
+                        stack.push(e.id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Filtered clones exclude private branches entirely (ADR-0044): sealed
@@ -886,5 +928,62 @@ mod tests {
             Error::Core(scl_core::Error::NotFound(_)) => {}
             other => panic!("expected NotFound for missing in-filter object, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn partial_walk_on_a_full_store_equals_the_strict_walk_with_no_gaps() {
+        let (arc, snap_id, ..) = two_subtree_repo();
+        let mut s = arc.lock().unwrap();
+        let strict = reachable_objects(&mut *s, &[snap_id]).unwrap();
+        let r = reachable_objects_partial(&mut s, &[snap_id]).unwrap();
+        assert_eq!(r.present, strict);
+        assert!(r.gaps.is_empty());
+        // The filtered walk keeps its meaning: against the same full store it
+        // still cuts out-of-filter objects (the origin relies on that to build
+        // a filtered transfer), which the presence walk does not.
+        let filter = crate::promisor::Promisor::new("origin", vec!["src/".into()]);
+        let f = reachable_objects_filtered(&mut *s, &[snap_id], Some(&filter)).unwrap();
+        assert!(!f.gaps.is_empty());
+        assert!(f.included.len() < strict.len());
+    }
+
+    #[test]
+    fn partial_walk_records_absent_children_with_their_referrer() {
+        let (arc, snap_id, root_id, src_tree_id, src_blob_id, docs_tree_id, docs_blob_id) =
+            two_subtree_repo();
+        let mut s = arc.lock().unwrap();
+        // The out-of-filter `docs` subtree is absent (a partial clone), and so
+        // is the in-filter blob under `src` (a fetch that omitted it).
+        s.delete(&docs_tree_id).unwrap();
+        s.delete(&docs_blob_id).unwrap();
+        s.delete(&src_blob_id).unwrap();
+        let r = reachable_objects_partial(&mut s, &[snap_id]).unwrap();
+        assert_eq!(r.gaps.get(&docs_tree_id), Some(&root_id));
+        assert_eq!(r.gaps.get(&src_blob_id), Some(&src_tree_id));
+        // Nothing below an absent tree is reachable, so it is not listed.
+        assert!(!r.gaps.contains_key(&docs_blob_id));
+        assert_eq!(r.gaps.len(), 2);
+        assert!(r.present.contains(&snap_id));
+        assert!(r.present.contains(&root_id));
+        assert!(r.present.contains(&src_tree_id));
+        assert!(r.present.iter().all(|id| s.contains(id)));
+    }
+
+    #[test]
+    fn partial_walk_treats_an_absent_root_tree_as_a_gap() {
+        let (arc, snap_id, root_id, ..) = two_subtree_repo();
+        let mut s = arc.lock().unwrap();
+        s.delete(&root_id).unwrap();
+        let r = reachable_objects_partial(&mut s, &[snap_id]).unwrap();
+        assert_eq!(r.gaps.get(&root_id), Some(&snap_id));
+        assert_eq!(r.present, BTreeSet::from([snap_id]));
+    }
+
+    #[test]
+    fn partial_walk_still_requires_the_snapshot_itself() {
+        let (arc, snap_id, ..) = two_subtree_repo();
+        let mut s = arc.lock().unwrap();
+        s.delete(&snap_id).unwrap();
+        assert!(reachable_objects_partial(&mut s, &[snap_id]).is_err());
     }
 }

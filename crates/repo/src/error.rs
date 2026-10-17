@@ -46,6 +46,24 @@ pub enum Error {
     GappedPathContent(String),
     #[error("{0} lies outside this partial clone's fetch filter; run `sc backfill {0}` to fetch it first")]
     GapOutsideFilter(String),
+    /// An object the checked-out view needs is absent from a partial clone's
+    /// store even though the path is inside its fetch filter (ADR-0048): an
+    /// ordinary `fetch` subtracts the closure of every have, so a new object
+    /// equal to one reachable from a have at an out-of-filter path is left
+    /// out of the reply. Raised before anything is written, so the working
+    /// tree and refs are untouched. `prefix` is the filter prefix that
+    /// `sc backfill` can act on.
+    #[error("{path} is missing from this partial clone's local objects (an earlier fetch left a gap inside the checked-out view); nothing was changed. Run `sc backfill {prefix}` to repair it")]
+    GapInView { path: String, prefix: String },
+    /// A push found an object the local store lacks (referenced by `referrer`)
+    /// that the destination does not hold either (ADR-0048). Pushing the new
+    /// tip would leave the destination with a tree that names an object it
+    /// cannot serve, so the push is refused before any byte is sent.
+    #[error("refusing to push: object {id} (referenced by {referrer}) is missing locally and the remote does not have it; if it came from the origin run `sc backfill --all`, otherwise restore or recreate the content and commit again, then retry")]
+    PushGap {
+        id: scl_core::ObjectId,
+        referrer: scl_core::ObjectId,
+    },
     /// A dedicated, non-path-shaped refusal for an operation that isn't
     /// supported on a partial clone at all (merge, cherry-pick/rebase
     /// replay, `sc ws harvest`, `sc work`) — distinct from
