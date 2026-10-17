@@ -165,9 +165,14 @@ fn status_diff_and_gc_succeed_on_fresh_partial_clone() {
 fn backfill_all_lifts_partial_clone_refusals() {
     let (src_root, dst_root) = make_partial_clone("backfill-all");
 
-    // Merge is refused while partial: create a divergent (non-conflicting —
-    // different files, so a clean merge is the only thing this test is
-    // exercising) branch first.
+    // A merge with conflicts is refused while partial (a clean one works, P37c-ii).
+    // Create a divergent, non-conflicting branch (different files) for the clean
+    // merge after backfill, and a clashing one (same file) for the refusal.
+    assert!(sc(&dst_root, &["branch", "clash"]).status.success());
+    assert!(sc(&dst_root, &["switch", "clash"]).status.success());
+    std::fs::write(dst_root.join("src/a.txt"), "clash-edit\n").unwrap();
+    assert!(sc(&dst_root, &["commit", "-m", "clash"]).status.success());
+    assert!(sc(&dst_root, &["switch", "main"]).status.success());
     assert!(sc(&dst_root, &["branch", "feature"]).status.success());
     assert!(sc(&dst_root, &["switch", "feature"]).status.success());
     std::fs::write(dst_root.join("src/feature.txt"), "feature-only\n").unwrap();
@@ -176,15 +181,23 @@ fn backfill_all_lifts_partial_clone_refusals() {
     std::fs::write(dst_root.join("src/a.txt"), "main-edit\n").unwrap();
     assert!(sc(&dst_root, &["commit", "-m", "main"]).status.success());
 
-    let merge_before = sc(&dst_root, &["merge", "feature"]);
+    let merge_before = sc(&dst_root, &["merge", "clash"]);
     assert!(
         !merge_before.status.success(),
-        "merge must still be refused before backfill --all"
+        "a conflicting merge must still be refused before backfill --all"
     );
     assert!(
         stderr(&merge_before).contains("backfill --all"),
         "refusal must point at `sc backfill --all`: {}",
         stderr(&merge_before)
+    );
+    assert!(
+        !dst_root.join("src/a.txt.theirs").exists(),
+        "a refused merge writes nothing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dst_root.join("src/a.txt")).unwrap(),
+        "main-edit\n"
     );
 
     let backfill = sc(&dst_root, &["backfill", "--all"]);

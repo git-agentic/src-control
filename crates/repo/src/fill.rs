@@ -169,6 +169,45 @@ impl Repo {
         Ok(filler.stats)
     }
 
+    /// Make the objects a tree merge asked for present (ADR-0049 decision 5).
+    /// Each `(id, path)` is what `merge_trees` could not read and where it
+    /// found it. A lazy, online partial clone fetches them by id in batches;
+    /// any other partial clone fails with the gap error for the first path
+    /// (`sc backfill <path>`), and with the whole-clone refusal when the gap is
+    /// the root, which no prefix can repair. Call it with the store lock
+    /// released: the fill takes it. Fetched objects stay (they are immutable
+    /// CAS additions), so a retry resumes from current presence.
+    pub(crate) fn fill_needs(&self, needs: &[(ObjectId, String)]) -> Result<FillStats> {
+        self.fill_needs_impl(needs, crate::promisor::offline())
+    }
+
+    /// `offline` is a parameter so tests can exercise `SC_OFFLINE` without
+    /// mutating the process environment.
+    fn fill_needs_impl(&self, needs: &[(ObjectId, String)], offline: bool) -> Result<FillStats> {
+        let Some((_, first)) = needs.first() else {
+            return Ok(FillStats::default());
+        };
+        let mut filler = Filler::new(self, offline)?;
+        let ids: BTreeSet<ObjectId> = needs.iter().map(|(id, _)| *id).collect();
+        if let Err(e) = filler.ensure_many(&ids, first) {
+            return Err(match e {
+                Error::GapOutsideFilter(p) if p.is_empty() => {
+                    crate::promisor::partial_clone_unsupported("merge")
+                }
+                other => other,
+            });
+        }
+        // The batch is all-or-nothing on the wire, but trust presence, not the
+        // reply: the caller's no-progress check rests on it.
+        let store_arc = self.vfs.store();
+        let store = store_arc.lock().unwrap();
+        if let Some(id) = ids.iter().find(|id| !store.contains(id)) {
+            return Err(Error::Core(scl_core::Error::NotFound(*id)));
+        }
+        drop(store);
+        Ok(filler.stats)
+    }
+
     /// The bytes of the file at `path` as of `refname`'s tip (`sc cat
     /// <ref>:<path>`). On a lazy partial clone, trees and the blob missing
     /// locally are fetched by id on the way down (one round trip per tree

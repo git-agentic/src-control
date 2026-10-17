@@ -106,7 +106,33 @@ impl Repo {
                 map.insert(normalize(path), (id, *mode, *perms));
             }
         }
-        self.build_subtree_inner(&map, "")
+        self.build_subtree_inner(&map, &BTreeMap::new(), "")
+    }
+
+    /// Like [`write_tree_with_perms`][Self::write_tree_with_perms], and also
+    /// places `carried` subtrees verbatim: each `(path, entry)` is inserted at
+    /// `path` with its id, mode and perms untouched and nothing below it read.
+    /// Ancestor directories are built from `files` and the carried paths
+    /// together. A carried path that is also a file, or the ancestor of one, is
+    /// the caller's collision to reject first (`merge::check_path_collisions`).
+    pub fn write_tree_with_carried(
+        &self,
+        files: &[(String, Vec<u8>, FileMode, u8)],
+        carried: &[(String, TreeEntry)],
+    ) -> Result<ObjectId> {
+        let mut map: BTreeMap<String, (ObjectId, FileMode, u8)> = BTreeMap::new();
+        {
+            let mut store = self.store.lock().unwrap();
+            for (path, bytes, mode, perms) in files {
+                let id = store.put(Object::blob(bytes.clone()))?;
+                map.insert(normalize(path), (id, *mode, *perms));
+            }
+        }
+        let carried: BTreeMap<String, TreeEntry> = carried
+            .iter()
+            .map(|(p, e)| (normalize(p), e.clone()))
+            .collect();
+        self.build_subtree_inner(&map, &carried, "")
     }
 
     /// Fork an in-memory worktree from a base snapshot. Cheap: allocates only an
@@ -133,7 +159,7 @@ impl Repo {
             .iter()
             .map(|(p, (id, mode))| (p.clone(), (*id, *mode, 0u8)))
             .collect();
-        self.build_subtree_inner(&with_perms, "")
+        self.build_subtree_inner(&with_perms, &BTreeMap::new(), "")
     }
 
     /// The single tree builder: reads each blob entry's `perms` byte from the map
@@ -142,6 +168,7 @@ impl Repo {
     fn build_subtree_inner(
         &self,
         files: &BTreeMap<String, (ObjectId, FileMode, u8)>,
+        carried: &BTreeMap<String, TreeEntry>,
         prefix: &str,
     ) -> Result<ObjectId> {
         // Partition entries directly under `prefix` into files vs subdirectories.
@@ -165,13 +192,27 @@ impl Repo {
                 }
             }
         }
+        for (path, entry) in carried {
+            let Some(rest) = strip_prefix_dir(path, prefix) else {
+                continue;
+            };
+            match rest.split_once('/') {
+                None => entries.push(TreeEntry {
+                    name: rest.to_string(),
+                    ..entry.clone()
+                }),
+                Some((dir, _)) => {
+                    subdirs.insert(dir.to_string(), ());
+                }
+            }
+        }
         for dir in subdirs.keys() {
             let child_prefix = if prefix.is_empty() {
                 format!("{dir}/")
             } else {
                 format!("{prefix}{dir}/")
             };
-            let sub_id = self.build_subtree_inner(files, &child_prefix)?;
+            let sub_id = self.build_subtree_inner(files, carried, &child_prefix)?;
             entries.push(TreeEntry {
                 name: dir.clone(),
                 kind: EntryKind::Tree,
@@ -457,6 +498,51 @@ mod tests {
 
     fn repo() -> Repo {
         Repo::new(Store::new(StoreConfig::default()))
+    }
+
+    #[test]
+    fn write_tree_with_carried_places_subtrees_verbatim_beside_built_ones() {
+        let r = repo();
+        // A subtree the store has never seen: only its entry is placed.
+        let absent = Object::blob(b"never stored".to_vec()).id();
+        let carried = TreeEntry {
+            name: "ignored".into(),
+            kind: EntryKind::Tree,
+            id: absent,
+            mode: FileMode(0o700),
+            perms: 3,
+        };
+        let root = r
+            .write_tree_with_carried(
+                &[
+                    ("a.txt".into(), b"a".to_vec(), FileMode::FILE, 0),
+                    ("dir/b.txt".into(), b"b".to_vec(), FileMode::FILE, 0),
+                ],
+                &[
+                    ("dir/sub".into(), carried.clone()),
+                    ("top".into(), carried.clone()),
+                    ("only/deep/er".into(), carried),
+                ],
+            )
+            .unwrap();
+        let store = r.store();
+        let mut s = store.lock().unwrap();
+        let t = s.get_tree(&root).unwrap();
+        let names: Vec<&str> = t.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "dir", "only", "top"]);
+        let top = t.get("top").unwrap();
+        assert_eq!((top.id, top.mode, top.perms), (absent, FileMode(0o700), 3));
+        let dir = s.get_tree(&t.get("dir").unwrap().id).unwrap();
+        let dn: Vec<&str> = dir.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            dn,
+            vec!["b.txt", "sub"],
+            "built and carried share a directory"
+        );
+        assert_eq!(dir.get("sub").unwrap().id, absent);
+        let only = s.get_tree(&t.get("only").unwrap().id).unwrap();
+        let deep = s.get_tree(&only.get("deep").unwrap().id).unwrap();
+        assert_eq!(deep.get("er").unwrap().id, absent);
     }
 
     fn seed(repo: &Repo) -> ObjectId {
