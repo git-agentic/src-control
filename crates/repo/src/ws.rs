@@ -548,7 +548,11 @@ impl Repo {
                     Err(e) => Err(e),
                 }
             }
-            Err(Error::ProtectedMergeNeedsIdentity(_)) | Err(Error::NotAuthorized(_)) => Ok(false),
+            // A file/directory collision (ADR-0049) is not a clean merge: this
+            // workspace falls back to a `work-<i>` branch like any conflict.
+            Err(Error::ProtectedMergeNeedsIdentity(_))
+            | Err(Error::NotAuthorized(_))
+            | Err(Error::PathCollision(_)) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -1570,6 +1574,38 @@ mod tests {
         assert!(!root.join("b.txt").exists());
 
         drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_file_directory_collision_falls_back_instead_of_aborting() {
+        // ws-1 adds a FILE `n`; ws-2 adds a DIRECTORY `n/` with a file in it.
+        // Landing ws-1 first makes ws-2's merge a file/directory collision
+        // (ADR-0049): it falls back to `work-2` like any conflict, and the
+        // harvest of the other workspaces is not aborted.
+        let root = tmp_root("harvest-file-dir-collision");
+        let repo = init(&root);
+        std::fs::write(root.join("keep.txt"), "k\n").unwrap();
+        repo.commit("t", "base").unwrap();
+
+        let session = repo.ws_fork(2, "t", None).unwrap();
+        std::fs::write(session.workspaces[0].dir.join("n"), "file\n").unwrap();
+        std::fs::create_dir_all(session.workspaces[1].dir.join("n")).unwrap();
+        std::fs::write(session.workspaces[1].dir.join("n/child"), "nested\n").unwrap();
+
+        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            matches!(&outcomes[0], WsHarvestOutcome::Landed { index: 1, .. }),
+            "got {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(&outcomes[1], WsHarvestOutcome::FallbackBranch { index: 2, branch } if branch == "work-2"),
+            "got {:?}",
+            outcomes[1]
+        );
+        assert_eq!(std::fs::read_to_string(root.join("n")).unwrap(), "file\n");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

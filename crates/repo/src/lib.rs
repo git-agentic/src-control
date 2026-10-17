@@ -14,7 +14,11 @@ pub mod ignore;
 pub mod layout;
 pub mod lock;
 pub mod merge;
+// Wired into `merge` on partial clones in P37c-ii (ADR-0049); until then only
+// its differential tests call it.
 pub mod merge_state;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod merge_tree;
 pub mod oplog;
 #[cfg(test)]
 mod partial_walks;
