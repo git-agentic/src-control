@@ -1583,7 +1583,7 @@ mod tests {
         // Landing ws-1 first makes ws-2's merge a file/directory collision
         // (ADR-0049): it falls back to `work-2` like any conflict, and the
         // harvest of the other workspaces is not aborted.
-        let root = tmp_root("harvest-collision");
+        let root = tmp_root("harvest-file-dir-collision");
         let repo = init(&root);
         std::fs::write(root.join("keep.txt"), "k\n").unwrap();
         repo.commit("t", "base").unwrap();
