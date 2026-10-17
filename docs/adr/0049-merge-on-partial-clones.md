@@ -19,11 +19,18 @@ Every step reads every file of both sides, and a partial clone does not hold the
 
 ## Decisions
 
-### 1. Leaf equality is one rule, shared by both engines
+### 1. Content and mode are merged as separate dimensions, in both engines
 
-The flatten merge resolves a plain path by **blob id alone** (`merge.rs:229-249`), and a protected path by `(blob id, PROTECTED)` (`merge.rs:312`). A mode-only change therefore loses today: base and ours hold blob X at `0644`, theirs holds X at `0755`; flatten sees ours' id equal to theirs' and keeps `0644`. A tree-level shortcut that compares whole entries would pick `0755`, so the two engines would disagree on the same merge.
+The flatten merge resolves a plain path by **blob id alone** (`merge.rs:229-249`) and a protected path by `(blob id, PROTECTED)` (`merge.rs:312`); the mode of the result then simply follows whichever side's entry was kept. A mode-only change therefore loses today: base and ours hold blob X at `0644`, theirs holds X at `0755`; the ids agree, ours is kept, and `0755` is dropped. A tree-level shortcut compares whole entries and would pick `0755`, so the two engines would disagree on the same merge.
 
-Rather than keep two behaviors, 37c-i changes the flatten leaf comparison to the entry key `(blob id, mode, perms & PROTECTED)` and uses that key in both engines. This is a deliberate, small behavior change on full clones: a mode-only change on one side now merges (it is currently dropped). `RANDOMIZED` stays out of the key because it is a property of the blob. ADR-0012 gets an amendment note and a regression test (the 0644/0755 example).
+A single composite key `(id, mode, perms)` is not the answer. It turns a metadata change into a false content divergence: base `(X,0644)`, ours `(Y,0644)`, theirs `(Y,0755)` agree on Y, yet every composite key differs, which would demand an identity for protected Y, report a conflict for identical binary Y, and could re-seal unchanged ciphertext (`merge.rs:283`, `:377`, `:399`).
+
+So 37c-i separates the dimensions, in **both** engines:
+
+- **Content** resolves exactly as today: by blob id (and the `PROTECTED` bit for protected paths). Nothing about content resolution, diff3, sealing or wraps changes.
+- **Mode** is merged afterwards, independently, as a three-way on the modes of the entries that exist: equal on both sides, take it; one side equal to base, take the other's; both sides changed differently, executable if either is (today's rule for that case, kept as the tiebreak). Example: base `(X,0755)`, ours `(X,0644)`, theirs `(Y,0755)` resolves content to Y (ours is unchanged from base by id, so theirs wins) and mode to `0644` (ours changed it, theirs did not), so ours' executable removal is kept.
+
+This is a deliberate, small behavior change on full clones: a mode-only change on one side now merges. It also makes the tree-level shortcuts below exact, because identical tree ids imply equal content and equal mode at every leaf, so "carry the differing side" is the per-dimension three-way answer. ADR-0012 gets an amendment note, and the cases above are regression tests (mode-only, identical-content/different-mode on binary and protected-keyless content, executable removal).
 
 ### 2. A tree-recursive merge that carries only what it can prove safe
 
@@ -38,16 +45,18 @@ Everything else is **enumerated**: read, flattened for that subtree, and resolve
 |---|---|
 | tree on all three sides, all differ | recurse |
 | tree on some sides, absent (or a blob) on others | enumerate the subtrees that exist and apply the per-path rules, so delete/modify and add/add keep their flatten meaning |
-| blob on one side and a tree on another | enumerate both and apply the per-path rules; if that yields both `x` and `x/child`, the existing tree writer's error stands (this is unchanged) |
+| blob on one side and a tree on another | enumerate both and apply the per-path rules, then apply the collision check below |
 | blobs on all three, all differ | the existing leaf merge |
+
+**File/directory collisions are rejected up front, in both engines.** The existing path does not reject them: with an empty base, ours adding file `x` and theirs adding `x/child`, the leaf merge reports two clean additions, the writer emits both a blob and a tree named `x` (`vfs/lib.rs:155`, `:175`; `Tree::new` only sorts duplicates, `object.rs:134`), and materialization can write `x` and then fail creating `x/` after changing files (`worktree.rs:839`). 37c-i makes the merge fail before any output write when a resolved name is a file and also a directory, or a file is an ancestor of another resolved path, including across the boundary between carried subtrees and enumerated files. The error names the path. This is a small fix to full-clone merge too.
 
 ### 3. Policy-intersecting subtrees are always enumerated
 
-A subtree is policy-disjoint when no rule in the **union** of the sides' rules covers it or lies inside it (`protect::matching_prefix` semantics: boundary-aware, longest prefix wins). A subtree that intersects a union rule and is not identical on all three sides is enumerated, never carried.
+A subtree is policy-disjoint when no rule in the **union** of the sides' rules covers it or lies inside it, checked in both directions at `/` boundaries (`protect::matching_prefix` semantics: boundary-aware, longest prefix wins). Every rule counts, including rules present on only one side and rules whose recipients have all been revoked: tombstones gate future seals and do not remove the prefix (`protect.rs:10`, `:30`). A subtree that intersects a union rule and is not identical on all three sides is enumerated, never carried.
 
 The first draft tested only whether a rule was *new* relative to the side being carried. That is not enough: the rule can already be on that side while plaintext sits under it. `protect` records the rule in a policy-only snapshot and encrypts in a second commit (`protect_ops.rs:85-105`), and a partial-clone commit encrypts only the sparse view and grafts the rest unchanged (`repo.rs:667`). The full merge encrypts every plain survivor under a union rule (`repo.rs:1403`) and would repair it; a carry would preserve it.
 
-One accepted divergence: a subtree identical on all three sides is carried even under a rule, so a merge does not force a partial clone to fetch every protected prefix. Plaintext under a rule that is identical on all three sides was already in both parents; the merge introduces nothing. A full merge would repair it and a partial one leaves it. A `sc verify` check for that state is a follow-on.
+One accepted divergence: a subtree identical on all three sides is carried even under a rule, so a merge does not force a partial clone to fetch every protected prefix. Plaintext under a rule that is identical on all three sides was already in both parents; the merge introduces nothing. A full merge would repair it and a partial one leaves it. A `sc verify` check for that state is a follow-on. The differential test (decision 9) excludes this state from its protection-perms equivalence on purpose.
 
 Recipient-list changes alone do not require re-wrapping a carried ciphertext: the full merge already carries ciphertext unchanged and unions the wraps it knows (`repo.rs:1413`, `merge.rs:454`).
 
@@ -65,11 +74,13 @@ Over-retention costs size: wraps are inline in the snapshot, and an object above
 
 The merged tree can also carry a subtree that is absent **inside the sparse view** (the fetch case from ADR-0048). So after the merge and before materializing, the caller runs `ensure_view(merged_root, sparse)`, as every other materializer site does. The claim that network traffic is bounded to the differing region is therefore "the differing region, the rule-intersecting region, and the view's closure".
 
-Failure contract: a fill that fails midway leaves only immutable CAS additions. No ref, spec, working-tree file or merge state is written before the last fill and `ensure_view` have succeeded.
+The order of a partial merge is: merge registries and files (a `Needs` result loops back through fill and recomputes, with no output writes during the retries) → refuse conflicts and collisions → encrypt → assemble the final root and wraps → `ensure_view(merged_root)` and the materialize preflight → materialize → snapshot and ref move. The repo lock stays held throughout; only the store mutex is released around fills.
+
+Failure contract: fetched objects persist (fill rounds write immutable CAS additions, so "before anything is written" cannot mean literally nothing), and so may the merged tree objects of the output step. No ref, spec, working-tree file or merge state is written until `ensure_view` and the preflight have succeeded.
 
 ### 6. The result keeps plaintext out of the CAS
 
-`TreeMerge` is not a bare tree id. It returns what `FileMerge` returns today (the enumerated `MergedFile` list with `needs_encrypt` plaintext, sidecars, conflicts, `wrapped_carry`) **plus** the carried subtrees as `(path, TreeEntry)` pairs. The existing pipeline (`repo.rs:1385-1530`) handles the enumerated files unchanged (routing through union rules, encryption, plaintext never written to the CAS). The carried entries are overlaid by id when the final tree is assembled. No new code path touches plaintext.
+`TreeMerge` is not a bare tree id. It returns what `FileMerge` returns today (the enumerated `MergedFile` list with `needs_encrypt` plaintext, sidecars, conflicts, `wrapped_carry`) **plus** the carried subtrees as `(path, TreeEntry)` pairs. The existing pipeline (`repo.rs:1385-1530`) handles the enumerated files unchanged (routing through union rules, encryption, plaintext never written to the CAS). The carried entries are overlaid by id when the final tree is assembled: a recursive overlay rebuilds each ancestor directory from the enumerated files at that level, inserts the carried entries verbatim (id, mode, perms untouched), and keeps the enumerated siblings, with the collision check above run over the combined names. No new code path touches plaintext.
 
 ### 7. Tree semantics, stated plainly
 
@@ -85,13 +96,14 @@ A conflict needs a state contract this record does not yet fix, and the review s
 - presence does not imply the sparse view: a conflict outside the view needs the existing `sc sparse set` refusal, and abort must preflight and fill before it deletes sidecars (today it deletes them first, `repo.rs:1666`);
 - `sc conflicts` and `sc resolve` flatten whole trees and need path-directed lookup (`conflicts.rs:147`, `:263`, `:329`).
 
-37c-i and 37c-ii therefore support **clean merges only**: any conflict on a partial clone is refused with a message saying so, before anything is written. 37c-iii amends this record with the conflict contract (a CAS-safe decided root, ephemeral conflict plaintext, persisted fresh wraps or an explicit refusal of the conflict-plus-out-of-view-protected-merge combination) before it builds anything.
+37c-i and 37c-ii therefore support **clean merges only**: any conflict on a partial clone is refused with a message saying so, before any merge-output, merge-state or working-tree write. This is implementable because `three_way_files` computes the conflict set without inserting objects (`merge.rs:191-438`), and a secret-registry conflict already fails before the file merge (`merge.rs:162`). 37c-iii amends this record with the conflict contract (a CAS-safe decided root, ephemeral conflict plaintext, persisted fresh wraps or an explicit refusal of the conflict-plus-out-of-view-protected-merge combination) before it builds anything.
 
 ### 9. Acceptance: differential tests built from real operations
 
-`merge_trees` is checked against the flatten implementation, with both on the shared leaf key of decision 1. The comparison is on **decrypted file sets, modes, perms, conflict sets, sidecars, effective rules and tombstones, the recipient set each protected blob is wrapped for, and actual decryption by each relevant identity**, not on wrap-map key coverage (which can pass with a missing recipient or a wrong DEK). Carried objects compare by bytes; freshly sealed output after decryption, because sealing is randomized. Cases are generated through real operations (`protect`, `grant`, `revoke`, commit, fetch) as well as arbitrary trees, and gaps are randomized independently of the sparse view and the filter. Required named cases:
+`merge_trees` is checked against the flatten implementation, with both using the content/mode split of decision 1. The comparison is on **decrypted file sets, modes, perms, conflict sets, sidecars, effective rules and tombstones, the recipient set each protected blob is wrapped for, and actual decryption by each relevant identity**, not on wrap-map key coverage (which can pass with a missing recipient or a wrong DEK). Carried objects compare by bytes; freshly sealed output after decryption, because sealing is randomized. Cases are generated through real operations (`protect`, `grant`, `revoke`, commit, fetch) as well as arbitrary trees, and gaps are randomized independently of the sparse view and the filter. Required named cases:
 
-- the mode-only change (0644/0755) from decision 1;
+- the mode and content cases from decision 1 (mode-only change, identical content with different mode on binary and on protected-keyless content, executable removal);
+- file/directory collisions, including across a carried/enumerated boundary;
 - plaintext under an existing rule on the carried side (decision 3), including the interrupted-`protect` state and the partial-clone graft state;
 - shared blob ids across a deleted path and a carried path (decision 4);
 - crossed revokes and regrants; nested prefix overrides (longest prefix wins);
@@ -104,7 +116,7 @@ A second differential runs each merge on a partial clone and a full clone. The n
 
 ## Phasing
 
-- **37c-i, engine.** The leaf-key fix on the flatten merge (with its ADR-0012 amendment and test), `merge_trees` returning `TreeMerge` or `Needs`, the policy-intersection test, the wrap-union rule, and the differential tests. Nothing calls the new engine yet except tests.
+- **37c-i, engine.** The content/mode split and the collision check on the flatten merge (with the ADR-0012 amendment and tests), `merge_trees` returning `TreeMerge` or `Needs`, the policy-intersection test, the wrap-union rule, and the differential tests. Nothing calls the new engine yet except tests.
 - **37c-ii, clean merge on a partial clone.** `merge_with_identity` uses the engine when the clone is partial: fill loop outside the lock, `ensure_view(merged_root)`, then the existing pipeline. A conflict is refused up front. Demo: two branches touching disjoint directories merge on a `--filter` clone without fetching either side's out-of-view content; a merge whose differing region is outside the view fills it on a lazy clone and is refused on a non-lazy one.
 - **37c-iii, conflicts.** First an amendment to this record that fixes decision 8's contract, then markers for present in-view conflicts, completion from the decided root, abort, `sc conflicts` and `sc resolve`.
 - **37c-iv, replay.** `cherry-pick` and `rebase` call the same engine; `replay.rs:176` is the only guard that blocks them, and `three_way_files` is already their merge. Replay adds protected re-encryption under the replayed rules and the resumable-rebase state.
@@ -113,7 +125,7 @@ A second differential runs each merge on a partial clone and a full clone. The n
 ## Consequences
 
 - A partial clone can merge without holding the other side's whole tree, which is what a partial clone is for. A merge whose differing region intersects a protection rule fetches that region.
-- Mode-only changes now merge on full clones too (decision 1). This is a deliberate fix and is called out in the release notes.
+- Mode-only changes now merge on full clones too (decision 1), and a file/directory collision is rejected before any write instead of failing during materialization. Both are deliberate fixes and are called out in the release notes.
 - A merged snapshot that carried subtrees holds the complete input wrap union, so it can be larger than the same merge on a full clone.
 - Merge becomes an allow-listed network site for lazy clones.
 - No wire change.
