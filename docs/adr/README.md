@@ -57,7 +57,8 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0044](0044-per-branch-access-control.md) | Per-branch access control with opaque private branches | Accepted | 34 |
 | [0045](0045-native-desktop-read-model.md) | Native desktop adapter and keyless read model | Accepted | 35 |
 | [0046](0046-wal-bucket-remotes.md) | Bucket remotes via an immutable-pack WAL + one CAS'd manifest | Accepted | 36 |
-| [0047](0047-want-by-id-fetch-and-gap-fill.md) | Want-by-id fetch and explicit gap fill for partial clones | Proposed | 37 |
+| [0047](0047-want-by-id-fetch-and-gap-fill.md) | Want-by-id fetch and explicit gap fill for partial clones | Accepted (37a built) | 37 |
+| [0048](0048-presence-based-partial-clones.md) | Presence-based walks for partial clones | Proposed | 37b |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
