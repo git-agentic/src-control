@@ -558,7 +558,7 @@ clone: the view closure is filled by id before switch, fast-forward, undo and
 `sparse disable` stay refused. Design and open questions in
 [ADR-0048](docs/adr/0048-presence-based-partial-clones.md).
 
-**P37c — merge on partial clones (proposed).** A tree-recursive three-way merge
+**P37c — merge on partial clones (proposed; 37c-i engine built, not yet wired).** A tree-recursive three-way merge
 that carries a subtree by id where the three sides agree, checks protection
 rules before carrying, never drops wraps for subtrees it does not enumerate,
 and fills (lazy) or refuses (otherwise) the region where the sides differ,

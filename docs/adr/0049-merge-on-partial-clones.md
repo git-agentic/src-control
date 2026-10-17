@@ -1,6 +1,6 @@
 # ADR-0049: Merge on partial clones (P37c)
 
-- **Status:** Proposed
+- **Status:** Proposed (37c-i built: engine and differential tests; not yet wired into `sc merge`)
 - **Date:** 2026-10-17
 - **Phase:** 37c
 - **Builds on:** ADR-0048 (presence-based partial clones), ADR-0047 (want-by-id fetch), ADR-0012 (three-way merge), ADR-0025 (protected merge and replay), ADR-0043 (randomized sealing)
