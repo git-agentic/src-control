@@ -106,7 +106,7 @@ the project tree if desired.
 
 ## Capability map (what's built, by phase)
 
-All 36 phases, P37a and P37b-i are built and tested. One line of current fact per phase; the
+All 36 phases, P37a, P37b-i and P37b-ii are built and tested. One line of current fact per phase; the
 authoritative rationale and full semantics live in the linked ADR, the design
 in `ARCHITECTURE.md`. The old per-phase narrative log this table replaced is
 archived verbatim at `docs/archive/claude-md-phase-log-2026-07.md` — do not
@@ -152,7 +152,7 @@ the code, those win.
 | P35 | Native Tauri desktop browser: opens `.sc` repositories through `scl-repo`, shows local/remote refs, all-parent snapshot DAG + provenance, public trees and first-parent diffs; protected content is locked and private branches remain opaque; no mutation or identity surface | [0045](docs/adr/0045-native-desktop-read-model.md) |
 | P36 | Bucket WAL remotes (sc+wal://, sc+s3://): immutable packs + CAS'd manifest, checkpoints + log-tail cold start, bucket-backed `sc serve --store` with disposable instances | [0046](docs/adr/0046-wal-bucket-remotes.md) |
 | P37a | Want-by-id fetch: batched `GetObjects` verb (wire v5), opt-in `.sc/promisor-lazy`, `sc cat <ref>:<path>` fills only the absent trees and blob on its path; `Store::get` stays network-free; sealed objects refused by kind; sparse widen and the lifted P27 refusals are P37b | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
-| P37b-i | Presence-based partial clones: push, verify and gc walk what the store holds (`reachable_objects_partial`), not the fetch filter; push checks every gap id against the destination before sending; a view gap fails with `GapInView` before any write (preflight at the top of `materialize`, plus `undo` and `sparse set`); a partial clone fetches from its origin only. Sparse widen (37b-ii) and merge/replay are next | [0048](docs/adr/0048-presence-based-partial-clones.md) |
+| P37b-i | Presence-based partial clones: push, verify and gc walk what the store holds (`reachable_objects_partial`), not the fetch filter; push checks every gap id against the destination before sending; a view gap fails with `GapInView` before any write (preflight at the top of `materialize`, plus `undo` and `sparse set`); a partial clone fetches from its origin only. 37b-ii: on a lazy, online clone `ensure_view` fills the view closure by id before switch, fast-forward, undo and `sparse set`, `sparse set` may widen past the filter, a by-id reply is capped at `min(--max-pack-size, 512 MiB)` and a refused batch is split. Merge/replay are next | [0048](docs/adr/0048-presence-based-partial-clones.md) |
 
 ## Standing boundaries & gotchas
 
@@ -169,14 +169,15 @@ transport-adjacent. The rest, imperatively:
   capability, and no DTO field capable of carrying protected ciphertext or
   identity material.
 - **Partial clones refuse merge, cherry-pick/rebase, `sc ws fork`/`harvest`,
-  `sc work`, `sc export`, `sparse disable`, an empty `sparse set`, `sc rewrap`,
+  `sc work`, `sc export`, `sparse disable`, an empty `sparse set` (and, on a non-lazy clone, one outside the filter), `sc rewrap`,
   `sc grant`/`revoke`, leaving a private branch, `sc push` to a git remote, and
   `sc fetch` from any native remote but the promisor origin.** `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what
   a clone *asked for*, not what is present: after a fetch an in-filter object
-  can be absent, and a switch, fast-forward, undo or `sparse set` that needs it
-  fails with `GapInView` (nothing changed) and names the `sc backfill <prefix>`
-  that repairs it.
+  can be absent. On a lazy, online clone a switch, fast-forward, rebase, undo
+  or `sparse set` fetches what its view needs by id first; on a non-lazy or
+  offline clone it fails with `GapInView` (nothing changed) and names the
+  `sc backfill <prefix>` that repairs it.
 - **Bucket remotes hold public content plaintext at rest** — bucket ACL is
   the perimeter (sealed content stays ciphertext, unchanged); partial-clone
   `filter` against bucket remotes is refused.

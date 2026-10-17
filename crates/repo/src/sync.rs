@@ -179,6 +179,7 @@ impl Repo {
             let head_snap = store.get_snapshot(&head_tip)?;
             let head_root = head_snap.root;
             let head_protection = head_snap.protection;
+            // ensure-view-exempt: clone: the lazy marker is set after the clone, and the materialize preflight covers it
             worktree::materialize(
                 &dst_repo.layout,
                 &mut store,

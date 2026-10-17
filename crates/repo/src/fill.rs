@@ -7,17 +7,19 @@
 //! `Store::get` stays network-free, so gc, verify, materialize and the desktop
 //! read model can never block on the network.
 //!
-//! Filling only ADDS objects the filter did not cover. The promisor filter is
-//! unchanged, so push, gc and verify (all filter-scoped walks) behave exactly
-//! as they did before the fill; they simply find a few extra present objects.
+//! Filling only ADDS objects. The promisor filter is unchanged, and push, gc
+//! and verify walk what the store holds (ADR-0048), so they simply find the
+//! extra present objects. On a lazy clone `ensure_view` also fills a sparse
+//! view's closure before an operation lays the tree out.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use scl_core::{EntryKind, Object, ObjectId};
 
 use crate::error::{Error, Result};
 use crate::repo::Repo;
+use crate::sparse::Sparse;
 use crate::stdio_transport::open_transport;
 use crate::transport::{ingest_pack_file_checked, TempPackGuard, Transport};
 
@@ -93,6 +95,78 @@ impl Repo {
             return Err(Error::Core(scl_core::Error::NotFound(*id)));
         }
         Ok(ingested.len())
+    }
+
+    /// Fetch `ids` from `transport` in as many round trips as it takes: batches
+    /// of at most [`crate::wire::MAX_GET_OBJECTS_IDS`], and a batch the server
+    /// refuses as over its reply cap is split in half and retried. A batch of
+    /// one that is still refused is final (an object above the server's cap
+    /// cannot be fetched by id), so splitting never loops.
+    fn fetch_ids_batched(
+        &self,
+        transport: &dyn Transport,
+        ids: &[ObjectId],
+        stats: &mut FillStats,
+    ) -> Result<()> {
+        for chunk in ids.chunks(crate::wire::MAX_GET_OBJECTS_IDS) {
+            self.fetch_ids_split(transport, chunk, stats)?;
+        }
+        Ok(())
+    }
+
+    fn fetch_ids_split(
+        &self,
+        transport: &dyn Transport,
+        ids: &[ObjectId],
+        stats: &mut FillStats,
+    ) -> Result<()> {
+        // Every attempt is a network round trip, including one the server
+        // refuses as over its reply cap; only ingested objects are counted.
+        stats.requests += 1;
+        match self.fetch_by_id_from(transport, ids) {
+            Ok(n) => {
+                stats.objects += n;
+                Ok(())
+            }
+            Err(Error::PackTooLarge(_)) if ids.len() > 1 => {
+                let (left, right) = ids.split_at(ids.len() / 2);
+                self.fetch_ids_split(transport, left, stats)?;
+                self.fetch_ids_split(transport, right, stats)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Make the closure of `sparse`'s view under `root` present before an
+    /// operation that lays the tree out (ADR-0048, the view closure
+    /// obligation). A lazy, online partial clone fetches what is missing by
+    /// id, level by level; anything else returns `Ok` and leaves the no-network
+    /// preflight inside `materialize` to report a gap before it writes. Call
+    /// it BEFORE any ref, spec or working-tree mutation, and not while holding
+    /// the store lock: the fill takes it.
+    pub(crate) fn ensure_view(&self, root: ObjectId, sparse: &Sparse) -> Result<FillStats> {
+        self.ensure_view_impl(root, sparse, crate::promisor::offline())
+    }
+
+    /// `offline` is a parameter so tests can exercise `SC_OFFLINE` without
+    /// mutating the process environment.
+    fn ensure_view_impl(
+        &self,
+        root: ObjectId,
+        sparse: &Sparse,
+        offline: bool,
+    ) -> Result<FillStats> {
+        // An empty spec is a full checkout: never fill the whole tree on a
+        // partial clone's behalf (the preflight reports the gap instead).
+        if sparse.is_full() {
+            return Ok(FillStats::default());
+        }
+        let mut filler = Filler::new(self, offline)?;
+        if filler.origin.is_none() {
+            return Ok(FillStats::default());
+        }
+        filler.fill_view(root, sparse)?;
+        Ok(filler.stats)
     }
 
     /// The bytes of the file at `path` as of `refname`'s tip (`sc cat
@@ -227,11 +301,96 @@ impl<'a> Filler<'a> {
         self.stats.objects += n;
         Ok(())
     }
+
+    /// Ensure every id in `ids` is in the local store, fetching the absent
+    /// ones in batches. `path` names what the caller is laying out, for the
+    /// gap error when filling is not allowed.
+    fn ensure_many(&mut self, ids: &BTreeSet<ObjectId>, path: &str) -> Result<()> {
+        let absent: Vec<ObjectId> = {
+            let store_arc = self.repo.vfs.store();
+            let store = store_arc.lock().unwrap();
+            ids.iter()
+                .copied()
+                .filter(|id| !store.contains(id))
+                .collect()
+        };
+        let Some(first) = absent.first() else {
+            return Ok(());
+        };
+        let Some(origin) = self.origin.clone() else {
+            return Err(if self.repo.promisor()?.is_some() {
+                crate::promisor::partial_gap_hint(path)
+            } else {
+                Error::Core(scl_core::Error::NotFound(*first))
+            });
+        };
+        if self.transport.is_none() {
+            self.transport = Some(open_transport(&origin)?);
+        }
+        let transport = self.transport.as_deref().expect("opened above");
+        self.repo
+            .fetch_ids_batched(transport, &absent, &mut self.stats)
+    }
+
+    /// Fill the closure of `sparse`'s view under `root`, one tree depth per
+    /// round (ADR-0048). Each round reads every tree of the current level
+    /// (present, or just arrived: a tree can land before its children, so
+    /// present trees are read too), collects the absent blobs and subtrees
+    /// under the view, and fetches them together in id batches. A duplicate
+    /// subtree is read once per path. Progress is by presence, so an
+    /// interrupted fill resumes where it stopped.
+    fn fill_view(&mut self, root: ObjectId, sparse: &Sparse) -> Result<()> {
+        self.ensure_many(&BTreeSet::from([root]), "")?;
+        let mut frontier: Vec<(ObjectId, String)> = vec![(root, String::new())];
+        // Under a path the view matches, every descendant is in view whatever
+        // its path, so a repeated subtree is read once by id. Above that (the
+        // ancestors of a view prefix) the verdict depends on the path.
+        let mut seen: HashSet<(ObjectId, Option<String>)> = HashSet::new();
+        while !frontier.is_empty() {
+            let mut want = BTreeSet::new();
+            let mut next = Vec::new();
+            for (tree_id, path) in &frontier {
+                let tree = {
+                    let store_arc = self.repo.vfs.store();
+                    let mut store = store_arc.lock().unwrap();
+                    store.get_tree(tree_id)?
+                };
+                for e in tree.entries {
+                    let child = if path.is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{path}/{}", e.name)
+                    };
+                    match e.kind {
+                        EntryKind::Blob => {
+                            if sparse.matches(&child) {
+                                want.insert(e.id);
+                            }
+                        }
+                        EntryKind::Tree => {
+                            if sparse.should_descend(&child) {
+                                want.insert(e.id);
+                                let key = (!sparse.matches(&child)).then(|| child.clone());
+                                if seen.insert((e.id, key)) {
+                                    next.push((e.id, child));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let hint = frontier.first().map(|(_, p)| p.clone()).unwrap_or_default();
+            self.ensure_many(&want, &hint)?;
+            frontier = next;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sparse::Sparse;
     use std::io::{Read, Write};
 
     /// Source repo with `src/a.txt`, `docs/readme.md` and `docs/api/guide.md`.
@@ -614,6 +773,289 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Core(scl_core::Error::NotFound(id)) if id == other.id()));
         assert!(store_has(&want.id()), "verified objects are retained");
+        fx.cleanup();
+    }
+
+    /// Serves from a real transport but refuses any by-id request over
+    /// `max_ids` as too large, like a server whose reply cap is lower than the
+    /// batch.
+    struct Capped {
+        inner: Box<dyn Transport>,
+        max_ids: usize,
+    }
+
+    impl Transport for Capped {
+        fn list_refs(&self) -> Result<Vec<(String, ObjectId)>> {
+            self.inner.list_refs()
+        }
+        fn head_branch(&self) -> Result<String> {
+            self.inner.head_branch()
+        }
+        fn has_object(&self, id: &ObjectId) -> Result<bool> {
+            self.inner.has_object(id)
+        }
+        fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
+            self.inner.get_object(id)
+        }
+        fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
+            self.inner.put_object(id, bytes)
+        }
+        fn update_ref(&self, b: &str, id: &ObjectId, old: Option<&ObjectId>) -> Result<()> {
+            self.inner.update_ref(b, id, old)
+        }
+        fn get_pack(
+            &self,
+            w: &[ObjectId],
+            h: &[ObjectId],
+            f: Option<&[String]>,
+            out: &mut dyn Write,
+        ) -> Result<()> {
+            self.inner.get_pack(w, h, f, out)
+        }
+        fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
+            self.inner.put_pack(src)
+        }
+        fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
+            if ids.len() > self.max_ids {
+                return Err(Error::PackTooLarge(
+                    "by-id response exceeds the limit".into(),
+                ));
+            }
+            self.inner.get_objects(ids, out)
+        }
+    }
+
+    #[test]
+    fn a_refused_batch_is_split_in_half_and_a_refused_single_is_final() {
+        let fx = Fixture::new("split");
+        let dst = fx.clone(true);
+        let ids = [fx.docs_tree, fx.api_tree, fx.guide_blob, fx.readme_blob];
+
+        let capped = Capped {
+            inner: open_transport(fx.src_root.to_str().unwrap()).unwrap(),
+            max_ids: 2,
+        };
+        let mut stats = FillStats::default();
+        dst.fetch_ids_batched(&capped, &ids, &mut stats).unwrap();
+        // 4 ids refused as one batch (still a round trip), then served as 2 + 2.
+        assert_eq!(
+            stats,
+            FillStats {
+                requests: 3,
+                objects: 4
+            }
+        );
+        assert!(ids.iter().all(|id| fx.has(&dst, id)));
+        fx.cleanup();
+
+        // A single object that is itself over the cap cannot be split further.
+        let fx = Fixture::new("split-final");
+        let dst = fx.clone(true);
+        let none = Capped {
+            inner: open_transport(fx.src_root.to_str().unwrap()).unwrap(),
+            max_ids: 0,
+        };
+        let err = dst
+            .fetch_ids_batched(&none, &[fx.docs_tree], &mut FillStats::default())
+            .unwrap_err();
+        assert!(matches!(err, Error::PackTooLarge(_)), "got {err:?}");
+        assert!(!fx.has(&dst, &fx.docs_tree));
+        fx.cleanup();
+    }
+
+    /// Serves synthetic blobs by id and records the size of every request.
+    struct Synth {
+        objs: std::collections::HashMap<ObjectId, Object>,
+        sizes: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl Transport for Synth {
+        fn list_refs(&self) -> Result<Vec<(String, ObjectId)>> {
+            unimplemented!()
+        }
+        fn head_branch(&self) -> Result<String> {
+            unimplemented!()
+        }
+        fn has_object(&self, _: &ObjectId) -> Result<bool> {
+            unimplemented!()
+        }
+        fn get_object(&self, _: &ObjectId) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+        fn put_object(&self, _: &ObjectId, _: &[u8]) -> Result<()> {
+            unimplemented!()
+        }
+        fn update_ref(&self, _: &str, _: &ObjectId, _: Option<&ObjectId>) -> Result<()> {
+            unimplemented!()
+        }
+        fn get_pack(
+            &self,
+            _: &[ObjectId],
+            _: &[ObjectId],
+            _: Option<&[String]>,
+            _: &mut dyn Write,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        fn put_pack(&self, _: &mut dyn Read) -> Result<Vec<ObjectId>> {
+            unimplemented!()
+        }
+        fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
+            self.sizes.borrow_mut().push(ids.len());
+            let mut w = scl_core::pack::PackWriter::new(&mut *out, ids.len() as u32)?;
+            for id in ids {
+                let o = &self.objs[id];
+                w.write_object(id, &o.encode())?;
+            }
+            w.finish()?;
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_wide_level_is_chunked_by_count_before_anything_is_split_by_size() {
+        let fx = Fixture::new("chunks");
+        let dst = fx.clone(true);
+        let objs: std::collections::HashMap<ObjectId, Object> = (0..2500u32)
+            .map(|i| {
+                let o = Object::blob(i.to_le_bytes().to_vec());
+                (o.id(), o)
+            })
+            .collect();
+        let ids: Vec<ObjectId> = objs.keys().copied().collect();
+        let t = Synth {
+            objs,
+            sizes: Default::default(),
+        };
+        let mut stats = FillStats::default();
+        dst.fetch_ids_batched(&t, &ids, &mut stats).unwrap();
+        // 2500 ids: two full 1024-id requests and one of 452, never split.
+        assert_eq!(*t.sizes.borrow(), vec![1024, 1024, 452]);
+        assert_eq!(
+            stats,
+            FillStats {
+                requests: 3,
+                objects: 2500
+            }
+        );
+        fx.cleanup();
+    }
+
+    #[test]
+    fn ensure_view_fills_the_closure_level_by_level() {
+        let fx = Fixture::new("view");
+        let dst = fx.clone(true);
+        let root = dst.snapshot(&fx.tip).unwrap().root;
+        let view = Sparse::new(vec!["docs/".to_string()]);
+
+        // Offline: nothing is fetched and the call is a no-op, so the
+        // preflight in `materialize` is what reports the gap.
+        let stats = dst.ensure_view_impl(root, &view, true).unwrap();
+        assert_eq!(stats, FillStats::default());
+        assert!(!fx.has(&dst, &fx.docs_tree));
+
+        let stats = dst.ensure_view_impl(root, &view, false).unwrap();
+        // docs tree; then readme.md + docs/api; then guide.md.
+        assert_eq!(
+            stats,
+            FillStats {
+                requests: 3,
+                objects: 4
+            }
+        );
+        assert!(fx.has(&dst, &fx.docs_tree));
+        assert!(fx.has(&dst, &fx.api_tree));
+        assert!(fx.has(&dst, &fx.guide_blob));
+        assert!(fx.has(&dst, &fx.readme_blob));
+
+        // Present already: a second call costs nothing.
+        let stats = dst.ensure_view_impl(root, &view, false).unwrap();
+        assert_eq!(stats, FillStats::default());
+        // An empty spec (a full checkout) is never filled on a clone's behalf.
+        let stats = dst
+            .ensure_view_impl(root, &Sparse::default(), false)
+            .unwrap();
+        assert_eq!(stats, FillStats::default());
+        fx.cleanup();
+    }
+
+    #[test]
+    fn sparse_set_outside_the_filter_fills_then_narrowing_back_removes_the_files() {
+        let fx = Fixture::new("widen");
+        let dst = fx.clone(true);
+        assert!(fx.dst_root.join("src/a.txt").exists());
+
+        dst.set_sparse(&["docs/".to_string()], None).unwrap();
+        assert_eq!(
+            std::fs::read(fx.dst_root.join("docs/api/guide.md")).unwrap(),
+            b"guide body"
+        );
+        assert!(fx.dst_root.join("docs/readme.md").exists());
+        assert!(
+            !fx.dst_root.join("src/a.txt").exists(),
+            "old view was removed"
+        );
+
+        // Back to src/: the docs files lie outside the promisor filter, so the
+        // old-view bound is what lets the removal walk find them.
+        dst.set_sparse(&["src/".to_string()], None).unwrap();
+        assert!(fx.dst_root.join("src/a.txt").exists());
+        assert!(!fx.dst_root.join("docs/readme.md").exists());
+        assert!(!fx.dst_root.join("docs/api/guide.md").exists());
+        fx.cleanup();
+    }
+
+    #[test]
+    fn sparse_set_outside_the_filter_is_refused_unless_the_clone_is_lazy() {
+        let fx = Fixture::new("widen-nonlazy");
+        let dst = fx.clone(false);
+        let err = dst.set_sparse(&["docs/".to_string()], None).unwrap_err();
+        assert!(matches!(err, Error::GapOutsideFilter(_)), "got {err:?}");
+        assert!(!fx.has(&dst, &fx.docs_tree));
+        fx.cleanup();
+    }
+
+    /// The demo flow: widen the view past the filter, edit and commit there,
+    /// push, and a second clone sees it; gc and verify still work, and an undo
+    /// of the commit needs no network once the closure is present.
+    #[test]
+    fn widen_commit_push_then_a_second_clone_sees_it() {
+        let fx = Fixture::new("widen-push");
+        let dst = fx.clone(true);
+        dst.set_sparse(&["src/".to_string(), "docs/".to_string()], None)
+            .unwrap();
+        std::fs::write(fx.dst_root.join("docs/api/guide.md"), b"guide, edited").unwrap();
+        let new_tip = dst.commit("t", "edit docs from a widened view").unwrap();
+        dst.push("origin").unwrap();
+
+        // A fresh full clone of the origin sees the edit.
+        let other_root =
+            std::env::temp_dir().join(format!("scl-fill-widen-push-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other_root);
+        let other = Repo::clone_to(&fx.src_root, &other_root).unwrap();
+        assert_eq!(
+            std::fs::read(other_root.join("docs/api/guide.md")).unwrap(),
+            b"guide, edited"
+        );
+        assert_eq!(other.head_tip().unwrap(), Some(new_tip));
+        drop(other);
+        std::fs::remove_dir_all(&other_root).unwrap();
+
+        // gc keeps the filled closure; verify counts no gap inside the view.
+        dst.gc(std::time::Duration::from_secs(0)).unwrap();
+        for id in [fx.docs_tree, fx.api_tree, fx.readme_blob] {
+            assert!(fx.has(&dst, &id), "gc dropped a filled object");
+        }
+        // The gap frontier is unchanged by the widen: nothing in the view is
+        // missing, so only objects outside it could still be gaps.
+        assert_eq!(dst.partial_gap_count(&[new_tip]).unwrap(), Some(0));
+        // Undo needs no network: the closure it restores is already present.
+        std::fs::remove_dir_all(&fx.src_root).unwrap();
+        dst.undo().unwrap();
+        assert_eq!(
+            std::fs::read(fx.dst_root.join("docs/api/guide.md")).unwrap(),
+            b"guide body"
+        );
         fx.cleanup();
     }
 }

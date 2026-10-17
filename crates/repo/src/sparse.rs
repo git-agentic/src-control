@@ -109,6 +109,50 @@ pub fn store(layout: &Layout, s: &Sparse) -> Result<()> {
     Ok(())
 }
 
+/// Record `s` as the spec in effect before an in-flight `sparse set`.
+pub(crate) fn store_prev(layout: &Layout, s: &Sparse) -> Result<()> {
+    let text = format!("{}\n", s.prefixes.join("\n"));
+    scl_core::fsutil::atomic_write_durable(&layout.sparse_prev_path(), text.as_bytes())?;
+    Ok(())
+}
+
+/// The spec recorded by an interrupted `sparse set`, if one is pending.
+pub(crate) fn load_prev(layout: &Layout) -> Result<Option<Sparse>> {
+    match std::fs::read_to_string(layout.sparse_prev_path()) {
+        Ok(text) => Ok(Some(Sparse {
+            prefixes: text
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect(),
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Drop the pending-`sparse set` marker.
+pub(crate) fn clear_prev(layout: &Layout) -> Result<()> {
+    remove_if_exists(&layout.sparse_prev_path())
+}
+
+impl Sparse {
+    /// A spec that matches whatever either input matches. A full (empty) spec
+    /// is full in the union.
+    pub(crate) fn union(&self, other: &Sparse) -> Sparse {
+        if self.is_full() || other.is_full() {
+            return Sparse::default();
+        }
+        let mut prefixes = self.prefixes.clone();
+        for p in &other.prefixes {
+            if !prefixes.contains(p) {
+                prefixes.push(p.clone());
+            }
+        }
+        Sparse { prefixes }
+    }
+}
+
 /// Clear the sparse spec (equivalent to `store`-ing an empty one).
 pub fn clear(layout: &Layout) -> Result<()> {
     remove_if_exists(&layout.sparse_path())
@@ -170,10 +214,15 @@ impl Repo {
                     promisor.prefixes().join(", ")
                 )));
             }
-            for p in prefixes {
-                let bare = p.trim_end_matches('/');
-                if !promisor.matches(bare) {
-                    return Err(crate::promisor::partial_gap_hint(p));
+            // A lazy clone may widen the view past its fetch filter: the
+            // closure is filled by id below. Any other partial clone never
+            // fetched outside the filter, so it refuses.
+            if !crate::promisor::is_lazy(&self.layout) {
+                for p in prefixes {
+                    let bare = p.trim_end_matches('/');
+                    if !promisor.matches(bare) {
+                        return Err(crate::promisor::partial_gap_hint(p));
+                    }
                 }
             }
         }
@@ -185,6 +234,9 @@ impl Repo {
             ));
         }
         let spec = Sparse::new(prefixes.to_vec());
+        // The view in effect now, read before it is replaced: it bounds the
+        // removal walk in the re-lay below.
+        let old_spec = self.sparse_spec()?;
         let tip = self.head_tip()?;
         let snap = match tip {
             Some(tip) => Some(self.snapshot(&tip)?),
@@ -195,18 +247,36 @@ impl Repo {
         // a failure below would leave the new spec over a tree that cannot be
         // laid out (ADR-0048).
         if let Some(snap) = &snap {
+            self.ensure_view(snap.root, &spec)?;
             let store_arc = self.vfs().store();
             let mut s = store_arc.lock().unwrap();
             crate::worktree::preflight_view(self.layout(), &mut s, snap.root, &spec)?;
         }
+        // Crash safety: record the spec being replaced before the new one is
+        // stored. If the process dies before the re-lay finishes, the marker
+        // keeps the old view in the removal walk's bound until a later
+        // materialize completes the job (ADR-0048, open question 9).
+        let partial = self.promisor()?.is_some();
+        if partial {
+            // An earlier interrupted `sparse set` may have left a marker: keep
+            // its view in the bound too.
+            let pending = match load_prev(self.layout())? {
+                Some(prev) => prev.union(&old_spec),
+                None => old_spec.clone(),
+            };
+            store_prev(self.layout(), &pending)?;
+        }
         store(self.layout(), &spec)?;
         let Some(snap) = snap else {
+            if partial {
+                clear_prev(self.layout())?;
+            }
             return Ok(Vec::new());
         };
         let store_arc = self.vfs().store();
         let mut s = store_arc.lock().unwrap();
         let mut cache = self.open_protected_cache()?;
-        let skipped = crate::worktree::materialize(
+        let skipped = crate::worktree::materialize_with_old_view(
             self.layout(),
             &mut s,
             snap.root,
@@ -214,6 +284,7 @@ impl Repo {
             &snap.protection,
             identity,
             &spec,
+            Some(&old_spec),
             Some(&mut cache),
         )?;
         // The sparse spec (the operation's durable commit point) is already
@@ -221,6 +292,9 @@ impl Repo {
         // is best-effort — never abort a sparse change on cache trouble
         // (P33 Task 7).
         cache.save_best_effort();
+        if partial {
+            clear_prev(self.layout())?;
+        }
         Ok(skipped)
     }
 
@@ -272,6 +346,7 @@ impl Repo {
         let store_arc = self.vfs().store();
         let mut s = store_arc.lock().unwrap();
         let mut cache = self.open_protected_cache()?;
+        // ensure-view-exempt: sparse disable is refused on partial clones
         let skipped = crate::worktree::materialize(
             self.layout(),
             &mut s,

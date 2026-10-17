@@ -123,4 +123,39 @@ cmp "$W/http.out" "$ORIGIN/docs/api/guide.bin" || fail "http cat must be byte-id
 echo "read-only sc+http server: lazy cat byte-identical, +3 objects, sibling not fetched ✔"
 
 echo
-echo "RESULT: lazy by-id fetch verified (path-only fetch, offline/non-lazy gap errors, http v5)"
+echo "=== 8: widen the view past the filter, commit, push, undo offline (ADR-0048) ==="
+WIDE="$W/wide"
+"$SC" clone --filter src/ --lazy "$ORIGIN" "$WIDE" >/dev/null
+[ ! -e "$WIDE/docs" ] || fail "docs/ must not be on disk before the widen"
+# Offline, the widen is refused before anything changes: the spec stays put.
+SPEC_BEFORE=$(cat "$WIDE/.sc/sparse")
+if (cd "$WIDE" && SC_OFFLINE=1 "$SC" sparse set src/ docs/) >/dev/null 2>"$W/wide-off.err"; then
+  fail "an offline widen of a lazy clone must fail"
+fi
+[ "$(cat "$WIDE/.sc/sparse")" = "$SPEC_BEFORE" ] || fail "a refused widen must leave .sc/sparse unchanged"
+[ ! -e "$WIDE/docs" ] || fail "a refused widen must write nothing"
+echo "offline widen: refused, .sc/sparse unchanged, nothing written ✔"
+# Online, it fills the closure by id and lays the files out.
+(cd "$WIDE" && "$SC" sparse set src/ docs/ >/dev/null)
+cmp "$WIDE/docs/api/guide.bin" "$ORIGIN/docs/api/guide.bin" || fail "widened file must be byte-identical"
+cmp "$WIDE/docs/api/other.bin" "$ORIGIN/docs/api/other.bin" || fail "the whole docs/ closure must be filled"
+echo "sparse set src/ docs/: closure filled, files byte-identical ✔"
+printf 'edited from a widened view\n' > "$WIDE/docs/api/guide.bin"
+(cd "$WIDE" && "$SC" commit -m "edit docs" --author demo >/dev/null && "$SC" push origin >/dev/null)
+SECOND="$W/second"
+"$SC" clone "$ORIGIN" "$SECOND" >/dev/null
+[ "$(cat "$SECOND/docs/api/guide.bin")" = "edited from a widened view" ] || fail "a second clone must see the edit"
+echo "commit + push from the widened view: a second clone sees it ✔"
+(cd "$WIDE" && "$SC" gc >/dev/null) || fail "gc must work after a widen"
+(cd "$WIDE" && "$SC" verify >/dev/null) || fail "verify must work after a widen"
+echo "gc and verify after the widen ✔"
+# The closure is present, so undo needs no network even with the origin gone.
+mv "$ORIGIN" "$ORIGIN.gone"
+(cd "$WIDE" && SC_OFFLINE=1 "$SC" undo >/dev/null) || fail "undo of the commit must work offline"
+# The origin working tree still holds the pre-edit file (a push moves refs only).
+cmp "$WIDE/docs/api/guide.bin" "$ORIGIN.gone/docs/api/guide.bin" || fail "undo must restore the pre-edit file"
+mv "$ORIGIN.gone" "$ORIGIN"
+echo "undo after a widen, offline ✔"
+
+echo
+echo "RESULT: lazy by-id fetch verified (path-only fetch, offline/non-lazy gap errors, http v5, widen/commit/push/undo)"

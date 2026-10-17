@@ -56,6 +56,7 @@ pub(crate) fn materialize_workspace(
     // passes an ephemeral one threaded fork->harvest. A `None` cache still
     // works — a workspace's randomized protected path just re-seals on the
     // next harvest instead of carrying (spurious-but-safe, per `cache.rs`).
+    // ensure-view-exempt: an ephemeral work session; `sc work` is refused on partial clones
     worktree::materialize(
         &ws,
         &mut store,

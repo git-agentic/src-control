@@ -385,9 +385,9 @@ pub(crate) fn tree_file_ids_sparse(
 /// Like [`tree_file_ids_sparse`], but skips a subtree the store lacks instead
 /// of failing. For `materialize`'s old-root removal walk on a partial clone:
 /// the old root was laid out under a preflighted view, so an absent subtree
-/// lay outside that view and has nothing on disk to remove. The promisor
-/// filter that bounds the walk is only a superset of the view, and a fetch can
-/// leave a tree inside the filter but outside the view absent (ADR-0048).
+/// lay outside that view and has nothing on disk to remove. A fetch can leave
+/// a tree absent that is inside the promisor filter but outside the view
+/// (ADR-0048).
 fn tree_file_ids_sparse_present(
     store: &mut Store,
     root: ObjectId,
@@ -497,11 +497,10 @@ pub struct Diff {
 /// `sparse` is full (the sparse-aware flattener falls back to the unfiltered
 /// one in that case) — the only behavior change is that an out-of-`sparse`
 /// path is now never fetched from the store at all, instead of being fetched
-/// and then filtered out by the loop below. On a partial clone, `sparse` is
-/// always a subset of the promisor filter (enforced by `set_sparse`/
-/// `disable_sparse`'s preflight), so this walk never touches a gapped
-/// out-of-filter object — an out-of-filter path was never materialized to
-/// disk either, so it's expected-absent, not a deletion.
+/// and then filtered out by the loop below. On a partial clone this walk never
+/// touches an object outside the view, so a gapped out-of-view path is
+/// expected-absent, not a deletion. (A lazy clone's view may extend past its
+/// promisor filter; the filled closure under the view is present.)
 pub(crate) fn diff_worktree(
     layout: &Layout,
     store: &mut Store,
@@ -616,9 +615,13 @@ pub(crate) fn preflight_view(
                 let bare = p.trim_end_matches('/');
                 path == bare || path.starts_with(&format!("{bare}/"))
             })
-            .or_else(|| promisor.prefixes().first())
             .cloned()
-            .unwrap_or_else(|| path.to_string());
+            // Outside the filter (a view widened past it): name the path
+            // itself, which `sc backfill` accepts as a prefix. For the root
+            // tree there is no path, so fall back to the first filter prefix.
+            .or_else(|| (!path.is_empty()).then(|| path.to_string()))
+            .or_else(|| promisor.prefixes().first().cloned())
+            .unwrap_or_default();
         Error::GapInView {
             path: if path.is_empty() {
                 "(root tree)".to_string()
@@ -678,12 +681,11 @@ pub(crate) fn preflight_view(
 ///
 /// Gap-tolerant on a partial clone (P27 Task 5): both the target walk and
 /// the old-root removal walk are bounded so neither ever `store.get`s an
-/// out-of-filter (never-fetched) object — the old-root walk is bounded by
-/// the promisor filter specifically (not by the possibly-narrower `sparse`),
-/// since `sparse`-narrowing is exactly the case that needs to enumerate
-/// paths `sparse` no longer matches. This closes the crash a bare
-/// `set_sparse`/`disable_sparse` narrowing (or a `switch`) used to hit on
-/// any partial clone with a genuine out-of-filter gap elsewhere in the tree.
+/// out-of-view (possibly never-fetched) object. The target walk is bounded by
+/// `sparse`; the old-root walk by the spec the old root was laid out under
+/// (see [`materialize_with_old_view`]), since narrowing is exactly the case
+/// that needs to enumerate paths `sparse` no longer matches. Before the first
+/// write, a partial clone's view closure is checked present (`preflight_view`).
 pub(crate) fn materialize(
     layout: &Layout,
     store: &mut Store,
@@ -692,6 +694,38 @@ pub(crate) fn materialize(
     protection: &Protection,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
+    cache: Option<&mut ProtectedCache>,
+) -> Result<Vec<String>> {
+    materialize_with_old_view(
+        layout,
+        store,
+        target_root,
+        old_root,
+        protection,
+        identity,
+        sparse,
+        None,
+        cache,
+    )
+}
+
+/// [`materialize`] for a caller that is CHANGING the sparse spec (`sparse set`).
+/// `old_view` is the spec that was in effect when `old_root` was laid out: the
+/// removal walk is bounded by it, because everything on disk lies inside it
+/// and nothing outside it was ever written. `None` means the spec is
+/// unchanged, so `sparse` itself is the bound (ADR-0048; this replaces the
+/// promisor-filter bound, which stops being a superset of the view once a lazy
+/// clone can widen it past the filter).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_with_old_view(
+    layout: &Layout,
+    store: &mut Store,
+    target_root: ObjectId,
+    old_root: Option<ObjectId>,
+    protection: &Protection,
+    identity: Option<&scl_crypto::SecretKey>,
+    sparse: &Sparse,
+    old_view: Option<&Sparse>,
     mut cache: Option<&mut ProtectedCache>,
 ) -> Result<Vec<String>> {
     // Fail before the first write if the view's closure is not all present
@@ -702,21 +736,32 @@ pub(crate) fn materialize(
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
     // walk here would `NotFound` on them.
     let target = tree_file_entries_with_perms_sparse(store, target_root, sparse)?;
+    // Set when an interrupted `sparse set`'s marker widened the removal bound;
+    // cleared once this call has finished laying the tree out under `sparse`.
+    let mut prev_marker_used = false;
     if let Some(old) = old_root {
-        // The old-root removal walk (P27 Task 5 fix): bounded by the
-        // promisor filter, not by `sparse` itself. `old` is enumerated to
-        // find paths that WERE materialized and might now need removing —
-        // `sparse` (the NEW, possibly narrower spec) can't be the descend
-        // bound here, since narrowing is exactly the case that needs to
-        // enumerate paths `sparse` no longer matches. On a partial clone,
-        // the promisor filter is the widest boundary that's guaranteed
-        // present in the CAS; anything outside it was never fetched and so
-        // was never materialized either — nothing to remove there, and
-        // walking it would `NotFound`. A full (non-partial) repo keeps the
-        // old unfiltered walk exactly (`Sparse::default()` falls back to
+        // The old-root removal walk: bounded by the spec the old root was
+        // laid out under (`old_view`, or `sparse` itself when the spec is
+        // unchanged), not by the promisor filter (ADR-0048). `old` is
+        // enumerated to find paths that WERE materialized and might now need
+        // removing, so the NEW, possibly narrower spec can't be the bound when
+        // it changed: narrowing is exactly the case that needs to enumerate
+        // paths it no longer matches. Everything on disk lies inside the old
+        // view, and the walk skips subtrees the store lacks (they were outside
+        // it, so nothing of them is on disk). A full (non-partial) repo keeps
+        // the old unfiltered walk exactly (`Sparse::default()` falls back to
         // `tree_file_ids` inside `tree_file_ids_sparse`).
         let (old_walk_bound, partial) = match crate::promisor::load(layout)? {
-            Some(p) => (Sparse::new(p.prefixes().to_vec()), true),
+            Some(_) => {
+                let mut bound = old_view.unwrap_or(sparse).clone();
+                // An interrupted `sparse set` left the replaced spec behind:
+                // files laid out under it are still on disk.
+                if let Some(prev) = crate::sparse::load_prev(layout)? {
+                    bound = bound.union(&prev);
+                    prev_marker_used = true;
+                }
+                (bound, true)
+            }
             None => (Sparse::default(), false),
         };
         let old_files = if partial {
@@ -796,6 +841,13 @@ pub(crate) fn materialize(
             }
             std::fs::write(&full, &bytes[..])?;
         }
+    }
+    // The removal walk above covered the replaced view, and the tree is now
+    // laid out under `sparse`: the marker has done its job. Leaving it would
+    // widen every later removal walk and delete files the user created
+    // outside the view.
+    if prev_marker_used {
+        crate::sparse::clear_prev(layout)?;
     }
     Ok(skipped)
 }
