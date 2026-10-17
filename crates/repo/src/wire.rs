@@ -1075,9 +1075,10 @@ fn serve_session(
                 // remotes refuse: they refuse partial clone (ADR-0046), and
                 // by-id reads exist only for partial clones.
                 let result = match &transport {
-                    ServeTransport::Local(t) => {
-                        t.build_objects_tempfile(&ids, policy.max_pack_size)
-                    }
+                    ServeTransport::Local(t) => t.build_objects_tempfile(
+                        &ids,
+                        crate::transport::by_id_reply_cap(policy.max_pack_size),
+                    ),
                     ServeTransport::Bucket { .. } => Err(Error::InvalidArgument(
                         "bucket remotes do not support by-id object fetch".into(),
                     )),

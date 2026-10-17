@@ -445,3 +445,69 @@ fn old_root_gap_outside_the_view_does_not_break_switch_or_undo() {
         std::fs::remove_dir_all(r).unwrap();
     }
 }
+
+/// On a lazy clone the fast-forward that 37b-i refuses with `GapInView` now
+/// heals itself: the missing blob is fetched by id before anything is written.
+#[test]
+fn lazy_clone_heals_the_fetch_gap_on_fast_forward() {
+    let (fx, clone) = Fx::new("lazy-ff");
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone.fetch("origin").unwrap();
+    assert!(!Fx::has(&clone, &fx.shared_blob));
+
+    clone.merge("origin/main", "t").unwrap();
+    assert!(Fx::has(&clone, &fx.shared_blob));
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/readme.txt")).unwrap(),
+        SHARED
+    );
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/aaa.txt")).unwrap(),
+        b"fetched normally"
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
+#[test]
+fn lazy_switch_and_undo_fill_the_target_view_first() {
+    let (fx, clone) = Fx::new("lazy-switch");
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone.fetch("origin").unwrap();
+    refs::write_branch_tip(clone.layout(), "feat", &fx.c2).unwrap();
+    clone.switch("feat").unwrap();
+    assert!(Fx::has(&clone, &fx.shared_blob));
+    assert!(fx.clone_root.join("src/readme.txt").exists());
+
+    // Undo back to main (a switch) then forward again: both present already.
+    clone.undo().unwrap();
+    assert_eq!(refs::current_branch(clone.layout()).unwrap(), "main");
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A fill that cannot reach the origin fails the operation before it changes
+/// anything: no ref move, no spec change, no file written.
+#[test]
+fn a_failed_fill_leaves_refs_spec_and_files_untouched() {
+    let (fx, clone) = Fx::new("lazy-offline");
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone.fetch("origin").unwrap();
+    refs::write_branch_tip(clone.layout(), "feat", &fx.c2).unwrap();
+    // The origin goes away.
+    std::fs::remove_dir_all(&fx.origin_root).unwrap();
+
+    let spec_before = clone.sparse_spec().unwrap();
+    assert!(clone.switch("feat").is_err());
+    assert_eq!(refs::current_branch(clone.layout()).unwrap(), "main");
+    assert!(!fx.clone_root.join("src/aaa.txt").exists());
+
+    assert!(clone.merge("origin/main", "t").is_err());
+    assert!(!fx.clone_root.join("src/aaa.txt").exists());
+
+    assert!(clone.set_sparse(&["docs/".to_string()], None).is_err());
+    assert_eq!(clone.sparse_spec().unwrap(), spec_before);
+    assert!(fx.clone_root.join("src/a.txt").exists());
+    drop(clone);
+    fx.cleanup();
+}

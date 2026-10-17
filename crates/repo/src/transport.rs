@@ -82,6 +82,23 @@ pub trait Transport {
     }
 }
 
+/// The most canonical object bytes one by-id reply carries (ADR-0048). It sits
+/// well under the client's 1 GiB read cap so pack record headers and zstd
+/// framing cannot push a legitimate reply past it.
+const BY_ID_REPLY_CAP: u64 = 512 << 20;
+
+/// The by-id reply limit for a server whose `--max-pack-size` is
+/// `max_pack_size` (0 means unlimited): the smaller of that and
+/// [`BY_ID_REPLY_CAP`]. Shared by the wire server and [`LocalTransport`], so a
+/// lazy clone of a local path cannot spool an unbounded reply either.
+pub(crate) fn by_id_reply_cap(max_pack_size: u64) -> u64 {
+    if max_pack_size == 0 {
+        BY_ID_REPLY_CAP
+    } else {
+        max_pack_size.min(BY_ID_REPLY_CAP)
+    }
+}
+
 /// Canonical encoded size of `obj`, computed without copying a large payload:
 /// a blob or sealed object encodes as one tag byte plus its payload; the small
 /// structural kinds are encoded to measure them.
@@ -520,7 +537,7 @@ impl Transport for LocalTransport {
                 crate::wire::MAX_GET_OBJECTS_IDS
             )));
         }
-        let (not_sent, guard) = self.build_objects_tempfile(ids, 0)?;
+        let (not_sent, guard) = self.build_objects_tempfile(ids, by_id_reply_cap(0))?;
         let mut f = std::fs::File::open(guard.path())?;
         std::io::copy(&mut f, out)?;
         Ok(not_sent)
@@ -1068,5 +1085,15 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn by_id_reply_cap_is_the_smaller_of_max_pack_size_and_512_mib() {
+        const MIB: u64 = 1 << 20;
+        // 0 means "unlimited" for --max-pack-size, but a by-id reply is still
+        // bounded so the client's read cap always covers it.
+        assert_eq!(by_id_reply_cap(0), 512 * MIB);
+        assert_eq!(by_id_reply_cap(64 * MIB), 64 * MIB);
+        assert_eq!(by_id_reply_cap(16 << 30), 512 * MIB);
     }
 }

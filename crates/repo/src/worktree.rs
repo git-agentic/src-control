@@ -616,9 +616,13 @@ pub(crate) fn preflight_view(
                 let bare = p.trim_end_matches('/');
                 path == bare || path.starts_with(&format!("{bare}/"))
             })
-            .or_else(|| promisor.prefixes().first())
             .cloned()
-            .unwrap_or_else(|| path.to_string());
+            // Outside the filter (a view widened past it): name the path
+            // itself, which `sc backfill` accepts as a prefix. For the root
+            // tree there is no path, so fall back to the first filter prefix.
+            .or_else(|| (!path.is_empty()).then(|| path.to_string()))
+            .or_else(|| promisor.prefixes().first().cloned())
+            .unwrap_or_default();
         Error::GapInView {
             path: if path.is_empty() {
                 "(root tree)".to_string()
@@ -692,6 +696,38 @@ pub(crate) fn materialize(
     protection: &Protection,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
+    cache: Option<&mut ProtectedCache>,
+) -> Result<Vec<String>> {
+    materialize_with_old_view(
+        layout,
+        store,
+        target_root,
+        old_root,
+        protection,
+        identity,
+        sparse,
+        None,
+        cache,
+    )
+}
+
+/// [`materialize`] for a caller that is CHANGING the sparse spec (`sparse set`).
+/// `old_view` is the spec that was in effect when `old_root` was laid out: the
+/// removal walk is bounded by it, because everything on disk lies inside it
+/// and nothing outside it was ever written. `None` means the spec is
+/// unchanged, so `sparse` itself is the bound (ADR-0048; this replaces the
+/// promisor-filter bound, which stops being a superset of the view once a lazy
+/// clone can widen it past the filter).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_with_old_view(
+    layout: &Layout,
+    store: &mut Store,
+    target_root: ObjectId,
+    old_root: Option<ObjectId>,
+    protection: &Protection,
+    identity: Option<&scl_crypto::SecretKey>,
+    sparse: &Sparse,
+    old_view: Option<&Sparse>,
     mut cache: Option<&mut ProtectedCache>,
 ) -> Result<Vec<String>> {
     // Fail before the first write if the view's closure is not all present
@@ -716,7 +752,7 @@ pub(crate) fn materialize(
         // old unfiltered walk exactly (`Sparse::default()` falls back to
         // `tree_file_ids` inside `tree_file_ids_sparse`).
         let (old_walk_bound, partial) = match crate::promisor::load(layout)? {
-            Some(p) => (Sparse::new(p.prefixes().to_vec()), true),
+            Some(_) => (old_view.unwrap_or(sparse).clone(), true),
             None => (Sparse::default(), false),
         };
         let old_files = if partial {

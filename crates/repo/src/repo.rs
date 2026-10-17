@@ -1268,11 +1268,14 @@ impl Repo {
             Some(ours) => ours,
             None => {
                 // Unborn local branch: adopt theirs wholesale (fast-forward from empty).
-                let store_arc = self.vfs.store();
-                let mut store = store_arc.lock().unwrap();
-                let theirs_snap = store.get_snapshot(&theirs)?;
+                let theirs_snap = self.snapshot(&theirs)?;
                 let theirs_root = theirs_snap.root;
                 let theirs_protection = theirs_snap.protection;
+                // Fill the view's closure first (lazy partial clones only);
+                // it takes the store lock, so it runs before ours.
+                self.ensure_view(theirs_root, &self.sparse_spec()?)?;
+                let store_arc = self.vfs.store();
+                let mut store = store_arc.lock().unwrap();
                 let mut cache = self.open_protected_cache()?;
                 let skipped = worktree::materialize(
                     &self.layout,
@@ -1311,6 +1314,11 @@ impl Repo {
                 let theirs_root = theirs_snap.root;
                 let theirs_protection = theirs_snap.protection;
                 let ours_root = store.get_snapshot(&ours)?.root;
+                // Fill the view's closure first (lazy partial clones only);
+                // the fill takes the store lock, so release ours around it.
+                drop(store);
+                self.ensure_view(theirs_root, &self.sparse_spec()?)?;
+                let mut store = store_arc.lock().unwrap();
                 let mut cache = self.open_protected_cache()?;
                 let skipped = worktree::materialize(
                     &self.layout,
@@ -1822,6 +1830,9 @@ impl Repo {
             let snap = store_arc.lock().unwrap().get_snapshot(&target_tip)?;
             (snap.root, snap.protection)
         };
+        // A lazy, online partial clone fills the target view's closure now,
+        // before the first stale file is removed or written (ADR-0048).
+        self.ensure_view(target_root, &self.sparse_spec()?)?;
         if head_priv.is_some() {
             // Remove private-tip paths the public target doesn't track,
             // BEFORE materialize lays the target down.

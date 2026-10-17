@@ -418,6 +418,8 @@ impl Repo {
         let restore = if rematerialize {
             let target_tip = will_be_tip.expect("checked non-unborn above");
             let snap = self.snapshot(&target_tip)?;
+            // A lazy, online partial clone fills the restored view first.
+            self.ensure_view(snap.root, &self.sparse_spec()?)?;
             {
                 let store_arc = self.vfs().store();
                 let mut store = store_arc.lock().unwrap();

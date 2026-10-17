@@ -170,10 +170,15 @@ impl Repo {
                     promisor.prefixes().join(", ")
                 )));
             }
-            for p in prefixes {
-                let bare = p.trim_end_matches('/');
-                if !promisor.matches(bare) {
-                    return Err(crate::promisor::partial_gap_hint(p));
+            // A lazy clone may widen the view past its fetch filter: the
+            // closure is filled by id below. Any other partial clone never
+            // fetched outside the filter, so it refuses.
+            if !crate::promisor::is_lazy(&self.layout) {
+                for p in prefixes {
+                    let bare = p.trim_end_matches('/');
+                    if !promisor.matches(bare) {
+                        return Err(crate::promisor::partial_gap_hint(p));
+                    }
                 }
             }
         }
@@ -185,6 +190,9 @@ impl Repo {
             ));
         }
         let spec = Sparse::new(prefixes.to_vec());
+        // The view in effect now, read before it is replaced: it bounds the
+        // removal walk in the re-lay below.
+        let old_spec = self.sparse_spec()?;
         let tip = self.head_tip()?;
         let snap = match tip {
             Some(tip) => Some(self.snapshot(&tip)?),
@@ -195,6 +203,7 @@ impl Repo {
         // a failure below would leave the new spec over a tree that cannot be
         // laid out (ADR-0048).
         if let Some(snap) = &snap {
+            self.ensure_view(snap.root, &spec)?;
             let store_arc = self.vfs().store();
             let mut s = store_arc.lock().unwrap();
             crate::worktree::preflight_view(self.layout(), &mut s, snap.root, &spec)?;
@@ -206,7 +215,7 @@ impl Repo {
         let store_arc = self.vfs().store();
         let mut s = store_arc.lock().unwrap();
         let mut cache = self.open_protected_cache()?;
-        let skipped = crate::worktree::materialize(
+        let skipped = crate::worktree::materialize_with_old_view(
             self.layout(),
             &mut s,
             snap.root,
@@ -214,6 +223,7 @@ impl Repo {
             &snap.protection,
             identity,
             &spec,
+            Some(&old_spec),
             Some(&mut cache),
         )?;
         // The sparse spec (the operation's durable commit point) is already

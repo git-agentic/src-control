@@ -54,6 +54,45 @@ impl<R: Read, W: Write> WireClient<R, W> {
         let mut rw = self.rw.borrow_mut();
         wire::write_frame(&mut rw.1, &Request::Bye.encode())
     }
+
+    /// [`WireClient::get_objects`], also reporting through `refused_in_sync`
+    /// whether the failure was the server refusing the request with a
+    /// `PackTooLarge` error frame. That reply is sent before any pack byte, so
+    /// the connection is still in sync and the caller may retry on it with a
+    /// smaller batch (ADR-0048). Every other failure leaves reply frames
+    /// unread or the stream in an unknown state.
+    pub(crate) fn get_objects_flagged(
+        &self,
+        ids: &[ObjectId],
+        out: &mut dyn Write,
+        refused_in_sync: &mut bool,
+    ) -> Result<Vec<ObjectId>> {
+        if ids.len() > wire::MAX_GET_OBJECTS_IDS {
+            return Err(Error::InvalidArgument(format!(
+                "by-id fetch takes at most {} ids per call",
+                wire::MAX_GET_OBJECTS_IDS
+            )));
+        }
+        let mut rw = self.rw.borrow_mut();
+        wire::write_frame(
+            &mut rw.1,
+            &Request::GetObjects { ids: ids.to_vec() }.encode(),
+        )?;
+        let frame = wire::read_frame(&mut rw.0)?;
+        let body = wire::parse_response(frame);
+        if matches!(body, Err(Error::PackTooLarge(_))) {
+            *refused_in_sync = true;
+        }
+        let not_sent = wire::decode_ids_body_capped(&body?, ids.len())?;
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(dup) = not_sent.iter().find(|id| !seen.insert(**id)) {
+            return Err(Error::Protocol(format!(
+                "reply lists object {dup} as not sent more than once"
+            )));
+        }
+        wire::read_pack_stream(&mut rw.0, out, GET_OBJECTS_RESPONSE_CAP)?;
+        Ok(not_sent)
+    }
 }
 
 impl<R: Read, W: Write> Transport for WireClient<R, W> {
@@ -138,27 +177,7 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
     /// stream is capped (`GET_OBJECTS_RESPONSE_CAP`) so a hostile server
     /// cannot make a by-id fetch spool without bound.
     fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
-        if ids.len() > wire::MAX_GET_OBJECTS_IDS {
-            return Err(Error::InvalidArgument(format!(
-                "by-id fetch takes at most {} ids per call",
-                wire::MAX_GET_OBJECTS_IDS
-            )));
-        }
-        let mut rw = self.rw.borrow_mut();
-        wire::write_frame(
-            &mut rw.1,
-            &Request::GetObjects { ids: ids.to_vec() }.encode(),
-        )?;
-        let frame = wire::read_frame(&mut rw.0)?;
-        let not_sent = wire::decode_ids_body_capped(&wire::parse_response(frame)?, ids.len())?;
-        let mut seen = std::collections::BTreeSet::new();
-        if let Some(dup) = not_sent.iter().find(|id| !seen.insert(**id)) {
-            return Err(Error::Protocol(format!(
-                "reply lists object {dup} as not sent more than once"
-            )));
-        }
-        wire::read_pack_stream(&mut rw.0, out, GET_OBJECTS_RESPONSE_CAP)?;
-        Ok(not_sent)
+        self.get_objects_flagged(ids, out, &mut false)
     }
 }
 
@@ -274,9 +293,14 @@ impl Transport for StdioTransport {
         self.client.put_pack(src)
     }
     fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
-        let r = self.client.get_objects(ids, out);
-        if r.is_err() {
-            // Any failure may have left unread reply frames on the pipe.
+        let mut refused_in_sync = false;
+        let r = self
+            .client
+            .get_objects_flagged(ids, out, &mut refused_in_sync);
+        if r.is_err() && !refused_in_sync {
+            // Any other failure may have left unread reply frames on the pipe.
+            // A server-side size refusal is sent before any pack byte, so the
+            // connection stays usable for a retry with a smaller batch.
             self.desynced.set(true);
         }
         r
@@ -682,6 +706,66 @@ mod tests {
             matches!(&err, Error::Protocol(m) if m.contains("more than once")),
             "got {err:?}"
         );
+    }
+
+    /// A server-side size refusal arrives before any pack byte, so the client
+    /// reports it as in sync and the same connection serves the retry.
+    #[test]
+    fn a_pack_too_large_refusal_leaves_the_connection_usable_for_a_retry() {
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let _ = wire::read_frame(&mut server_read).unwrap();
+            wire::write_ok(&mut server_write, &wire::u32_body(wire::PROTOCOL_VERSION)).unwrap();
+            // First request: refused as too large.
+            let _ = wire::read_frame(&mut server_read).unwrap();
+            wire::write_err(
+                &mut server_write,
+                wire::EC_TOO_LARGE,
+                "by-id response exceeds the limit",
+            )
+            .unwrap();
+            // Second request, on the same connection: served (nothing to send).
+            let _ = wire::read_frame(&mut server_read).unwrap();
+            wire::write_ok(&mut server_write, &wire::ids_body(&[])).unwrap();
+            wire::write_pack_stream(&mut server_write, &mut std::io::empty(), 1024).unwrap();
+        });
+        let client = WireClient::handshake(client_read, client_write).unwrap();
+        let id = Object::blob(b"wanted".to_vec()).id();
+        let mut in_sync = false;
+        let err = client
+            .get_objects_flagged(&[id], &mut Vec::new(), &mut in_sync)
+            .unwrap_err();
+        assert!(matches!(err, Error::PackTooLarge(_)), "got {err:?}");
+        assert!(in_sync, "a pre-stream refusal keeps the stream in sync");
+        let mut in_sync = false;
+        client
+            .get_objects_flagged(&[id], &mut Vec::new(), &mut in_sync)
+            .expect("the retry is served on the same connection");
+        assert!(!in_sync);
+        server.join().unwrap();
+    }
+
+    /// Any other failure is not known to be in sync.
+    #[test]
+    fn a_malformed_reply_is_not_reported_as_in_sync() {
+        let id = Object::blob(b"wanted".to_vec()).id();
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let _ = wire::read_frame(&mut server_read).unwrap();
+            wire::write_ok(&mut server_write, &wire::u32_body(wire::PROTOCOL_VERSION)).unwrap();
+            let _ = wire::read_frame(&mut server_read).unwrap();
+            wire::write_ok(&mut server_write, &wire::ids_body(&[id, id])).unwrap();
+        });
+        let client = WireClient::handshake(client_read, client_write).unwrap();
+        let mut in_sync = false;
+        let other = Object::blob(b"other".to_vec()).id();
+        assert!(client
+            .get_objects_flagged(&[id, other], &mut Vec::new(), &mut in_sync)
+            .is_err());
+        assert!(!in_sync, "only a size refusal is reported as in sync");
+        server.join().unwrap();
     }
 
     #[test]
