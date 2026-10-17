@@ -480,6 +480,7 @@ impl Repo {
                     // Protection-aware materialize: a PROTECTED entry decrypts
                     // for `identity` when possible, else is skipped (never
                     // writes ciphertext to disk) — same as merge's clean path.
+                    // ensure-view-exempt: replay is refused on partial clones
                     worktree::materialize(
                         &self.layout,
                         &mut store,
@@ -604,6 +605,7 @@ impl Repo {
             // No identity at abort time: nothing is decrypted, so `materialize`
             // records nothing — pass `None`, no cache to open or save
             // (P33 Task 7 item 7).
+            // ensure-view-exempt: replay is refused on partial clones
             skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -718,6 +720,11 @@ impl Repo {
                 let target_snap = store.get_snapshot(&target_tip)?;
                 let target_root = target_snap.root;
                 let target_protection = target_snap.protection;
+                // Fill the view's closure first (lazy partial clones only);
+                // the fill takes the store lock, so release ours around it.
+                drop(store);
+                self.ensure_view(target_root, &self.sparse_spec()?)?;
+                let mut store = store_arc.lock().unwrap();
                 let mut cache = self.open_protected_cache()?;
                 worktree::materialize(
                     &self.layout,
@@ -1013,6 +1020,7 @@ impl Repo {
             // (each step pruned its wrap map to its own merged tree): a
             // PROTECTED entry decrypts for `identity` when possible, else is
             // skipped — never writes ciphertext to disk.
+            // ensure-view-exempt: replay is refused on partial clones
             worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1230,6 +1238,7 @@ impl Repo {
             // No identity at abort time: nothing is decrypted, so `materialize`
             // records nothing — pass `None`, no cache to open or save
             // (P33 Task 7 item 7).
+            // ensure-view-exempt: replay is refused on partial clones
             worktree::materialize(
                 &self.layout,
                 &mut store,

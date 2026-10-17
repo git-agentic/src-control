@@ -511,3 +511,163 @@ fn a_failed_fill_leaves_refs_spec_and_files_untouched() {
     drop(clone);
     fx.cleanup();
 }
+
+/// Fast-forward rebase is a materializer site too: a lazy clone heals the gap.
+#[test]
+fn lazy_clone_heals_the_fetch_gap_on_fast_forward_rebase() {
+    let (fx, clone) = Fx::new("lazy-rebase");
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone.fetch("origin").unwrap();
+    assert!(!Fx::has(&clone, &fx.shared_blob));
+    let r = clone.rebase("origin/main", "t", None).unwrap();
+    assert!(
+        matches!(r, crate::replay::RebaseResult::FastForwarded(_)),
+        "got {r:?}"
+    );
+    assert!(Fx::has(&clone, &fx.shared_blob));
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/readme.txt")).unwrap(),
+        SHARED
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A non-lazy clone still refuses the fast-forward rebase before writing.
+#[test]
+fn non_lazy_fast_forward_rebase_fails_before_writing() {
+    let (fx, clone) = Fx::new("rebase-gap");
+    clone.fetch("origin").unwrap();
+    let err = clone.rebase("origin/main", "t", None).unwrap_err();
+    assert!(matches!(err, Error::GapInView { .. }), "got {err:?}");
+    assert!(!fx.clone_root.join("src/aaa.txt").exists());
+    drop(clone);
+    fx.cleanup();
+}
+
+/// The unborn-branch adopt path fills the view first on a lazy clone.
+#[test]
+fn lazy_adopt_into_an_unborn_branch_fills_first() {
+    let (fx, clone) = Fx::new("lazy-adopt");
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone.fetch("origin").unwrap();
+    refs::write_head(clone.layout(), "fresh").unwrap();
+    assert!(clone.head_tip().unwrap().is_none());
+    clone.merge("origin/main", "t").unwrap();
+    assert!(Fx::has(&clone, &fx.shared_blob));
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/readme.txt")).unwrap(),
+        SHARED
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
+/// Undo on a lazy clone fills the snapshot it restores before moving any ref.
+#[test]
+fn lazy_undo_fills_the_restored_view_before_moving_refs() {
+    let (fx, clone) = Fx::new("lazy-undo");
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone.fetch("origin").unwrap();
+    let head = refs::current_branch(clone.layout()).unwrap();
+    let cur = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    crate::oplog::record(
+        clone.layout(),
+        "synthetic",
+        &head,
+        &head,
+        &[("main".to_string(), Some(fx.c2), cur)],
+    )
+    .unwrap();
+    clone.undo().unwrap();
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        Some(fx.c2)
+    );
+    assert!(Fx::has(&clone, &fx.shared_blob), "the gap was filled");
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/readme.txt")).unwrap(),
+        SHARED
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A crash between storing the new sparse spec and re-laying the tree must not
+/// strand files the new spec no longer names: the pending marker keeps the old
+/// view in the removal walk's bound until a later materialize finishes.
+#[test]
+fn an_interrupted_sparse_set_is_finished_by_the_next_materialize() {
+    let (fx, clone) = Fx::new_in_sync("sparse-crash");
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone
+        .set_sparse(&["src/".to_string(), "docs/".to_string()], None)
+        .unwrap();
+    assert!(fx.clone_root.join("docs/readme.txt").exists());
+    // Simulate the crash window of `sparse set src/`: the previous spec is
+    // recorded and the new one stored, but the tree was never re-laid.
+    let prev = clone.sparse_spec().unwrap();
+    crate::sparse::store_prev(clone.layout(), &prev).unwrap();
+    crate::sparse::store(clone.layout(), &Sparse::new(vec!["src/".to_string()])).unwrap();
+    assert!(
+        fx.clone_root.join("docs/readme.txt").exists(),
+        "still on disk"
+    );
+
+    // The next operation that lays the tree out removes the stranded files.
+    clone.set_sparse(&["src/".to_string()], None).unwrap();
+    assert!(!fx.clone_root.join("docs/readme.txt").exists());
+    assert!(
+        !fx.clone_root.join("docs").exists() || !fx.clone_root.join("docs/readme.txt").exists()
+    );
+    assert!(
+        !clone.layout().sparse_prev_path().exists(),
+        "the marker is cleared once the re-lay completes"
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
+/// Every non-test call of the materializer either fills the view's closure
+/// first (`ensure_view`) or carries an `ensure-view-exempt` note saying why it
+/// cannot run on a partial clone. A new call site cannot be added silently.
+#[test]
+fn every_materializer_call_site_fills_or_is_exempt() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name == "worktree.rs" || name == "partial_walks.rs" {
+            continue; // the definition, and this test
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let body = text
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(&text);
+        let lines: Vec<&str> = body.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if t.starts_with("//") || t.starts_with("///") {
+                continue;
+            }
+            let call = t.contains("worktree::materialize(")
+                || t.contains("worktree::materialize_with_old_view(");
+            if !call {
+                continue;
+            }
+            checked += 1;
+            let window = lines[i.saturating_sub(60)..i].join("\n");
+            assert!(
+                window.contains("ensure_view(") || window.contains("ensure-view-exempt"),
+                "{name}:{}: materializer call without ensure_view or an ensure-view-exempt note",
+                i + 1
+            );
+        }
+    }
+    assert!(checked >= 15, "the scan found only {checked} call sites");
+}

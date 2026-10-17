@@ -7,9 +7,10 @@
 //! `Store::get` stays network-free, so gc, verify, materialize and the desktop
 //! read model can never block on the network.
 //!
-//! Filling only ADDS objects the filter did not cover. The promisor filter is
-//! unchanged, so push, gc and verify (all filter-scoped walks) behave exactly
-//! as they did before the fill; they simply find a few extra present objects.
+//! Filling only ADDS objects. The promisor filter is unchanged, and push, gc
+//! and verify walk what the store holds (ADR-0048), so they simply find the
+//! extra present objects. On a lazy clone `ensure_view` also fills a sparse
+//! view's closure before an operation lays the tree out.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -339,7 +340,10 @@ impl<'a> Filler<'a> {
     fn fill_view(&mut self, root: ObjectId, sparse: &Sparse) -> Result<()> {
         self.ensure_many(&BTreeSet::from([root]), "")?;
         let mut frontier: Vec<(ObjectId, String)> = vec![(root, String::new())];
-        let mut seen: HashSet<(ObjectId, String)> = HashSet::new();
+        // Under a path the view matches, every descendant is in view whatever
+        // its path, so a repeated subtree is read once by id. Above that (the
+        // ancestors of a view prefix) the verdict depends on the path.
+        let mut seen: HashSet<(ObjectId, Option<String>)> = HashSet::new();
         while !frontier.is_empty() {
             let mut want = BTreeSet::new();
             let mut next = Vec::new();
@@ -364,7 +368,8 @@ impl<'a> Filler<'a> {
                         EntryKind::Tree => {
                             if sparse.should_descend(&child) {
                                 want.insert(e.id);
-                                if seen.insert((e.id, child.clone())) {
+                                let key = (!sparse.matches(&child)).then(|| child.clone());
+                                if seen.insert((e.id, key)) {
                                     next.push((e.id, child));
                                 }
                             }
@@ -1036,10 +1041,12 @@ mod tests {
 
         // gc keeps the filled closure; verify counts no gap inside the view.
         dst.gc(std::time::Duration::from_secs(0)).unwrap();
-        assert_eq!(
-            std::fs::read(fx.dst_root.join("docs/readme.md")).unwrap(),
-            b"readme body"
-        );
+        for id in [fx.docs_tree, fx.api_tree, fx.readme_blob] {
+            assert!(fx.has(&dst, &id), "gc dropped a filled object");
+        }
+        // The gap frontier is unchanged by the widen: nothing in the view is
+        // missing, so only objects outside it could still be gaps.
+        assert_eq!(dst.partial_gap_count(&[new_tip]).unwrap(), Some(0));
         // Undo needs no network: the closure it restores is already present.
         std::fs::remove_dir_all(&fx.src_root).unwrap();
         dst.undo().unwrap();

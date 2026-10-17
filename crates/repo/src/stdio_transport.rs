@@ -90,7 +90,13 @@ impl<R: Read, W: Write> WireClient<R, W> {
                 "reply lists object {dup} as not sent more than once"
             )));
         }
-        wire::read_pack_stream(&mut rw.0, out, GET_OBJECTS_RESPONSE_CAP)?;
+        // The client's own read cap tripping is NOT a server refusal: the reply
+        // is already part-way through the stream, so report it as a protocol
+        // violation that callers must not answer by splitting the batch.
+        wire::read_pack_stream(&mut rw.0, out, GET_OBJECTS_RESPONSE_CAP).map_err(|e| match e {
+            Error::PackTooLarge(m) => Error::Protocol(format!("by-id reply too large: {m}")),
+            other => other,
+        })?;
         Ok(not_sent)
     }
 }

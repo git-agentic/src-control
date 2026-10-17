@@ -110,6 +110,14 @@ impl Layout {
     pub fn promisor_lazy_path(&self) -> PathBuf {
         self.dot_sc.join("promisor-lazy")
     }
+    /// `.sc/sparse-prev` — the sparse spec in effect before an in-flight `sparse
+    /// set` (ADR-0048). Written before the new spec is stored and removed once
+    /// the tree is re-laid; while it exists, the removal walk is bounded by the
+    /// union of both specs, so a crash in between cannot strand files that the
+    /// new spec no longer names.
+    pub fn sparse_prev_path(&self) -> PathBuf {
+        self.dot_sc.join("sparse-prev")
+    }
     /// `.sc/serve-tokens.toml` — server access-control tokens (P29): each entry is
     /// `{label, hash = BLAKE3(raw token), scope}`. Presence of ≥1 entry turns on
     /// bearer auth for `sc serve --http`. Distinct from `recipients.toml`

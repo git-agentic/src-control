@@ -251,7 +251,7 @@ checkout (it equals disable), so it is refused on a partial clone too, in
 spec, bypassing the refusal.
 
 *As built in 37b-ii:* `Repo::ensure_view` (`fill.rs`) runs before any ref, spec
-or file mutation at switch, adopt and fast-forward merge, undo (against
+or file mutation at switch, adopt, fast-forward merge and fast-forward rebase, undo (against
 `will_be_tip`) and `sparse set` (against the proposed spec), and not while the
 store lock is held. It does nothing on a non-lazy, offline or full-spec call,
 so the `materialize` preflight remains the single no-network backstop.
@@ -259,7 +259,17 @@ so the `materialize` preflight remains the single no-network backstop.
 removal walk; every other caller passes the unchanged spec as the bound. A lazy
 clone may `sparse set` outside the filter; any other partial clone still
 refuses. The conflict-materialization and abort sites in the decision list stay
-unreachable on a partial clone until merge and replay lift their refusals.
+unreachable on a partial clone until merge and replay lift their refusals; each
+carries an `ensure-view-exempt` note, and a test scans the sources so that a new
+materializer call site must either call `ensure_view` or say why it is exempt.
+Duplicate subtrees under a matched path are read once by id.
+
+`sparse set` writes `.sc/sparse-prev` (the replaced spec) before storing the new
+one and clears it after the re-lay. While it exists the removal walk is bounded
+by the union of both specs, so a crash in between strands no files (this closes
+open question 9). The client splits a batch only on a size refusal the server
+sent before any pack byte; the client's own read cap tripping mid-stream is a
+protocol error, because the stream is no longer in sync.
 
 ### 5. Reply size limits
 
@@ -377,8 +387,9 @@ review established, as constraints on that work:
    differ by id from the same commit on a full clone. A spike should check.
 9. **Crash between storing the sparse spec and materializing** (`sparse.rs:178`
    and `:186`) leaves in-view files reading as deleted at the next commit.
-   Pre-existing; the old-spec parameter in decision 4 is a natural place to
-   close it.
+   Closed in 37b-ii for the files a narrowing would strand, by the
+   `.sc/sparse-prev` marker (decision 4, as built). The in-view-reads-as-deleted
+   half after a widen is unchanged.
 10. **Private branches on a partial clone** have no `ensure_view` or
     preflight (`private.rs` materializes through its own path). Untested:
     whether switching to one can hit a raw `NotFound` when public base

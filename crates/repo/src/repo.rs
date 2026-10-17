@@ -1514,6 +1514,7 @@ impl Repo {
         let skipped = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
+            // ensure-view-exempt: conflict materialization; merge is refused on partial clones
             worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1617,6 +1618,7 @@ impl Repo {
             // skipped content, so nothing is lost by not surfacing the list
             // here (the `Err`/`Stopped` return can't carry it).
             let mut cache = self.open_protected_cache()?;
+            // ensure-view-exempt: conflict materialization; merge is refused on partial clones
             let _skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1681,6 +1683,7 @@ impl Repo {
             // (not decrypted). With nothing decrypted, `materialize` records
             // nothing into a cache, so pass `None` — no cache to open or save
             // (P33 Task 7 item 7).
+            // ensure-view-exempt: merge abort; no merge can be in progress on a partial clone
             skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
