@@ -3868,6 +3868,16 @@ fn run_push(remote: &str, include_encrypted: bool) -> Result<()> {
                      `sc branch publish {branch}` first"
                 );
             }
+            // A partial clone cannot export: the git bridge walks the whole
+            // history and every blob, and the first absent object would fail
+            // it partway through. Refuse up front, like `sc export` does.
+            if repo.promisor()?.is_some() {
+                anyhow::bail!(
+                    "refusing to push to a git remote: this is a partial clone \
+                     (.sc/promisor present) and the git bridge needs the whole history \
+                     and every blob; run `sc backfill --all` to convert to a full clone first"
+                );
+            }
             run_push_git(&repo, remote, include_encrypted)
         }
         _ => {

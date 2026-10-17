@@ -189,27 +189,37 @@ pub fn offline() -> bool {
 }
 
 impl Repo {
+    /// Refuse `op` on a partial clone with the explicit
+    /// [`Error::PartialCloneUnsupported`] message. For commands that flatten
+    /// whole trees and would otherwise fail with a raw `NotFound` on the
+    /// first absent object (ADR-0048).
+    pub(crate) fn refuse_on_partial(&self, op: &str) -> Result<()> {
+        if self.promisor()?.is_some() {
+            return Err(partial_clone_unsupported(op));
+        }
+        Ok(())
+    }
+
     /// The repo's current promisor marker, if any (thin wrapper over
     /// `load`). `None` means this is a full clone.
     pub fn promisor(&self) -> Result<Option<Promisor>> {
         load(self.layout())
     }
 
-    /// The out-of-filter gap count for `sc verify`'s partial-clone report
-    /// (P27 Task 5): walks the filtered reachability from `tips` and returns
-    /// the number of gaps recorded (ids referenced by an in-filter parent
-    /// tree but never fetched) — `None` if this is a full clone (no
-    /// `.sc/promisor`), so a partial clone's expected gaps are never mistaken
-    /// for missing/corrupt objects. An in-filter object that's genuinely
-    /// absent still surfaces as an `Err` from the underlying walk (real
-    /// corruption), not folded into this count.
+    /// The gap count for `sc verify`'s partial-clone report (ADR-0048): the
+    /// number of objects a present tree references that the store lacks,
+    /// from the presence-based walk over `tips`. `None` if this is a full
+    /// clone (no `.sc/promisor`). A gap is expected on a partial clone, never
+    /// treated as corruption, and the count is the size of the gap frontier:
+    /// a fill can replace one missing tree with several missing children, so
+    /// it is not a measure of progress.
     pub fn partial_gap_count(&self, tips: &[scl_core::ObjectId]) -> Result<Option<usize>> {
-        let Some(p) = self.promisor()? else {
+        if self.promisor()?.is_none() {
             return Ok(None);
-        };
+        }
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
-        let r = crate::reachable::reachable_objects_filtered(&mut *store, tips, Some(&p))?;
+        let r = crate::reachable::reachable_objects_partial(&mut store, tips)?;
         Ok(Some(r.gaps.len()))
     }
 }

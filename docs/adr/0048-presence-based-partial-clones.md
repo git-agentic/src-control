@@ -1,6 +1,6 @@
 # ADR-0048: Presence-based walks for partial clones (P37b)
 
-- **Status:** Proposed
+- **Status:** Accepted (37b-i built)
 - **Date:** 2026-10-16
 - **Phase:** 37b
 - **Builds on:** ADR-0047 (want-by-id fetch, 37a), ADR-0037 (partial clone), ADR-0034 (sparse), ADR-0035 (streaming transfer), ADR-0039/0041 (size limits)
@@ -148,7 +148,8 @@ is not all-or-nothing, so a stored tree does not prove a stored closure.
 
 ### 3. Verify and gc
 
-- `sc verify` on a partial clone reports `partial: N gaps` from the presence
+- `sc verify` on a partial clone keeps its `partial: N object(s) outside
+  filter [...]` line (the demos match on it) but counts N from the presence
   walk. N is the size of the gap frontier: it can rise when a fill replaces one
   missing tree with several missing children, and it is not a measure of
   progress. An optional origin check over the gap set is a follow-on.
@@ -181,7 +182,17 @@ clone and fails with the existing gap hint on a non-lazy or offline one
 in-filter gap case above for lazy clones; non-lazy clones keep the explicit
 `sc backfill` answer.
 
-`ensure_view` has two halves, and they ship separately. The **preflight**
+`ensure_view` has two halves, and they ship separately. **As built in 37b-i,
+the preflight lives at the top of `worktree::materialize`**, so it runs before
+the first file write at every materializer call site (clone, switch, adopt,
+fast-forward merge, conflict materialization, aborts, undo, sparse) and no
+site can forget it. Sites that mutate a ref or the spec *before* they reach
+`materialize` also call it explicitly, ahead of the mutation: `sc undo`
+(against `will_be_tip`) and `sparse set` (against the proposed spec). The
+check raises `Error::GapInView`, which names the missing path and the filter
+prefix `sc backfill` repairs. The fill half is still 37b-ii.
+
+The original two halves: The **preflight**
 (check that the view's closure at the target root is present, otherwise fail
 with the gap hint, before any mutation) needs no network and lands in 37b-i, so
 a fast-forward or switch after an ordinary fetch fails cleanly with an
@@ -226,7 +237,9 @@ truth:
   (`worktree.rs:288`), stays on the sparse view: relaxing it would silently
   discard an edit under a carried subtree.
 - **Materialize.** The old-view bound comes from the spec that was in effect,
-  passed in, not from the filter prefixes.
+  passed in, not from the filter prefixes. *Moved to 37b-ii:* until a widen
+  exists the sparse view is always inside the filter, so the filter-prefix
+  bound is a safe superset and the change would be unobservable.
 
 `sc sparse disable` stays refused on a partial clone; whole history and a full
 tree stay `sc backfill --all`. A `sc sparse set` with no prefixes means a full
@@ -296,10 +309,10 @@ review established, as constraints on that work:
 
 ## Phasing
 
-- **37b-i, engine.** `reachable_objects_partial`; gc, push and verify on it;
+- **37b-i, engine (built).** `reachable_objects_partial`; gc, push and verify on it;
   the push gap-edge check; graft authority for new names as the union;
-  materialize takes the old spec; the `ensure_view` preflight at every
-  materializer site; refusals for the commands above, for `sc push` to a git
+  the `ensure_view` preflight at every materializer site (materialize
+  taking the old spec moved to 37b-ii, see decision 4); refusals for the commands above, for `sc push` to a git
   remote, for `sc fetch` from a non-origin remote, and for a zero-prefix
   `sc sparse set`. Regression tests: the
   fetch-then-gc repro from the Context, the filtered-`get_pack`-still-cuts

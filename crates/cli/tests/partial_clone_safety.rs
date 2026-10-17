@@ -249,3 +249,121 @@ fn sparse_widen_beyond_partial_filter_is_refused() {
     std::fs::remove_dir_all(&src_root).unwrap();
     std::fs::remove_dir_all(&dst_root).unwrap();
 }
+
+/// ADR-0048: an ordinary `sc fetch` can leave an in-filter object absent
+/// (the origin subtracts the closure of every have, and the new file equals
+/// one that is only reachable at an out-of-filter path). `sc gc` must keep
+/// working, `sc verify` must count the gap, and a fast-forward must fail
+/// before it writes anything, with a repair hint that works.
+#[test]
+fn fetch_then_gc_and_fast_forward_on_a_partial_clone() {
+    let src_root = tmp("fetch-gc-src");
+    let dst_root = tmp("fetch-gc-dst");
+    std::fs::create_dir_all(src_root.join("src")).unwrap();
+    std::fs::create_dir_all(src_root.join("docs")).unwrap();
+    assert!(sc(&src_root, &["init"]).status.success());
+    std::fs::write(src_root.join("src/a.txt"), "src-one\n").unwrap();
+    std::fs::write(
+        src_root.join("docs/readme.txt"),
+        "same bytes at two paths\n",
+    )
+    .unwrap();
+    assert!(sc(&src_root, &["commit", "-m", "c1"]).status.success());
+    let out = sc(
+        &src_root,
+        &[
+            "clone",
+            src_root.to_str().unwrap(),
+            dst_root.to_str().unwrap(),
+            "--filter",
+            "src/",
+        ],
+    );
+    assert!(out.status.success(), "clone: {}", stderr(&out));
+
+    // The origin adds an in-filter file whose bytes equal docs/readme.txt, and
+    // another in-filter file that sorts before it.
+    std::fs::write(src_root.join("src/aaa.txt"), "fetched normally\n").unwrap();
+    std::fs::write(src_root.join("src/readme.txt"), "same bytes at two paths\n").unwrap();
+    assert!(sc(&src_root, &["commit", "-m", "c2"]).status.success());
+
+    let fetch = sc(&dst_root, &["fetch", "origin"]);
+    assert!(fetch.status.success(), "fetch: {}", stderr(&fetch));
+
+    let gc = sc(&dst_root, &["gc"]);
+    assert!(
+        gc.status.success(),
+        "gc must work after an ordinary fetch: {}",
+        stderr(&gc)
+    );
+    let verify = sc(&dst_root, &["verify"]);
+    assert!(verify.status.success(), "verify: {}", stderr(&verify));
+
+    let merge = sc(&dst_root, &["merge", "origin/main"]);
+    assert!(!merge.status.success(), "the fast-forward must be refused");
+    let err = stderr(&merge);
+    assert!(
+        err.contains("sc backfill src/"),
+        "error names the repair: {err}"
+    );
+    assert!(
+        !dst_root.join("src/aaa.txt").exists() && !dst_root.join("src/readme.txt").exists(),
+        "nothing was written before the refusal"
+    );
+
+    let backfill = sc(&dst_root, &["backfill", "src/"]);
+    assert!(backfill.status.success(), "backfill: {}", stderr(&backfill));
+    let merge = sc(&dst_root, &["merge", "origin/main"]);
+    assert!(merge.status.success(), "merge: {}", stderr(&merge));
+    assert_eq!(
+        std::fs::read_to_string(dst_root.join("src/readme.txt")).unwrap(),
+        "same bytes at two paths\n"
+    );
+
+    std::fs::remove_dir_all(&src_root).unwrap();
+    std::fs::remove_dir_all(&dst_root).unwrap();
+}
+
+/// The git bridge walks the whole history and every blob, so a partial clone
+/// refuses `sc push` to a git remote up front, like `sc export`.
+#[test]
+fn push_to_a_git_remote_is_refused_on_a_partial_clone() {
+    let (src_root, dst_root) = make_partial_clone("push-git");
+    let bare = tmp("push-git-bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let init = Command::new("git")
+        .args(["init", "-q", "--bare", "-b", "main"])
+        .arg(&bare)
+        .output()
+        .expect("git runs");
+    assert!(init.status.success());
+    assert!(sc(
+        &dst_root,
+        &["remote", "add", "hub", bare.to_str().unwrap(), "--git"]
+    )
+    .status
+    .success());
+
+    let out = sc(&dst_root, &["push", "hub"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("partial clone"), "names the cause: {err}");
+    assert!(err.contains("backfill --all"), "names the repair: {err}");
+
+    std::fs::remove_dir_all(&src_root).unwrap();
+    std::fs::remove_dir_all(&dst_root).unwrap();
+    std::fs::remove_dir_all(&bare).unwrap();
+}
+
+/// `sc sparse set` with no prefixes is a full checkout, which is what `sparse
+/// disable` is, so it is refused too (otherwise it would bypass that refusal).
+#[test]
+fn sparse_set_with_no_prefixes_is_refused_on_a_partial_clone() {
+    let (src_root, dst_root) = make_partial_clone("sparse-empty");
+    let out = sc(&dst_root, &["sparse", "set"]);
+    assert!(!out.status.success(), "an empty spec must be refused");
+    assert!(stderr(&out).contains("backfill"), "{}", stderr(&out));
+    assert!(!dst_root.join("docs/b.txt").exists());
+    std::fs::remove_dir_all(&src_root).unwrap();
+    std::fs::remove_dir_all(&dst_root).unwrap();
+}

@@ -412,6 +412,27 @@ impl Repo {
             None
         };
 
+        // On a partial clone, check that the snapshot undo will restore can
+        // be laid out BEFORE any ref moves (ADR-0048). `will_be_tip`, not the
+        // ambient HEAD read after the writes below, is the tip being restored.
+        let restore = if rematerialize {
+            let target_tip = will_be_tip.expect("checked non-unborn above");
+            let snap = self.snapshot(&target_tip)?;
+            {
+                let store_arc = self.vfs().store();
+                let mut store = store_arc.lock().unwrap();
+                worktree::preflight_view(
+                    &self.layout,
+                    &mut store,
+                    snap.root,
+                    &self.sparse_spec()?,
+                )?;
+            }
+            Some((snap.root, snap.protection))
+        } else {
+            None
+        };
+
         // Restore: ref writes first, inverse oplog record last (crash safety
         // — a crash between the two leaves the refs already-restored state
         // recoverable by re-running undo, never a torn write).
@@ -429,13 +450,7 @@ impl Repo {
             refs::write_head(&self.layout, &rec.head_before)?;
         }
 
-        let skipped = if rematerialize {
-            // Guarded above: rematerialize implies will_be_tip is Some.
-            let target_tip = will_be_tip.expect("checked non-unborn above");
-            let (target_root, protection) = {
-                let snap = self.snapshot(&target_tip)?;
-                (snap.root, snap.protection)
-            };
+        let skipped = if let Some((target_root, protection)) = restore {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
             worktree::materialize(

@@ -16,6 +16,8 @@ pub mod lock;
 pub mod merge;
 pub mod merge_state;
 pub mod oplog;
+#[cfg(test)]
+mod partial_walks;
 pub mod pick_state;
 pub mod private;
 pub mod promisor;

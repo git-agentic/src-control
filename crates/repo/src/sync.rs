@@ -349,6 +349,21 @@ impl Repo {
         let url = cfg
             .url(remote)
             .ok_or_else(|| Error::NoSuchRemote(remote.to_string()))?;
+        // A partial clone fetches from its promisor origin only (ADR-0048).
+        // Its promise is that every object a present tree names but the store
+        // lacks is held by the origin. Another remote subtracts the closure
+        // of a have it holds, and the origin may not hold that object, so a
+        // fetch from it could leave a gap nobody can fill.
+        if let Some(p) = self.promisor()? {
+            if !same_remote_url(url, &p.origin) {
+                return Err(Error::InvalidArgument(format!(
+                    "refusing to fetch from {remote}: this is a partial clone and only its \
+                     promisor origin ({}) can fill the gaps a fetch leaves. Fetch from the \
+                     origin, or run `sc backfill --all` to convert to a full clone first",
+                    p.origin
+                )));
+            }
+        }
         let transport = open_transport(url)?;
         let remote_refs = transport.list_refs()?;
 
@@ -424,26 +439,30 @@ impl Repo {
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            // Partial-clone push (P27 Task 4): an unfiltered reachability
-            // walk would descend into any gapped (never-fetched)
-            // out-of-filter subtree and NotFound on the missing tree/blob
-            // object. When this repo is a partial clone, walk with its
-            // promisor filter instead — this sends exactly the (possibly
-            // newly-committed) in-filter objects; the origin already has
-            // every out-of-filter object untouched (a P24/P15 carry-by-id
-            // commit never wrote to them), so a full clone of the origin
-            // still sees the intact gapped subtree after the push lands.
-            let promisor = self.promisor()?;
-            let reachable = match &promisor {
-                Some(p) => {
-                    reachable::reachable_objects_filtered(
-                        &mut *store,
-                        &[local_tip],
-                        Some(p as &dyn reachable::PrefixFilter),
-                    )?
-                    .included
+            // Partial-clone push (ADR-0048): walk what the store holds. An
+            // unfiltered walk would descend into a never-fetched subtree and
+            // `NotFound`, and a filtered one would trust the filter to say
+            // what is present, which an ordinary fetch can falsify. Absent
+            // children of present trees come back as gaps instead. The
+            // destination already holds every untouched out-of-filter object
+            // (a carry-by-id commit never wrote to it), so gaps are not sent,
+            // but each must exist there: a gap that is a lost local object or
+            // that this destination never had would leave a pushed tree
+            // naming something it cannot serve. Check before any byte moves.
+            let partial = self.promisor()?.is_some();
+            let reachable = if partial {
+                let r = reachable::reachable_objects_partial(&mut store, &[local_tip])?;
+                for (gap, referrer) in &r.gaps {
+                    if !transport.has_object(gap)? {
+                        return Err(Error::PushGap {
+                            id: *gap,
+                            referrer: *referrer,
+                        });
+                    }
                 }
-                None => reachable::reachable_objects(&mut *store, &[local_tip])?,
+                r.present
+            } else {
+                reachable::reachable_objects(&mut *store, &[local_tip])?
             };
             // Sender seam (P22 Task 3): unlike `fetch`/`clone`, `push` builds
             // its outgoing set directly from a local reachability walk
@@ -481,6 +500,13 @@ impl Repo {
         transport.update_ref(&branch, &local_tip, expected_old.as_ref())?;
         Ok(local_tip)
     }
+}
+
+/// Whether two configured remote URLs name the same place: equal after
+/// trimming trailing slashes, which the stored promisor origin and a
+/// `[remote]` entry can differ by.
+fn same_remote_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 /// The tips we already hold locally: every local branch and remote-tracking ref

@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use scl_core::{Object, ObjectId, Store};
+use scl_core::{ObjectId, Store};
 
 use crate::error::Result;
 use crate::layout::Layout;
@@ -80,6 +80,23 @@ fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     Ok(set.into_iter().collect())
 }
 
+/// Protect an in-progress operation's decided carried tree. On a partial
+/// clone the walk tolerates an absent child, like the main reachability walk
+/// does, so a stopped operation cannot brick gc; a full clone stays strict.
+fn walk_decided_root(
+    store: &mut Store,
+    tree: ObjectId,
+    partial: bool,
+    reachable: &mut BTreeSet<ObjectId>,
+) -> Result<()> {
+    if partial {
+        let mut gaps = std::collections::BTreeMap::new();
+        reachable::walk_tree_partial(store, tree, tree, reachable, &mut gaps)
+    } else {
+        reachable::walk_tree(store, tree, reachable)
+    }
+}
+
 /// Run a gc pass. Caller must already hold the repo lock.
 pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStats> {
     let mut stats = GcStats::default();
@@ -94,60 +111,22 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     oplog::trim_older_than(layout, cutoff)?;
 
     let roots = roots(layout)?;
-    // Gap-tolerant reachability on a partial clone (P27 Task 5): when
-    // `.sc/promisor` is present, walk with the filtered reachability walk and
-    // keep only `.included` — an out-of-filter child is recorded in `.gaps`
-    // by id and never `get()`'d, so a genuinely-missing out-of-filter object
-    // (the whole premise of a partial clone) can never surface as a `gc`
-    // error, and a gap is never treated as unreachable garbage either (it's
-    // simply not in `reachable` at all, so the loose-object sweep below never
-    // considers it — it was never fetched, so it's never `store.list_loose`d
-    // in the first place). A full clone (`promisor::load` returns `None`)
-    // takes the unfiltered path, unchanged.
-    let filter = promisor::load(layout)?;
-    let mut reachable: BTreeSet<ObjectId> = match &filter {
-        Some(p) => {
-            let r = reachable::reachable_objects_filtered(store, &roots, Some(p))?;
-            let mut included = r.included;
-            // P27 Task 5 review Critical fix (gc defense-in-depth): a gap id
-            // means "referenced by an in-filter parent tree but never
-            // fetched" — the filtered walk deliberately never `get()`s it,
-            // so it's normally absent locally. But gc must not treat "gap"
-            // as license to prune an object that IS present locally for any
-            // reason (belt-and-suspenders alongside the Task 5 commit-side
-            // refusal above, which closes the one known way such an object
-            // could be created; this is the backstop for any path that
-            // doesn't yet route through that guard). Walk every PRESENT gap
-            // id in, so it — and anything it in turn references — becomes
-            // part of `reachable` and survives the sweep below: gc never
-            // prunes reachable content it holds. This walk-in is itself
-            // ABSENCE-TOLERANT (P27 final review I1, `walk_tree_present_only`),
-            // not the strict `walk_tree`: `ingest_pack_file`'s write pass is
-            // not all-or-nothing, so a crash-interrupted `sc backfill` can
-            // leave a present gap-frontier tree with an absent child — the
-            // strict walk would `get()` that child and hard-error, which
-            // `Store::write_pack` below would then repeat on the id anyway
-            // if it were smuggled into `reachable`. Present content BELOW an
-            // absent child is not reached and is pruned by the ordinary
-            // loose-object sweep if it's otherwise disconnected — gc never
-            // prunes anything connected to the local graph, but it is not
-            // structurally incapable of pruning locally-disconnected residue.
-            for gap in &r.gaps {
-                if included.contains(gap) || !store.contains(gap) {
-                    continue;
-                }
-                match store.get(gap)? {
-                    Object::Tree(_) => {
-                        reachable::walk_tree_present_only(store, *gap, &mut included)?;
-                    }
-                    _ => {
-                        included.insert(*gap);
-                    }
-                }
-            }
-            included
-        }
-        None => reachable::reachable_objects(store, &roots)?,
+    // Presence-based reachability on a partial clone (ADR-0048): when
+    // `.sc/promisor` is present, walk what the store actually holds. An absent
+    // child of a present tree is a gap, recorded and never read, so a
+    // genuinely missing object (the premise of a partial clone) cannot
+    // surface as a `gc` error, and a gap is not garbage either: it is not in
+    // `reachable`, so the loose-object sweep below never considers it. The
+    // promisor filter is deliberately not consulted. It records what a clone
+    // asked for, not what is present, and an ordinary `fetch` can leave an
+    // in-filter object absent. Every present tree is descended, so content a
+    // lazy fill or a backfill brought in survives. A full clone
+    // (`promisor::load` returns `None`) takes the strict walk, unchanged.
+    let partial = promisor::load(layout)?.is_some();
+    let mut reachable: BTreeSet<ObjectId> = if partial {
+        reachable::reachable_objects_partial(store, &roots)?.present
+    } else {
+        reachable::reachable_objects(store, &roots)?
     };
     // An in-progress merge's or cherry-pick's decided carried tree
     // (MERGE_DECIDED_ROOT / PICK_DECIDED_ROOT) is a TREE root, not a
@@ -161,16 +140,16 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     // tree forever.
     if merge_state::read_merge_head(layout)?.is_some() {
         if let Some(tree) = merge_state::read_decided_root(layout)? {
-            reachable::walk_tree(store, tree, &mut reachable)?;
+            walk_decided_root(store, tree, partial, &mut reachable)?;
         }
     }
     if pick_state::read_pick_head(layout)?.is_some() {
         if let Some(tree) = pick_state::read_decided_root(layout)? {
-            reachable::walk_tree(store, tree, &mut reachable)?;
+            walk_decided_root(store, tree, partial, &mut reachable)?;
         }
     }
     if let Some(tree) = rebase_state::read_decided_root(layout)? {
-        reachable::walk_tree(store, tree, &mut reachable)?;
+        walk_decided_root(store, tree, partial, &mut reachable)?;
     }
 
     // Transcript index (P30): a Transcript is likewise reachable from no
