@@ -736,6 +736,9 @@ pub(crate) fn materialize_with_old_view(
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
     // walk here would `NotFound` on them.
     let target = tree_file_entries_with_perms_sparse(store, target_root, sparse)?;
+    // Set when an interrupted `sparse set`'s marker widened the removal bound;
+    // cleared once this call has finished laying the tree out under `sparse`.
+    let mut prev_marker_used = false;
     if let Some(old) = old_root {
         // The old-root removal walk: bounded by the spec the old root was
         // laid out under (`old_view`, or `sparse` itself when the spec is
@@ -755,6 +758,7 @@ pub(crate) fn materialize_with_old_view(
                 // files laid out under it are still on disk.
                 if let Some(prev) = crate::sparse::load_prev(layout)? {
                     bound = bound.union(&prev);
+                    prev_marker_used = true;
                 }
                 (bound, true)
             }
@@ -837,6 +841,13 @@ pub(crate) fn materialize_with_old_view(
             }
             std::fs::write(&full, &bytes[..])?;
         }
+    }
+    // The removal walk above covered the replaced view, and the tree is now
+    // laid out under `sparse`: the marker has done its job. Leaving it would
+    // widen every later removal walk and delete files the user created
+    // outside the view.
+    if prev_marker_used {
+        crate::sparse::clear_prev(layout)?;
     }
     Ok(skipped)
 }

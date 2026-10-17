@@ -624,6 +624,23 @@ fn an_interrupted_sparse_set_is_finished_by_the_next_materialize() {
         !clone.layout().sparse_prev_path().exists(),
         "the marker is cleared once the re-lay completes"
     );
+
+    // A marker left by a crash is also cleared by any other materialize (here
+    // a switch), so it cannot widen later removal walks forever.
+    crate::sparse::store_prev(
+        clone.layout(),
+        &Sparse::new(vec!["src/".to_string(), "docs/".to_string()]),
+    )
+    .unwrap();
+    refs::write_branch_tip(clone.layout(), "other", &fx.c2).unwrap();
+    clone.switch("other").unwrap();
+    assert!(!clone.layout().sparse_prev_path().exists());
+    // ...and a file the user creates outside the view afterwards survives the
+    // next switch (it is not in the old root, and the bound is back to normal).
+    std::fs::create_dir_all(fx.clone_root.join("docs")).unwrap();
+    std::fs::write(fx.clone_root.join("docs/mine.txt"), b"mine").unwrap();
+    clone.switch("main").unwrap();
+    assert!(fx.clone_root.join("docs/mine.txt").exists());
     drop(clone);
     fx.cleanup();
 }
