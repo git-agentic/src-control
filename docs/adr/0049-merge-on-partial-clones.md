@@ -44,7 +44,7 @@ Everything else is **enumerated**: read, flattened for that subtree, and resolve
 | Situation at a name | Result |
 |---|---|
 | tree on all three sides, all differ | recurse |
-| tree on some sides, absent (or a blob) on others | enumerate the subtrees that exist and apply the per-path rules, so delete/modify and add/add keep their flatten meaning |
+| tree on some sides, absent on others | the carry rules above apply first (a one-sided add or delete carries or drops the subtree); when all three differ it recurses with the missing side as an empty tree, so delete/modify and add/add keep their flatten meaning |
 | blob on one side and a tree on another | enumerate both and apply the per-path rules, then apply the collision check below |
 | blobs on all three, all differ | the existing leaf merge |
 
@@ -116,7 +116,7 @@ A second differential runs each merge on a partial clone and a full clone. The n
 
 ## Phasing
 
-- **37c-i, engine.** The content/mode split and the collision check on the flatten merge (with the ADR-0012 amendment and tests), `merge_trees` returning `TreeMerge` or `Needs`, the policy-intersection test, the wrap-union rule, and the differential tests. Nothing calls the new engine yet except tests.
+- **37c-i, engine (built).** The content/mode split and the collision check on the flatten merge (with the ADR-0012 amendment and tests), `merge_trees` returning `TreeMerge` or `Needs`, the policy-intersection test, `TreeMergeDone::merged_wraps` (the wrap-union rule; assembling and pruning the merged snapshot's `protection.wrapped` from it is 37c-ii), and the differential tests (file sets with modes and perms, conflicts, sidecars, wraps, carried-subtree policy, and fills on a store with objects removed). Nothing calls the new engine yet except tests. Decision 9's cases built from real operations (protect, grant, revoke, with decryption by each identity), equal plaintext sealed independently, an empty-directory entry on a carried side, merge then gc, and an interrupted fill then retry need the repo layer and land with 37c-ii.
 - **37c-ii, clean merge on a partial clone.** `merge_with_identity` uses the engine when the clone is partial: fill loop outside the lock, `ensure_view(merged_root)`, then the existing pipeline. A conflict is refused up front. Demo: two branches touching disjoint directories merge on a `--filter` clone without fetching either side's out-of-view content; a merge whose differing region is outside the view fills it on a lazy clone and is refused on a non-lazy one.
 - **37c-iii, conflicts.** First an amendment to this record that fixes decision 8's contract, then markers for present in-view conflicts, completion from the decided root, abort, `sc conflicts` and `sc resolve`.
 - **37c-iv, replay.** `cherry-pick` and `rebase` call the same engine; `replay.rs:176` is the only guard that blocks them, and `three_way_files` is already their merge. Replay adds protected re-encryption under the replayed rules and the resumable-rebase state.
@@ -132,11 +132,15 @@ A second differential runs each merge on a partial clone and a full clone. The n
 
 ## Open questions
 
-1. **A `sc verify` check for plaintext under a rule** (decision 3's accepted divergence).
-2. **Wrap growth.** Measure before designing a prune; `sc rewrap` on a partial clone is refused today.
-3. **Switching full clones to the new engine.** Out of scope; decide after the differential has soaked.
-4. **Merging a public branch INTO a private one** routes through `merge_into_private` and stays refused on a partial clone (ADR-0048 q10).
-5. **Empty-directory normalization.** Decision 7 accepts the divergence; revisit if it shows up in real histories.
+1. **Ciphertext fetched before a refusal it cannot avoid.** `plain_input` reads a protected blob before it checks for an identity (`merge.rs:565`, `:569`), so a lazy partial merge of a content-divergent protected path would fetch the ciphertext and then refuse with `ProtectedMergeNeedsIdentity`. 37c-ii should check the identity requirement before reporting `Needs`.
+2. **Fill progress.** `merge_trees` detects an absent tree with `store.contains` but an absent blob through a `NotFound` from `get`. If those ever disagree (a stale pack index entry), a round asks for an id the filler thinks is present. The 37c-ii fill loop must detect a round that makes no progress and fail.
+3. **Mode change against a delete.** Ours changes only the mode and theirs deletes the file: the delete wins silently (content decides, as before). Git reports modify/delete. Unchanged by this work; decide separately.
+4. **Pre-existing collisions.** Before the collision check, a clean cherry-pick or rebase that produced a file and a directory with the same name may already have committed such a snapshot. The fix prevents new ones and does not repair old ones.
+5. **A `sc verify` check for plaintext under a rule** (decision 3's accepted divergence).
+6. **Wrap growth.** Measure before designing a prune; `sc rewrap` on a partial clone is refused today.
+7. **Switching full clones to the new engine.** Out of scope; decide after the differential has soaked.
+8. **Merging a public branch INTO a private one** routes through `merge_into_private` and stays refused on a partial clone (ADR-0048 q10).
+9. **Empty-directory normalization.** Decision 7 accepts the divergence; revisit if it shows up in real histories.
 
 ## Alternatives considered
 

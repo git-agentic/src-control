@@ -43,12 +43,54 @@ pub(crate) enum Carried {
 }
 
 /// A finished tree merge.
+///
+/// **`merge.wrapped_carry` is incomplete whenever anything was carried**: it
+/// holds wraps only for the protected blobs of the regions the merge read, and a
+/// carried subtree's protected blobs are never enumerated. Building the merged
+/// snapshot's `protection.wrapped` from it, then pruning to reachable blobs as
+/// the full merge does, would permanently drop every recipient's access to
+/// those blobs. Use [`TreeMergeDone::merged_wraps`] instead.
 #[derive(Debug)]
 pub(crate) struct TreeMergeDone {
     /// The resolved files of every region the merge read.
     pub merge: FileMerge,
     /// The subtrees it did not read.
     pub carried: Carried,
+}
+
+impl TreeMergeDone {
+    /// Did the merge carry any subtree by id?
+    pub fn carried_any(&self) -> bool {
+        match &self.carried {
+            Carried::Root(_) => true,
+            Carried::Entries(v) => !v.is_empty(),
+        }
+    }
+
+    /// The wraps the merged snapshot must start from (ADR-0049 decision 4).
+    /// If anything was carried, the complete union of the input wraps (ours,
+    /// theirs, base; an id seen as deleted at one path may survive under a
+    /// carried subtree elsewhere, so no per-id pruning is sound). Otherwise
+    /// just the enumerated regions' wraps, which the caller prunes to
+    /// reachable blobs exactly as the full merge does.
+    pub fn merged_wraps(
+        &self,
+        ours: &Protection,
+        theirs: &Protection,
+        base: &Protection,
+    ) -> BTreeMap<ObjectId, Vec<scl_core::WrappedKey>> {
+        let mut out = self.merge.wrapped_carry.clone();
+        if !self.carried_any() {
+            return out;
+        }
+        for p in [ours, theirs, base] {
+            for (id, wks) in &p.wrapped {
+                let entry = out.entry(*id).or_default();
+                *entry = crate::protect::union_wraps(entry, wks);
+            }
+        }
+        out
+    }
 }
 
 /// The outcome of one [`merge_trees`] pass.
@@ -154,6 +196,10 @@ pub(crate) fn merge_trees(
             Some(root_entry(theirs.0)),
         ],
     )?;
+    // A pass that needs objects discards everything it accumulated: leaves
+    // push into `acc` before some reads that can come back NotFound, so a
+    // partial `acc` must never survive into the next round. The caller fills
+    // and calls again from scratch.
     if !w.needs.is_empty() {
         return Ok(TreeMerge::Needs(w.needs));
     }
@@ -636,6 +682,25 @@ mod tests {
         } else {
             rand_policy(&mut rng)
         };
+        // Give each side wraps for (some of) its protected blobs, for a random
+        // recipient subset, so the wrap union can be checked.
+        let (mut bp, mut op, mut tp) = (bp, op, tp);
+        for (files, prot) in [(&base, &mut bp), (&ours, &mut op), (&theirs, &mut tp)] {
+            for l in files.values().filter(|l| l.prot) {
+                let id = scl_core::Object::blob(leaf_bytes(l)).id();
+                for r in ["r1", "r2", "r3"] {
+                    if rng.chance(1, 2) {
+                        prot.wrapped
+                            .entry(id)
+                            .or_default()
+                            .push(scl_core::WrappedKey {
+                                recipient_id: r.to_string(),
+                                wrapped_dek: vec![rng.below(256) as u8],
+                            });
+                    }
+                }
+            }
+        }
 
         let full_repo = VfsRepo::new(Store::with_budget(1 << 22));
         let (rb, ro, rt) = (
@@ -677,6 +742,39 @@ mod tests {
                     "seed {seed}: sidecars differ"
                 );
 
+                // Wraps: the merged snapshot must keep every wrap the full merge
+                // keeps, and lose none the inputs held for a protected blob that
+                // survives in the result.
+                let recips = |ws: Option<&Vec<scl_core::WrappedKey>>| -> BTreeSet<String> {
+                    ws.map(|v| v.iter().map(|w| w.recipient_id.clone()).collect())
+                        .unwrap_or_default()
+                };
+                let merged_wraps = done.merged_wraps(&op, &tp, &bp);
+                for (id, wks) in &fm.wrapped_carry {
+                    let want: BTreeSet<String> =
+                        wks.iter().map(|w| w.recipient_id.clone()).collect();
+                    assert!(
+                        recips(merged_wraps.get(id)).is_superset(&want),
+                        "seed {seed}: engine lost wraps the full merge keeps for {id}"
+                    );
+                }
+                for (path, (_, perms, bytes, _)) in &got {
+                    if perms & PROTECTED == 0 {
+                        continue;
+                    }
+                    let id = scl_core::Object::blob(bytes.clone()).id();
+                    let held: BTreeSet<String> = [&op, &tp, &bp]
+                        .iter()
+                        .flat_map(|p| recips(p.wrapped.get(&id)))
+                        .collect();
+                    if done.carried_any() {
+                        assert!(
+                            recips(merged_wraps.get(&id)).is_superset(&held),
+                            "seed {seed}: carried merge dropped input wraps for protected {path}"
+                        );
+                    }
+                }
+
                 // Policy: a carried subtree is policy-disjoint, or identical
                 // on all three sides.
                 let prots = [&op, &tp, &bp];
@@ -717,14 +815,23 @@ mod tests {
                 let mut allowed: HashSet<ObjectId> = HashSet::new();
                 for r in [rb, ro, rt] {
                     for (p, id) in all_nodes(&mut full, r) {
-                        if !carried
-                            .iter()
-                            .any(|c| under(&p, c) && !c.is_empty() || c.is_empty() && !p.is_empty())
-                        {
+                        if !carried.iter().any(|c| {
+                            if c.is_empty() {
+                                !p.is_empty()
+                            } else {
+                                under(&p, c)
+                            }
+                        }) {
                             allowed.insert(id);
                         }
                     }
                     allowed.insert(r);
+                }
+                let mut node_paths: HashSet<(String, ObjectId)> = HashSet::new();
+                for r in [rb, ro, rt] {
+                    for (p, id) in all_nodes(&mut full, r) {
+                        node_paths.insert((p, id));
+                    }
                 }
                 let mut rounds = 0;
                 let done2 = loop {
@@ -739,10 +846,14 @@ mod tests {
                                 cov.needed_fill += 1;
                             }
                             assert!(!list.is_empty());
-                            for (id, _path) in list {
+                            for (id, path) in list {
                                 assert!(
                                     allowed.contains(&id),
                                     "seed {seed}: asked for {id} under a carried subtree"
+                                );
+                                assert!(
+                                    node_paths.contains(&(path.clone(), id)),
+                                    "seed {seed}: Needs reported {path:?} for {id}, which is not where it lives"
                                 );
                                 let obj = full.get(&id).unwrap();
                                 part.put(obj).unwrap();
@@ -756,6 +867,16 @@ mod tests {
                     expand(&mut full, &done2),
                     want,
                     "seed {seed}: partial run differs"
+                );
+                assert_eq!(
+                    sorted(done2.merge.conflicts.clone()),
+                    sorted(fm.conflicts.clone()),
+                    "seed {seed}: partial run conflicts differ"
+                );
+                assert_eq!(
+                    sorted_sidecars(&done2.merge.sidecars),
+                    sorted_sidecars(&fm.sidecars),
+                    "seed {seed}: partial run sidecars differ"
                 );
             }
             (Err(a), Err(b)) => {
@@ -948,9 +1069,10 @@ mod tests {
     }
 
     #[test]
-    fn a_file_and_a_directory_collide_across_the_carry_boundary() {
-        // Ours adds file `x`; theirs adds directory `x/` (carried, since the
-        // base lacks it and ours lacks it as a tree: a mixed-kind name).
+    fn a_file_and_a_directory_with_the_same_name_collide() {
+        // Ours adds file `x`; theirs adds directory `x/`: a mixed-kind name,
+        // which the engine enumerates (it is never carried), so the collision
+        // check sees both `x` and `x/y`.
         let repo = VfsRepo::new(Store::with_budget(1 << 20));
         let ours = build(&repo, &files(&[("x", 1, false)]));
         let theirs = build(&repo, &files(&[("x/y", 1, false)]));

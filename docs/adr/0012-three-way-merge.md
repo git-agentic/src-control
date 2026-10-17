@@ -63,11 +63,14 @@ Two behaviors changed, both fixes:
   to base yields to the side that changed, a lone survivor (delete/modify)
   keeps its own mode, and when both sides changed differently executable wins.
   Previously the mode followed whichever side's entry was kept, so a mode-only
-  change on one side was silently dropped, and identical content with different
-  modes could be reported as a conflict.
+  change on one side was silently dropped (the unchanged side's blob id equalled
+  the changed side's, so the unchanged side's entry won).
 - **A file/directory collision is rejected before any output is written.**
   When the merged result would make a name both a file and a directory (`x` and
-  `x/child`), the merge fails with `PathCollision` naming the path. Previously
+  `x/child`), the merge fails with `PathCollision` naming the path. This
+  covers every caller of the file merge: `sc merge`, cherry-pick, rebase, the
+  merge into a private branch and the `sc ws harvest` auto-merge check (a
+  colliding workspace falls back to a `work-<i>` branch). Previously
   the tree writer emitted both a blob and a tree with that name and
   materialization failed after changing working files.
 
