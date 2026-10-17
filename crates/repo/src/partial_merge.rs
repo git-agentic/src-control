@@ -1,0 +1,447 @@
+//! Tests for clean merges on a partial clone (ADR-0049, P37c-ii).
+//!
+//! The fixture is an origin with `src/`, `docs/`, `docs/api/` and `lib/`, a
+//! `--filter src/` clone of it, and two origin branches `b1` and `b2` cut from
+//! the first commit. The clone's view is `src/`, so everything the tests touch
+//! under `docs/` is outside it.
+
+use std::path::{Path, PathBuf};
+
+use scl_core::{Object, ObjectId};
+
+use crate::error::Error;
+use crate::refs;
+use crate::repo::Repo;
+
+const SRC_A: &[u8] = b"one\ntwo\nthree\n";
+
+struct Fx {
+    origin_root: PathBuf,
+    clone_root: PathBuf,
+    origin: Repo,
+}
+
+impl Fx {
+    /// An origin on `main` at one commit, with `extra` written into that first
+    /// commit by the caller-supplied closure.
+    fn origin(tag: &str, extra: impl FnOnce(&Path)) -> Fx {
+        let pid = std::process::id();
+        let base = std::env::temp_dir();
+        let origin_root = base.join(format!("scl-p37c-{tag}-origin-{pid}"));
+        let clone_root = base.join(format!("scl-p37c-{tag}-clone-{pid}"));
+        for r in [&origin_root, &clone_root] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+        for d in ["src", "docs/api", "lib"] {
+            std::fs::create_dir_all(origin_root.join(d)).unwrap();
+        }
+        let origin = Repo::init(&origin_root).unwrap();
+        std::fs::write(origin_root.join("src/a.txt"), SRC_A).unwrap();
+        std::fs::write(origin_root.join("docs/a.md"), b"a\n").unwrap();
+        std::fs::write(origin_root.join("docs/b.md"), b"b\n").unwrap();
+        std::fs::write(origin_root.join("docs/api/guide.md"), b"g\n").unwrap();
+        std::fs::write(origin_root.join("lib/x.txt"), b"x\n").unwrap();
+        extra(&origin_root);
+        origin.commit("t", "c1").unwrap();
+        Fx {
+            origin_root,
+            clone_root,
+            origin,
+        }
+    }
+
+    /// Cut `name` from the origin's `main`, write `files` on it, commit, and
+    /// return to `main`. Returns the new tip.
+    fn origin_branch(&self, name: &str, files: &[(&str, &[u8])]) -> ObjectId {
+        self.origin.branch(name).unwrap();
+        self.origin.switch(name).unwrap();
+        for (p, bytes) in files {
+            std::fs::write(self.origin_root.join(p), bytes).unwrap();
+        }
+        let tip = self.origin.commit("t", &format!("edit on {name}")).unwrap();
+        self.origin.switch("main").unwrap();
+        tip
+    }
+
+    /// A `--filter src/` clone, lazy or not, that has fetched every origin branch.
+    fn clone(&self, lazy: bool) -> Repo {
+        let clone = Repo::clone_url_filtered(
+            self.origin_root.to_str().unwrap(),
+            &self.clone_root,
+            Some(&["src/".to_string()]),
+        )
+        .unwrap();
+        crate::promisor::set_lazy(clone.layout(), lazy).unwrap();
+        clone.fetch("origin").unwrap();
+        clone
+    }
+
+    fn cleanup(self) {
+        drop(self.origin);
+        for r in [&self.origin_root, &self.clone_root] {
+            if r.exists() {
+                std::fs::remove_dir_all(r).unwrap();
+            }
+            assert!(!r.exists(), "fixture {} must be removed", r.display());
+        }
+    }
+}
+
+fn has(repo: &Repo, id: &ObjectId) -> bool {
+    repo.vfs().store().lock().unwrap().contains(id)
+}
+
+fn blob_id(bytes: &[u8]) -> ObjectId {
+    Object::blob(bytes.to_vec()).id()
+}
+
+/// The tree id of directory `name` directly under `snap`'s root.
+fn dir_id(repo: &Repo, snap: &ObjectId, name: &str) -> ObjectId {
+    let arc = repo.vfs().store();
+    let mut s = arc.lock().unwrap();
+    let root = s.get_snapshot(snap).unwrap().root;
+    s.get_tree(&root).unwrap().get(name).unwrap().id
+}
+
+/// Commit an edit to `src/a.txt` on the clone's `main`.
+fn clone_edit_src(fx: &Fx, clone: &Repo, bytes: &[u8]) {
+    std::fs::write(fx.clone_root.join("src/a.txt"), bytes).unwrap();
+    clone.commit("t", "ours").unwrap();
+}
+
+/// Disjoint edits merge without reading, or fetching, the other side's region.
+/// The clone is not lazy, so a merge that needed the network could not succeed.
+#[test]
+fn disjoint_merge_carries_the_other_sides_subtree_without_a_fetch() {
+    let fx = Fx::origin("carry", |_| {});
+    let b1 = fx.origin_branch("b1", &[("docs/api/guide.md", b"g changed\n")]);
+    let theirs_docs = dir_id(&fx.origin, &b1, "docs");
+    let clone = fx.clone(false);
+    assert!(
+        !has(&clone, &theirs_docs),
+        "premise: the docs tree is a gap"
+    );
+
+    clone_edit_src(&fx, &clone, b"one\nTWO\nthree\n");
+    let ours = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    let (merged, _) = clone.merge_with_identity("origin/b1", "t", None).unwrap();
+
+    let snap = clone.snapshot(&merged).unwrap();
+    assert_eq!(snap.parents.len(), 2);
+    assert_eq!(Some(snap.parents[0]), ours);
+    assert_eq!(
+        dir_id(&clone, &merged, "docs"),
+        theirs_docs,
+        "their docs tree is carried by id"
+    );
+    assert!(!has(&clone, &theirs_docs), "and never read or fetched");
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
+        b"one\nTWO\nthree\n"
+    );
+    assert!(!fx.clone_root.join("docs").exists());
+    assert!(!clone.merge_in_progress());
+    // The merged snapshot references a subtree the store does not hold: gc and
+    // push must walk what is present and cope (ADR-0048).
+    clone.gc(std::time::Duration::from_secs(0)).unwrap();
+    assert!(has(&clone, &merged), "gc keeps the merge");
+    assert!(!has(&clone, &theirs_docs), "and does not invent the gap");
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A region both sides changed is outside the view: a lazy clone fetches it by
+/// id (trees only, the blobs are decided by id) and a non-lazy one is refused
+/// before it writes anything.
+#[test]
+fn differing_region_outside_the_view_fills_when_lazy_and_is_refused_otherwise() {
+    let fx = Fx::origin("fill", |_| {});
+    let b1 = fx.origin_branch("b1", &[("docs/a.md", b"a1\n")]);
+    let b2 = fx.origin_branch("b2", &[("docs/b.md", b"b2\n")]);
+    let clone = fx.clone(false);
+    clone.merge("origin/b1", "t").unwrap(); // fast-forward
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        Some(b1)
+    );
+
+    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    let err = clone.merge("origin/b2", "t").unwrap_err();
+    assert!(
+        matches!(&err, Error::GapOutsideFilter(p) if p == "docs"),
+        "got {err:?}"
+    );
+    assert!(err.to_string().contains("sc backfill docs"), "{err}");
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        before,
+        "refused before any write"
+    );
+    assert!(!clone.merge_in_progress());
+    assert!(!fx.clone_root.join("docs").exists());
+
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    let (merged, _) = clone.merge_with_identity("origin/b2", "t", None).unwrap();
+    let snap = clone.snapshot(&merged).unwrap();
+    assert_eq!(snap.parents, vec![b1, b2]);
+    // The differing region was read: its trees and the two changed blobs
+    // arrived. The untouched `docs/api` subtree is identical on all three sides,
+    // so it was carried and never fetched. Nothing is on disk: docs/ is outside
+    // the view.
+    assert!(has(&clone, &blob_id(b"a1\n")));
+    assert!(has(&clone, &blob_id(b"b2\n")));
+    let api = dir_id(&clone, &b1, "docs");
+    let api = {
+        let arc = clone.vfs().store();
+        let mut s = arc.lock().unwrap();
+        s.get_tree(&api).unwrap().get("api").unwrap().id
+    };
+    assert!(!has(&clone, &api), "the identical subtree stays a gap");
+    assert!(!fx.clone_root.join("docs").exists());
+    let docs = dir_id(&clone, &merged, "docs");
+    let arc = clone.vfs().store();
+    let mut s = arc.lock().unwrap();
+    let docs = s.get_tree(&docs).unwrap();
+    assert_eq!(docs.get("a.md").unwrap().id, blob_id(b"a1\n"));
+    assert_eq!(docs.get("b.md").unwrap().id, blob_id(b"b2\n"));
+    assert_eq!(docs.get("api").unwrap().id, api);
+    drop(s);
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A conflict is refused before any merge output, state or working-tree write.
+#[test]
+fn conflict_on_a_partial_clone_is_refused_before_any_write() {
+    let fx = Fx::origin("conflict", |_| {});
+    fx.origin_branch("b1", &[("src/a.txt", b"ONE\ntwo\nthree\n")]);
+    fx.origin_branch("b2", &[("src/a.txt", b"uno\ntwo\nthree\n")]);
+    let clone = fx.clone(true);
+    clone.merge("origin/b1", "t").unwrap();
+    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+
+    let err = clone.merge("origin/b2", "t").unwrap_err();
+    assert!(
+        matches!(&err, Error::PartialCloneUnsupported(op) if op.contains("conflicts")),
+        "got {err:?}"
+    );
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        before
+    );
+    assert!(!clone.merge_in_progress());
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
+        b"ONE\ntwo\nthree\n",
+        "no markers"
+    );
+    assert!(!fx.clone_root.join("src/a.txt.theirs").exists());
+    drop(clone);
+    fx.cleanup();
+}
+
+/// An origin whose `vault/` is protected for `pk` (rule plus ciphertext).
+fn protected_origin(tag: &str, pk: &scl_crypto::PublicKey) -> Fx {
+    let fx = Fx::origin(tag, |root| {
+        std::fs::create_dir_all(root.join("vault")).unwrap();
+        std::fs::write(root.join("vault/s.txt"), b"l1\nl2\nl3\n").unwrap();
+    });
+    fx.origin
+        .protect("vault/", std::slice::from_ref(pk), None)
+        .unwrap();
+    fx
+}
+
+/// A protected subtree no side touched is carried, so its blobs were never
+/// enumerated: the merged snapshot must keep every wrap, or no recipient could
+/// decrypt the carried files again (ADR-0049 decision 4).
+#[test]
+fn a_carried_protected_subtree_keeps_its_wraps() {
+    let (sk, pk) = scl_crypto::generate_keypair();
+    let fx = protected_origin("wraps", &pk);
+    let base = fx.origin.head_tip().unwrap().unwrap();
+    let base_snap = fx.origin.snapshot(&base).unwrap();
+    assert!(!base_snap.protection.wrapped.is_empty(), "premise: sealed");
+    let vault = dir_id(&fx.origin, &base, "vault");
+    fx.origin_branch("b1", &[("docs/a.md", b"a1\n")]);
+    let clone = fx.clone(false);
+    assert!(!has(&clone, &vault), "premise: vault is outside the filter");
+
+    clone_edit_src(&fx, &clone, b"one\nTWO\nthree\n");
+    let (merged, _) = clone.merge_with_identity("origin/b1", "t", None).unwrap();
+    let snap = clone.snapshot(&merged).unwrap();
+    assert_eq!(dir_id(&clone, &merged, "vault"), vault, "carried by id");
+    assert!(!has(&clone, &vault), "and never fetched");
+    for (id, wraps) in &base_snap.protection.wrapped {
+        assert_eq!(
+            snap.protection.wrapped.get(id),
+            Some(wraps),
+            "the wraps of {id} survive the merge byte for byte"
+        );
+    }
+    // And they still open the carried ciphertext: the recipient decrypts the
+    // blob (read from the origin, which holds it) under the MERGED policy.
+    let (cipher_id, _) = base_snap.protection.wrapped.iter().next().unwrap();
+    let cipher = {
+        let arc = fx.origin.vfs().store();
+        let mut s = arc.lock().unwrap();
+        match s.get(cipher_id).unwrap() {
+            Object::Blob(b) => b,
+            other => panic!("expected a blob, got {}", other.kind_name()),
+        }
+    };
+    let plain =
+        crate::protect::decrypt_with(&cipher, cipher_id, &[&snap.protection], &sk, "vault/s.txt")
+            .unwrap();
+    assert_eq!(&plain[..], b"l1\nl2\nl3\n");
+    assert_eq!(snap.protection.prefixes, base_snap.protection.prefixes);
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A keyless merge of a protected path both sides changed refuses without
+/// fetching its ciphertext; with the identity it merges the content.
+#[test]
+fn keyless_protected_merge_refuses_before_fetching_the_ciphertext() {
+    let (sk, pk) = scl_crypto::generate_keypair();
+    let fx = protected_origin("identity", &pk);
+    // The origin materialized `vault/s.txt` as plaintext at its protect commit;
+    // each branch rewrites it, so the edit is committed under the rule.
+    let b1 = fx.origin_branch("b1", &[("vault/s.txt", b"L1\nl2\nl3\n")]);
+    let b2 = fx.origin_branch("b2", &[("vault/s.txt", b"l1\nl2\nL3\n")]);
+    let cipher = |tip: &ObjectId| {
+        let arc = fx.origin.vfs().store();
+        let mut s = arc.lock().unwrap();
+        let root = s.get_snapshot(tip).unwrap().root;
+        let vault = s.get_tree(&root).unwrap().get("vault").unwrap().id;
+        s.get_tree(&vault).unwrap().get("s.txt").unwrap().id
+    };
+    let (c1, c2) = (cipher(&b1), cipher(&b2));
+    assert_ne!(c1, c2);
+
+    let clone = fx.clone(true);
+    clone.merge("origin/b1", "t").unwrap(); // fast-forward
+    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    let err = clone.merge("origin/b2", "t").unwrap_err();
+    assert!(
+        matches!(&err, Error::ProtectedMergeNeedsIdentity(p) if p == "vault/s.txt"),
+        "got {err:?}"
+    );
+    assert!(!has(&clone, &c1), "ciphertext not fetched for a refusal");
+    assert!(!has(&clone, &c2), "ciphertext not fetched for a refusal");
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        before
+    );
+
+    let (merged, _) = clone
+        .merge_with_identity("origin/b2", "t", Some(&sk))
+        .unwrap();
+    let snap = clone.snapshot(&merged).unwrap();
+    let arc = clone.vfs().store();
+    let mut s = arc.lock().unwrap();
+    let vault = s.get_tree(&snap.root).unwrap().get("vault").unwrap().id;
+    let entry = s.get_tree(&vault).unwrap().get("s.txt").unwrap().clone();
+    assert_ne!(entry.perms & scl_core::PROTECTED, 0, "sealed again");
+    assert!(
+        snap.protection.wrapped.contains_key(&entry.id),
+        "with fresh wraps for the merged content"
+    );
+    // The merged plaintext reaches neither the store nor the disk; the sealed
+    // blob decrypts for the recipient to the clean three-way result.
+    assert!(
+        !s.contains(&blob_id(b"L1\nl2\nL3\n")),
+        "no plaintext in the CAS"
+    );
+    let sealed = match s.get(&entry.id).unwrap() {
+        Object::Blob(b) => b,
+        other => panic!("expected a blob, got {}", other.kind_name()),
+    };
+    let plain =
+        crate::protect::decrypt_with(&sealed, &entry.id, &[&snap.protection], &sk, "vault/s.txt")
+            .unwrap();
+    assert_eq!(&plain[..], b"L1\nl2\nL3\n");
+    assert!(!fx.clone_root.join("vault").exists(), "outside the view");
+    drop(s);
+    drop(clone);
+    fx.cleanup();
+}
+
+/// The merged tree carries a subtree that is absent inside the sparse view:
+/// the view's closure is filled before anything is written, on a lazy clone,
+/// and a non-lazy one fails with the view-gap error and changes nothing.
+#[test]
+fn a_carried_subtree_inside_the_view_is_filled_before_materializing() {
+    let fx = Fx::origin("view", |_| {});
+    fx.origin_branch("b1", &[("docs/api/guide.md", b"g changed\n")]);
+    let clone = fx.clone(true);
+    clone
+        .set_sparse(&["src/".to_string(), "docs/".to_string()], None)
+        .unwrap();
+    assert!(fx.clone_root.join("docs/api/guide.md").exists());
+    clone_edit_src(&fx, &clone, b"one\nTWO\nthree\n");
+    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+
+    // Their docs subtree is carried, so it is not read, yet it lies in the view.
+    crate::promisor::set_lazy(clone.layout(), false).unwrap();
+    let err = clone.merge("origin/b1", "t").unwrap_err();
+    assert!(matches!(err, Error::GapInView { .. }), "got {err:?}");
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("docs/api/guide.md")).unwrap(),
+        b"g\n",
+        "nothing was laid out"
+    );
+    assert!(!clone.merge_in_progress());
+
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone.merge("origin/b1", "t").unwrap();
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("docs/api/guide.md")).unwrap(),
+        b"g changed\n"
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A fill interrupted partway leaves its objects behind and nothing else; the
+/// retry resumes from what is present and succeeds.
+#[test]
+fn an_interrupted_fill_changes_nothing_and_the_retry_succeeds() {
+    let fx = Fx::origin("retry", |_| {});
+    let b1 = fx.origin_branch("b1", &[("docs/a.md", b"a1\n")]);
+    let b2 = fx.origin_branch("b2", &[("docs/b.md", b"b2\n")]);
+    let clone = fx.clone(true);
+    clone.merge("origin/b1", "t").unwrap(); // fast-forward
+    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+
+    // Round one by hand: fetch the docs trees of both sides, then lose the origin
+    // before the blobs arrive.
+    let docs = [&b1, &b2].map(|tip| dir_id(&fx.origin, tip, "docs"));
+    let needs: Vec<(ObjectId, String)> = docs.iter().map(|id| (*id, "docs".to_string())).collect();
+    clone.needs_filler().unwrap().fill(&needs).unwrap();
+    assert!(docs.iter().all(|id| has(&clone, id)), "trees arrived");
+    let gone = fx.origin_root.with_extension("gone");
+    std::fs::rename(&fx.origin_root, &gone).unwrap();
+    let err = clone.merge("origin/b2", "t").unwrap_err();
+    assert!(
+        !matches!(err, Error::MergeConflicts(_) | Error::UpToDate),
+        "got {err:?}"
+    );
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        before
+    );
+    assert!(!clone.merge_in_progress());
+    assert!(!fx.clone_root.join("docs").exists());
+    assert!(docs.iter().all(|id| has(&clone, id)), "progress is kept");
+
+    std::fs::rename(&gone, &fx.origin_root).unwrap();
+    let (merged, _) = clone.merge_with_identity("origin/b2", "t", None).unwrap();
+    assert_eq!(clone.snapshot(&merged).unwrap().parents, vec![b1, b2]);
+    drop(clone);
+    fx.cleanup();
+}

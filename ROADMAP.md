@@ -558,11 +558,11 @@ clone: the view closure is filled by id before switch, fast-forward, undo and
 `sparse disable` stay refused. Design and open questions in
 [ADR-0048](docs/adr/0048-presence-based-partial-clones.md).
 
-**P37c — merge on partial clones (proposed; 37c-i engine built, not yet wired).** A tree-recursive three-way merge
+**P37c — merge on partial clones (proposed; 37c-i engine and 37c-ii clean merge built).** A tree-recursive three-way merge
 that carries a subtree by id where the three sides agree, checks protection
 rules before carrying, never drops wraps for subtrees it does not enumerate,
 and fills (lazy) or refuses (otherwise) the region where the sides differ,
-the region that intersects a protection rule, and the sparse view's closure. Clean merges first, then conflicts, then cherry-pick/rebase; sessions
+the region that intersects a protection rule, and the sparse view's closure. Clean merges are built (`sc merge` on a partial clone; a conflict is refused before any write). Conflicts are next, then cherry-pick/rebase; sessions
 are undecided. Design in
 [ADR-0049](docs/adr/0049-merge-on-partial-clones.md).
 

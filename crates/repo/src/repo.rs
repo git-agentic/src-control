@@ -1344,22 +1344,68 @@ impl Repo {
             }
         }
 
-        // Merge/pick completion guard (P27 Task 5, T5-I4): a real three-way
-        // merge flattens BOTH sides' full trees (`crate::merge::three_way`);
-        // on a partial clone that would touch out-of-filter content this
-        // clone never fetched. `three_way`'s unfiltered walk already fails
-        // with a raw `NotFound` there today — refuse explicitly and loudly
-        // here instead, before ever calling it, so the failure names the
-        // real cause (a partial clone) and points at `sc backfill` rather
-        // than surfacing as a confusing corruption-shaped error. Only the
-        // fast-forward/adopt paths above (which never rebuild a tree, only
-        // gap-tolerant `materialize`) are exempt.
-        if self.promisor()?.is_some() {
-            return Err(crate::promisor::partial_clone_unsupported("merge"));
-        }
+        // A partial clone cannot flatten both sides: most of their objects are
+        // absent. It merges tree by tree instead (ADR-0049), reading only the
+        // regions where the sides differ or a protection rule applies, and
+        // fetching what those need by id on a lazy, online clone (outside the
+        // store lock). Everything else is carried by id, unread.
+        let partial = self.promisor()?.is_some();
 
         // Real three-way merge.
-        let (merge_result, ours_root, ours_protection, theirs_protection) = {
+        let (merge_result, tree_carried, ours_root, ours_protection, theirs_protection) = if partial
+        {
+            let (base_snap, ours_snap, theirs_snap) = {
+                let store_arc = self.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                let base = crate::merge::merge_base(&mut store, ours, theirs)?
+                    .ok_or(Error::NoCommonAncestor)?;
+                (
+                    store.get_snapshot(&base)?,
+                    store.get_snapshot(&ours)?,
+                    store.get_snapshot(&theirs)?,
+                )
+            };
+            let secrets = crate::merge::merge_secrets(
+                &base_snap.secrets,
+                &ours_snap.secrets,
+                &theirs_snap.secrets,
+            )?;
+            let (done, _fill) = self.tree_merge_filled(
+                Some((base_snap.root, &base_snap.protection)),
+                (ours_snap.root, &ours_snap.protection),
+                (theirs_snap.root, &theirs_snap.protection),
+                identity,
+            )?;
+            // Conflicts need a state contract this phase does not build
+            // (ADR-0049 decision 8): refuse before any merge output, merge
+            // state or working-tree write.
+            if !done.merge.conflicts.is_empty() {
+                return Err(crate::promisor::partial_clone_unsupported(
+                    "a merge with conflicts",
+                ));
+            }
+            let wrapped_carry = done.merged_wraps(
+                &ours_snap.protection,
+                &theirs_snap.protection,
+                &base_snap.protection,
+            );
+            let carried_any = done.carried_any();
+            let fm = done.merge;
+            let m = crate::merge::Merge {
+                files: fm.files,
+                sidecars: fm.sidecars,
+                conflicts: fm.conflicts,
+                secrets,
+                wrapped_carry,
+            };
+            (
+                m,
+                Some((done.carried, carried_any)),
+                ours_snap.root,
+                ours_snap.protection,
+                theirs_snap.protection,
+            )
+        } else {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
             let base = crate::merge::merge_base(&mut store, ours, theirs)?
@@ -1369,7 +1415,7 @@ impl Repo {
             let ours_root = store.get_snapshot(&ours)?.root;
             let ours_protection = store.get_snapshot(&ours)?.protection;
             let theirs_protection = store.get_snapshot(&theirs)?.protection;
-            (m, ours_root, ours_protection, theirs_protection)
+            (m, None, ours_root, ours_protection, theirs_protection)
         };
 
         // Union protection rules across both sides: governs which recipients a
@@ -1471,7 +1517,18 @@ impl Repo {
         carried.extend(encrypted);
         let all = carried;
 
-        let merged_root = self.vfs.write_tree_with_perms(&all)?;
+        // Carried subtrees (partial clone only) are overlaid by id; nothing
+        // below them was read, and the plaintext rules above never saw them.
+        let merged_root = match &tree_carried {
+            Some((crate::merge_tree::Carried::Root(id), _)) => {
+                debug_assert!(all.is_empty(), "a carried root leaves nothing enumerated");
+                *id
+            }
+            Some((crate::merge_tree::Carried::Entries(entries), _)) => {
+                self.vfs.write_tree_with_carried(&all, entries)?
+            }
+            None => self.vfs.write_tree_with_perms(&all)?,
+        };
 
         // Merged wrap map: union the carried wraps (from `wrapped_carry`, for
         // ciphertext that survived unchanged/one-sided) with the freshly
@@ -1488,7 +1545,11 @@ impl Repo {
         // Prune to blobs actually reachable in the merged tree (commit's
         // rebuild discipline — a path that lost its rule mid-merge and no
         // longer resolves to that blob must not leave a stale wrap entry).
-        {
+        // Not when a subtree was carried: its blobs were never enumerated, so
+        // pruning would drop their wraps for good. The map is then the
+        // complete input union (ADR-0049 decision 4).
+        let carried_any = tree_carried.as_ref().is_some_and(|(_, any)| *any);
+        if !carried_any {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
             let reachable: std::collections::BTreeSet<ObjectId> =
@@ -1503,6 +1564,11 @@ impl Repo {
             wrapped,
         };
 
+        // The merged tree may carry a subtree that is absent inside the sparse
+        // view: fill its closure now (lazy partial clones only), before any ref,
+        // spec or working-tree write and outside the store lock.
+        self.ensure_view(merged_root, &self.sparse_spec()?)?;
+
         // Materialize the merged tree into the working dir. Protection-aware:
         // a merged PROTECTED entry decrypts for `identity` when possible, else
         // is skipped (never writes ciphertext to disk) and reported to the
@@ -1514,7 +1580,6 @@ impl Repo {
         let skipped = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
-            // ensure-view-exempt: conflict materialization; merge is refused on partial clones
             worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1618,7 +1683,7 @@ impl Repo {
             // skipped content, so nothing is lost by not surfacing the list
             // here (the `Err`/`Stopped` return can't carry it).
             let mut cache = self.open_protected_cache()?;
-            // ensure-view-exempt: conflict materialization; merge is refused on partial clones
+            // ensure-view-exempt: conflict materialization; a partial clone refuses conflicts before any write
             let _skipped = worktree::materialize(
                 &self.layout,
                 &mut store,

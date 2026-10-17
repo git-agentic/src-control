@@ -562,11 +562,18 @@ fn plain_input(
     identity: Option<&scl_crypto::SecretKey>,
     path: &str,
 ) -> Result<scl_crypto::Zeroizing<Vec<u8>>> {
+    // The identity requirement is checked before the blob is read, so a lazy
+    // partial clone refuses a keyless merge of a protected path without first
+    // fetching its ciphertext (ADR-0049 open question 1).
+    let sk = if entry.2 & PROTECTED == 0 {
+        None
+    } else {
+        Some(identity.ok_or_else(|| Error::ProtectedMergeNeedsIdentity(path.to_string()))?)
+    };
     let bytes = blob_bytes(store, entry.0)?;
-    if entry.2 & PROTECTED == 0 {
+    let Some(sk) = sk else {
         return Ok(scl_crypto::Zeroizing::new(bytes));
-    }
-    let sk = identity.ok_or_else(|| Error::ProtectedMergeNeedsIdentity(path.to_string()))?;
+    };
     protect::decrypt_with(&bytes, &entry.0, prots, sk, path)
 }
 
