@@ -243,13 +243,14 @@ impl crate::repo::Repo {
         theirs: (ObjectId, &Protection),
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<(TreeMergeDone, FillStats)> {
+        let mut filler = self.needs_filler()?;
         fill_loop(
             || {
                 let store_arc = self.vfs().store();
                 let mut store = store_arc.lock().unwrap();
                 merge_trees(&mut store, base, ours, theirs, identity)
             },
-            |needs| self.fill_needs(needs),
+            |needs| filler.fill(needs),
         )
     }
 }

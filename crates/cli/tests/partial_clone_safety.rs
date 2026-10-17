@@ -220,6 +220,22 @@ fn backfill_all_lifts_partial_clone_refusals() {
         stderr(&sparse_disable)
     );
 
+    // The conflicting merge is no longer refused: it reaches the ordinary
+    // conflict state (markers in the file), which `--abort` undoes.
+    let conflict_after = sc(&dst_root, &["merge", "clash"]);
+    assert!(
+        !stderr(&conflict_after).contains("partial clone"),
+        "a conflicting merge must no longer be refused after backfill --all: {}",
+        stderr(&conflict_after)
+    );
+    assert!(
+        std::fs::read_to_string(dst_root.join("src/a.txt"))
+            .unwrap()
+            .contains("<<<<<<<"),
+        "the ordinary conflict markers are written"
+    );
+    assert!(sc(&dst_root, &["merge", "--abort"]).status.success());
+
     let merge_after = sc(&dst_root, &["merge", "feature"]);
     assert!(
         merge_after.status.success(),

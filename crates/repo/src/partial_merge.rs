@@ -257,7 +257,7 @@ fn protected_origin(tag: &str, pk: &scl_crypto::PublicKey) -> Fx {
 /// decrypt the carried files again (ADR-0049 decision 4).
 #[test]
 fn a_carried_protected_subtree_keeps_its_wraps() {
-    let (_sk, pk) = scl_crypto::generate_keypair();
+    let (sk, pk) = scl_crypto::generate_keypair();
     let fx = protected_origin("wraps", &pk);
     let base = fx.origin.head_tip().unwrap().unwrap();
     let base_snap = fx.origin.snapshot(&base).unwrap();
@@ -273,13 +273,27 @@ fn a_carried_protected_subtree_keeps_its_wraps() {
     assert_eq!(dir_id(&clone, &merged, "vault"), vault, "carried by id");
     assert!(!has(&clone, &vault), "and never fetched");
     for (id, wraps) in &base_snap.protection.wrapped {
-        let kept = snap.protection.wrapped.get(id);
         assert_eq!(
-            kept.map(|w| w.len()),
-            Some(wraps.len()),
-            "the wraps of {id} survive the merge"
+            snap.protection.wrapped.get(id),
+            Some(wraps),
+            "the wraps of {id} survive the merge byte for byte"
         );
     }
+    // And they still open the carried ciphertext: the recipient decrypts the
+    // blob (read from the origin, which holds it) under the MERGED policy.
+    let (cipher_id, _) = base_snap.protection.wrapped.iter().next().unwrap();
+    let cipher = {
+        let arc = fx.origin.vfs().store();
+        let mut s = arc.lock().unwrap();
+        match s.get(cipher_id).unwrap() {
+            Object::Blob(b) => b,
+            other => panic!("expected a blob, got {}", other.kind_name()),
+        }
+    };
+    let plain =
+        crate::protect::decrypt_with(&cipher, cipher_id, &[&snap.protection], &sk, "vault/s.txt")
+            .unwrap();
+    assert_eq!(&plain[..], b"l1\nl2\nl3\n");
     assert_eq!(snap.protection.prefixes, base_snap.protection.prefixes);
     drop(clone);
     fx.cleanup();
@@ -333,6 +347,20 @@ fn keyless_protected_merge_refuses_before_fetching_the_ciphertext() {
         snap.protection.wrapped.contains_key(&entry.id),
         "with fresh wraps for the merged content"
     );
+    // The merged plaintext reaches neither the store nor the disk; the sealed
+    // blob decrypts for the recipient to the clean three-way result.
+    assert!(
+        !s.contains(&blob_id(b"L1\nl2\nL3\n")),
+        "no plaintext in the CAS"
+    );
+    let sealed = match s.get(&entry.id).unwrap() {
+        Object::Blob(b) => b,
+        other => panic!("expected a blob, got {}", other.kind_name()),
+    };
+    let plain =
+        crate::protect::decrypt_with(&sealed, &entry.id, &[&snap.protection], &sk, "vault/s.txt")
+            .unwrap();
+    assert_eq!(&plain[..], b"L1\nl2\nL3\n");
     assert!(!fx.clone_root.join("vault").exists(), "outside the view");
     drop(s);
     drop(clone);
@@ -375,6 +403,45 @@ fn a_carried_subtree_inside_the_view_is_filled_before_materializing() {
         std::fs::read(fx.clone_root.join("docs/api/guide.md")).unwrap(),
         b"g changed\n"
     );
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A fill interrupted partway leaves its objects behind and nothing else; the
+/// retry resumes from what is present and succeeds.
+#[test]
+fn an_interrupted_fill_changes_nothing_and_the_retry_succeeds() {
+    let fx = Fx::origin("retry", |_| {});
+    let b1 = fx.origin_branch("b1", &[("docs/a.md", b"a1\n")]);
+    let b2 = fx.origin_branch("b2", &[("docs/b.md", b"b2\n")]);
+    let clone = fx.clone(true);
+    clone.merge("origin/b1", "t").unwrap(); // fast-forward
+    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+
+    // Round one by hand: fetch the docs trees of both sides, then lose the origin
+    // before the blobs arrive.
+    let docs = [&b1, &b2].map(|tip| dir_id(&fx.origin, tip, "docs"));
+    let needs: Vec<(ObjectId, String)> = docs.iter().map(|id| (*id, "docs".to_string())).collect();
+    clone.needs_filler().unwrap().fill(&needs).unwrap();
+    assert!(docs.iter().all(|id| has(&clone, id)), "trees arrived");
+    let gone = fx.origin_root.with_extension("gone");
+    std::fs::rename(&fx.origin_root, &gone).unwrap();
+    let err = clone.merge("origin/b2", "t").unwrap_err();
+    assert!(
+        !matches!(err, Error::MergeConflicts(_) | Error::UpToDate),
+        "got {err:?}"
+    );
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        before
+    );
+    assert!(!clone.merge_in_progress());
+    assert!(!fx.clone_root.join("docs").exists());
+    assert!(docs.iter().all(|id| has(&clone, id)), "progress is kept");
+
+    std::fs::rename(&gone, &fx.origin_root).unwrap();
+    let (merged, _) = clone.merge_with_identity("origin/b2", "t", None).unwrap();
+    assert_eq!(clone.snapshot(&merged).unwrap().parents, vec![b1, b2]);
     drop(clone);
     fx.cleanup();
 }

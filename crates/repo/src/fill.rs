@@ -169,43 +169,19 @@ impl Repo {
         Ok(filler.stats)
     }
 
-    /// Make the objects a tree merge asked for present (ADR-0049 decision 5).
-    /// Each `(id, path)` is what `merge_trees` could not read and where it
-    /// found it. A lazy, online partial clone fetches them by id in batches;
-    /// any other partial clone fails with the gap error for the first path
-    /// (`sc backfill <path>`), and with the whole-clone refusal when the gap is
-    /// the root, which no prefix can repair. Call it with the store lock
-    /// released: the fill takes it. Fetched objects stay (they are immutable
-    /// CAS additions), so a retry resumes from current presence.
-    pub(crate) fn fill_needs(&self, needs: &[(ObjectId, String)]) -> Result<FillStats> {
-        self.fill_needs_impl(needs, crate::promisor::offline())
+    /// A filler for one tree merge's rounds (ADR-0049 decision 5): the
+    /// connection to the promisor origin opens on the first fill and is reused
+    /// by every later round of the same merge.
+    pub(crate) fn needs_filler(&self) -> Result<NeedsFiller<'_>> {
+        self.needs_filler_impl(crate::promisor::offline())
     }
 
     /// `offline` is a parameter so tests can exercise `SC_OFFLINE` without
     /// mutating the process environment.
-    fn fill_needs_impl(&self, needs: &[(ObjectId, String)], offline: bool) -> Result<FillStats> {
-        let Some((_, first)) = needs.first() else {
-            return Ok(FillStats::default());
-        };
-        let mut filler = Filler::new(self, offline)?;
-        let ids: BTreeSet<ObjectId> = needs.iter().map(|(id, _)| *id).collect();
-        if let Err(e) = filler.ensure_many(&ids, first) {
-            return Err(match e {
-                Error::GapOutsideFilter(p) if p.is_empty() => {
-                    crate::promisor::partial_clone_unsupported("merge")
-                }
-                other => other,
-            });
-        }
-        // The batch is all-or-nothing on the wire, but trust presence, not the
-        // reply: the caller's no-progress check rests on it.
-        let store_arc = self.vfs.store();
-        let store = store_arc.lock().unwrap();
-        if let Some(id) = ids.iter().find(|id| !store.contains(id)) {
-            return Err(Error::Core(scl_core::Error::NotFound(*id)));
-        }
-        drop(store);
-        Ok(filler.stats)
+    fn needs_filler_impl(&self, offline: bool) -> Result<NeedsFiller<'_>> {
+        Ok(NeedsFiller {
+            filler: Filler::new(self, offline)?,
+        })
     }
 
     /// The bytes of the file at `path` as of `refname`'s tip (`sc cat
@@ -290,6 +266,50 @@ impl Repo {
             }
         }
         unreachable!("the loop returns on the last path component")
+    }
+}
+
+/// Fills what a tree merge asks for, round after round, over one connection.
+pub(crate) struct NeedsFiller<'a> {
+    filler: Filler<'a>,
+}
+
+impl NeedsFiller<'_> {
+    /// Make the objects a tree merge asked for present. Each `(id, path)` is
+    /// what `merge_trees` could not read and where it found it. A lazy, online
+    /// partial clone fetches them by id in batches; any other partial clone
+    /// fails with the gap error for the first path (`sc backfill <path>`), and
+    /// with the whole-clone refusal when the gap is the root, which no prefix
+    /// can repair. Call it with the store lock released: the fill takes it.
+    /// Fetched objects stay (they are immutable CAS additions), so a retry
+    /// resumes from current presence. Returns what this call cost.
+    pub(crate) fn fill(&mut self, needs: &[(ObjectId, String)]) -> Result<FillStats> {
+        let Some((_, first)) = needs.first() else {
+            return Ok(FillStats::default());
+        };
+        let before = self.filler.stats;
+        let ids: BTreeSet<ObjectId> = needs.iter().map(|(id, _)| *id).collect();
+        if let Err(e) = self.filler.ensure_many(&ids, first) {
+            return Err(match e {
+                Error::GapOutsideFilter(p) if p.is_empty() => {
+                    crate::promisor::partial_clone_unsupported("merge")
+                }
+                other => other,
+            });
+        }
+        // The batch is all-or-nothing on the wire, but trust presence, not the
+        // reply: the caller's no-progress check rests on it.
+        let store_arc = self.filler.repo.vfs.store();
+        let store = store_arc.lock().unwrap();
+        if let Some(id) = ids.iter().find(|id| !store.contains(id)) {
+            return Err(Error::Core(scl_core::Error::NotFound(*id)));
+        }
+        drop(store);
+        let after = self.filler.stats;
+        Ok(FillStats {
+            requests: after.requests - before.requests,
+            objects: after.objects - before.objects,
+        })
     }
 }
 
