@@ -207,8 +207,10 @@ fn walk_snapshots<S: ObjectSource>(
     Ok(included)
 }
 
-/// The result of a presence-based walk (ADR-0048): `present` are the objects
-/// the walk reached and the store holds; `gaps` maps every absent object that
+/// The result of a presence-based walk (ADR-0048): `present` are the tree and
+/// blob objects the walk reached and the store holds, plus the snapshot-level
+/// ids it takes without a presence check, as the strict walk does (manifest
+/// closure ids and secrets); `gaps` maps every absent object that
 /// a present tree (or snapshot, for a root tree) references to its referrer.
 /// The two are disjoint by construction, since an id is either in the store
 /// or not.

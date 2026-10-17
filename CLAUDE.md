@@ -171,7 +171,7 @@ transport-adjacent. The rest, imperatively:
 - **Partial clones refuse merge, cherry-pick/rebase, `sc ws fork`/`harvest`,
   `sc work`, `sc export`, `sparse disable`, an empty `sparse set`, `sc rewrap`,
   `sc grant`/`revoke`, leaving a private branch, `sc push` to a git remote, and
-  `sc fetch` from any remote but the promisor origin.** `sc backfill --all`
+  `sc fetch` from any native remote but the promisor origin.** `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what
   a clone *asked for*, not what is present: after a fetch an in-filter object
   can be absent, and a switch, fast-forward, undo or `sparse set` that needs it

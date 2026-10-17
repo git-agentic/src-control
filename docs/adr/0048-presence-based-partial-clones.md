@@ -239,7 +239,10 @@ truth:
 - **Materialize.** The old-view bound comes from the spec that was in effect,
   passed in, not from the filter prefixes. *Moved to 37b-ii:* until a widen
   exists the sparse view is always inside the filter, so the filter-prefix
-  bound is a safe superset and the change would be unobservable.
+  bound covers everything that was ever laid out. A superset of the view is
+  not necessarily present, though (a fetch can leave a tree inside the filter
+  but outside the view absent), so 37b-i makes that removal walk skip absent
+  subtrees; nothing of them is on disk.
 
 `sc sparse disable` stays refused on a partial clone; whole history and a full
 tree stay `sc backfill --all`. A `sc sparse set` with no prefixes means a full

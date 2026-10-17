@@ -378,7 +378,25 @@ pub(crate) fn tree_file_ids_sparse(
         return tree_file_ids(store, root);
     }
     let mut out = BTreeMap::new();
-    walk_tree_sparse(store, root, String::new(), sparse, &mut out)?;
+    walk_tree_sparse(store, root, String::new(), sparse, &mut out, false)?;
+    Ok(out)
+}
+
+/// Like [`tree_file_ids_sparse`], but skips a subtree the store lacks instead
+/// of failing. For `materialize`'s old-root removal walk on a partial clone:
+/// the old root was laid out under a preflighted view, so an absent subtree
+/// lay outside that view and has nothing on disk to remove. The promisor
+/// filter that bounds the walk is only a superset of the view, and a fetch can
+/// leave a tree inside the filter but outside the view absent (ADR-0048).
+fn tree_file_ids_sparse_present(
+    store: &mut Store,
+    root: ObjectId,
+    sparse: &Sparse,
+) -> Result<BTreeMap<String, ObjectId>> {
+    let mut out = BTreeMap::new();
+    if store.contains(&root) {
+        walk_tree_sparse(store, root, String::new(), sparse, &mut out, true)?;
+    }
     Ok(out)
 }
 
@@ -388,6 +406,7 @@ fn walk_tree_sparse(
     prefix: String,
     sparse: &Sparse,
     out: &mut BTreeMap<String, ObjectId>,
+    skip_absent: bool,
 ) -> Result<()> {
     let tree: Tree = store.get_tree(&tree_id)?;
     for e in tree.entries {
@@ -403,8 +422,8 @@ fn walk_tree_sparse(
                 }
             }
             EntryKind::Tree => {
-                if sparse.should_descend(&path) {
-                    walk_tree_sparse(store, e.id, path, sparse, out)?;
+                if sparse.should_descend(&path) && (!skip_absent || store.contains(&e.id)) {
+                    walk_tree_sparse(store, e.id, path, sparse, out, skip_absent)?;
                 }
             }
         }
@@ -696,11 +715,16 @@ pub(crate) fn materialize(
         // walking it would `NotFound`. A full (non-partial) repo keeps the
         // old unfiltered walk exactly (`Sparse::default()` falls back to
         // `tree_file_ids` inside `tree_file_ids_sparse`).
-        let old_walk_bound = match crate::promisor::load(layout)? {
-            Some(p) => Sparse::new(p.prefixes().to_vec()),
-            None => Sparse::default(),
+        let (old_walk_bound, partial) = match crate::promisor::load(layout)? {
+            Some(p) => (Sparse::new(p.prefixes().to_vec()), true),
+            None => (Sparse::default(), false),
         };
-        for p in tree_file_ids_sparse(store, old, &old_walk_bound)?.keys() {
+        let old_files = if partial {
+            tree_file_ids_sparse_present(store, old, &old_walk_bound)?
+        } else {
+            tree_file_ids_sparse(store, old, &old_walk_bound)?
+        };
+        for p in old_files.keys() {
             if !target.contains_key(p) || !sparse.matches(p) {
                 let full = safe_join(&layout.root, p)?;
                 let _ = std::fs::remove_file(full);

@@ -59,7 +59,7 @@ pub enum Error {
     /// that the destination does not hold either (ADR-0048). Pushing the new
     /// tip would leave the destination with a tree that names an object it
     /// cannot serve, so the push is refused before any byte is sent.
-    #[error("refusing to push: object {id} (referenced by {referrer}) is missing locally and the remote does not have it; fetch from the origin or run `sc backfill --all`, then retry")]
+    #[error("refusing to push: object {id} (referenced by {referrer}) is missing locally and the remote does not have it; if it came from the origin run `sc backfill --all`, otherwise restore or recreate the content and commit again, then retry")]
     PushGap {
         id: scl_core::ObjectId,
         referrer: scl_core::ObjectId,

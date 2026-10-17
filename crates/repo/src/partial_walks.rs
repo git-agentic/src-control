@@ -392,3 +392,56 @@ fn graft_new_name_check_uses_filter_union_sparse() {
     drop(clone);
     fx.cleanup();
 }
+
+/// A fetch can leave a tree inside the filter but outside the (narrower)
+/// sparse view absent. A later switch or undo then lays out from a root that
+/// has that gap as its OLD root; the removal walk must skip it (nothing of it
+/// is on disk) instead of failing with a raw `NotFound` after refs moved.
+#[test]
+fn old_root_gap_outside_the_view_does_not_break_switch_or_undo() {
+    let pid = std::process::id();
+    let base = std::env::temp_dir();
+    let origin_root = base.join(format!("scl-p37b-oldroot-origin-{pid}"));
+    let clone_root = base.join(format!("scl-p37b-oldroot-clone-{pid}"));
+    for r in [&origin_root, &clone_root] {
+        let _ = std::fs::remove_dir_all(r);
+    }
+    std::fs::create_dir_all(origin_root.join("src/a")).unwrap();
+    std::fs::create_dir_all(origin_root.join("docs")).unwrap();
+    let origin = Repo::init(&origin_root).unwrap();
+    std::fs::write(origin_root.join("src/a/x.txt"), b"x").unwrap();
+    std::fs::write(origin_root.join("docs/d.txt"), SHARED).unwrap();
+    let c1 = origin.commit("t", "c1").unwrap();
+    let clone = Repo::clone_url_filtered(
+        origin_root.to_str().unwrap(),
+        &clone_root,
+        Some(&["src/".to_string()]),
+    )
+    .unwrap();
+    clone.set_sparse(&["src/a/".to_string()], None).unwrap();
+    // `src/b` is byte-identical to `docs`, so its tree id is reachable from a
+    // have and the fetch leaves it out: inside the filter, outside the view.
+    std::fs::create_dir_all(origin_root.join("src/b")).unwrap();
+    std::fs::write(origin_root.join("src/b/d.txt"), SHARED).unwrap();
+    origin.commit("t", "c2").unwrap();
+    drop(origin);
+
+    refs::write_branch_tip(clone.layout(), "old", &c1).unwrap();
+    clone.fetch("origin").unwrap();
+    clone.merge("origin/main", "t").unwrap();
+
+    clone.switch("old").unwrap();
+    let tip_old = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    clone.switch("main").unwrap();
+    // Undo the second switch, then the first: each lays out across the gap.
+    clone.undo().unwrap();
+    assert_eq!(refs::current_branch(clone.layout()).unwrap(), "old");
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        tip_old
+    );
+    drop(clone);
+    for r in [&origin_root, &clone_root] {
+        std::fs::remove_dir_all(r).unwrap();
+    }
+}
