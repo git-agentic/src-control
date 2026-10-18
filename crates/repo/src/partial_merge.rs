@@ -880,3 +880,32 @@ fn a_sidecar_outside_the_view_is_refused_before_any_write() {
     drop(clone);
     fx.cleanup();
 }
+
+/// A binary conflict's `<path>.theirs` sidecar must not overwrite a tracked
+/// file of that name: the merge is refused before any write.
+#[test]
+fn a_sidecar_that_would_overwrite_a_tracked_file_is_refused() {
+    let fx = Fx::origin("sidecar-tracked", |root| {
+        std::fs::write(root.join("src/a.txt.theirs"), b"mine\n").unwrap();
+    });
+    fx.origin_branch("b1", &[("src/a.txt", b"\xff\xfeTHEIRS\n")]);
+    let clone = fx.clone(false);
+    clone_edit_src(&fx, &clone, b"\xff\xfeOURS\n");
+    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    let err = clone.merge("origin/b1", "t").unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidArgument(m) if m.contains("overwrite a tracked file")),
+        "got {err:?}"
+    );
+    assert!(!clone.merge_in_progress());
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/a.txt.theirs")).unwrap(),
+        b"mine\n"
+    );
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        before
+    );
+    drop(clone);
+    fx.cleanup();
+}

@@ -1732,6 +1732,27 @@ impl Repo {
             self.vfs
                 .write_tree_with_carried(carried, carried_subtrees)?
         };
+        // A sidecar must not land on a file either tree tracks: the write
+        // below would overwrite it, and `resolve` leaves tracked sidecar-named
+        // files alone, so the overwritten bytes would be committed. A failed
+        // lookup counts as tracked.
+        if !sidecars.is_empty() {
+            let partial = self.promisor()?.is_some();
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            for (rel, _) in sidecars {
+                let tracked = [old_root, conflict_root].iter().any(|root| {
+                    worktree::tree_entry_at(&mut store, *root, rel, partial)
+                        .map_or(true, |e| e.is_some())
+                });
+                if tracked {
+                    return Err(Error::InvalidArgument(format!(
+                        "merge has conflicts, and its sidecar {rel} would overwrite a tracked file; \
+                         rename or remove that file, then retry"
+                    )));
+                }
+            }
+        }
         // A carried subtree can sit inside the view: fill its closure before
         // the first working-tree write (lazy partial clones only), outside
         // the store lock.
