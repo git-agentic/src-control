@@ -106,7 +106,7 @@ the project tree if desired.
 
 ## Capability map (what's built, by phase)
 
-All 36 phases, P37a, P37b-i, P37b-ii, P37c-ii and P37c-iii are built and tested. One line of current fact per phase; the
+All 36 phases, P37a, P37b-i, P37b-ii and P37c are built and tested. One line of current fact per phase; the
 authoritative rationale and full semantics live in the linked ADR, the design
 in `ARCHITECTURE.md`. The old per-phase narrative log this table replaced is
 archived verbatim at `docs/archive/claude-md-phase-log-2026-07.md` — do not
@@ -153,7 +153,7 @@ the code, those win.
 | P36 | Bucket WAL remotes (sc+wal://, sc+s3://): immutable packs + CAS'd manifest, checkpoints + log-tail cold start, bucket-backed `sc serve --store` with disposable instances | [0046](docs/adr/0046-wal-bucket-remotes.md) |
 | P37a | Want-by-id fetch: batched `GetObjects` verb (wire v5), opt-in `.sc/promisor-lazy`, `sc cat <ref>:<path>` fills only the absent trees and blob on its path; `Store::get` stays network-free; sealed objects refused by kind; sparse widen and the lifted P27 refusals are P37b | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
 | P37b-i | Presence-based partial clones: push, verify and gc walk what the store holds (`reachable_objects_partial`), not the fetch filter; push checks every gap id against the destination before sending; a view gap fails with `GapInView` before any write (preflight at the top of `materialize`, plus `undo` and `sparse set`); a partial clone fetches from its origin only. 37b-ii: on a lazy, online clone `ensure_view` fills the view closure by id before switch, fast-forward, undo and `sparse set`, `sparse set` may widen past the filter, a by-id reply is capped at `min(--max-pack-size, 512 MiB)` and a refused batch is split. | [0048](docs/adr/0048-presence-based-partial-clones.md) |
-| P37c-ii, P37c-iii | Merge on a partial clone: a tree-recursive engine (`merge_trees`) carries a subtree by id when the sides agree and no protection rule applies, reads only where they differ or a rule intersects, and on a lazy, online clone fills what it asks for by id outside the store lock (a non-lazy clone gets the gap error with `sc backfill <path>`); a carried protected subtree keeps the complete input wrap union; a conflict inside the view is marked and resolved like on a full clone (`sc conflicts`/`sc resolve`/`merge --abort`/`sc commit`; the out-of-view part is grafted from the decided root), while a conflict outside the view, or a result that must be sealed outside it, is refused before any ref, merge-state or working-tree change (fetched objects stay). A subtree identical on all three sides is carried even under a protection rule. Mode-only edits now merge and a file/directory collision fails before any write, on full clones too. Cherry-pick/rebase are next | [0049](docs/adr/0049-merge-on-partial-clones.md) |
+| P37c | Merge, cherry-pick and rebase on a partial clone: a tree-recursive engine (`merge_trees`) carries a subtree by id when the sides agree and no protection rule applies, reads only where they differ or a rule intersects, and on a lazy, online clone fills what it asks for by id outside the store lock (a non-lazy clone gets the gap error with `sc backfill <path>`); a carried protected subtree keeps the complete input wrap union; a conflict inside the view is marked and resolved like on a full clone (`sc conflicts`/`sc resolve`/`merge --abort`/`sc commit`; the out-of-view part is grafted from the decided root), while a conflict outside the view, or a result that must be sealed outside it, is refused before any ref, merge-state or working-tree change (fetched objects stay). A subtree identical on all three sides is carried even under a protection rule. Cherry-pick and rebase use the same engine (`replay_commit`): the fold's accumulator may hold absent subtrees, the view is filled before the final write, and a stopped pick or rebase keeps its carried subtrees in the decided root. Mode-only edits now merge and a file/directory collision fails before any write, on full clones too. Sessions are undecided | [0049](docs/adr/0049-merge-on-partial-clones.md) |
 
 ## Standing boundaries & gotchas
 
@@ -169,10 +169,10 @@ transport-adjacent. The rest, imperatively:
   renderer has five typed repository commands, no general filesystem/shell
   capability, and no DTO field capable of carrying protected ciphertext or
   identity material.
-- **Partial clones refuse cherry-pick/rebase, `sc ws fork`/`harvest`,
+- **Partial clones refuse `sc ws fork`/`harvest`,
   `sc work`, `sc export`, `sparse disable`, an empty `sparse set` (and, on a non-lazy clone, one outside the filter), `sc rewrap`,
-  `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge whose conflict lies outside the view or needs sealing outside it (no ref, state or working-tree change), `sc push` to a git remote, and
-  `sc fetch` from any native remote but the promisor origin.** `sc merge` works, including conflicts inside the view (P37c). `sc backfill --all`
+  `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view or needs sealing outside it (no ref, state or working-tree change), `sc push` to a git remote, and
+  `sc fetch` from any native remote but the promisor origin.** `sc merge`, `sc cherry-pick` and `sc rebase` work, including conflicts inside the view (P37c). `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what
   a clone *asked for*, not what is present: after a fetch an in-filter object
   can be absent. On a lazy, online clone a switch, fast-forward, rebase, undo

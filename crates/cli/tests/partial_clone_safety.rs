@@ -160,15 +160,14 @@ fn status_diff_and_gc_succeed_on_fresh_partial_clone() {
 
 /// P27 final review I2: `sc backfill --all` is the real escape hatch —
 /// fetches every remaining object and removes `.sc/promisor`, after which
-/// a cherry-pick that was refused as unsupported on a partial clone works.
+/// a sparse disable that was refused on a partial clone works.
 #[test]
 fn backfill_all_lifts_partial_clone_refusals() {
     let (src_root, dst_root) = make_partial_clone("backfill-all");
 
-    // Replay is still refused while partial (a merge, clean or conflicting
-    // inside the view, works since P37c). Create a clashing branch (same
-    // file) for the refusal and a non-conflicting one for the merge after
-    // backfill.
+    // `sparse disable` is still refused while partial (merge, cherry-pick
+    // and rebase work since P37c). Create a clashing branch and a
+    // non-conflicting one for the merge after backfill.
     assert!(sc(&dst_root, &["branch", "clash"]).status.success());
     assert!(sc(&dst_root, &["switch", "clash"]).status.success());
     std::fs::write(dst_root.join("src/a.txt"), "clash-edit\n").unwrap();
@@ -182,19 +181,15 @@ fn backfill_all_lifts_partial_clone_refusals() {
     std::fs::write(dst_root.join("src/a.txt"), "main-edit\n").unwrap();
     assert!(sc(&dst_root, &["commit", "-m", "main"]).status.success());
 
-    let pick_before = sc(&dst_root, &["cherry-pick", "clash"]);
+    let disable_before = sc(&dst_root, &["sparse", "disable"]);
     assert!(
-        !pick_before.status.success(),
-        "a cherry-pick must still be refused before backfill --all"
+        !disable_before.status.success(),
+        "`sparse disable` must still be refused before backfill --all"
     );
     assert!(
-        stderr(&pick_before).contains("backfill --all"),
-        "refusal must point at `sc backfill --all`: {}",
-        stderr(&pick_before)
-    );
-    assert!(
-        !dst_root.join("src/a.txt.theirs").exists(),
-        "a refused cherry-pick writes nothing"
+        stderr(&disable_before).contains("backfill"),
+        "refusal must point at `sc backfill`: {}",
+        stderr(&disable_before)
     );
     assert_eq!(
         std::fs::read_to_string(dst_root.join("src/a.txt")).unwrap(),
@@ -220,22 +215,6 @@ fn backfill_all_lifts_partial_clone_refusals() {
         "sparse disable must now succeed: {}",
         stderr(&sparse_disable)
     );
-
-    // The cherry-pick is no longer refused: it reaches the ordinary
-    // conflict state (markers in the file), which `--abort` undoes.
-    let conflict_after = sc(&dst_root, &["cherry-pick", "clash"]);
-    assert!(
-        !stderr(&conflict_after).contains("partial clone"),
-        "a cherry-pick must no longer be refused after backfill --all: {}",
-        stderr(&conflict_after)
-    );
-    assert!(
-        std::fs::read_to_string(dst_root.join("src/a.txt"))
-            .unwrap()
-            .contains("<<<<<<<"),
-        "the ordinary conflict markers are written"
-    );
-    assert!(sc(&dst_root, &["cherry-pick", "--abort"]).status.success());
 
     let merge_after = sc(&dst_root, &["merge", "feature"]);
     assert!(
@@ -292,6 +271,65 @@ fn conflicting_merge_on_a_partial_clone_resolves_and_commits() {
     assert_eq!(
         std::fs::read_to_string(dst_root.join("src/a.txt")).unwrap(),
         "clash-edit\n"
+    );
+    assert!(!dst_root.join("docs").exists());
+    let verify = sc(&dst_root, &["verify"]);
+    assert!(verify.status.success(), "{}", stderr(&verify));
+
+    std::fs::remove_dir_all(&src_root).unwrap();
+    std::fs::remove_dir_all(&dst_root).unwrap();
+}
+
+/// P37c-iv: cherry-pick and rebase work on a partial clone, and a conflict in
+/// the view stops them with markers that `sc conflicts` and `sc resolve` find.
+#[test]
+fn cherry_pick_and_rebase_work_on_a_partial_clone() {
+    let (src_root, dst_root) = make_partial_clone("replay");
+    // Two branches off the first commit, each editing the same line.
+    assert!(sc(&dst_root, &["branch", "side"]).status.success());
+    assert!(sc(&dst_root, &["switch", "side"]).status.success());
+    std::fs::write(dst_root.join("src/a.txt"), "side-edit\n").unwrap();
+    assert!(sc(&dst_root, &["commit", "-m", "side"]).status.success());
+    assert!(sc(&dst_root, &["switch", "main"]).status.success());
+    std::fs::write(dst_root.join("src/a.txt"), "main-edit\n").unwrap();
+    assert!(sc(&dst_root, &["commit", "-m", "main"]).status.success());
+
+    let pick = sc(&dst_root, &["cherry-pick", "side"]);
+    assert!(!pick.status.success(), "a conflicting pick exits nonzero");
+    assert!(
+        !stderr(&pick).contains("partial clone"),
+        "not refused as unsupported: {}",
+        stderr(&pick)
+    );
+    assert!(std::fs::read_to_string(dst_root.join("src/a.txt"))
+        .unwrap()
+        .contains("<<<<<<<"));
+    assert!(
+        !dst_root.join("docs").exists(),
+        "docs/ stays out of the view"
+    );
+    let listed = sc(&dst_root, &["conflicts"]);
+    assert!(stdout(&listed).contains("src/a.txt"), "{}", stdout(&listed));
+    assert!(sc(&dst_root, &["cherry-pick", "--abort"]).status.success());
+    assert_eq!(
+        std::fs::read_to_string(dst_root.join("src/a.txt")).unwrap(),
+        "main-edit\n"
+    );
+
+    let rebase = sc(&dst_root, &["rebase", "side"]);
+    assert!(!rebase.status.success(), "a conflicting rebase stops");
+    assert!(
+        !stderr(&rebase).contains("partial clone"),
+        "not refused as unsupported: {}",
+        stderr(&rebase)
+    );
+    let resolved = sc(&dst_root, &["resolve", "--theirs", "src/a.txt"]);
+    assert!(resolved.status.success(), "{}", stderr(&resolved));
+    let cont = sc(&dst_root, &["rebase", "--continue"]);
+    assert!(cont.status.success(), "{}", stderr(&cont));
+    assert_eq!(
+        std::fs::read_to_string(dst_root.join("src/a.txt")).unwrap(),
+        "main-edit\n"
     );
     assert!(!dst_root.join("docs").exists());
     let verify = sc(&dst_root, &["verify"]);

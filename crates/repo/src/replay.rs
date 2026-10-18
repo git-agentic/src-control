@@ -83,6 +83,10 @@ pub(crate) enum ReplayOutcome {
         files: Vec<MergedFile>,
         sidecars: Vec<(String, Vec<u8>)>,
         paths: Vec<String>,
+        /// Subtrees a partial clone's merge carried by id instead of reading
+        /// (ADR-0049 decision 10). They ride into the decided root. Empty on
+        /// a full clone.
+        carried: Vec<(String, scl_core::TreeEntry)>,
     },
 }
 
@@ -166,19 +170,6 @@ pub(crate) fn replay_commit(
             ),
         ));
     }
-    // Merge/pick completion guard (P27 Task 5, T5-I4): `three_way_files`
-    // below flattens the full base/onto/theirs trees; on a partial clone
-    // that would touch content this clone never fetched (out-of-filter),
-    // silently surfacing as a raw `NotFound` from deep inside the flatten.
-    // Refuse explicitly here instead — one choke point for both cherry-pick
-    // and rebase's fold, which both replay through this function — pointing
-    // at `sc backfill` rather than a confusing corruption-shaped error.
-    if repo.promisor()?.is_some() {
-        return Err(crate::promisor::partial_clone_unsupported(
-            "cherry-pick/rebase replay",
-        ));
-    }
-
     let (onto_root, onto_prot) = onto;
     let base_snap = match base_override.or_else(|| snap.parents.first().copied()) {
         Some(p) => Some(repo.snapshot(&p)?),
@@ -187,23 +178,54 @@ pub(crate) fn replay_commit(
     let theirs_root = snap.root;
     let theirs_prot = &snap.protection;
 
-    let fm = {
-        let store_arc = repo.vfs().store();
-        let mut store = store_arc.lock().unwrap();
-        merge::three_way_files(
-            &mut store,
-            base_snap.as_ref().map(|b| (b.root, &b.protection)),
+    // A partial clone cannot flatten the trees: it merges tree by tree
+    // (ADR-0049), filling what it must read outside the store lock and
+    // carrying the rest by id. A full clone keeps the flatten merge.
+    let base_arg = base_snap.as_ref().map(|b| (b.root, &b.protection));
+    let (fm, tree_carried) = if repo.promisor()?.is_some() {
+        let (done, _fill) = repo.tree_merge_filled(
+            base_arg,
             (onto_root, onto_prot),
             (theirs_root, theirs_prot),
             identity,
-        )?
+        )?;
+        let no_base = Protection::default();
+        let wrapped_carry = done.merged_wraps(
+            onto_prot,
+            theirs_prot,
+            base_snap.as_ref().map_or(&no_base, |b| &b.protection),
+        );
+        let carried_any = done.carried_any();
+        let mut fm = done.merge;
+        fm.wrapped_carry = wrapped_carry;
+        (fm, Some((done.carried, carried_any)))
+    } else {
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let fm = merge::three_way_files(
+            &mut store,
+            base_arg,
+            (onto_root, onto_prot),
+            (theirs_root, theirs_prot),
+            identity,
+        )?;
+        (fm, None)
     };
 
     if !fm.conflicts.is_empty() {
+        let carried = match tree_carried {
+            Some((crate::merge_tree::Carried::Entries(entries), _)) => entries,
+            Some((crate::merge_tree::Carried::Root(_), _)) => {
+                debug_assert!(false, "a carried root leaves no conflict");
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
         return Ok(ReplayOutcome::Conflicts {
             files: fm.files,
             sidecars: fm.sidecars,
             paths: fm.conflicts,
+            carried,
         });
     }
 
@@ -221,7 +243,13 @@ pub(crate) fn replay_commit(
     let (mut all, to_encrypt) = split_for_encryption(&fm.files, &union_prot)?;
     let (encrypted, fresh_wrapped) = protect::encrypt_protected(to_encrypt)?;
     all.extend(encrypted);
-    let root = repo.vfs().write_tree_with_perms(&all)?;
+    let root = match &tree_carried {
+        Some((crate::merge_tree::Carried::Root(id), _)) => *id,
+        Some((crate::merge_tree::Carried::Entries(entries), _)) => {
+            repo.vfs().write_tree_with_carried(&all, entries)?
+        }
+        None => repo.vfs().write_tree_with_perms(&all)?,
+    };
 
     // Empty (P15 Task 9 extension): a tree-equal replay is a genuine no-op
     // only when this commit's own protection-prefix rules are ALSO
@@ -251,7 +279,9 @@ pub(crate) fn replay_commit(
         *entry = protect::union_wraps(entry, &wks);
     }
     protect::reuse_prior_wraps(&mut wrapped, &onto_prot.wrapped);
-    {
+    // Not when a subtree was carried: its blobs were never enumerated, so a
+    // prune would drop their wraps for good (ADR-0049 decision 4).
+    if !tree_carried.as_ref().is_some_and(|(_, any)| *any) {
         let store_arc = repo.vfs().store();
         let mut store = store_arc.lock().unwrap();
         let reachable: std::collections::BTreeSet<ObjectId> =
@@ -473,6 +503,10 @@ impl Repo {
                 )?;
                 // Cache hoisted above the block so its save follows the ref
                 // move below, matching commit/amend's discipline (P33 Task 7).
+                // The picked tree may carry a subtree that is absent inside
+                // the view: fill its closure before any ref, spec or file
+                // write (lazy partial clones only), outside the store lock.
+                self.ensure_view(root, &self.sparse_spec()?)?;
                 let mut cache = self.open_protected_cache()?;
                 {
                     let store_arc = self.vfs().store();
@@ -480,7 +514,6 @@ impl Repo {
                     // Protection-aware materialize: a PROTECTED entry decrypts
                     // for `identity` when possible, else is skipped (never
                     // writes ciphertext to disk) — same as merge's clean path.
-                    // ensure-view-exempt: replay is refused on partial clones
                     worktree::materialize(
                         &self.layout,
                         &mut store,
@@ -507,6 +540,7 @@ impl Repo {
                 files,
                 sidecars,
                 paths,
+                carried: carried_subtrees,
             } => {
                 // Conflicted pick (P15 Task 7) — same worktree-direct-write
                 // restructure as `Repo::merge_with_identity`'s conflict path
@@ -546,7 +580,7 @@ impl Repo {
                 };
                 let conflict_root = self.materialize_conflict_state(
                     &carried,
-                    &[],
+                    &carried_subtrees,
                     &to_encrypt,
                     &sidecars,
                     &conflict_prot,
@@ -593,20 +627,25 @@ impl Repo {
                 "no cherry-pick in progress — nothing to abort".into(),
             ));
         }
-        for path in crate::pick_state::read_conflicts(&self.layout)? {
-            let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
-        }
         let decided = crate::pick_state::read_decided_root(&self.layout)?;
         let ours_tip = self.head_tip()?;
         let mut skipped = Vec::new();
+        let mut sidecar_roots: Vec<ObjectId> = Vec::new();
         if let Some(tip) = ours_tip {
             let snap = self.snapshot(&tip)?;
+            sidecar_roots.push(snap.root);
+            if let Some(picked) = crate::pick_state::read_pick_head(&self.layout)? {
+                sidecar_roots.push(self.snapshot(&picked)?.root);
+            }
+            // Fill the view's closure first (lazy partial clones only),
+            // before anything is removed: a view gap must leave the stopped
+            // pick intact and retryable (ADR-0049 decision 10).
+            self.ensure_view(snap.root, &self.sparse_spec()?)?;
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
             // No identity at abort time: nothing is decrypted, so `materialize`
             // records nothing — pass `None`, no cache to open or save
             // (P33 Task 7 item 7).
-            // ensure-view-exempt: replay is refused on partial clones
             skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -618,6 +657,10 @@ impl Repo {
                 None,
             )?;
         }
+        self.remove_conflict_sidecars(
+            &crate::pick_state::read_conflicts(&self.layout)?,
+            &sidecar_roots,
+        )?;
         crate::pick_state::clear(&self.layout)?;
         Ok(skipped)
     }
@@ -938,6 +981,7 @@ impl Repo {
                     files,
                     sidecars,
                     paths,
+                    carried: carried_subtrees,
                 } => {
                     // Stop, don't abort (P19/ADR-0029): persist the fold's
                     // progress and put P4 markers in the working tree. The
@@ -968,7 +1012,7 @@ impl Repo {
                     };
                     let conflict_root = self.materialize_conflict_state(
                         &carried,
-                        &[],
+                        &carried_subtrees,
                         &to_encrypt,
                         &sidecars,
                         &conflict_prot,
@@ -1012,6 +1056,10 @@ impl Repo {
             }
         }
 
+        // The accumulated tree may carry a subtree that is absent inside the
+        // view: fill its closure before any ref, spec or file write (lazy
+        // partial clones only), outside the store lock.
+        self.ensure_view(acc_root, &self.sparse_spec()?)?;
         // Cache hoisted above the block so its save follows the ref move
         // below, matching commit/amend's discipline (P33 Task 7).
         let mut cache = self.open_protected_cache()?;
@@ -1022,7 +1070,6 @@ impl Repo {
             // (each step pruned its wrap map to its own merged tree): a
             // PROTECTED entry decrypts for `identity` when possible, else is
             // skipped — never writes ciphertext to disk.
-            // ensure-view-exempt: replay is refused on partial clones
             worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1165,9 +1212,17 @@ impl Repo {
             // `merge_abort`'s cleanup): once resolved, they're pure
             // working-tree litter — never part of the tracked tree, so
             // `materialize` never touches them itself.
-            for path in crate::rebase_state::read_conflicts(&self.layout)? {
-                let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
-            }
+            // Not a file any of the trees involved tracks (that one is the
+            // user's own): see `remove_conflict_sidecars`.
+            let roots = [
+                self.snapshot(&st.acc_tip)?.root,
+                self.snapshot(&st.conflicted)?.root,
+                self.snapshot(&new_tip)?.root,
+            ];
+            self.remove_conflict_sidecars(
+                &crate::rebase_state::read_conflicts(&self.layout)?,
+                &roots,
+            )?;
             // Advance state BEFORE attempting the fold, so an error from the
             // fold below (on a later commit) leaves a retryable, idempotent
             // `--continue` rather than losing resumability. `rebase_abort`
@@ -1220,9 +1275,6 @@ impl Repo {
                 "no rebase in progress — nothing to abort".into(),
             ));
         };
-        for path in crate::rebase_state::read_conflicts(&self.layout)? {
-            let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
-        }
         // The stop's own conflict-materialize wrote `REBASE_DECIDED_ROOT`
         // (`conflict_root` in `rebase_fold_and_finish`'s Conflicts arm) to
         // disk as the tree the working tree currently, actually reflects —
@@ -1234,13 +1286,16 @@ impl Repo {
         // where the decided root is unexpectedly absent.
         let decided = crate::rebase_state::read_decided_root(&self.layout)?;
         let snap = self.snapshot(&st.original_tip)?;
+        // Fill the view's closure first (lazy partial clones only), before
+        // anything is removed: a view gap must leave the stopped rebase
+        // intact and retryable (ADR-0049 decision 10).
+        self.ensure_view(snap.root, &self.sparse_spec()?)?;
         let skipped = {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
             // No identity at abort time: nothing is decrypted, so `materialize`
             // records nothing — pass `None`, no cache to open or save
             // (P33 Task 7 item 7).
-            // ensure-view-exempt: replay is refused on partial clones
             worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1252,6 +1307,12 @@ impl Repo {
                 None,
             )?
         };
+        let roots = [
+            snap.root,
+            self.snapshot(&st.conflicted)?.root,
+            self.snapshot(&st.acc_tip)?.root,
+        ];
+        self.remove_conflict_sidecars(&crate::rebase_state::read_conflicts(&self.layout)?, &roots)?;
         crate::rebase_state::clear(&self.layout)?;
         Ok(skipped)
     }
