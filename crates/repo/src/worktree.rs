@@ -162,7 +162,23 @@ pub(crate) fn tree_file_entries_with_perms_sparse(
         return tree_file_entries_with_perms(store, root);
     }
     let mut out = BTreeMap::new();
-    walk_entries_with_perms_sparse(store, root, String::new(), sparse, &mut out)?;
+    walk_entries_with_perms_sparse(store, root, String::new(), sparse, &mut out, false)?;
+    Ok(out)
+}
+
+/// [`tree_file_entries_with_perms_sparse`] that skips a tree the store lacks
+/// instead of failing. For a parent read only as a fallback on a partial clone
+/// (ADR-0049 merge completion): a subtree it does not hold lies where the
+/// decided root already decided, and is never the only record of a path.
+pub(crate) fn tree_file_entries_with_perms_sparse_present(
+    store: &mut Store,
+    root: ObjectId,
+    sparse: &Sparse,
+) -> Result<BTreeMap<String, (ObjectId, FileMode, u8)>> {
+    let mut out = BTreeMap::new();
+    if store.contains(&root) {
+        walk_entries_with_perms_sparse(store, root, String::new(), sparse, &mut out, true)?;
+    }
     Ok(out)
 }
 
@@ -172,6 +188,7 @@ fn walk_entries_with_perms_sparse(
     prefix: String,
     sparse: &Sparse,
     out: &mut BTreeMap<String, (ObjectId, FileMode, u8)>,
+    skip_absent: bool,
 ) -> Result<()> {
     let tree: Tree = store.get_tree(&tree_id)?;
     for e in tree.entries {
@@ -187,8 +204,8 @@ fn walk_entries_with_perms_sparse(
                 }
             }
             EntryKind::Tree => {
-                if sparse.should_descend(&path) {
-                    walk_entries_with_perms_sparse(store, e.id, path, sparse, out)?;
+                if sparse.should_descend(&path) && (!skip_absent || store.contains(&e.id)) {
+                    walk_entries_with_perms_sparse(store, e.id, path, sparse, out, skip_absent)?;
                 }
             }
         }
@@ -305,9 +322,16 @@ pub(crate) fn graft_out_of_sparse(
         // An ancestor directory: some deeper prefix is in-sparse, so recurse
         // rather than grafting the whole thing whole.
         if pe.kind != EntryKind::Tree {
-            // A file sitting where the sparse spec expects a descendable
-            // directory (a genuinely malformed/unexpected shape) — leave
-            // whatever the built side already decided.
+            // A file where the sparse spec expects a descendable directory
+            // (a merge can swap a directory for a file, ADR-0049). A file
+            // that does not match the view is out of it, so it is grafted by
+            // id like any other out-of-sparse entry; dropping it would lose
+            // the path. Content the built side holds under the same name is
+            // refused for the same reason as above.
+            if by_name.contains_key(&pe.name) {
+                return Err(Error::GappedPathContent(path));
+            }
+            by_name.insert(pe.name.clone(), pe);
             continue;
         }
         let child_built_id = match by_name.get(&pe.name) {
@@ -982,6 +1006,41 @@ mod tests {
 
         drop(store);
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    /// A merge can swap a directory for a file. When the file lies outside a
+    /// view whose prefixes sit below it, the graft must carry it by id, not
+    /// skip it as a malformed ancestor (ADR-0049 decision 8).
+    #[test]
+    fn graft_carries_an_out_of_view_file_standing_where_a_directory_was() {
+        let (layout, mut store) = tmp_objects("graft-dir-to-file");
+        let file = |store: &mut Store, name: &str, bytes: &[u8]| TreeEntry {
+            name: name.into(),
+            kind: EntryKind::Blob,
+            id: store.put(Object::blob(bytes.to_vec())).unwrap(),
+            mode: FileMode::FILE,
+            perms: 0,
+        };
+        let other = file(&mut store, "other.txt", b"o");
+        // The decided tree replaced directory `src/` with the file `src`.
+        let src_file = file(&mut store, "src", b"now a file");
+        let parent = store
+            .put(Object::Tree(Tree::new(vec![
+                other.clone(),
+                src_file.clone(),
+            ])))
+            .unwrap();
+        // The built side comes from the view: only `other.txt` survives.
+        let built = store
+            .put(Object::Tree(Tree::new(vec![other.clone()])))
+            .unwrap();
+        let sparse = Sparse::new(vec!["src/a.txt".into(), "other.txt".into()]);
+        let promisor = crate::promisor::Promisor::new("origin", vec!["src/a.txt".into()]);
+        let out = graft_out_of_sparse(&mut store, built, parent, &sparse, &promisor, "").unwrap();
+        let tree = store.get_tree(&out).unwrap();
+        assert_eq!(tree.get("src").map(|e| e.id), Some(src_file.id));
+        assert_eq!(tree.get("other.txt").map(|e| e.id), Some(other.id));
+        let _ = std::fs::remove_dir_all(&layout.root);
     }
 
     #[test]

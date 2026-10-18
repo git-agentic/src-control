@@ -171,13 +171,25 @@ impl Repo {
         path: &str,
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<ConflictVersions> {
+        self.versions_impl(path, identity, true)
+    }
+
+    /// [`Repo::conflict_versions`], optionally leaving the base side
+    /// `Absent` unread. `resolve` takes ours or theirs and never needs the
+    /// base, which a partial clone may not hold.
+    fn versions_impl(
+        &self,
+        path: &str,
+        identity: Option<&scl_crypto::SecretKey>,
+        with_base: bool,
+    ) -> Result<ConflictVersions> {
         let triple = self.op_triple()?;
         let partial = self.promisor()?.is_some();
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         let base = match triple.base {
-            Some(id) => side_for(&mut store, id, identity, path, partial)?,
-            None => Side::Absent,
+            Some(id) if with_base => side_for(&mut store, id, identity, path, partial)?,
+            _ => Side::Absent,
         };
         let ours = side_for(&mut store, triple.ours, identity, path, partial)?;
         let theirs = side_for(&mut store, triple.theirs, identity, path, partial)?;
@@ -219,7 +231,7 @@ impl Repo {
             )));
         }
 
-        let versions = self.conflict_versions(path, identity)?;
+        let versions = self.versions_impl(path, identity, false)?;
         let chosen = match side {
             ResolveSide::Ours => versions.ours,
             ResolveSide::Theirs => versions.theirs,

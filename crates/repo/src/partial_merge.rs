@@ -369,6 +369,30 @@ fn an_abort_that_hits_a_view_gap_changes_nothing() {
     fx.cleanup();
 }
 
+/// A file the user tracks under the name of a sidecar (`a.txt.theirs`) is not
+/// this system's scratch: abort restores it and must not delete it.
+#[test]
+fn abort_keeps_a_tracked_file_that_is_named_like_a_sidecar() {
+    let fx = Fx::origin("abort-tracked", |root| {
+        std::fs::write(root.join("src/a.txt.theirs"), b"mine\n").unwrap();
+    });
+    fx.origin_branch("b1", &[("src/a.txt", b"ONE\ntwo\nthree\n")]);
+    let clone = fx.clone(false);
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    clone.merge_abort().unwrap();
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/a.txt.theirs")).unwrap(),
+        b"mine\n",
+        "the tracked file survives the abort"
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
 /// A conflict outside the view is refused before any write, with the widen
 /// hint; nothing is marked and no state is recorded.
 #[test]
@@ -692,6 +716,167 @@ fn a_conflict_with_sealing_outside_the_view_is_refused_before_any_write() {
         on_disk
     );
     assert!(!fx.clone_root.join("vault").exists());
+    drop(clone);
+    fx.cleanup();
+}
+
+/// Out-of-view entries the merge READ and resolved cleanly (both sides edited
+/// different `docs/` files) ride through a conflicted completion too: the
+/// decided root holds enumerated entries there, not just carried subtrees, and
+/// the graft must put them all back. Same tree as the full merge.
+#[test]
+fn a_conflict_completion_grafts_enumerated_out_of_view_entries() {
+    let fx = Fx::origin("conflict-enum", |_| {});
+    fx.origin_branch(
+        "o",
+        &[("src/a.txt", b"uno\ntwo\nthree\n"), ("docs/b.md", b"b2\n")],
+    );
+    fx.origin_branch(
+        "b1",
+        &[("src/a.txt", b"ONE\ntwo\nthree\n"), ("docs/a.md", b"a1\n")],
+    );
+    let expect = full_merge_root(
+        &fx,
+        "b1",
+        &[("src/a.txt", b"uno\ntwo\nthree\n"), ("docs/b.md", b"b2\n")],
+        &["src/a.txt"],
+    );
+    let clone = fx.clone(true);
+    clone.merge("origin/o", "t").unwrap(); // fast-forward
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    assert!(!fx.clone_root.join("docs").exists());
+    clone
+        .resolve_path("src/a.txt", crate::conflicts::ResolveSide::Ours, None)
+        .unwrap();
+    let merged = clone.commit("t", "merge").unwrap();
+    assert_eq!(clone.snapshot(&merged).unwrap().root, expect);
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A carried subtree that lies inside the view is filled before the conflict
+/// is laid out: its file reaches the disk next to the markers.
+#[test]
+fn a_conflict_fills_a_carried_subtree_inside_the_view() {
+    let fx = Fx::origin("conflict-view", |_| {});
+    fx.origin_branch(
+        "b1",
+        &[
+            ("src/a.txt", b"ONE\ntwo\nthree\n"),
+            ("docs/api/guide.md", b"g changed\n"),
+        ],
+    );
+    let clone = fx.clone(true);
+    clone
+        .set_sparse(&["src/".to_string(), "docs/".to_string()], None)
+        .unwrap();
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("docs/api/guide.md")).unwrap(),
+        b"g changed\n",
+        "the carried subtree was filled and laid out"
+    );
+    clone.merge_abort().unwrap();
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("docs/api/guide.md")).unwrap(),
+        b"g\n",
+        "abort puts the view back"
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A protected path in the view conflicts: the markers are plaintext on disk
+/// only, resolution and completion seal the result for the recipient, and no
+/// plaintext reaches the store.
+#[test]
+fn a_protected_conflict_in_the_view_seals_at_completion() {
+    let (sk, pk) = scl_crypto::generate_keypair();
+    let fx = protected_origin("conflict-protected", &pk);
+    fx.origin_branch("b1", &[("vault/s.txt", b"X\nl2\nl3\n")]);
+    fx.origin_branch("b2", &[("vault/s.txt", b"Y\nl2\nl3\n")]);
+    let clone = fx.clone(true);
+    clone
+        .set_sparse(&["src/".to_string(), "vault/".to_string()], Some(&sk))
+        .unwrap();
+    clone
+        .merge_with_identity("origin/b1", "t", Some(&sk))
+        .unwrap(); // fast-forward
+    let err = clone
+        .merge_with_identity("origin/b2", "t", Some(&sk))
+        .unwrap_err();
+    assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+    let marked = std::fs::read(fx.clone_root.join("vault/s.txt")).unwrap();
+    assert!(String::from_utf8_lossy(&marked).contains("<<<<<<<"));
+    assert!(
+        !has(&clone, &blob_id(&marked)),
+        "marker plaintext never reaches the store"
+    );
+
+    clone
+        .resolve_path(
+            "vault/s.txt",
+            crate::conflicts::ResolveSide::Ours,
+            Some(&sk),
+        )
+        .unwrap();
+    let merged = clone.commit("t", "merge").unwrap();
+    let snap = clone.snapshot(&merged).unwrap();
+    let arc = clone.vfs().store();
+    let mut s = arc.lock().unwrap();
+    let vault = s.get_tree(&snap.root).unwrap().get("vault").unwrap().id;
+    let entry = s.get_tree(&vault).unwrap().get("s.txt").unwrap().clone();
+    assert_ne!(entry.perms & scl_core::PROTECTED, 0, "sealed again");
+    let sealed = match s.get(&entry.id).unwrap() {
+        Object::Blob(b) => b,
+        other => panic!("expected a blob, got {}", other.kind_name()),
+    };
+    let plain =
+        crate::protect::decrypt_with(&sealed, &entry.id, &[&snap.protection], &sk, "vault/s.txt")
+            .unwrap();
+    assert_eq!(&plain[..], b"X\nl2\nl3\n");
+    assert!(
+        !s.contains(&blob_id(b"X\nl2\nl3\n")),
+        "no plaintext in the CAS"
+    );
+    drop(s);
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A binary conflict writes `<path>.theirs` beside the file. When the view is
+/// the file itself the sidecar falls outside it, so the merge is refused before
+/// any write instead of leaving plaintext where completion does not look.
+#[test]
+fn a_sidecar_outside_the_view_is_refused_before_any_write() {
+    let fx = Fx::origin("sidecar-out", |_| {});
+    fx.origin_branch("b1", &[("src/a.txt", b"\xff\xfeTHEIRS\n")]);
+    let clone = fx.clone(false);
+    clone.set_sparse(&["src/a.txt".to_string()], None).unwrap();
+    clone_edit_src(&fx, &clone, b"\xff\xfeOURS\n");
+    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    let err = clone.merge("origin/b1", "t").unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidArgument(m) if m.contains("sidecar")),
+        "got {err:?}"
+    );
+    assert!(!clone.merge_in_progress());
+    assert!(!fx.clone_root.join("src/a.txt.theirs").exists());
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
+        b"\xff\xfeOURS\n"
+    );
     drop(clone);
     fx.cleanup();
 }

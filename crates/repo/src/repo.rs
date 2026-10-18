@@ -613,7 +613,14 @@ impl Repo {
             for parent in tip.into_iter().chain(merge_head) {
                 let parent_root = store.get_snapshot(&parent)?.root;
                 let mut entries = if partial {
-                    worktree::tree_file_entries_with_perms_sparse(&mut store, parent_root, sparse)?
+                    // A parent is only a fallback behind the decided root
+                    // (merge completion); a subtree it lacks was never the
+                    // only record of a path, so skip it, not fail.
+                    worktree::tree_file_entries_with_perms_sparse_present(
+                        &mut store,
+                        parent_root,
+                        sparse,
+                    )?
                 } else {
                     worktree::tree_file_entries_with_perms(&mut store, parent_root)?
                 };
@@ -1708,6 +1715,17 @@ impl Repo {
                 )));
             }
         }
+        // A sidecar is plaintext written beside a conflicted file. Outside the
+        // view it would sit where completion neither expects nor protects it,
+        // and a later commit would read it back as a plain file.
+        if self.promisor()?.is_some() {
+            if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !sparse.matches(r)) {
+                return Err(Error::InvalidArgument(format!(
+                    "merge has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
+                     run `sc sparse set` to include it, or `sc backfill --all`, then retry"
+                )));
+            }
+        }
         let conflict_root = if carried_subtrees.is_empty() {
             self.vfs.write_tree_with_perms(carried)?
         } else {
@@ -1783,6 +1801,16 @@ impl Repo {
         // the deletion pass drops files the conflicted merge pulled in from
         // theirs; materializing against ours==old would delete nothing.
         let mut skipped = Vec::new();
+        // Sidecars (`<path>.theirs`) this abort may remove: not a file either
+        // side tracks, which would be the user's own and was just restored.
+        // A lookup that fails is treated as tracked: a stray sidecar is
+        // harmless, deleting a tracked file is not.
+        let mut removable: Vec<String> = Vec::new();
+        let partial = self.promisor()?.is_some();
+        let sidecars = crate::merge_state::read_conflicts(&self.layout)?
+            .into_iter()
+            .map(|p| format!("{p}.theirs"))
+            .collect::<Vec<_>>();
         let ours_tip = self.head_tip()?;
         if let Some(ours_id) = ours_tip {
             let store_arc = self.vfs.store();
@@ -1791,6 +1819,15 @@ impl Repo {
             let ours_root = ours_snap.root;
             let ours_protection = ours_snap.protection;
             let theirs_root = store.get_snapshot(&theirs_id)?.root;
+            for sidecar in sidecars {
+                let tracked = [ours_root, theirs_root].iter().any(|root| {
+                    worktree::tree_entry_at(&mut store, *root, &sidecar, partial)
+                        .map_or(true, |e| e.is_some())
+                });
+                if !tracked {
+                    removable.push(sidecar);
+                }
+            }
             // No identity at abort time: protected files in ours are skipped
             // (not decrypted). With nothing decrypted, `materialize` records
             // nothing into a cache, so pass `None` — no cache to open or save
@@ -1806,10 +1843,11 @@ impl Repo {
                 &self.sparse_spec()?,
                 None,
             )?;
+        } else {
+            removable = sidecars;
         }
-        // Remove any .theirs sidecars recorded as conflicts.
-        for path in crate::merge_state::read_conflicts(&self.layout)? {
-            let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
+        for sidecar in removable {
+            let _ = std::fs::remove_file(self.layout.root.join(sidecar));
         }
         crate::merge_state::clear(&self.layout)?;
         Ok(skipped)
