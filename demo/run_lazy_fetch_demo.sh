@@ -196,4 +196,47 @@ cmp "$MFULL/docs/api/big.bin" "$W/feature-big.bin" || fail "the merge must carry
 echo "push + full re-clone: merged result has both sides, docs byte-identical ✔"
 
 echo
-echo "RESULT: lazy by-id fetch verified (path-only fetch, offline/non-lazy gap errors, http v5, widen/commit/push/undo, merge)"
+echo "=== 10: a conflict inside the view resolves and completes without the other side's region (ADR-0049) ==="
+CORIGIN="$W/corigin"
+mkdir -p "$CORIGIN"
+(
+  cd "$CORIGIN"
+  "$SC" init >/dev/null
+  mkdir -p src docs/api
+  printf 'one\ntwo\nthree\n' > src/a.txt
+  printf 'guide\n' > docs/api/guide.md
+  head -c 65536 /dev/urandom | od -An -tx1 | tr -d ' \n' > docs/api/big.bin
+  "$SC" commit -m "base" --author demo >/dev/null
+  "$SC" branch feature
+  "$SC" switch feature >/dev/null
+  printf 'ONE\ntwo\nthree\n' > src/a.txt
+  head -c 65536 /dev/urandom | od -An -tx1 | tr -d ' \n' > docs/api/big.bin
+  cp docs/api/big.bin "$W/conflict-feature-big.bin"
+  "$SC" commit -m "feature edits src and docs" --author demo >/dev/null
+  "$SC" switch main >/dev/null
+)
+CONFLICT="$W/conflict"
+"$SC" clone --filter src/ --lazy "$CORIGIN" "$CONFLICT" >/dev/null
+printf 'uno\ntwo\nthree\n' > "$CONFLICT/src/a.txt"
+(cd "$CONFLICT" && "$SC" commit -m "local src edit" --author demo >/dev/null && "$SC" fetch origin >/dev/null)
+CBEFORE=$(objects "$CONFLICT")
+if (cd "$CONFLICT" && "$SC" merge origin/feature --author demo >/dev/null 2>&1); then
+  fail "a conflicting merge must stop for resolution"
+fi
+grep -q '<<<<<<<' "$CONFLICT/src/a.txt" || fail "markers must be written in the view"
+[ ! -e "$CONFLICT/docs" ] || fail "docs/ is outside the view and must not be written"
+(cd "$CONFLICT" && "$SC" conflicts | grep -q 'src/a.txt') || fail "sc conflicts must list the path"
+(cd "$CONFLICT" && "$SC" resolve --ours src/a.txt >/dev/null) || fail "sc resolve must work on a partial clone"
+(cd "$CONFLICT" && "$SC" commit -m "merge feature" --author demo >/dev/null) || fail "completing the merge must work"
+CAFTER=$(objects "$CONFLICT")
+[ "$(($CAFTER - $CBEFORE))" -le 6 ] || fail "a conflict in the view must not fetch the other side's region ($CBEFORE -> $CAFTER)"
+echo "conflict in src/ resolved and committed, docs/ unwritten and unfetched ($CBEFORE -> $CAFTER objects) ✔"
+(cd "$CONFLICT" && "$SC" push origin >/dev/null) || fail "pushing the merge must work"
+CFULL="$W/conflict-full"
+"$SC" clone "$CORIGIN" "$CFULL" >/dev/null
+[ "$(cat "$CFULL/src/a.txt")" = "$(printf 'uno\ntwo\nthree')" ] || fail "the resolution must be the merged result"
+cmp "$CFULL/docs/api/big.bin" "$W/conflict-feature-big.bin" || fail "feature's docs blob must be carried byte-identical"
+echo "push + full re-clone: resolution and carried docs both present ✔"
+
+echo
+echo "RESULT: lazy by-id fetch verified (path-only fetch, offline/non-lazy gap errors, http v5, widen/commit/push/undo, merge, conflict)"

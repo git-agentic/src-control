@@ -407,7 +407,14 @@ impl Repo {
         // Refuse loudly instead of ever letting that happen; a clean
         // (non-conflicted) pick/rebase fold still has `decided_root: None`
         // and keeps using the single-tip graft path, unaffected.
-        if partial && (decided_root.is_some() || merge_head.is_some()) {
+        //
+        // A conflicted MERGE completion is the exception (ADR-0049 decision
+        // 8): the conflict recorded a decided root holding the merge's whole
+        // outcome, carried subtrees included, so the out-of-view part is
+        // grafted from it below. A merge with no decided root, and every
+        // pick or rebase completion, still refuse.
+        let merge_completion = merge_head.is_some() && decided_root.is_some();
+        if partial && !merge_completion && (decided_root.is_some() || merge_head.is_some()) {
             return Err(crate::promisor::partial_clone_unsupported(
                 "merge/pick completion",
             ));
@@ -664,11 +671,22 @@ impl Repo {
         // for the id-only walk). Scoped to a plain single-tip commit —
         // `decided_root`/`merge_head` both absent — matching the carry
         // block's own documented merge/pick boundary above.
-        if partial && decided_root.is_none() && merge_head.is_none() {
-            if let Some(t) = tip {
+        // A merge completion grafts from the DECIDED root instead of the tip:
+        // it already holds the merge's outcome for everything out of view.
+        let graft_from: Option<ObjectId> = if merge_completion {
+            decided_root
+        } else if decided_root.is_none() && merge_head.is_none() {
+            match tip {
+                Some(t) => Some(self.snapshot(&t)?.root),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if partial {
+            if let Some(parent_root) = graft_from {
                 let store_arc = self.vfs.store();
                 let mut store = store_arc.lock().unwrap();
-                let parent_root = store.get_snapshot(&t)?.root;
                 let p = promisor
                     .as_ref()
                     .expect("partial implies promisor().is_some()");
@@ -1376,14 +1394,6 @@ impl Repo {
                 (theirs_snap.root, &theirs_snap.protection),
                 identity,
             )?;
-            // Conflicts need a state contract this phase does not build
-            // (ADR-0049 decision 8): refuse before any merge output, merge
-            // state or working-tree write.
-            if !done.merge.conflicts.is_empty() {
-                return Err(crate::promisor::partial_clone_unsupported(
-                    "a merge with conflicts",
-                ));
-            }
             let wrapped_carry = done.merged_wraps(
                 &ours_snap.protection,
                 &theirs_snap.protection,
@@ -1485,8 +1495,20 @@ impl Repo {
                 prefixes: union_prefixes,
                 wrapped: merge_result.wrapped_carry.clone(),
             };
+            // A partial clone's carried subtrees ride into the decided root
+            // by id (ADR-0049 decision 8). A carried root cannot coexist with
+            // a conflict: it means the three roots agreed.
+            let carried_subtrees: &[(String, scl_core::TreeEntry)] = match &tree_carried {
+                Some((crate::merge_tree::Carried::Entries(entries), _)) => entries,
+                Some((crate::merge_tree::Carried::Root(_), _)) => {
+                    debug_assert!(false, "a carried root leaves no conflict");
+                    &[]
+                }
+                None => &[],
+            };
             let conflict_root = self.materialize_conflict_state(
                 &carried,
+                carried_subtrees,
                 &to_encrypt,
                 &merge_result.sidecars,
                 &conflict_prot,
@@ -1651,6 +1673,7 @@ impl Repo {
     pub(crate) fn materialize_conflict_state(
         &self,
         carried: &[(String, Vec<u8>, scl_core::FileMode, u8)],
+        carried_subtrees: &[(String, scl_core::TreeEntry)],
         to_encrypt: &[(String, Vec<u8>, scl_core::FileMode, Vec<[u8; 32]>)],
         sidecars: &[(String, Vec<u8>)],
         conflict_prot: &scl_core::Protection,
@@ -1673,7 +1696,28 @@ impl Repo {
                 "conflict in {names} is outside your sparse checkout; run `sc sparse set` to include it, then retry"
             )));
         }
-        let conflict_root = self.vfs.write_tree_with_perms(carried)?;
+        // A partial clone completes from its view alone, so plaintext that
+        // must be sealed at completion has to sit inside the view (ADR-0049
+        // decision 8). A full clone writes it wherever it lies and reads it
+        // back; here it would be left behind and dropped.
+        if self.promisor()?.is_some() {
+            if let Some((path, ..)) = to_encrypt.iter().find(|(p, ..)| !sparse.matches(p)) {
+                return Err(Error::InvalidArgument(format!(
+                    "merge has conflicts, and {path} (outside your sparse checkout) needs sealing at completion; \
+                     run `sc sparse set` to include it, or `sc backfill --all`, then retry"
+                )));
+            }
+        }
+        let conflict_root = if carried_subtrees.is_empty() {
+            self.vfs.write_tree_with_perms(carried)?
+        } else {
+            self.vfs
+                .write_tree_with_carried(carried, carried_subtrees)?
+        };
+        // A carried subtree can sit inside the view: fill its closure before
+        // the first working-tree write (lazy partial clones only), outside
+        // the store lock.
+        self.ensure_view(conflict_root, &sparse)?;
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
@@ -1683,7 +1727,6 @@ impl Repo {
             // skipped content, so nothing is lost by not surfacing the list
             // here (the `Err`/`Stopped` return can't carry it).
             let mut cache = self.open_protected_cache()?;
-            // ensure-view-exempt: conflict materialization; a partial clone refuses conflicts before any write
             let _skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1728,9 +1771,13 @@ impl Repo {
         }
         let theirs_id = crate::merge_state::read_merge_head(&self.layout)?
             .expect("in_progress is true but MERGE_HEAD is absent");
-        // Remove any .theirs sidecars recorded as conflicts.
-        for path in crate::merge_state::read_conflicts(&self.layout)? {
-            let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
+        // Fill the view's closure first (lazy partial clones only), outside
+        // the store lock and before anything is removed: a view gap must
+        // leave the conflicted state intact and retryable (ADR-0049
+        // decision 8). The sidecars go last for the same reason.
+        if let Some(ours_id) = self.head_tip()? {
+            let ours_root = self.snapshot(&ours_id)?.root;
+            self.ensure_view(ours_root, &self.sparse_spec()?)?;
         }
         // Restore working tree to ours tip. Pass theirs' root as `old_root` so
         // the deletion pass drops files the conflicted merge pulled in from
@@ -1748,7 +1795,7 @@ impl Repo {
             // (not decrypted). With nothing decrypted, `materialize` records
             // nothing into a cache, so pass `None` — no cache to open or save
             // (P33 Task 7 item 7).
-            // ensure-view-exempt: merge abort; no merge can be in progress on a partial clone
+            // ensure_view ran above, before the lock and before any removal.
             skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
@@ -1759,6 +1806,10 @@ impl Repo {
                 &self.sparse_spec()?,
                 None,
             )?;
+        }
+        // Remove any .theirs sidecars recorded as conflicts.
+        for path in crate::merge_state::read_conflicts(&self.layout)? {
+            let _ = std::fs::remove_file(self.layout.root.join(format!("{path}.theirs")));
         }
         crate::merge_state::clear(&self.layout)?;
         Ok(skipped)
@@ -6020,20 +6071,25 @@ mod tests {
     }
 
     #[test]
-    fn merge_refuses_on_partial_clone_instead_of_silently_dropping_gaps() {
-        // T5-I4 (mandatory reassignment): a two-parent merge completion on a
-        // partial clone would silently DROP out-of-filter subtrees (the
-        // Task 4 graft is single-tip-scoped). Refuse loudly instead of
-        // relying on an incidental NotFound from deep inside `three_way`.
+    fn conflicting_merge_on_partial_clone_completes_without_dropping_the_gap() {
+        // T5-I4 history: a two-parent merge completion on a partial clone
+        // used to silently DROP out-of-filter subtrees, so it was refused.
+        // Since P37c-iii a conflict inside the view is supported and the
+        // completion grafts the out-of-view part from the decided root: the
+        // never-fetched docs/ subtree must come through by id.
         let (src, src_root, dst, dst_root) =
             tmp_repo_with_src_and_docs_partial("merge-guard-partial");
+        let docs_before = {
+            let tip = dst.head_tip().unwrap().unwrap();
+            let arc = dst.vfs().store();
+            let mut st = arc.lock().unwrap();
+            let root = st.get_snapshot(&tip).unwrap().root;
+            st.get_tree(&root).unwrap().get("docs").unwrap().id
+        };
 
         // Fork a second branch off the initial commit, then diverge both
         // sides so `merge` needs a genuine (non-FF) three-way, not just an
-        // adopt/fast-forward (both of which stay gap-tolerant via
-        // `materialize` and don't need this guard). `switch` between them
-        // (exercising its own P27 Task 5 fix to `materialize`'s old-root
-        // walk, below).
+        // adopt/fast-forward.
         dst.branch("feature").unwrap();
         dst.switch("feature").unwrap();
         std::fs::write(dst_root.join("src/a.txt"), b"feature-side-edit").unwrap();
@@ -6044,16 +6100,19 @@ mod tests {
         dst.commit("t", "main edit").unwrap();
 
         let err = dst.merge_with_identity("feature", "t", None).unwrap_err();
-        assert!(
-            matches!(err, Error::PartialCloneUnsupported(_)),
-            "expected the explicit partial-clone-unsupported refusal, got {err:?}"
-        );
-        assert!(err.to_string().contains("backfill"));
-        assert!(err.to_string().contains("not supported on a partial clone"));
-        assert!(
-            !dst.merge_in_progress(),
-            "the refusal must be a preflight, not a conflict state"
-        );
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+        assert!(dst.merge_in_progress());
+        dst.resolve_path("src/a.txt", crate::conflicts::ResolveSide::Ours, None)
+            .unwrap();
+        let merged = dst.commit("t", "merge feature").unwrap();
+        let docs_after = {
+            let arc = dst.vfs().store();
+            let mut st = arc.lock().unwrap();
+            let root = st.get_snapshot(&merged).unwrap().root;
+            st.get_tree(&root).unwrap().get("docs").unwrap().id
+        };
+        assert_eq!(docs_after, docs_before, "the gap subtree is kept by id");
+        assert!(!dst.merge_in_progress());
 
         drop(src);
         drop(dst);

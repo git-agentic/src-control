@@ -210,19 +210,179 @@ fn differing_region_outside_the_view_fills_when_lazy_and_is_refused_otherwise() 
     fx.cleanup();
 }
 
-/// A conflict is refused before any merge output, state or working-tree write.
+/// The same edits as the clone's conflicting merge, done on a full repo: the
+/// origin commits `ours` on a side branch and merges `theirs` into it. The
+/// result is what a partial clone's completed merge must equal, by tree id.
+fn full_merge_root(
+    fx: &Fx,
+    theirs: &str,
+    ours_edit: &[(&str, &[u8])],
+    resolve: &[&str],
+) -> ObjectId {
+    fx.origin.branch("expect").unwrap();
+    fx.origin.switch("expect").unwrap();
+    for (p, bytes) in ours_edit {
+        std::fs::write(fx.origin_root.join(p), bytes).unwrap();
+    }
+    fx.origin.commit("t", "ours").unwrap();
+    assert!(matches!(
+        fx.origin.merge(theirs, "t").unwrap_err(),
+        Error::MergeConflicts(_)
+    ));
+    for p in resolve {
+        fx.origin
+            .resolve_path(p, crate::conflicts::ResolveSide::Ours, None)
+            .unwrap();
+    }
+    let id = fx.origin.commit("t", "merge").unwrap();
+    let root = fx.origin.snapshot(&id).unwrap().root;
+    fx.origin.switch("main").unwrap();
+    root
+}
+
+/// A conflict inside the view is marked on disk; the subtree only theirs
+/// changed is carried by id and never fetched, on a clone that cannot fetch.
+/// Resolving and committing completes the merge, and the result is the tree a
+/// full clone produces from the same edits (ADR-0049 decision 8).
 #[test]
-fn conflict_on_a_partial_clone_is_refused_before_any_write() {
+fn a_conflict_in_the_view_completes_with_the_carried_subtree_grafted_from_the_decided_root() {
     let fx = Fx::origin("conflict", |_| {});
-    fx.origin_branch("b1", &[("src/a.txt", b"ONE\ntwo\nthree\n")]);
-    fx.origin_branch("b2", &[("src/a.txt", b"uno\ntwo\nthree\n")]);
+    let b1 = fx.origin_branch(
+        "b1",
+        &[
+            ("src/a.txt", b"ONE\ntwo\nthree\n"),
+            ("docs/api/guide.md", b"g changed\n"),
+        ],
+    );
+    let theirs_docs = dir_id(&fx.origin, &b1, "docs");
+    let expect = full_merge_root(
+        &fx,
+        "b1",
+        &[("src/a.txt", b"uno\ntwo\nthree\n")],
+        &["src/a.txt"],
+    );
+    let clone = fx.clone(false);
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    let ours = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    assert!(!has(&clone, &theirs_docs), "premise: theirs' docs is a gap");
+
+    let err = clone.merge("origin/b1", "t").unwrap_err();
+    assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+    assert!(clone.merge_in_progress());
+    assert_eq!(clone.active_conflicts().unwrap(), vec!["src/a.txt"]);
+    let marked = std::fs::read_to_string(fx.clone_root.join("src/a.txt")).unwrap();
+    assert!(marked.contains("<<<<<<<"), "markers on disk: {marked}");
+    assert!(!fx.clone_root.join("docs").exists());
+    assert!(!has(&clone, &theirs_docs), "carried, never fetched");
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        ours,
+        "no ref moved"
+    );
+
+    // `sc conflicts` / `sc resolve` look a path up by descending it.
+    let v = clone.conflict_versions("src/a.txt", None).unwrap();
+    assert!(matches!(&v.ours, crate::conflicts::Side::Present(b) if b == b"uno\ntwo\nthree\n"));
+    assert!(matches!(&v.theirs, crate::conflicts::Side::Present(b) if b == b"ONE\ntwo\nthree\n"));
+    assert!(matches!(&v.base, crate::conflicts::Side::Present(b) if b == SRC_A));
+    // A path under a gap is a gap error, never an absent side.
+    let gap = clone
+        .conflict_versions("docs/api/guide.md", None)
+        .unwrap_err();
+    assert!(matches!(gap, Error::GapOutsideFilter(_)), "got {gap:?}");
+
+    clone
+        .resolve_path("src/a.txt", crate::conflicts::ResolveSide::Ours, None)
+        .unwrap();
+    let merged = clone.commit("t", "merge").unwrap();
+    assert!(!clone.merge_in_progress());
+    let snap = clone.snapshot(&merged).unwrap();
+    assert_eq!(snap.parents.len(), 2);
+    assert_eq!(Some(snap.parents[0]), ours);
+    assert_eq!(snap.root, expect, "same tree as the full merge");
+    assert_eq!(dir_id(&clone, &merged, "docs"), theirs_docs);
+    assert!(!has(&clone, &theirs_docs), "and still never fetched");
+    clone.gc(std::time::Duration::from_secs(0)).unwrap();
+    assert!(has(&clone, &merged));
+    drop(clone);
+    fx.cleanup();
+}
+
+/// Aborting restores ours and removes the markers; the carried subtree was
+/// never on disk and the ref never moved.
+#[test]
+fn aborting_a_partial_conflict_restores_ours() {
+    let fx = Fx::origin("abort", |_| {});
+    fx.origin_branch(
+        "b1",
+        &[
+            ("src/a.txt", b"ONE\ntwo\nthree\n"),
+            ("docs/api/guide.md", b"g changed\n"),
+        ],
+    );
+    let clone = fx.clone(false);
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    let ours = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    clone.merge_abort().unwrap();
+    assert!(!clone.merge_in_progress());
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
+        b"uno\ntwo\nthree\n"
+    );
+    assert!(!fx.clone_root.join("docs").exists());
+    assert_eq!(refs::read_branch_tip(clone.layout(), "main").unwrap(), ours);
+    assert!(clone.status().unwrap().modified.is_empty());
+    drop(clone);
+    fx.cleanup();
+}
+
+/// Abort checks the view before it removes anything: when ours' view is
+/// missing an object, it fails with `GapInView` and the conflicted state, the
+/// markers and the sidecar are all still there to retry.
+#[test]
+fn an_abort_that_hits_a_view_gap_changes_nothing() {
+    let fx = Fx::origin("abort-gap", |_| {});
+    fx.origin_branch("b1", &[("src/a.txt", b"\xff\xfeTHEIRS\n")]);
+    let clone = fx.clone(false);
+    clone_edit_src(&fx, &clone, b"\xff\xfeOURS\n");
+    let ours = refs::read_branch_tip(clone.layout(), "main")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    let sidecar = fx.clone_root.join("src/a.txt.theirs");
+    assert!(sidecar.exists(), "a binary conflict writes a sidecar");
+
+    let src = dir_id(&clone, &ours, "src");
+    clone.vfs().store().lock().unwrap().delete(&src).unwrap();
+    let err = clone.merge_abort().unwrap_err();
+    assert!(matches!(err, Error::GapInView { .. }), "got {err:?}");
+    assert!(clone.merge_in_progress(), "the merge is still open");
+    assert!(sidecar.exists(), "the sidecar is still there");
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A conflict outside the view is refused before any write, with the widen
+/// hint; nothing is marked and no state is recorded.
+#[test]
+fn a_conflict_outside_the_view_is_refused_before_any_write() {
+    let fx = Fx::origin("conflict-out", |_| {});
+    fx.origin_branch("b1", &[("docs/a.md", b"a1\n")]);
+    fx.origin_branch("b2", &[("docs/a.md", b"a2\n")]);
     let clone = fx.clone(true);
-    clone.merge("origin/b1", "t").unwrap();
+    clone.merge("origin/b1", "t").unwrap(); // fast-forward
     let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
 
     let err = clone.merge("origin/b2", "t").unwrap_err();
     assert!(
-        matches!(&err, Error::PartialCloneUnsupported(op) if op.contains("conflicts")),
+        matches!(&err, Error::InvalidArgument(m) if m.contains("outside your sparse checkout")),
         "got {err:?}"
     );
     assert_eq!(
@@ -230,12 +390,7 @@ fn conflict_on_a_partial_clone_is_refused_before_any_write() {
         before
     );
     assert!(!clone.merge_in_progress());
-    assert_eq!(
-        std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
-        b"ONE\ntwo\nthree\n",
-        "no markers"
-    );
-    assert!(!fx.clone_root.join("src/a.txt.theirs").exists());
+    assert!(!fx.clone_root.join("docs").exists());
     drop(clone);
     fx.cleanup();
 }
@@ -442,6 +597,101 @@ fn an_interrupted_fill_changes_nothing_and_the_retry_succeeds() {
     std::fs::rename(&gone, &fx.origin_root).unwrap();
     let (merged, _) = clone.merge_with_identity("origin/b2", "t", None).unwrap();
     assert_eq!(clone.snapshot(&merged).unwrap().parents, vec![b1, b2]);
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A conflict in the view while a protected subtree is carried: the decided
+/// root holds the subtree by id, and the completion keeps its wraps, so the
+/// recipient can still decrypt it afterwards.
+#[test]
+fn a_carried_protected_subtree_survives_a_conflicted_merge_and_its_completion() {
+    let (sk, pk) = scl_crypto::generate_keypair();
+    let fx = protected_origin("conflict-wraps", &pk);
+    let base = fx.origin.head_tip().unwrap().unwrap();
+    let base_snap = fx.origin.snapshot(&base).unwrap();
+    let vault = dir_id(&fx.origin, &base, "vault");
+    fx.origin_branch("b1", &[("src/a.txt", b"ONE\ntwo\nthree\n")]);
+    let clone = fx.clone(false);
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    clone
+        .resolve_path("src/a.txt", crate::conflicts::ResolveSide::Theirs, None)
+        .unwrap();
+    let merged = clone.commit("t", "merge").unwrap();
+    let snap = clone.snapshot(&merged).unwrap();
+    assert_eq!(dir_id(&clone, &merged, "vault"), vault, "carried by id");
+    assert!(!has(&clone, &vault), "never fetched");
+    for (id, wraps) in &base_snap.protection.wrapped {
+        assert_eq!(
+            snap.protection.wrapped.get(id),
+            Some(wraps),
+            "wraps of {id}"
+        );
+    }
+    let (cipher_id, _) = base_snap.protection.wrapped.iter().next().unwrap();
+    let cipher = {
+        let arc = fx.origin.vfs().store();
+        let mut s = arc.lock().unwrap();
+        match s.get(cipher_id).unwrap() {
+            Object::Blob(b) => b,
+            other => panic!("expected a blob, got {}", other.kind_name()),
+        }
+    };
+    let plain =
+        crate::protect::decrypt_with(&cipher, cipher_id, &[&snap.protection], &sk, "vault/s.txt")
+            .unwrap();
+    assert_eq!(&plain[..], b"l1\nl2\nl3\n");
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A conflict in the view together with a clean protected merge outside it:
+/// completion could not seal the outside plaintext, so the merge is refused
+/// before any write and names the path.
+#[test]
+fn a_conflict_with_sealing_outside_the_view_is_refused_before_any_write() {
+    let (sk, pk) = scl_crypto::generate_keypair();
+    let fx = protected_origin("conflict-seal", &pk);
+    fx.origin_branch(
+        "b1",
+        &[
+            ("src/a.txt", b"ONE\ntwo\nthree\n"),
+            ("vault/s.txt", b"L1\nl2\nl3\n"),
+        ],
+    );
+    fx.origin_branch(
+        "b2",
+        &[
+            ("src/a.txt", b"uno\ntwo\nthree\n"),
+            ("vault/s.txt", b"l1\nl2\nL3\n"),
+        ],
+    );
+    let clone = fx.clone(true);
+    clone.merge("origin/b1", "t").unwrap(); // fast-forward
+    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    let on_disk = std::fs::read(fx.clone_root.join("src/a.txt")).unwrap();
+
+    let err = clone
+        .merge_with_identity("origin/b2", "t", Some(&sk))
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidArgument(m) if m.contains("vault/s.txt") && m.contains("sealing")),
+        "got {err:?}"
+    );
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        before
+    );
+    assert!(!clone.merge_in_progress());
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
+        on_disk
+    );
+    assert!(!fx.clone_root.join("vault").exists());
     drop(clone);
     fx.cleanup();
 }

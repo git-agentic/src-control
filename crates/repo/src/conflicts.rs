@@ -8,7 +8,9 @@ use scl_core::{Object, ObjectId, Store, PROTECTED};
 
 use crate::error::{Error, Result};
 use crate::repo::Repo;
-use crate::worktree::{safe_join, tree_file_entries_with_perms};
+#[cfg(test)]
+use crate::worktree::tree_file_entries_with_perms;
+use crate::worktree::{safe_join, tree_entry_at};
 
 /// Which in-progress operation owns the current conflicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,20 +142,20 @@ impl Repo {
     /// else non-UTF8 ours/theirs content → Binary; else Text).
     pub fn conflict_kind(&self, path: &str) -> Result<ConflictKind> {
         let triple = self.op_triple()?;
+        let partial = self.promisor()?.is_some();
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         for id in [triple.ours, triple.theirs] {
             let root = store.get_snapshot(&id)?.root;
-            let entries = tree_file_entries_with_perms(&mut store, root)?;
-            if let Some((_, _, perms)) = entries.get(path) {
+            if let Some((_, _, perms)) = tree_entry_at(&mut store, root, path, partial)? {
                 if perms & PROTECTED != 0 {
                     return Ok(ConflictKind::Protected);
                 }
             }
         }
         // Neither tip is protected: a None identity is fine to inspect content.
-        let ours = side_for(&mut store, triple.ours, None, path)?;
-        let theirs = side_for(&mut store, triple.theirs, None, path)?;
+        let ours = side_for(&mut store, triple.ours, None, path, partial)?;
+        let theirs = side_for(&mut store, triple.theirs, None, path, partial)?;
         let is_binary = |s: &Side| matches!(s, Side::Present(b) if std::str::from_utf8(b).is_err());
         if is_binary(&ours) || is_binary(&theirs) {
             Ok(ConflictKind::Binary)
@@ -170,14 +172,15 @@ impl Repo {
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<ConflictVersions> {
         let triple = self.op_triple()?;
+        let partial = self.promisor()?.is_some();
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         let base = match triple.base {
-            Some(id) => side_for(&mut store, id, identity, path)?,
+            Some(id) => side_for(&mut store, id, identity, path, partial)?,
             None => Side::Absent,
         };
-        let ours = side_for(&mut store, triple.ours, identity, path)?;
-        let theirs = side_for(&mut store, triple.theirs, identity, path)?;
+        let ours = side_for(&mut store, triple.ours, identity, path, partial)?;
+        let theirs = side_for(&mut store, triple.theirs, identity, path, partial)?;
         Ok(ConflictVersions { base, ours, theirs })
     }
 
@@ -256,12 +259,12 @@ impl Repo {
                         ResolveSide::Ours => triple.ours,
                         ResolveSide::Theirs => triple.theirs,
                     };
+                    let partial = self.promisor()?.is_some();
                     let store_arc = self.vfs.store();
                     let blob_id = {
                         let mut store = store_arc.lock().unwrap();
                         let snap = store.get_snapshot(&chosen_snapshot)?;
-                        let entries = tree_file_entries_with_perms(&mut store, snap.root)?;
-                        entries.get(path).map(|(id, _, _)| *id)
+                        tree_entry_at(&mut store, snap.root, path, partial)?.map(|(id, _, _)| id)
                     };
                     if let Some(blob_id) = blob_id {
                         let mut cache = self.open_protected_cache()?;
@@ -326,12 +329,15 @@ fn side_for(
     snapshot_id: ObjectId,
     identity: Option<&scl_crypto::SecretKey>,
     path: &str,
+    partial: bool,
 ) -> Result<Side> {
     let snap = store.get_snapshot(&snapshot_id)?;
-    let entries = tree_file_entries_with_perms(store, snap.root)?;
-    let Some((blob_id, _mode, perms)) = entries.get(path).copied() else {
+    let Some((blob_id, _mode, perms)) = tree_entry_at(store, snap.root, path, partial)? else {
         return Ok(Side::Absent);
     };
+    if partial && !store.contains(&blob_id) {
+        return Err(crate::promisor::partial_gap_hint(path));
+    }
     let bytes = match store.get(&blob_id)? {
         Object::Blob(b) => b,
         _ => return Err(Error::BadRef(format!("{path}: tree entry is not a blob"))),

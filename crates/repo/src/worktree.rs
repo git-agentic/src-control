@@ -355,6 +355,42 @@ fn walk_entries_with_perms(
     Ok(())
 }
 
+/// The file entry at `path` under `root`, found by descending its components
+/// instead of flattening the tree (ADR-0049 decision 8). `Ok(None)` means the
+/// path is not in the tree. A tree on the way that this store lacks is never
+/// read as absence: on a partial clone it is the gap error naming `path`, on a
+/// full clone the plain not-found, so a gap cannot pass for a deletion.
+/// A path that names a directory is also `None`: callers ask for files.
+pub(crate) fn tree_entry_at(
+    store: &mut Store,
+    root: ObjectId,
+    path: &str,
+    partial: bool,
+) -> Result<Option<(ObjectId, FileMode, u8)>> {
+    let comps: Vec<&str> = path.split('/').collect();
+    let mut cur = root;
+    for (i, comp) in comps.iter().enumerate() {
+        if !store.contains(&cur) {
+            return Err(if partial {
+                crate::promisor::partial_gap_hint(path)
+            } else {
+                scl_core::Error::NotFound(cur).into()
+            });
+        }
+        let tree: Tree = store.get_tree(&cur)?;
+        let Some(e) = tree.get(comp) else {
+            return Ok(None);
+        };
+        let last = i + 1 == comps.len();
+        match (e.kind, last) {
+            (EntryKind::Blob, true) => return Ok(Some((e.id, e.mode, e.perms))),
+            (EntryKind::Tree, false) => cur = e.id,
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
 /// Flatten a snapshot's root tree to `path -> blob id`.
 pub fn tree_file_ids(store: &mut Store, root: ObjectId) -> Result<BTreeMap<String, ObjectId>> {
     let mut out = BTreeMap::new();
