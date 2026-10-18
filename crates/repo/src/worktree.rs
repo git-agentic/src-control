@@ -162,7 +162,23 @@ pub(crate) fn tree_file_entries_with_perms_sparse(
         return tree_file_entries_with_perms(store, root);
     }
     let mut out = BTreeMap::new();
-    walk_entries_with_perms_sparse(store, root, String::new(), sparse, &mut out)?;
+    walk_entries_with_perms_sparse(store, root, String::new(), sparse, &mut out, false)?;
+    Ok(out)
+}
+
+/// [`tree_file_entries_with_perms_sparse`] that skips a tree the store lacks
+/// instead of failing. For a parent read only as a fallback on a partial clone
+/// (ADR-0049 merge completion): a subtree it does not hold lies where the
+/// decided root already decided, and is never the only record of a path.
+pub(crate) fn tree_file_entries_with_perms_sparse_present(
+    store: &mut Store,
+    root: ObjectId,
+    sparse: &Sparse,
+) -> Result<BTreeMap<String, (ObjectId, FileMode, u8)>> {
+    let mut out = BTreeMap::new();
+    if store.contains(&root) {
+        walk_entries_with_perms_sparse(store, root, String::new(), sparse, &mut out, true)?;
+    }
     Ok(out)
 }
 
@@ -172,6 +188,7 @@ fn walk_entries_with_perms_sparse(
     prefix: String,
     sparse: &Sparse,
     out: &mut BTreeMap<String, (ObjectId, FileMode, u8)>,
+    skip_absent: bool,
 ) -> Result<()> {
     let tree: Tree = store.get_tree(&tree_id)?;
     for e in tree.entries {
@@ -187,8 +204,8 @@ fn walk_entries_with_perms_sparse(
                 }
             }
             EntryKind::Tree => {
-                if sparse.should_descend(&path) {
-                    walk_entries_with_perms_sparse(store, e.id, path, sparse, out)?;
+                if sparse.should_descend(&path) && (!skip_absent || store.contains(&e.id)) {
+                    walk_entries_with_perms_sparse(store, e.id, path, sparse, out, skip_absent)?;
                 }
             }
         }
@@ -305,9 +322,14 @@ pub(crate) fn graft_out_of_sparse(
         // An ancestor directory: some deeper prefix is in-sparse, so recurse
         // rather than grafting the whole thing whole.
         if pe.kind != EntryKind::Tree {
-            // A file sitting where the sparse spec expects a descendable
-            // directory (a genuinely malformed/unexpected shape) — leave
-            // whatever the built side already decided.
+            // A file where the sparse spec expects a descendable directory
+            // (a merge can swap a directory for a file, ADR-0049). A file
+            // that does not match the view is out of it, so it is grafted by
+            // id like any other out-of-sparse entry; dropping it would lose
+            // the path. When the built side already holds the name (a file
+            // replaced by a directory, or rewritten in place) it decided
+            // that path, so it stays.
+            by_name.entry(pe.name.clone()).or_insert(pe);
             continue;
         }
         let child_built_id = match by_name.get(&pe.name) {
@@ -353,6 +375,42 @@ fn walk_entries_with_perms(
         }
     }
     Ok(())
+}
+
+/// The file entry at `path` under `root`, found by descending its components
+/// instead of flattening the tree (ADR-0049 decision 8). `Ok(None)` means the
+/// path is not in the tree. A tree on the way that this store lacks is never
+/// read as absence: on a partial clone it is the gap error naming `path`, on a
+/// full clone the plain not-found, so a gap cannot pass for a deletion.
+/// A path that names a directory is also `None`: callers ask for files.
+pub(crate) fn tree_entry_at(
+    store: &mut Store,
+    root: ObjectId,
+    path: &str,
+    partial: bool,
+) -> Result<Option<(ObjectId, FileMode, u8)>> {
+    let comps: Vec<&str> = path.split('/').collect();
+    let mut cur = root;
+    for (i, comp) in comps.iter().enumerate() {
+        if !store.contains(&cur) {
+            return Err(if partial {
+                crate::promisor::partial_gap_hint(path)
+            } else {
+                scl_core::Error::NotFound(cur).into()
+            });
+        }
+        let tree: Tree = store.get_tree(&cur)?;
+        let Some(e) = tree.get(comp) else {
+            return Ok(None);
+        };
+        let last = i + 1 == comps.len();
+        match (e.kind, last) {
+            (EntryKind::Blob, true) => return Ok(Some((e.id, e.mode, e.perms))),
+            (EntryKind::Tree, false) => cur = e.id,
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 /// Flatten a snapshot's root tree to `path -> blob id`.
@@ -946,6 +1004,85 @@ mod tests {
 
         drop(store);
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    /// A merge can swap a directory for a file. When the file lies outside a
+    /// view whose prefixes sit below it, the graft must carry it by id, not
+    /// skip it as a malformed ancestor (ADR-0049 decision 8).
+    #[test]
+    fn graft_carries_an_out_of_view_file_standing_where_a_directory_was() {
+        let (layout, mut store) = tmp_objects("graft-dir-to-file");
+        let file = |store: &mut Store, name: &str, bytes: &[u8]| TreeEntry {
+            name: name.into(),
+            kind: EntryKind::Blob,
+            id: store.put(Object::blob(bytes.to_vec())).unwrap(),
+            mode: FileMode::FILE,
+            perms: 0,
+        };
+        let other = file(&mut store, "other.txt", b"o");
+        // The decided tree replaced directory `src/` with the file `src`.
+        let src_file = file(&mut store, "src", b"now a file");
+        let parent = store
+            .put(Object::Tree(Tree::new(vec![
+                other.clone(),
+                src_file.clone(),
+            ])))
+            .unwrap();
+        // The built side comes from the view: only `other.txt` survives.
+        let built = store
+            .put(Object::Tree(Tree::new(vec![other.clone()])))
+            .unwrap();
+        let sparse = Sparse::new(vec!["src/a.txt".into(), "other.txt".into()]);
+        let promisor = crate::promisor::Promisor::new("origin", vec!["src/a.txt".into()]);
+        let out = graft_out_of_sparse(&mut store, built, parent, &sparse, &promisor, "").unwrap();
+        let tree = store.get_tree(&out).unwrap();
+        assert_eq!(tree.get("src").map(|e| e.id), Some(src_file.id));
+        assert_eq!(tree.get("other.txt").map(|e| e.id), Some(other.id));
+        let _ = std::fs::remove_dir_all(&layout.root);
+    }
+
+    /// A single-tip commit that replaces the file `src` with a directory
+    /// holding an in-view file: the built side decided that path, so the
+    /// graft keeps it and does not resurrect the old file or refuse.
+    #[test]
+    fn graft_keeps_a_directory_the_built_side_put_where_a_file_was() {
+        let (layout, mut store) = tmp_objects("graft-file-to-dir");
+        let blob =
+            |store: &mut Store, bytes: &[u8]| store.put(Object::blob(bytes.to_vec())).unwrap();
+        let old_file = blob(&mut store, b"was a file");
+        let a = blob(&mut store, b"a");
+        let parent = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "src".into(),
+                kind: EntryKind::Blob,
+                id: old_file,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+        let dir = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "a.txt".into(),
+                kind: EntryKind::Blob,
+                id: a,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+        let built = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "src".into(),
+                kind: EntryKind::Tree,
+                id: dir,
+                mode: FileMode(0o755),
+                perms: 0,
+            }])))
+            .unwrap();
+        let sparse = Sparse::new(vec!["src/a.txt".into()]);
+        let promisor = crate::promisor::Promisor::new("origin", vec!["src/".into()]);
+        let out = graft_out_of_sparse(&mut store, built, parent, &sparse, &promisor, "").unwrap();
+        assert_eq!(out, built, "the built directory stays");
+        let _ = std::fs::remove_dir_all(&layout.root);
     }
 
     #[test]

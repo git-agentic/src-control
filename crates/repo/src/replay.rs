@@ -546,6 +546,7 @@ impl Repo {
                 };
                 let conflict_root = self.materialize_conflict_state(
                     &carried,
+                    &[],
                     &to_encrypt,
                     &sidecars,
                     &conflict_prot,
@@ -967,6 +968,7 @@ impl Repo {
                     };
                     let conflict_root = self.materialize_conflict_state(
                         &carried,
+                        &[],
                         &to_encrypt,
                         &sidecars,
                         &conflict_prot,

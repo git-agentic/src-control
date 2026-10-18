@@ -160,14 +160,15 @@ fn status_diff_and_gc_succeed_on_fresh_partial_clone() {
 
 /// P27 final review I2: `sc backfill --all` is the real escape hatch —
 /// fetches every remaining object and removes `.sc/promisor`, after which
-/// a merge that was refused as unsupported on a partial clone works.
+/// a cherry-pick that was refused as unsupported on a partial clone works.
 #[test]
 fn backfill_all_lifts_partial_clone_refusals() {
     let (src_root, dst_root) = make_partial_clone("backfill-all");
 
-    // A merge with conflicts is refused while partial (a clean one works, P37c-ii).
-    // Create a divergent, non-conflicting branch (different files) for the clean
-    // merge after backfill, and a clashing one (same file) for the refusal.
+    // Replay is still refused while partial (a merge, clean or conflicting
+    // inside the view, works since P37c). Create a clashing branch (same
+    // file) for the refusal and a non-conflicting one for the merge after
+    // backfill.
     assert!(sc(&dst_root, &["branch", "clash"]).status.success());
     assert!(sc(&dst_root, &["switch", "clash"]).status.success());
     std::fs::write(dst_root.join("src/a.txt"), "clash-edit\n").unwrap();
@@ -181,19 +182,19 @@ fn backfill_all_lifts_partial_clone_refusals() {
     std::fs::write(dst_root.join("src/a.txt"), "main-edit\n").unwrap();
     assert!(sc(&dst_root, &["commit", "-m", "main"]).status.success());
 
-    let merge_before = sc(&dst_root, &["merge", "clash"]);
+    let pick_before = sc(&dst_root, &["cherry-pick", "clash"]);
     assert!(
-        !merge_before.status.success(),
-        "a conflicting merge must still be refused before backfill --all"
+        !pick_before.status.success(),
+        "a cherry-pick must still be refused before backfill --all"
     );
     assert!(
-        stderr(&merge_before).contains("backfill --all"),
+        stderr(&pick_before).contains("backfill --all"),
         "refusal must point at `sc backfill --all`: {}",
-        stderr(&merge_before)
+        stderr(&pick_before)
     );
     assert!(
         !dst_root.join("src/a.txt.theirs").exists(),
-        "a refused merge writes nothing"
+        "a refused cherry-pick writes nothing"
     );
     assert_eq!(
         std::fs::read_to_string(dst_root.join("src/a.txt")).unwrap(),
@@ -220,12 +221,12 @@ fn backfill_all_lifts_partial_clone_refusals() {
         stderr(&sparse_disable)
     );
 
-    // The conflicting merge is no longer refused: it reaches the ordinary
+    // The cherry-pick is no longer refused: it reaches the ordinary
     // conflict state (markers in the file), which `--abort` undoes.
-    let conflict_after = sc(&dst_root, &["merge", "clash"]);
+    let conflict_after = sc(&dst_root, &["cherry-pick", "clash"]);
     assert!(
         !stderr(&conflict_after).contains("partial clone"),
-        "a conflicting merge must no longer be refused after backfill --all: {}",
+        "a cherry-pick must no longer be refused after backfill --all: {}",
         stderr(&conflict_after)
     );
     assert!(
@@ -234,7 +235,7 @@ fn backfill_all_lifts_partial_clone_refusals() {
             .contains("<<<<<<<"),
         "the ordinary conflict markers are written"
     );
-    assert!(sc(&dst_root, &["merge", "--abort"]).status.success());
+    assert!(sc(&dst_root, &["cherry-pick", "--abort"]).status.success());
 
     let merge_after = sc(&dst_root, &["merge", "feature"]);
     assert!(
@@ -242,6 +243,59 @@ fn backfill_all_lifts_partial_clone_refusals() {
         "merge must succeed after backfill --all: {}",
         stderr(&merge_after)
     );
+
+    std::fs::remove_dir_all(&src_root).unwrap();
+    std::fs::remove_dir_all(&dst_root).unwrap();
+}
+
+/// P37c-iii: a merge with a conflict inside the view works on a partial clone.
+/// Markers land, `sc conflicts` and `sc resolve` find the path without
+/// flattening a tree, and `sc commit` completes the merge. The untouched
+/// `docs/` subtree is never fetched or written.
+#[test]
+fn conflicting_merge_on_a_partial_clone_resolves_and_commits() {
+    let (src_root, dst_root) = make_partial_clone("conflict-merge");
+    assert!(sc(&dst_root, &["branch", "clash"]).status.success());
+    assert!(sc(&dst_root, &["switch", "clash"]).status.success());
+    std::fs::write(dst_root.join("src/a.txt"), "clash-edit\n").unwrap();
+    assert!(sc(&dst_root, &["commit", "-m", "clash"]).status.success());
+    assert!(sc(&dst_root, &["switch", "main"]).status.success());
+    std::fs::write(dst_root.join("src/a.txt"), "main-edit\n").unwrap();
+    assert!(sc(&dst_root, &["commit", "-m", "main"]).status.success());
+
+    let merge = sc(&dst_root, &["merge", "clash"]);
+    assert!(!merge.status.success(), "a conflicting merge exits nonzero");
+    assert!(
+        !stderr(&merge).contains("partial clone"),
+        "not refused as unsupported: {}",
+        stderr(&merge)
+    );
+    assert!(std::fs::read_to_string(dst_root.join("src/a.txt"))
+        .unwrap()
+        .contains("<<<<<<<"));
+    assert!(
+        !dst_root.join("docs").exists(),
+        "docs/ stays out of the view"
+    );
+
+    let listed = sc(&dst_root, &["conflicts"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    assert!(stdout(&listed).contains("src/a.txt"));
+    let shown = sc(&dst_root, &["conflicts", "src/a.txt"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    assert!(stdout(&shown).contains("main-edit") && stdout(&shown).contains("clash-edit"));
+
+    let resolved = sc(&dst_root, &["resolve", "--theirs", "src/a.txt"]);
+    assert!(resolved.status.success(), "{}", stderr(&resolved));
+    let commit = sc(&dst_root, &["commit", "-m", "merge clash"]);
+    assert!(commit.status.success(), "{}", stderr(&commit));
+    assert_eq!(
+        std::fs::read_to_string(dst_root.join("src/a.txt")).unwrap(),
+        "clash-edit\n"
+    );
+    assert!(!dst_root.join("docs").exists());
+    let verify = sc(&dst_root, &["verify"]);
+    assert!(verify.status.success(), "{}", stderr(&verify));
 
     std::fs::remove_dir_all(&src_root).unwrap();
     std::fs::remove_dir_all(&dst_root).unwrap();
