@@ -180,6 +180,32 @@ impl Repo {
         }
     }
 
+    /// `tracked`, plus the paths a stopped operation's decided root holds. A
+    /// file that root holds is part of the outcome, so an ignore rule must not
+    /// hide it from the completion's working-tree read (ADR-0049 q19).
+    fn with_decided_paths(
+        &self,
+        mut tracked: std::collections::BTreeSet<String>,
+        decided_root: Option<ObjectId>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let Some(root) = decided_root else {
+            return Ok(tracked);
+        };
+        // A path the operation wrote in plaintext is part of the outcome too,
+        // though no tree holds it: the user's resolution of it is read even
+        // under an ignore rule. An absent one stays absent.
+        tracked.extend(crate::conflict_plaintext::read(&self.layout)?);
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let ids = if self.promisor()?.is_some() {
+            worktree::tree_file_ids_sparse(&mut store, root, &self.sparse_spec()?)?
+        } else {
+            worktree::tree_file_ids(&mut store, root)?
+        };
+        tracked.extend(ids.into_keys());
+        Ok(tracked)
+    }
+
     /// The pick/rebase-completion snapshot assembly, extracted from
     /// `commit`'s pick-completion arm (P19 Task 2 groundwork) so
     /// `Repo::rebase_continue` can reuse it verbatim: read the resolved
@@ -212,7 +238,9 @@ impl Repo {
         // filled (a rebase accumulator that carried it): fill it before the
         // tracked paths are read from it (lazy partial clones only).
         self.ensure_view(self.snapshot(&parent)?.root, &self.sparse_spec()?)?;
-        let files = worktree::read_worktree(&self.layout, &self.tracked_paths_at(Some(parent))?)?;
+        let tracked =
+            self.with_decided_paths(self.tracked_paths_at(Some(parent))?, decided_root)?;
+        let files = worktree::read_worktree(&self.layout, &tracked)?;
         // Pick/rebase completion opens its own main cache. It saves right
         // after `snapshot_files` (before the caller moves the ref): the sealed
         // blobs are already in the store via `write_tree_with_perms`, so a
@@ -636,9 +664,18 @@ impl Repo {
                 sources.push(entries);
             }
 
+            // Paths the stopped operation wrote in plaintext. One of them that
+            // is absent from disk now was deleted by the user (resolving a
+            // delete-versus-modify conflict to the deleted side): it must not
+            // be carried back from a parent (ADR-0049 q16).
+            let conflict_plaintext = if merge_head.is_some() || pick_head.is_some() {
+                crate::conflict_plaintext::read(&self.layout)?
+            } else {
+                Default::default()
+            };
             for entries in sources {
                 for (path, (blob_id, mode, perms)) in entries {
-                    if on_disk.contains(&path) {
+                    if on_disk.contains(&path) || conflict_plaintext.contains(&path) {
                         continue;
                     }
                     let still_protected = perms & scl_core::PROTECTED != 0
@@ -842,7 +879,8 @@ impl Repo {
                 message,
             )?,
             _ => {
-                let files = worktree::read_worktree(&self.layout, &self.tracked_paths()?)?;
+                let tracked = self.with_decided_paths(self.tracked_paths()?, decided_root)?;
+                let files = worktree::read_worktree(&self.layout, &tracked)?;
                 let mut c = self.open_protected_cache()?;
                 let id = self.snapshot_files(
                     files,
@@ -1788,6 +1826,15 @@ impl Repo {
             // so cache trouble never aborts the conflict write-out (P33 Task 7).
             cache.save_best_effort();
         }
+        // Record what is about to be written in plaintext, before writing it:
+        // completion and abort need the list (see `conflict_plaintext`).
+        crate::conflict_plaintext::write(
+            &self.layout,
+            &to_encrypt
+                .iter()
+                .map(|(p, ..)| p.clone())
+                .collect::<Vec<_>>(),
+        )?;
         for (path, bytes, _mode, _recipients) in to_encrypt {
             let full = worktree::safe_join(&self.layout.root, path)?;
             if let Some(parent) = full.parent() {
@@ -1803,6 +1850,39 @@ impl Repo {
             std::fs::write(full, bytes)?;
         }
         Ok(conflict_root)
+    }
+
+    /// Remove the plaintext a stopped merge, pick or rebase wrote for
+    /// protected content (`conflict_plaintext`), except a path the restored
+    /// tree tracks as a plain file: that one is the user's own. Call it after
+    /// the restore. A lookup that fails keeps the file: it would be a path the
+    /// restored tree may track.
+    pub(crate) fn remove_conflict_plaintext(&self, restored_root: ObjectId) -> Result<()> {
+        let paths = crate::conflict_plaintext::read(&self.layout)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let partial = self.promisor()?.is_some();
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        for path in paths {
+            let remove = match worktree::tree_entry_at(&mut store, restored_root, &path, partial) {
+                Ok(None) => true,
+                Ok(Some((_, _, perms))) => perms & scl_core::PROTECTED != 0,
+                Err(_) => false,
+            };
+            if remove {
+                // Only an already-absent file is fine: any other failure must
+                // stop the abort before its state is cleared, or the decrypted
+                // text stays on disk with nothing left to retry.
+                match std::fs::remove_file(worktree::safe_join(&self.layout.root, &path)?) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Remove the `<path>.theirs` sidecars a stopped merge, pick or rebase
@@ -1881,6 +1961,9 @@ impl Repo {
                 &self.sparse_spec()?,
                 None,
             )?;
+        }
+        if let Some(root) = sidecar_roots.first() {
+            self.remove_conflict_plaintext(*root)?;
         }
         self.remove_conflict_sidecars(
             &crate::merge_state::read_conflicts(&self.layout)?,

@@ -3,6 +3,7 @@
 
 pub mod bucket_transport;
 pub(crate) mod cache;
+pub(crate) mod conflict_plaintext;
 pub(crate) mod conflicts;
 pub mod diff3;
 pub mod error;

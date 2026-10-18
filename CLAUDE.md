@@ -238,6 +238,10 @@ transport-adjacent. The rest, imperatively:
 - **`sc ws harvest` lands on the currently-checked-out branch** (default the
   session's base; `--into` must also be checked out) — it refuses with a
   `sc switch` hint otherwise.
+- **A stopped merge/pick/rebase lists the paths it wrote as plaintext in
+  `.sc/CONFLICT_PLAINTEXT`.** Protected conflict text never enters the CAS, so no
+  tree records it; completion treats a listed path absent from disk as deleted,
+  and abort removes listed paths the restored tree does not track as plain files.
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first.

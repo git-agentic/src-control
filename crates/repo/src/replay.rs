@@ -657,6 +657,9 @@ impl Repo {
                 None,
             )?;
         }
+        if let Some(root) = sidecar_roots.first() {
+            self.remove_conflict_plaintext(*root)?;
+        }
         self.remove_conflict_sidecars(
             &crate::pick_state::read_conflicts(&self.layout)?,
             &sidecar_roots,
@@ -1304,6 +1307,7 @@ impl Repo {
                 None,
             )?
         };
+        self.remove_conflict_plaintext(snap.root)?;
         self.remove_conflict_sidecars(
             &crate::rebase_state::read_conflicts(&self.layout)?,
             &[snap.root],
@@ -2482,6 +2486,295 @@ mod tests {
             b"OURS\nl2\nTHEIRS\n".to_vec()
         );
 
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Base has a plain `secret/a.txt`. `main` then protects `secret/` (so the
+    /// file becomes ciphertext) while `work` deletes the plain file. Picking
+    /// `work` onto `main` is a delete-versus-modify conflict on a protected
+    /// path. Returns the repo, its root, the recipient key and `main`'s tip.
+    fn protected_delete_modify_pick(
+        tag: &str,
+    ) -> (Repo, std::path::PathBuf, scl_crypto::SecretKey) {
+        let root = tmp_root(tag);
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("keep.txt"), b"k\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        repo.switch("work").unwrap();
+        std::fs::remove_file(root.join("secret/a.txt")).unwrap();
+        repo.commit("me", "work deletes").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        let err = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert!(
+            root.join("secret/a.txt").exists(),
+            "plaintext surviving side"
+        );
+        (repo, root, alice_sk)
+    }
+
+    /// ADR-0049 q16: such a conflict resolved by deleting the file stays
+    /// deleted at completion. The plaintext conflict path is not in the decided
+    /// root, so the absent-protected carry used to bring the parent's
+    /// ciphertext back.
+    #[test]
+    fn resolving_a_protected_delete_modify_conflict_to_deletion_sticks() {
+        let (repo, root, alice_sk) = protected_delete_modify_pick("cp-prot-delete");
+        repo.resolve_path(
+            "secret/a.txt",
+            crate::conflicts::ResolveSide::Theirs,
+            Some(&alice_sk),
+        )
+        .unwrap();
+        assert!(!root.join("secret/a.txt").exists());
+        let id = repo.commit("me", "pick: delete").unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        let arc = repo.vfs().store();
+        let mut store = arc.lock().unwrap();
+        let entries = worktree::tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+        assert!(
+            !entries.contains_key("secret/a.txt"),
+            "the deletion must stick, got {:?}",
+            entries.keys().collect::<Vec<_>>()
+        );
+        assert!(entries.contains_key("keep.txt"));
+        drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ADR-0049 q18: aborting that pick removes the decrypted conflict text it
+    /// wrote. Abort has no identity, so the restored protected file is skipped,
+    /// and materialize neither writes nor deletes a skipped path.
+    #[test]
+    fn aborting_a_protected_conflict_leaves_no_plaintext_on_disk() {
+        let (repo, root, _sk) = protected_delete_modify_pick("cp-prot-abort");
+        repo.cherry_pick_abort().unwrap();
+        assert!(!repo.pick_in_progress());
+        assert!(
+            !root.join("secret/a.txt").exists(),
+            "decrypted conflict text must not outlive the abort"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Base has a plain `secret/a.txt`, `main` deletes it, `work` protects
+    /// `secret/` and edits it. Picking `work` stops on a delete-versus-modify
+    /// conflict whose decrypted text lives in neither the original nor the
+    /// decided root. With `ignore`, `main` also ignores `secret/`.
+    fn delete_vs_protected_edit_pick(
+        tag: &str,
+        ignore: bool,
+    ) -> (Repo, std::path::PathBuf, scl_crypto::SecretKey) {
+        let root = tmp_root(tag);
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("keep.txt"), b"k\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::remove_file(root.join("secret/a.txt")).unwrap();
+        if ignore {
+            std::fs::write(root.join(".scignore"), b"secret/\n").unwrap();
+        }
+        repo.commit("me", "main deletes").unwrap();
+        repo.switch("work").unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"EDITED\nl2\nl3\n").unwrap();
+        repo.commit("me", "work edits").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        let err = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert!(root.join("secret/a.txt").exists(), "plaintext on disk");
+        (repo, root, alice_sk)
+    }
+
+    /// ADR-0049 q18: abort removes that decrypted text.
+    #[test]
+    fn aborting_a_conflict_whose_text_is_in_no_root_leaves_no_plaintext() {
+        let (repo, root, _sk) = delete_vs_protected_edit_pick("cp-prot-abort2", false);
+        repo.cherry_pick_abort().unwrap();
+        assert!(
+            !root.join("secret/a.txt").exists(),
+            "decrypted conflict text must not outlive the abort"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An abort that cannot remove the plaintext keeps the stopped pick, so the
+    /// text is not left behind with nothing to retry.
+    #[cfg(unix)]
+    #[test]
+    fn an_abort_that_cannot_remove_the_plaintext_keeps_the_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let (repo, root, _sk) = delete_vs_protected_edit_pick("cp-prot-abort-fail", false);
+        let dir = root.join("secret");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Running as a user that ignores directory permissions: nothing to test.
+        let can_write = std::fs::File::create(dir.join("probe")).is_ok();
+        if can_write {
+            std::fs::remove_file(dir.join("probe")).ok();
+        } else {
+            assert!(repo.cherry_pick_abort().is_err());
+            assert!(repo.pick_in_progress(), "the state is kept for a retry");
+            assert!(root.join("secret/a.txt").exists());
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !can_write {
+            repo.cherry_pick_abort().unwrap();
+            assert!(!root.join("secret/a.txt").exists());
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The user's resolution of a plaintext-only conflict path is read even
+    /// when an ignore rule covers it: it is part of the outcome.
+    #[test]
+    fn a_resolved_plaintext_only_conflict_path_survives_an_ignore_rule() {
+        let (repo, root, alice_sk) = delete_vs_protected_edit_pick("cp-prot-ignored", true);
+        repo.resolve_path(
+            "secret/a.txt",
+            crate::conflicts::ResolveSide::Theirs,
+            Some(&alice_sk),
+        )
+        .unwrap();
+        assert!(root.join("secret/a.txt").exists());
+        let id = repo.commit("me", "pick").unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        let arc = repo.vfs().store();
+        let mut store = arc.lock().unwrap();
+        let entries = worktree::tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+        let (_, _, perms) = entries
+            .get("secret/a.txt")
+            .expect("the resolved file must be committed");
+        assert_ne!(perms & scl_core::PROTECTED, 0, "sealed");
+        drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The merge flavour of `delete_vs_protected_edit_pick`: same history, but
+    /// `main` merges `work` and stops on the delete-versus-modify conflict.
+    fn delete_vs_protected_edit_merge(
+        tag: &str,
+        ignore: bool,
+    ) -> (Repo, std::path::PathBuf, scl_crypto::SecretKey) {
+        let root = tmp_root(tag);
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("keep.txt"), b"k\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::remove_file(root.join("secret/a.txt")).unwrap();
+        if ignore {
+            std::fs::write(root.join(".scignore"), b"secret/\n").unwrap();
+        }
+        repo.commit("me", "main deletes").unwrap();
+        repo.switch("work").unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"EDITED\nl2\nl3\n").unwrap();
+        repo.commit("me", "work edits").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        let err = repo
+            .merge_with_identity("work", "me", Some(&alice_sk))
+            .unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+        assert!(root.join("secret/a.txt").exists(), "plaintext on disk");
+        (repo, root, alice_sk)
+    }
+
+    /// A merge completion keeps the user's resolution of a plaintext-only
+    /// conflict path under an ignore rule, sealed and with both parents.
+    #[test]
+    fn a_merge_completion_keeps_a_resolved_plaintext_only_path_under_an_ignore_rule() {
+        let (repo, root, sk) = delete_vs_protected_edit_merge("mg-prot-ignored", true);
+        repo.resolve_path(
+            "secret/a.txt",
+            crate::conflicts::ResolveSide::Theirs,
+            Some(&sk),
+        )
+        .unwrap();
+        let id = repo.commit("me", "merge").unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        assert_eq!(snap.parents.len(), 2);
+        let arc = repo.vfs().store();
+        let mut store = arc.lock().unwrap();
+        let entries = worktree::tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+        let (_, _, perms) = entries
+            .get("secret/a.txt")
+            .expect("the resolved file must be committed");
+        assert_ne!(perms & scl_core::PROTECTED, 0, "sealed");
+        drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Deleting the file while resolving that merge conflict sticks.
+    #[test]
+    fn a_merge_conflict_on_a_protected_path_honors_deletion() {
+        let (repo, root, _sk) = delete_vs_protected_edit_merge("mg-prot-delete", false);
+        std::fs::remove_file(root.join("secret/a.txt")).unwrap();
+        let id = repo.commit("me", "merge").unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        let arc = repo.vfs().store();
+        let mut store = arc.lock().unwrap();
+        let entries = worktree::tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+        assert!(!entries.contains_key("secret/a.txt"), "the deletion sticks");
+        drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Aborting a merge removes the decrypted conflict text.
+    #[test]
+    fn aborting_a_merge_conflict_on_a_protected_path_leaves_no_plaintext() {
+        let (repo, root, _sk) = delete_vs_protected_edit_merge("mg-prot-abort", false);
+        repo.merge_abort().unwrap();
+        assert!(!repo.merge_in_progress());
+        assert!(
+            !root.join("secret/a.txt").exists(),
+            "decrypted conflict text must not outlive the abort"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An ordinary conflict, with nothing protected, records no plaintext.
+    #[test]
+    fn an_unprotected_conflict_records_no_plaintext() {
+        let root = tmp_root("mg-plain-no-record");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(1)
+        ));
+        assert!(!root.join(".sc/CONFLICT_PLAINTEXT").exists());
+        repo.merge_abort().unwrap();
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
     }
