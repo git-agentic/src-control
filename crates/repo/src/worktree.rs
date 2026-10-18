@@ -326,12 +326,10 @@ pub(crate) fn graft_out_of_sparse(
             // (a merge can swap a directory for a file, ADR-0049). A file
             // that does not match the view is out of it, so it is grafted by
             // id like any other out-of-sparse entry; dropping it would lose
-            // the path. Content the built side holds under the same name is
-            // refused for the same reason as above.
-            if by_name.contains_key(&pe.name) {
-                return Err(Error::GappedPathContent(path));
-            }
-            by_name.insert(pe.name.clone(), pe);
+            // the path. When the built side already holds the name (a file
+            // replaced by a directory, or rewritten in place) it decided
+            // that path, so it stays.
+            by_name.entry(pe.name.clone()).or_insert(pe);
             continue;
         }
         let child_built_id = match by_name.get(&pe.name) {
@@ -1040,6 +1038,50 @@ mod tests {
         let tree = store.get_tree(&out).unwrap();
         assert_eq!(tree.get("src").map(|e| e.id), Some(src_file.id));
         assert_eq!(tree.get("other.txt").map(|e| e.id), Some(other.id));
+        let _ = std::fs::remove_dir_all(&layout.root);
+    }
+
+    /// A single-tip commit that replaces the file `src` with a directory
+    /// holding an in-view file: the built side decided that path, so the
+    /// graft keeps it and does not resurrect the old file or refuse.
+    #[test]
+    fn graft_keeps_a_directory_the_built_side_put_where_a_file_was() {
+        let (layout, mut store) = tmp_objects("graft-file-to-dir");
+        let blob =
+            |store: &mut Store, bytes: &[u8]| store.put(Object::blob(bytes.to_vec())).unwrap();
+        let old_file = blob(&mut store, b"was a file");
+        let a = blob(&mut store, b"a");
+        let parent = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "src".into(),
+                kind: EntryKind::Blob,
+                id: old_file,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+        let dir = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "a.txt".into(),
+                kind: EntryKind::Blob,
+                id: a,
+                mode: FileMode::FILE,
+                perms: 0,
+            }])))
+            .unwrap();
+        let built = store
+            .put(Object::Tree(Tree::new(vec![TreeEntry {
+                name: "src".into(),
+                kind: EntryKind::Tree,
+                id: dir,
+                mode: FileMode(0o755),
+                perms: 0,
+            }])))
+            .unwrap();
+        let sparse = Sparse::new(vec!["src/a.txt".into()]);
+        let promisor = crate::promisor::Promisor::new("origin", vec!["src/".into()]);
+        let out = graft_out_of_sparse(&mut store, built, parent, &sparse, &promisor, "").unwrap();
+        assert_eq!(out, built, "the built directory stays");
         let _ = std::fs::remove_dir_all(&layout.root);
     }
 
