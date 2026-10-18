@@ -184,7 +184,7 @@ Replay is a three-way merge with a different base, and `replay_commit` is the on
 19. **Completion can drop a newly tracked ignored file.** *Resolved:* completion reads the working tree with the decided root's paths counted as tracked, so an ignore rule cannot hide a file the operation itself added. Test `completing_a_conflicted_pick_keeps_an_added_file_the_parent_ignores`.
 20. **A stopped pick or rebase without its decided root.** `PICK_DECIDED_ROOT` and `REBASE_DECIDED_ROOT` are written before the state's in-progress signal, so the state cannot normally be missing. If it is (a lost file, a power loss before the data reached disk), a partial clone's completion refuses, because grafting from the tip would keep the old out-of-view content; `--abort` still works.
 
-21. **A conflict stop overwrites an ignored or untracked file at a plaintext path.** The stop writes the decrypted text with a plain write, so a local copy the user kept at that path (the usual "stop tracking, keep it ignored" move) is replaced, and abort now removes the path. The loss happens at the stop and predates the record; refusing the stop when an untracked file sits at a plaintext path would close it.
+21. **A conflict stop overwrites an ignored or untracked file at a plaintext path.** *Resolved:* `materialize_conflict_state` refuses, before any write, when a plaintext or sidecar path already exists on disk and the tree the working tree reflects does not track it. A clean merge, pick or rebase still overwrites an untracked file that a materialized added file lands on; that is `materialize`'s behaviour and is not changed here. Test `a_conflict_stop_refuses_to_overwrite_an_untracked_local_copy`.
 
 ## Alternatives considered
 

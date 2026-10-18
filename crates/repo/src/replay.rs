@@ -2779,6 +2779,50 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// ADR-0049 q21: the conflict stop refuses, before any write, when the
+    /// plaintext it would write lands on an untracked file the user kept (the
+    /// "stop tracking, keep it ignored" move). Nothing is lost, and the pick
+    /// can be retried once the file is moved.
+    #[test]
+    fn a_conflict_stop_refuses_to_overwrite_an_untracked_local_copy() {
+        let root = tmp_root("cp-prot-untracked");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::remove_file(root.join("secret/a.txt")).unwrap();
+        std::fs::write(root.join(".scignore"), b"secret/\n").unwrap();
+        repo.commit("me", "main deletes and ignores").unwrap();
+        repo.switch("work").unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"EDITED\nl2\nl3\n").unwrap();
+        repo.commit("me", "work edits").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        // The user's own ignored copy of the file main stopped tracking.
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"MY LOCAL COPY\n").unwrap();
+        let before = repo.head_tip().unwrap();
+
+        let err = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("overwrite an untracked")),
+            "got {err:?}"
+        );
+        assert!(!repo.pick_in_progress());
+        assert_eq!(repo.head_tip().unwrap(), before);
+        assert_eq!(
+            std::fs::read(root.join("secret/a.txt")).unwrap(),
+            b"MY LOCAL COPY\n",
+            "the local copy is untouched"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn cherry_pick_protected_conflict_writes_plaintext_markers_worktree_only() {
         // Same-line edits of secret/a.txt on both sides: the pick conflicts.

@@ -1799,6 +1799,34 @@ impl Repo {
                 }
             }
         }
+        // The stop writes plaintext and sidecars with plain writes, outside
+        // `materialize`. A file already on disk at one of those paths that
+        // `old_root` does not track is the user's own (an ignored or untracked
+        // copy): the write would replace it, and abort would then delete it.
+        // Refuse instead (ADR-0049 q21). A lookup that fails counts as tracked.
+        {
+            let partial = self.promisor()?.is_some();
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let targets = to_encrypt
+                .iter()
+                .map(|(p, ..)| p.as_str())
+                .chain(sidecars.iter().map(|(r, _)| r.as_str()));
+            for rel in targets {
+                let full = worktree::safe_join(&self.layout.root, rel)?;
+                if full.symlink_metadata().is_err() {
+                    continue;
+                }
+                let tracked = worktree::tree_entry_at(&mut store, old_root, rel, partial)
+                    .map_or(true, |e| e.is_some());
+                if !tracked {
+                    return Err(Error::InvalidArgument(format!(
+                        "merge has conflicts, and writing {rel} would overwrite an untracked or \
+                         ignored file; move that file away, then retry"
+                    )));
+                }
+            }
+        }
         // A carried subtree can sit inside the view: fill its closure before
         // the first working-tree write (lazy partial clones only), outside
         // the store lock.
