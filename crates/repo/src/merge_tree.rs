@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use scl_core::{EntryKind, FileMode, ObjectId, Protection, Store, TreeEntry};
 
 use crate::error::{Error, Result};
+use crate::fill::FillStats;
 use crate::merge::{check_path_collisions, merge_path, FileEntry, FileMerge, MergeAcc};
 
 /// What the merge carried by id instead of reading.
@@ -223,6 +224,62 @@ pub(crate) fn merge_trees(
         merge: w.acc.into(),
         carried,
     }))
+}
+
+impl crate::repo::Repo {
+    /// Run [`merge_trees`] to completion on this repo's store, filling what it
+    /// asks for between passes (ADR-0049 decision 5). Every pass takes the
+    /// store lock and releases it before the fill, which takes it too. A pass
+    /// that needs objects discards its work, so a round is idempotent and an
+    /// interrupted fill resumes from current presence.
+    ///
+    /// An id asked for again after it was filled means the store reports it
+    /// present while the traversal cannot read it (a stale index entry): that
+    /// would loop forever, so it fails instead.
+    pub(crate) fn tree_merge_filled(
+        &self,
+        base: Option<(ObjectId, &Protection)>,
+        ours: (ObjectId, &Protection),
+        theirs: (ObjectId, &Protection),
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<(TreeMergeDone, FillStats)> {
+        let mut filler = self.needs_filler()?;
+        fill_loop(
+            || {
+                let store_arc = self.vfs().store();
+                let mut store = store_arc.lock().unwrap();
+                merge_trees(&mut store, base, ours, theirs, identity)
+            },
+            |needs| filler.fill(needs),
+        )
+    }
+}
+
+/// The pass-then-fill loop of [`Repo::tree_merge_filled`], with the pass and
+/// the fill as parameters so the no-progress guard can be tested without a
+/// store whose index disagrees with itself.
+fn fill_loop(
+    mut pass: impl FnMut() -> Result<TreeMerge>,
+    mut fill: impl FnMut(&[(ObjectId, String)]) -> Result<FillStats>,
+) -> Result<(TreeMergeDone, FillStats)> {
+    let mut stats = FillStats::default();
+    let mut asked: BTreeSet<ObjectId> = BTreeSet::new();
+    loop {
+        let needs = match pass()? {
+            TreeMerge::Done(done) => return Ok((done, stats)),
+            TreeMerge::Needs(needs) => needs,
+        };
+        if let Some((id, path)) = needs.iter().find(|(id, _)| asked.contains(id)) {
+            return Err(Error::Protocol(format!(
+                "merge asked again for object {id} (at {path:?}) after it was fetched; \
+                 the object store and its index disagree"
+            )));
+        }
+        asked.extend(needs.iter().map(|(id, _)| *id));
+        let round = fill(&needs)?;
+        stats.requests += round.requests;
+        stats.objects += round.objects;
+    }
 }
 
 /// Visit one name at `path` with its (up to three) entries.
@@ -1081,5 +1138,70 @@ mod tests {
         let mut s = arc.lock().unwrap();
         let err = merge_trees(&mut s, None, (ours, &p), (theirs, &p), None).unwrap_err();
         assert!(matches!(err, Error::PathCollision(_)), "got {err:?}");
+    }
+
+    fn empty_done() -> TreeMerge {
+        TreeMerge::Done(TreeMergeDone {
+            merge: FileMerge {
+                files: vec![],
+                sidecars: vec![],
+                conflicts: vec![],
+                wrapped_carry: Default::default(),
+            },
+            carried: Carried::Entries(vec![]),
+        })
+    }
+
+    #[test]
+    fn fill_loop_fills_then_finishes_and_sums_the_cost() {
+        let a = scl_core::Object::blob(b"a".to_vec()).id();
+        let b = scl_core::Object::blob(b"b".to_vec()).id();
+        let mut passes = vec![
+            TreeMerge::Needs(vec![(a, "x".into())]),
+            TreeMerge::Needs(vec![(b, "x/y".into())]),
+            empty_done(),
+        ]
+        .into_iter();
+        let mut filled: Vec<ObjectId> = Vec::new();
+        let (_, stats) = fill_loop(
+            || Ok(passes.next().unwrap()),
+            |needs| {
+                filled.extend(needs.iter().map(|(id, _)| *id));
+                Ok(FillStats {
+                    requests: 1,
+                    objects: needs.len(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(filled, vec![a, b]);
+        assert_eq!(
+            stats,
+            FillStats {
+                requests: 2,
+                objects: 2
+            }
+        );
+    }
+
+    #[test]
+    fn fill_loop_fails_when_a_filled_id_is_asked_for_again() {
+        // The store claims to hold the object (the fill succeeds) while the
+        // traversal still cannot read it: without the guard this spins forever.
+        let a = scl_core::Object::blob(b"a".to_vec()).id();
+        let mut rounds = 0;
+        let err = fill_loop(
+            || Ok(TreeMerge::Needs(vec![(a, "x".into())])),
+            |_| {
+                rounds += 1;
+                Ok(FillStats::default())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(rounds, 1, "one fill, then the repeat is caught");
+        assert!(
+            matches!(&err, Error::Protocol(m) if m.contains("asked again")),
+            "got {err:?}"
+        );
     }
 }

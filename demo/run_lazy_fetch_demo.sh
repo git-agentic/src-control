@@ -158,4 +158,42 @@ mv "$ORIGIN.gone" "$ORIGIN"
 echo "undo after a widen, offline ✔"
 
 echo
-echo "RESULT: lazy by-id fetch verified (path-only fetch, offline/non-lazy gap errors, http v5, widen/commit/push/undo)"
+echo "=== 9: merge on a partial clone carries the other side's region unread (ADR-0049) ==="
+MORIGIN="$W/morigin"
+mkdir -p "$MORIGIN"
+(
+  cd "$MORIGIN"
+  "$SC" init >/dev/null
+  mkdir -p src docs/api
+  printf 'one\ntwo\nthree\n' > src/a.txt
+  printf 'guide\n' > docs/api/guide.md
+  head -c 65536 /dev/urandom | od -An -tx1 | tr -d ' \n' > docs/api/big.bin
+  "$SC" commit -m "base" --author demo >/dev/null
+  "$SC" branch feature
+  "$SC" switch feature >/dev/null
+  head -c 65536 /dev/urandom | od -An -tx1 | tr -d ' \n' > docs/api/big.bin
+  cp docs/api/big.bin "$W/feature-big.bin"
+  "$SC" commit -m "feature edits docs" --author demo >/dev/null
+  "$SC" switch main >/dev/null
+)
+MERGE="$W/merge"
+"$SC" clone --filter src/ --lazy "$MORIGIN" "$MERGE" >/dev/null
+printf 'one\nTWO\nthree\n' > "$MERGE/src/a.txt"
+(cd "$MERGE" && "$SC" commit -m "local src edit" --author demo >/dev/null && "$SC" fetch origin >/dev/null)
+MBEFORE=$(objects "$MERGE")
+(cd "$MERGE" && "$SC" merge origin/feature --author demo >/dev/null) || fail "disjoint merge on a partial clone must succeed"
+[ ! -e "$MERGE/docs" ] || fail "docs/ is outside the view and must not be written"
+[ "$(cat "$MERGE/src/a.txt")" = "$(printf 'one\nTWO\nthree')" ] || fail "the local src edit must survive the merge"
+MAFTER=$(objects "$MERGE")
+# The merge commit and the merged root/src trees are new; the 64 KiB docs blob is not.
+[ "$(($MAFTER - $MBEFORE))" -le 4 ] || fail "a disjoint merge must not fetch the other side's region ($MBEFORE -> $MAFTER)"
+echo "disjoint merge on a lazy partial clone: docs/ untouched and unfetched ($MBEFORE -> $MAFTER objects) ✔"
+(cd "$MERGE" && "$SC" push origin >/dev/null) || fail "pushing the merge must work"
+MFULL="$W/merge-full"
+"$SC" clone "$MORIGIN" "$MFULL" >/dev/null
+[ "$(cat "$MFULL/src/a.txt")" = "$(printf 'one\nTWO\nthree')" ] || fail "a full re-clone must see the local edit"
+cmp "$MFULL/docs/api/big.bin" "$W/feature-big.bin" || fail "the merge must carry feature's docs blob byte-identical"
+echo "push + full re-clone: merged result has both sides, docs byte-identical ✔"
+
+echo
+echo "RESULT: lazy by-id fetch verified (path-only fetch, offline/non-lazy gap errors, http v5, widen/commit/push/undo, merge)"
