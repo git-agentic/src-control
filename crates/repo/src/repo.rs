@@ -1817,8 +1817,12 @@ impl Repo {
                 if full.symlink_metadata().is_err() {
                     continue;
                 }
-                let tracked = worktree::tree_entry_at(&mut store, old_root, rel, partial)
-                    .map_or(true, |e| e.is_some());
+                // A path the sparse view never materialized holds no tracked
+                // file on disk, even if the tree tracks it: whatever is there
+                // is the user's own.
+                let tracked = sparse.matches(rel)
+                    && worktree::tree_entry_at(&mut store, old_root, rel, partial)
+                        .map_or(true, |e| e.is_some());
                 if !tracked {
                     return Err(Error::InvalidArgument(format!(
                         "merge has conflicts, and writing {rel} would overwrite an untracked or \

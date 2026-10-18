@@ -2823,6 +2823,52 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A full clone with a sparse view: the tree tracks a protected path the
+    /// view never materialized, and the user keeps an ignored local copy there.
+    /// An in-view conflict together with a clean protected merge of that path
+    /// would write plaintext over it, so the stop refuses.
+    #[test]
+    fn a_conflict_stop_does_not_treat_an_out_of_view_path_as_materialized() {
+        let root = tmp_root("mg-sparse-untracked");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("vault/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("vault")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("vault/s.txt"), b"a\nb\nc\nd\ne\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("vault/s.txt"), b"A\nb\nc\nd\ne\n").unwrap();
+        repo.commit("me", "main edits").unwrap();
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("vault/s.txt"), b"a\nb\nc\nd\nE\n").unwrap();
+        repo.commit("me", "work edits").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        repo.set_sparse(&["src/".to_string()], Some(&alice_sk))
+            .unwrap();
+        assert!(!root.join("vault/s.txt").exists(), "out of the view");
+        std::fs::create_dir_all(root.join("vault")).unwrap();
+        std::fs::write(root.join("vault/s.txt"), b"MY LOCAL COPY\n").unwrap();
+
+        let err = repo
+            .merge_with_identity("work", "me", Some(&alice_sk))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("overwrite an untracked")),
+            "got {err:?}"
+        );
+        assert!(!repo.merge_in_progress());
+        assert_eq!(
+            std::fs::read(root.join("vault/s.txt")).unwrap(),
+            b"MY LOCAL COPY\n"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn cherry_pick_protected_conflict_writes_plaintext_markers_worktree_only() {
         // Same-line edits of secret/a.txt on both sides: the pick conflicts.
