@@ -419,7 +419,10 @@ impl Repo {
         // pick or rebase completion, still refuse.
         let merge_completion =
             (merge_head.is_some() || pick_head.is_some()) && decided_root.is_some();
-        if partial && !merge_completion && (decided_root.is_some() || merge_head.is_some()) {
+        if partial
+            && !merge_completion
+            && (decided_root.is_some() || merge_head.is_some() || pick_head.is_some())
+        {
             return Err(crate::promisor::partial_clone_unsupported(
                 "merge/pick completion",
             ));

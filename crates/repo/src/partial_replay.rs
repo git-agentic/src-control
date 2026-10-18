@@ -472,3 +472,38 @@ fn a_rebase_fills_a_carried_subtree_inside_the_view() {
     drop(clone);
     fx.cleanup();
 }
+
+/// A stopped pick whose decided root is gone cannot be completed on a partial
+/// clone: grafting from the tip would silently keep the old out-of-view
+/// content. It refuses, and `--abort` still clears the state.
+#[test]
+fn a_stopped_pick_without_its_decided_root_refuses_to_complete() {
+    let fx = Fx::origin("pick-no-decided", |_| {});
+    fx.origin_branch(
+        "b1",
+        &[
+            ("src/a.txt", SRC_ONE),
+            ("docs/api/guide.md", b"g changed\n"),
+        ],
+    );
+    let clone = fx.clone(false);
+    clone_edit_src(&fx, &clone, SRC_UNO);
+    assert!(matches!(
+        clone.cherry_pick("origin/b1", "t", None, None).unwrap_err(),
+        Error::PickConflicts(1)
+    ));
+    std::fs::remove_file(clone.layout().dot_sc.join("PICK_DECIDED_ROOT")).unwrap();
+    clone
+        .resolve_path("src/a.txt", ResolveSide::Ours, None)
+        .unwrap();
+    let err = clone.commit("t", "pick").unwrap_err();
+    assert!(
+        matches!(err, Error::PartialCloneUnsupported(_)),
+        "got {err:?}"
+    );
+    assert!(clone.pick_in_progress(), "the state is kept");
+    clone.cherry_pick_abort().unwrap();
+    assert!(!clone.pick_in_progress());
+    drop(clone);
+    fx.cleanup();
+}
