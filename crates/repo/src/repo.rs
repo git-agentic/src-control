@@ -191,6 +191,10 @@ impl Repo {
         let Some(root) = decided_root else {
             return Ok(tracked);
         };
+        // A path the operation wrote in plaintext is part of the outcome too,
+        // though no tree holds it: the user's resolution of it is read even
+        // under an ignore rule. An absent one stays absent.
+        tracked.extend(crate::conflict_plaintext::read(&self.layout)?);
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         let ids = if self.promisor()?.is_some() {
@@ -1868,7 +1872,14 @@ impl Repo {
                 Err(_) => false,
             };
             if remove {
-                let _ = std::fs::remove_file(worktree::safe_join(&self.layout.root, &path)?);
+                // Only an already-absent file is fine: any other failure must
+                // stop the abort before its state is cleared, or the decrypted
+                // text stays on disk with nothing left to retry.
+                match std::fs::remove_file(worktree::safe_join(&self.layout.root, &path)?) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         Ok(())

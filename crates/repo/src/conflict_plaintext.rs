@@ -1,5 +1,6 @@
 //! The paths a stopped merge, cherry-pick or rebase wrote to the working tree
-//! as plaintext (`.sc/CONFLICT_PLAINTEXT`, one path per line).
+//! as plaintext (`.sc/CONFLICT_PLAINTEXT`, NUL-separated: a path can hold a
+//! newline but never a NUL).
 //!
 //! A protected path's conflict text, or a clean content merge of one, is never
 //! put in the CAS (ADR-0025), so no tree records that the file was written.
@@ -29,7 +30,7 @@ pub(crate) fn write(layout: &Layout, paths: &[String]) -> Result<()> {
         return clear(layout);
     }
     let tmp = layout.dot_sc.join("CONFLICT_PLAINTEXT.tmp");
-    std::fs::write(&tmp, paths.join("\n") + "\n")?;
+    std::fs::write(&tmp, paths.join("\0"))?;
     std::fs::rename(&tmp, path(layout))?;
     Ok(())
 }
@@ -37,7 +38,11 @@ pub(crate) fn write(layout: &Layout, paths: &[String]) -> Result<()> {
 /// The recorded paths, empty when there is no record.
 pub(crate) fn read(layout: &Layout) -> Result<BTreeSet<String>> {
     match std::fs::read_to_string(path(layout)) {
-        Ok(text) => Ok(text.lines().map(str::to_string).collect()),
+        Ok(text) => Ok(text
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
         Err(e) => Err(e.into()),
     }
@@ -68,6 +73,12 @@ mod tests {
         assert_eq!(
             read(&layout).unwrap().into_iter().collect::<Vec<_>>(),
             vec!["a/b.txt", "c.txt"]
+        );
+        write(&layout, &["odd\nname.txt".into()]).unwrap();
+        assert_eq!(
+            read(&layout).unwrap().into_iter().collect::<Vec<_>>(),
+            vec!["odd\nname.txt"],
+            "a newline in a path survives"
         );
         write(&layout, &[]).unwrap();
         assert!(read(&layout).unwrap().is_empty(), "an empty list clears");
