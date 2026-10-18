@@ -13,18 +13,18 @@ use crate::error::Error;
 use crate::refs;
 use crate::repo::Repo;
 
-const SRC_A: &[u8] = b"one\ntwo\nthree\n";
+pub(crate) const SRC_A: &[u8] = b"one\ntwo\nthree\n";
 
-struct Fx {
-    origin_root: PathBuf,
-    clone_root: PathBuf,
-    origin: Repo,
+pub(crate) struct Fx {
+    pub(crate) origin_root: PathBuf,
+    pub(crate) clone_root: PathBuf,
+    pub(crate) origin: Repo,
 }
 
 impl Fx {
     /// An origin on `main` at one commit, with `extra` written into that first
     /// commit by the caller-supplied closure.
-    fn origin(tag: &str, extra: impl FnOnce(&Path)) -> Fx {
+    pub(crate) fn origin(tag: &str, extra: impl FnOnce(&Path)) -> Fx {
         let pid = std::process::id();
         let base = std::env::temp_dir();
         let origin_root = base.join(format!("scl-p37c-{tag}-origin-{pid}"));
@@ -52,7 +52,7 @@ impl Fx {
 
     /// Cut `name` from the origin's `main`, write `files` on it, commit, and
     /// return to `main`. Returns the new tip.
-    fn origin_branch(&self, name: &str, files: &[(&str, &[u8])]) -> ObjectId {
+    pub(crate) fn origin_branch(&self, name: &str, files: &[(&str, &[u8])]) -> ObjectId {
         self.origin.branch(name).unwrap();
         self.origin.switch(name).unwrap();
         for (p, bytes) in files {
@@ -64,7 +64,7 @@ impl Fx {
     }
 
     /// A `--filter src/` clone, lazy or not, that has fetched every origin branch.
-    fn clone(&self, lazy: bool) -> Repo {
+    pub(crate) fn clone(&self, lazy: bool) -> Repo {
         let clone = Repo::clone_url_filtered(
             self.origin_root.to_str().unwrap(),
             &self.clone_root,
@@ -76,7 +76,7 @@ impl Fx {
         clone
     }
 
-    fn cleanup(self) {
+    pub(crate) fn cleanup(self) {
         drop(self.origin);
         for r in [&self.origin_root, &self.clone_root] {
             if r.exists() {
@@ -87,16 +87,16 @@ impl Fx {
     }
 }
 
-fn has(repo: &Repo, id: &ObjectId) -> bool {
+pub(crate) fn has(repo: &Repo, id: &ObjectId) -> bool {
     repo.vfs().store().lock().unwrap().contains(id)
 }
 
-fn blob_id(bytes: &[u8]) -> ObjectId {
+pub(crate) fn blob_id(bytes: &[u8]) -> ObjectId {
     Object::blob(bytes.to_vec()).id()
 }
 
 /// The tree id of directory `name` directly under `snap`'s root.
-fn dir_id(repo: &Repo, snap: &ObjectId, name: &str) -> ObjectId {
+pub(crate) fn dir_id(repo: &Repo, snap: &ObjectId, name: &str) -> ObjectId {
     let arc = repo.vfs().store();
     let mut s = arc.lock().unwrap();
     let root = s.get_snapshot(snap).unwrap().root;
@@ -104,7 +104,7 @@ fn dir_id(repo: &Repo, snap: &ObjectId, name: &str) -> ObjectId {
 }
 
 /// Commit an edit to `src/a.txt` on the clone's `main`.
-fn clone_edit_src(fx: &Fx, clone: &Repo, bytes: &[u8]) {
+pub(crate) fn clone_edit_src(fx: &Fx, clone: &Repo, bytes: &[u8]) {
     std::fs::write(fx.clone_root.join("src/a.txt"), bytes).unwrap();
     clone.commit("t", "ours").unwrap();
 }
@@ -420,7 +420,7 @@ fn a_conflict_outside_the_view_is_refused_before_any_write() {
 }
 
 /// An origin whose `vault/` is protected for `pk` (rule plus ciphertext).
-fn protected_origin(tag: &str, pk: &scl_crypto::PublicKey) -> Fx {
+pub(crate) fn protected_origin(tag: &str, pk: &scl_crypto::PublicKey) -> Fx {
     let fx = Fx::origin(tag, |root| {
         std::fs::create_dir_all(root.join("vault")).unwrap();
         std::fs::write(root.join("vault/s.txt"), b"l1\nl2\nl3\n").unwrap();

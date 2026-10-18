@@ -208,6 +208,10 @@ impl Repo {
         author: &str,
         message: &str,
     ) -> Result<ObjectId> {
+        // The parent's view closure can hold an in-view subtree no earlier step
+        // filled (a rebase accumulator that carried it): fill it before the
+        // tracked paths are read from it (lazy partial clones only).
+        self.ensure_view(self.snapshot(&parent)?.root, &self.sparse_spec()?)?;
         let files = worktree::read_worktree(&self.layout, &self.tracked_paths_at(Some(parent))?)?;
         // Pick/rebase completion opens its own main cache. It saves right
         // after `snapshot_files` (before the caller moves the ref): the sealed
@@ -408,13 +412,17 @@ impl Repo {
         // (non-conflicted) pick/rebase fold still has `decided_root: None`
         // and keeps using the single-tip graft path, unaffected.
         //
-        // A conflicted MERGE completion is the exception (ADR-0049 decision
-        // 8): the conflict recorded a decided root holding the merge's whole
-        // outcome, carried subtrees included, so the out-of-view part is
-        // grafted from it below. A merge with no decided root, and every
-        // pick or rebase completion, still refuse.
-        let merge_completion = merge_head.is_some() && decided_root.is_some();
-        if partial && !merge_completion && (decided_root.is_some() || merge_head.is_some()) {
+        // A conflicted merge, pick or rebase completion is the exception
+        // (ADR-0049 decisions 8 and 10): the conflict recorded a decided root
+        // holding the operation's whole outcome, carried subtrees included,
+        // so the out-of-view part is grafted from it below. One with no
+        // decided root still refuses.
+        let merge_completion =
+            (merge_head.is_some() || pick_head.is_some()) && decided_root.is_some();
+        if partial
+            && !merge_completion
+            && (decided_root.is_some() || merge_head.is_some() || pick_head.is_some())
+        {
             return Err(crate::promisor::partial_clone_unsupported(
                 "merge/pick completion",
             ));
@@ -1797,6 +1805,32 @@ impl Repo {
         Ok(conflict_root)
     }
 
+    /// Remove the `<path>.theirs` sidecars a stopped merge, pick or rebase
+    /// wrote for `paths`, except a file any of `roots` tracks: that one is the
+    /// user's own and was just restored. A failed lookup counts as tracked: a
+    /// stray sidecar is harmless, deleting a tracked file is not. Call it after
+    /// the restore, so a restore that fails leaves the sidecars to retry.
+    pub(crate) fn remove_conflict_sidecars(
+        &self,
+        paths: &[String],
+        roots: &[ObjectId],
+    ) -> Result<()> {
+        let partial = self.promisor()?.is_some();
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        for path in paths {
+            let sidecar = format!("{path}.theirs");
+            let tracked = roots.iter().any(|root| {
+                worktree::tree_entry_at(&mut store, *root, &sidecar, partial)
+                    .map_or(true, |e| e.is_some())
+            });
+            if !tracked {
+                let _ = std::fs::remove_file(self.layout.root.join(sidecar));
+            }
+        }
+        Ok(())
+    }
+
     /// Abandon an in-progress merge: restore the working tree to the current tip
     /// and clear merge state. Errors if no merge is in progress.
     ///
@@ -1822,16 +1856,7 @@ impl Repo {
         // the deletion pass drops files the conflicted merge pulled in from
         // theirs; materializing against ours==old would delete nothing.
         let mut skipped = Vec::new();
-        // Sidecars (`<path>.theirs`) this abort may remove: not a file either
-        // side tracks, which would be the user's own and was just restored.
-        // A lookup that fails is treated as tracked: a stray sidecar is
-        // harmless, deleting a tracked file is not.
-        let mut removable: Vec<String> = Vec::new();
-        let partial = self.promisor()?.is_some();
-        let sidecars = crate::merge_state::read_conflicts(&self.layout)?
-            .into_iter()
-            .map(|p| format!("{p}.theirs"))
-            .collect::<Vec<_>>();
+        let mut sidecar_roots: Vec<ObjectId> = Vec::new();
         let ours_tip = self.head_tip()?;
         if let Some(ours_id) = ours_tip {
             let store_arc = self.vfs.store();
@@ -1840,15 +1865,7 @@ impl Repo {
             let ours_root = ours_snap.root;
             let ours_protection = ours_snap.protection;
             let theirs_root = store.get_snapshot(&theirs_id)?.root;
-            for sidecar in sidecars {
-                let tracked = [ours_root, theirs_root].iter().any(|root| {
-                    worktree::tree_entry_at(&mut store, *root, &sidecar, partial)
-                        .map_or(true, |e| e.is_some())
-                });
-                if !tracked {
-                    removable.push(sidecar);
-                }
-            }
+            sidecar_roots = vec![ours_root];
             // No identity at abort time: protected files in ours are skipped
             // (not decrypted). With nothing decrypted, `materialize` records
             // nothing into a cache, so pass `None` — no cache to open or save
@@ -1864,12 +1881,11 @@ impl Repo {
                 &self.sparse_spec()?,
                 None,
             )?;
-        } else {
-            removable = sidecars;
         }
-        for sidecar in removable {
-            let _ = std::fs::remove_file(self.layout.root.join(sidecar));
-        }
+        self.remove_conflict_sidecars(
+            &crate::merge_state::read_conflicts(&self.layout)?,
+            &sidecar_roots,
+        )?;
         crate::merge_state::clear(&self.layout)?;
         Ok(skipped)
     }

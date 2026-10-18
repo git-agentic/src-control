@@ -239,4 +239,37 @@ cmp "$CFULL/docs/api/big.bin" "$W/conflict-feature-big.bin" || fail "feature's d
 echo "push + full re-clone: resolution and carried docs both present ✔"
 
 echo
-echo "RESULT: lazy by-id fetch verified (path-only fetch, offline/non-lazy gap errors, http v5, widen/commit/push/undo, merge, conflict)"
+echo "=== 11: cherry-pick and rebase carry the other side's region unread (ADR-0049) ==="
+PORIGIN="$W/porigin"
+mkdir -p "$PORIGIN"
+(
+  cd "$PORIGIN"
+  "$SC" init >/dev/null
+  mkdir -p src docs/api
+  printf 'one\ntwo\nthree\n' > src/a.txt
+  head -c 65536 /dev/urandom | od -An -tx1 | tr -d ' \n' > docs/api/big.bin
+  "$SC" commit -m "base" --author demo >/dev/null
+  "$SC" branch feature
+  "$SC" switch feature >/dev/null
+  head -c 65536 /dev/urandom | od -An -tx1 | tr -d ' \n' > docs/api/big.bin
+  cp docs/api/big.bin "$W/pick-feature-big.bin"
+  "$SC" commit -m "feature edits docs" --author demo >/dev/null
+  "$SC" switch main >/dev/null
+)
+for OP in cherry-pick rebase; do
+  PCLONE="$W/replay-$OP"
+  "$SC" clone --filter src/ --lazy "$PORIGIN" "$PCLONE" >/dev/null
+  printf 'one\nTWO\nthree\n' > "$PCLONE/src/a.txt"
+  (cd "$PCLONE" && "$SC" commit -m "local src edit" --author demo >/dev/null && "$SC" fetch origin >/dev/null)
+  PBEFORE=$(objects "$PCLONE")
+  (cd "$PCLONE" && "$SC" "$OP" origin/feature --author demo >/dev/null 2>&1) || fail "$OP on a partial clone must succeed"
+  [ ! -e "$PCLONE/docs" ] || fail "docs/ is outside the view and must not be written ($OP)"
+  [ "$(cat "$PCLONE/src/a.txt")" = "$(printf 'one\nTWO\nthree')" ] || fail "the local src edit must survive $OP"
+  PAFTER=$(objects "$PCLONE")
+  [ "$(($PAFTER - $PBEFORE))" -le 8 ] || fail "$OP must not fetch the other side's region ($PBEFORE -> $PAFTER)"
+  (cd "$PCLONE" && "$SC" verify >/dev/null) || fail "verify must work after $OP"
+  echo "$OP on a lazy partial clone: docs/ untouched and unfetched ($PBEFORE -> $PAFTER objects) ✔"
+done
+
+echo
+echo "RESULT: lazy by-id fetch verified (path-only fetch, offline/non-lazy gap errors, http v5, widen/commit/push/undo, merge, conflict, cherry-pick/rebase)"
