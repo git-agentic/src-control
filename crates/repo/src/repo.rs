@@ -1800,10 +1800,12 @@ impl Repo {
             }
         }
         // The stop writes plaintext and sidecars with plain writes, outside
-        // `materialize`. A file already on disk at one of those paths that
-        // `old_root` does not track is the user's own (an ignored or untracked
-        // copy): the write would replace it, and abort would then delete it.
-        // Refuse instead (ADR-0049 q21). A lookup that fails counts as tracked.
+        // `materialize`. A file or directory already on disk at one of those
+        // paths that `old_root` does not track is the user's own (an ignored or
+        // untracked copy, or a leftover sidecar): the write would replace it,
+        // and abort would then delete it. A file standing where a parent
+        // directory must be would fail the write halfway. Refuse both before
+        // any write (ADR-0049 q21). A lookup that fails counts as untracked.
         {
             let partial = self.promisor()?.is_some();
             let store_arc = self.vfs.store();
@@ -1814,6 +1816,17 @@ impl Repo {
                 .chain(sidecars.iter().map(|(r, _)| r.as_str()));
             for rel in targets {
                 let full = worktree::safe_join(&self.layout.root, rel)?;
+                let blocked_parent = full.ancestors().skip(1).any(|a| {
+                    a.starts_with(&self.layout.root)
+                        && a != self.layout.root
+                        && a.symlink_metadata().is_ok_and(|m| !m.is_dir())
+                });
+                if blocked_parent {
+                    return Err(Error::InvalidArgument(format!(
+                        "merge has conflicts, and a file stands where a directory for {rel} must be; \
+                         move that file away, then retry"
+                    )));
+                }
                 if full.symlink_metadata().is_err() {
                     continue;
                 }
@@ -1822,11 +1835,12 @@ impl Repo {
                 // is the user's own.
                 let tracked = sparse.matches(rel)
                     && worktree::tree_entry_at(&mut store, old_root, rel, partial)
-                        .map_or(true, |e| e.is_some());
+                        .is_ok_and(|e| e.is_some());
                 if !tracked {
                     return Err(Error::InvalidArgument(format!(
                         "merge has conflicts, and writing {rel} would overwrite an untracked or \
-                         ignored file; move that file away, then retry"
+                         ignored file or directory (possibly a sidecar left by an earlier stop); \
+                         move it away, then retry"
                     )));
                 }
             }

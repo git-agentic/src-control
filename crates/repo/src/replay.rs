@@ -2869,6 +2869,85 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A binary conflict writes `<path>.theirs`. An untracked file already
+    /// there (a leftover from an earlier stop, or the user's own) is refused,
+    /// not overwritten.
+    #[test]
+    fn a_binary_conflict_stop_refuses_over_an_untracked_sidecar() {
+        let root = tmp_root("mg-sidecar-untracked");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfebase\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeOURS\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeTHEIRS\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("bin.dat.theirs"), b"leftover\n").unwrap();
+
+        let err = repo.merge("work", "me").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("overwrite an untracked")),
+            "got {err:?}"
+        );
+        assert!(!repo.merge_in_progress());
+        assert_eq!(
+            std::fs::read(root.join("bin.dat.theirs")).unwrap(),
+            b"leftover\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("bin.dat")).unwrap(),
+            b"\xff\xfeOURS\n"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A file where a parent directory of a plaintext path must be fails the
+    /// write halfway; the stop refuses before writing anything instead.
+    #[test]
+    fn a_conflict_stop_refuses_when_a_file_blocks_a_parent_directory() {
+        let root = tmp_root("cp-prot-blocked-parent");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::remove_file(root.join("secret/a.txt")).unwrap();
+        std::fs::write(root.join(".scignore"), b"secret\n").unwrap();
+        repo.commit("me", "main deletes and ignores").unwrap();
+        repo.switch("work").unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"EDITED\nl2\nl3\n").unwrap();
+        repo.commit("me", "work edits").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        // The user keeps an ignored FILE named `secret`.
+        let _ = std::fs::remove_dir_all(root.join("secret"));
+        std::fs::write(root.join("secret"), b"not a directory\n").unwrap();
+
+        let err = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("stands where a directory")),
+            "got {err:?}"
+        );
+        assert!(!repo.pick_in_progress());
+        assert!(
+            !root.join(".sc/CONFLICT_PLAINTEXT").exists(),
+            "nothing written"
+        );
+        assert_eq!(
+            std::fs::read(root.join("secret")).unwrap(),
+            b"not a directory\n"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn cherry_pick_protected_conflict_writes_plaintext_markers_worktree_only() {
         // Same-line edits of secret/a.txt on both sides: the pick conflicts.
