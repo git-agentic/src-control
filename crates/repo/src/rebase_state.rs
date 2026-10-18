@@ -230,6 +230,7 @@ pub fn clear(layout: &Layout) -> Result<()> {
     remove_if_exists(&state_path(layout))?;
     remove_if_exists(&conflicts_path(layout))?;
     remove_if_exists(&decided_root_path(layout))?;
+    crate::conflict_plaintext::clear(layout)?;
     Ok(())
 }
 

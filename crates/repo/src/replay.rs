@@ -657,6 +657,9 @@ impl Repo {
                 None,
             )?;
         }
+        if let Some(root) = sidecar_roots.first() {
+            self.remove_conflict_plaintext(*root)?;
+        }
         self.remove_conflict_sidecars(
             &crate::pick_state::read_conflicts(&self.layout)?,
             &sidecar_roots,
@@ -1304,6 +1307,7 @@ impl Repo {
                 None,
             )?
         };
+        self.remove_conflict_plaintext(snap.root)?;
         self.remove_conflict_sidecars(
             &crate::rebase_state::read_conflicts(&self.layout)?,
             &[snap.root],
@@ -2482,6 +2486,161 @@ mod tests {
             b"OURS\nl2\nTHEIRS\n".to_vec()
         );
 
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Base has a plain `secret/a.txt`. `main` then protects `secret/` (so the
+    /// file becomes ciphertext) while `work` deletes the plain file. Picking
+    /// `work` onto `main` is a delete-versus-modify conflict on a protected
+    /// path. Returns the repo, its root, the recipient key and `main`'s tip.
+    fn protected_delete_modify_pick(
+        tag: &str,
+    ) -> (Repo, std::path::PathBuf, scl_crypto::SecretKey) {
+        let root = tmp_root(tag);
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("keep.txt"), b"k\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        repo.switch("work").unwrap();
+        std::fs::remove_file(root.join("secret/a.txt")).unwrap();
+        repo.commit("me", "work deletes").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        let err = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert!(
+            root.join("secret/a.txt").exists(),
+            "plaintext surviving side"
+        );
+        (repo, root, alice_sk)
+    }
+
+    /// ADR-0049 q16: such a conflict resolved by deleting the file stays
+    /// deleted at completion. The plaintext conflict path is not in the decided
+    /// root, so the absent-protected carry used to bring the parent's
+    /// ciphertext back.
+    #[test]
+    fn resolving_a_protected_delete_modify_conflict_to_deletion_sticks() {
+        let (repo, root, alice_sk) = protected_delete_modify_pick("cp-prot-delete");
+        repo.resolve_path(
+            "secret/a.txt",
+            crate::conflicts::ResolveSide::Theirs,
+            Some(&alice_sk),
+        )
+        .unwrap();
+        assert!(!root.join("secret/a.txt").exists());
+        let id = repo.commit("me", "pick: delete").unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        let arc = repo.vfs().store();
+        let mut store = arc.lock().unwrap();
+        let entries = worktree::tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+        assert!(
+            !entries.contains_key("secret/a.txt"),
+            "the deletion must stick, got {:?}",
+            entries.keys().collect::<Vec<_>>()
+        );
+        assert!(entries.contains_key("keep.txt"));
+        drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ADR-0049 q18: aborting that pick removes the decrypted conflict text it
+    /// wrote. Abort has no identity, so the restored protected file is skipped,
+    /// and materialize neither writes nor deletes a skipped path.
+    #[test]
+    fn aborting_a_protected_conflict_leaves_no_plaintext_on_disk() {
+        let (repo, root, _sk) = protected_delete_modify_pick("cp-prot-abort");
+        repo.cherry_pick_abort().unwrap();
+        assert!(!repo.pick_in_progress());
+        assert!(
+            !root.join("secret/a.txt").exists(),
+            "decrypted conflict text must not outlive the abort"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ADR-0049 q18, the variant where the conflict text lives in neither the
+    /// original nor the decided root: base has a plain `secret/a.txt`, `main`
+    /// deletes it, `work` protects `secret/` and edits it. The pick stops on a
+    /// delete-versus-modify conflict and writes the decrypted text to disk;
+    /// abort must remove it.
+    #[test]
+    fn aborting_a_conflict_whose_text_is_in_no_root_leaves_no_plaintext() {
+        let root = tmp_root("cp-prot-abort2");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("keep.txt"), b"k\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::remove_file(root.join("secret/a.txt")).unwrap();
+        repo.commit("me", "main deletes").unwrap();
+        repo.switch("work").unwrap();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"EDITED\nl2\nl3\n").unwrap();
+        repo.commit("me", "work edits").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        let err = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert!(root.join("secret/a.txt").exists(), "plaintext on disk");
+
+        repo.cherry_pick_abort().unwrap();
+        assert!(
+            !root.join("secret/a.txt").exists(),
+            "decrypted conflict text must not outlive the abort"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ADR-0049 q19: a file the picked commit adds that the completion parent's
+    /// `.scignore` covers is part of the pick's outcome, so completing the pick
+    /// keeps it. Ignore rules hide untracked files only, and the decided root
+    /// says the file is tracked.
+    #[test]
+    fn completing_a_conflicted_pick_keeps_an_added_file_the_parent_ignores() {
+        let root = tmp_root("cp-ignored-added");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join(".scignore"), b"gen/\n").unwrap();
+        std::fs::write(root.join("a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        repo.commit("me", "main ignores gen and edits").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::create_dir_all(root.join("gen")).unwrap();
+        std::fs::write(root.join("gen/x.txt"), b"generated\n").unwrap();
+        std::fs::write(root.join("a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        repo.commit("me", "work adds gen and edits").unwrap();
+        repo.switch("main").unwrap();
+
+        let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        assert!(root.join("gen/x.txt").exists(), "the pick laid it out");
+        repo.resolve_path("a.txt", crate::conflicts::ResolveSide::Ours, None)
+            .unwrap();
+        let id = repo.commit("me", "pick").unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        let arc = repo.vfs().store();
+        let mut store = arc.lock().unwrap();
+        let entries = worktree::tree_file_entries_with_perms(&mut store, snap.root).unwrap();
+        assert!(
+            entries.contains_key("gen/x.txt"),
+            "the added file must be kept, got {:?}",
+            entries.keys().collect::<Vec<_>>()
+        );
+        drop(store);
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
     }
