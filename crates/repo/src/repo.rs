@@ -412,11 +412,11 @@ impl Repo {
         // (non-conflicted) pick/rebase fold still has `decided_root: None`
         // and keeps using the single-tip graft path, unaffected.
         //
-        // A conflicted MERGE completion is the exception (ADR-0049 decision
-        // 8): the conflict recorded a decided root holding the merge's whole
-        // outcome, carried subtrees included, so the out-of-view part is
-        // grafted from it below. A merge with no decided root, and every
-        // pick or rebase completion, still refuse.
+        // A conflicted merge, pick or rebase completion is the exception
+        // (ADR-0049 decisions 8 and 10): the conflict recorded a decided root
+        // holding the operation's whole outcome, carried subtrees included,
+        // so the out-of-view part is grafted from it below. One with no
+        // decided root still refuses.
         let merge_completion =
             (merge_head.is_some() || pick_head.is_some()) && decided_root.is_some();
         if partial
@@ -1865,7 +1865,7 @@ impl Repo {
             let ours_root = ours_snap.root;
             let ours_protection = ours_snap.protection;
             let theirs_root = store.get_snapshot(&theirs_id)?.root;
-            sidecar_roots = vec![ours_root, theirs_root];
+            sidecar_roots = vec![ours_root];
             // No identity at abort time: protected files in ours are skipped
             // (not decrypted). With nothing decrypted, `materialize` records
             // nothing into a cache, so pass `None` — no cache to open or save

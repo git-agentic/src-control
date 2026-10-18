@@ -116,18 +116,6 @@ Flatten drops empty directories and directory metadata and rebuilds directories 
 
 **`sc conflicts` and `sc resolve`** look a path up by descending its components (`entry_at`) instead of flattening a whole tree. A missing tree on the way is a gap error that names the path, never `Absent`: an absent side means the path is not in that snapshot, and a gap must not read as a deletion. On a full clone the result is identical.
 
-### 10. Replay: cherry-pick and rebase (amended in 37c-iv)
-
-Replay is a three-way merge with a different base, and `replay_commit` is the only place cherry-pick and the rebase fold reach the file merge (`replay.rs:176` is the one guard that refuses a partial clone). So replay uses the engine of decisions 2 to 5 and the conflict contract of decision 8, and adds only what the fold needs.
-
-- **The merge.** On a partial clone `replay_commit` calls `tree_merge_filled` with base = the replayed commit's parent (or the `--mainline` parent, or none for a root commit), ours = the onto tree, theirs = the commit. It fills outside the store lock, as merge does. Registry merging is unchanged: it is snapshot-level and already runs before the file replay.
-- **Clean result.** The root is the enumerated files plus the carried subtrees (or the carried root), exactly as in merge. The wrap map is `merged_wraps` (the complete input union when anything was carried, else the existing prune). An `Empty` outcome still means the root equals the onto root and the commit's own rule delta is nil.
-- **The fold's accumulator** (`acc_root`, `acc_protection`) may itself contain absent subtrees, because an earlier step carried them. That needs nothing new: the next step's engine pass sees an onto tree it may not hold and asks for what it reads. What the fold must add is the view: before the final materialize, `ensure_view(acc_root)` runs outside the store lock, and no ref, spec or working-tree file is written until it and the preflight succeed. The intermediate snapshots are CAS-only, so they stay unconstrained.
-- **Conflict state** is decision 8 applied: `PICK_DECIDED_ROOT` and `REBASE_DECIDED_ROOT` hold the CAS-safe entries plus the carried subtrees, nothing is sealed while the op is open, and the same three refusals fire before any write (conflict outside the view, sidecar outside the view or over a tracked file, plaintext to seal outside the view). `ReplayOutcome::Conflicts` therefore carries the subtrees.
-- **Completion.** `snapshot_files` accepts a recorded decided root for a pick or a rebase step as it does for a merge, grafts the out-of-view part from it, and keeps the union of the tip's and the picked commit's wraps. `rebase --continue` reads its parent's view first, since the accumulator can hold an in-view subtree no earlier step filled. A pick or rebase completion with no decided root still refuses.
-- **Abort.** `cherry-pick --abort` and `rebase --abort` check the view before they delete anything and remove only sidecars that no tree tracks, the same as `merge --abort`. The same rule now holds for the sidecar cleanup in `rebase --continue`.
-- **Unchanged.** A rebase over a range that contains a merge commit still refuses before replaying anything. Sessions (`sc ws`, `sc work`) stay refused.
-
 ### 9. Acceptance: differential tests built from real operations
 
 `merge_trees` is checked against the flatten implementation, with both using the content/mode split of decision 1. The comparison is on **decrypted file sets, modes, perms, conflict sets, sidecars, effective rules and tombstones, the recipient set each protected blob is wrapped for, and actual decryption by each relevant identity**, not on wrap-map key coverage (which can pass with a missing recipient or a wrong DEK). Carried objects compare by bytes; freshly sealed output after decryption, because sealing is randomized. Cases are generated through real operations (`protect`, `grant`, `revoke`, commit, fetch) as well as arbitrary trees, and gaps are randomized independently of the sparse view and the filter. Required named cases:
@@ -143,6 +131,18 @@ Replay is a three-way merge with a different base, and `replay_commit` is the on
 - merge then gc, and an interrupted fill then retry.
 
 A second differential runs each merge on a partial clone and a full clone. The new engine is wired only for partial clones first; full clones keep the flatten path (with the decision 1 leaf key) until the differential has run clean for a release.
+
+### 10. Replay: cherry-pick and rebase (amended in 37c-iv)
+
+Replay is a three-way merge with a different base, and `replay_commit` is the only place cherry-pick and the rebase fold reach the file merge (its guard against partial clones, `partial_clone_unsupported("cherry-pick/rebase replay")`, is what this decision removes). So replay uses the engine of decisions 2 to 5 and the conflict contract of decision 8, and adds only what the fold needs.
+
+- **The merge.** On a partial clone `replay_commit` calls `tree_merge_filled` with base = the replayed commit's parent (or the `--mainline` parent, or none for a root commit), ours = the onto tree, theirs = the commit. It fills outside the store lock, as merge does. Registry merging is unchanged: it is snapshot-level and already runs before the file replay.
+- **Clean result.** The root is the enumerated files plus the carried subtrees (or the carried root), exactly as in merge. The wrap map is `merged_wraps` (the complete input union when anything was carried, else the existing prune). An `Empty` outcome still means the root equals the onto root and the commit's own rule delta is nil.
+- **The fold's accumulator** (`acc_root`, `acc_protection`) may itself contain absent subtrees, because an earlier step carried them. That needs nothing new: the next step's engine pass sees an onto tree it may not hold and asks for what it reads. What the fold must add is the view: before the final materialize, `ensure_view(acc_root)` runs outside the store lock, and no ref, spec or working-tree file is written until it and the preflight succeed. The intermediate snapshots are CAS-only, so they stay unconstrained.
+- **Conflict state** is decision 8 applied: `PICK_DECIDED_ROOT` and `REBASE_DECIDED_ROOT` hold the CAS-safe entries plus the carried subtrees, nothing is sealed while the op is open, and the same three refusals fire before any write (conflict outside the view, sidecar outside the view or over a tracked file, plaintext to seal outside the view). `ReplayOutcome::Conflicts` therefore carries the subtrees.
+- **Completion.** `snapshot_files` accepts a recorded decided root for a pick or a rebase step as it does for a merge, grafts the out-of-view part from it, and keeps the union of the tip's and the picked commit's wraps. `rebase --continue` reads its parent's view first, since the accumulator can hold an in-view subtree no earlier step filled. A pick or rebase completion with no decided root still refuses.
+- **Abort.** `cherry-pick --abort` and `rebase --abort` check the view before they delete anything and remove only sidecars the restored tree does not track, the same as `merge --abort`. `rebase --continue` removes only sidecars its completion parent does not track. A sidecar the user left behind and a commit swept up is the existing defect of q19's kind: completion reads untracked files.
+- **Unchanged.** A rebase over a range that contains a merge commit still refuses before replaying anything. Sessions (`sc ws`, `sc work`) stay refused.
 
 ## Phasing
 

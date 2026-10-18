@@ -507,3 +507,78 @@ fn a_stopped_pick_without_its_decided_root_refuses_to_complete() {
     drop(clone);
     fx.cleanup();
 }
+
+/// A rebase abort that hits a gap in the view changes nothing: the rebase is
+/// still open and the sidecar is still there.
+#[test]
+fn a_rebase_abort_that_hits_a_view_gap_changes_nothing() {
+    let fx = Fx::origin("rebase-abort-gap", |_| {});
+    fx.origin_branch("b1", &[("src/a.txt", b"\xff\xfeTHEIRS\n")]);
+    let clone = fx.clone(false);
+    clone_edit_src(&fx, &clone, b"\xff\xfeOURS\n");
+    let ours = refs::read_branch_tip(clone.layout(), "main")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        clone.rebase("origin/b1", "t", None).unwrap(),
+        RebaseResult::Stopped { .. }
+    ));
+    let sidecar = fx.clone_root.join("src/a.txt.theirs");
+    assert!(sidecar.exists());
+    let src = dir_id(&clone, &ours, "src");
+    clone.vfs().store().lock().unwrap().delete(&src).unwrap();
+    let err = clone.rebase_abort().unwrap_err();
+    assert!(matches!(err, Error::GapInView { .. }), "got {err:?}");
+    assert!(clone.rebase_in_progress(), "still open");
+    assert!(sidecar.exists(), "sidecar still there");
+    drop(clone);
+    fx.cleanup();
+}
+
+/// Two replayed steps over a protected subtree no commit touched: it is carried
+/// at every step, so the final snapshot keeps its wraps and the recipient still
+/// decrypts it.
+#[test]
+fn a_two_step_rebase_keeps_the_wraps_of_a_carried_protected_subtree() {
+    let (sk, pk) = scl_crypto::generate_keypair();
+    let fx = protected_origin("rebase-wraps", &pk);
+    let base = fx.origin.head_tip().unwrap().unwrap();
+    let base_snap = fx.origin.snapshot(&base).unwrap();
+    let vault = dir_id(&fx.origin, &base, "vault");
+    fx.origin_branch("b1", &[("docs/a.md", b"a1\n")]);
+    let clone = fx.clone(false);
+    assert!(!has(&clone, &vault));
+    std::fs::write(fx.clone_root.join("src/a.txt"), SRC_UNO).unwrap();
+    clone.commit("t", "local 1").unwrap();
+    std::fs::write(fx.clone_root.join("src/n.txt"), b"n\n").unwrap();
+    clone.commit("t", "local 2").unwrap();
+
+    let RebaseResult::Rebased {
+        new_tip, replayed, ..
+    } = clone.rebase("origin/b1", "t", None).unwrap()
+    else {
+        panic!("expected a rebase");
+    };
+    assert_eq!(replayed, 2);
+    let snap = clone.snapshot(&new_tip).unwrap();
+    assert_eq!(dir_id(&clone, &new_tip, "vault"), vault);
+    assert!(!has(&clone, &vault));
+    for (blob, wraps) in &base_snap.protection.wrapped {
+        assert_eq!(snap.protection.wrapped.get(blob), Some(wraps));
+    }
+    let (cipher_id, _) = base_snap.protection.wrapped.iter().next().unwrap();
+    let cipher = {
+        let arc = fx.origin.vfs().store();
+        let mut s = arc.lock().unwrap();
+        match s.get(cipher_id).unwrap() {
+            scl_core::Object::Blob(b) => b,
+            other => panic!("expected a blob, got {}", other.kind_name()),
+        }
+    };
+    let plain =
+        crate::protect::decrypt_with(&cipher, cipher_id, &[&snap.protection], &sk, "vault/s.txt")
+            .unwrap();
+    assert_eq!(&plain[..], b"l1\nl2\nl3\n");
+    drop(clone);
+    fx.cleanup();
+}

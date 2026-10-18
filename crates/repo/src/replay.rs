@@ -633,10 +633,10 @@ impl Repo {
         let mut sidecar_roots: Vec<ObjectId> = Vec::new();
         if let Some(tip) = ours_tip {
             let snap = self.snapshot(&tip)?;
+            // Only the restored tree: a file it tracks is the user's own. A
+            // path only the picked tree tracks is gone after the restore, and
+            // whatever sits there is the sidecar.
             sidecar_roots.push(snap.root);
-            if let Some(picked) = crate::pick_state::read_pick_head(&self.layout)? {
-                sidecar_roots.push(self.snapshot(&picked)?.root);
-            }
             // Fill the view's closure first (lazy partial clones only),
             // before anything is removed: a view gap must leave the stopped
             // pick intact and retryable (ADR-0049 decision 10).
@@ -1214,14 +1214,11 @@ impl Repo {
             // `materialize` never touches them itself.
             // Not a file any of the trees involved tracks (that one is the
             // user's own): see `remove_conflict_sidecars`.
-            let roots = [
-                self.snapshot(&st.acc_tip)?.root,
-                self.snapshot(&st.conflicted)?.root,
-                self.snapshot(&new_tip)?.root,
-            ];
+            // Not a file the completion's parent tracks (that one is the
+            // user's own): see `remove_conflict_sidecars`.
             self.remove_conflict_sidecars(
                 &crate::rebase_state::read_conflicts(&self.layout)?,
-                &roots,
+                &[self.snapshot(&st.acc_tip)?.root],
             )?;
             // Advance state BEFORE attempting the fold, so an error from the
             // fold below (on a later commit) leaves a retryable, idempotent
@@ -1307,12 +1304,10 @@ impl Repo {
                 None,
             )?
         };
-        let roots = [
-            snap.root,
-            self.snapshot(&st.conflicted)?.root,
-            self.snapshot(&st.acc_tip)?.root,
-        ];
-        self.remove_conflict_sidecars(&crate::rebase_state::read_conflicts(&self.layout)?, &roots)?;
+        self.remove_conflict_sidecars(
+            &crate::rebase_state::read_conflicts(&self.layout)?,
+            &[snap.root],
+        )?;
         crate::rebase_state::clear(&self.layout)?;
         Ok(skipped)
     }
