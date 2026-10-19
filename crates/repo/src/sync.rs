@@ -80,6 +80,11 @@ impl Repo {
         dst: impl AsRef<Path>,
         filter: Option<&[String]>,
     ) -> Result<Repo> {
+        // Before the network or the destination directory: a blank prefix
+        // would be persisted as a sparse line that reloads as a full view.
+        if let Some(f) = filter {
+            crate::sparse::validate_prefixes(f)?;
+        }
         let transport = open_transport(src_url)?;
         let remote_refs = transport.list_refs()?;
         let head_branch = transport.head_branch()?;
