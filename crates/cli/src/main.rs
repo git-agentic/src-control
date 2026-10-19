@@ -1098,13 +1098,21 @@ fn run_sparse(op: SparseOp) -> Result<()> {
                 );
             }
             let sk = resolve_identity_opt(identity)?;
-            let unmatched = repo.sparse_prefixes_matching_nothing(&prefixes)?;
             let skipped = repo.set_sparse(&prefixes, sk.as_ref())?;
             println!("sparse set: {} prefix(es)", prefixes.len());
-            for p in &unmatched {
+            // After the set: a lazy partial clone fills the new view during
+            // it, so a check before would warn about paths that then arrive.
+            let partial = repo.promisor()?.is_some();
+            for p in repo.sparse_prefixes_matching_nothing(&prefixes)? {
+                let way_back = if partial {
+                    "this is a partial clone: choose a prefix inside what was fetched, or run \
+                     `sc backfill --all` first and then `sc sparse disable`"
+                } else {
+                    "`sc sparse disable` restores the full checkout"
+                };
                 eprintln!(
                     "warning: prefix {p:?} matches no tracked path at HEAD, so none of it is on \
-                     disk; `sc sparse disable` restores the full checkout"
+                     disk; {way_back}"
                 );
             }
             for path in &skipped {

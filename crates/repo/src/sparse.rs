@@ -91,10 +91,10 @@ pub fn load(layout: &Layout) -> Result<Sparse> {
         Ok(text) => {
             // Blank lines (a hand edit, a trailing newline doubled) name no
             // prefix; keep them out of the spec.
+            // `trim` only decides what is blank: a prefix keeps its bytes.
             let prefixes = text
                 .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
+                .filter(|l| !l.trim().is_empty())
                 .map(String::from)
                 .collect();
             Ok(Sparse { prefixes })
@@ -742,6 +742,12 @@ mod tests {
             !spec.matches("lib/x.txt"),
             "a blank line must not widen the view"
         );
+
+        // A nonblank prefix is kept byte for byte, significant whitespace
+        // included, across a store/load round trip.
+        let odd = Sparse::new(vec![" lead/".to_string(), "trail /".to_string()]);
+        store(&layout, &odd).unwrap();
+        assert_eq!(load(&layout).unwrap().prefixes(), odd.prefixes());
         std::fs::remove_dir_all(&layout.root).unwrap();
     }
 }
