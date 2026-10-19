@@ -720,13 +720,10 @@ scale-&-reach horizon):
   limitation across different Git repos).
 - **Richer trust models** beyond trusted-key lists (delegation, expiry) —
   P22 ships the key-list model.
-- **Sidecar-cleanup footgun in `rebase_continue`.** `replay.rs:1059`'s
-  sidecar sweep blind-unlinks `{path}.theirs` with neither the
-  non-text-kind gate nor the tracked-path guard that P23 added to
-  `resolve_path` — so completing a stopped rebase can delete an untracked
-  user file named `foo.txt.theirs`. Pre-existing (predates P23); flagged
-  at the P23 final review as the twin of the resolve fix. Apply the same
-  two guards.
+- **Sidecar-cleanup footgun in `rebase_continue` — fixed (P37c).**
+  `remove_conflict_sidecars` now unlinks `{path}.theirs` only when the
+  completion's parent tree does not track it, so an untracked user file of
+  that name survives `--continue`.
 - **In-progress guard for the RECEIVING repo on push.**
   `LocalTransport::update_ref` moves a branch tip with only a CAS/ff gate
   and no in-progress check on the receiving side — a push into a repo
@@ -785,11 +782,9 @@ scale-&-reach horizon):
   `sc protect … rotate`-style genuine per-path cryptographic cutover — the
   protected-path analogue of `sc secret rotate` — is now coherent. Recorded in
   ADR-0043, not built.
-- **`sc rewrap` on partial clones (P33 final-review follow-on).** `sc rewrap`
-  loads each protected plaintext whole into RAM and has no
-  `PartialCloneUnsupported` guard, unlike merge/rebase/ws-fork/ws-harvest/`sc
-  work` (P27); a paths-only/streaming tree rebuild (or the same refusal-first
-  posture) is the follow-on.
+- **`sc rewrap` on partial clones — refused (P37).** `Repo::rewrap` calls
+  `refuse_on_partial`; a paths-only/streaming rebuild that would lift the
+  refusal remains a possible follow-on.
 - **Protected-cache hygiene (P33 final-review follow-on).** `.sc/protected-cache`
   and `.sc/ws/cache-<i>` entries for a deleted or renamed path are never
   pruned — unbounded but benign growth (a stale entry just goes unmatched).
