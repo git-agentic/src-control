@@ -277,9 +277,10 @@ too, not just the src-control-side metadata.
   - See `docs/research/tls-options-sc-http.md` §B for the full comparison
     (nginx/HAProxy/stunnel capabilities, Caddy's non-bundled layer-4 caveat)
     that this guidance is drawn from.
-- **Repo presence is not observable pre-auth (both `sc+http://` and `sc+https://`):**
+- **Repo presence is not observable from pre-auth status responses (both `sc+http://` and `sc+https://`):**
   the `404` (no repo) is written after the auth gate, so behind mandatory auth an
-  unauthenticated client gets `401` whether or not a repo is served. With no tokens
+  unauthenticated client gets `401` whether or not a repo is served (timing is not
+  equalized: a present repo costs a token-file read first). With no tokens
   configured there is no auth to leak around and a missing repo still answers `404`.
 - **Not proxy/CDN-safe** (raw post-opening protocol, both plaintext and TLS
   variants) — this remains open, deferred in [`ROADMAP.md`](../ROADMAP.md).
