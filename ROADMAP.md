@@ -730,6 +730,10 @@ scale-&-reach horizon):
   recorded in `.sc/CONFLICT_SIDECARS` unless a root tracks that path, and the
   commit then removes them; resolving by hand-editing no longer commits the
   scratch file.
+  Known limit: the sweep retires the record before it unlinks, so a crash
+  between the two leaves the scratch file on disk with no record, and a retried
+  `sc commit` would take it. The opposite order would risk deleting a file the
+  user recreated at that path; closing both needs a journal.
 - **In-progress guard for the RECEIVING repo on push.**
   `LocalTransport::update_ref` moves a branch tip with only a CAS/ff gate
   and no in-progress check on the receiving side — a push into a repo
