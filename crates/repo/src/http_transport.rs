@@ -1031,11 +1031,6 @@ fn handle_http_connection(
     // The request-target isn't used to route (one repo per listener).
     let _ = &opening.target;
 
-    if !root.join(".sc").is_dir() {
-        write_status(&mut writer, 404)?;
-        return Ok(());
-    }
-
     // Auth gate (P29): if ≥1 token is configured, a valid bearer is
     // REQUIRED on every connection, loopback included — the bind gate only
     // decides whether the port may be opened at all, not who may use it
@@ -1071,6 +1066,16 @@ fn handle_http_connection(
             }
         }
     };
+
+    // Repo presence is checked only AFTER the auth gate, so a client that does
+    // not hold a valid token sees the same 401 whether or not a repo is served
+    // here. Tokens live under `.sc/`, so a bearer can only be required when the
+    // repo exists; with no tokens configured (open loopback, `--read-only` or
+    // `--allow-public`) there is no gate to leak around and the 404 stays.
+    if !root.join(".sc").is_dir() {
+        write_status(&mut writer, 404)?;
+        return Ok(());
+    }
 
     write_status(&mut writer, 200)?;
 
@@ -1826,6 +1831,28 @@ mod tests {
         assert_eq!(connect_raw_status(port, Some("sct-not-a-real-token")), 401);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A mandatory-auth listener (tokens are the sole justification for its
+    /// public bind) answers 401 to everyone when its root holds no repo, not
+    /// 404: an unauthenticated probe must not learn whether a repo is served.
+    /// With auth off (the loopback default) the 404 stays, as there is no
+    /// gate to leak around.
+    #[test]
+    fn missing_repo_is_401_behind_mandatory_auth_and_404_without_it() {
+        let bare = std::env::temp_dir().join(format!("scl-http-oracle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+
+        let gated = spawn_real_http_server_policy_auth(bare.clone(), false, true);
+        assert_eq!(connect_raw_status(gated, None), 401);
+        assert_eq!(connect_raw_status(gated, Some("sct-not-a-real-token")), 401);
+
+        let open = spawn_real_http_server_policy_auth(bare.clone(), false, false);
+        assert_eq!(connect_raw_status(open, None), 404);
+
+        std::fs::remove_dir_all(&bare).unwrap();
+        assert!(!bare.exists(), "test must leave no residue");
     }
 
     // ── Task 5: client-side `SC_HTTP_TOKEN` support (`connect_with_token`). ──
