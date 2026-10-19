@@ -76,11 +76,20 @@ pub const CHUNK_SIZE: usize = 1 << 20;
 /// sender, the client's `PutPack` sender) call this, so setting the var
 /// before either side starts affects the whole round trip.
 pub fn pack_chunk_size() -> usize {
-    std::env::var("SC_PACK_CHUNK")
-        .ok()
+    chunk_from(std::env::var("SC_PACK_CHUNK").ok().as_deref())
+}
+
+/// The `SC_PACK_CHUNK` decision, pure so it can be tested without touching the
+/// process environment: an unset, unparsable or zero value is the default, and
+/// anything above `MAX_OBJECT_SIZE` is clamped to it (a chunk above it is a
+/// frame the receiver's length cap refuses, so an oversized setting would fail
+/// every transfer with a confusing error).
+fn chunk_from(value: Option<&str>) -> usize {
+    value
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(CHUNK_SIZE)
+        .min(scl_core::MAX_OBJECT_SIZE)
 }
 
 // Wire error codes. Typed errors that sync logic relies on get their own code;
@@ -1857,6 +1866,20 @@ mod tests {
         let tmp = root.join(".sc").join("tmp");
         assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chunk_from_defaults_and_clamps_to_the_object_cap() {
+        assert_eq!(chunk_from(None), CHUNK_SIZE);
+        assert_eq!(chunk_from(Some("")), CHUNK_SIZE);
+        assert_eq!(chunk_from(Some("0")), CHUNK_SIZE);
+        assert_eq!(chunk_from(Some("junk")), CHUNK_SIZE);
+        assert_eq!(chunk_from(Some("4096")), 4096);
+        assert_eq!(
+            chunk_from(Some(&(scl_core::MAX_OBJECT_SIZE * 8).to_string())),
+            scl_core::MAX_OBJECT_SIZE,
+            "an oversized setting is clamped, not passed through"
+        );
     }
 
     #[test]

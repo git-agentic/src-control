@@ -16,6 +16,9 @@ const HEAD_PREFIX: &str = "ref: refs/heads/";
 
 /// Write `HEAD` as a symbolic ref to `branch`.
 pub fn write_head(layout: &Layout, branch: &str) -> Result<()> {
+    // Same grammar gate as every other ref write: HEAD must never name a
+    // branch the rest of the code could not have created.
+    crate::repo::validate_branch_name(branch)?;
     atomic_write(
         &layout.head_path(),
         format!("{HEAD_PREFIX}{branch}\n").as_bytes(),
@@ -128,6 +131,9 @@ fn is_unsafe_ref_component(s: &str) -> bool {
 /// names — that would leave `HEAD` dangling — and errors `NoSuchBranch` if
 /// the ref is already absent.
 pub fn delete_branch(layout: &Layout, name: &str) -> Result<()> {
+    // `ref_path` joins `name` onto the refs directory: validate first so a
+    // crafted name can never reach outside it.
+    crate::repo::validate_branch_name(name)?;
     if current_branch(layout)? == name {
         return Err(Error::InvalidArgument(format!(
             "refusing to delete the current branch: {name}"
@@ -405,5 +411,28 @@ mod tests {
         drop(l1);
         let _l2 = RepoLock::acquire(&layout).unwrap(); // freed
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn write_head_and_delete_branch_validate_the_branch_name() {
+        let root = std::env::temp_dir().join(format!("scl-refs-validate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        let layout = repo.layout().clone();
+        for bad in ["../escape", "a/b", "", "with space", ".hidden"] {
+            assert!(write_head(&layout, bad).is_err(), "write_head({bad:?})");
+            assert!(
+                delete_branch(&layout, bad).is_err(),
+                "delete_branch({bad:?})"
+            );
+        }
+        assert_eq!(
+            current_branch(&layout).unwrap(),
+            "main",
+            "HEAD is untouched"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 }

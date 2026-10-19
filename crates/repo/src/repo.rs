@@ -1116,12 +1116,7 @@ impl Repo {
         // set to enumerate without decrypting. Callers that need one on a
         // private branch must publish first.
         self.refuse_on_private("listing the working-tree paths")?;
-        Ok(
-            worktree::read_worktree(&self.layout, &self.tracked_paths()?)?
-                .into_iter()
-                .map(|(path, _bytes, _mode)| path)
-                .collect(),
-        )
+        worktree::list_worktree_paths(&self.layout, &self.tracked_paths()?)
     }
 
     /// Line-level unified diff of the working tree against HEAD (`sc diff`).
