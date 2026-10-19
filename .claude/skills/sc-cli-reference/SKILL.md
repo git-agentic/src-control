@@ -95,7 +95,10 @@ cargo run --bin sc -- secret add <name> --to <recipient> --value <val>
 cargo run --bin sc -- secret grant <name> --to <recipient> --identity <key>
 cargo run --bin sc -- secret revoke <name> --recipient-id <id>
 cargo run --bin sc -- secret list
-cargo run --bin sc -- run -- <cmd> [args…]   # inject decrypted secrets + run command
+cargo run --bin sc -- run [--secrets-fd N] -- <cmd> [args…]   # inject decrypted secrets + run command;
+                                              # --secrets-fd N (unix, N>=3) passes them on fd N as
+                                              # NUL-terminated NAME=VALUE records instead of env vars
+                                              # (SC_SECRETS_FD names N); ADR-0052
 cargo run --bin sc -- gc                      # pack reachable objects + prune unreachable
 cargo run --bin sc -- gc --prune-expire 7d    # custom grace window
 cargo run --bin sc -- export --to <git-repo>  # write current branch history to Git

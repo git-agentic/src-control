@@ -245,10 +245,18 @@ enum Cmd {
     /// Injected secrets are visible to the child and any same-user process,
     /// crash dump, or shell wrapper — an authorized local-process boundary,
     /// not isolation.
+    ///
+    /// With `--secrets-fd N` the secrets stay out of the environment: they
+    /// arrive on file descriptor N as NUL-terminated NAME=VALUE records (read
+    /// to EOF), and SC_SECRETS_FD=N names it.
     Run {
         /// Identity file (default ~/.sc/identity or $SC_IDENTITY).
         #[arg(long)]
         identity: Option<PathBuf>,
+        /// Hand the secrets to the command on this file descriptor (3 or
+        /// higher) instead of in its environment. Unix only.
+        #[arg(long, value_name = "FD")]
+        secrets_fd: Option<i32>,
         /// Command and args after `--`.
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
@@ -951,7 +959,11 @@ fn main() -> Result<()> {
             identity,
         } => run_rebase(target, r#continue, abort, &resolve_author(author), identity),
         Cmd::Secret { op } => run_secret(op),
-        Cmd::Run { identity, cmd } => run_run(identity, cmd),
+        Cmd::Run {
+            identity,
+            secrets_fd,
+            cmd,
+        } => run_run(identity, secrets_fd, cmd),
         Cmd::Work {
             agents,
             name,
@@ -3080,10 +3092,13 @@ fn run_escrow(op: EscrowOp) -> Result<()> {
     Ok(())
 }
 
-fn run_run(identity: Option<PathBuf>, cmd: Vec<String>) -> Result<()> {
+fn run_run(identity: Option<PathBuf>, secrets_fd: Option<i32>, cmd: Vec<String>) -> Result<()> {
     let repo = open_repo()?;
     let sk = load_identity(identity)?;
-    let code = repo.run(&sk, &cmd)?;
+    let code = match secrets_fd {
+        Some(fd) => repo.run_with_secrets_fd(&sk, &cmd, fd)?,
+        None => repo.run(&sk, &cmd)?,
+    };
     // `process::exit` skips destructors, so the repo's RepoLock would never run
     // its Drop and `.sc/lock` would leak — bricking the next `sc` command with a
     // spurious `Locked` error. Drop the repo (releasing the lock) before exiting.

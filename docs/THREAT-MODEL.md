@@ -28,18 +28,17 @@ too, not just the src-control-side metadata.
   wrappers can observe the plaintext through the child environment; this is
   fundamental to env-var injection. The parent's intermediate buffer is zeroized
   (best-effort), the child copy is not.
-- **Re-affirmed (map ticket #31): fd/stdin injection stays deferred.** The
-  security claim for a non-env injection mode is mostly illusory against the
-  named adversary — a same-user attacker who can read the identity key file
-  and `.sc/` directly decrypts everything regardless of injection mechanism;
-  what fd/stdin would actually remove is *accidental* propagation (env dumps,
-  inheritance by grandchildren), which is hygiene, not attack surface. Env
-  stays the default contract for `sc run`, `sc work --with-secrets`, and `sc
-  ws run --with-secrets` alike. Revisit triggers: real committed-secret use in
-  agent sessions, or an observed env-leak incident class (agents dumping env
-  into logs or committed files) — at which point an additive fd-pipe opt-in
-  mode is the presumptive shape, since deferring an *additional* mode carries
-  no lock-in cost.
+- **`sc run --secrets-fd N` (ADR-0052) is the opt-in non-env mode.** The earlier
+  re-affirmation (map ticket #31) kept fd injection deferred because the security
+  claim against a same-user attacker is mostly illusory: that attacker can read
+  the identity key file and `.sc/` directly and decrypt everything whatever the
+  injection mechanism. What a descriptor removes is *accidental* propagation: the
+  values are not in `/proc/<pid>/environ`, not in an env dump a script or agent
+  logs, and not inherited by every descendant through the environment; the
+  parent's copy stays in a zeroizing buffer. It is hygiene, not isolation: a
+  same-user process can still read the child's descriptor table, and the child
+  decides what to do with what it read. Env stays the default for `sc run`,
+  `sc work --with-secrets` and `sc ws run --with-secrets`.
 - **Rotation ≠ erasure:** `sc secret rotate` re-seals under a fresh DEK and cuts
   off future reads through the current registry, but the old ciphertext object
   remains reachable and decryptable by anyone who kept the old DEK. `sc secret

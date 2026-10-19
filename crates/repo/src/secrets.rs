@@ -337,8 +337,41 @@ impl Repo {
         identity: &SecretKey,
         strict: bool,
     ) -> Result<Vec<(String, OsString)>> {
-        let reg = self.registry()?;
         let mut envs: Vec<(String, OsString)> = Vec::new();
+        for (name, plaintext) in self.secret_values(identity, strict)? {
+            // The `OsString` produced below is the unavoidable hand-off:
+            // injecting a secret into a child's environment is an
+            // authorized LOCAL PROCESS context, NOT strong isolation — the
+            // decrypted secret is observable by same-user processes, crash
+            // dumps, and shell wrappers through the child environment. That
+            // copy is fundamentally un-zeroizable (the kernel owns it once
+            // the child is spawned) and is the accepted boundary, not a
+            // defect. `sc run --secrets-fd` avoids it (ADR-0052).
+            #[cfg(unix)]
+            let val = {
+                use std::os::unix::ffi::OsStrExt;
+                std::ffi::OsStr::from_bytes(&plaintext).to_os_string()
+            };
+            #[cfg(not(unix))]
+            let val = OsString::from(
+                std::str::from_utf8(&plaintext)
+                    .map_err(|_| Error::InvalidArgument(format!("secret {name} not UTF-8")))?,
+            );
+            envs.push((name, val));
+        }
+        Ok(envs)
+    }
+
+    /// The decrypted values behind [`Repo::secret_env`], still in zeroizing
+    /// buffers: the one place registered secrets are opened for a process.
+    /// Same `strict` contract.
+    pub(crate) fn secret_values(
+        &self,
+        identity: &SecretKey,
+        strict: bool,
+    ) -> Result<Vec<(String, scl_crypto::Zeroizing<Vec<u8>>)>> {
+        let reg = self.registry()?;
+        let mut out = Vec::new();
         for (name, id) in reg {
             let obj = {
                 let arc = self.store_arc();
@@ -350,34 +383,11 @@ impl Repo {
                 _ => continue,
             };
             match scl_crypto::open(&secret, identity) {
+                // Pin the type explicitly: if `scl_crypto::open` ever stops
+                // returning `Zeroizing<Vec<u8>>`, this line fails to compile.
                 Ok(plaintext) => {
-                    // Pin the type explicitly: if `scl_crypto::open` ever stops
-                    // returning `Zeroizing<Vec<u8>>`, this line fails to compile.
-                    // The `OsStr::from_bytes` below reads directly out of this
-                    // buffer — no intermediate plain `Vec`/`String` copy — so the
-                    // parent-side plaintext stays zeroized until `plaintext`
-                    // drops at the end of this iteration.
-                    //
-                    // The `OsString` produced below is the unavoidable hand-off:
-                    // injecting a secret into a child's environment is an
-                    // authorized LOCAL PROCESS context, NOT strong isolation —
-                    // the decrypted secret is observable by same-user processes,
-                    // crash dumps, and shell wrappers through the child
-                    // environment. That copy is fundamentally un-zeroizable (the
-                    // kernel owns it once the child is spawned) and is the
-                    // accepted boundary, not a defect.
                     let plaintext: scl_crypto::Zeroizing<Vec<u8>> = plaintext;
-                    #[cfg(unix)]
-                    let val = {
-                        use std::os::unix::ffi::OsStrExt;
-                        std::ffi::OsStr::from_bytes(&plaintext).to_os_string()
-                    };
-                    #[cfg(not(unix))]
-                    let val =
-                        OsString::from(std::str::from_utf8(&plaintext).map_err(|_| {
-                            Error::InvalidArgument(format!("secret {name} not UTF-8"))
-                        })?);
-                    envs.push((name, val));
+                    out.push((name, plaintext));
                 }
                 Err(scl_crypto::Error::NotARecipient) if strict => {
                     return Err(Error::InvalidArgument(format!(
@@ -390,7 +400,7 @@ impl Repo {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(envs)
+        Ok(out)
     }
 
     /// Decrypt all secrets the `identity` can read, inject into the environment,
@@ -410,6 +420,99 @@ impl Repo {
         }
         let status = command.status()?;
         Ok(status.code().unwrap_or(1))
+    }
+
+    /// Like [`Repo::run`], but the secrets never enter the child's
+    /// environment: they are written to a pipe whose read end the child
+    /// inherits as file descriptor `fd` (ADR-0052). The payload is
+    /// NUL-terminated `NAME=VALUE` records, the shape of
+    /// `/proc/<pid>/environ`; the child reads to EOF. The values therefore do
+    /// not show up in `/proc/<pid>/environ`, are not inherited by every
+    /// descendant through the environment, and the parent's copy stays in a
+    /// zeroizing buffer. `SC_SECRETS_FD` (not a secret) tells the child which
+    /// descriptor to read. This is still an authorized local-process context,
+    /// not isolation: a same-user process can read the child's fd table, and
+    /// the child decides what happens to what it read.
+    ///
+    /// `fd` must be 3 or higher; a secret whose value holds a NUL byte is
+    /// refused (it could not be framed, and could not be an environment
+    /// value either). Unix only.
+    #[cfg(unix)]
+    pub fn run_with_secrets_fd(
+        &self,
+        identity: &SecretKey,
+        cmd: &[String],
+        fd: i32,
+    ) -> Result<i32> {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+
+        self.refuse_on_private("sc run")?;
+        if !(3..=1023).contains(&fd) {
+            return Err(Error::InvalidArgument(format!(
+                "--secrets-fd must be between 3 and 1023 (0, 1 and 2 are stdin, stdout and stderr), got {fd}"
+            )));
+        }
+        let (exe, args) = cmd
+            .split_first()
+            .ok_or_else(|| Error::InvalidArgument("empty command".into()))?;
+
+        let mut payload: scl_crypto::Zeroizing<Vec<u8>> = scl_crypto::Zeroizing::new(Vec::new());
+        for (name, value) in self.secret_values(identity, false)? {
+            if value.contains(&0) {
+                return Err(Error::InvalidArgument(format!(
+                    "secret {name} holds a NUL byte and cannot be framed for --secrets-fd"
+                )));
+            }
+            payload.extend_from_slice(name.as_bytes());
+            payload.push(b'=');
+            payload.extend_from_slice(&value);
+            payload.push(0);
+        }
+
+        let (reader, mut writer) = std::io::pipe()?;
+        let reader: OwnedFd = reader.into();
+        let raw = reader.as_raw_fd();
+        let mut command = Command::new(exe);
+        command.args(args);
+        command.env("SC_SECRETS_FD", fd.to_string());
+        // SAFETY: the closure only calls dup2 and fcntl, both async-signal-safe.
+        // The pipe's read end is close-on-exec, so it needs to land on `fd`
+        // (dup2 clears the flag on the copy) or have the flag cleared where it
+        // already is; the write end is close-on-exec and never reaches the child.
+        unsafe {
+            command.pre_exec(move || {
+                if raw == fd {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else if libc::dup2(raw, fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        // Only the child holds a read end now; a child that exits unread
+        // breaks the pipe and ends the writer instead of blocking it.
+        drop(reader);
+        // A payload larger than the pipe buffer must not block the parent
+        // before the child has read it, so it is written on its own thread. The
+        // thread owns the zeroizing buffer and wipes it when it is done.
+        std::thread::spawn(move || {
+            let _ = writer.write_all(&payload);
+        });
+        let status = child.wait()?;
+        Ok(status.code().unwrap_or(1))
+    }
+
+    /// `--secrets-fd` needs POSIX file descriptors.
+    #[cfg(not(unix))]
+    pub fn run_with_secrets_fd(&self, _: &SecretKey, _: &[String], _: i32) -> Result<i32> {
+        Err(Error::InvalidArgument(
+            "--secrets-fd is only available on unix".into(),
+        ))
     }
 }
 

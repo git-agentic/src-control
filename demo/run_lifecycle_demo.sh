@@ -38,6 +38,11 @@ OUT="$(SC_IDENTITY="$KEYS/escrow" "$SC" run -- sh -c 'printf %s "$DB_URL"')"
 [ "$OUT" = "v1" ] || { echo "FAIL: escrow did not recover rotated value ($OUT)"; exit 1; }
 echo "  DB_URL=$OUT"
 
+# ADR-0052: the same secret on a file descriptor, not in the environment.
+FD_OUT="$(SC_IDENTITY="$KEYS/escrow" "$SC" run --secrets-fd 3 -- sh -c 'test -z "${DB_URL+set}" && cat <&3 | tr "\0" "\n"')"
+[ "$FD_OUT" = "DB_URL=v1" ] || { echo "FAIL: --secrets-fd did not deliver the secret on fd 3 ($FD_OUT)"; exit 1; }
+echo "  --secrets-fd 3: $FD_OUT (not in the environment)"
+
 echo
 echo "OK: rotation + escrow verified"
 echo "caveat: rotation cuts off future registry reads; the old ciphertext remains in history."
