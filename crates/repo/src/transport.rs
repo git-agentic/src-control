@@ -561,6 +561,23 @@ impl Transport for LocalTransport {
         expected_old: Option<&ObjectId>,
     ) -> Result<()> {
         let _lock = RepoLock::acquire(&self.layout)?;
+        // A stopped merge, cherry-pick or rebase here is completed against the
+        // checked-out branch's tip: moving that tip from underneath it would
+        // make the completing commit silently drop what was pushed (the P19-I1
+        // discard shape, reached by a remote writer). Refuse before any
+        // write; other branches are unaffected. Local ops guard themselves
+        // the same way (`MergeInProgress` & co.).
+        if crate::refs::current_branch(&self.layout).is_ok_and(|head| head == branch) {
+            if crate::merge_state::in_progress(&self.layout) {
+                return Err(Error::MergeInProgress);
+            }
+            if crate::pick_state::in_progress(&self.layout) {
+                return Err(Error::PickInProgress);
+            }
+            if crate::rebase_state::in_progress(&self.layout) {
+                return Err(Error::RebaseInProgress);
+            }
+        }
         // Revalidate inside the lock: the caller's fast-forward check ran
         // unlocked, so the ref may have moved since (two concurrent pushes).
         let current = crate::refs::read_branch_tip(&self.layout, branch)?;
@@ -1095,5 +1112,91 @@ mod tests {
         assert_eq!(by_id_reply_cap(0), 512 * MIB);
         assert_eq!(by_id_reply_cap(64 * MIB), 64 * MIB);
         assert_eq!(by_id_reply_cap(16 << 30), 512 * MIB);
+    }
+
+    /// A repo with a stopped merge, pick or rebase is completed against its
+    /// checked-out branch's tip. A push moving that tip would make the
+    /// completing commit drop the pushed work, so it is refused (other
+    /// branches are untouched), and allowed again once the op is over.
+    #[test]
+    fn update_ref_refuses_the_checked_out_branch_during_a_stopped_op() {
+        let root = std::env::temp_dir().join(format!("scl-xport-stopped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("t", "base").unwrap();
+        repo.branch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        let main_tip = repo.commit("t", "main").unwrap();
+        repo.switch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nOTHER\nc\n").unwrap();
+        repo.commit("t", "other").unwrap();
+        repo.switch("main").unwrap();
+        assert!(repo.merge("other", "t").is_err(), "setup: a stopped merge");
+        assert!(repo.merge_in_progress());
+        // The pushed-to repo's own process has exited (a Repo handle holds the
+        // single-writer lock the transport needs).
+        let layout = repo.layout().clone();
+        drop(repo);
+
+        let t = LocalTransport::open(&root).unwrap();
+        let pushed = Object::blob(b"pushed".to_vec()).id();
+        // The checked-out branch: refused, and nothing moved.
+        assert!(matches!(
+            t.update_ref("main", &pushed, Some(&main_tip)),
+            Err(Error::MergeInProgress)
+        ));
+        assert_eq!(
+            crate::refs::read_branch_tip(&layout, "main").unwrap(),
+            Some(main_tip)
+        );
+        // A branch that is not checked out is not in the way.
+        t.update_ref("elsewhere", &pushed, None).unwrap();
+        assert_eq!(
+            crate::refs::read_branch_tip(&layout, "elsewhere").unwrap(),
+            Some(pushed)
+        );
+        // Once the merge is over the push lands.
+        drop(t);
+        let repo = crate::repo::Repo::open(&root).unwrap();
+        repo.merge_abort().unwrap();
+        drop(repo);
+        let t = LocalTransport::open(&root).unwrap();
+        t.update_ref("main", &pushed, Some(&main_tip)).unwrap();
+        drop(t);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// The same receiving-side refusal for a stopped cherry-pick.
+    #[test]
+    fn update_ref_refuses_the_checked_out_branch_during_a_stopped_pick() {
+        let root = std::env::temp_dir().join(format!("scl-xport-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("t", "base").unwrap();
+        repo.branch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        let main_tip = repo.commit("t", "main").unwrap();
+        repo.switch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nOTHER\nc\n").unwrap();
+        repo.commit("t", "other").unwrap();
+        repo.switch("main").unwrap();
+        assert!(repo.cherry_pick("other", "t", None, None).is_err());
+        assert!(repo.pick_in_progress());
+        drop(repo);
+
+        let t = LocalTransport::open(&root).unwrap();
+        let pushed = Object::blob(b"pushed".to_vec()).id();
+        assert!(matches!(
+            t.update_ref("main", &pushed, Some(&main_tip)),
+            Err(Error::PickInProgress)
+        ));
+        drop(t);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 }
