@@ -253,7 +253,8 @@ transport-adjacent. The rest, imperatively:
   away and retry. Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded.
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
-  or abort the in-progress op first.
+  or abort the in-progress op first. A push into a repo with a stopped op is
+  refused for that repo's checked-out branch (other branches still accept it).
 - **A `sc work`/`ws` session is the only sanctioned ephemeral+persistent mix:**
   temp checkouts are removed on teardown; durable writes go only through the
   normal commit path.

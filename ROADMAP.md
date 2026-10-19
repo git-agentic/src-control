@@ -726,13 +726,12 @@ scale-&-reach horizon):
   between the two leaves the scratch file on disk with no record, and a retried
   `sc commit` would take it. The opposite order would risk deleting a file the
   user recreated at that path; closing both needs a journal.
-- **In-progress guard for the RECEIVING repo on push.**
-  `LocalTransport::update_ref` moves a branch tip with only a CAS/ff gate
-  and no in-progress check on the receiving side — a push into a repo
-  with a stopped merge/pick reproduces the P19-I1 discard shape via a
-  remote writer (the stopped rebase has its moved-tip backstop;
-  merge/pick completion does not). Pre-existing since P6/P12; flagged at
-  the P21 final review as the one gap outside the policy-op class.
+- **In-progress guard for the RECEIVING repo on push — fixed.**
+  `LocalTransport::update_ref` (so `sc push` to a local path and the wire
+  `UpdateRef`) refuses to move the receiving repo's checked-out branch while a
+  merge, cherry-pick or rebase is stopped there (`MergeInProgress` & co.), so
+  the completing commit cannot silently drop a pushed commit. Other branches
+  are unaffected.
 - **Sparse-gate the conflict helper's non-marker writes (P24 boundary).**
   `Repo::materialize_conflict_state` gates conflict *markers* against the
   sparse spec but not its `to_encrypt`/sidecar write loops — so an
