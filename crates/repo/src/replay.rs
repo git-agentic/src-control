@@ -3184,6 +3184,38 @@ mod tests {
         remove_root(&root);
     }
 
+    /// Base and `work` track `bin.dat.theirs`, `main` deletes it, and
+    /// `bin.dat` conflicts as binary: the stop writes scratch at the path the
+    /// result no longer tracks. Completion must not re-add it because
+    /// `work` once tracked it.
+    #[test]
+    fn a_path_the_result_deleted_is_not_kept_because_theirs_tracked_it() {
+        let root = tmp_root("sweep-deleted-by-ours");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfebase\n").unwrap();
+        std::fs::write(root.join("bin.dat.theirs"), b"old\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::remove_file(root.join("bin.dat.theirs")).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeOURS\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeTHEIRS\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        repo.merge("work", "me").unwrap_err();
+        assert!(
+            root.join("bin.dat.theirs").exists(),
+            "setup: scratch written"
+        );
+        std::fs::write(root.join("bin.dat"), b"\xff\xferesolved\n").unwrap();
+        repo.commit("me", "merge").unwrap();
+        assert!(!repo.tracked_paths().unwrap().contains("bin.dat.theirs"));
+        assert!(!root.join("bin.dat.theirs").exists());
+        drop(repo);
+        remove_root(&root);
+    }
+
     #[test]
     fn a_pick_commit_leaves_the_leftover_sidecar_out() {
         let (root, repo) = binary_conflict("sweep-commit-pick");

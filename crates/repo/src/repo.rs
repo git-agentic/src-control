@@ -407,7 +407,7 @@ impl Repo {
         // hand and left it on disk. A tracked path of the same name is the
         // user's own file and stays.
         let files = if merge_head.is_some() || pick_head.is_some() || decided_root.is_some() {
-            self.without_recorded_sidecars(files, &[tip, merge_head, pick_head], decided_root)?
+            self.without_recorded_sidecars(files, &[tip], decided_root)?
         } else {
             files
         };
@@ -1962,7 +1962,9 @@ impl Repo {
 
     /// Drop from `files` the sidecars the stop recorded writing
     /// (`conflict_plaintext::read_sidecars`) that no snapshot in `snapshots`
-    /// nor `decided_root` tracks. No record, no change.
+    /// nor `decided_root` tracks. The other side's history does not count: a path
+    /// the result deleted stays deleted, however the input tracked it. No
+    /// record, no change.
     fn without_recorded_sidecars(
         &self,
         files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
