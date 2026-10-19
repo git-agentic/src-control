@@ -580,6 +580,7 @@ impl Repo {
                     wrapped,
                 };
                 let conflict_root = self.materialize_conflict_state(
+                    "cherry-pick",
                     &carried,
                     &carried_subtrees,
                     &to_encrypt,
@@ -1013,6 +1014,7 @@ impl Repo {
                         wrapped,
                     };
                     let conflict_root = self.materialize_conflict_state(
+                        "rebase",
                         &carried,
                         &carried_subtrees,
                         &to_encrypt,
@@ -3397,6 +3399,40 @@ mod tests {
     /// The guard must not mistake what a conflict stop itself wrote for the
     /// user's files: a stopped rebase whose target adds a file lays that file
     /// down, and `--continue` must still finish.
+    /// A conflict stop names the operation that is running, and refuses before
+    /// any write when a clean-added file would land on an untracked one.
+    #[test]
+    fn a_conflict_stop_names_its_operation_when_it_refuses() {
+        let root = tmp_root("guard-stop-names-op");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+        repo.switch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nOTHER\nc\n").unwrap();
+        std::fs::write(root.join("new.txt"), b"from other\n").unwrap();
+        repo.commit("me", "other edits x, adds new.txt").unwrap();
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("new.txt"), b"MINE\n").unwrap();
+
+        let err = repo.cherry_pick("other", "me", None, None).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.starts_with("cherry-pick")),
+            "got {err:?}"
+        );
+        let err = repo.merge("other", "me").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.starts_with("merge")),
+            "got {err:?}"
+        );
+        assert_mine(&root);
+        assert!(!repo.pick_in_progress() && !repo.merge_in_progress());
+        drop(repo);
+        remove_root(&root);
+    }
+
     #[test]
     fn rebase_continue_is_not_blocked_by_files_the_stop_wrote() {
         let root = tmp_root("guard-rebase-continue");

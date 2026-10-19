@@ -1580,6 +1580,7 @@ impl Repo {
                 None => &[],
             };
             let conflict_root = self.materialize_conflict_state(
+                "merge",
                 &carried,
                 carried_subtrees,
                 &to_encrypt,
@@ -1746,6 +1747,7 @@ impl Repo {
     /// materialize skip-write path (P24 Task 3), no markers involved.
     pub(crate) fn materialize_conflict_state(
         &self,
+        op: &str,
         carried: &[(String, Vec<u8>, scl_core::FileMode, u8)],
         carried_subtrees: &[(String, scl_core::TreeEntry)],
         to_encrypt: &[(String, Vec<u8>, scl_core::FileMode, Vec<[u8; 32]>)],
@@ -1777,7 +1779,7 @@ impl Repo {
         if self.promisor()?.is_some() {
             if let Some((path, ..)) = to_encrypt.iter().find(|(p, ..)| !sparse.matches(p)) {
                 return Err(Error::InvalidArgument(format!(
-                    "merge has conflicts, and {path} (outside your sparse checkout) needs sealing at completion; \
+                    "{op} has conflicts, and {path} (outside your sparse checkout) needs sealing at completion; \
                      run `sc sparse set` to include it, or `sc backfill --all`, then retry"
                 )));
             }
@@ -1788,7 +1790,7 @@ impl Repo {
         if self.promisor()?.is_some() {
             if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !sparse.matches(r)) {
                 return Err(Error::InvalidArgument(format!(
-                    "merge has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
+                    "{op} has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
                      run `sc sparse set` to include it, or `sc backfill --all`, then retry"
                 )));
             }
@@ -1814,7 +1816,7 @@ impl Repo {
                 });
                 if tracked {
                     return Err(Error::InvalidArgument(format!(
-                        "merge has conflicts, and its sidecar {rel} would overwrite a tracked file; \
+                        "{op} has conflicts, and its sidecar {rel} would overwrite a tracked file; \
                          rename or remove that file, then retry"
                     )));
                 }
@@ -1848,13 +1850,13 @@ impl Repo {
                     None => {}
                     Some(StopBlocker::ParentFile) => {
                         return Err(Error::InvalidArgument(format!(
-                            "merge has conflicts, and a file stands where a directory for {rel} \
+                            "{op} has conflicts, and a file stands where a directory for {rel} \
                              must be; move that file away, then retry"
                         )))
                     }
                     Some(StopBlocker::Occupied) => {
                         return Err(Error::InvalidArgument(format!(
-                            "merge has conflicts, and writing {rel} would overwrite an untracked \
+                            "{op} has conflicts, and writing {rel} would overwrite an untracked \
                              or ignored file or directory (possibly a sidecar left by an earlier \
                              stop); move it away, then retry"
                         )))
@@ -1866,7 +1868,7 @@ impl Repo {
         // the first working-tree write (lazy partial clones only), outside
         // the store lock.
         self.ensure_view(conflict_root, &sparse)?;
-        self.refuse_untracked_overwrite("merge", Some(old_root), conflict_root)?;
+        self.refuse_untracked_overwrite(op, Some(old_root), conflict_root)?;
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
