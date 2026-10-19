@@ -401,12 +401,16 @@ impl Repo {
             }
         };
 
-        // A sidecar the stop wrote is working-tree scratch: it must reach
-        // neither the scanner nor the tree, whether or not the user resolved by
+        // On a completion only (an ordinary commit, amend or workspace harvest
+        // has none of these): a sidecar the stop wrote is working-tree scratch,
+        // so it must reach neither the scanner nor the tree, whether or not the user resolved by
         // hand and left it on disk. A tracked path of the same name is the
         // user's own file and stays.
-        let files =
-            self.without_recorded_sidecars(files, &[tip, merge_head, pick_head], decided_root)?;
+        let files = if merge_head.is_some() || pick_head.is_some() || decided_root.is_some() {
+            self.without_recorded_sidecars(files, &[tip, merge_head, pick_head], decided_root)?
+        } else {
+            files
+        };
 
         // Single pass: split protected files (capturing each rule's recipients, so
         // the encryption loop needn't look the prefix up again) from plaintext.
@@ -906,13 +910,15 @@ impl Repo {
                 id
             }
         };
-        refs::write_branch_tip(&self.layout, &head, &id)?;
         // The stop's `.theirs` sidecars were left out of the commit (see
-        // `snapshot_files`); remove them now, or the next commit would take
-        // them. Best effort: the ref already moved.
-        if let Ok(snap) = self.snapshot(&id) {
-            let _ = self.remove_conflict_sidecars(&[snap.root]);
+        // `snapshot_files`); remove them before the ref moves, or the next
+        // commit would take them. A removal failure fails this commit with
+        // nothing moved and the record intact, so it can be retried.
+        if merging || picking {
+            let root = self.snapshot(&id)?.root;
+            self.remove_conflict_sidecars(&[root])?;
         }
+        refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
         crate::pick_state::clear(&self.layout)?;
         // The ref moved: persist the cache best-effort (no-op in the pick arm,

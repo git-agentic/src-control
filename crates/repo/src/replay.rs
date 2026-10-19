@@ -3157,6 +3157,33 @@ mod tests {
         remove_root(&root);
     }
 
+    /// A sidecar that cannot be removed fails the completing commit before
+    /// anything moves; the record survives, and the retry finishes.
+    #[test]
+    fn a_completion_whose_sidecar_cannot_be_removed_fails_and_retries() {
+        let (root, repo) = binary_conflict("sweep-commit-fails");
+        let ours = repo.head_tip().unwrap();
+        repo.merge("work", "me").unwrap_err();
+        std::fs::write(root.join("bin.dat"), b"\xff\xferesolved\n").unwrap();
+        std::fs::remove_file(root.join("bin.dat.theirs")).unwrap();
+        std::fs::create_dir(root.join("bin.dat.theirs")).unwrap();
+        repo.commit("me", "merge").unwrap_err();
+        assert_eq!(repo.head_tip().unwrap(), ours, "the ref did not move");
+        assert!(repo.merge_in_progress());
+        assert!(
+            crate::conflict_plaintext::read_sidecars(&repo.layout)
+                .unwrap()
+                .contains("bin.dat.theirs"),
+            "the record survives for the retry"
+        );
+        std::fs::remove_dir(root.join("bin.dat.theirs")).unwrap();
+        repo.commit("me", "merge").unwrap();
+        assert!(!repo.merge_in_progress());
+        assert!(!repo.tracked_paths().unwrap().contains("bin.dat.theirs"));
+        drop(repo);
+        remove_root(&root);
+    }
+
     #[test]
     fn a_pick_commit_leaves_the_leftover_sidecar_out() {
         let (root, repo) = binary_conflict("sweep-commit-pick");
