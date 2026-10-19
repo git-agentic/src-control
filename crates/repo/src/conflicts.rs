@@ -1163,7 +1163,8 @@ mod tests {
         );
 
         drop(repo);
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test must leave no residue");
     }
 
     #[test]
@@ -1199,7 +1200,8 @@ mod tests {
         );
 
         drop(repo);
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test must leave no residue");
     }
 
     #[test]
@@ -1235,7 +1237,8 @@ mod tests {
         );
 
         drop(repo);
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test must leave no residue");
     }
 
     #[test]

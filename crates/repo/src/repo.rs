@@ -569,9 +569,12 @@ impl Repo {
                     let cipher = {
                         let store_arc = self.vfs.store();
                         let mut store = store_arc.lock().unwrap();
-                        match store.get(&blob_id)? {
-                            Object::Blob(b) => Some(b.to_vec()),
-                            _ => None,
+                        match store.get(&blob_id) {
+                            Ok(Object::Blob(b)) => Some(b.to_vec()),
+                            Ok(_) => None,
+                            // Absent prior blob: seal below rather than abort.
+                            Err(scl_core::Error::NotFound(_)) => None,
+                            Err(e) => return Err(e.into()),
                         }
                     };
                     match cipher {
