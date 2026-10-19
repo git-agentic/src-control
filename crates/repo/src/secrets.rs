@@ -444,7 +444,6 @@ impl Repo {
         cmd: &[String],
         fd: i32,
     ) -> Result<i32> {
-        use std::io::Write;
         use std::os::fd::{AsRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
@@ -458,22 +457,43 @@ impl Repo {
             .split_first()
             .ok_or_else(|| Error::InvalidArgument("empty command".into()))?;
 
-        let mut payload: scl_crypto::Zeroizing<Vec<u8>> = scl_crypto::Zeroizing::new(Vec::new());
-        for (name, value) in self.secret_values(identity, false)? {
-            if value.contains(&0) {
-                return Err(Error::InvalidArgument(format!(
-                    "secret {name} holds a NUL byte and cannot be framed for --secrets-fd"
-                )));
-            }
+        let values = self.secret_values(identity, false)?;
+        // Names are framed as `NAME=`: an empty one, or one holding `=` or NUL,
+        // would corrupt the record or forge another.
+        if let Some((name, _)) = values
+            .iter()
+            .find(|(n, _)| n.is_empty() || n.bytes().any(|b| b == b'=' || b == 0))
+        {
+            return Err(Error::InvalidArgument(format!(
+                "secret name {name:?} cannot be framed for --secrets-fd (empty, or it holds '=' or NUL)"
+            )));
+        }
+        if let Some((name, _)) = values.iter().find(|(_, v)| v.contains(&0)) {
+            return Err(Error::InvalidArgument(format!(
+                "secret {name} holds a NUL byte and cannot be framed for --secrets-fd"
+            )));
+        }
+        // One allocation of the exact size: a Vec that grows moves, and the
+        // freed old buffer would keep plaintext that `Zeroizing` never wipes.
+        let total: usize = values.iter().map(|(n, v)| n.len() + 1 + v.len() + 1).sum();
+        let mut payload: scl_crypto::Zeroizing<Vec<u8>> =
+            scl_crypto::Zeroizing::new(Vec::with_capacity(total));
+        for (name, value) in &values {
             payload.extend_from_slice(name.as_bytes());
             payload.push(b'=');
-            payload.extend_from_slice(&value);
+            payload.extend_from_slice(value);
             payload.push(0);
         }
+        drop(values);
 
-        let (reader, mut writer) = std::io::pipe()?;
+        let (reader, writer) = std::io::pipe()?;
         let reader: OwnedFd = reader.into();
         let raw = reader.as_raw_fd();
+        // `fd` may be a descriptor `std` would pick for its own exec-error pipe
+        // while it spawns, which the pre_exec dup2 below would then clobber.
+        // Hold `fd` open (close-on-exec) across the spawn when it is free; when
+        // it is already taken the probe lands higher and nothing needs holding.
+        let _reserved = reserve_fd(fd);
         let mut command = Command::new(exe);
         command.args(args);
         command.env("SC_SECRETS_FD", fd.to_string());
@@ -497,14 +517,34 @@ impl Repo {
         // Only the child holds a read end now; a child that exits unread
         // breaks the pipe and ends the writer instead of blocking it.
         drop(reader);
-        // A payload larger than the pipe buffer must not block the parent
-        // before the child has read it, so it is written on its own thread. The
-        // thread owns the zeroizing buffer and wipes it when it is done.
-        std::thread::spawn(move || {
-            let _ = writer.write_all(&payload);
-        });
-        let status = child.wait()?;
-        Ok(status.code().unwrap_or(1))
+        drop(_reserved);
+        // The write end is non-blocking and fed by its own thread, so a payload
+        // larger than the pipe buffer cannot block the parent before the child
+        // has read it, and the thread stops once the child is gone even if a
+        // grandchild still holds the read end open (it is joined below, so the
+        // zeroizing buffer is wiped before this returns).
+        if set_nonblocking(&writer).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_done = std::sync::Arc::clone(&done);
+        let spawned = std::thread::Builder::new()
+            .name("sc-secrets-fd".into())
+            .spawn(move || feed_pipe(writer, payload, &thread_done));
+        let feeder = match spawned {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Io(e));
+            }
+        };
+        let status = child.wait();
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let _ = feeder.join();
+        Ok(status?.code().unwrap_or(1))
     }
 
     /// `--secrets-fd` needs POSIX file descriptors.
@@ -513,6 +553,74 @@ impl Repo {
         Err(Error::InvalidArgument(
             "--secrets-fd is only available on unix".into(),
         ))
+    }
+}
+
+/// Hold descriptor `fd` open (close-on-exec) if it is free: a probe at the
+/// lowest free descriptor at or above `fd` lands exactly on `fd` only when
+/// nothing else has it. The held descriptor is closed when dropped.
+#[cfg(unix)]
+fn reserve_fd(fd: i32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: opens /dev/null read-only and wraps the new descriptors, each
+    // owned exactly once.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if null < 0 {
+            return None;
+        }
+        let null = OwnedFd::from_raw_fd(null);
+        let probe = libc::fcntl(
+            std::os::fd::AsRawFd::as_raw_fd(&null),
+            libc::F_DUPFD_CLOEXEC,
+            fd,
+        );
+        if probe < 0 {
+            return None;
+        }
+        let probe = OwnedFd::from_raw_fd(probe);
+        (std::os::fd::AsRawFd::as_raw_fd(&probe) == fd).then_some(probe)
+    }
+}
+
+/// Make the pipe's write end non-blocking (its own open file description, so
+/// the child's read end is unaffected).
+#[cfg(unix)]
+fn set_nonblocking(w: &std::io::PipeWriter) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fcntl on a descriptor this PipeWriter owns.
+    unsafe {
+        let fl = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
+        if fl < 0 || libc::fcntl(w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Write `payload` to the non-blocking pipe until it is all in, the reader is
+/// gone, or `done` is set (the child exited): then the buffer is wiped on drop.
+#[cfg(unix)]
+fn feed_pipe(
+    mut w: std::io::PipeWriter,
+    payload: scl_crypto::Zeroizing<Vec<u8>>,
+    done: &std::sync::atomic::AtomicBool,
+) {
+    use std::io::Write;
+    let mut off = 0;
+    while off < payload.len() {
+        match w.write(&payload[off..]) {
+            Ok(0) => return,
+            Ok(n) => off += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if done.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return, // the reader is gone (EPIPE)
+        }
     }
 }
 

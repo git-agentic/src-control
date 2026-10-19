@@ -225,3 +225,92 @@ fn a_secret_holding_a_nul_byte_is_refused() {
     std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
     std::fs::remove_dir_all(&keys).unwrap();
 }
+
+/// Whatever descriptor is asked for, a command that cannot be executed fails
+/// with its real error: the requested number must not clobber the descriptor
+/// the standard library uses to report an exec failure.
+#[test]
+fn a_missing_command_reports_its_error_for_every_nearby_descriptor() {
+    let (repo, id, keys) = repo_with("noexec", &[("S", b"v".to_vec())]);
+    for fd in 3..=12 {
+        let out = sc(
+            &repo,
+            &[
+                "run",
+                "--identity",
+                id.to_str().unwrap(),
+                "--secrets-fd",
+                &fd.to_string(),
+                "--",
+                "/definitely/not/a/command",
+            ],
+        );
+        assert!(!out.status.success(), "fd {fd}: must fail");
+        let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        assert!(
+            err.contains("no such file") || err.contains("not found"),
+            "fd {fd}: expected the exec error, got {err:?}"
+        );
+    }
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}
+
+/// A descendant that keeps the descriptor open after the command exits cannot
+/// keep `sc run` (or the unread payload) alive.
+#[test]
+fn a_grandchild_holding_the_descriptor_does_not_pin_sc_run() {
+    let (repo, id, keys) = repo_with("grandchild", &[("BIG", vec![b'x'; 300_000])]);
+    let start = std::time::Instant::now();
+    // The shell backgrounds a sleeper that inherits fd 3, never reads it, and exits.
+    let out = run_fd(&repo, &id, "3", "sleep 4 >/dev/null 2>&1 & exit 0");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "sc run waited on the grandchild: {:?}",
+        start.elapsed()
+    );
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}
+
+/// A name that cannot be framed (empty, or holding `=`) is refused before the
+/// command runs, whether or not `secret add` let it be registered.
+#[test]
+fn a_secret_name_that_cannot_be_framed_is_refused() {
+    let root = tmp("badname");
+    let keys = tmp("badname-keys");
+    let id = keys.join("alice.id");
+    let out = sc(&keys, &["keygen", "--out", id.to_str().unwrap()]);
+    let pk = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find(|l| l.contains("public key"))
+        .and_then(|l| l.split_whitespace().find(|w| w.starts_with("scl-pk-")))
+        .unwrap()
+        .to_string();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(sc(&repo, &["init"]).status.success());
+    std::fs::write(
+        repo.join(".sc/recipients.toml"),
+        format!("[recipients]\nalice = \"{pk}\"\n"),
+    )
+    .unwrap();
+    let add = sc_stdin(&repo, &["secret", "add", "TOKEN=x", "--to", "alice"], b"v");
+    if add.status.success() {
+        let out = run_fd(&repo, &id, "3", "echo ran");
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("cannot be framed"), "{err}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("ran"));
+    } else {
+        // Registration already refuses it: nothing to frame, nothing to leak.
+        eprintln!("secret add refuses '=' in a name; the framing check is a backstop");
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}
