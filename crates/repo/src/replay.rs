@@ -3450,6 +3450,43 @@ mod tests {
         remove_root(&root);
     }
 
+    /// A tracked path outside the sparse view was never laid out, so a user
+    /// file standing where a directory for an in-view path must be is not the
+    /// tracked file: the guard must not count the old tree's `a` as it.
+    #[test]
+    fn a_tracked_path_outside_the_view_does_not_excuse_a_user_file_in_the_way() {
+        let root = tmp_root("guard-sparse");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/b"), b"b\n").unwrap();
+        std::fs::write(root.join("keep.txt"), b"k\n").unwrap();
+        let target = repo.commit("me", "target tree has a/b").unwrap();
+        let target_root = repo.snapshot(&target).unwrap().root;
+        // The user's own file where the directory `a` must be.
+        std::fs::remove_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a"), b"MINE\n").unwrap();
+        // The tree being left tracks a regular file `a`.
+        let old: std::collections::BTreeSet<String> =
+            ["a".to_string(), "keep.txt".to_string()].into();
+
+        // Full view: the old tree's `a` is on disk, so it is the tracked file.
+        repo.refuse_untracked_overwrite_vs("switch", &old, target_root)
+            .unwrap();
+        // Narrowed view: `a` was never laid out, so the file in the way is the
+        // user's and the guard refuses.
+        std::fs::write(repo.layout().dot_sc.join("sparse"), "a/b\n").unwrap();
+        let err = repo
+            .refuse_untracked_overwrite_vs("switch", &old, target_root)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("would fail")),
+            "got {err:?}"
+        );
+        assert_eq!(std::fs::read(root.join("a")).unwrap(), b"MINE\n");
+        drop(repo);
+        remove_root(&root);
+    }
+
     #[test]
     fn merge_abort_keeps_a_user_theirs_file_beside_a_text_conflict() {
         let (root, repo) = text_conflict_with_user_theirs_file("sweep-merge-abort");

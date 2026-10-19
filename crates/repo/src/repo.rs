@@ -2010,7 +2010,9 @@ impl Repo {
                 worktree::tree_file_entries_with_perms_sparse(&mut store, target_root, &sparse)?
             }
         };
-        let mut is_tracked = |p: &str| tracked.contains(p);
+        // A path outside the view was never laid out: whatever is on disk
+        // there is the user's, even if the tree tracks it.
+        let mut is_tracked = |p: &str| sparse.matches(p) && tracked.contains(p);
         for rel in target.keys().filter(|p| sparse.matches(p)) {
             match stop_write_blocker(&self.layout.root, rel, &mut is_tracked)? {
                 None => {}
@@ -2512,6 +2514,9 @@ fn stop_write_blocker(
     match full.symlink_metadata() {
         Err(_) => Ok(None),
         Ok(m) if m.is_dir() => Ok(Some(StopBlocker::Occupied)),
+        // A symlink is never the tracked file: a write would follow it to
+        // whatever it points at, outside the repository.
+        Ok(m) if m.file_type().is_symlink() => Ok(Some(StopBlocker::Occupied)),
         Ok(_) if tracked(rel) => Ok(None),
         Ok(_) => Ok(Some(StopBlocker::Occupied)),
     }
@@ -6668,6 +6673,25 @@ mod stop_blocker_tests {
             Some(StopBlocker::Occupied)
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A symlink is never the tracked file: writing would follow it out of the
+    /// repository (a protected path skipped for want of an identity leaves
+    /// room for one).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_target_is_occupied_even_when_tracked() {
+        let root = tmp("stop-symlink");
+        let outside = tmp("stop-symlink-outside").join("personal.txt");
+        std::fs::write(&outside, b"personal\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("p.txt")).unwrap();
+        let tracked = |_: &str| true;
+        assert_eq!(
+            stop_write_blocker(&root, "p.txt", &mut { tracked }).unwrap(),
+            Some(StopBlocker::Occupied)
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(outside.parent().unwrap()).ok();
     }
 
     #[test]
