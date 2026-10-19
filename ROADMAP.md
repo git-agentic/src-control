@@ -784,10 +784,12 @@ scale-&-reach horizon):
 - **`sc rewrap` on partial clones — refused (P37).** `Repo::rewrap` calls
   `refuse_on_partial`; a paths-only/streaming rebuild that would lift the
   refusal remains a possible follow-on.
-- **Protected-cache hygiene (P33 final-review follow-on).** `.sc/protected-cache`
-  and `.sc/ws/cache-<i>` entries for a deleted or renamed path are never
-  pruned — unbounded but benign growth (a stale entry just goes unmatched).
-  Periodic or commit-time pruning of dead entries is the follow-on.
+- **Protected-cache hygiene — shipped.** `ProtectedCache::save` skips entries
+  whose file is no longer on disk (deleted, renamed, outside the sparse view), so
+  `.sc/protected-cache` and `.sc/ws/cache-<i>` stay bounded by the protected
+  files actually present; a ws cache file is already removed with its session.
+  A dropped entry can only cost one re-seal if the path returns (randomized
+  sealing, so unchanged content gets a new blob id).
 - **Theirs-side resolve carry (P33 final-review follow-on).** `sc resolve
   --theirs` on a PROTECTED path records into the main-tree cache today, but
   completion's format-dispatched carry only consults the cache against the
