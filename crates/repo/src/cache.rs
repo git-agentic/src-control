@@ -214,12 +214,22 @@ impl ProtectedCache {
     /// Durable atomic write via the shared `fsutil` helper (fsync temp +
     /// rename + fsync parent dir, no residue on failure); no-op for an
     /// ephemeral cache.
+    ///
+    /// Entries whose file is gone from the checkout (deleted, renamed, or
+    /// outside the sparse view) are left out, so the file stays bounded by the
+    /// protected files actually on disk instead of growing for the life of the
+    /// repo. A lookup always compares the keyed tag of plaintext read from the
+    /// file, so an entry for an absent file can never be consulted; dropping it
+    /// at worst costs one re-seal if the path returns.
     pub(crate) fn save(&self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
         let mut out = String::new();
         for (p, e) in &self.entries {
+            if !self.root.join(p).is_file() {
+                continue;
+            }
             out.push_str(&format!(
                 "{} {} {} {} {}\n",
                 e.mtime_ns,
@@ -384,6 +394,45 @@ mod tests {
             Some(layout.protected_cache_path()),
         );
         assert_eq!(c3.unchanged("a b/spaced name.txt", b"v"), None);
+        cleanup(&layout);
+    }
+
+    #[test]
+    fn save_drops_entries_for_files_no_longer_on_disk() {
+        let layout = tmp("prune");
+        let key = local_key(&layout).unwrap();
+        let open = || {
+            ProtectedCache::open(
+                key,
+                layout.root.clone(),
+                Some(layout.protected_cache_path()),
+            )
+        };
+        for f in ["keep", "gone", "moved"] {
+            std::fs::write(layout.root.join(f), b"v").unwrap();
+        }
+        let id = ObjectId::of(b"c");
+        let mut c = open();
+        for f in ["keep", "gone", "moved"] {
+            c.record(f, b"v", id);
+        }
+        c.save().unwrap();
+        assert_eq!(open().entries.len(), 3);
+
+        std::fs::remove_file(layout.root.join("gone")).unwrap();
+        std::fs::rename(layout.root.join("moved"), layout.root.join("moved-to")).unwrap();
+        // A directory at a cached path is not a protected file either.
+        std::fs::create_dir(layout.root.join("gone")).unwrap();
+        let mut c = open();
+        c.record("moved-to", b"v", id);
+        c.save().unwrap();
+
+        let after = open();
+        assert_eq!(after.unchanged("keep", b"v"), Some(id));
+        assert_eq!(after.unchanged("moved-to", b"v"), Some(id));
+        assert_eq!(after.unchanged("gone", b"v"), None);
+        assert_eq!(after.unchanged("moved", b"v"), None);
+        assert_eq!(after.entries.len(), 2, "dead entries are pruned on save");
         cleanup(&layout);
     }
 
