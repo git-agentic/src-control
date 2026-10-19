@@ -351,7 +351,7 @@ impl HttpTransport {
     /// and delegated to [`Self::connect_with_pins`], the testable,
     /// env-free core.
     pub fn connect_with_token(url: &ScHttpUrl, token: Option<&str>) -> Result<HttpTransport> {
-        let ignored = ignored_https_knobs(url, |k| std::env::var(k).ok());
+        let ignored = ignored_https_knobs(url, |k| std::env::var_os(k));
         // Once per process: a command that connects repeatedly (batched lazy
         // fetches) should not repeat the same warning.
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -645,8 +645,23 @@ const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
 fn connect_within(authority: &str, timeout: Duration) -> std::io::Result<TcpStream> {
     use std::net::ToSocketAddrs;
     let deadline = std::time::Instant::now() + timeout;
+    // Name resolution is a blocking libc call with no timeout of its own, so it
+    // runs on a helper thread the connect only waits on up to the deadline. A
+    // resolver that stalls leaves that thread parked until it returns; the
+    // connect itself fails on time.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target = authority.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(target.to_socket_addrs().map(|a| a.collect::<Vec<_>>()));
+    });
+    let addrs = rx.recv_timeout(timeout).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "name resolution did not finish within the bound",
+        )
+    })??;
     let mut last = None;
-    for addr in authority.to_socket_addrs()? {
+    for addr in addrs {
         // One deadline for the whole connect, not one bound per address: a
         // dual-stack host with unreachable addresses must not take n x timeout.
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -690,7 +705,10 @@ fn lost_if_timeout(e: Error) -> Error {
 /// do nothing (a scheme-downgrade footgun worth a warning). Empty for an
 /// `sc+https://` URL. `env` is injected so this is testable without mutating
 /// the process environment.
-fn ignored_https_knobs(url: &ScHttpUrl, env: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+fn ignored_https_knobs(
+    url: &ScHttpUrl,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<&'static str> {
     if url.tls {
         return Vec::new();
     }
@@ -2117,6 +2135,21 @@ mod tests {
         holder.join().unwrap();
     }
 
+    /// `connect_within` resolves the name under the deadline and reports a
+    /// failure to connect as an error rather than hanging.
+    #[test]
+    fn connect_within_reaches_a_listener_and_fails_on_a_closed_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(connect_within(&format!("127.0.0.1:{port}"), SHORT * 10).is_ok());
+        drop(listener);
+        assert!(connect_within(&format!("127.0.0.1:{port}"), SHORT * 10).is_err());
+        // A name that cannot resolve is an error too, within the bound.
+        let started = std::time::Instant::now();
+        assert!(connect_within("host.invalid:1", Duration::from_secs(5)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
     /// The bound also covers the wire handshake: a server that sends the 200
     /// opening and then goes silent fails the connect as `ConnectionLost`.
     #[test]
@@ -2224,10 +2257,10 @@ mod tests {
         let plain = ScHttpUrl::parse("sc+http://127.0.0.1:1/x").unwrap();
         let secure = ScHttpUrl::parse("sc+https://127.0.0.1:1/x").unwrap();
         let env = |k: &str| match k {
-            "SC_HTTPS_STRICT" => Some("1".to_string()),
-            "SC_HTTPS_CA" => Some("system".to_string()),
-            "SC_HTTPS_FINGERPRINT" => Some(String::new()), // empty counts as unset
-            "SC_HTTPS_CA_FILE" => Some(String::new()),     // but not for a CA knob
+            "SC_HTTPS_STRICT" => Some("1".into()),
+            "SC_HTTPS_CA" => Some("system".into()),
+            "SC_HTTPS_FINGERPRINT" => Some(std::ffi::OsString::new()), // empty counts as unset
+            "SC_HTTPS_CA_FILE" => Some(std::ffi::OsString::new()),     // but not for a CA knob
             _ => None,
         };
         assert_eq!(
@@ -2236,6 +2269,16 @@ mod tests {
         );
         assert!(ignored_https_knobs(&secure, env).is_empty());
         assert!(ignored_https_knobs(&plain, |_| None).is_empty());
+
+        // A value that is not valid UTF-8 is still a value that was set.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let odd = |k: &str| {
+                (k == "SC_HTTPS_CA_FILE").then(|| std::ffi::OsString::from_vec(vec![0xff, 0xfe]))
+            };
+            assert_eq!(ignored_https_knobs(&plain, odd), vec!["SC_HTTPS_CA_FILE"]);
+        }
     }
 
     // ── Task 5: client-side `SC_HTTP_TOKEN` support (`connect_with_token`). ──

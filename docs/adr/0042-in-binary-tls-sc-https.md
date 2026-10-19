@@ -185,7 +185,8 @@ channel was always a weaker guarantee than the gate's wording implied.
   the 200 gets 300 s (a bucket-backed server opens its bucket before it answers
   HELLO), so a peer that accepts and goes silent fails the connect as
   `ConnectionLost` instead of hanging it. These bound each read or write, not
-  total time, and the connect shares one deadline across resolved addresses. Both
+  total time, and the connect (name resolution included, on a helper thread) shares one
+  deadline across resolved addresses. Both
   bounds are lifted once the handshake is done; a long transfer is governed by
   the server's session timeout. They are not configurable.
 - **`sc remote add` validates.** `sc+http://` and `sc+https://` URLs are parsed
