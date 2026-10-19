@@ -865,10 +865,9 @@ scale-&-reach horizon):
   skip majors on these (minor/patch security updates still flow). Migrating the
   whole stack to current majors is a deliberate, tested pass, not an automated
   bump; likewise `toml` 0.8 → 1.x and any pinned-toolchain bump.
-- **`404`-before-auth repo-presence oracle (P29).** `handle_http_connection`
-  checks `.sc/` presence before the bearer-auth gate, so an unauthenticated
-  client can distinguish "repo here, need a token" (401) from "no repo here"
-  (404) — a minor information leak, not a read/write bypass. Deferred.
+- **`404`-before-auth repo-presence oracle — closed.** `handle_http_connection`
+  now checks repo presence after the bearer-auth gate (ADR-0040), so behind
+  mandatory auth an unauthenticated probe sees `401` either way.
 - **`--transcript auto` probing (P30).** `sc ws harvest --transcript
   <path>` requires an explicit path today; auto-discovering a
   conventional transcript location (e.g. an agent-runner-written temp

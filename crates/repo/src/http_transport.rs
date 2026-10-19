@@ -1031,11 +1031,6 @@ fn handle_http_connection(
     // The request-target isn't used to route (one repo per listener).
     let _ = &opening.target;
 
-    if !root.join(".sc").is_dir() {
-        write_status(&mut writer, 404)?;
-        return Ok(());
-    }
-
     // Auth gate (P29): if ≥1 token is configured, a valid bearer is
     // REQUIRED on every connection, loopback included — the bind gate only
     // decides whether the port may be opened at all, not who may use it
@@ -1043,15 +1038,39 @@ fn handle_http_connection(
     // pre-P29 behavior). A matched token's scope sets this connection's
     // read-only flag; `--read-only` below is a floor an `rw` token cannot
     // elevate.
-    let tokens = crate::serve_tokens::load(&crate::layout::Layout::at(root))?;
+    // Tokens live under `.sc/`; without a repo directory there are none, and
+    // reading through a non-directory `.sc` would error and drop the
+    // connection with no status instead of answering below.
+    let has_repo = root.join(".sc").is_dir();
+    let tokens = if has_repo {
+        match crate::serve_tokens::load(&crate::layout::Layout::at(root)) {
+            Ok(tokens) => tokens,
+            // A token store that cannot be read is a refusal, not a dropped
+            // connection: behind mandatory auth every unauthenticated client
+            // gets the same 401, so a broken store is not a presence signal.
+            Err(e) if mandatory_auth => {
+                eprintln!("sc serve --http: refusing connection — token store unavailable: {e}");
+                write_status(&mut writer, 401)?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        Vec::new()
+    };
     let token_read_only = if tokens.is_empty() {
         if mandatory_auth {
             // The public bind's sole justification (tokens) was removed while
             // running — fail closed, do NOT serve an open unauthenticated server.
+            let why = if has_repo {
+                "none are configured (re-add a token, or restart with --read-only / \
+                 --allow-public)"
+            } else {
+                "the served root has no `.sc/` directory (the repo was removed while running)"
+            };
             eprintln!(
                 "sc serve --http: refusing connection — this non-loopback server was \
-                 justified only by tokens, but none are configured (re-add a token, or \
-                 restart with --read-only / --allow-public)"
+                 justified only by tokens, but {why}"
             );
             write_status(&mut writer, 401)?;
             return Ok(());
@@ -1071,6 +1090,16 @@ fn handle_http_connection(
             }
         }
     };
+
+    // Repo presence is checked only AFTER the auth gate, so a client that does
+    // not hold a valid token sees the same 401 whether or not a repo is served
+    // here. Tokens live under `.sc/`, so a bearer can only be required when the
+    // repo exists; with no tokens configured (open loopback, `--read-only` or
+    // `--allow-public`) there is no gate to leak around and the 404 stays.
+    if !has_repo {
+        write_status(&mut writer, 404)?;
+        return Ok(());
+    }
 
     write_status(&mut writer, 200)?;
 
@@ -1826,6 +1855,46 @@ mod tests {
         assert_eq!(connect_raw_status(port, Some("sct-not-a-real-token")), 401);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A mandatory-auth listener (tokens are the sole justification for its
+    /// public bind) answers 401 to everyone when its root holds no repo, not
+    /// 404: an unauthenticated probe must not learn whether a repo is served.
+    /// With auth off (the loopback default) the 404 stays, as there is no
+    /// gate to leak around.
+    #[test]
+    fn missing_repo_is_401_behind_mandatory_auth_and_404_without_it() {
+        let bare = std::env::temp_dir().join(format!("scl-http-oracle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+
+        let gated = spawn_real_http_server_policy_auth(bare.clone(), false, true);
+        assert_eq!(connect_raw_status(gated, None), 401);
+        assert_eq!(connect_raw_status(gated, Some("sct-not-a-real-token")), 401);
+
+        let open = spawn_real_http_server_policy_auth(bare.clone(), false, false);
+        assert_eq!(connect_raw_status(open, None), 404);
+
+        // A `.sc` that is a regular file is no repo either: still a status,
+        // never a dropped connection from the token read.
+        std::fs::write(bare.join(".sc"), b"not a directory").unwrap();
+        assert_eq!(connect_raw_status(open, None), 404);
+        assert_eq!(connect_raw_status(gated, None), 401);
+
+        std::fs::remove_dir_all(&bare).unwrap();
+        assert!(!bare.exists(), "test must leave no residue");
+
+        // A malformed token store behind mandatory auth is a 401 too.
+        let broken = tmp_repo("oracle-broken-tokens");
+        std::fs::write(
+            crate::layout::Layout::at(&broken).serve_tokens_path(),
+            b"this is = not [valid toml",
+        )
+        .unwrap();
+        let gated = spawn_real_http_server_policy_auth(broken.clone(), false, true);
+        assert_eq!(connect_raw_status(gated, None), 401);
+        std::fs::remove_dir_all(&broken).unwrap();
+        assert!(!broken.exists(), "test must leave no residue");
     }
 
     // ── Task 5: client-side `SC_HTTP_TOKEN` support (`connect_with_token`). ──

@@ -85,7 +85,11 @@ the `Authorization` header. `wire::serve` stays a thin wrapper delegating to
   crosses the wire in plaintext, so a public deployment must front with a TLS reverse proxy.
   Nor does it defend against a leaked token (bearer, reusable until removed) or a malicious
   holder of a valid token. Not HTTP-proxy/CDN-safe (the raw post-opening protocol), as P26.
-- **Minor pre-auth information leak:** the `.sc`-missing `404` is written before the auth
-  gate, so an unauthenticated client can distinguish "a repo is served here" (`401`) from
-  "no repo here" (`404`) — repo *presence* is observable pre-auth, though no content is.
-  Ordering the `404` after the auth check would close it; deferred (ROADMAP).
+- **Pre-auth repo-presence leak — closed.** The `.sc`-missing `404` used to be written
+  before the auth gate, so an unauthenticated client could tell "a repo is served here"
+  (`401`) from "no repo here" (`404`). The `404` now follows the gate: behind mandatory auth
+  a client without a valid token gets `401` either way. With no tokens configured (open
+  loopback, `--read-only`, `--allow-public`) there is no gate to leak around and the `404`
+  remains. A token store that cannot be read or parsed is a `401` there too, not a dropped connection. The two answers are status-indistinguishable, not timing-identical. A client
+  holding a valid token sees the `401` authentication error rather than `NotARepo` if the
+  repo is removed while the server runs.
