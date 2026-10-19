@@ -77,6 +77,15 @@ after upgrade. Dispatched on the *prior tip entry's* format:
 | **Randomized** | Consult the unchanged-detection cache (below); a hit carries the cached id, a miss seals randomized. |
 | **New protected path** | Seal randomized. |
 
+On a merge or pick completion the same proof also runs against the *other
+parent's* entry for the path (the merge head, or the picked commit): a path
+resolved with `sc resolve --theirs` has the chosen plaintext recorded against
+their blob id, so it carries their ciphertext instead of re-sealing. The blob
+must be held and its wrap list non-empty in the unioned protection. Their wrap
+list is carried verbatim, like any carry, so a recipient revoked or a key
+granted on our side after the fork is not applied to that blob until
+`sc rewrap`/`sc grant` — the same result as a clean merge that takes their side.
+
 Had dispatch been cache-only — "no cache entry ⇒ re-seal" — the first commit
 after upgrading to a P33 binary would have found an empty cache and re-sealed
 **every** unchanged protected file randomized, a mass-migration commit nobody
@@ -118,7 +127,7 @@ cannot be safely keyed without it).
   conflicts **by construction — even when the plaintexts are trivially
   identical** and needs `--identity` (or P23 `sc conflicts`/`sc resolve`) to
   resolve, at which point diff3 merges the identical plaintexts cleanly and
-  re-seals the result randomized.
+  re-seals the result randomized (a `--ours`/`--theirs` resolution carries the chosen side's ciphertext instead).
 - **(4b) `sc rewrap` is no longer policy-only / tree-identical when it
   upgrades.** A rewrap that re-seals any convergent blob randomized changes
   that blob's id and therefore the root tree — the commit is content-changing,

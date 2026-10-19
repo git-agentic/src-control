@@ -476,7 +476,10 @@ impl Repo {
         // convergent forever). A RANDOMIZED prior can't be compared by
         // re-encrypting (a fresh seal differs every time), so it consults the
         // `.sc`-local stat/tag cache; a lost/stale cache degrades to a spurious
-        // reseal, never to incorrectness. Everything else seals.
+        // reseal, never to incorrectness. Everything else seals. On a merge or
+        // pick completion the same proof also runs against the other parent's
+        // entry, so a protected path resolved to THEIR side keeps their
+        // ciphertext (below).
         let tip_entries: BTreeMap<String, (ObjectId, scl_core::FileMode, u8)> = match tip {
             Some(t) => {
                 let store_arc = self.vfs.store();
@@ -495,31 +498,69 @@ impl Repo {
         // (path, plaintext) for each sealed path, so its fresh blob id can be
         // recorded into the cache after `encrypt_protected` returns.
         let mut sealed_plaintexts: Vec<(String, Vec<u8>)> = Vec::new();
+        // Merge/pick completion only: the other parent's root, so a path
+        // resolved to THEIR side can carry their ciphertext too (ADR-0043).
+        let other_root: Option<ObjectId> = match merge_head.or(pick_head) {
+            Some(h) if cache.is_some() => Some(self.snapshot(&h)?.root),
+            _ => None,
+        };
         for (path, bytes, mode, granted) in protected {
-            // Decide carry (Some(prior blob id + perms)) vs. seal (None).
-            let carry: Option<(ObjectId, u8)> = match tip_entries.get(&path) {
-                Some((blob_id, _m, perms)) if perms & scl_core::PROTECTED != 0 => {
-                    let unchanged = if perms & scl_core::RANDOMIZED == 0 {
-                        // Convergent prior: exact re-encrypt-and-compare.
+            // Does `blob_id` (a protected blob with `perms`) provably hold
+            // exactly `bytes`? A convergent prior is proven by re-encrypting
+            // and comparing; a randomized one can't be, so it consults the
+            // `.sc`-local stat/tag cache, which resolves its stat path against
+            // its own checkout root (P33 Task 7), so a workspace commit stats
+            // the workspace file, not the host's. Carry iff the cached id is
+            // the prior id (same content AND same recorded seal); a lost or
+            // stale cache degrades to a spurious reseal, never incorrectness.
+            let proves =
+                |blob_id: &ObjectId, perms: u8, cache: Option<&crate::cache::ProtectedCache>| {
+                    if perms & scl_core::RANDOMIZED == 0 {
                         Object::blob(scl_crypto::encrypt_path(&bytes).0).id() == *blob_id
                     } else {
-                        // Randomized prior: the local stat/tag cache is the only
-                        // way to prove "same plaintext". Carry iff the cached id
-                        // matches the prior tip id (double-checked: same content
-                        // AND same recorded seal). The cache resolves the abs
-                        // stat path against its own checkout root (P33 Task 7),
-                        // so a workspace commit stats the workspace file, not
-                        // the host's.
-                        cache.as_deref().and_then(|c| c.unchanged(&path, &bytes)) == Some(*blob_id)
-                    };
-                    if unchanged {
-                        Some((*blob_id, *perms))
-                    } else {
-                        None
+                        cache.and_then(|c| c.unchanged(&path, &bytes)) == Some(*blob_id)
                     }
+                };
+            // Decide carry (Some(prior blob id + perms)) vs. seal (None).
+            let mut carry: Option<(ObjectId, u8)> = match tip_entries.get(&path) {
+                Some((blob_id, _m, perms))
+                    if perms & scl_core::PROTECTED != 0
+                        && proves(blob_id, *perms, cache.as_deref()) =>
+                {
+                    Some((*blob_id, *perms))
                 }
                 _ => None,
             };
+            // Not ours: a path resolved with `--theirs` was recorded against
+            // the other parent's blob id. Carry it only when its blob is held
+            // and its wrap list is non-empty in the unioned protection, so the
+            // carried ciphertext stays decryptable; any lookup trouble (a gap
+            // on a partial clone) just seals. Like every carry, it keeps that
+            // wrap list verbatim rather than re-deriving it from the merged
+            // rule's `granted_keys()` (see the wrap-lifecycle note below).
+            if carry.is_none() {
+                if let Some(root) = other_root {
+                    let found = {
+                        let store_arc = self.vfs.store();
+                        let mut store = store_arc.lock().unwrap();
+                        crate::worktree::tree_entry_at(&mut store, root, &path, partial)
+                            .ok()
+                            .flatten()
+                            .filter(|(id, _, _)| store.contains(id))
+                    };
+                    if let Some((blob_id, _m, perms)) = found {
+                        if perms & scl_core::PROTECTED != 0
+                            && protection
+                                .wrapped
+                                .get(&blob_id)
+                                .is_some_and(|wks| !wks.is_empty())
+                            && proves(&blob_id, perms, cache.as_deref())
+                        {
+                            carry = Some((blob_id, perms));
+                        }
+                    }
+                }
+            }
 
             match carry {
                 Some((blob_id, perms)) => {
@@ -528,9 +569,12 @@ impl Repo {
                     let cipher = {
                         let store_arc = self.vfs.store();
                         let mut store = store_arc.lock().unwrap();
-                        match store.get(&blob_id)? {
-                            Object::Blob(b) => Some(b.to_vec()),
-                            _ => None,
+                        match store.get(&blob_id) {
+                            Ok(Object::Blob(b)) => Some(b.to_vec()),
+                            Ok(_) => None,
+                            // Absent prior blob: seal below rather than abort.
+                            Err(scl_core::Error::NotFound(_)) => None,
+                            Err(e) => return Err(e.into()),
                         }
                     };
                     match cipher {
@@ -806,7 +850,11 @@ impl Repo {
         // them back to `granted_keys()` on the next commit, whereas carry
         // preserves them on unchanged content. This is not a new disclosure
         // (the recipient already holds the key; the ciphertext is unchanged)
-        // and `sc rewrap` remains the deliberate cutover, per ADR-0027.
+        // and `sc rewrap` remains the deliberate cutover, per ADR-0027. A path
+        // resolved to THEIR side carries their wrap list the same way: a
+        // recipient revoked, or a key granted, on our side after the fork is
+        // not applied to that blob until `sc rewrap`/`sc grant` (under-grant,
+        // never over-grant), exactly as a clean merge that takes their blob.
         let prior = std::mem::take(&mut protection.wrapped);
         crate::protect::reuse_prior_wraps(&mut fresh_wrapped, &prior);
         protection.wrapped = fresh_wrapped;
