@@ -24,18 +24,24 @@ pub struct CaTrust {
     roots: Arc<RootCertStore>,
     /// How many anchors were loaded (for the caller's diagnostics).
     count: usize,
+    /// Non-fatal problems loading the platform store (a directory that could
+    /// not be read, a certificate that did not parse). The anchors that did
+    /// load still validate; the caller decides whether to warn.
+    warnings: Vec<String>,
 }
 
 impl CaTrust {
     /// Anchors from a PEM bundle (one or more `CERTIFICATE` blocks). A file
     /// with no usable certificate is an error, never an empty store that would
-    /// make every connection fail later with a confusing message.
+    /// make every connection fail later with a confusing message, and so is a
+    /// block that is not a valid certificate: an explicitly supplied bundle
+    /// must be whole, not quietly shrunk.
     pub fn from_pem_file(path: &Path) -> Result<CaTrust> {
         let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
             .map_err(|e| Error::Mint(format!("read CA bundle {}: {e}", path.display())))?
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| Error::Mint(format!("parse CA bundle {}: {e}", path.display())))?;
-        Self::from_der(certs, &path.display().to_string())
+        Self::from_der(certs, &path.display().to_string(), true)
     }
 
     /// Anchors from the platform's trust store (system roots).
@@ -51,26 +57,54 @@ impl CaTrust {
                 "no system root certificates could be loaded{why}"
             )));
         }
-        Self::from_der(loaded.certs, "the system trust store")
+        let mut trust = Self::from_der(loaded.certs, "the system trust store", false)?;
+        // Loading a real platform store routinely reports a stray unreadable
+        // entry; the roots that loaded still validate (a smaller trust set,
+        // never a larger one), so these are reported, not fatal.
+        trust
+            .warnings
+            .extend(loaded.errors.iter().map(|e| e.to_string()));
+        Ok(trust)
     }
 
-    fn from_der(certs: Vec<CertificateDer<'static>>, from: &str) -> Result<CaTrust> {
+    fn from_der(
+        certs: Vec<CertificateDer<'static>>,
+        from: &str,
+        reject_unparsable: bool,
+    ) -> Result<CaTrust> {
         let mut roots = RootCertStore::empty();
-        let (added, _ignored) = roots.add_parsable_certificates(certs);
+        let (added, ignored) = roots.add_parsable_certificates(certs);
         if added == 0 {
             return Err(Error::Mint(format!(
                 "{from} holds no usable CA certificate"
             )));
         }
+        let mut warnings = Vec::new();
+        if ignored > 0 {
+            if reject_unparsable {
+                return Err(Error::Mint(format!(
+                    "{from} holds {ignored} certificate block(s) that are not valid CA certificates"
+                )));
+            }
+            warnings.push(format!(
+                "{ignored} certificate(s) in {from} could not be parsed"
+            ));
+        }
         Ok(CaTrust {
             roots: Arc::new(roots),
             count: added,
+            warnings,
         })
     }
 
     /// The number of trust anchors loaded.
     pub fn anchors(&self) -> usize {
         self.count
+    }
+
+    /// Non-fatal problems met while loading the anchors (system store only).
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }
 
@@ -258,6 +292,27 @@ mod tests {
             .err()
             .expect("must fail");
         assert!(missing.to_string().contains("read CA bundle"), "{missing}");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// One valid CA plus a CERTIFICATE block that is not a certificate: the
+    /// bundle is refused, not silently shrunk.
+    #[test]
+    fn a_partially_invalid_bundle_is_refused() {
+        let dir = tmp("partial");
+        let p = pki(&["localhost"]);
+        let bundle = format!(
+            "{}\n-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+            p.ca_pem
+        );
+        let f = dir.join("bundle.pem");
+        std::fs::write(&f, bundle).unwrap();
+        let err = CaTrust::from_pem_file(&f).err().expect("must fail");
+        assert!(
+            err.to_string().contains("not valid CA certificates"),
+            "{err}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
     }

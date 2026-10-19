@@ -408,6 +408,9 @@ impl HttpTransport {
                     crate::tls_pins::CaSource::File(f) => scl_tlsio::CaTrust::from_pem_file(f),
                     crate::tls_pins::CaSource::System => scl_tlsio::CaTrust::system(),
                 }?;
+                for w in trust.warnings() {
+                    eprintln!("warning: sc+https CA trust: {w}");
+                }
                 let tls = scl_tlsio::client_connect_ca(stream, &url.host, &trust)?;
                 let (rh, wh) = tls.split();
                 (
