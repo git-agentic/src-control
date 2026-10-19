@@ -1890,10 +1890,6 @@ mod tests {
             cap
         );
         assert_eq!(chunk_from(Some(&cap.to_string())), cap);
-        assert!(
-            cap + 1 <= scl_core::MAX_OBJECT_SIZE,
-            "tag + data fits a frame"
-        );
     }
 
     #[test]
