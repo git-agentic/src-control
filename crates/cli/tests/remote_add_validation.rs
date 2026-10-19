@@ -28,6 +28,8 @@ fn malformed_http_urls_are_refused_at_add_time_and_good_ones_recorded() {
         "sc+http:///repo",
         "sc+https://host:notaport/repo",
         "sc+http://host:99999/repo",
+        "sc+https:/host/repo", // near-miss scheme: one slash
+        "sc+http:host/repo",
     ] {
         let out = sc(&root, &["remote", "add", "origin", bad]);
         assert!(!out.status.success(), "{bad} should be refused");
@@ -55,4 +57,40 @@ fn malformed_http_urls_are_refused_at_add_time_and_good_ones_recorded() {
 
     std::fs::remove_dir_all(&root).unwrap();
     assert!(!root.exists(), "test must leave no residue");
+}
+
+/// With no path, `sc serve fingerprint` finds the repo from a subdirectory,
+/// and outside any repo it refuses instead of minting.
+#[test]
+fn serve_fingerprint_discovers_the_repo_and_refuses_outside_one() {
+    let root = repo("fingerprint");
+    let sub = root.join("a/b");
+    std::fs::create_dir_all(&sub).unwrap();
+    let out = sc(&sub, &["serve", "fingerprint"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("sha256:"));
+    assert!(
+        root.join(".sc/serve-tls").is_dir(),
+        "minted in the repo root"
+    );
+    assert!(!sub.join(".sc").exists(), "never in the subdirectory");
+
+    let bare =
+        std::env::temp_dir().join(format!("scl-cli-fingerprint-bare-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bare);
+    std::fs::create_dir_all(&bare).unwrap();
+    let out = sc(&bare, &["serve", "fingerprint"]);
+    assert!(!out.status.success());
+    assert!(!bare.join(".sc").exists(), "nothing may be created");
+
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&bare).unwrap();
+    assert!(
+        !root.exists() && !bare.exists(),
+        "test must leave no residue"
+    );
 }

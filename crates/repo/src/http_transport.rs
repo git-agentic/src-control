@@ -462,7 +462,8 @@ impl HttpTransport {
                 for w in trust.warnings() {
                     eprintln!("warning: sc+https CA trust: {w}");
                 }
-                let tls = scl_tlsio::client_connect_ca(stream, &url.host, &trust)?;
+                let tls = scl_tlsio::client_connect_ca(stream, &url.host, &trust)
+                    .map_err(|e| lost_if_timeout(e.into()))?;
                 let (rh, wh) = tls.split();
                 (
                     BufReader::new(HttpReadHalf::Tls(rh)),
@@ -514,7 +515,7 @@ impl HttpTransport {
                     Err(scl_tlsio::Error::UnknownHostStrict) => {
                         return Err(Error::TlsStrictUnknownHost(url.authority()))
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(lost_if_timeout(e.into())),
                 }
             }
             (true, None) => {
@@ -552,7 +553,7 @@ impl HttpTransport {
             }
         }
 
-        let client = WireClient::handshake(r, w)?;
+        let client = WireClient::handshake(r, w).map_err(lost_if_timeout)?;
         ctl.set_read_timeout(None)
             .and_then(|()| ctl.set_write_timeout(None))
             .map_err(|e| Error::ConnectionLost(format!("sc+http clear timeouts: {e}")))?;
@@ -622,19 +623,45 @@ const CLIENT_OPENING_TIMEOUT: Duration = Duration::from_secs(30);
 /// unroutable or black-holed host fails in `timeout` rather than the OS default.
 fn connect_within(authority: &str, timeout: Duration) -> std::io::Result<TcpStream> {
     use std::net::ToSocketAddrs;
+    let deadline = std::time::Instant::now() + timeout;
     let mut last = None;
     for addr in authority.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, timeout) {
+        // One deadline for the whole connect, not one bound per address: a
+        // dual-stack host with unreachable addresses must not take n x timeout.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&addr, remaining) {
             Ok(s) => return Ok(s),
             Err(e) => last = Some(e),
         }
     }
     Err(last.unwrap_or_else(|| {
         std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "no addresses resolved",
+            std::io::ErrorKind::TimedOut,
+            "no address connected within the bound",
         )
     }))
+}
+
+/// A timeout from the client's opening bound, in whatever shape the layer that
+/// hit it reported it (plain I/O from the wire framing, or wrapped by TLS), as
+/// the one typed `ConnectionLost` a caller can match. Every other error passes
+/// through unchanged.
+fn lost_if_timeout(e: Error) -> Error {
+    let timed_out = |io: &std::io::Error| {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    };
+    match &e {
+        Error::Io(io) | Error::Tls(scl_tlsio::Error::Io(io)) if timed_out(io) => {
+            Error::ConnectionLost("sc+http timed out waiting for the server".to_string())
+        }
+        _ => e,
+    }
 }
 
 /// The `SC_HTTPS_*` environment knobs that are set but cannot apply to `url`:
@@ -654,7 +681,13 @@ fn ignored_https_knobs(url: &ScHttpUrl, env: impl Fn(&str) -> Option<String>) ->
         "SC_HTTPS_CA",
     ]
     .into_iter()
-    .filter(|k| env(k).is_some_and(|v| !v.is_empty()))
+    .filter(|k| match (*k, env(k)) {
+        // The CA knobs fail closed when present-but-empty (an unset shell
+        // variable), so presence alone is the signal; for the rest an empty
+        // value is the same as unset.
+        ("SC_HTTPS_CA_FILE" | "SC_HTTPS_CA", v) => v.is_some(),
+        (_, v) => v.is_some_and(|v| !v.is_empty()),
+    })
     .collect()
 }
 
@@ -2061,6 +2094,39 @@ mod tests {
         holder.join().unwrap();
     }
 
+    /// The bound also covers the wire handshake: a server that sends the 200
+    /// opening and then goes silent fails the connect as `ConnectionLost`.
+    #[test]
+    fn a_server_silent_after_the_opening_fails_the_wire_handshake_as_lost() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            // Read the client opening, answer 200, then say nothing.
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let _ = read_client_opening(&mut reader);
+            write_status(&mut conn, 200).unwrap();
+            let _ = rx.recv();
+        });
+        let url = ScHttpUrl {
+            host: "127.0.0.1".to_string(),
+            port,
+            path: "/repo".to_string(),
+            tls: false,
+        };
+        let started = std::time::Instant::now();
+        let err = HttpTransport::connect_bounded(&url, None, None, Duration::from_millis(300))
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "unbounded: {err:?}"
+        );
+        assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
+        tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
     /// The same bound covers the TLS handshake: a peer that accepts and never
     /// answers the ClientHello fails the connect instead of hanging it.
     #[test]
@@ -2094,6 +2160,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "the TLS handshake was not bounded: {err:?}"
         );
+        assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
         assert!(
             !home.join("known_hosts").exists(),
             "a failed handshake must not write a pin"
@@ -2132,11 +2199,12 @@ mod tests {
             "SC_HTTPS_STRICT" => Some("1".to_string()),
             "SC_HTTPS_CA" => Some("system".to_string()),
             "SC_HTTPS_FINGERPRINT" => Some(String::new()), // empty counts as unset
+            "SC_HTTPS_CA_FILE" => Some(String::new()),     // but not for a CA knob
             _ => None,
         };
         assert_eq!(
             ignored_https_knobs(&plain, env),
-            vec!["SC_HTTPS_STRICT", "SC_HTTPS_CA"]
+            vec!["SC_HTTPS_STRICT", "SC_HTTPS_CA_FILE", "SC_HTTPS_CA"]
         );
         assert!(ignored_https_knobs(&secure, env).is_empty());
         assert!(ignored_https_knobs(&plain, |_| None).is_empty());

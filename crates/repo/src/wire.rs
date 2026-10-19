@@ -417,8 +417,11 @@ fn read_frame_inner(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
         )));
     }
     let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)
-        .map_err(|e| Error::Protocol(format!("read inside {len}-byte frame body failed: {e}")))?;
+    r.read_exact(&mut buf).map_err(|e| match e.kind() {
+        // A read timeout is the peer going quiet, not a malformed frame.
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Error::Io(e),
+        _ => Error::Protocol(format!("read inside {len}-byte frame body failed: {e}")),
+    })?;
     Ok(Some(buf))
 }
 

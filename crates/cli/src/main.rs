@@ -1033,7 +1033,8 @@ fn main() -> Result<()> {
             Some(ServeSub::Fingerprint { path }) => {
                 let root = match path {
                     Some(p) => p,
-                    None => std::env::current_dir()?,
+                    // Like every repo command, find the repo from a subdirectory.
+                    None => scl_repo::layout::Layout::discover(std::env::current_dir()?)?.root,
                 };
                 println!(
                     "{}",
@@ -3912,7 +3913,10 @@ fn run_remote(op: RemoteOp) -> Result<()> {
                 if url.starts_with("ssh://") {
                     scl_repo::SshUrl::parse(&url)?; // fail fast on malformed URLs
                 }
-                if url.starts_with("sc+http://") || url.starts_with("sc+https://") {
+                // The reserved scheme prefix, not just the exact `://` form: a
+                // near miss such as `sc+https:/host/repo` would otherwise be
+                // recorded and later read as a local path.
+                if url.starts_with("sc+http:") || url.starts_with("sc+https:") {
                     scl_repo::ScHttpUrl::parse(&url)?; // fail fast on malformed URLs
                 }
                 if url.starts_with("sc+wal://") || url.starts_with("sc+s3://") {
