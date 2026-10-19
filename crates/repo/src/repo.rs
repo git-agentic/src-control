@@ -1799,6 +1799,48 @@ impl Repo {
                 }
             }
         }
+        // The stop writes plaintext and sidecars with plain writes, outside
+        // `materialize`. A file or directory already on disk at one of those
+        // paths that `old_root` does not track is the user's own (an ignored or
+        // untracked copy, or a leftover sidecar): the write would replace it,
+        // and abort would then delete it. A file standing where a parent
+        // directory must be would fail the write halfway. Refuse both before
+        // any write (ADR-0049 q21). A lookup that fails counts as untracked.
+        {
+            let partial = self.promisor()?.is_some();
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let targets = to_encrypt
+                .iter()
+                .map(|(p, ..)| p.as_str())
+                .chain(sidecars.iter().map(|(r, _)| r.as_str()));
+            for rel in targets {
+                // A path the sparse view never materialized holds no tracked
+                // file on disk, even if the tree tracks it: whatever is there
+                // is the user's own. A failed lookup counts as untracked.
+                let mut tracked = |p: &str| {
+                    sparse.matches(p)
+                        && worktree::tree_entry_at(&mut store, old_root, p, partial)
+                            .is_ok_and(|e| e.is_some())
+                };
+                match stop_write_blocker(&self.layout.root, rel, &mut tracked)? {
+                    None => {}
+                    Some(StopBlocker::ParentFile) => {
+                        return Err(Error::InvalidArgument(format!(
+                            "merge has conflicts, and a file stands where a directory for {rel} \
+                             must be; move that file away, then retry"
+                        )))
+                    }
+                    Some(StopBlocker::Occupied) => {
+                        return Err(Error::InvalidArgument(format!(
+                            "merge has conflicts, and writing {rel} would overwrite an untracked \
+                             or ignored file or directory (possibly a sidecar left by an earlier \
+                             stop); move it away, then retry"
+                        )))
+                    }
+                }
+            }
+        }
         // A carried subtree can sit inside the view: fill its closure before
         // the first working-tree write (lazy partial clones only), outside
         // the store lock.
@@ -2259,6 +2301,45 @@ impl Repo {
             "system",
             "set protected prefix",
         )
+    }
+}
+
+/// What stands in the way of a conflict stop's direct write to `rel`.
+#[derive(Debug, PartialEq, Eq)]
+enum StopBlocker {
+    /// A file the old tree does not track sits where a parent directory of
+    /// `rel` must be.
+    ParentFile,
+    /// `rel` itself exists on disk and is not a tracked file: an untracked or
+    /// ignored copy, a leftover sidecar, or a directory.
+    Occupied,
+}
+
+/// Decide whether a conflict stop may write `rel` under `root` (ADR-0049
+/// q21). `tracked(path)` says whether the tree the working tree reflects
+/// tracks `path` as a file that is on disk. A tracked file standing where a
+/// parent directory must be is fine: the stop's materialize removes it before
+/// the write, as a merge that replaces a file with a directory does. A
+/// directory at `rel` is never fine, tracked or not: the write would fail.
+fn stop_write_blocker(
+    root: &std::path::Path,
+    rel: &str,
+    tracked: &mut impl FnMut(&str) -> bool,
+) -> Result<Option<StopBlocker>> {
+    let comps: Vec<&str> = rel.split('/').collect();
+    for i in 1..comps.len() {
+        let prefix = comps[..i].join("/");
+        let full = worktree::safe_join(root, &prefix)?;
+        if full.symlink_metadata().is_ok_and(|m| !m.is_dir()) && !tracked(&prefix) {
+            return Ok(Some(StopBlocker::ParentFile));
+        }
+    }
+    let full = worktree::safe_join(root, rel)?;
+    match full.symlink_metadata() {
+        Err(_) => Ok(None),
+        Ok(m) if m.is_dir() => Ok(Some(StopBlocker::Occupied)),
+        Ok(_) if tracked(rel) => Ok(None),
+        Ok(_) => Ok(Some(StopBlocker::Occupied)),
     }
 }
 
@@ -6371,5 +6452,68 @@ mod tests {
         drop(dst);
         std::fs::remove_dir_all(&src_root).unwrap();
         std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stop_blocker_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("scl-stop-blocker-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_tracked_file_replaced_by_a_directory_does_not_block() {
+        let root = tmp("file-to-dir");
+        std::fs::write(root.join("a"), b"tracked\n").unwrap();
+        let tracked = |p: &str| p == "a";
+        assert_eq!(
+            stop_write_blocker(&root, "a/b", &mut { tracked }).unwrap(),
+            None,
+            "the old tree tracks `a`; materialize removes it before the write"
+        );
+        let untracked = |_: &str| false;
+        assert_eq!(
+            stop_write_blocker(&root, "a/b", &mut { untracked }).unwrap(),
+            Some(StopBlocker::ParentFile)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_directory_at_the_target_blocks_even_when_tracked() {
+        let root = tmp("dir-at-target");
+        std::fs::create_dir_all(root.join("x/y")).unwrap();
+        let tracked = |_: &str| true;
+        assert_eq!(
+            stop_write_blocker(&root, "x/y", &mut { tracked }).unwrap(),
+            Some(StopBlocker::Occupied)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_tracked_file_target_is_fine_and_an_untracked_one_is_not() {
+        let root = tmp("file-target");
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let tracked = |p: &str| p == "f";
+        assert_eq!(
+            stop_write_blocker(&root, "f", &mut { tracked }).unwrap(),
+            None
+        );
+        let untracked = |_: &str| false;
+        assert_eq!(
+            stop_write_blocker(&root, "f", &mut { untracked }).unwrap(),
+            Some(StopBlocker::Occupied)
+        );
+        assert_eq!(
+            stop_write_blocker(&root, "missing", &mut { untracked }).unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
