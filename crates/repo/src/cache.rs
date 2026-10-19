@@ -111,7 +111,9 @@ struct CacheEntry {
 /// checkout dir. The keyed-tag comparison that decides every `unchanged()`
 /// hit does not depend on `root` at all (it hashes the caller's in-memory
 /// plaintext), so a mismatched root only ever loses the advisory stat
-/// bookkeeping — never incorrectness.
+/// bookkeeping — never incorrectness. `save` resolves entries against `root`
+/// too, so a mismatched root would also prune every entry at the next save (a
+/// full re-seal, still never incorrect).
 pub(crate) struct ProtectedCache {
     key: [u8; 32],
     /// Absolute base dir of the served checkout; `root.join(rel)` is the file
@@ -220,7 +222,8 @@ impl ProtectedCache {
     /// protected files actually on disk instead of growing for the life of the
     /// repo. A lookup always compares the keyed tag of plaintext read from the
     /// file, so an entry for an absent file can never be consulted; dropping it
-    /// at worst costs one re-seal if the path returns.
+    /// at worst costs one re-seal if the path returns. Sealing is randomized,
+    /// so that re-seal yields a new blob id for unchanged content.
     pub(crate) fn save(&self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
