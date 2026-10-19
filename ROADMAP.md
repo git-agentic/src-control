@@ -799,11 +799,10 @@ scale-&-reach horizon):
   is minted 0600-from-first-byte via a unix-only `OpenOptions::mode` call;
   there is no non-unix fallback today, so the key file is left world-readable
   on a non-unix target. A non-unix permission-hardening path is deferred.
-- **fd/stdin secret injection (P28).** `sc run` hands decrypted secrets to
-  the child via its environment — observable by same-user processes,
-  crash dumps, and shell wrappers, per the tightened threat-model wording.
-  An alternative injection path (an fd or stdin the child reads instead of
-  inheriting an env var) would shrink that exposure and is deferred.
+- **fd secret injection — shipped (ADR-0052).** `sc run --secrets-fd N` hands the
+  secrets to the command on a descriptor (NUL-terminated `NAME=VALUE` records)
+  instead of its environment. Not built: the same mode for `sc ws run` and
+  `sc work --with-secrets`, and a stdin variant.
 - **`--max-object-size` operator config knob (P28).** `MAX_OBJECT_SIZE`
   (256 MiB) is a compile-time constant anchoring every untrusted-length
   guard; letting an operator raise or lower it per-deployment is deferred.

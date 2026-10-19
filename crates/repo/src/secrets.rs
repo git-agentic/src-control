@@ -337,8 +337,41 @@ impl Repo {
         identity: &SecretKey,
         strict: bool,
     ) -> Result<Vec<(String, OsString)>> {
-        let reg = self.registry()?;
         let mut envs: Vec<(String, OsString)> = Vec::new();
+        for (name, plaintext) in self.secret_values(identity, strict)? {
+            // The `OsString` produced below is the unavoidable hand-off:
+            // injecting a secret into a child's environment is an
+            // authorized LOCAL PROCESS context, NOT strong isolation — the
+            // decrypted secret is observable by same-user processes, crash
+            // dumps, and shell wrappers through the child environment. That
+            // copy is fundamentally un-zeroizable (the kernel owns it once
+            // the child is spawned) and is the accepted boundary, not a
+            // defect. `sc run --secrets-fd` avoids it (ADR-0052).
+            #[cfg(unix)]
+            let val = {
+                use std::os::unix::ffi::OsStrExt;
+                std::ffi::OsStr::from_bytes(&plaintext).to_os_string()
+            };
+            #[cfg(not(unix))]
+            let val = OsString::from(
+                std::str::from_utf8(&plaintext)
+                    .map_err(|_| Error::InvalidArgument(format!("secret {name} not UTF-8")))?,
+            );
+            envs.push((name, val));
+        }
+        Ok(envs)
+    }
+
+    /// The decrypted values behind [`Repo::secret_env`], still in zeroizing
+    /// buffers: the one place registered secrets are opened for a process.
+    /// Same `strict` contract.
+    pub(crate) fn secret_values(
+        &self,
+        identity: &SecretKey,
+        strict: bool,
+    ) -> Result<Vec<(String, scl_crypto::Zeroizing<Vec<u8>>)>> {
+        let reg = self.registry()?;
+        let mut out = Vec::new();
         for (name, id) in reg {
             let obj = {
                 let arc = self.store_arc();
@@ -350,34 +383,11 @@ impl Repo {
                 _ => continue,
             };
             match scl_crypto::open(&secret, identity) {
+                // Pin the type explicitly: if `scl_crypto::open` ever stops
+                // returning `Zeroizing<Vec<u8>>`, this line fails to compile.
                 Ok(plaintext) => {
-                    // Pin the type explicitly: if `scl_crypto::open` ever stops
-                    // returning `Zeroizing<Vec<u8>>`, this line fails to compile.
-                    // The `OsStr::from_bytes` below reads directly out of this
-                    // buffer — no intermediate plain `Vec`/`String` copy — so the
-                    // parent-side plaintext stays zeroized until `plaintext`
-                    // drops at the end of this iteration.
-                    //
-                    // The `OsString` produced below is the unavoidable hand-off:
-                    // injecting a secret into a child's environment is an
-                    // authorized LOCAL PROCESS context, NOT strong isolation —
-                    // the decrypted secret is observable by same-user processes,
-                    // crash dumps, and shell wrappers through the child
-                    // environment. That copy is fundamentally un-zeroizable (the
-                    // kernel owns it once the child is spawned) and is the
-                    // accepted boundary, not a defect.
                     let plaintext: scl_crypto::Zeroizing<Vec<u8>> = plaintext;
-                    #[cfg(unix)]
-                    let val = {
-                        use std::os::unix::ffi::OsStrExt;
-                        std::ffi::OsStr::from_bytes(&plaintext).to_os_string()
-                    };
-                    #[cfg(not(unix))]
-                    let val =
-                        OsString::from(std::str::from_utf8(&plaintext).map_err(|_| {
-                            Error::InvalidArgument(format!("secret {name} not UTF-8"))
-                        })?);
-                    envs.push((name, val));
+                    out.push((name, plaintext));
                 }
                 Err(scl_crypto::Error::NotARecipient) if strict => {
                     return Err(Error::InvalidArgument(format!(
@@ -390,7 +400,7 @@ impl Repo {
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(envs)
+        Ok(out)
     }
 
     /// Decrypt all secrets the `identity` can read, inject into the environment,
@@ -410,6 +420,218 @@ impl Repo {
         }
         let status = command.status()?;
         Ok(status.code().unwrap_or(1))
+    }
+
+    /// Like [`Repo::run`], but the secrets never enter the child's
+    /// environment: they are written to a pipe whose read end the child
+    /// inherits as file descriptor `fd` (ADR-0052). The payload is
+    /// NUL-terminated `NAME=VALUE` records, the shape of
+    /// `/proc/<pid>/environ`; the child reads to EOF. The values therefore do
+    /// not show up in `/proc/<pid>/environ`, are not inherited by every
+    /// descendant through the environment, and the parent's copy stays in a
+    /// zeroizing buffer. `SC_SECRETS_FD` (not a secret) tells the child which
+    /// descriptor to read. This is still an authorized local-process context,
+    /// not isolation: a same-user process can read the child's fd table, and
+    /// the child decides what happens to what it read.
+    ///
+    /// A payload larger than the pipe buffer (64 KiB on Linux) is delivered only
+    /// while the command is running: once it exits the writer stops, so a
+    /// command that backgrounds its consumer must read before it exits (a
+    /// smaller payload already sits whole in the pipe and survives).
+    ///
+    /// `fd` must be between 3 and 1023; a secret whose value holds a NUL byte is
+    /// refused (it could not be framed, and could not be an environment
+    /// value either). Unix only.
+    #[cfg(unix)]
+    pub fn run_with_secrets_fd(
+        &self,
+        identity: &SecretKey,
+        cmd: &[String],
+        fd: i32,
+    ) -> Result<i32> {
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+
+        self.refuse_on_private("sc run")?;
+        if !(3..=1023).contains(&fd) {
+            return Err(Error::InvalidArgument(format!(
+                "--secrets-fd must be between 3 and 1023 (0, 1 and 2 are stdin, stdout and stderr), got {fd}"
+            )));
+        }
+        let (exe, args) = cmd
+            .split_first()
+            .ok_or_else(|| Error::InvalidArgument("empty command".into()))?;
+
+        let values = self.secret_values(identity, false)?;
+        // Names are framed as `NAME=`: an empty one, or one holding `=` or NUL,
+        // would corrupt the record or forge another.
+        if let Some((name, _)) = values
+            .iter()
+            .find(|(n, _)| n.is_empty() || n.bytes().any(|b| b == b'=' || b == 0))
+        {
+            return Err(Error::InvalidArgument(format!(
+                "secret name {name:?} cannot be framed for --secrets-fd (empty, or it holds '=' or NUL)"
+            )));
+        }
+        if let Some((name, _)) = values.iter().find(|(_, v)| v.contains(&0)) {
+            return Err(Error::InvalidArgument(format!(
+                "secret {name} holds a NUL byte and cannot be framed for --secrets-fd"
+            )));
+        }
+        // One allocation of the exact size: a Vec that grows moves, and the
+        // freed old buffer would keep plaintext that `Zeroizing` never wipes.
+        let total: usize = values.iter().map(|(n, v)| n.len() + 1 + v.len() + 1).sum();
+        let mut payload: scl_crypto::Zeroizing<Vec<u8>> =
+            scl_crypto::Zeroizing::new(Vec::with_capacity(total));
+        for (name, value) in &values {
+            payload.extend_from_slice(name.as_bytes());
+            payload.push(b'=');
+            payload.extend_from_slice(value);
+            payload.push(0);
+        }
+        // The names delivered here must not also reach the child through an
+        // environment variable the caller already had set.
+        let delivered: Vec<String> = values.iter().map(|(n, _)| n.clone()).collect();
+        drop(values);
+
+        let (reader, writer) = std::io::pipe()?;
+        let reader: OwnedFd = reader.into();
+        let raw = reader.as_raw_fd();
+        // `fd` may be a descriptor `std` would pick for its own exec-error pipe
+        // while it spawns, which the pre_exec dup2 below would then clobber.
+        // Hold `fd` open (close-on-exec) across the spawn when it is free; when
+        // it is already taken the probe lands higher and nothing needs holding.
+        let _reserved = reserve_fd(fd);
+        let mut command = Command::new(exe);
+        command.args(args);
+        for name in &delivered {
+            command.env_remove(name);
+        }
+        command.env("SC_SECRETS_FD", fd.to_string());
+        // SAFETY: the closure only calls dup2 and fcntl, both async-signal-safe.
+        // The pipe's read end is close-on-exec, so it needs to land on `fd`
+        // (dup2 clears the flag on the copy) or have the flag cleared where it
+        // already is; the write end is close-on-exec and never reaches the child.
+        unsafe {
+            command.pre_exec(move || {
+                if raw == fd {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else if libc::dup2(raw, fd) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        // Only the child holds a read end now; a child that exits unread
+        // breaks the pipe and ends the writer instead of blocking it.
+        drop(reader);
+        drop(_reserved);
+        // The write end is non-blocking and fed by its own thread, so a payload
+        // larger than the pipe buffer cannot block the parent before the child
+        // has read it, and the thread stops once the child is gone even if a
+        // grandchild still holds the read end open (it is joined below, so the
+        // zeroizing buffer is wiped before this returns).
+        if set_nonblocking(&writer).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_done = std::sync::Arc::clone(&done);
+        let spawned = std::thread::Builder::new()
+            .name("sc-secrets-fd".into())
+            .spawn(move || feed_pipe(writer, payload, &thread_done));
+        let feeder = match spawned {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Io(e));
+            }
+        };
+        let status = child.wait();
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let _ = feeder.join();
+        Ok(status?.code().unwrap_or(1))
+    }
+
+    /// `--secrets-fd` needs POSIX file descriptors.
+    #[cfg(not(unix))]
+    pub fn run_with_secrets_fd(&self, _: &SecretKey, _: &[String], _: i32) -> Result<i32> {
+        Err(Error::InvalidArgument(
+            "--secrets-fd is only available on unix".into(),
+        ))
+    }
+}
+
+/// Hold descriptor `fd` open (close-on-exec) if it is free: a probe at the
+/// lowest free descriptor at or above `fd` lands exactly on `fd` only when
+/// nothing else has it. The held descriptor is closed when dropped.
+#[cfg(unix)]
+fn reserve_fd(fd: i32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: opens /dev/null read-only and wraps the new descriptors, each
+    // owned exactly once.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if null < 0 {
+            return None;
+        }
+        let null = OwnedFd::from_raw_fd(null);
+        let probe = libc::fcntl(
+            std::os::fd::AsRawFd::as_raw_fd(&null),
+            libc::F_DUPFD_CLOEXEC,
+            fd,
+        );
+        if probe < 0 {
+            return None;
+        }
+        let probe = OwnedFd::from_raw_fd(probe);
+        (std::os::fd::AsRawFd::as_raw_fd(&probe) == fd).then_some(probe)
+    }
+}
+
+/// Make the pipe's write end non-blocking (its own open file description, so
+/// the child's read end is unaffected).
+#[cfg(unix)]
+fn set_nonblocking(w: &std::io::PipeWriter) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fcntl on a descriptor this PipeWriter owns.
+    unsafe {
+        let fl = libc::fcntl(w.as_raw_fd(), libc::F_GETFL);
+        if fl < 0 || libc::fcntl(w.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Write `payload` to the non-blocking pipe until it is all in, the reader is
+/// gone, or `done` is set (the child exited): then the buffer is wiped on drop.
+#[cfg(unix)]
+fn feed_pipe(
+    mut w: std::io::PipeWriter,
+    payload: scl_crypto::Zeroizing<Vec<u8>>,
+    done: &std::sync::atomic::AtomicBool,
+) {
+    use std::io::Write;
+    let mut off = 0;
+    while off < payload.len() {
+        match w.write(&payload[off..]) {
+            Ok(0) => return,
+            Ok(n) => off += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if done.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return, // the reader is gone (EPIPE)
+        }
     }
 }
 

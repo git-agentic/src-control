@@ -231,6 +231,10 @@ transport-adjacent. The rest, imperatively:
 - **Secret injection is an authorized local process context, NOT isolation:**
   same-user processes, crash dumps, and shell wrappers can observe the child
   env. The parent's buffer is zeroized; the child's copy cannot be.
+  `sc run --secrets-fd N` (ADR-0052, unix) keeps the secrets out of the
+  environment (they arrive on fd N as NUL-terminated `NAME=VALUE` records,
+  `SC_SECRETS_FD` names it): hygiene against env dumps and inheritance, still
+  not isolation. `sc ws run` and `sc work --with-secrets` use the environment.
 - **Sparse is checkout-only** and has one disk-hygiene boundary: an in-sparse
   conflict co-occurring with an out-of-sparse protected/plain clean change can
   leave that out-of-sparse plaintext on disk until the next materializing
@@ -264,8 +268,7 @@ transport-adjacent. The rest, imperatively:
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here). Notable standing entries: transparent
 lazy-fetch for partial clones, per-case gap-tolerant merge/replay on partial
-clones, fd/stdin
-secret injection, CA-path validation alongside TOFU pinning, and pin-management
+clones, CA-path validation alongside TOFU pinning, and pin-management
 UX (`sc tls`).
 
 ## Agent skills
