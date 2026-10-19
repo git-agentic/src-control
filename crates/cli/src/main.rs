@@ -506,6 +506,12 @@ enum Cmd {
         #[command(subcommand)]
         op: SparseOp,
     },
+    /// Manage the `sc+https://` pins in the user-level known_hosts file
+    /// (`$XDG_CONFIG_HOME/sc/known_hosts`, or `$SC_HTTPS_KNOWN_HOSTS`).
+    Tls {
+        #[command(subcommand)]
+        op: TlsOp,
+    },
     /// Widen a partial clone: fetch objects under these prefixes from the
     /// promisor origin and widen `.sc/promisor` to include them. Errors if
     /// this repo is not a partial clone.
@@ -595,6 +601,32 @@ enum TranscriptOp {
         #[arg(long)]
         identity: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum TlsOp {
+    /// List the pinned `host:port` fingerprints, in file order.
+    List {
+        /// Emit JSON instead of `host:port sha256:<hex>` lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove every pin for a host (the recovery for a changed server key).
+    /// The port defaults to 8730.
+    Forget {
+        /// `host` or `host:port`.
+        target: String,
+    },
+    /// Pin a host to a fingerprint (replacing any pin it had), e.g. one
+    /// printed by `sc serve fingerprint`, without connecting first.
+    Pin {
+        /// `host` or `host:port`.
+        target: String,
+        /// `sha256:<hex>` (or bare hex), as `sc serve fingerprint` prints it.
+        fingerprint: String,
+    },
+    /// Print the pin file in effect.
+    Path,
 }
 
 #[derive(Subcommand)]
@@ -1065,12 +1097,76 @@ fn main() -> Result<()> {
         Cmd::Sign { r#ref, identity } => run_sign(&r#ref, identity),
         Cmd::Verify { r#ref, require } => run_verify(r#ref, require),
         Cmd::Sparse { op } => run_sparse(op),
+        Cmd::Tls { op } => run_tls(op),
         Cmd::Backfill {
             prefixes,
             all,
             lazy,
         } => run_backfill(prefixes, all, lazy),
         Cmd::Transcript { op } => run_transcript(op),
+    }
+}
+
+fn run_tls(op: TlsOp) -> Result<()> {
+    use scl_repo::tls_pins;
+    let file = tls_pins::known_hosts_path()?;
+    match op {
+        TlsOp::List { json } => {
+            let entries = tls_pins::list(&file)?;
+            if json {
+                let rows: Vec<_> = entries
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "host": e.host,
+                            "port": e.port,
+                            "pin": tls_pins::fingerprint(&e.pin),
+                        })
+                    })
+                    .collect();
+                print_line(&serde_json::json!({"file": file, "pins": rows}).to_string());
+            } else {
+                for e in &entries {
+                    print_line(&format!(
+                        "{}:{} {}",
+                        e.host,
+                        e.port,
+                        tls_pins::fingerprint(&e.pin)
+                    ));
+                }
+                if entries.is_empty() {
+                    eprintln!("no pins in {}", file.display());
+                }
+            }
+            Ok(())
+        }
+        TlsOp::Forget { target } => {
+            let (host, port) = tls_pins::parse_host_port(&target)?;
+            let n = tls_pins::forget(&file, &host, port)?;
+            if n == 0 {
+                anyhow::bail!("no pin for {host}:{port} in {}", file.display());
+            }
+            println!("forgot {n} pin(s) for {host}:{port}; the next connection pins what it sees");
+            Ok(())
+        }
+        TlsOp::Pin {
+            target,
+            fingerprint,
+        } => {
+            let (host, port) = tls_pins::parse_host_port(&target)?;
+            let pin = tls_pins::parse_fingerprint(&fingerprint)?;
+            let replaced = tls_pins::set_pin(&file, &host, port, &pin)?;
+            println!(
+                "{} {host}:{port} -> {}",
+                if replaced { "re-pinned" } else { "pinned" },
+                tls_pins::fingerprint(&pin)
+            );
+            Ok(())
+        }
+        TlsOp::Path => {
+            print_line(&file.display().to_string());
+            Ok(())
+        }
     }
 }
 

@@ -353,6 +353,11 @@ cargo run --bin sc -- clone sc+https://host[:port]/repo <dst>   # TLS clone (P32
                                               # SC_HTTPS_FINGERPRINT=<sha256:hex> pre-pins (CI),
                                               # SC_HTTPS_STRICT=1 refuses unknown hosts;
                                               # remote add/fetch/push accept the same URL form
+cargo run --bin sc -- tls list [--json]       # pins in the known_hosts file (ADR-0053)
+cargo run --bin sc -- tls forget <host[:port]>   # drop a host's pin (changed server key); the next
+                                              # connect re-pins; errors if nothing was pinned
+cargo run --bin sc -- tls pin <host[:port]> <sha256:hex>   # pin without connecting (replaces)
+cargo run --bin sc -- tls path                # the pin file in effect
 bash demo/run_tls_demo.sh                     # sc+https proof (P32): TLS round trip w/ signed
                                               # chunked blob, TOFU pin/mismatch/strict/pre-pin,
                                               # tightened plaintext gate — run twice

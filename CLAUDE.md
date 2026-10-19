@@ -268,8 +268,8 @@ transport-adjacent. The rest, imperatively:
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here). Notable standing entries: transparent
 lazy-fetch for partial clones, per-case gap-tolerant merge/replay on partial
-clones, CA-path validation alongside TOFU pinning, and pin-management
-UX (`sc tls`).
+clones, and CA-path validation alongside TOFU pinning. `sc tls list/forget/pin/path`
+manages the `sc+https://` pin file (ADR-0053).
 
 ## Agent skills
 

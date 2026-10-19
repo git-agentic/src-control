@@ -122,8 +122,9 @@ pub enum Error {
     #[error(
         "sc+https server key for {host} does not match the pinned fingerprint ({file})\n  \
          pinned: {pinned}\n  server: {seen}\n\
-         If the server key legitimately changed, remove that host's line from the pin file \
-         and reconnect (the next connect re-pins); verify with `sc serve fingerprint` on the server."
+         If the server key legitimately changed, run `sc tls forget {host}` (or remove that \
+         host's line from the pin file) and reconnect (the next connect re-pins); verify with \
+         `sc serve fingerprint` on the server."
     )]
     TlsPinMismatch {
         host: String,
@@ -133,7 +134,8 @@ pub enum Error {
     },
     #[error(
         "sc+https host {0} is not pinned and SC_HTTPS_STRICT=1 refuses unknown hosts; \
-         pre-pin with SC_HTTPS_FINGERPRINT=sha256:<hex> or connect once without SC_HTTPS_STRICT"
+         pre-pin with `sc tls pin {0} sha256:<hex>` or SC_HTTPS_FINGERPRINT=sha256:<hex>, or \
+         connect once without SC_HTTPS_STRICT"
     )]
     TlsStrictUnknownHost(String),
     #[error(

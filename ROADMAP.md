@@ -836,9 +836,9 @@ scale-&-reach horizon):
   the Phase 32 entry above. Follow-ons this phase named rather than closed:
   CA-path validation as an additive trust option for PEM-provisioned
   deployments (v1 is pin-only, names/validity ignored); opt-in SNI/
-  certificate-name validation; pin-management UX (`sc tls` list/remove
+  certificate-name validation; pin-management UX (SHIPPED in ADR-0053: `sc tls list/forget/pin/path`; it was `sc tls` list/remove
   entries in `~/.config/sc/known_hosts` — today only `sc serve fingerprint`
-  and first-connect/`SC_HTTPS_FINGERPRINT` write pins, nothing removes one);
+  and first-connect/`SC_HTTPS_FINGERPRINT` write pins, nothing removed one);
   TLS session-resumption knobs (not evaluated this phase — a later
   throughput pass if repeated short-lived connections to the same host prove
   handshake cost material).

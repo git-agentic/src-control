@@ -27,10 +27,7 @@ pub struct TlsClientPolicy {
 
 impl TlsClientPolicy {
     pub fn from_env() -> Result<TlsClientPolicy> {
-        let known_hosts = match std::env::var_os("SC_HTTPS_KNOWN_HOSTS") {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => default_known_hosts_path()?,
-        };
+        let known_hosts = known_hosts_path()?;
         let pre_pin = match std::env::var("SC_HTTPS_FINGERPRINT") {
             Ok(s) if !s.is_empty() => Some(parse_fingerprint(&s)?),
             _ => None,
@@ -55,6 +52,15 @@ fn strict_from(value: Option<&str>) -> bool {
         None => false,
         Some(v) if v.is_empty() || v == "0" => false,
         Some(_) => true,
+    }
+}
+
+/// The pin file in effect: `SC_HTTPS_KNOWN_HOSTS` if set and non-empty, else
+/// [`default_known_hosts_path`].
+pub fn known_hosts_path() -> Result<PathBuf> {
+    match std::env::var_os("SC_HTTPS_KNOWN_HOSTS") {
+        Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+        _ => default_known_hosts_path(),
     }
 }
 
@@ -136,6 +142,124 @@ pub fn record(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<()> 
     Ok(())
 }
 
+/// One pin as stored: the `host:port` it was recorded for and its SPKI hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinEntry {
+    pub host: String,
+    pub port: u16,
+    pub pin: [u8; 32],
+}
+
+/// A pin rendered as `sha256:<lowercase hex>`, the one fingerprint format.
+pub fn fingerprint(pin: &[u8; 32]) -> String {
+    scl_tlsio::fingerprint_hex(pin)
+}
+
+/// Parse `host`, `host:port` (the port defaults to
+/// [`crate::http_transport::DEFAULT_PORT`]), the same split an `sc+https://`
+/// URL's authority gets, so a pin names exactly what a connection looks up.
+pub fn parse_host_port(s: &str) -> Result<(String, u16)> {
+    let (host, port) = match s.split_once(':') {
+        Some((h, p)) => (
+            h,
+            p.parse::<u16>()
+                .map_err(|_| Error::InvalidArgument(format!("bad port in {s:?}")))?,
+        ),
+        None => (s, crate::http_transport::DEFAULT_PORT),
+    };
+    if host.is_empty() {
+        return Err(Error::InvalidArgument(format!("empty host in {s:?}")));
+    }
+    Ok((host.to_string(), port))
+}
+
+/// One non-comment line as a pin entry, if it is a well-formed one.
+fn parse_line(line: &str) -> Option<PinEntry> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (key, value) = line.split_once(' ')?;
+    let (host, port) = key.split_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    Some(PinEntry {
+        host: host.to_string(),
+        port,
+        pin: parse_fingerprint(value.trim()).ok()?,
+    })
+}
+
+fn read_pin_file(file: &Path) -> Result<String> {
+    match std::fs::read_to_string(file) {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(Error::InvalidArgument(format!(
+            "read pin file {}: {e}",
+            file.display()
+        ))),
+    }
+}
+
+/// Every well-formed pin in the file, in file order (a missing file is none;
+/// comments and malformed lines are skipped). A host that was pinned twice is
+/// listed twice: a connection uses the first.
+pub fn list(file: &Path) -> Result<Vec<PinEntry>> {
+    Ok(read_pin_file(file)?
+        .lines()
+        .filter_map(parse_line)
+        .collect())
+}
+
+/// Drop every pin for `host:port` (hostnames compare case-insensitively) and
+/// leave every other line, comments and malformed ones included, as it was.
+/// Returns how many pins were removed; the file is only rewritten when it was
+/// more than none, and atomically.
+pub fn forget(file: &Path, host: &str, port: u16) -> Result<usize> {
+    let text = read_pin_file(file)?;
+    let (kept, removed) = without_pins(&text, host, port);
+    if removed > 0 {
+        write_pin_file(file, &kept)?;
+    }
+    Ok(removed)
+}
+
+/// Pin `host:port` to `pin`, replacing any pin it had. Returns whether one was
+/// replaced.
+pub fn set_pin(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<bool> {
+    let text = read_pin_file(file)?;
+    let (mut kept, removed) = without_pins(&text, host, port);
+    if !kept.is_empty() && !kept.ends_with('\n') {
+        kept.push('\n');
+    }
+    kept.push_str(&format!(
+        "{host}:{port} {}\n",
+        scl_tlsio::fingerprint_hex(pin)
+    ));
+    write_pin_file(file, &kept)?;
+    Ok(removed > 0)
+}
+
+fn without_pins(text: &str, host: &str, port: u16) -> (String, usize) {
+    let mut kept = String::with_capacity(text.len());
+    let mut removed = 0;
+    for line in text.split_inclusive('\n') {
+        match parse_line(line) {
+            Some(e) if e.port == port && e.host.eq_ignore_ascii_case(host) => removed += 1,
+            _ => kept.push_str(line),
+        }
+    }
+    (kept, removed)
+}
+
+fn write_pin_file(file: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::InvalidArgument(format!("create {}: {e}", parent.display())))?;
+    }
+    scl_core::fsutil::atomic_write_durable(file, text.as_bytes())
+        .map_err(|e| Error::InvalidArgument(format!("write pin file {}: {e}", file.display())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +327,78 @@ mod tests {
         assert!(parse_fingerprint("sha256:short").is_err());
         assert!(parse_fingerprint("md5:abcd").is_err());
         assert!(parse_fingerprint("").is_err());
+    }
+
+    #[test]
+    fn list_forget_and_set_pin_manage_the_file() {
+        let dir = tmp("manage");
+        let file = dir.join("known_hosts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &file,
+            format!(
+                "# mine\nA.example:8730 sha256:{}\nnot a pin\nb.example:9000 sha256:{}\nA.example:8730 sha256:{}\n",
+                "11".repeat(32),
+                "22".repeat(32),
+                "33".repeat(32)
+            ),
+        )
+        .unwrap();
+        let entries = list(&file).unwrap();
+        assert_eq!(entries.len(), 3, "a host pinned twice is listed twice");
+        assert_eq!(entries[1].host, "b.example");
+        assert_eq!(entries[1].port, 9000);
+
+        // Forget is case-insensitive on the host, port-exact, removes every
+        // pin for the slot, and leaves other lines (comments, junk) alone.
+        assert_eq!(forget(&file, "a.EXAMPLE", 9000).unwrap(), 0);
+        assert_eq!(forget(&file, "a.EXAMPLE", 8730).unwrap(), 2);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "# mine\nnot a pin\nb.example:9000 sha256:{}\n",
+                "22".repeat(32)
+            )
+        );
+        assert_eq!(forget(&file, "gone", 1).unwrap(), 0);
+        assert_eq!(
+            forget(&dir.join("nope"), "h", 1).unwrap(),
+            0,
+            "no file, no pins"
+        );
+
+        // set_pin replaces and appends; the connection path sees the new pin.
+        assert!(set_pin(&file, "b.example", 9000, &[0x44; 32]).unwrap());
+        assert!(!set_pin(&file, "c.example", 8730, &[0x55; 32]).unwrap());
+        assert_eq!(lookup(&file, "b.example", 9000).unwrap(), Some([0x44; 32]));
+        assert_eq!(lookup(&file, "c.example", 8730).unwrap(), Some([0x55; 32]));
+        assert_eq!(list(&file).unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn set_pin_creates_the_file_and_a_missing_final_newline_is_handled() {
+        let dir = tmp("create");
+        let file = dir.join("sub").join("known_hosts");
+        assert!(!set_pin(&file, "h", 1, &[0x66; 32]).unwrap());
+        assert_eq!(list(&file).unwrap().len(), 1);
+        std::fs::write(&file, "x:1 sha256:zz").unwrap(); // no trailing newline
+        set_pin(&file, "h", 1, &[0x66; 32]).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("x:1 sha256:zz\nh:1 sha256:"), "{text:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn parse_host_port_defaults_the_port_and_rejects_junk() {
+        assert_eq!(parse_host_port("h").unwrap(), ("h".into(), 8730));
+        assert_eq!(parse_host_port("h:9").unwrap(), ("h".into(), 9));
+        assert!(parse_host_port("").is_err());
+        assert!(parse_host_port(":9").is_err());
+        assert!(parse_host_port("h:notaport").is_err());
+        assert!(parse_host_port("h:99999").is_err());
     }
 }
