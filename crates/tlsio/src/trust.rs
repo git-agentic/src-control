@@ -128,6 +128,12 @@ pub fn client_connect_ca(
         .map_err(|e| Error::Handshake(e.to_string()))?;
     while conn.is_handshaking() {
         if let Err(e) = conn.complete_io(&mut tcp) {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                return Err(Error::Io(e));
+            }
             return Err(Error::Handshake(format!(
                 "certificate validation for {host} failed: {e}"
             )));

@@ -180,6 +180,14 @@ pub fn client_connect(
         .map_err(|e| Error::Handshake(e.to_string()))?;
     while conn.is_handshaking() {
         if let Err(e) = conn.complete_io(&mut tcp) {
+            // A socket timeout is the caller's bound firing, not a rejection:
+            // keep it typed so it can be told from a failed handshake.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                return Err(Error::Io(e));
+            }
             // Translate our verifier's rejections into typed errors.
             let seen = *verifier.seen.lock().unwrap();
             if let (Some(expected), Some(seen)) = (expected_pin, seen) {
