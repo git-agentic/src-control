@@ -308,6 +308,7 @@ impl Repo {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
+            crate::conflict_plaintext::retire_sidecar(&self.layout, &theirs_sidecar_path)?;
         }
 
         let remaining: Vec<String> = conflicts.into_iter().filter(|p| p != path).collect();

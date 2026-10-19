@@ -2896,6 +2896,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Remove a test repository and assert it is gone.
+    fn remove_root(root: &std::path::Path) {
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!root.exists(), "test repository must leave no residue");
+    }
+
     /// Two branches that conflict as text on `x.txt`, `main` checked out, with
     /// an untracked user file `x.txt.theirs` beside it. A text conflict writes
     /// no sidecar, so no sweep may touch that file.
@@ -2949,7 +2955,7 @@ mod tests {
             b"mine\n"
         );
         drop(repo);
-        std::fs::remove_dir_all(&root).ok();
+        remove_root(&root);
     }
 
     /// A protected UTF-8 conflict writes markers, not a sidecar.
@@ -2982,7 +2988,7 @@ mod tests {
         repo.cherry_pick_abort().unwrap();
         assert_eq!(mine(), b"mine\n", "abort must keep the user's file");
         drop(repo);
-        std::fs::remove_dir_all(&root).ok();
+        remove_root(&root);
     }
 
     /// The control: a binary conflict's own sidecar is still cleaned up.
@@ -3007,7 +3013,39 @@ mod tests {
         repo.merge_abort().unwrap();
         assert!(!root.join("bin.dat.theirs").exists());
         drop(repo);
-        std::fs::remove_dir_all(&root).ok();
+        remove_root(&root);
+    }
+
+    /// `sc resolve` removes the sidecar it recorded; a file the user later
+    /// creates at that path must survive a later abort.
+    #[test]
+    fn abort_keeps_a_user_file_created_at_a_sidecar_path_after_resolve() {
+        let root = tmp_root("sweep-after-resolve");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfebase\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeOURS\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeTHEIRS\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(_)
+        ));
+        repo.resolve_path("bin.dat", crate::ResolveSide::Ours, None)
+            .unwrap();
+        assert!(!root.join("bin.dat.theirs").exists());
+        std::fs::write(root.join("bin.dat.theirs"), b"mine\n").unwrap();
+        repo.merge_abort().unwrap();
+        assert_eq!(
+            std::fs::read(root.join("bin.dat.theirs")).unwrap(),
+            b"mine\n"
+        );
+        drop(repo);
+        remove_root(&root);
     }
 
     #[test]
@@ -3020,7 +3058,7 @@ mod tests {
         repo.merge_abort().unwrap();
         assert_user_theirs_file_survives(&root);
         drop(repo);
-        std::fs::remove_dir_all(&root).ok();
+        remove_root(&root);
     }
 
     #[test]
@@ -3034,7 +3072,7 @@ mod tests {
         repo.cherry_pick_abort().unwrap();
         assert_user_theirs_file_survives(&root);
         drop(repo);
-        std::fs::remove_dir_all(&root).ok();
+        remove_root(&root);
     }
 
     #[test]
@@ -3057,7 +3095,7 @@ mod tests {
         repo.rebase_continue("me", None).unwrap();
         assert_user_theirs_file_survives(&root);
         drop(repo);
-        std::fs::remove_dir_all(&root).ok();
+        remove_root(&root);
     }
 
     /// A file where a parent directory of a plaintext path must be fails the

@@ -80,6 +80,16 @@ pub(crate) fn write_sidecars(layout: &Layout, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Drop one sidecar from the record once it has been dealt with, so a file
+/// the user later creates at that path is not mistaken for ours.
+pub(crate) fn retire_sidecar(layout: &Layout, sidecar: &str) -> Result<()> {
+    let mut paths = read_sidecars(layout)?;
+    if paths.remove(sidecar) {
+        write_sidecars(layout, &paths.into_iter().collect::<Vec<_>>())?;
+    }
+    Ok(())
+}
+
 /// The recorded sidecar paths, empty when there is no record. Only the
 /// sidecars a stop actually wrote are listed: a `.theirs` file beside a
 /// conflict that wrote none is the user's own.
@@ -129,6 +139,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["x.theirs"]
         );
+        write_sidecars(&layout, &["x.theirs".into(), "y.theirs".into()]).unwrap();
+        retire_sidecar(&layout, "x.theirs").unwrap();
+        assert_eq!(
+            read_sidecars(&layout)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["y.theirs"]
+        );
+        retire_sidecar(&layout, "y.theirs").unwrap();
+        assert!(
+            read_sidecars(&layout).unwrap().is_empty(),
+            "last one removes the file"
+        );
+        write_sidecars(&layout, &["x.theirs".into()]).unwrap();
         clear(&layout).unwrap();
         assert!(read(&layout).unwrap().is_empty());
         assert!(read_sidecars(&layout).unwrap().is_empty());
