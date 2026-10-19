@@ -78,16 +78,24 @@ pub(crate) fn write_client_opening(
     path: &str,
     bearer: Option<&str>,
 ) -> Result<()> {
+    // A write timeout is the peer not reading (the client's bound firing), a
+    // lost connection like the read-side timeout; any other failure is a bad
+    // opening.
+    let werr = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            Error::ConnectionLost("timed out writing the HTTP opening".to_string())
+        }
+        _ => Error::InvalidArgument(format!("HTTP opening write failed: {e}")),
+    };
     write!(
         w,
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: sc/2\r\n"
     )
-    .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))?;
+    .map_err(werr)?;
     if let Some(tok) = bearer {
-        write!(w, "Authorization: Bearer {tok}\r\n")
-            .map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))?;
+        write!(w, "Authorization: Bearer {tok}\r\n").map_err(werr)?;
     }
-    write!(w, "\r\n").map_err(|e| Error::InvalidArgument(format!("HTTP opening write failed: {e}")))
+    write!(w, "\r\n").map_err(werr)
 }
 
 /// SERVER: read the request line + headers up to the blank line (bounded by
@@ -2148,6 +2156,38 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(connect_within("host.invalid:1", Duration::from_secs(5)).is_err());
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A peer that accepts but never reads must fail the connect when the
+    /// opening does not fit the socket buffers, as `ConnectionLost` like every
+    /// other timeout (not as a bad-opening `InvalidArgument`).
+    #[test]
+    fn a_peer_that_never_reads_fails_the_opening_write_as_lost() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _conn = listener.accept().unwrap();
+            let _ = rx.recv();
+        });
+        let url = ScHttpUrl {
+            host: "127.0.0.1".to_string(),
+            port,
+            path: "/repo".to_string(),
+            tls: false,
+        };
+        // Far larger than any loopback send + receive buffer.
+        let huge = "t".repeat(64 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        let err =
+            HttpTransport::connect_bounded(&url, Some(&huge), None, SHORT, SHORT).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "unbounded: {err:?}"
+        );
+        assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
+        tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     /// The bound also covers the wire handshake: a server that sends the 200
