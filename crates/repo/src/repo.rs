@@ -1975,9 +1975,14 @@ impl Repo {
         if sidecars.is_empty() {
             return Ok(files);
         }
+        // The decided root is the operation's outcome and takes precedence: a
+        // parent that tracks the path says nothing about a result that deleted
+        // it. Without one, the tip is the only owner.
         let mut roots: Vec<ObjectId> = decided_root.into_iter().collect();
-        for id in snapshots.iter().flatten() {
-            roots.push(self.snapshot(id)?.root);
+        if roots.is_empty() {
+            for id in snapshots.iter().flatten() {
+                roots.push(self.snapshot(id)?.root);
+            }
         }
         let partial = self.promisor()?.is_some();
         let store_arc = self.vfs.store();

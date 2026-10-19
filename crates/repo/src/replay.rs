@@ -1212,11 +1212,9 @@ impl Repo {
             // `merge_abort`'s cleanup): once resolved, they're pure
             // working-tree litter — never part of the tracked tree, so
             // `materialize` never touches them itself.
-            // Not a file any of the trees involved tracks (that one is the
-            // user's own): see `remove_conflict_sidecars`.
-            // Not a file the completion's parent tracks (that one is the
-            // user's own): see `remove_conflict_sidecars`.
-            self.remove_conflict_sidecars(&[self.snapshot(&st.acc_tip)?.root])?;
+            // Not a file the completed commit tracks (that one is the user's
+            // own): see `remove_conflict_sidecars`.
+            self.remove_conflict_sidecars(&[self.snapshot(&new_tip)?.root])?;
             // Advance state BEFORE attempting the fold, so an error from the
             // fold below (on a later commit) leaves a retryable, idempotent
             // `--continue` rather than losing resumability. `rebase_abort`
@@ -3210,6 +3208,37 @@ mod tests {
         );
         std::fs::write(root.join("bin.dat"), b"\xff\xferesolved\n").unwrap();
         repo.commit("me", "merge").unwrap();
+        assert!(!repo.tracked_paths().unwrap().contains("bin.dat.theirs"));
+        assert!(!root.join("bin.dat.theirs").exists());
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// The target tracks `bin.dat.theirs`, the replayed commit deletes it and
+    /// conflicts with the target on `bin.dat`. The stop writes scratch at a
+    /// path the result no longer tracks; the target's old tracking of it must
+    /// not make completion commit the scratch.
+    #[test]
+    fn a_rebase_that_deletes_a_target_tracked_path_does_not_commit_the_scratch() {
+        let root = tmp_root("sweep-rebase-deleted");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfebase\n").unwrap();
+        std::fs::write(root.join("bin.dat.theirs"), b"keep\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeMAIN\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::remove_file(root.join("bin.dat.theirs")).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeWORK\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        assert!(matches!(
+            repo.rebase("main", "me", None).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        assert!(root.join("bin.dat.theirs").exists(), "setup: scratch");
+        std::fs::write(root.join("bin.dat"), b"\xff\xferesolved\n").unwrap();
+        repo.rebase_continue("me", None).unwrap();
         assert!(!repo.tracked_paths().unwrap().contains("bin.dat.theirs"));
         assert!(!root.join("bin.dat.theirs").exists());
         drop(repo);
