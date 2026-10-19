@@ -110,6 +110,8 @@ pub fn lookup(file: &Path, host: &str, port: u16) -> Result<Option<[u8; 32]>> {
 
 /// Append a pin line (creating parent dirs and the file as needed).
 pub fn record(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<()> {
+    let file = resolve_pin_path(file);
+    let file = file.as_path();
     let _lock = PinLock::acquire(file)?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)
@@ -129,16 +131,14 @@ pub fn record(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<()> 
 /// An exclusive advisory lock on the pin file's sibling `<file>.lock`, held for
 /// a whole read-modify-write (and for a first-connection append), so two `sc`
 /// processes cannot lose each other's update or resurrect a forgotten pin.
-/// Unix only; elsewhere updates are unserialized, as before.
+/// `File::lock` is `flock` on unix and `LockFileEx` on Windows; the lock is
+/// released when the guard drops.
 struct PinLock {
-    #[cfg(unix)]
     _file: std::fs::File,
 }
 
 impl PinLock {
-    #[cfg(unix)]
     fn acquire(file: &Path) -> Result<PinLock> {
-        use std::os::fd::AsRawFd;
         let mut lock_path = file.as_os_str().to_owned();
         lock_path.push(".lock");
         let lock_path = PathBuf::from(lock_path);
@@ -154,20 +154,28 @@ impl PinLock {
             .map_err(|e| {
                 Error::InvalidArgument(format!("open pin lock {}: {e}", lock_path.display()))
             })?;
-        // SAFETY: flock on a descriptor this File owns; released on drop/close.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(Error::InvalidArgument(format!(
-                "lock {}: {}",
-                lock_path.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
+        f.lock()
+            .map_err(|e| Error::InvalidArgument(format!("lock {}: {e}", lock_path.display())))?;
         Ok(PinLock { _file: f })
     }
+}
 
-    #[cfg(not(unix))]
-    fn acquire(_: &Path) -> Result<PinLock> {
-        Ok(PinLock {})
+/// Where a pin update really lands: a pin file that is a symlink (a shared or
+/// dotfile-managed store) is followed, so the atomic rename replaces the target
+/// and not the link. Anything else is returned as given.
+fn resolve_pin_path(file: &Path) -> PathBuf {
+    let is_link = std::fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return file.to_path_buf();
+    }
+    if let Ok(real) = std::fs::canonicalize(file) {
+        return real;
+    }
+    // A dangling link: write where it points.
+    match std::fs::read_link(file) {
+        Ok(target) if target.is_absolute() => target,
+        Ok(target) => file.parent().unwrap_or(Path::new("")).join(target),
+        Err(_) => file.to_path_buf(),
     }
 }
 
@@ -254,6 +262,8 @@ pub fn list(file: &Path) -> Result<Vec<PinEntry>> {
 /// Returns how many pins were removed; the file is only rewritten when it was
 /// more than none, and atomically.
 pub fn forget(file: &Path, host: &str, port: u16) -> Result<usize> {
+    let file = resolve_pin_path(file);
+    let file = file.as_path();
     let _lock = PinLock::acquire(file)?;
     let text = read_pin_file(file)?;
     let (kept, removed) = without_pins(&text, host, port);
@@ -266,6 +276,8 @@ pub fn forget(file: &Path, host: &str, port: u16) -> Result<usize> {
 /// Pin `host:port` to `pin`, replacing any pin it had. Returns whether one was
 /// replaced.
 pub fn set_pin(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<bool> {
+    let file = resolve_pin_path(file);
+    let file = file.as_path();
     let _lock = PinLock::acquire(file)?;
     let text = read_pin_file(file)?;
     let (mut kept, removed) = without_pins(&text, host, port);
@@ -524,6 +536,44 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(list(&file).unwrap().len(), 32, "no update may be lost");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// A pin file that is a symlink to a shared store: updates land in the
+    /// target and the link survives.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_pin_file_is_updated_through_the_link() {
+        let dir = tmp("symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("shared_known_hosts");
+        let link = dir.join("known_hosts");
+        std::fs::write(&target, "").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        set_pin(&link, "h.example", 1, &[0x99; 32]).unwrap();
+        record(&link, "r.example", 2, &[0xaa; 32]).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive an update"
+        );
+        assert_eq!(list(&target).unwrap().len(), 2, "the target holds the pins");
+        assert_eq!(forget(&link, "h.example", 1).unwrap(), 1);
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(list(&target).unwrap().len(), 1);
+
+        // A dangling link is written through to where it points.
+        let dangling = dir.join("dangling");
+        std::os::unix::fs::symlink(dir.join("not-yet"), &dangling).unwrap();
+        set_pin(&dangling, "d.example", 3, &[0xbb; 32]).unwrap();
+        assert_eq!(list(&dir.join("not-yet")).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
     }

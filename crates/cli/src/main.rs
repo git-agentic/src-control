@@ -1124,7 +1124,11 @@ fn run_tls(op: TlsOp) -> Result<()> {
                         })
                     })
                     .collect();
-                print_line(&serde_json::json!({"file": file, "pins": rows}).to_string());
+                // `display()` is lossy for a non-UTF-8 path; a `PathBuf` would fail to serialize.
+                print_line(
+                    &serde_json::json!({"file": file.display().to_string(), "pins": rows})
+                        .to_string(),
+                );
             } else {
                 for e in &entries {
                     print_line(&format!(

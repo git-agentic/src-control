@@ -137,3 +137,25 @@ fn bad_input_is_refused_before_the_file_is_touched() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(!dir.exists());
 }
+
+/// A pin file path that is not valid UTF-8 is rendered lossily instead of
+/// panicking while building the JSON.
+#[cfg(unix)]
+#[test]
+fn list_json_survives_a_non_utf8_pin_file_path() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tmp("nonutf8");
+    let kh = dir.join(std::ffi::OsStr::from_bytes(b"known_\xff_hosts"));
+    let o = Command::new(env!("CARGO_BIN_EXE_sc"))
+        .args(["tls", "list", "--json"])
+        .current_dir(&dir)
+        .env("SC_HTTPS_KNOWN_HOSTS", &kh)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+    assert!(v["file"].as_str().unwrap().contains("known_"));
+    assert_eq!(v["pins"].as_array().unwrap().len(), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(!dir.exists());
+}
