@@ -561,28 +561,32 @@ impl Transport for LocalTransport {
         expected_old: Option<&ObjectId>,
     ) -> Result<()> {
         let _lock = RepoLock::acquire(&self.layout)?;
-        // A stopped merge, cherry-pick or rebase here is completed against the
-        // checked-out branch's tip: moving that tip from underneath it would
-        // make the completing commit silently drop what was pushed (the P19-I1
-        // discard shape, reached by a remote writer). Refuse before any
-        // write; other branches are unaffected. Local ops guard themselves
-        // the same way (`MergeInProgress` & co.).
-        if crate::refs::current_branch(&self.layout).is_ok_and(|head| head == branch) {
-            if crate::merge_state::in_progress(&self.layout) {
-                return Err(Error::MergeInProgress);
-            }
-            if crate::pick_state::in_progress(&self.layout) {
-                return Err(Error::PickInProgress);
-            }
-            if crate::rebase_state::in_progress(&self.layout) {
-                return Err(Error::RebaseInProgress);
-            }
-        }
         // Revalidate inside the lock: the caller's fast-forward check ran
         // unlocked, so the ref may have moved since (two concurrent pushes).
         let current = crate::refs::read_branch_tip(&self.layout, branch)?;
         if current.as_ref() == Some(id) {
-            return Ok(()); // already there — idempotent
+            return Ok(()); // already there — idempotent, nothing moves
+        }
+        // A stopped merge, cherry-pick or rebase here is completed against the
+        // checked-out branch's tip: moving that tip from underneath it would
+        // make the completing commit silently drop what was pushed (the P19-I1
+        // discard shape, reached by a remote writer). Refuse before any
+        // write; other branches are unaffected. HEAD is read only when an op
+        // is stopped, and a failure to read it then fails closed: the op's
+        // state exists, so a push must not guess which branch it belongs to.
+        let stopped = if crate::merge_state::in_progress(&self.layout) {
+            Some(Error::MergeInProgress)
+        } else if crate::pick_state::in_progress(&self.layout) {
+            Some(Error::PickInProgress)
+        } else if crate::rebase_state::in_progress(&self.layout) {
+            Some(Error::RebaseInProgress)
+        } else {
+            None
+        };
+        if let Some(err) = stopped {
+            if crate::refs::current_branch(&self.layout)? == branch {
+                return Err(err);
+            }
         }
         if current.as_ref() != expected_old {
             return Err(Error::NonFastForward);
@@ -1151,6 +1155,21 @@ mod tests {
             crate::refs::read_branch_tip(&layout, "main").unwrap(),
             Some(main_tip)
         );
+        // A retry of a push that already landed moves nothing: still accepted.
+        t.update_ref("main", &main_tip, None).unwrap();
+        // An unreadable HEAD with a stopped op fails closed, not open.
+        let head_path = layout.head_path();
+        let head_text = std::fs::read(&head_path).unwrap();
+        std::fs::remove_file(&head_path).unwrap();
+        assert!(
+            t.update_ref("main", &pushed, Some(&main_tip)).is_err(),
+            "a push must not guess the checked-out branch while an op is stopped"
+        );
+        assert_eq!(
+            crate::refs::read_branch_tip(&layout, "main").unwrap(),
+            Some(main_tip)
+        );
+        std::fs::write(&head_path, head_text).unwrap();
         // A branch that is not checked out is not in the way.
         t.update_ref("elsewhere", &pushed, None).unwrap();
         assert_eq!(
