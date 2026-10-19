@@ -352,7 +352,10 @@ impl HttpTransport {
     /// env-free core.
     pub fn connect_with_token(url: &ScHttpUrl, token: Option<&str>) -> Result<HttpTransport> {
         let ignored = ignored_https_knobs(url, |k| std::env::var(k).ok());
-        if !ignored.is_empty() {
+        // Once per process: a command that connects repeatedly (batched lazy
+        // fetches) should not repeat the same warning.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ignored.is_empty() && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
                 "warning: {} set but {} is plaintext sc+http:// — it has no effect; use an \
                  sc+https:// URL for TLS",
