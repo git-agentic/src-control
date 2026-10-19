@@ -35,6 +35,59 @@ pub fn read_worktree(
     Ok(out)
 }
 
+/// The paths [`read_worktree`] would return, without reading a byte of any file:
+/// the same walk, ignore rules and tracked-path exemption, for callers that
+/// only need the list (`Repo::worktree_paths`).
+pub fn list_worktree_paths(layout: &Layout, tracked: &BTreeSet<String>) -> Result<Vec<String>> {
+    let ignore = Ignore::load(&layout.root)?;
+    let mut out = Vec::new();
+    walk_disk_paths(
+        &layout.root,
+        &layout.root,
+        &layout.dot_sc,
+        &ignore,
+        tracked,
+        &mut out,
+    )?;
+    out.sort();
+    Ok(out)
+}
+
+fn walk_disk_paths(
+    base: &Path,
+    dir: &Path,
+    skip: &Path,
+    ignore: &Ignore,
+    tracked: &BTreeSet<String>,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == skip {
+            continue;
+        }
+        let ft = entry.file_type()?;
+        let rel = path
+            .strip_prefix(base)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if ft.is_dir() {
+            if ignore.matches(&rel) && !tracked_under(tracked, &rel) {
+                continue;
+            }
+            walk_disk_paths(base, &path, skip, ignore, tracked, out)?;
+        } else if ft.is_file() {
+            if ignore.matches(&rel) && !tracked.contains(&rel) {
+                continue;
+            }
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
 fn walk_disk(
     base: &Path,
     dir: &Path,
@@ -1294,5 +1347,37 @@ mod tests {
         drop(store);
         std::fs::remove_dir_all(&layout.root).unwrap();
         assert!(!layout.root.exists());
+    }
+
+    /// The paths-only walk lists exactly what the reading walk returns, honoring
+    /// `.scignore` and the tracked-path exemption, without reading file bytes.
+    #[test]
+    fn list_worktree_paths_matches_read_worktree() {
+        let root = std::env::temp_dir().join(format!("scl-listpaths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".sc")).unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join(".scignore"), "ignored/\n*.tmp\n").unwrap();
+        std::fs::write(root.join("a/b/f.txt"), b"1").unwrap();
+        std::fs::write(root.join("a/skip.tmp"), b"2").unwrap();
+        std::fs::write(root.join("ignored/keep.txt"), b"3").unwrap();
+        std::fs::write(root.join("ignored/drop.txt"), b"4").unwrap();
+        std::fs::write(root.join("top.txt"), b"5").unwrap();
+        let layout = Layout::at(&root);
+        // A tracked path under an ignored directory is still listed.
+        let tracked: BTreeSet<String> = ["ignored/keep.txt".to_string()].into();
+        let listed = list_worktree_paths(&layout, &tracked).unwrap();
+        let read: Vec<String> = read_worktree(&layout, &tracked)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _, _)| p)
+            .collect();
+        assert_eq!(listed, read);
+        assert!(listed.contains(&"ignored/keep.txt".to_string()));
+        assert!(!listed.contains(&"ignored/drop.txt".to_string()));
+        assert!(!listed.contains(&"a/skip.tmp".to_string()));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 }

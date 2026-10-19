@@ -11,14 +11,21 @@ pub fn matching_prefix<'a>(protection: &'a Protection, path: &str) -> Option<&'a
     protection
         .prefixes
         .iter()
-        .filter(|p| {
-            // Match only at a path boundary: a path is governed by a prefix iff it
-            // equals the prefix's bare form or lies under it at a `/` boundary.
-            // `starts_with` alone would over-match (e.g. `secret` -> `secretstuff`).
-            let bare = p.prefix.trim_end_matches('/');
-            path == bare || path.starts_with(&format!("{bare}/"))
-        })
+        .filter(|p| path_under_prefix(path, &p.prefix))
         .max_by_key(|p| p.prefix.len())
+}
+
+/// Is `path` governed by `prefix`? Matches only at a path boundary: a path is
+/// under a prefix iff it equals the prefix's bare form (trailing `/` stripped)
+/// or lies under it at a `/` boundary. `starts_with` alone would over-match
+/// (`secret` -> `secretstuff`). The one rule `sc protect`, its CLI nudge and
+/// rule lookup share.
+pub fn path_under_prefix(path: &str, prefix: &str) -> bool {
+    let bare = prefix.trim_end_matches('/');
+    path == bare
+        || path
+            .strip_prefix(bare)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Merge two protection policies' prefix rules. Prefixes unite by `prefix`
@@ -418,5 +425,15 @@ mod tests {
         let b = vec![rule("secret/", vec![entry(1, 1, true), entry(2, 2, false)])];
         let m = merge_prefixes(&a, &b);
         assert!(m[0].granted_keys().is_empty());
+    }
+
+    #[test]
+    fn path_under_prefix_matches_at_a_boundary_only() {
+        assert!(path_under_prefix("secret", "secret/"));
+        assert!(path_under_prefix("secret/a/b", "secret/"));
+        assert!(path_under_prefix("secret/a", "secret"));
+        assert!(!path_under_prefix("secretstuff", "secret/"));
+        assert!(!path_under_prefix("secretstuff/x", "secret"));
+        assert!(!path_under_prefix("other/secret", "secret"));
     }
 }

@@ -806,21 +806,13 @@ scale-&-reach horizon):
 - **`--max-object-size` operator config knob (P28).** `MAX_OBJECT_SIZE`
   (256 MiB) is a compile-time constant anchoring every untrusted-length
   guard; letting an operator raise or lower it per-deployment is deferred.
-- **P28 review follow-ons.** A whole-branch final review of the P28
-  security sweep closed the one real client-side DoS gap
-  (`wire::decode_refs_body`'s fabricated-count allocation) and corrected
-  stale docs, but named four small non-blocking items, deferred rather
-  than silently dropped: `refs::write_head`/`refs::delete_branch` gaining
-  a one-line `validate_branch_name` call for ref-validation class
-  completeness (not exploitable today — `HEAD`'s path is fixed and
-  `delete_branch` only takes internally-generated names); an
-  `SC_PACK_CHUNK` upper-clamp to `MAX_OBJECT_SIZE` (an oversized chunk
-  config today produces frames the receiver's cap rejects — a
-  self-inflicted confusing failure rather than a clear one);
-  `Repo::worktree_paths` doing a paths-only walk instead of loading every
-  file's full bytes; and extracting a shared `path_under_prefix(path,
-  prefix)` helper so `run_protect`'s `/`-boundary filter and
-  `protect.rs::matching_prefix` stop duplicating the same rule.
+- **P28 review follow-ons — shipped.** `refs::write_head`/`delete_branch` run
+  `validate_branch_name`; `SC_PACK_CHUNK` is clamped to `MAX_OBJECT_SIZE - 1` (a chunk frame carries a tag byte too; an
+  oversized value used to make every transfer fail with a confusing receiver
+  error); `Repo::worktree_paths` is a paths-only walk (`list_worktree_paths`,
+  the same ignore and tracked-path rules as `read_worktree`, no file read); and
+  the `/`-boundary rule is one shared `protect::path_under_prefix` used by rule
+  lookup and the `sc protect` low-entropy nudge.
 - **Per-path/per-ref ACLs (P29).** `sc serve --http` access control is
   all-or-nothing per connection (`ro`/`rw`); scoping a token to specific
   path prefixes or refs is beyond the MVP. Deferred.
