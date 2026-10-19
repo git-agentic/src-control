@@ -1408,6 +1408,7 @@ impl Repo {
                 // the fill takes the store lock, so release ours around it.
                 drop(store);
                 self.ensure_view(theirs_root, &self.sparse_spec()?)?;
+                self.refuse_untracked_overwrite("merge", Some(ours_root), theirs_root)?;
                 let mut store = store_arc.lock().unwrap();
                 let mut cache = self.open_protected_cache()?;
                 let skipped = worktree::materialize(
@@ -1662,6 +1663,7 @@ impl Repo {
         // view: fill its closure now (lazy partial clones only), before any ref,
         // spec or working-tree write and outside the store lock.
         self.ensure_view(merged_root, &self.sparse_spec()?)?;
+        self.refuse_untracked_overwrite("merge", Some(ours_root), merged_root)?;
 
         // Materialize the merged tree into the working dir. Protection-aware:
         // a merged PROTECTED entry decrypts for `identity` when possible, else
@@ -1864,6 +1866,7 @@ impl Repo {
         // the first working-tree write (lazy partial clones only), outside
         // the store lock.
         self.ensure_view(conflict_root, &sparse)?;
+        self.refuse_untracked_overwrite("merge", Some(old_root), conflict_root)?;
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
@@ -1944,6 +1947,84 @@ impl Repo {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Repo::refuse_untracked_overwrite_vs`] against the tree `old_root`
+    /// reflects on disk.
+    pub(crate) fn refuse_untracked_overwrite(
+        &self,
+        op: &str,
+        old_root: Option<ObjectId>,
+        target_root: ObjectId,
+    ) -> Result<()> {
+        let sparse = self.sparse_spec()?;
+        let partial = self.promisor()?.is_some();
+        let old: std::collections::BTreeSet<String> = match old_root {
+            None => std::collections::BTreeSet::new(),
+            Some(old) => {
+                let store_arc = self.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                if partial {
+                    worktree::tree_file_entries_with_perms_sparse_present(&mut store, old, &sparse)?
+                } else {
+                    worktree::tree_file_entries_with_perms_sparse(&mut store, old, &sparse)?
+                }
+                .into_keys()
+                .collect()
+            }
+        };
+        self.refuse_untracked_overwrite_vs(op, &old, target_root)
+    }
+
+    /// Refuse, before any write, a forward operation (`op`) whose result would
+    /// lay a file or directory on top of one the user owns: a path the target
+    /// tree has and `tracked` (the paths the working tree reflects) does not
+    /// contain, yet something already sits there (an untracked or ignored
+    /// copy), or an untracked file where a parent directory must be. The check
+    /// reads the working tree only; a path outside the sparse view is skipped
+    /// because nothing is written there, and on a partial clone a gap in the
+    /// target is left for `materialize`'s own view check to report. Git
+    /// refuses the same case.
+    pub(crate) fn refuse_untracked_overwrite_vs(
+        &self,
+        op: &str,
+        tracked: &std::collections::BTreeSet<String>,
+        target_root: ObjectId,
+    ) -> Result<()> {
+        let sparse = self.sparse_spec()?;
+        let partial = self.promisor()?.is_some();
+        let target = {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            if partial {
+                worktree::tree_file_entries_with_perms_sparse_present(
+                    &mut store,
+                    target_root,
+                    &sparse,
+                )?
+            } else {
+                worktree::tree_file_entries_with_perms_sparse(&mut store, target_root, &sparse)?
+            }
+        };
+        let mut is_tracked = |p: &str| tracked.contains(p);
+        for rel in target.keys().filter(|p| sparse.matches(p)) {
+            match stop_write_blocker(&self.layout.root, rel, &mut is_tracked)? {
+                None => {}
+                Some(StopBlocker::ParentFile) => {
+                    return Err(Error::InvalidArgument(format!(
+                        "{op} would fail: a file stands where a directory for {rel} must be; \
+                         move that file away, then retry"
+                    )))
+                }
+                Some(StopBlocker::Occupied) => {
+                    return Err(Error::InvalidArgument(format!(
+                        "{op} would overwrite an untracked or ignored file or directory at \
+                         {rel}; move it away, then retry"
+                    )))
                 }
             }
         }
@@ -2245,6 +2326,7 @@ impl Repo {
         // A lazy, online partial clone fills the target view's closure now,
         // before the first stale file is removed or written (ADR-0048).
         self.ensure_view(target_root, &self.sparse_spec()?)?;
+        self.refuse_untracked_overwrite_vs("switch", &old_paths, target_root)?;
         if head_priv.is_some() {
             // Remove private-tip paths the public target doesn't track,
             // BEFORE materialize lays the target down.
