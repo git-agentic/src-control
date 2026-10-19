@@ -1,12 +1,13 @@
 //! TLS quarantine crate (P32, ADR-0042): the ONLY crate linking rustls and
 //! rcgen (the gix→gitio / RustCrypto→crypto precedent). Exposes blocking
 //! `Read + Write` TLS streams for the sc+https:// transport, a pin-only
-//! TOFU certificate verifier, self-signed cert mint/load, and SPKI-SHA-256
-//! fingerprints. Depends on no other workspace crate.
+//! TOFU certificate verifier, an additive CA-path validator (ADR-0054),
+//! self-signed cert mint/load, and SPKI-SHA-256 fingerprints. Depends on no other workspace crate.
 
 mod identity;
 mod spki;
 mod stream;
+mod trust;
 
 pub use identity::{load_or_mint, load_pem, ServerIdentity};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -15,6 +16,7 @@ pub use stream::{
     client_connect, server_config, server_stream, TlsClientReadHalf, TlsClientStream,
     TlsClientWriteHalf, TlsServerConfig, TlsServerReadHalf, TlsServerStream, TlsServerWriteHalf,
 };
+pub use trust::{client_connect_ca, CaTrust};
 
 /// Errors from the TLS layer. `PinMismatch` carries both fingerprints so the
 /// caller (crates/repo) can render a recovery hint naming its pin source —

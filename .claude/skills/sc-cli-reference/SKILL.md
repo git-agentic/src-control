@@ -352,6 +352,9 @@ cargo run --bin sc -- clone sc+https://host[:port]/repo <dst>   # TLS clone (P32
                                               # overrides), mismatch always hard-fails;
                                               # SC_HTTPS_FINGERPRINT=<sha256:hex> pre-pins (CI),
                                               # SC_HTTPS_STRICT=1 refuses unknown hosts;
+                                              # SC_HTTPS_CA_FILE=<pem> | SC_HTTPS_CA=system validate the
+                                              # chain, dates and name against a CA instead of
+                                              # pinning (no pin file read/written; ADR-0054);
                                               # remote add/fetch/push accept the same URL form
 cargo run --bin sc -- tls list [--json]       # pins in the known_hosts file (ADR-0053)
 cargo run --bin sc -- tls forget <host[:port]>   # drop a host's pin (changed server key); a later

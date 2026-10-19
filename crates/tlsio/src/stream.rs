@@ -121,6 +121,15 @@ pub struct TlsClientStream {
     inner: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
 }
 
+impl TlsClientStream {
+    /// Wrap a completed client handshake (used by the CA-validating connect).
+    pub(crate) fn from_parts(conn: rustls::ClientConnection, tcp: TcpStream) -> TlsClientStream {
+        TlsClientStream {
+            inner: rustls::StreamOwned::new(conn, tcp),
+        }
+    }
+}
+
 impl std::fmt::Debug for TlsClientStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsClientStream").finish_non_exhaustive()

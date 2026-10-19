@@ -23,20 +23,106 @@ pub struct TlsClientPolicy {
     /// as enabled (fails closed on typos like `=true`/`=yes` rather than
     /// silently falling back to accept-new — see [`strict_from`]).
     pub strict: bool,
+    /// `SC_HTTPS_CA_FILE` / `SC_HTTPS_CA=system` (ADR-0054): validate the
+    /// server's certificate chain, validity and name against a CA instead of
+    /// pinning. When set, the pin file is neither read nor written.
+    pub ca: Option<CaSource>,
+}
+
+/// Where a CA-validated connection gets its trust anchors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaSource {
+    /// A PEM bundle of CA certificates (`SC_HTTPS_CA_FILE`).
+    File(PathBuf),
+    /// The platform trust store (`SC_HTTPS_CA=system`).
+    System,
+}
+
+/// Pure decision for the CA env knobs, factored out for the same reason as
+/// [`strict_from`]. `file`/`mode` are the raw environment values (`None` =
+/// the variable is absent). Fails closed: a security knob that is PRESENT but
+/// empty (an unset shell variable in `SC_HTTPS_CA_FILE="$BUNDLE"`) or not
+/// valid UTF-8 is an error, not an absence; so is an unrecognized `SC_HTTPS_CA`
+/// value, both knobs at once, or CA trust together with a pre-pin. Nothing
+/// here may quietly fall back to pinning or accept-new, which would send the
+/// bearer token to an unverified host.
+fn ca_from(
+    file: Option<&std::ffi::OsStr>,
+    mode: Option<&std::ffi::OsStr>,
+    has_pre_pin: bool,
+) -> Result<Option<CaSource>> {
+    if file.is_some_and(|f| f.is_empty()) {
+        return Err(Error::InvalidArgument(
+            "SC_HTTPS_CA_FILE is set but empty; unset it or point it at a PEM bundle".to_string(),
+        ));
+    }
+    let mode =
+        match mode {
+            None => None,
+            Some(m) => Some(m.to_str().ok_or_else(|| {
+                Error::InvalidArgument("SC_HTTPS_CA is not valid UTF-8".to_string())
+            })?),
+        };
+    if mode.is_some_and(|m| m.is_empty()) {
+        return Err(Error::InvalidArgument(
+            "SC_HTTPS_CA is set but empty; use `system` or unset it".to_string(),
+        ));
+    }
+    let source = match (file, mode) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {
+            return Err(Error::InvalidArgument(
+                "set one of SC_HTTPS_CA_FILE and SC_HTTPS_CA, not both".to_string(),
+            ))
+        }
+        (Some(f), None) => CaSource::File(PathBuf::from(f)),
+        (None, Some("system")) => CaSource::System,
+        (None, Some(other)) => {
+            return Err(Error::InvalidArgument(format!(
+                "SC_HTTPS_CA must be `system` (or use SC_HTTPS_CA_FILE=<pem>), got {other:?}"
+            )))
+        }
+    };
+    if has_pre_pin {
+        return Err(Error::InvalidArgument(
+            "SC_HTTPS_FINGERPRINT (a pin) cannot be combined with CA validation".to_string(),
+        ));
+    }
+    Ok(Some(source))
 }
 
 impl TlsClientPolicy {
     pub fn from_env() -> Result<TlsClientPolicy> {
-        let known_hosts = known_hosts_path()?;
+        // A pre-pin that is present but not valid UTF-8 is an error, not an
+        // absent pin: ignoring it would drop an explicit trust decision (and
+        // its conflict check with CA trust).
         let pre_pin = match std::env::var("SC_HTTPS_FINGERPRINT") {
             Ok(s) if !s.is_empty() => Some(parse_fingerprint(&s)?),
-            _ => None,
+            Ok(_) | Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(Error::InvalidArgument(
+                    "SC_HTTPS_FINGERPRINT is not valid UTF-8".to_string(),
+                ))
+            }
         };
         let strict = strict_from(std::env::var("SC_HTTPS_STRICT").ok().as_deref());
+        let ca = ca_from(
+            std::env::var_os("SC_HTTPS_CA_FILE").as_deref(),
+            std::env::var_os("SC_HTTPS_CA").as_deref(),
+            pre_pin.is_some(),
+        )?;
+        // CA mode never reads or writes the pin file, so a missing HOME (a
+        // service, a container) must not fail it.
+        let known_hosts = if ca.is_some() {
+            known_hosts_path().unwrap_or_default()
+        } else {
+            known_hosts_path()?
+        };
         Ok(TlsClientPolicy {
             known_hosts,
             pre_pin,
             strict,
+            ca,
         })
     }
 }
@@ -576,5 +662,42 @@ mod tests {
         assert_eq!(list(&dir.join("not-yet")).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn ca_from_resolves_the_knobs_and_fails_closed() {
+        use std::ffi::OsStr;
+        let os = OsStr::new;
+        assert_eq!(ca_from(None, None, false).unwrap(), None);
+        assert_eq!(
+            ca_from(Some(os("/etc/ca.pem")), None, false).unwrap(),
+            Some(CaSource::File("/etc/ca.pem".into()))
+        );
+        assert_eq!(
+            ca_from(None, Some(os("system")), false).unwrap(),
+            Some(CaSource::System)
+        );
+        for bad in [
+            ca_from(None, Some(os("yes")), false),
+            ca_from(None, Some(os("System")), false),
+            ca_from(Some(os("/x")), Some(os("system")), false),
+            ca_from(None, Some(os("system")), true),
+            ca_from(Some(os("/x")), None, true),
+            // Present but empty: an unset shell variable, never an absence.
+            ca_from(Some(os("")), None, false),
+            ca_from(None, Some(os("")), false),
+            ca_from(Some(os("")), Some(os("system")), false),
+        ] {
+            assert!(bad.is_err(), "must fail closed, got {bad:?}");
+        }
+    }
+
+    /// A non-UTF-8 `SC_HTTPS_CA` must not read as "unset".
+    #[cfg(unix)]
+    #[test]
+    fn ca_from_rejects_a_non_utf8_mode() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"sys\xffem");
+        assert!(ca_from(None, Some(bad), false).is_err());
     }
 }
