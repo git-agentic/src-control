@@ -848,12 +848,12 @@ scale-&-reach horizon):
   a lone `stream.read()` for the `HTTP/1.1 400` assertion returned as soon
   as the first TCP segment arrived, so under load it split off just
   `HTTP/1.1 ` before `400 Bad Request` — now read to EOF.
-- **Tighten the workspace clippy allow-list (launch prep).** CI runs
-  `clippy --all-targets -D warnings`; `[workspace.lints.clippy]` in the root
-  `Cargo.toml` allows a curated set (`type_complexity`, `too_many_arguments`,
-  `doc_lazy_continuation`, and three cosmetic style lints) that are deliberate
-  design or cosmetic in reviewed code. Revisit whether any should be fixed at
-  the source and removed from the allow-list.
+- **Workspace clippy allow-list — tightened.** `type_complexity` (named aliases in
+  `protect.rs` for the seal inputs, sealed files and wrap map) and
+  `doc_lazy_continuation` are fixed at the source and no longer allowed;
+  `too_many_arguments` stays, for the eight commit/snapshot-assembly and replay
+  functions that take their inputs one by one (a parameter struct would only
+  move the list).
 - **CodeQL / SAST workflow (launch prep).** A CodeQL security-scanning
   workflow (as the sibling `git.agentic` has) was left out of the initial
   launch because CodeQL's Rust support is newer; add it once verified not to

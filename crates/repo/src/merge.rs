@@ -975,6 +975,9 @@ mod tests {
         );
     }
 
+    /// A tree root with the protection that governs it.
+    type RootAndProtection = (ObjectId, Protection);
+
     /// Fixture for the content-divergent cases: secret/a.txt protected on all
     /// three sides with distinct contents. Returns (repo, roots, protections).
     fn divergent_protected_fixture(
@@ -984,9 +987,9 @@ mod tests {
         theirs_c: &[u8],
     ) -> (
         VfsRepo,
-        (ObjectId, Protection),
-        (ObjectId, Protection),
-        (ObjectId, Protection),
+        RootAndProtection,
+        RootAndProtection,
+        RootAndProtection,
     ) {
         let repo = VfsRepo::new(Store::with_budget(1 << 20));
         let (mut bp, mut op, mut tp) = (

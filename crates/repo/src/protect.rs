@@ -123,6 +123,14 @@ pub(crate) fn decrypt_with(
     Err(Error::NotAuthorized(path.to_string()))
 }
 
+/// A working-tree file headed for sealing: `(path, plaintext, mode, recipient
+/// pubkeys)`.
+pub(crate) type SealInput = (String, Vec<u8>, FileMode, Vec<[u8; 32]>);
+/// A sealed (or carried) protected file: `(path, ciphertext, mode, perms)`.
+pub(crate) type SealedFile = (String, Vec<u8>, FileMode, u8);
+/// Wrapped DEKs keyed by the ciphertext blob they unlock.
+pub(crate) type WrapMap = BTreeMap<ObjectId, Vec<WrappedKey>>;
+
 /// Randomized encryption (P33, ADR-0043): each file seals under a fresh
 /// random DEK+nonce, wrapping that DEK to its rule's recipients. Returns the
 /// ciphertext write-set entries (PROTECTED | RANDOMIZED perms) and fresh
@@ -133,12 +141,7 @@ pub(crate) fn decrypt_with(
 /// file's recipient list is empty: a rule whose every recipient is
 /// tombstoned (e.g. crossed revokes merged together) must fail the seal
 /// loudly — sealing to nobody mints permanently unreadable ciphertext.
-pub(crate) fn encrypt_protected(
-    plaintexts: Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)>,
-) -> Result<(
-    Vec<(String, Vec<u8>, FileMode, u8)>,
-    BTreeMap<ObjectId, Vec<WrappedKey>>,
-)> {
+pub(crate) fn encrypt_protected(plaintexts: Vec<SealInput>) -> Result<(Vec<SealedFile>, WrapMap)> {
     // Encrypt protected files; accumulate fresh wrapped DEKs keyed by blob id.
     let mut all: Vec<(String, Vec<u8>, FileMode, u8)> = Vec::new();
     let mut fresh_wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();

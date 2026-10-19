@@ -26,14 +26,13 @@ categories = ["development-tools", "command-line-utilities"]
 publish = false
 
 # Clippy lints intentionally allowed workspace-wide (each crate opts in with
-# `[lints] workspace = true`). Kept deliberately small: two structural lints that
-# are design choices, and one pedantic markdown lint that misfires on prose doc
-# comments. Everything else clippy flags is fixed at the source. CI runs
-# `clippy --all-targets -D warnings`, so this list is the single source of truth.
+# `[lints] workspace = true`). Kept deliberately to one structural lint: the
+# commit/snapshot-assembly and replay functions take many inputs by design, and
+# bundling them into parameter structs would only move the list. Everything else
+# clippy flags is fixed at the source. CI runs `clippy --all-targets -D
+# warnings`, so this list is the single source of truth.
 [workspace.lints.clippy]
-type_complexity = "allow"       # deliberate: crypto wrap/protection map types
 too_many_arguments = "allow"    # deliberate: commit/snapshot-assembly fns
-doc_lazy_continuation = "allow" # pedantic markdown lint on prose doc comments
 
 [profile.release]
 lto = true

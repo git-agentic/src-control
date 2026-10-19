@@ -17,7 +17,7 @@ pub(crate) const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
 
 /// A working-tree file headed for encryption at commit time:
 /// `(path, plaintext bytes, file mode, recipient pubkeys)`.
-type ProtectedFile = (String, Vec<u8>, scl_core::FileMode, Vec<[u8; 32]>);
+type ProtectedFile = crate::protect::SealInput;
 
 /// Working-tree status against HEAD.
 pub type Status = Diff;
@@ -1564,8 +1564,8 @@ impl Repo {
         // through encryption — one side unprotecting a path the other side
         // still rules must not let plaintext land in the merged snapshot
         // (bit<->rule invariant, Task 4 review I2).
-        let mut carried: Vec<(String, Vec<u8>, scl_core::FileMode, u8)> = Vec::new();
-        let mut to_encrypt: Vec<(String, Vec<u8>, scl_core::FileMode, Vec<[u8; 32]>)> = Vec::new();
+        let mut carried: Vec<crate::protect::SealedFile> = Vec::new();
+        let mut to_encrypt: Vec<crate::protect::SealInput> = Vec::new();
         for f in &merge_result.files {
             if f.needs_encrypt {
                 let recipients = crate::protect::matching_prefix(&union_prot, &f.path)
@@ -1791,9 +1791,9 @@ impl Repo {
     pub(crate) fn materialize_conflict_state(
         &self,
         op: &str,
-        carried: &[(String, Vec<u8>, scl_core::FileMode, u8)],
+        carried: &[crate::protect::SealedFile],
         carried_subtrees: &[(String, scl_core::TreeEntry)],
-        to_encrypt: &[(String, Vec<u8>, scl_core::FileMode, Vec<[u8; 32]>)],
+        to_encrypt: &[crate::protect::SealInput],
         sidecars: &[(String, Vec<u8>)],
         conflict_prot: &scl_core::Protection,
         old_root: ObjectId,
@@ -5877,7 +5877,8 @@ mod tests {
 
         // (state name, setup fn, teardown fn) — each policy op is exercised
         // against all three, asserting the exact typed error per state.
-        let states: [(&str, fn(&Layout), fn(&Layout)); 3] = [
+        type StateFns = (&'static str, fn(&Layout), fn(&Layout));
+        let states: [StateFns; 3] = [
             (
                 "merge",
                 |layout| {
