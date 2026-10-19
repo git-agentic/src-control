@@ -401,6 +401,13 @@ impl Repo {
             }
         };
 
+        // A sidecar the stop wrote is working-tree scratch: it must reach
+        // neither the scanner nor the tree, whether or not the user resolved by
+        // hand and left it on disk. A tracked path of the same name is the
+        // user's own file and stays.
+        let files =
+            self.without_recorded_sidecars(files, &[tip, merge_head, pick_head], decided_root)?;
+
         // Single pass: split protected files (capturing each rule's recipients, so
         // the encryption loop needn't look the prefix up again) from plaintext.
         let mut plain: Vec<(String, Vec<u8>, scl_core::FileMode)> = Vec::new();
@@ -900,6 +907,12 @@ impl Repo {
             }
         };
         refs::write_branch_tip(&self.layout, &head, &id)?;
+        // The stop's `.theirs` sidecars were left out of the commit (see
+        // `snapshot_files`); remove them now, or the next commit would take
+        // them. Best effort: the ref already moved.
+        if let Ok(snap) = self.snapshot(&id) {
+            let _ = self.remove_conflict_sidecars(&[snap.root]);
+        }
         crate::merge_state::clear(&self.layout)?;
         crate::pick_state::clear(&self.layout)?;
         // The ref moved: persist the cache best-effort (no-op in the pick arm,
@@ -1929,6 +1942,41 @@ impl Repo {
             }
         }
         Ok(())
+    }
+
+    /// Drop from `files` the sidecars the stop recorded writing
+    /// (`conflict_plaintext::read_sidecars`) that no snapshot in `snapshots`
+    /// nor `decided_root` tracks. No record, no change.
+    fn without_recorded_sidecars(
+        &self,
+        files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
+        snapshots: &[Option<ObjectId>],
+        decided_root: Option<ObjectId>,
+    ) -> Result<Vec<(String, Vec<u8>, scl_core::FileMode)>> {
+        let sidecars = crate::conflict_plaintext::read_sidecars(&self.layout)?;
+        if sidecars.is_empty() {
+            return Ok(files);
+        }
+        let mut roots: Vec<ObjectId> = decided_root.into_iter().collect();
+        for id in snapshots.iter().flatten() {
+            roots.push(self.snapshot(id)?.root);
+        }
+        let partial = self.promisor()?.is_some();
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let mut kept = Vec::with_capacity(files.len());
+        for file in files {
+            let scratch = sidecars.contains(&file.0)
+                && !roots.iter().any(|root| {
+                    // A failed lookup counts as tracked: keep the file.
+                    worktree::tree_entry_at(&mut store, *root, &file.0, partial)
+                        .map_or(true, |e| e.is_some())
+                });
+            if !scratch {
+                kept.push(file);
+            }
+        }
+        Ok(kept)
     }
 
     /// Remove the `<path>.theirs` sidecars the stop recorded writing

@@ -3123,6 +3123,70 @@ mod tests {
         remove_root(&root);
     }
 
+    /// Two branches that conflict as binary on `bin.dat`, `main` checked out.
+    fn binary_conflict(name: &str) -> (std::path::PathBuf, Repo) {
+        let root = tmp_root(name);
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfebase\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeOURS\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeTHEIRS\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        (root, repo)
+    }
+
+    /// Resolving by editing the file and leaving the sidecar on disk must not
+    /// commit the sidecar, and the next commit must not take it either.
+    #[test]
+    fn a_merge_commit_leaves_the_leftover_sidecar_out_and_removes_it() {
+        let (root, repo) = binary_conflict("sweep-commit-merge");
+        repo.merge("work", "me").unwrap_err();
+        assert!(root.join("bin.dat.theirs").exists(), "setup: sidecar");
+        std::fs::write(root.join("bin.dat"), b"\xff\xferesolved\n").unwrap();
+        repo.commit("me", "merge").unwrap();
+        assert!(!repo.tracked_paths().unwrap().contains("bin.dat.theirs"));
+        assert!(!root.join("bin.dat.theirs").exists(), "scratch removed");
+        std::fs::write(root.join("other.txt"), b"x\n").unwrap();
+        repo.commit("me", "next").unwrap();
+        assert!(!repo.tracked_paths().unwrap().contains("bin.dat.theirs"));
+        drop(repo);
+        remove_root(&root);
+    }
+
+    #[test]
+    fn a_pick_commit_leaves_the_leftover_sidecar_out() {
+        let (root, repo) = binary_conflict("sweep-commit-pick");
+        repo.cherry_pick("work", "me", None, None).unwrap_err();
+        assert!(root.join("bin.dat.theirs").exists(), "setup: sidecar");
+        std::fs::write(root.join("bin.dat"), b"\xff\xferesolved\n").unwrap();
+        repo.commit("me", "pick").unwrap();
+        assert!(!repo.tracked_paths().unwrap().contains("bin.dat.theirs"));
+        assert!(!root.join("bin.dat.theirs").exists());
+        drop(repo);
+        remove_root(&root);
+    }
+
+    #[test]
+    fn rebase_continue_leaves_the_leftover_sidecar_out() {
+        let (root, repo) = binary_conflict("sweep-commit-rebase");
+        repo.switch("work").unwrap();
+        assert!(matches!(
+            repo.rebase("main", "me", None).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        assert!(root.join("bin.dat.theirs").exists(), "setup: sidecar");
+        std::fs::write(root.join("bin.dat"), b"\xff\xferesolved\n").unwrap();
+        repo.rebase_continue("me", None).unwrap();
+        assert!(!repo.tracked_paths().unwrap().contains("bin.dat.theirs"));
+        assert!(!root.join("bin.dat.theirs").exists());
+        drop(repo);
+        remove_root(&root);
+    }
+
     #[test]
     fn merge_abort_keeps_a_user_theirs_file_beside_a_text_conflict() {
         let (root, repo) = text_conflict_with_user_theirs_file("sweep-merge-abort");
