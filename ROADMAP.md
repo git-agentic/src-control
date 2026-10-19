@@ -720,12 +720,11 @@ scale-&-reach horizon):
   limitation across different Git repos).
 - **Richer trust models** beyond trusted-key lists (delegation, expiry) —
   P22 ships the key-list model.
-- **Sidecar-cleanup footgun in `rebase_continue` — half fixed (P37c).**
-  `remove_conflict_sidecars` now skips paths the completion's parent tree
-  tracks, but it still has no non-text-kind gate: a text conflict writes no
-  `.theirs` sidecar, so an untracked user file named `foo.txt.theirs` is
-  still deleted when the stop's conflict path is `foo.txt`. Pass the conflict
-  kind (or the written sidecar list) to the sweep to close it.
+- **Sidecar-cleanup footgun in `rebase_continue` — fixed.**
+  `remove_conflict_sidecars` (merge/pick/rebase abort and `rebase --continue`)
+  unlinks `{path}.theirs` only for a non-text conflict whose sidecar the
+  completion's parent tree does not track, so an untracked user file of that
+  name survives; a kind that cannot be derived leaves the file.
 - **In-progress guard for the RECEIVING repo on push.**
   `LocalTransport::update_ref` moves a branch tip with only a CAS/ff gate
   and no in-progress check on the receiving side — a push into a repo

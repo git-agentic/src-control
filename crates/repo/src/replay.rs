@@ -2905,6 +2905,83 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Two branches that conflict as text on `x.txt`, `main` checked out, with
+    /// an untracked user file `x.txt.theirs` beside it. A text conflict writes
+    /// no sidecar, so no sweep may touch that file.
+    fn text_conflict_with_user_theirs_file(name: &str) -> (std::path::PathBuf, Repo) {
+        let root = tmp_root(name);
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nWORK\nc\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("x.txt.theirs"), b"mine\n").unwrap();
+        (root, repo)
+    }
+
+    fn assert_user_theirs_file_survives(root: &std::path::Path) {
+        assert_eq!(
+            std::fs::read(root.join("x.txt.theirs")).unwrap(),
+            b"mine\n",
+            "an untracked x.txt.theirs beside a text conflict is the user's"
+        );
+    }
+
+    #[test]
+    fn merge_abort_keeps_a_user_theirs_file_beside_a_text_conflict() {
+        let (root, repo) = text_conflict_with_user_theirs_file("sweep-merge-abort");
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(_)
+        ));
+        repo.merge_abort().unwrap();
+        assert_user_theirs_file_survives(&root);
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cherry_pick_abort_keeps_a_user_theirs_file_beside_a_text_conflict() {
+        let (root, repo) = text_conflict_with_user_theirs_file("sweep-pick-abort");
+        assert!(matches!(
+            repo.cherry_pick("work", "me", None, None).unwrap_err(),
+            Error::PickConflicts(_)
+        ));
+        assert!(repo.pick_in_progress());
+        repo.cherry_pick_abort().unwrap();
+        assert_user_theirs_file_survives(&root);
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn rebase_abort_and_continue_keep_a_user_theirs_file_beside_a_text_conflict() {
+        // work is rebased onto main: x.txt conflicts as text.
+        let (root, repo) = text_conflict_with_user_theirs_file("sweep-rebase");
+        repo.switch("work").unwrap();
+        assert!(matches!(
+            repo.rebase("main", "me", None).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        repo.rebase_abort().unwrap();
+        assert_user_theirs_file_survives(&root);
+
+        assert!(matches!(
+            repo.rebase("main", "me", None).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
+        repo.rebase_continue("me", None).unwrap();
+        assert_user_theirs_file_survives(&root);
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A file where a parent directory of a plaintext path must be fails the
     /// write halfway; the stop refuses before writing anything instead.
     #[test]
