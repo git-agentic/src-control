@@ -2010,10 +2010,29 @@ impl Repo {
                 worktree::tree_file_entries_with_perms_sparse(&mut store, target_root, &sparse)?
             }
         };
+        self.refuse_untracked_paths(op, tracked, target.keys())
+    }
+
+    /// The path-list core of [`Repo::refuse_untracked_overwrite_vs`], for a
+    /// caller that already holds the target's paths (a private branch's
+    /// decrypted tree).
+    pub(crate) fn refuse_untracked_paths<'a>(
+        &self,
+        op: &str,
+        tracked: &std::collections::BTreeSet<String>,
+        target: impl Iterator<Item = &'a String>,
+    ) -> Result<()> {
+        let sparse = self.sparse_spec()?;
         // A path outside the view was never laid out: whatever is on disk
-        // there is the user's, even if the tree tracks it.
-        let mut is_tracked = |p: &str| sparse.matches(p) && tracked.contains(p);
-        for rel in target.keys().filter(|p| sparse.matches(p)) {
+        // there is the user's, even if the tree tracks it. On a
+        // case-insensitive filesystem a tracked file may answer to another
+        // spelling (a case-only rename): it counts as tracked only when it is
+        // provably the same file.
+        let root = &self.layout.root;
+        let mut is_tracked = |p: &str| {
+            sparse.matches(p) && (tracked.contains(p) || is_tracked_case_alias(root, tracked, p))
+        };
+        for rel in target.filter(|p| sparse.matches(p)) {
             match stop_write_blocker(&self.layout.root, rel, &mut is_tracked)? {
                 None => {}
                 Some(StopBlocker::ParentFile) => {
@@ -2249,8 +2268,10 @@ impl Repo {
     /// Switch HEAD to `name` and materialize its tip into the working tree.
     ///
     /// Refuses to switch when the working tree has uncommitted modifications or
-    /// deletions, because `materialize` would silently overwrite them. (New,
-    /// untracked files are left in place and so don't block the switch.) The
+    /// deletions, because `materialize` would silently overwrite them. New,
+    /// untracked files are left in place and don't block the switch, unless the
+    /// target branch tracks a file at the same path (or needs a directory where
+    /// one stands): that fails with `InvalidArgument` before any write. The
     /// dirty check is protection-aware (see `status`/`diff_worktree`): a
     /// decrypted protected file that matches HEAD is clean and a skipped/absent
     /// protected file is clean, but a genuine edit to a protected file blocks
@@ -2478,6 +2499,39 @@ impl Repo {
             "set protected prefix",
         )
     }
+}
+
+/// Whether `rel` is, on this filesystem, the same file as a tracked path that
+/// differs from it only in case (a case-insensitive checkout where `foo` was
+/// renamed to `Foo`). Same device and inode, or it is not an alias: a separate
+/// user file that happens to share the spelling must stay protected.
+#[cfg(unix)]
+fn is_tracked_case_alias(
+    root: &std::path::Path,
+    tracked: &std::collections::BTreeSet<String>,
+    rel: &str,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(here) = root.join(rel).symlink_metadata() else {
+        return false;
+    };
+    tracked
+        .iter()
+        .filter(|t| t.as_str() != rel && t.eq_ignore_ascii_case(rel))
+        .any(|t| {
+            root.join(t)
+                .symlink_metadata()
+                .is_ok_and(|m| m.dev() == here.dev() && m.ino() == here.ino())
+        })
+}
+
+#[cfg(not(unix))]
+fn is_tracked_case_alias(
+    _root: &std::path::Path,
+    _tracked: &std::collections::BTreeSet<String>,
+    _rel: &str,
+) -> bool {
+    false
 }
 
 /// What stands in the way of a conflict stop's direct write to `rel`.
@@ -6692,6 +6746,29 @@ mod stop_blocker_tests {
         );
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(outside.parent().unwrap()).ok();
+    }
+
+    /// On a case-insensitive checkout `foo` renamed to `Foo` is one file under
+    /// two spellings; only the same device and inode makes it an alias. A
+    /// separate user file called `Foo` stays protected.
+    #[cfg(unix)]
+    #[test]
+    fn a_case_alias_of_a_tracked_file_is_tracked_only_when_it_is_the_same_file() {
+        let root = tmp("case-alias");
+        std::fs::write(root.join("foo"), b"tracked\n").unwrap();
+        let tracked: std::collections::BTreeSet<String> = ["foo".to_string()].into();
+
+        // A separate file `Foo`: different inode, not an alias.
+        std::fs::write(root.join("Foo"), b"user's own\n").unwrap();
+        assert!(!is_tracked_case_alias(&root, &tracked, "Foo"));
+
+        // The same file under a second spelling (what a case-insensitive
+        // filesystem presents): an alias.
+        std::fs::remove_file(root.join("Foo")).unwrap();
+        std::fs::hard_link(root.join("foo"), root.join("Foo")).unwrap();
+        assert!(is_tracked_case_alias(&root, &tracked, "Foo"));
+        assert!(!is_tracked_case_alias(&root, &tracked, "Other"));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

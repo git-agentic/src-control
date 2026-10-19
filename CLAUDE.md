@@ -247,7 +247,7 @@ transport-adjacent. The rest, imperatively:
   did not write; the completing commit leaves them out of the tree and removes them.
 - **A merge, switch, cherry-pick or rebase refuses, before any write, to lay a file or
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
-  away and retry. Merging into an unborn branch, `undo`, `sparse set` and private-branch switch/merge are not guarded.
+  away and retry. Merging into an unborn branch, `undo` and `sparse set` are not guarded.
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first.
