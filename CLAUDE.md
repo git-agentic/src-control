@@ -245,9 +245,9 @@ transport-adjacent. The rest, imperatively:
   sidecars it wrote are listed apart in `.sc/CONFLICT_SIDECARS`; abort, `rebase
   --continue` and `sc resolve` remove only those, never a `.theirs` file the stop
   did not write; the completing commit leaves them out of the tree and removes them.
-- **A merge, switch, cherry-pick or rebase refuses, before any write, to lay a file or
+- **A merge, switch, cherry-pick, rebase, undo or sparse-spec change refuses, before any write, to lay a file or
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
-  away and retry. Merging into an unborn branch, `undo`, `sparse set` and the conflict stop of a merge into a private branch are not guarded.
+  away and retry. Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded.
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first.

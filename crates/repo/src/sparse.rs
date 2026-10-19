@@ -248,9 +248,14 @@ impl Repo {
         // laid out (ADR-0048).
         if let Some(snap) = &snap {
             self.ensure_view(snap.root, &spec)?;
-            let store_arc = self.vfs().store();
-            let mut s = store_arc.lock().unwrap();
-            crate::worktree::preflight_view(self.layout(), &mut s, snap.root, &spec)?;
+            {
+                let store_arc = self.vfs().store();
+                let mut s = store_arc.lock().unwrap();
+                crate::worktree::preflight_view(self.layout(), &mut s, snap.root, &spec)?;
+            }
+            // Widening lays tracked files onto disk: refuse before anything is
+            // stored if one would replace a file the user owns.
+            self.refuse_untracked_for_view_change("sparse set", snap.root, &old_spec, &spec)?;
         }
         // Crash safety: record the spec being replaced before the new one is
         // stored. If the process dies before the re-lay finishes, the marker
@@ -337,6 +342,15 @@ impl Repo {
                 "working tree has uncommitted changes; commit before changing the sparse spec"
                     .into(),
             ));
+        }
+        if let Some(tip) = self.head_tip()? {
+            let root = self.snapshot(&tip)?.root;
+            self.refuse_untracked_for_view_change(
+                "sparse disable",
+                root,
+                &self.sparse_spec()?,
+                &Sparse::default(),
+            )?;
         }
         clear(self.layout())?;
         let Some(tip) = self.head_tip()? else {

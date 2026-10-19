@@ -2015,6 +2015,36 @@ impl Repo {
         self.refuse_untracked_paths(op, tracked, target.keys())
     }
 
+    /// Refuse a sparse-spec change (`op`) that would lay a tracked file onto an
+    /// untracked or ignored one: a path newly in view (`new_view`) that the
+    /// tree `root` tracks, with something already standing there and the old
+    /// view (`old_view`) not having laid it out. Same rules as
+    /// [`Repo::refuse_untracked_overwrite_vs`].
+    pub(crate) fn refuse_untracked_for_view_change(
+        &self,
+        op: &str,
+        root: ObjectId,
+        old_view: &crate::Sparse,
+        new_view: &crate::Sparse,
+    ) -> Result<()> {
+        let partial = self.promisor()?.is_some();
+        let (laid_out, target) = {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let mut files = |view: &crate::Sparse| -> Result<std::collections::BTreeSet<String>> {
+                Ok(if partial {
+                    worktree::tree_file_entries_with_perms_sparse_present(&mut store, root, view)?
+                } else {
+                    worktree::tree_file_entries_with_perms_sparse(&mut store, root, view)?
+                }
+                .into_keys()
+                .collect())
+            };
+            (files(old_view)?, files(new_view)?)
+        };
+        self.refuse_untracked_paths_in(op, &laid_out, target.iter(), new_view)
+    }
+
     /// The path-list core of [`Repo::refuse_untracked_overwrite_vs`], for a
     /// caller that already holds the target's paths (a private branch's
     /// decrypted tree).
@@ -2024,7 +2054,19 @@ impl Repo {
         tracked: &std::collections::BTreeSet<String>,
         target: impl Iterator<Item = &'a String>,
     ) -> Result<()> {
-        let sparse = self.sparse_spec()?;
+        self.refuse_untracked_paths_in(op, tracked, target, &self.sparse_spec()?)
+    }
+
+    /// [`Repo::refuse_untracked_paths`] for the view the write will happen
+    /// under (`sparse`), which is not the persisted one while a sparse spec is
+    /// being changed.
+    pub(crate) fn refuse_untracked_paths_in<'a>(
+        &self,
+        op: &str,
+        tracked: &std::collections::BTreeSet<String>,
+        target: impl Iterator<Item = &'a String>,
+        sparse: &crate::Sparse,
+    ) -> Result<()> {
         // A path outside the view was never laid out: whatever is on disk
         // there is the user's, even if the tree tracks it. On a
         // case-insensitive filesystem a tracked file may answer to another

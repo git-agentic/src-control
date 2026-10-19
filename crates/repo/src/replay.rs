@@ -3433,6 +3433,66 @@ mod tests {
         remove_root(&root);
     }
 
+    /// `sc undo` re-lays the restored tree; it must not replace an untracked
+    /// file there.
+    #[test]
+    fn undo_refuses_to_overwrite_an_untracked_file() {
+        let root = tmp_root("guard-undo");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        std::fs::write(root.join("gone.txt"), b"was tracked\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        let tip = repo.commit("me", "deletes gone.txt").unwrap();
+        // The user now has their own gone.txt; undoing the commit would bring
+        // the tracked one back over it.
+        std::fs::write(root.join("gone.txt"), b"MINE\n").unwrap();
+
+        let err = repo.undo().unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("would overwrite")),
+            "got {err:?}"
+        );
+        assert_eq!(repo.head_tip().unwrap(), Some(tip), "no ref moved");
+        assert_eq!(std::fs::read(root.join("gone.txt")).unwrap(), b"MINE\n");
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// Widening or disabling a sparse view lays tracked files onto disk: a
+    /// file the user made at one of those paths must survive, and the spec
+    /// must stay as it was.
+    #[test]
+    fn sparse_set_and_disable_refuse_to_overwrite_an_untracked_file() {
+        let root = tmp_root("guard-sparse-widen");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("in")).unwrap();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("in/x.txt"), b"x\n").unwrap();
+        std::fs::write(root.join("out/y.txt"), b"tracked y\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.set_sparse(&["in".to_string()], None).unwrap();
+        assert!(!root.join("out/y.txt").exists(), "setup: out of view");
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(root.join("out/y.txt"), b"MINE\n").unwrap();
+        let spec_before = repo.sparse_spec().unwrap();
+
+        for err in [
+            repo.set_sparse(&["in".to_string(), "out".to_string()], None)
+                .unwrap_err(),
+            repo.disable_sparse(None).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains("would overwrite")),
+                "got {err:?}"
+            );
+        }
+        assert_eq!(repo.sparse_spec().unwrap(), spec_before, "spec unchanged");
+        assert_eq!(std::fs::read(root.join("out/y.txt")).unwrap(), b"MINE\n");
+        drop(repo);
+        remove_root(&root);
+    }
+
     #[test]
     fn rebase_continue_is_not_blocked_by_files_the_stop_wrote() {
         let root = tmp_root("guard-rebase-continue");
