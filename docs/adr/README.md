@@ -63,6 +63,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0050](0050-sessions-on-partial-clones.md) | Agent sessions on partial clones | Accepted | 37d |
 | [0051](0051-rotate-protected-paths.md) | Rotating protected paths (`sc rewrap --rotate`) | Accepted | — |
 | [0052](0052-secret-injection-by-fd.md) | Secret injection by file descriptor (`sc run --secrets-fd`) | Accepted | — |
+| [0053](0053-tls-pin-management.md) | TLS pin management (`sc tls`) | Accepted | — |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
