@@ -5,8 +5,10 @@ use std::path::Path;
 use std::process::Command;
 
 fn sc(known_hosts: &Path, args: &[&str]) -> std::process::Output {
+    // Run in the test-owned directory that holds the pin file.
     Command::new(env!("CARGO_BIN_EXE_sc"))
         .args(args)
+        .current_dir(known_hosts.parent().expect("pin file has a parent dir"))
         .env("SC_HTTPS_KNOWN_HOSTS", known_hosts)
         .output()
         .expect("sc runs")
@@ -65,6 +67,15 @@ fn pin_list_forget_round_trip_through_the_cli() {
     assert!(out(&re).contains("re-pinned"), "{}", out(&re));
     assert_eq!(out(&sc(&kh, &["tls", "list"])).lines().count(), 2);
 
+    // A host typed in another case is the same host.
+    assert!(sc(&kh, &["tls", "pin", "C.Example:9001", &fp_a])
+        .status
+        .success());
+    assert!(out(&sc(&kh, &["tls", "list"])).contains("c.example:9001"));
+    assert!(sc(&kh, &["tls", "forget", "c.EXAMPLE:9001"])
+        .status
+        .success());
+
     // Forget removes that host's pin only; the other survives untouched.
     let f = sc(&kh, &["tls", "forget", "A.EXAMPLE"]);
     assert!(f.status.success(), "{}", err(&f));
@@ -108,6 +119,13 @@ fn bad_input_is_refused_before_the_file_is_touched() {
             &format!("sha256:{}", "ab".repeat(32)),
         ],
         vec!["tls", "forget", "h:99999"],
+        vec![
+            "tls",
+            "pin",
+            "h/repo",
+            &format!("sha256:{}", "ab".repeat(32)),
+        ],
+        vec!["tls", "pin", "a b", &format!("sha256:{}", "ab".repeat(32))],
     ] {
         let o = sc(&kh, &args);
         assert!(!o.status.success(), "{args:?} must be refused");

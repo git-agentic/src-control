@@ -1146,7 +1146,10 @@ fn run_tls(op: TlsOp) -> Result<()> {
             if n == 0 {
                 anyhow::bail!("no pin for {host}:{port} in {}", file.display());
             }
-            println!("forgot {n} pin(s) for {host}:{port}; the next connection pins what it sees");
+            println!(
+                "forgot {n} pin(s) for {host}:{port}; a later connection pins what it sees \
+                 unless SC_HTTPS_STRICT=1 or SC_HTTPS_FINGERPRINT is set (then use `sc tls pin`)"
+            );
             Ok(())
         }
         TlsOp::Pin {

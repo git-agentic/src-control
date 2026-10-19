@@ -122,9 +122,10 @@ pub enum Error {
     #[error(
         "sc+https server key for {host} does not match the pinned fingerprint ({file})\n  \
          pinned: {pinned}\n  server: {seen}\n\
-         If the server key legitimately changed, run `sc tls forget {host}` (or remove that \
-         host's line from the pin file) and reconnect (the next connect re-pins); verify with \
-         `sc serve fingerprint` on the server."
+         If the server key legitimately changed, verify the new fingerprint with `sc serve \
+         fingerprint` on the server, then run `sc tls pin {host} sha256:<hex>` (works under \
+         SC_HTTPS_STRICT=1), or `sc tls forget {host}` and reconnect without SC_HTTPS_STRICT \
+         so the next connect re-pins."
     )]
     TlsPinMismatch {
         host: String,

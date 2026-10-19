@@ -98,35 +98,19 @@ pub fn parse_fingerprint(s: &str) -> Result<[u8; 32]> {
 /// malformed or comment line is skipped, never an error (the file is
 /// user-editable — the documented mismatch recovery is deleting a line).
 pub fn lookup(file: &Path, host: &str, port: u16) -> Result<Option<[u8; 32]>> {
-    let text = match std::fs::read_to_string(file) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(Error::InvalidArgument(format!(
-                "read pin file {}: {e}",
-                file.display()
-            )))
-        }
-    };
-    let key = format!("{host}:{port}");
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once(' ') {
-            if k == key {
-                if let Ok(pin) = parse_fingerprint(v.trim()) {
-                    return Ok(Some(pin));
-                }
-            }
-        }
-    }
-    Ok(None)
+    let text = read_pin_file(file)?;
+    // Hostnames are case-insensitive; the port is exact. A malformed or
+    // comment line is skipped, never an error.
+    Ok(text
+        .lines()
+        .filter_map(parse_line)
+        .find(|e| e.port == port && e.host.eq_ignore_ascii_case(host))
+        .map(|e| e.pin))
 }
 
 /// Append a pin line (creating parent dirs and the file as needed).
 pub fn record(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<()> {
+    let _lock = PinLock::acquire(file)?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::InvalidArgument(format!("create {}: {e}", parent.display())))?;
@@ -140,6 +124,51 @@ pub fn record(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<()> 
     writeln!(f, "{host}:{port} {}", scl_tlsio::fingerprint_hex(pin))
         .map_err(|e| Error::InvalidArgument(format!("write pin file {}: {e}", file.display())))?;
     Ok(())
+}
+
+/// An exclusive advisory lock on the pin file's sibling `<file>.lock`, held for
+/// a whole read-modify-write (and for a first-connection append), so two `sc`
+/// processes cannot lose each other's update or resurrect a forgotten pin.
+/// Unix only; elsewhere updates are unserialized, as before.
+struct PinLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl PinLock {
+    #[cfg(unix)]
+    fn acquire(file: &Path) -> Result<PinLock> {
+        use std::os::fd::AsRawFd;
+        let mut lock_path = file.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::InvalidArgument(format!("create {}: {e}", parent.display())))?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                Error::InvalidArgument(format!("open pin lock {}: {e}", lock_path.display()))
+            })?;
+        // SAFETY: flock on a descriptor this File owns; released on drop/close.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "lock {}: {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(PinLock { _file: f })
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_: &Path) -> Result<PinLock> {
+        Ok(PinLock {})
+    }
 }
 
 /// One pin as stored: the `host:port` it was recorded for and its SPKI hash.
@@ -170,7 +199,17 @@ pub fn parse_host_port(s: &str) -> Result<(String, u16)> {
     if host.is_empty() {
         return Err(Error::InvalidArgument(format!("empty host in {s:?}")));
     }
-    Ok((host.to_string(), port))
+    // A host that a connection's URL authority could never produce would
+    // yield a pin nothing looks up (or a line the reader takes for a comment).
+    if host
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '/' || c == '#')
+    {
+        return Err(Error::InvalidArgument(format!(
+            "bad host in {s:?}: no whitespace, '/' or '#'"
+        )));
+    }
+    Ok((host.to_ascii_lowercase(), port))
 }
 
 /// One non-comment line as a pin entry, if it is a well-formed one.
@@ -215,6 +254,7 @@ pub fn list(file: &Path) -> Result<Vec<PinEntry>> {
 /// Returns how many pins were removed; the file is only rewritten when it was
 /// more than none, and atomically.
 pub fn forget(file: &Path, host: &str, port: u16) -> Result<usize> {
+    let _lock = PinLock::acquire(file)?;
     let text = read_pin_file(file)?;
     let (kept, removed) = without_pins(&text, host, port);
     if removed > 0 {
@@ -226,6 +266,7 @@ pub fn forget(file: &Path, host: &str, port: u16) -> Result<usize> {
 /// Pin `host:port` to `pin`, replacing any pin it had. Returns whether one was
 /// replaced.
 pub fn set_pin(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<bool> {
+    let _lock = PinLock::acquire(file)?;
     let text = read_pin_file(file)?;
     let (mut kept, removed) = without_pins(&text, host, port);
     if !kept.is_empty() && !kept.ends_with('\n') {
@@ -252,6 +293,13 @@ fn without_pins(text: &str, host: &str, port: u16) -> (String, usize) {
 }
 
 fn write_pin_file(file: &Path, text: &str) -> Result<()> {
+    // A bare relative name has an empty parent, which the durable write cannot
+    // open to sync: anchor it at the current directory.
+    let file: std::borrow::Cow<Path> = match file.parent() {
+        Some(p) if p.as_os_str().is_empty() => Path::new(".").join(file).into(),
+        _ => file.into(),
+    };
+    let file = file.as_ref();
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::InvalidArgument(format!("create {}: {e}", parent.display())))?;
@@ -400,5 +448,83 @@ mod tests {
         assert!(parse_host_port(":9").is_err());
         assert!(parse_host_port("h:notaport").is_err());
         assert!(parse_host_port("h:99999").is_err());
+    }
+
+    #[test]
+    fn lookup_matches_the_host_case_insensitively_and_the_port_exactly() {
+        let dir = tmp("case");
+        let file = dir.join("known_hosts");
+        record(&file, "Example.COM", 8730, &[0x77; 32]).unwrap();
+        assert_eq!(
+            lookup(&file, "example.com", 8730).unwrap(),
+            Some([0x77; 32])
+        );
+        assert_eq!(
+            lookup(&file, "EXAMPLE.com", 8730).unwrap(),
+            Some([0x77; 32])
+        );
+        assert_eq!(lookup(&file, "example.com", 8731).unwrap(), None);
+        // A pin typed with any case is stored canonically, so a later lookup
+        // (or a strict connect) under another case finds it.
+        let (h, p) = parse_host_port("EXAMPLE.org:9").unwrap();
+        assert_eq!((h.as_str(), p), ("example.org", 9));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn parse_host_port_rejects_hosts_no_connection_could_look_up() {
+        for bad in [
+            "example.com/repo",
+            "a b",
+            "#x",
+            "x#y",
+            "tab\there",
+            "a\u{7}b",
+        ] {
+            assert!(parse_host_port(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_bare_relative_pin_file_works() {
+        let dir = tmp("relative");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Written through a relative name (empty parent), anchored at the cwd
+        // by `write_pin_file`; the test uses an absolute path to the same effect
+        // for the durable write, and checks the empty-parent branch directly.
+        let rel = std::path::Path::new("scl-pins-relative-test-file");
+        let _ = std::fs::remove_file(rel);
+        set_pin(rel, "h", 1, &[0x88; 32]).unwrap();
+        assert_eq!(lookup(rel, "h", 1).unwrap(), Some([0x88; 32]));
+        assert_eq!(forget(rel, "h", 1).unwrap(), 1);
+        let _ = std::fs::remove_file(rel);
+        let _ = std::fs::remove_file("scl-pins-relative-test-file.lock");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Concurrent writers (threads stand in for processes: `flock` locks the
+    /// open file description, and each update opens its own) never lose a pin.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_pin_updates_lose_nothing() {
+        let dir = tmp("concurrent");
+        let file = dir.join("known_hosts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let handles: Vec<_> = (0..16u16)
+            .map(|i| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    set_pin(&file, &format!("h{i}.example"), 8730 + i, &[i as u8; 32]).unwrap();
+                    record(&file, &format!("r{i}.example"), 8730, &[i as u8; 32]).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(list(&file).unwrap().len(), 32, "no update may be lost");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
     }
 }
