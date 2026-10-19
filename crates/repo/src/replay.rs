@@ -660,10 +660,7 @@ impl Repo {
         if let Some(root) = sidecar_roots.first() {
             self.remove_conflict_plaintext(*root)?;
         }
-        self.remove_conflict_sidecars(
-            &crate::pick_state::read_conflicts(&self.layout)?,
-            &sidecar_roots,
-        )?;
+        self.remove_conflict_sidecars(&sidecar_roots)?;
         crate::pick_state::clear(&self.layout)?;
         Ok(skipped)
     }
@@ -1219,10 +1216,7 @@ impl Repo {
             // user's own): see `remove_conflict_sidecars`.
             // Not a file the completion's parent tracks (that one is the
             // user's own): see `remove_conflict_sidecars`.
-            self.remove_conflict_sidecars(
-                &crate::rebase_state::read_conflicts(&self.layout)?,
-                &[self.snapshot(&st.acc_tip)?.root],
-            )?;
+            self.remove_conflict_sidecars(&[self.snapshot(&st.acc_tip)?.root])?;
             // Advance state BEFORE attempting the fold, so an error from the
             // fold below (on a later commit) leaves a retryable, idempotent
             // `--continue` rather than losing resumability. `rebase_abort`
@@ -1308,10 +1302,7 @@ impl Repo {
             )?
         };
         self.remove_conflict_plaintext(snap.root)?;
-        self.remove_conflict_sidecars(
-            &crate::rebase_state::read_conflicts(&self.layout)?,
-            &[snap.root],
-        )?;
+        self.remove_conflict_sidecars(&[snap.root])?;
         crate::rebase_state::clear(&self.layout)?;
         Ok(skipped)
     }
@@ -2930,6 +2921,93 @@ mod tests {
             b"mine\n",
             "an untracked x.txt.theirs beside a text conflict is the user's"
         );
+    }
+
+    /// Binary delete/modify writes no sidecar: `ours` deletes, `work` edits.
+    #[test]
+    fn abort_keeps_a_user_theirs_file_beside_a_binary_delete_modify_conflict() {
+        let root = tmp_root("sweep-bin-delmod");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfebase\n").unwrap();
+        std::fs::write(root.join("keep.txt"), b"k\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::remove_file(root.join("bin.dat")).unwrap();
+        repo.commit("me", "main deletes").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeWORK\n").unwrap();
+        repo.commit("me", "work edits").unwrap();
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("bin.dat.theirs"), b"mine\n").unwrap();
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(_)
+        ));
+        repo.merge_abort().unwrap();
+        assert_eq!(
+            std::fs::read(root.join("bin.dat.theirs")).unwrap(),
+            b"mine\n"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A protected UTF-8 conflict writes markers, not a sidecar.
+    #[test]
+    fn abort_and_resolve_keep_a_user_theirs_file_beside_a_protected_text_conflict() {
+        let root = tmp_root("sweep-protected-text");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"MAIN\nl2\nl3\n").unwrap();
+        repo.commit("me", "main edits").unwrap();
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"WORK\nl2\nl3\n").unwrap();
+        repo.commit("me", "work edits").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt.theirs"), b"mine\n").unwrap();
+        let mine = || std::fs::read(root.join("secret/a.txt.theirs")).unwrap();
+
+        let err = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        repo.resolve_path("secret/a.txt", crate::ResolveSide::Ours, Some(&alice_sk))
+            .unwrap();
+        assert_eq!(mine(), b"mine\n", "resolve must keep the user's file");
+        repo.cherry_pick_abort().unwrap();
+        assert_eq!(mine(), b"mine\n", "abort must keep the user's file");
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The control: a binary conflict's own sidecar is still cleaned up.
+    #[test]
+    fn abort_still_removes_the_sidecar_a_binary_conflict_wrote() {
+        let root = tmp_root("sweep-bin-own");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfebase\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeOURS\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeTHEIRS\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(_)
+        ));
+        assert!(root.join("bin.dat.theirs").exists());
+        repo.merge_abort().unwrap();
+        assert!(!root.join("bin.dat.theirs").exists());
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

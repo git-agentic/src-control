@@ -292,33 +292,21 @@ impl Repo {
             },
         }
 
-        // Drop the `.theirs` sidecar this system may have written — the only
-        // sidecar extension ever written (`.base` and `.ours` are never
-        // produced, so removing them was both dead code and a footgun: a
-        // repo can legitimately track a real file named
-        // `foo.txt.base`/`foo.txt.ours`, and blind-unlinking it would
-        // silently destroy user data). `.theirs` is written only for
-        // BINARY/PROTECTED-with-binary-content conflicts (merge.rs writes
-        // `{path}.theirs` in the binary-conflict arm) — a TEXT conflict
-        // never writes one, so a `.theirs`-named file sitting untracked next
-        // to a text conflict is not this system's scratch, it's the user's;
-        // removing it there would silently and unrecoverably delete
-        // untracked data. So only consider removal when the conflict kind is
-        // NOT Text (`!= Text`, not `== Binary`: a protected binary conflict
-        // still writes a plaintext `.theirs` sidecar and classifies as
-        // Protected, so it must still be cleaned up). And even then, only
-        // remove it when it is NOT a tracked path — a genuine sidecar is
-        // untracked scratch by construction, so a tracked `{path}.theirs`
-        // must be a user's real file and is left alone.
-        if kind != ConflictKind::Text {
-            let theirs_sidecar_path = format!("{path}.theirs");
-            if !self.tracked_paths()?.contains(&theirs_sidecar_path) {
-                let sidecar = safe_join(&self.layout.root, &theirs_sidecar_path)?;
-                match std::fs::remove_file(&sidecar) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
+        // Drop the `.theirs` sidecar the stop recorded writing for this path.
+        // Only a recorded sidecar is ours: the kind of conflict does not say
+        // whether one was written (a protected UTF-8 conflict and a binary
+        // delete/modify write none), and a `.theirs` file the stop did not
+        // write is the user's, as is a tracked `{path}.theirs` (a repo can
+        // legitimately track `foo.txt.theirs`, `.base` or `.ours`).
+        let theirs_sidecar_path = format!("{path}.theirs");
+        if crate::conflict_plaintext::read_sidecars(&self.layout)?.contains(&theirs_sidecar_path)
+            && !self.tracked_paths()?.contains(&theirs_sidecar_path)
+        {
+            let sidecar = safe_join(&self.layout.root, &theirs_sidecar_path)?;
+            match std::fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
         }
 

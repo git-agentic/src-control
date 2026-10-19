@@ -48,11 +48,49 @@ pub(crate) fn read(layout: &Layout) -> Result<BTreeSet<String>> {
     }
 }
 
-/// Drop the record.
+/// Drop both records.
 pub(crate) fn clear(layout: &Layout) -> Result<()> {
-    match std::fs::remove_file(path(layout)) {
+    remove_if_present(&path(layout))?;
+    remove_if_present(&sidecar_path(layout))
+}
+
+fn remove_if_present(p: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(p) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn sidecar_path(layout: &Layout) -> std::path::PathBuf {
+    layout.dot_sc.join("CONFLICT_SIDECARS")
+}
+
+/// Record the `<path>.theirs` sidecars a stop wrote, by full path. They are
+/// kept apart from the plaintext list because completion counts a plaintext
+/// path as tracked, and a sidecar must never be committed. An empty list
+/// removes the record.
+pub(crate) fn write_sidecars(layout: &Layout, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return remove_if_present(&sidecar_path(layout));
+    }
+    let tmp = layout.dot_sc.join("CONFLICT_SIDECARS.tmp");
+    std::fs::write(&tmp, paths.join("\0"))?;
+    std::fs::rename(&tmp, sidecar_path(layout))?;
+    Ok(())
+}
+
+/// The recorded sidecar paths, empty when there is no record. Only the
+/// sidecars a stop actually wrote are listed: a `.theirs` file beside a
+/// conflict that wrote none is the user's own.
+pub(crate) fn read_sidecars(layout: &Layout) -> Result<BTreeSet<String>> {
+    match std::fs::read_to_string(sidecar_path(layout)) {
+        Ok(text) => Ok(text
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
         Err(e) => Err(e.into()),
     }
 }
@@ -83,8 +121,17 @@ mod tests {
         write(&layout, &[]).unwrap();
         assert!(read(&layout).unwrap().is_empty(), "an empty list clears");
         write(&layout, &["x".into()]).unwrap();
+        write_sidecars(&layout, &["x.theirs".into()]).unwrap();
+        assert_eq!(
+            read_sidecars(&layout)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["x.theirs"]
+        );
         clear(&layout).unwrap();
         assert!(read(&layout).unwrap().is_empty());
+        assert!(read_sidecars(&layout).unwrap().is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
