@@ -244,7 +244,7 @@ transport-adjacent. The rest, imperatively:
   and abort removes listed paths the restored tree does not track as plain files. The `<path>.theirs`
   sidecars it wrote are listed apart in `.sc/CONFLICT_SIDECARS`; abort, `rebase
   --continue` and `sc resolve` remove only those, never a `.theirs` file the stop
-  did not write.
+  did not write; the completing commit leaves them out of the tree and removes them.
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first.

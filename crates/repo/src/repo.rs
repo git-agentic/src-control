@@ -401,6 +401,17 @@ impl Repo {
             }
         };
 
+        // On a completion only (an ordinary commit, amend or workspace harvest
+        // has none of these): a sidecar the stop wrote is working-tree scratch,
+        // so it must reach neither the scanner nor the tree, whether or not the user resolved by
+        // hand and left it on disk. A tracked path of the same name is the
+        // user's own file and stays.
+        let files = if merge_head.is_some() || pick_head.is_some() || decided_root.is_some() {
+            self.without_recorded_sidecars(files, &[tip], decided_root)?
+        } else {
+            files
+        };
+
         // Single pass: split protected files (capturing each rule's recipients, so
         // the encryption loop needn't look the prefix up again) from plaintext.
         let mut plain: Vec<(String, Vec<u8>, scl_core::FileMode)> = Vec::new();
@@ -899,6 +910,14 @@ impl Repo {
                 id
             }
         };
+        // The stop's `.theirs` sidecars were left out of the commit (see
+        // `snapshot_files`); remove them before the ref moves, or the next
+        // commit would take them. A removal failure fails this commit with
+        // nothing moved and the record intact, so it can be retried.
+        if merging || picking {
+            let root = self.snapshot(&id)?.root;
+            self.remove_conflict_sidecars(&[root])?;
+        }
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
         crate::pick_state::clear(&self.layout)?;
@@ -1931,6 +1950,58 @@ impl Repo {
         Ok(())
     }
 
+    /// The sidecars the in-progress stop recorded writing. A record with no
+    /// merge, pick or rebase in progress is residue of a crash mid-stop, and
+    /// names nothing that is ours: it reads as empty.
+    fn recorded_sidecars(&self) -> Result<std::collections::BTreeSet<String>> {
+        if self.active_conflict_op()?.is_none() {
+            return Ok(std::collections::BTreeSet::new());
+        }
+        crate::conflict_plaintext::read_sidecars(&self.layout)
+    }
+
+    /// Drop from `files` the sidecars the stop recorded writing
+    /// (`conflict_plaintext::read_sidecars`) that no snapshot in `snapshots`
+    /// nor `decided_root` tracks. The other side's history does not count: a path
+    /// the result deleted stays deleted, however the input tracked it. No
+    /// record, no change.
+    fn without_recorded_sidecars(
+        &self,
+        files: Vec<(String, Vec<u8>, scl_core::FileMode)>,
+        snapshots: &[Option<ObjectId>],
+        decided_root: Option<ObjectId>,
+    ) -> Result<Vec<(String, Vec<u8>, scl_core::FileMode)>> {
+        let sidecars = self.recorded_sidecars()?;
+        if sidecars.is_empty() {
+            return Ok(files);
+        }
+        // The decided root is the operation's outcome and takes precedence: a
+        // parent that tracks the path says nothing about a result that deleted
+        // it. Without one, the tip is the only owner.
+        let mut roots: Vec<ObjectId> = decided_root.into_iter().collect();
+        if roots.is_empty() {
+            for id in snapshots.iter().flatten() {
+                roots.push(self.snapshot(id)?.root);
+            }
+        }
+        let partial = self.promisor()?.is_some();
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let mut kept = Vec::with_capacity(files.len());
+        for file in files {
+            let scratch = sidecars.contains(&file.0)
+                && !roots.iter().any(|root| {
+                    // A failed lookup counts as tracked: keep the file.
+                    worktree::tree_entry_at(&mut store, *root, &file.0, partial)
+                        .map_or(true, |e| e.is_some())
+                });
+            if !scratch {
+                kept.push(file);
+            }
+        }
+        Ok(kept)
+    }
+
     /// Remove the `<path>.theirs` sidecars the stop recorded writing
     /// (`conflict_plaintext::read_sidecars`), except a file any of `roots`
     /// tracks: that one is the user's own and was just restored. A `.theirs`
@@ -1940,7 +2011,7 @@ impl Repo {
     /// a restore that fails leaves the sidecars to retry. The record is retired
     /// once swept.
     pub(crate) fn remove_conflict_sidecars(&self, roots: &[ObjectId]) -> Result<()> {
-        let sidecars = crate::conflict_plaintext::read_sidecars(&self.layout)?;
+        let sidecars = self.recorded_sidecars()?;
         if sidecars.is_empty() {
             return Ok(());
         }
