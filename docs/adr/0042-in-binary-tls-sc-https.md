@@ -172,6 +172,23 @@ channel was always a weaker guarantee than the gate's wording implied.
   blob, the TOFU pin/mismatch/strict/pre-pin lifecycle, and the tightened
   plaintext gate refusing a token-only public bind — run twice, zero residue.
 
+## Follow-ons closed after the first release
+
+- **A repo is required to mint.** `sc serve fingerprint` and `--tls` auto-mint
+  refuse a root with no `.sc/` directory; the identity lives in `.sc/serve-tls/`
+  and minting elsewhere left a stray `.sc/`.
+- **A downgrade is reported.** When an `SC_HTTPS_*` knob (strict, fingerprint,
+  known-hosts, CA file or CA) is set and the URL is plaintext `sc+http://`, the
+  client prints a warning, since the knob silently does nothing there.
+- **The client is bounded.** The connect, the TLS handshake, the opening line,
+  the status line and the wire handshake share a 30 s bound, so a peer that
+  accepts and goes silent fails the connect instead of hanging it (a read
+  timeout is `ConnectionLost`). The bound is lifted once the handshake is done;
+  a long transfer is governed by the server's session timeout. It is not
+  configurable.
+- **`sc remote add` validates.** `sc+http://` and `sc+https://` URLs are parsed
+  at add time, like `ssh://` and the bucket schemes.
+
 ## Rejected alternatives
 
 - **aws-lc-rs as the primary provider.** Rejected for its heavier build

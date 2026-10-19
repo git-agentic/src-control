@@ -3912,6 +3912,9 @@ fn run_remote(op: RemoteOp) -> Result<()> {
                 if url.starts_with("ssh://") {
                     scl_repo::SshUrl::parse(&url)?; // fail fast on malformed URLs
                 }
+                if url.starts_with("sc+http://") || url.starts_with("sc+https://") {
+                    scl_repo::ScHttpUrl::parse(&url)?; // fail fast on malformed URLs
+                }
                 if url.starts_with("sc+wal://") || url.starts_with("sc+s3://") {
                     scl_repo::BucketUrl::parse(&url)?; // fail fast on malformed URLs
                 }

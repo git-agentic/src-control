@@ -40,9 +40,15 @@ fn read_bounded_opening(r: &mut impl Read) -> Result<Vec<u8>> {
                 "HTTP opening exceeded {MAX_OPENING_BYTES} bytes without a terminating blank line"
             )));
         }
-        let n = r
-            .read(&mut byte)
-            .map_err(|e| Error::InvalidArgument(format!("HTTP opening read failed: {e}")))?;
+        let n = r.read(&mut byte).map_err(|e| match e.kind() {
+            // A socket read timeout surfaces as WouldBlock (unix) or TimedOut
+            // (windows): the peer went quiet, which is a lost connection, not
+            // a malformed opening.
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                Error::ConnectionLost("timed out waiting for the HTTP opening".to_string())
+            }
+            _ => Error::InvalidArgument(format!("HTTP opening read failed: {e}")),
+        })?;
         if n == 0 {
             return Err(Error::InvalidArgument(
                 "HTTP opening ended before a terminating blank line".to_string(),
@@ -345,6 +351,15 @@ impl HttpTransport {
     /// and delegated to [`Self::connect_with_pins`], the testable,
     /// env-free core.
     pub fn connect_with_token(url: &ScHttpUrl, token: Option<&str>) -> Result<HttpTransport> {
+        let ignored = ignored_https_knobs(url, |k| std::env::var(k).ok());
+        if !ignored.is_empty() {
+            eprintln!(
+                "warning: {} set but {} is plaintext sc+http:// — it has no effect; use an \
+                 sc+https:// URL for TLS",
+                ignored.join(", "),
+                url.authority()
+            );
+        }
         let policy = if url.tls {
             Some(crate::tls_pins::TlsClientPolicy::from_env()?)
         } else {
@@ -366,6 +381,21 @@ impl HttpTransport {
         token: Option<&str>,
         policy: Option<&crate::tls_pins::TlsClientPolicy>,
     ) -> Result<HttpTransport> {
+        Self::connect_bounded(url, token, policy, CLIENT_OPENING_TIMEOUT)
+    }
+
+    /// [`Self::connect_with_pins`] with the opening bound as a parameter, so a
+    /// test can use a short one. The connect, the TLS handshake, the opening
+    /// line, the status line and the wire handshake are all bounded by
+    /// `opening`: a peer that accepts and then goes silent fails the connect
+    /// instead of hanging it. Once the handshake is done the bound is lifted;
+    /// a long transfer is governed by the server's session timeout.
+    fn connect_bounded(
+        url: &ScHttpUrl,
+        token: Option<&str>,
+        policy: Option<&crate::tls_pins::TlsClientPolicy>,
+        opening: Duration,
+    ) -> Result<HttpTransport> {
         if let Some(t) = token {
             if t.contains(['\r', '\n']) {
                 return Err(Error::InvalidArgument(
@@ -385,8 +415,18 @@ impl HttpTransport {
             }
         }
 
-        let stream = TcpStream::connect(url.authority())
+        let stream = connect_within(&url.authority(), opening)
             .map_err(|e| Error::ConnectionLost(format!("sc+http connect to {url:?}: {e}")))?;
+        // Socket options are shared by every clone of the stream, so these
+        // bound the TLS handshake and both halves below; `ctl` lifts them
+        // once the opening is done.
+        let ctl = stream
+            .try_clone()
+            .map_err(|e| Error::ConnectionLost(format!("sc+http socket clone: {e}")))?;
+        stream
+            .set_read_timeout(Some(opening))
+            .and_then(|()| stream.set_write_timeout(Some(opening)))
+            .map_err(|e| Error::ConnectionLost(format!("sc+http set timeouts: {e}")))?;
 
         let (mut r, mut w) = match (url.tls, policy) {
             (false, _) => {
@@ -513,6 +553,9 @@ impl HttpTransport {
         }
 
         let client = WireClient::handshake(r, w)?;
+        ctl.set_read_timeout(None)
+            .and_then(|()| ctl.set_write_timeout(None))
+            .map_err(|e| Error::ConnectionLost(format!("sc+http clear timeouts: {e}")))?;
         Ok(HttpTransport { client })
     }
 }
@@ -569,6 +612,51 @@ impl Transport for HttpTransport {
 /// after the 200 status is written, before handing off to `wire::serve` —
 /// see [`handle_http_connection`] for the timeout sequencing.
 const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the client allows the connect, TLS handshake, opening and wire
+/// handshake to take before giving up on a silent or stalled peer. Matches the
+/// server's opening bound; lifted once the handshake completes.
+const CLIENT_OPENING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `TcpStream::connect` with a bound on each resolved address, so an
+/// unroutable or black-holed host fails in `timeout` rather than the OS default.
+fn connect_within(authority: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let mut last = None;
+    for addr in authority.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no addresses resolved",
+        )
+    }))
+}
+
+/// The `SC_HTTPS_*` environment knobs that are set but cannot apply to `url`:
+/// all of them configure TLS, so on a plaintext `sc+http://` URL they silently
+/// do nothing (a scheme-downgrade footgun worth a warning). Empty for an
+/// `sc+https://` URL. `env` is injected so this is testable without mutating
+/// the process environment.
+fn ignored_https_knobs(url: &ScHttpUrl, env: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    if url.tls {
+        return Vec::new();
+    }
+    [
+        "SC_HTTPS_STRICT",
+        "SC_HTTPS_FINGERPRINT",
+        "SC_HTTPS_KNOWN_HOSTS",
+        "SC_HTTPS_CA_FILE",
+        "SC_HTTPS_CA",
+    ]
+    .into_iter()
+    .filter(|k| env(k).is_some_and(|v| !v.is_empty()))
+    .collect()
+}
 
 /// Exponential accept-error backoff (P31): Go net/http's shape — 5ms
 /// doubling to a 1s cap, reset on the next successful accept. Turns fd
@@ -756,6 +844,7 @@ fn resolve_tls(
     let identity = match tls {
         TlsMode::Off => return Ok(None),
         TlsMode::AutoMint => {
+            require_repo_for_tls_identity(root)?;
             scl_tlsio::load_or_mint(&crate::layout::Layout::at(root).serve_tls_dir())?
         }
         TlsMode::Pem { cert, key } => scl_tlsio::load_pem(cert, key)?,
@@ -763,11 +852,26 @@ fn resolve_tls(
     Ok(Some(scl_tlsio::server_config(identity)?))
 }
 
+/// The serve-TLS identity lives in `<root>/.sc/serve-tls/`, so minting one
+/// under a root that is not a repo would create a stray `.sc/` there (or fail
+/// obscurely). Refuse first, naming the fix.
+fn require_repo_for_tls_identity(root: &std::path::Path) -> Result<()> {
+    if root.join(".sc").is_dir() {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "{} has no .sc directory, so there is nowhere to keep the serve TLS identity \
+         (.sc/serve-tls/); run `sc init` there, or point at a repo",
+        root.display()
+    )))
+}
+
 /// The repo's serve-TLS fingerprint (`sha256:<hex>`), minting the identity
 /// if it doesn't exist yet — so an operator can distribute the pin BEFORE
 /// first serve (`sc serve fingerprint`, P32). Same load-or-mint path the
 /// server uses; no drift possible.
 pub fn serve_tls_fingerprint(root: &std::path::Path) -> Result<String> {
+    require_repo_for_tls_identity(root)?;
     let id = scl_tlsio::load_or_mint(&crate::layout::Layout::at(root).serve_tls_dir())?;
     Ok(scl_tlsio::fingerprint_hex(&id.spki_sha256))
 }
@@ -1895,6 +1999,147 @@ mod tests {
         assert_eq!(connect_raw_status(gated, None), 401);
         std::fs::remove_dir_all(&broken).unwrap();
         assert!(!broken.exists(), "test must leave no residue");
+    }
+
+    /// `sc serve fingerprint` and `--tls` auto-mint keep the identity in
+    /// `.sc/serve-tls/`, so a root that is not a repo is refused up front
+    /// rather than gaining a stray `.sc/`.
+    #[test]
+    fn tls_identity_is_not_minted_outside_a_repo() {
+        let bare = std::env::temp_dir().join(format!("scl-http-mint-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+
+        let err = serve_tls_fingerprint(&bare).unwrap_err();
+        assert!(err.to_string().contains("sc init"), "got {err}");
+        let err = match resolve_tls(&bare, &TlsMode::AutoMint) {
+            Err(e) => e,
+            Ok(_) => panic!("auto-mint outside a repo must be refused"),
+        };
+        assert!(err.to_string().contains("no .sc directory"), "got {err}");
+        assert!(!bare.join(".sc").exists(), "nothing may be created");
+
+        // Inside a repo it still mints.
+        let repo = tmp_repo("mint-ok");
+        assert!(serve_tls_fingerprint(&repo).unwrap().starts_with("sha256:"));
+        std::fs::remove_dir_all(&repo).unwrap();
+
+        std::fs::remove_dir_all(&bare).unwrap();
+        assert!(!bare.exists(), "test must leave no residue");
+    }
+
+    /// A peer that accepts the TCP connection and then says nothing must fail
+    /// the client's connect within the opening bound, not hang it: neither the
+    /// status line nor the wire handshake ever arrives.
+    #[test]
+    fn a_silent_server_fails_the_connect_within_the_opening_bound() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Hold accepted sockets open and mute until the test ends.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _conn = listener.accept().unwrap();
+            let _ = rx.recv();
+        });
+        let url = ScHttpUrl {
+            host: "127.0.0.1".to_string(),
+            port,
+            path: "/repo".to_string(),
+            tls: false,
+        };
+
+        let started = std::time::Instant::now();
+        let err = HttpTransport::connect_bounded(&url, None, None, Duration::from_millis(300))
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the connect was not bounded: {err:?} after {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
+        tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    /// The same bound covers the TLS handshake: a peer that accepts and never
+    /// answers the ClientHello fails the connect instead of hanging it.
+    #[test]
+    fn a_silent_tls_peer_fails_the_connect_within_the_opening_bound() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _conn = listener.accept().unwrap();
+            let _ = rx.recv();
+        });
+        let url = ScHttpUrl {
+            host: "127.0.0.1".to_string(),
+            port,
+            path: "/repo".to_string(),
+            tls: true,
+        };
+        let home = std::env::temp_dir().join(format!("scl-http-silent-tls-{}", std::process::id()));
+        let policy = crate::tls_pins::TlsClientPolicy {
+            known_hosts: home.join("known_hosts"),
+            pre_pin: None,
+            strict: false,
+            ca: None,
+        };
+
+        let started = std::time::Instant::now();
+        let err =
+            HttpTransport::connect_bounded(&url, None, Some(&policy), Duration::from_millis(300))
+                .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the TLS handshake was not bounded: {err:?}"
+        );
+        assert!(
+            !home.join("known_hosts").exists(),
+            "a failed handshake must not write a pin"
+        );
+        tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    /// The opening bound is lifted once the handshake is done: a connection
+    /// that then sits idle for longer than the bound still works.
+    #[test]
+    fn the_opening_bound_is_lifted_after_the_handshake() {
+        let root = tmp_repo("opening-bound-lifted");
+        let port = spawn_real_http_server(root.clone());
+        let url = ScHttpUrl {
+            host: "127.0.0.1".to_string(),
+            port,
+            path: "/repo".to_string(),
+            tls: false,
+        };
+        let transport =
+            HttpTransport::connect_bounded(&url, None, None, Duration::from_millis(300)).unwrap();
+        std::thread::sleep(Duration::from_millis(900));
+        transport.list_refs().unwrap();
+        drop(transport);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test must leave no residue");
+    }
+
+    #[test]
+    fn https_knobs_on_a_plaintext_url_are_reported_and_otherwise_silent() {
+        let plain = ScHttpUrl::parse("sc+http://127.0.0.1:1/x").unwrap();
+        let secure = ScHttpUrl::parse("sc+https://127.0.0.1:1/x").unwrap();
+        let env = |k: &str| match k {
+            "SC_HTTPS_STRICT" => Some("1".to_string()),
+            "SC_HTTPS_CA" => Some("system".to_string()),
+            "SC_HTTPS_FINGERPRINT" => Some(String::new()), // empty counts as unset
+            _ => None,
+        };
+        assert_eq!(
+            ignored_https_knobs(&plain, env),
+            vec!["SC_HTTPS_STRICT", "SC_HTTPS_CA"]
+        );
+        assert!(ignored_https_knobs(&secure, env).is_empty());
+        assert!(ignored_https_knobs(&plain, |_| None).is_empty());
     }
 
     // ── Task 5: client-side `SC_HTTP_TOKEN` support (`connect_with_token`). ──

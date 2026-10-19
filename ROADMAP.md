@@ -906,19 +906,16 @@ scale-&-reach horizon):
   today; and a one-line fix to `SignatureObj.snapshot`'s now-stale doc
   comment, which still describes the field as always a snapshot id even
   though signing a transcript stores a transcript id there instead.
-- **P32 follow-ons.** Four items named but not closed by the P32 TLS work,
-  deferred rather than silently dropped: (1) a `.sc`-existence check before
-  `sc serve fingerprint`/`--tls` auto-mint — today it happily mints
-  `~/.sc/serve-tls` even when run outside a repo; (2) a stderr warning when
-  an `SC_HTTPS_*` env knob (`SC_HTTPS_STRICT`/`SC_HTTPS_FINGERPRINT`/
-  `SC_HTTPS_KNOWN_HOSTS`) is set but the target URL is plaintext
-  `sc+http://` — a scheme-downgrade footgun where the knob silently does
-  nothing; (3) a client-side TLS handshake/read timeout — the server bounds
-  its side at 30s (the opening read), but the `sc+https://` client is
-  unbounded, so this folds into the existing deferred hostile-peer pass
-  alongside `read_frame_inner`'s unbounded frame-length allocation; (4)
-  `sc remote add` parse-validating `sc+http(s)://` URLs at add time, the
-  way `ssh://` already does, instead of deferring the parse to first use.
+- **P32 follow-ons — shipped.** The four items the TLS work named: (1) `sc serve
+  fingerprint` and `--tls` auto-mint refuse a root with no `.sc/` instead of
+  minting there; (2) a stderr warning when an `SC_HTTPS_*` knob is set but the
+  URL is plaintext `sc+http://`; (3) the `sc+http(s)://` client bounds the
+  connect, TLS handshake, opening and wire handshake (30 s) so a silent peer
+  fails the connect, and lifts the bound afterwards (a read timeout is
+  `ConnectionLost`); (4) `sc remote add` parse-validates `sc+http(s)://` URLs
+  at add time like `ssh://` and the bucket schemes. The client bound is not
+  configurable, and `read_frame_inner`'s frame-length allocation (covered by the
+  `MAX_OBJECT_SIZE` cap since P28) is unchanged.
 
 - **P34 follow-ons (private branches, ADR-0044).** Deferred rather than
   built: (1) `sc branch publish --squash` — collapse the sealed history into
