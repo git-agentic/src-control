@@ -476,7 +476,10 @@ impl Repo {
         // convergent forever). A RANDOMIZED prior can't be compared by
         // re-encrypting (a fresh seal differs every time), so it consults the
         // `.sc`-local stat/tag cache; a lost/stale cache degrades to a spurious
-        // reseal, never to incorrectness. Everything else seals.
+        // reseal, never to incorrectness. Everything else seals. On a merge or
+        // pick completion the same proof also runs against the other parent's
+        // entry, so a protected path resolved to THEIR side keeps their
+        // ciphertext (below).
         let tip_entries: BTreeMap<String, (ObjectId, scl_core::FileMode, u8)> = match tip {
             Some(t) => {
                 let store_arc = self.vfs.store();
@@ -529,10 +532,12 @@ impl Repo {
                 _ => None,
             };
             // Not ours: a path resolved with `--theirs` was recorded against
-            // the other parent's blob id. Carry it only when its wrap list is
-            // in the unioned protection, so the carried ciphertext stays
-            // decryptable; any lookup trouble (a gap on a partial clone)
-            // just seals.
+            // the other parent's blob id. Carry it only when its blob is held
+            // and its wrap list is non-empty in the unioned protection, so the
+            // carried ciphertext stays decryptable; any lookup trouble (a gap
+            // on a partial clone) just seals. Like every carry, it keeps that
+            // wrap list verbatim rather than re-deriving it from the merged
+            // rule's `granted_keys()` (see the wrap-lifecycle note below).
             if carry.is_none() {
                 if let Some(root) = other_root {
                     let found = {
@@ -541,10 +546,14 @@ impl Repo {
                         crate::worktree::tree_entry_at(&mut store, root, &path, partial)
                             .ok()
                             .flatten()
+                            .filter(|(id, _, _)| store.contains(id))
                     };
                     if let Some((blob_id, _m, perms)) = found {
                         if perms & scl_core::PROTECTED != 0
-                            && protection.wrapped.contains_key(&blob_id)
+                            && protection
+                                .wrapped
+                                .get(&blob_id)
+                                .is_some_and(|wks| !wks.is_empty())
                             && proves(&blob_id, perms, cache.as_deref())
                         {
                             carry = Some((blob_id, perms));
@@ -838,7 +847,11 @@ impl Repo {
         // them back to `granted_keys()` on the next commit, whereas carry
         // preserves them on unchanged content. This is not a new disclosure
         // (the recipient already holds the key; the ciphertext is unchanged)
-        // and `sc rewrap` remains the deliberate cutover, per ADR-0027.
+        // and `sc rewrap` remains the deliberate cutover, per ADR-0027. A path
+        // resolved to THEIR side carries their wrap list the same way: a
+        // recipient revoked, or a key granted, on our side after the fork is
+        // not applied to that blob until `sc rewrap`/`sc grant` (under-grant,
+        // never over-grant), exactly as a clean merge that takes their blob.
         let prior = std::mem::take(&mut protection.wrapped);
         crate::protect::reuse_prior_wraps(&mut fresh_wrapped, &prior);
         protection.wrapped = fresh_wrapped;
