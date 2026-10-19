@@ -725,6 +725,12 @@ scale-&-reach horizon):
   rebase abort, `rebase --continue` and `sc resolve` unlink only those (and
   never a path the restored tree tracks), so an untracked user `foo.txt.theirs`
   survives whatever the conflict kind.
+- **Completion commits a leftover `.theirs` sidecar.** A binary conflict's
+  `<path>.theirs` is working-tree scratch, but if the user resolves by editing
+  `<path>` (not `sc resolve`) and leaves the sidecar, the completing `sc commit`
+  or `rebase --continue` snapshots it as a tracked file (reproduced on main with
+  a merge). Exclude recorded sidecars (`.sc/CONFLICT_SIDECARS`) that no input
+  root tracks from the completion snapshot.
 - **In-progress guard for the RECEIVING repo on push.**
   `LocalTransport::update_ref` moves a branch tip with only a CAS/ff gate
   and no in-progress check on the receiving side — a push into a repo

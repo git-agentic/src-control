@@ -1937,7 +1937,8 @@ impl Repo {
     /// file the stop did not write is the user's, whatever kind of conflict
     /// sits beside it. A failed lookup counts as tracked: a stray sidecar is
     /// harmless, deleting a tracked file is not. Call it after the restore, so
-    /// a restore that fails leaves the sidecars to retry.
+    /// a restore that fails leaves the sidecars to retry. The record is retired
+    /// once swept.
     pub(crate) fn remove_conflict_sidecars(&self, roots: &[ObjectId]) -> Result<()> {
         let sidecars = crate::conflict_plaintext::read_sidecars(&self.layout)?;
         if sidecars.is_empty() {
@@ -1955,7 +1956,10 @@ impl Repo {
                 let _ = std::fs::remove_file(self.layout.root.join(sidecar));
             }
         }
-        Ok(())
+        // Handled: retire the record, so a retry (a `--continue` whose fold
+        // fails later) cannot sweep a file the user creates at that path.
+        drop(store);
+        crate::conflict_plaintext::write_sidecars(&self.layout, &[])
     }
 
     /// Abandon an in-progress merge: restore the working tree to the current tip

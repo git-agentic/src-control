@@ -3048,6 +3048,43 @@ mod tests {
         remove_root(&root);
     }
 
+    /// A sweep retires the record: a retried `--continue` (or any second
+    /// sweep) must not remove a file the user creates at that path meanwhile.
+    #[test]
+    fn a_swept_sidecar_is_retired_from_the_record() {
+        let root = tmp_root("sweep-retired");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfebase\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeOURS\n").unwrap();
+        let ours = repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeTHEIRS\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(_)
+        ));
+        let ours_root = repo.snapshot(&ours).unwrap().root;
+        repo.remove_conflict_sidecars(&[ours_root]).unwrap();
+        assert!(
+            !root.join("bin.dat.theirs").exists(),
+            "first sweep removes it"
+        );
+
+        std::fs::write(root.join("bin.dat.theirs"), b"mine\n").unwrap();
+        repo.remove_conflict_sidecars(&[ours_root]).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("bin.dat.theirs")).unwrap(),
+            b"mine\n",
+            "second sweep must not touch a file made after the first"
+        );
+        drop(repo);
+        remove_root(&root);
+    }
+
     #[test]
     fn merge_abort_keeps_a_user_theirs_file_beside_a_text_conflict() {
         let (root, repo) = text_conflict_with_user_theirs_file("sweep-merge-abort");
