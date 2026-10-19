@@ -78,7 +78,9 @@ wait_for_line() {
 
 # --- File mode, portable across BSD (macOS) and GNU stat. ---
 file_mode() {
-  stat -f "%Lp" "$1" 2>/dev/null || stat -c "%a" "$1"
+  # GNU form first: on GNU stat `-f` means "filesystem status" and succeeds,
+  # so trying the BSD form first never reaches the fallback.
+  stat -c "%a" "$1" 2>/dev/null || stat -f "%Lp" "$1"
 }
 
 check_no_tmp_residue() {
