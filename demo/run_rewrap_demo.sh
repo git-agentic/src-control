@@ -123,7 +123,25 @@ grep -q "skipped (no key): secret/db.txt" "$work/post-rewrap-switch.err" \
 [ "$(cat secret/db.txt)" = "hunter2" ] \
   || fail "alice must still decrypt secret/db.txt after rewrap"
 
+# 7. ROTATE (ADR-0051): `sc rewrap --rotate` re-seals every protected file
+#    under a FRESH key, so a recipient who kept an old wrap cannot open the
+#    new ciphertext. It reports the rotated blobs, alice still reads the file,
+#    and bob is still skipped.
+rot_out=$("$SC" rewrap --rotate --identity "$keys/alice" 2>"$work/rotate.err")
+echo "$rot_out" | grep -q "rotated 1 protected blob(s) under fresh keys" \
+  || fail "rewrap --rotate must report 1 rotated blob, got: $rot_out"
+"$SC" switch main --identity "$keys/alice" >/dev/null
+[ "$(cat secret/db.txt)" = "hunter2" ] \
+  || fail "alice must still decrypt secret/db.txt after rotate"
+"$SC" switch main --identity "$keys/bob" 2>"$work/post-rotate-switch.err" >/dev/null \
+  || fail "switch itself must still succeed for bob after rotate"
+grep -q "skipped (no key): secret/db.txt" "$work/post-rotate-switch.err" \
+  || fail "bob must stay skipped (no key) for secret/db.txt after rotate"
+"$SC" switch main --identity "$keys/alice" >/dev/null
+
 echo "RESULT: bulk rewrap proven -- escrow sweep re-sealed the pre-escrow secret,"
 echo "one undo/redo pair flipped the whole sweep atomically (2 -> 1 -> 2"
 echo "recipients), and on that same rewrapped tip the R1 re-attached wrap was"
 echo "stripped (bob's decrypt flipped success -> skipped)."
+echo "and rewrap --rotate re-sealed the protected file under a fresh key (alice"
+echo "still decrypts, bob stays skipped)."

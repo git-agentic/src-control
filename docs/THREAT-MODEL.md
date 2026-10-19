@@ -78,8 +78,10 @@ too, not just the src-control-side metadata.
   pre-revoke branches (revocation tombstones, ADR-0026), so a revoked recipient
   never seals a *fresh* DEK again. But a recipient who already held a wrap can
   still decrypt the ciphertext sealed *before* the revoke — cryptographic cutover
-  is rotation (`sc rewrap` on the live tip), not revoke, and history keeps the old
-  wraps regardless.
+  is rotation, not revoke: `sc rewrap --rotate` on the live tip re-seals every
+  protected blob under a fresh key (ADR-0051), whereas a plain `sc rewrap` only
+  replaces wrap lists and leaves the key a revoked holder already has. History
+  keeps the old wraps and ciphertext regardless.
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 

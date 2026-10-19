@@ -17,6 +17,9 @@ pub struct RewrapReport {
     /// Convergent (pre-P33) protected blobs eagerly re-sealed randomized
     /// (fresh DEK + nonce, new ciphertext id) during this run (P33 Task 10).
     pub blobs_resealed: usize,
+    /// Already-randomized protected blobs re-sealed under a fresh DEK because
+    /// the run asked to rotate (`rewrap_with` / `sc rewrap --rotate`).
+    pub blobs_rotated: usize,
     /// (entry label e.g. "secret db-pass" / "path secret/db.txt", reason)
     pub skipped: Vec<(String, String)>,
     /// The commit id; None on --dry-run or when nothing needed rewrapping.
@@ -43,6 +46,24 @@ impl Repo {
         escrows: &[PublicKey],
         known_keys: &[PublicKey],
         dry_run: bool,
+    ) -> Result<RewrapReport> {
+        self.rewrap_with(identity, escrows, known_keys, dry_run, false)
+    }
+
+    /// [`Repo::rewrap`] with `rotate`: also re-seal every already-randomized
+    /// protected blob under a FRESH DEK (the protected-path analogue of
+    /// `sc secret rotate`, ADR-0051). A plain rewrap replaces wrap lists only,
+    /// so a recipient revoked earlier who kept an old wrap can still open the
+    /// tip's ciphertext; rotating makes that ciphertext unreadable to them. It
+    /// changes ciphertext ids, so the root tree changes. History is untouched
+    /// (rotation is not erasure).
+    pub fn rewrap_with(
+        &self,
+        identity: &SecretKey,
+        escrows: &[PublicKey],
+        known_keys: &[PublicKey],
+        dry_run: bool,
+        rotate: bool,
     ) -> Result<RewrapReport> {
         self.refuse_on_private("sc rewrap")?;
         self.refuse_on_partial("sc rewrap")?;
@@ -137,6 +158,7 @@ impl Repo {
         let mut protection = snap.protection.clone();
         let mut blobs_rewrapped = 0usize;
         let mut blobs_resealed = 0usize;
+        let mut blobs_rotated = 0usize;
         // path -> (new blob id, new perms) for eagerly-upgraded entries; the
         // commit tail rebuilds the root iff this is non-empty.
         let mut retargets: std::collections::BTreeMap<String, (ObjectId, u8)> =
@@ -220,10 +242,12 @@ impl Repo {
                     target_pks.push(e.clone());
                 }
             }
-            if perms & scl_core::RANDOMIZED == 0 {
-                // Convergent (pre-P33): eager upgrade. Decrypt with the DEK
-                // we just unwrapped, re-seal randomized, retarget the tree
-                // entry + wraps to the fresh ciphertext id.
+            let convergent = perms & scl_core::RANDOMIZED == 0;
+            if convergent || rotate {
+                // Convergent (pre-P33): eager upgrade. Randomized with
+                // `rotate`: a genuine cutover to a fresh DEK. Either way:
+                // decrypt with the DEK we just unwrapped, re-seal randomized,
+                // retarget the tree entry + wraps to the fresh ciphertext id.
                 let cipher = {
                     let arc = self.store_arc();
                     let obj = arc.lock().unwrap().get(blob_id)?;
@@ -249,7 +273,11 @@ impl Repo {
                     }
                 };
                 if dry_run {
-                    blobs_resealed += 1;
+                    if convergent {
+                        blobs_resealed += 1;
+                    } else {
+                        blobs_rotated += 1;
+                    }
                     continue;
                 }
                 let (new_cipher, new_dek) = scl_crypto::encrypt_path_randomized(&pt);
@@ -280,7 +308,11 @@ impl Repo {
                     // at the next commit, never incorrectness.
                     c.record(path, &pt, new_id);
                 }
-                blobs_resealed += 1;
+                if convergent {
+                    blobs_resealed += 1;
+                } else {
+                    blobs_rotated += 1;
+                }
                 continue;
             }
             if dry_run {
@@ -328,12 +360,14 @@ impl Repo {
             || (secrets_rewrapped.is_empty()
                 && new_secret_objs.is_empty()
                 && blobs_rewrapped == 0
-                && blobs_resealed == 0)
+                && blobs_resealed == 0
+                && blobs_rotated == 0)
         {
             return Ok(RewrapReport {
                 secrets_rewrapped,
                 blobs_rewrapped,
                 blobs_resealed,
+                blobs_rotated,
                 skipped,
                 commit: None,
             });
@@ -380,20 +414,17 @@ impl Repo {
         };
         let head = crate::refs::current_branch(self.layout())?;
         let before = crate::refs::read_branch_tip(self.layout(), &head)?;
-        let msg = if blobs_resealed > 0 {
-            format!(
-                "rewrap: {} secret(s), {} blob(s), {} re-sealed randomized",
-                secrets_rewrapped.len(),
-                blobs_rewrapped,
-                blobs_resealed
-            )
-        } else {
-            format!(
-                "rewrap: {} secret(s), {} blob(s)",
-                secrets_rewrapped.len(),
-                blobs_rewrapped
-            )
-        };
+        let mut msg = format!(
+            "rewrap: {} secret(s), {} blob(s)",
+            secrets_rewrapped.len(),
+            blobs_rewrapped
+        );
+        if blobs_resealed > 0 {
+            msg.push_str(&format!(", {blobs_resealed} re-sealed randomized"));
+        }
+        if blobs_rotated > 0 {
+            msg.push_str(&format!(", {blobs_rotated} rotated"));
+        }
         let id = self.commit_snapshot(new_root, vec![tip], registry, protection, "system", &msg)?;
         crate::oplog::record(
             self.layout(),
@@ -414,6 +445,7 @@ impl Repo {
             secrets_rewrapped,
             blobs_rewrapped,
             blobs_resealed,
+            blobs_rotated,
             skipped,
             commit: Some(id),
         })
@@ -1008,6 +1040,148 @@ mod tests {
             .rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), true)
             .unwrap_err();
         assert!(matches!(err, Error::MergeInProgress), "got {err:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// ADR-0051: a plain rewrap strips a revoked recipient's wrap but leaves
+    /// the ciphertext and its DEK alone, so a recipient who kept the old wrap
+    /// still opens the tip; `--rotate` re-seals under a fresh DEK and closes it.
+    #[test]
+    fn rotate_makes_the_tip_unreadable_with_a_revoked_recipients_old_dek() {
+        let root = tmp_root("rotate");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/db.txt"), b"hunter2").unwrap();
+        repo.commit("me", "add").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        let tip0 = repo.head_tip().unwrap().unwrap();
+        let (old_id, perms) = entry_at(&repo, tip0, "secret/db.txt");
+        assert_ne!(perms & scl_core::RANDOMIZED, 0, "premise: randomized");
+
+        // Bob's DEK, as he holds it from before the revoke.
+        let bob_dek = {
+            let wks = repo.snapshot(&tip0).unwrap().protection.wrapped[&old_id].clone();
+            let w = wks
+                .iter()
+                .find(|w| w.recipient_id == bob_pk.recipient_id().to_string())
+                .expect("bob holds a wrap");
+            scl_crypto::unwrap_dek_with(w, &bob_sk).unwrap()
+        };
+        let opens_with_bob_dek = |tip: ObjectId| {
+            let (id, _) = entry_at(&repo, tip, "secret/db.txt");
+            let cipher = {
+                let arc = repo.store_arc();
+                let obj = arc.lock().unwrap().get(&id).unwrap();
+                match obj {
+                    Object::Blob(b) => b.to_vec(),
+                    other => panic!("not a blob: {other:?}"),
+                }
+            };
+            scl_crypto::decrypt_path(&cipher, &bob_dek).is_ok()
+        };
+        repo.revoke("secret/", &bob_pk.recipient_id()).unwrap();
+
+        // Plain rewrap: wraps change, ciphertext does not, bob's old DEK opens.
+        let plain = repo
+            .rewrap(&alice_sk, &[], std::slice::from_ref(&alice_pk), false)
+            .unwrap();
+        let tip1 = plain.commit.unwrap();
+        assert_eq!(entry_at(&repo, tip1, "secret/db.txt").0, old_id);
+        assert_eq!(plain.blobs_rotated, 0);
+        assert!(opens_with_bob_dek(tip1), "the gap rotation closes");
+
+        // Dry-run reports without committing.
+        let dry = repo
+            .rewrap_with(&alice_sk, &[], std::slice::from_ref(&alice_pk), true, true)
+            .unwrap();
+        assert_eq!(dry.blobs_rotated, 1);
+        assert!(dry.commit.is_none());
+        assert_eq!(repo.head_tip().unwrap(), Some(tip1));
+
+        // Rotate: new ciphertext id, same plaintext for alice, bob's DEK fails.
+        let rot = repo
+            .rewrap_with(&alice_sk, &[], std::slice::from_ref(&alice_pk), false, true)
+            .unwrap();
+        assert_eq!(rot.blobs_rotated, 1);
+        assert_eq!(rot.blobs_resealed, 0, "nothing was convergent");
+        assert!(rot.skipped.is_empty());
+        let tip2 = rot.commit.unwrap();
+        let (new_id, perms2) = entry_at(&repo, tip2, "secret/db.txt");
+        assert_ne!(new_id, old_id, "a fresh seal has a new id");
+        assert_ne!(perms2 & scl_core::RANDOMIZED, 0);
+        assert!(!opens_with_bob_dek(tip2), "the old DEK no longer opens it");
+        assert_eq!(
+            decrypt_at(&repo, tip2, "secret/db.txt", &alice_sk),
+            b"hunter2"
+        );
+        let snap2 = repo.snapshot(&tip2).unwrap();
+        assert!(
+            !snap2.protection.wrapped.contains_key(&old_id),
+            "the old ciphertext's wraps are dropped from the tip"
+        );
+        assert_eq!(repo.snapshot(&tip2).unwrap().parents, vec![tip1]);
+        // The unchanged working file still reads as clean: no spurious diff.
+        let st = repo.status().unwrap();
+        assert!(
+            st.modified.is_empty() && st.deleted.is_empty() && st.added.is_empty(),
+            "status after rotate: {st:?}"
+        );
+
+        // Rotating again is again a fresh seal (not a no-op), and undo restores.
+        let again = repo
+            .rewrap_with(&alice_sk, &[], std::slice::from_ref(&alice_pk), false, true)
+            .unwrap();
+        let tip3 = again.commit.unwrap();
+        assert_ne!(entry_at(&repo, tip3, "secret/db.txt").0, new_id);
+        repo.undo().unwrap();
+        assert_eq!(repo.head_tip().unwrap(), Some(tip2));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A path the identity cannot open is skipped by a rotating run, as by a
+    /// plain one, and the rest of the sweep still lands.
+    #[test]
+    fn rotate_skips_a_path_the_identity_cannot_open_and_rotates_the_rest() {
+        let root = tmp_root("rotate-skip");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        repo.protect("mine/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
+        repo.protect("theirs/", std::slice::from_ref(&bob_pk), None)
+            .unwrap();
+        std::fs::create_dir_all(root.join("mine")).unwrap();
+        std::fs::create_dir_all(root.join("theirs")).unwrap();
+        std::fs::write(root.join("mine/a.txt"), b"alice's").unwrap();
+        std::fs::write(root.join("theirs/b.txt"), b"bob's").unwrap();
+        repo.commit("me", "add").unwrap();
+        let tip0 = repo.head_tip().unwrap().unwrap();
+        let theirs_before = entry_at(&repo, tip0, "theirs/b.txt").0;
+        let mine_before = entry_at(&repo, tip0, "mine/a.txt").0;
+
+        let report = repo
+            .rewrap_with(&alice_sk, &[], std::slice::from_ref(&alice_pk), false, true)
+            .unwrap();
+        assert_eq!(report.blobs_rotated, 1);
+        assert_eq!(
+            report.skipped.len(),
+            1,
+            "bob's path is reported, not hidden"
+        );
+        let tip = report.commit.unwrap();
+        assert_ne!(entry_at(&repo, tip, "mine/a.txt").0, mine_before);
+        assert_eq!(
+            entry_at(&repo, tip, "theirs/b.txt").0,
+            theirs_before,
+            "an unopenable blob is left exactly as it was"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

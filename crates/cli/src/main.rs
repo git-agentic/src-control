@@ -465,6 +465,11 @@ enum Cmd {
         /// Report what would be re-wrapped without committing.
         #[arg(long)]
         dry_run: bool,
+        /// Also re-seal every protected file under a fresh key, so a
+        /// recipient revoked earlier cannot open the tip with an old wrap.
+        /// Changes ciphertext ids (and the root tree); history is untouched.
+        #[arg(long)]
+        rotate: bool,
     },
     /// Revert the last operation (run again to redo).
     Undo,
@@ -1038,7 +1043,11 @@ fn main() -> Result<()> {
             include_encrypted,
         } => run_export(to, r#ref, include_encrypted),
         Cmd::Escrow { op } => run_escrow(op),
-        Cmd::Rewrap { identity, dry_run } => run_rewrap(identity, dry_run),
+        Cmd::Rewrap {
+            identity,
+            dry_run,
+            rotate,
+        } => run_rewrap(identity, dry_run, rotate),
         Cmd::Undo => run_undo(),
         Cmd::Oplog => run_oplog(),
         Cmd::Sign { r#ref, identity } => run_sign(&r#ref, identity),
@@ -4246,7 +4255,7 @@ fn run_gc(prune_expire: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_rewrap(identity: Option<PathBuf>, dry_run: bool) -> Result<()> {
+fn run_rewrap(identity: Option<PathBuf>, dry_run: bool, rotate: bool) -> Result<()> {
     let repo = open_repo()?;
     let sk = load_identity(identity)?;
     let recipients_path = repo.layout().dot_sc.join("recipients.toml");
@@ -4267,7 +4276,7 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool) -> Result<()> {
         known.push(me);
     }
 
-    let report = repo.rewrap(&sk, &escrows, &known, dry_run)?;
+    let report = repo.rewrap_with(&sk, &escrows, &known, dry_run, rotate)?;
     let verb = if dry_run { "would rewrap" } else { "rewrapped" };
     println!(
         "{verb} {} secret(s), {} protected blob(s)",
@@ -4285,6 +4294,13 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool) -> Result<()> {
             report.blobs_resealed
         );
     }
+    if report.blobs_rotated > 0 {
+        let rotate_verb = if dry_run { "would rotate" } else { "rotated" };
+        println!(
+            "{rotate_verb} {} protected blob(s) under fresh keys",
+            report.blobs_rotated
+        );
+    }
     if let Some(id) = &report.commit {
         println!("commit: {}", id.short());
     }
@@ -4293,7 +4309,12 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool) -> Result<()> {
         for (entry, reason) in &report.skipped {
             eprintln!("  {entry}: {reason}");
         }
-        eprintln!("re-run `sc rewrap` with an identity that can open them to complete the sweep");
+        let again = if rotate {
+            "sc rewrap --rotate"
+        } else {
+            "sc rewrap"
+        };
+        eprintln!("re-run `{again}` with an identity that can open them to complete the sweep");
     }
     eprintln!(
         "note: rewrap cuts the live tip only — snapshots already in history keep \

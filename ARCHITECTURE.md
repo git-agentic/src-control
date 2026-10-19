@@ -500,15 +500,17 @@ is recovered via `--identity` and re-sealed. Recipients default to the
 secret's current set (reverse `recipient_id` lookup against
 `.sc/recipients.toml`), overridable with `--to`.
 
-Rotation is **secrets-only**: pre-P33 protected paths used convergent
+`sc secret rotate` rotates secrets. Protected paths could not be rotated before randomized sealing (P33): they used convergent
 encryption (`DEK = HKDF(BLAKE3(plaintext))`), so a recipient who checked the
 file out could re-derive the key — "rotating" a convergent path's DEK is either
-dedup-breaking or security-meaningless. Path lifecycle stays on recipient
+dedup-breaking or security-meaningless, so their lifecycle stayed on recipient
 re-wrap (`grant`/`revoke`). `sc secret revoke` remains metadata-only and now
 hints to run `rotate` for the actual cryptographic cutover. (**P33/ADR-0043:**
 the security-meaningless objection dissolves for **randomized** content — a
 random DEK is independent of the plaintext — so a genuine rotate-for-paths
-cutover is now coherent and recorded as an unlocked follow-on, not yet built.)
+cutover is coherent and is built as `sc rewrap --rotate` (ADR-0051): it
+re-seals every protected blob under a fresh key, where a plain `sc rewrap`
+only replaces wrap lists and keeps the key.)
 
 `sc escrow set <pubkey-or-name>` / `sc escrow show` configure a single
 break-glass recipient key (`[escrow]` in `.sc/recipients.toml`) that is
