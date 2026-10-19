@@ -149,7 +149,7 @@ cannot be safely keyed without it).
   One command, one commit, one oplog record, skip-and-report semantics
   unchanged; sealing to an empty granted set still fails loudly.
 
-### Unlocked follow-on: rotate-for-paths (built in ADR-0051)
+### Unlocked follow-on: rotate-for-paths (recorded, not built)
 
 ADR-0019 declared per-path DEK rotation "security-meaningless" under convergent
 encryption — the DEK is a deterministic function of the plaintext, so
@@ -158,7 +158,7 @@ for randomized content:** a randomized DEK is independent of the plaintext, so
 re-sealing a protected path under a fresh DEK is a genuine cryptographic
 cutover, exactly as `sc secret rotate` already is for secrets. A
 `sc protect … rotate`-style surface is now a coherent follow-on, recorded here
-and in `ROADMAP.md`, and built later as `sc rewrap --rotate` (ADR-0051).
+and in `ROADMAP.md`, **not built** in this phase.
 
 ## Consequences
 
