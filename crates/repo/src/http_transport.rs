@@ -1038,7 +1038,15 @@ fn handle_http_connection(
     // pre-P29 behavior). A matched token's scope sets this connection's
     // read-only flag; `--read-only` below is a floor an `rw` token cannot
     // elevate.
-    let tokens = crate::serve_tokens::load(&crate::layout::Layout::at(root))?;
+    // Tokens live under `.sc/`; without a repo directory there are none, and
+    // reading through a non-directory `.sc` would error and drop the
+    // connection with no status instead of answering below.
+    let has_repo = root.join(".sc").is_dir();
+    let tokens = if has_repo {
+        crate::serve_tokens::load(&crate::layout::Layout::at(root))?
+    } else {
+        Vec::new()
+    };
     let token_read_only = if tokens.is_empty() {
         if mandatory_auth {
             // The public bind's sole justification (tokens) was removed while
@@ -1072,7 +1080,7 @@ fn handle_http_connection(
     // here. Tokens live under `.sc/`, so a bearer can only be required when the
     // repo exists; with no tokens configured (open loopback, `--read-only` or
     // `--allow-public`) there is no gate to leak around and the 404 stays.
-    if !root.join(".sc").is_dir() {
+    if !has_repo {
         write_status(&mut writer, 404)?;
         return Ok(());
     }
@@ -1850,6 +1858,12 @@ mod tests {
 
         let open = spawn_real_http_server_policy_auth(bare.clone(), false, false);
         assert_eq!(connect_raw_status(open, None), 404);
+
+        // A `.sc` that is a regular file is no repo either: still a status,
+        // never a dropped connection from the token read.
+        std::fs::write(bare.join(".sc"), b"not a directory").unwrap();
+        assert_eq!(connect_raw_status(open, None), 404);
+        assert_eq!(connect_raw_status(gated, None), 401);
 
         std::fs::remove_dir_all(&bare).unwrap();
         assert!(!bare.exists(), "test must leave no residue");
