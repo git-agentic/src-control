@@ -21,6 +21,14 @@ pub struct WireClient<R: Read, W: Write> {
 }
 
 impl<R: Read, W: Write> WireClient<R, W> {
+    /// Test hook: look at the two halves (e.g. the socket options behind them)
+    /// without issuing a request.
+    #[cfg(test)]
+    pub(crate) fn with_halves<T>(&self, f: impl FnOnce(&R, &W) -> T) -> T {
+        let rw = self.rw.borrow();
+        f(&rw.0, &rw.1)
+    }
+
     /// Exchange HELLOs and return a ready client. Fails typed: version skew is
     /// `Protocol`, a served non-repo path is `NotARepo`, a dead peer is
     /// `ConnectionLost`.

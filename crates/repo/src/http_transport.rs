@@ -381,20 +381,30 @@ impl HttpTransport {
         token: Option<&str>,
         policy: Option<&crate::tls_pins::TlsClientPolicy>,
     ) -> Result<HttpTransport> {
-        Self::connect_bounded(url, token, policy, CLIENT_OPENING_TIMEOUT)
+        Self::connect_bounded(
+            url,
+            token,
+            policy,
+            CLIENT_OPENING_TIMEOUT,
+            CLIENT_HANDSHAKE_TIMEOUT,
+        )
     }
 
-    /// [`Self::connect_with_pins`] with the opening bound as a parameter, so a
-    /// test can use a short one. The connect, the TLS handshake, the opening
-    /// line, the status line and the wire handshake are all bounded by
-    /// `opening`: a peer that accepts and then goes silent fails the connect
-    /// instead of hanging it. Once the handshake is done the bound is lifted;
-    /// a long transfer is governed by the server's session timeout.
+    /// [`Self::connect_with_pins`] with the two bounds as parameters, so a test
+    /// can use short ones. `opening` covers the connect, the TLS handshake, the
+    /// opening line and the status line; `handshake` covers the wire handshake
+    /// that follows the 200, which can legitimately be slow (a bucket-backed
+    /// server opens its bucket before it answers HELLO). Both are inactivity
+    /// bounds on each read or write, not a total deadline: a peer that goes
+    /// silent fails the connect, instead of hanging it. Once the handshake is
+    /// done both are lifted; a long transfer is governed by the server's
+    /// session timeout.
     fn connect_bounded(
         url: &ScHttpUrl,
         token: Option<&str>,
         policy: Option<&crate::tls_pins::TlsClientPolicy>,
         opening: Duration,
+        handshake: Duration,
     ) -> Result<HttpTransport> {
         if let Some(t) = token {
             if t.contains(['\r', '\n']) {
@@ -553,6 +563,9 @@ impl HttpTransport {
             }
         }
 
+        // The 200 is in: the wire handshake gets its own, longer, bound.
+        ctl.set_read_timeout(Some(handshake))
+            .map_err(|e| Error::ConnectionLost(format!("sc+http set timeouts: {e}")))?;
         let client = WireClient::handshake(r, w).map_err(lost_if_timeout)?;
         ctl.set_read_timeout(None)
             .and_then(|()| ctl.set_write_timeout(None))
@@ -618,6 +631,11 @@ const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// handshake to take before giving up on a silent or stalled peer. Matches the
 /// server's opening bound; lifted once the handshake completes.
 const CLIENT_OPENING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the client waits for each part of the wire handshake after the
+/// server's 200. Longer than the opening bound because a bucket-backed server
+/// opens its bucket (replaying a log tail) before it answers HELLO.
+const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// `TcpStream::connect` with a bound on each resolved address, so an
 /// unroutable or black-holed host fails in `timeout` rather than the OS default.
@@ -1447,6 +1465,9 @@ mod tests {
         (port, handle)
     }
 
+    /// A bound short enough for a silent-peer test to finish quickly.
+    const SHORT: Duration = Duration::from_millis(300);
+
     fn tmp_repo(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("scl-http-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -2082,8 +2103,7 @@ mod tests {
         };
 
         let started = std::time::Instant::now();
-        let err = HttpTransport::connect_bounded(&url, None, None, Duration::from_millis(300))
-            .unwrap_err();
+        let err = HttpTransport::connect_bounded(&url, None, None, SHORT, SHORT).unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the connect was not bounded: {err:?} after {:?}",
@@ -2116,8 +2136,7 @@ mod tests {
             tls: false,
         };
         let started = std::time::Instant::now();
-        let err = HttpTransport::connect_bounded(&url, None, None, Duration::from_millis(300))
-            .unwrap_err();
+        let err = HttpTransport::connect_bounded(&url, None, None, SHORT, SHORT).unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "unbounded: {err:?}"
@@ -2154,8 +2173,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let err =
-            HttpTransport::connect_bounded(&url, None, Some(&policy), Duration::from_millis(300))
-                .unwrap_err();
+            HttpTransport::connect_bounded(&url, None, Some(&policy), SHORT, SHORT).unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the TLS handshake was not bounded: {err:?}"
@@ -2169,10 +2187,10 @@ mod tests {
         holder.join().unwrap();
     }
 
-    /// The opening bound is lifted once the handshake is done: a connection
-    /// that then sits idle for longer than the bound still works.
+    /// Both client bounds are lifted once the handshake is done, so a long
+    /// transfer or a slow server reply is not cut off by them.
     #[test]
-    fn the_opening_bound_is_lifted_after_the_handshake() {
+    fn the_client_bounds_are_lifted_after_the_handshake() {
         let root = tmp_repo("opening-bound-lifted");
         let port = spawn_real_http_server(root.clone());
         let url = ScHttpUrl {
@@ -2181,9 +2199,16 @@ mod tests {
             path: "/repo".to_string(),
             tls: false,
         };
-        let transport =
-            HttpTransport::connect_bounded(&url, None, None, Duration::from_millis(300)).unwrap();
-        std::thread::sleep(Duration::from_millis(900));
+        let transport = HttpTransport::connect_bounded(&url, None, None, SHORT, SHORT).unwrap();
+        // A timeout only fires while a read waits, so an idle sleep proves
+        // nothing: look at the socket options the live transport holds.
+        transport.client.with_halves(|r, w| match (r.get_ref(), w) {
+            (HttpReadHalf::Plain(rd), HttpWriteHalf::Plain(wr)) => {
+                assert_eq!(rd.read_timeout().unwrap(), None, "read bound not lifted");
+                assert_eq!(wr.write_timeout().unwrap(), None, "write bound not lifted");
+            }
+            _ => panic!("expected a plaintext transport"),
+        });
         transport.list_refs().unwrap();
         drop(transport);
 

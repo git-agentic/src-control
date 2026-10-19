@@ -909,11 +909,11 @@ scale-&-reach horizon):
 - **P32 follow-ons — shipped.** The four items the TLS work named: (1) `sc serve
   fingerprint` and `--tls` auto-mint refuse a root with no `.sc/` instead of
   minting there; (2) a stderr warning when an `SC_HTTPS_*` knob is set but the
-  URL is plaintext `sc+http://`; (3) the `sc+http(s)://` client bounds the
-  connect, TLS handshake, opening and wire handshake (30 s) so a silent peer
-  fails the connect, and lifts the bound afterwards (a read timeout is
-  `ConnectionLost`); (4) `sc remote add` parse-validates `sc+http(s)://` URLs
-  at add time like `ssh://` and the bucket schemes. The client bound is not
+  URL is plaintext `sc+http://`; (3) the `sc+http(s)://` client bounds the connect, TLS handshake, opening and
+  status line (30 s inactivity) and the wire handshake (300 s, for a bucket
+  server's slow open), so a silent peer fails the connect as `ConnectionLost`,
+  and lifts both afterwards; (4) `sc remote add` parse-validates `sc+http(s)://` URLs
+  at add time like `ssh://` and the bucket schemes. The client bounds are not
   configurable, and `read_frame_inner`'s frame-length allocation (covered by the
   `MAX_OBJECT_SIZE` cap since P28) is unchanged.
 

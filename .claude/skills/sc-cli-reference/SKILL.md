@@ -345,7 +345,8 @@ cargo run --bin sc -- serve --http <addr> <path> --tls [--tls-cert <pem> --tls-k
                                               # --tls now — plaintext public needs
                                               # --allow-public (or --read-only)
 cargo run --bin sc -- serve fingerprint [<path>]   # print (minting if absent) the serve-TLS
-                                              # SPKI fingerprint (sha256:<hex>)
+                                              # SPKI fingerprint (sha256:<hex>); needs a repo
+                                              # (.sc/) — found from the cwd, or <path>
 cargo run --bin sc -- clone sc+https://host[:port]/repo <dst>   # TLS clone (P32); accept-new
                                               # TOFU: first connect pins into
                                               # ~/.config/sc/known_hosts (SC_HTTPS_KNOWN_HOSTS
