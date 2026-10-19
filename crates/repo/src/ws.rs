@@ -204,14 +204,6 @@ impl Repo {
         if agents == 0 {
             return Err(Error::InvalidArgument("agents must be >= 1".into()));
         }
-        // Partial-clone guard (P27 final review I2): `sc ws harvest` already
-        // refuses on a partial clone (a real merge needs the full tree
-        // closure), so an unguarded `ws fork` would create a session that
-        // can never be harvested — a guaranteed dead end. Refuse at the
-        // source instead of letting the session get created first.
-        if self.promisor()?.is_some() {
-            return Err(crate::promisor::partial_clone_unsupported("ws fork"));
-        }
         if let Some(existing) = read_manifest(self.layout())? {
             return Err(Error::InvalidArgument(format!(
                 "a workspace session is already open ({} workspace(s) forked from branch {} @ {}); \
@@ -228,6 +220,20 @@ impl Repo {
         // durable session is closer to a second working tree for the same
         // repo, so it should see the same narrowed checkout the user does.
         let sparse = self.sparse_spec()?;
+        // On a partial clone the workspaces see the host's view and nothing
+        // more (ADR-0050): fill its closure first (lazy, online clones), or
+        // fail with the gap error before any checkout is written.
+        let tip_root = self.snapshot(&tip)?.root;
+        self.ensure_view(tip_root, &sparse)?;
+        // `ensure_view` fills only when it can; on a non-lazy or offline clone
+        // the view may still hold a gap. Check presence against the HOST's
+        // layout now: a workspace's own layout is not a partial clone, so its
+        // materialize would not, and the gap would surface mid-write.
+        {
+            let store_arc = self.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            crate::worktree::preflight_view(self.layout(), &mut store, tip_root, &sparse)?;
+        }
 
         let root = ws_dir(self.layout());
         // No manifest proves any .sc/ws content is crash residue from a
@@ -514,7 +520,7 @@ impl Repo {
         // this is a hard `Err`, never silently folded into the "not clean"
         // fallback path.
         if self.promisor()?.is_some() {
-            return Err(crate::promisor::partial_clone_unsupported("ws harvest"));
+            return self.would_merge_cleanly_partial(ours, theirs, identity);
         }
         let store_arc = self.vfs().store();
         let mut store = store_arc.lock().unwrap();
@@ -550,6 +556,57 @@ impl Repo {
             }
             // A file/directory collision (ADR-0049) is not a clean merge: this
             // workspace falls back to a `work-<i>` branch like any conflict.
+            Err(Error::ProtectedMergeNeedsIdentity(_))
+            | Err(Error::NotAuthorized(_))
+            | Err(Error::PathCollision(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Self::would_merge_cleanly`] on a partial clone: the same question,
+    /// answered with the tree-recursive engine (ADR-0049), which reads only
+    /// where the sides differ and fills what it needs by id on a lazy, online
+    /// clone. Any conflict, in the view or not, is "not clean": the workspace
+    /// then falls back to a `work-<i>` branch like on a full clone.
+    fn would_merge_cleanly_partial(
+        &self,
+        ours: ObjectId,
+        theirs: ObjectId,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<bool> {
+        let (base_snap, ours_snap, theirs_snap) = {
+            let store_arc = self.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            if crate::merge::is_ancestor(&mut store, theirs, ours)?
+                || crate::merge::is_ancestor(&mut store, ours, theirs)?
+            {
+                return Ok(true); // a no-op or a pure fast-forward
+            }
+            let Some(base) = crate::merge::merge_base(&mut store, ours, theirs)? else {
+                return Ok(false);
+            };
+            (
+                store.get_snapshot(&base)?,
+                store.get_snapshot(&ours)?,
+                store.get_snapshot(&theirs)?,
+            )
+        };
+        match crate::merge::merge_secrets(
+            &base_snap.secrets,
+            &ours_snap.secrets,
+            &theirs_snap.secrets,
+        ) {
+            Ok(_) => {}
+            Err(Error::SecretMergeConflict(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        match self.tree_merge_filled(
+            Some((base_snap.root, &base_snap.protection)),
+            (ours_snap.root, &ours_snap.protection),
+            (theirs_snap.root, &theirs_snap.protection),
+            identity,
+        ) {
+            Ok((done, _)) => Ok(done.merge.conflicts.is_empty()),
             Err(Error::ProtectedMergeNeedsIdentity(_))
             | Err(Error::NotAuthorized(_))
             | Err(Error::PathCollision(_)) => Ok(false),
@@ -602,20 +659,6 @@ impl Repo {
         if crate::rebase_state::in_progress(&self.layout) {
             return Err(Error::RebaseInProgress);
         }
-        // Partial-clone guard (P27 Task 5 review Important fix), at the top
-        // of the whole operation — mirroring `merge_with_identity`'s and
-        // `sc work`'s own top-level refusals rather than relying solely on
-        // `would_merge_cleanly`'s inner guard: `harvest_workspace` itself
-        // (`workspace.rs`) computes its tracked-path set via the UNFILTERED
-        // `tree_file_ids`, which `NotFound`s on an out-of-filter gap before
-        // a landing ever reaches the merge probe. Refusing here, before any
-        // `harvest_workspace` call, turns that into the same loud typed
-        // error every other partial-clone-unsupported operation gives,
-        // instead of a raw corruption-shaped `NotFound`.
-        if self.promisor()?.is_some() {
-            return Err(crate::promisor::partial_clone_unsupported("ws harvest"));
-        }
-
         let mut session = read_manifest(self.layout())?
             .ok_or_else(|| Error::InvalidArgument("no workspace session open".into()))?;
 
@@ -760,7 +803,17 @@ impl Repo {
                 crate::workspace::HarvestResult::Committed(id) => {
                     let current_tip =
                         refs::read_branch_tip(self.layout(), &landing)?.ok_or(Error::Unborn)?;
-                    let clean = self.would_merge_cleanly(current_tip, id, identity)?;
+                    // The candidate branch exists only to be landed or kept for
+                    // a conflict. A failing probe leaves the workspace live for
+                    // a retry, which would mint another candidate: remove this
+                    // one first.
+                    let clean = match self.would_merge_cleanly(current_tip, id, identity) {
+                        Ok(clean) => clean,
+                        Err(e) => {
+                            let _ = refs::delete_branch(self.layout(), &branch);
+                            return Err(e);
+                        }
+                    };
                     if clean {
                         // The second tuple element on `Ok` is skipped
                         // protected paths (missing-identity skips), not
@@ -822,6 +875,14 @@ impl Repo {
                                 // of three_way's parameters is wrong, not a
                                 // normal user-facing conflict. Bail loudly
                                 // before any teardown.
+                                if !matches!(e, Error::MergeConflicts(_)) {
+                                    // Refused before any write (a gap, a policy
+                                    // error): the workspace stays live, so drop
+                                    // the candidate rather than leak one per
+                                    // retry. A real conflict keeps it: its
+                                    // markers are on disk.
+                                    let _ = refs::delete_branch(self.layout(), &branch);
+                                }
                                 return Err(if matches!(e, Error::MergeConflicts(_)) {
                                     Error::BadRef(format!(
                                         "ws harvest: probe predicted a clean merge of {branch} \
@@ -1976,47 +2037,5 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// P27 final review I2: `sc ws fork` is now refused up front on a
-    /// partial clone (it used to succeed, creating a session that could
-    /// never be harvested — `ws harvest` already refused with
-    /// `PartialCloneUnsupported`, but only after the dead-end session was
-    /// created and an agent may have already done work in it). Refusing at
-    /// the source eliminates the whole dead-end class instead of just
-    /// naming it after the fact.
-    #[test]
-    fn fork_refuses_on_partial_clone() {
-        let src_root = tmp_root("fork-partial-src");
-        let dst_root = tmp_root("fork-partial-dst");
-        std::fs::create_dir_all(src_root.join("src")).unwrap();
-        std::fs::create_dir_all(src_root.join("docs")).unwrap();
-        let src = Repo::init(&src_root).unwrap();
-        std::fs::write(src_root.join("src/a.txt"), b"src-one").unwrap();
-        std::fs::write(src_root.join("docs/b.txt"), b"docs-one").unwrap();
-        src.commit("t", "c1").unwrap();
-
-        let dst = Repo::clone_url_filtered(
-            src_root.to_str().unwrap(),
-            &dst_root,
-            Some(&["src/".to_string()]),
-        )
-        .unwrap();
-
-        let err = dst.ws_fork(1, "t", None).unwrap_err();
-        assert!(
-            matches!(err, Error::PartialCloneUnsupported(_)),
-            "expected the explicit partial-clone-unsupported refusal, got {err:?}"
-        );
-        assert!(err.to_string().contains("not supported on a partial clone"));
-        assert!(
-            read_manifest(dst.layout()).unwrap().is_none(),
-            "no dead-end session must be created"
-        );
-
-        drop(src);
-        drop(dst);
-        std::fs::remove_dir_all(&src_root).unwrap();
-        std::fs::remove_dir_all(&dst_root).unwrap();
     }
 }

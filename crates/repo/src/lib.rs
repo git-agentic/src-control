@@ -23,6 +23,8 @@ mod partial_merge;
 #[cfg(test)]
 mod partial_replay;
 #[cfg(test)]
+mod partial_sessions;
+#[cfg(test)]
 mod partial_walks;
 pub mod pick_state;
 pub mod private;
