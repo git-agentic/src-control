@@ -430,6 +430,9 @@ impl Repo {
                     &self.sparse_spec()?,
                 )?;
             }
+            // Before any ref moves: the restored tree must not land on a file
+            // the user owns.
+            self.refuse_untracked_overwrite("undo", old_root, snap.root)?;
             Some((snap.root, snap.protection))
         } else {
             None
