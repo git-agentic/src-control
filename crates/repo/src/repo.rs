@@ -1944,26 +1944,35 @@ impl Repo {
         if sidecars.is_empty() {
             return Ok(());
         }
+        // Retire the whole record before unlinking anything, in one write: a
+        // crash then leaves harmless residue, never a record naming a path the
+        // user may recreate before the retry. A removal that fails puts the
+        // failed and unprocessed paths back so the retry can finish the job.
+        crate::conflict_plaintext::write_sidecars(&self.layout, &[])?;
         let partial = self.promisor()?.is_some();
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
-        for sidecar in sidecars {
+        let sidecars: Vec<String> = sidecars.into_iter().collect();
+        for (i, sidecar) in sidecars.iter().enumerate() {
             let tracked = roots.iter().any(|root| {
-                worktree::tree_entry_at(&mut store, *root, &sidecar, partial)
+                worktree::tree_entry_at(&mut store, *root, sidecar, partial)
                     .map_or(true, |e| e.is_some())
             });
-            if !tracked {
-                // Only an already-absent file is fine: any other failure stops
-                // the sweep with the record intact, so a retry can finish it.
-                match std::fs::remove_file(worktree::safe_join(&self.layout.root, &sidecar)?) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
+            if tracked {
+                continue;
             }
-            // Handled: retire it, so a retry (a `--continue` whose fold fails
-            // later) cannot sweep a file the user creates at that path.
-            crate::conflict_plaintext::retire_sidecar(&self.layout, &sidecar)?;
+            let removed = worktree::safe_join(&self.layout.root, sidecar).and_then(|full| {
+                match std::fs::remove_file(full) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e.into()),
+                }
+            });
+            if let Err(e) = removed {
+                // Best effort: the removal error is the one worth reporting.
+                let _ = crate::conflict_plaintext::write_sidecars(&self.layout, &sidecars[i..]);
+                return Err(e);
+            }
         }
         Ok(())
     }

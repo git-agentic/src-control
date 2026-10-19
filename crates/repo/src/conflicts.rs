@@ -303,12 +303,23 @@ impl Repo {
             && !self.tracked_paths()?.contains(&theirs_sidecar_path)
         {
             let sidecar = safe_join(&self.layout.root, &theirs_sidecar_path)?;
+            // Retire first: a crash after the unlink must not leave a record
+            // that names a path the user may recreate. A failed unlink puts
+            // the entry back.
+            crate::conflict_plaintext::retire_sidecar(&self.layout, &theirs_sidecar_path)?;
             match std::fs::remove_file(&sidecar) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    let mut paths = crate::conflict_plaintext::read_sidecars(&self.layout)?;
+                    paths.insert(theirs_sidecar_path);
+                    let _ = crate::conflict_plaintext::write_sidecars(
+                        &self.layout,
+                        &paths.into_iter().collect::<Vec<_>>(),
+                    );
+                    return Err(e.into());
+                }
             }
-            crate::conflict_plaintext::retire_sidecar(&self.layout, &theirs_sidecar_path)?;
         }
 
         let remaining: Vec<String> = conflicts.into_iter().filter(|p| p != path).collect();
