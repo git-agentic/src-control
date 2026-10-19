@@ -374,6 +374,17 @@ impl HttpTransport {
             }
         }
 
+        // Two trust decisions in one policy is a caller bug: refuse it before
+        // any socket exists, so a caller cannot believe a pin is being checked
+        // while CA validation silently wins (`from_env` rejects it too).
+        if let Some(p) = policy {
+            if p.ca.is_some() && p.pre_pin.is_some() {
+                return Err(Error::InvalidArgument(
+                    "a TLS policy cannot combine CA validation with a pre-pin".to_string(),
+                ));
+            }
+        }
+
         let stream = TcpStream::connect(url.authority())
             .map_err(|e| Error::ConnectionLost(format!("sc+http connect to {url:?}: {e}")))?;
 
@@ -2328,6 +2339,18 @@ mod tests {
             Err(Error::Tls(_))
         ));
         assert!(!kh.exists(), "still no pin written");
+
+        // A policy that asks for both trust decisions is refused up front.
+        let both = crate::tls_pins::TlsClientPolicy {
+            known_hosts: kh.clone(),
+            pre_pin: Some([0x11; 32]),
+            strict: false,
+            ca: Some(crate::tls_pins::CaSource::System),
+        };
+        assert!(matches!(
+            HttpTransport::connect_with_pins(&url, None, Some(&both)),
+            Err(Error::InvalidArgument(m)) if m.contains("cannot combine")
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
