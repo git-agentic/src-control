@@ -400,6 +400,21 @@ impl HttpTransport {
                     HttpWriteHalf::Plain(stream),
                 )
             }
+            // CA validation (ADR-0054): chain, validity and name against a CA,
+            // not a pin; the pin file is neither read nor written, and the
+            // handshake still completes before any application byte.
+            (true, Some(p)) if p.ca.is_some() => {
+                let trust = match p.ca.as_ref().expect("guarded by is_some") {
+                    crate::tls_pins::CaSource::File(f) => scl_tlsio::CaTrust::from_pem_file(f),
+                    crate::tls_pins::CaSource::System => scl_tlsio::CaTrust::system(),
+                }?;
+                let tls = scl_tlsio::client_connect_ca(stream, &url.host, &trust)?;
+                let (rh, wh) = tls.split();
+                (
+                    BufReader::new(HttpReadHalf::Tls(rh)),
+                    HttpWriteHalf::Tls(wh),
+                )
+            }
             (true, Some(p)) => {
                 let expected = match p.pre_pin {
                     Some(pin) => Some(pin),
@@ -2179,6 +2194,7 @@ mod tests {
             known_hosts: kh.clone(),
             pre_pin: None,
             strict: false,
+            ca: None,
         };
 
         // 1. Unknown host, accept-new: connects AND records the pin.
@@ -2197,6 +2213,7 @@ mod tests {
             known_hosts: kh.clone(),
             pre_pin: None,
             strict: true,
+            ca: None,
         };
         HttpTransport::connect_with_pins(&url, None, Some(&strict_known)).unwrap();
         let fresh = pins_dir.join("fresh_kh");
@@ -2204,6 +2221,7 @@ mod tests {
             known_hosts: fresh.clone(),
             pre_pin: None,
             strict: true,
+            ca: None,
         };
         match HttpTransport::connect_with_pins(&url, None, Some(&strict_unknown)) {
             Err(Error::TlsStrictUnknownHost(_)) => {}
@@ -2217,6 +2235,7 @@ mod tests {
             known_hosts: prepin_file.clone(),
             pre_pin: Some(spki),
             strict: true,
+            ca: None,
         };
         HttpTransport::connect_with_pins(&url, None, Some(&prepin)).unwrap();
         assert!(!prepin_file.exists(), "pre-pin must not persist");
@@ -2228,6 +2247,7 @@ mod tests {
             known_hosts: bad.clone(),
             pre_pin: None,
             strict: false,
+            ca: None,
         };
         match HttpTransport::connect_with_pins(&url, None, Some(&badpol)) {
             Err(Error::TlsPinMismatch {
@@ -2245,6 +2265,67 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&pins_dir).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// CA validation replaces pinning (ADR-0054): a server the CA does not
+    /// vouch for is refused, the pin file is neither created nor read, and an
+    /// unusable CA bundle fails the connection instead of falling back to
+    /// accept-new.
+    #[test]
+    fn a_ca_policy_never_touches_the_pin_file_and_fails_closed() {
+        let root = tmp_repo("tls-ca-policy");
+        let (addr, _spki) = spawn_tls_server(&root);
+        let (host, port) = addr
+            .rsplit_once(':')
+            .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap()))
+            .unwrap();
+        let url = ScHttpUrl {
+            host,
+            port,
+            path: "/".into(),
+            tls: true,
+        };
+        let dir = std::env::temp_dir().join(format!("scl-ca-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let kh = dir.join("known_hosts");
+        let policy = |ca| crate::tls_pins::TlsClientPolicy {
+            known_hosts: kh.clone(),
+            pre_pin: None,
+            strict: false,
+            ca: Some(ca),
+        };
+
+        // The server's own self-signed certificate is not a CA for the name
+        // dialled (it covers `sc-serve`, not 127.0.0.1): refused.
+        let own_cert = root.join(".sc/serve-tls/cert.pem");
+        let as_ca = policy(crate::tls_pins::CaSource::File(own_cert));
+        match HttpTransport::connect_with_pins(&url, None, Some(&as_ca)) {
+            Err(Error::Tls(e)) => {
+                assert!(e.to_string().contains("certificate validation"), "got {e}")
+            }
+            other => panic!(
+                "expected a CA validation failure, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(!kh.exists(), "CA mode must not write a pin");
+
+        // A missing or empty bundle fails closed, never falls back to TOFU.
+        let missing = policy(crate::tls_pins::CaSource::File(dir.join("absent.pem")));
+        assert!(matches!(
+            HttpTransport::connect_with_pins(&url, None, Some(&missing)),
+            Err(Error::Tls(_))
+        ));
+        std::fs::write(dir.join("empty.pem"), "").unwrap();
+        let empty = policy(crate::tls_pins::CaSource::File(dir.join("empty.pem")));
+        assert!(matches!(
+            HttpTransport::connect_with_pins(&url, None, Some(&empty)),
+            Err(Error::Tls(_))
+        ));
+        assert!(!kh.exists(), "still no pin written");
+        std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2269,6 +2350,7 @@ mod tests {
             known_hosts: std::env::temp_dir().join(format!("scl-verbs-kh-{}", std::process::id())),
             pre_pin: Some(spki),
             strict: false,
+            ca: None,
         };
         let t = HttpTransport::connect_with_pins(&url, None, Some(&policy)).unwrap();
         // A fresh `tmp_repo` has no commits, so `list_refs()` is legitimately

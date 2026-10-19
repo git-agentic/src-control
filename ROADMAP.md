@@ -835,8 +835,10 @@ scale-&-reach horizon):
   a narrowed non-loopback bind gate (`--tls` + token, not token alone). See
   the Phase 32 entry above. Follow-ons this phase named rather than closed:
   CA-path validation as an additive trust option for PEM-provisioned
-  deployments (v1 is pin-only, names/validity ignored); opt-in SNI/
-  certificate-name validation; pin-management UX (shipped in ADR-0053 as `sc tls list/forget/pin/path`;
+  deployments (shipped in ADR-0054: `SC_HTTPS_CA_FILE` / `SC_HTTPS_CA=system`,
+  with chain, validity and name checks; v1 was pin-only, names/validity
+  ignored); opt-in SNI/
+  certificate-name validation (covered by the CA mode); pin-management UX (shipped in ADR-0053 as `sc tls list/forget/pin/path`;
   before it, only first-connect and `SC_HTTPS_FINGERPRINT` wrote pins and
   nothing listed or removed one);
   TLS session-resumption knobs (not evaluated this phase — a later

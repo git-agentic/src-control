@@ -210,12 +210,25 @@ too, not just the src-control-side metadata.
   `SC_HTTPS_FINGERPRINT` lets an operator (e.g. CI) pre-pin out-of-band
   instead of trusting the first connection; `SC_HTTPS_STRICT=1` refuses to
   connect to any host with no existing pin, closing the accept-new window
-  entirely for operators who need it. Trust is **pin-only in v1** —
-  certificate names and validity periods are deliberately ignored, and
-  CA-path validation as an additional trust option is deferred (see
-  `ROADMAP.md`). The TLS handshake signature is still verified even though
-  names/validity are not, so a captured certificate replayed without its
-  matching private key is rejected regardless of pin state.
+  entirely for operators who need it. Pin trust ignores certificate names
+  and validity periods deliberately. The TLS handshake signature is still
+  verified even though names/validity are not, so a captured certificate
+  replayed without its matching private key is rejected regardless of pin
+  state.
+- **CA validation is the additive alternative (ADR-0054).** A client that sets
+  `SC_HTTPS_CA_FILE=<pem>` (a CA bundle) or `SC_HTTPS_CA=system` (the platform
+  roots) stops pinning and validates like a browser: the chain to a trusted
+  root, the validity window, and that the certificate covers the name or IP the
+  client dialled. This removes the first-connection blind spot for a server
+  whose certificate comes from a CA (certbot/ACME, a private CA), and a
+  rotating certificate no longer invalidates a pin. It is a client choice per
+  process: the pin file is neither read nor written, an unusable or empty
+  bundle fails the connection (it never falls back to accept-new), an
+  unrecognized `SC_HTTPS_CA` value, both knobs at once, or a pre-pin
+  (`SC_HTTPS_FINGERPRINT`) together with CA trust is an error, and
+  `SC_HTTPS_STRICT` has no meaning in this mode. What it does not give: trust
+  is only as good as the CA set (the whole platform store for `system`), and
+  revocation (CRL/OCSP) is not checked.
 - **`sc+http://` (plaintext) still exists, and its boundary is now narrower
   and clearer: it applies only to loopback or explicitly `--allow-public`
   deployments.** A public (non-loopback) plaintext deployment protected by

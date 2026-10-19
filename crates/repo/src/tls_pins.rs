@@ -23,6 +23,53 @@ pub struct TlsClientPolicy {
     /// as enabled (fails closed on typos like `=true`/`=yes` rather than
     /// silently falling back to accept-new — see [`strict_from`]).
     pub strict: bool,
+    /// `SC_HTTPS_CA_FILE` / `SC_HTTPS_CA=system` (ADR-0054): validate the
+    /// server's certificate chain, validity and name against a CA instead of
+    /// pinning. When set, the pin file is neither read nor written.
+    pub ca: Option<CaSource>,
+}
+
+/// Where a CA-validated connection gets its trust anchors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaSource {
+    /// A PEM bundle of CA certificates (`SC_HTTPS_CA_FILE`).
+    File(PathBuf),
+    /// The platform trust store (`SC_HTTPS_CA=system`).
+    System,
+}
+
+/// Pure decision for the CA env knobs, factored out for the same reason as
+/// [`strict_from`]. Fails closed: an unrecognized `SC_HTTPS_CA` value, both
+/// knobs at once, or CA trust together with a pre-pin is an error, never a
+/// silent fall back to pinning or accept-new.
+fn ca_from(
+    file: Option<&std::ffi::OsStr>,
+    mode: Option<&str>,
+    has_pre_pin: bool,
+) -> Result<Option<CaSource>> {
+    let file = file.filter(|f| !f.is_empty());
+    let mode = mode.filter(|m| !m.is_empty());
+    let source = match (file, mode) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {
+            return Err(Error::InvalidArgument(
+                "set one of SC_HTTPS_CA_FILE and SC_HTTPS_CA, not both".to_string(),
+            ))
+        }
+        (Some(f), None) => CaSource::File(PathBuf::from(f)),
+        (None, Some("system")) => CaSource::System,
+        (None, Some(other)) => {
+            return Err(Error::InvalidArgument(format!(
+                "SC_HTTPS_CA must be `system` (or use SC_HTTPS_CA_FILE=<pem>), got {other:?}"
+            )))
+        }
+    };
+    if has_pre_pin {
+        return Err(Error::InvalidArgument(
+            "SC_HTTPS_FINGERPRINT (a pin) cannot be combined with CA validation".to_string(),
+        ));
+    }
+    Ok(Some(source))
 }
 
 impl TlsClientPolicy {
@@ -33,10 +80,16 @@ impl TlsClientPolicy {
             _ => None,
         };
         let strict = strict_from(std::env::var("SC_HTTPS_STRICT").ok().as_deref());
+        let ca = ca_from(
+            std::env::var_os("SC_HTTPS_CA_FILE").as_deref(),
+            std::env::var("SC_HTTPS_CA").ok().as_deref(),
+            pre_pin.is_some(),
+        )?;
         Ok(TlsClientPolicy {
             known_hosts,
             pre_pin,
             strict,
+            ca,
         })
     }
 }
@@ -576,5 +629,32 @@ mod tests {
         assert_eq!(list(&dir.join("not-yet")).unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn ca_from_resolves_the_knobs_and_fails_closed() {
+        use std::ffi::OsStr;
+        assert_eq!(ca_from(None, None, false).unwrap(), None);
+        assert_eq!(
+            ca_from(Some(OsStr::new("")), Some(""), false).unwrap(),
+            None
+        );
+        assert_eq!(
+            ca_from(Some(OsStr::new("/etc/ca.pem")), None, false).unwrap(),
+            Some(CaSource::File("/etc/ca.pem".into()))
+        );
+        assert_eq!(
+            ca_from(None, Some("system"), false).unwrap(),
+            Some(CaSource::System)
+        );
+        for bad in [
+            ca_from(None, Some("yes"), false),
+            ca_from(None, Some("System"), false),
+            ca_from(Some(OsStr::new("/x")), Some("system"), false),
+            ca_from(None, Some("system"), true),
+            ca_from(Some(OsStr::new("/x")), None, true),
+        ] {
+            assert!(bad.is_err(), "must fail closed, got {bad:?}");
+        }
     }
 }
