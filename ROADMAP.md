@@ -790,13 +790,11 @@ scale-&-reach horizon):
   files actually present; a ws cache file is already removed with its session.
   A dropped entry can only cost one re-seal if the path returns (randomized
   sealing, so unchanged content gets a new blob id).
-- **Theirs-side resolve carry (P33 final-review follow-on).** `sc resolve
-  --theirs` on a PROTECTED path records into the main-tree cache today, but
-  completion's format-dispatched carry only consults the cache against the
-  prior TIP (ours') entry, so a theirs-side recording never matches and
-  completion re-seals randomized anyway (spurious-but-safe). Extending the
-  carry-candidate map to also check `merge_head`/decided-root entries would
-  let a theirs-side resolution skip the re-seal too.
+- **Theirs-side resolve carry — shipped.** Completion's carry now also checks
+  the cache against the other parent's blob (merge head or picked commit), so a
+  `sc resolve --theirs` protected path keeps their ciphertext instead of
+  re-sealing; their wrap list must be in the unioned protection, and a lookup
+  gap on a partial clone just seals.
 - **Non-unix local-key fallback (P33 final-review follow-on).** `.sc/local-key`
   is minted 0600-from-first-byte via a unix-only `OpenOptions::mode` call;
   there is no non-unix fallback today, so the key file is left world-readable

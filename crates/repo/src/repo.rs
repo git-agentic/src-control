@@ -495,31 +495,63 @@ impl Repo {
         // (path, plaintext) for each sealed path, so its fresh blob id can be
         // recorded into the cache after `encrypt_protected` returns.
         let mut sealed_plaintexts: Vec<(String, Vec<u8>)> = Vec::new();
+        // Merge/pick completion only: the other parent's root, so a path
+        // resolved to THEIR side can carry their ciphertext too (ADR-0043).
+        let other_root: Option<ObjectId> = match merge_head.or(pick_head) {
+            Some(h) if cache.is_some() => Some(self.snapshot(&h)?.root),
+            _ => None,
+        };
         for (path, bytes, mode, granted) in protected {
-            // Decide carry (Some(prior blob id + perms)) vs. seal (None).
-            let carry: Option<(ObjectId, u8)> = match tip_entries.get(&path) {
-                Some((blob_id, _m, perms)) if perms & scl_core::PROTECTED != 0 => {
-                    let unchanged = if perms & scl_core::RANDOMIZED == 0 {
-                        // Convergent prior: exact re-encrypt-and-compare.
+            // Does `blob_id` (a protected blob with `perms`) provably hold
+            // exactly `bytes`? A convergent prior is proven by re-encrypting
+            // and comparing; a randomized one can't be, so it consults the
+            // `.sc`-local stat/tag cache, which resolves its stat path against
+            // its own checkout root (P33 Task 7), so a workspace commit stats
+            // the workspace file, not the host's. Carry iff the cached id is
+            // the prior id (same content AND same recorded seal); a lost or
+            // stale cache degrades to a spurious reseal, never incorrectness.
+            let proves =
+                |blob_id: &ObjectId, perms: u8, cache: Option<&crate::cache::ProtectedCache>| {
+                    if perms & scl_core::RANDOMIZED == 0 {
                         Object::blob(scl_crypto::encrypt_path(&bytes).0).id() == *blob_id
                     } else {
-                        // Randomized prior: the local stat/tag cache is the only
-                        // way to prove "same plaintext". Carry iff the cached id
-                        // matches the prior tip id (double-checked: same content
-                        // AND same recorded seal). The cache resolves the abs
-                        // stat path against its own checkout root (P33 Task 7),
-                        // so a workspace commit stats the workspace file, not
-                        // the host's.
-                        cache.as_deref().and_then(|c| c.unchanged(&path, &bytes)) == Some(*blob_id)
-                    };
-                    if unchanged {
-                        Some((*blob_id, *perms))
-                    } else {
-                        None
+                        cache.and_then(|c| c.unchanged(&path, &bytes)) == Some(*blob_id)
                     }
+                };
+            // Decide carry (Some(prior blob id + perms)) vs. seal (None).
+            let mut carry: Option<(ObjectId, u8)> = match tip_entries.get(&path) {
+                Some((blob_id, _m, perms))
+                    if perms & scl_core::PROTECTED != 0
+                        && proves(blob_id, *perms, cache.as_deref()) =>
+                {
+                    Some((*blob_id, *perms))
                 }
                 _ => None,
             };
+            // Not ours: a path resolved with `--theirs` was recorded against
+            // the other parent's blob id. Carry it only when its wrap list is
+            // in the unioned protection, so the carried ciphertext stays
+            // decryptable; any lookup trouble (a gap on a partial clone)
+            // just seals.
+            if carry.is_none() {
+                if let Some(root) = other_root {
+                    let found = {
+                        let store_arc = self.vfs.store();
+                        let mut store = store_arc.lock().unwrap();
+                        crate::worktree::tree_entry_at(&mut store, root, &path, partial)
+                            .ok()
+                            .flatten()
+                    };
+                    if let Some((blob_id, _m, perms)) = found {
+                        if perms & scl_core::PROTECTED != 0
+                            && protection.wrapped.contains_key(&blob_id)
+                            && proves(&blob_id, perms, cache.as_deref())
+                        {
+                            carry = Some((blob_id, perms));
+                        }
+                    }
+                }
+            }
 
             match carry {
                 Some((blob_id, perms)) => {

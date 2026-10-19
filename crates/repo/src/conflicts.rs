@@ -252,19 +252,14 @@ impl Repo {
                 // P33 Task 8: a resolved PROTECTED path's plaintext is now
                 // sitting on disk exactly as the chosen side's ciphertext
                 // decrypted it — record it in the main-tree cache regardless
-                // of which side was chosen. This only pays off for an
-                // `--ours` resolution: completion's format-dispatched carry
-                // (`snapshot_files`) consults the cache against the prior
-                // TIP entry's blob id, so an `--ours` recording matches and
-                // the completing `sc commit`/`sc rebase --continue` carries
-                // the existing ciphertext instead of re-sealing under a
-                // fresh random nonce. A `--theirs` recording keys the cache
-                // to a blob id completion never looks up against (the tip is
-                // still ours), so it goes unmatched and completion re-seals
-                // randomized anyway — spurious cache-population, but benign
-                // (never incorrect, just a wasted write). Plain paths never
-                // touch the cache — it exists only to skip re-sealing
-                // convergent-free randomized ciphertext.
+                // of which side was chosen. Completion's format-dispatched
+                // carry (`snapshot_files`) consults the cache against the
+                // tip entry (ours) and the other parent's entry (theirs), so
+                // either recording matches and the completing `sc commit` /
+                // `sc rebase --continue` carries the chosen ciphertext
+                // instead of re-sealing under a fresh random nonce. Plain
+                // paths never touch the cache — it exists only to skip
+                // re-sealing convergent-free randomized ciphertext.
                 if kind == ConflictKind::Protected {
                     let triple = self.op_triple()?;
                     let chosen_snapshot = match side {
@@ -1107,6 +1102,136 @@ mod tests {
             cache.unchanged("secret/a.txt", b"ours\n"),
             Some(ours_blob_id),
             "resolve must record the resolved plaintext -> chosen ciphertext id in the main cache"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The protected blob id at `path` in `snapshot`'s tree.
+    fn protected_blob_at(repo: &Repo, snapshot: ObjectId, path: &str) -> ObjectId {
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let root = store.get_snapshot(&snapshot).unwrap().root;
+        tree_file_entries_with_perms(&mut store, root)
+            .unwrap()
+            .get(path)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn resolve_theirs_on_a_protected_path_carries_their_ciphertext_on_merge() {
+        let root = tmp_root("resolve-theirs-carry-merge");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours edits secret").unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"theirs\n").unwrap();
+        let theirs_tip = repo.commit("me", "theirs edits secret").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        let err = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+        repo.resolve_path("secret/a.txt", ResolveSide::Theirs, Some(&alice_sk))
+            .unwrap();
+        let merged = repo.commit("me", "take theirs").unwrap();
+
+        assert_eq!(
+            protected_blob_at(&repo, merged, "secret/a.txt"),
+            protected_blob_at(&repo, theirs_tip, "secret/a.txt"),
+            "a --theirs resolution keeps their ciphertext instead of re-sealing"
+        );
+        // The carried ciphertext is decryptable: a fresh checkout of the merge
+        // gets their plaintext back.
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("secret/a.txt")).unwrap(),
+            b"theirs\n"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_theirs_on_a_protected_path_carries_their_ciphertext_on_pick() {
+        let root = tmp_root("resolve-theirs-carry-pick");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"main-edit\n").unwrap();
+        repo.commit("me", "main edits secret").unwrap();
+        repo.switch_with_identity("work", Some(&alice_sk)).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"work-edit\n").unwrap();
+        let picked = repo.commit("me", "work edits secret").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        let err = repo
+            .cherry_pick("work", "me", Some(&alice_sk), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::PickConflicts(1)), "got {err:?}");
+        repo.resolve_path("secret/a.txt", ResolveSide::Theirs, Some(&alice_sk))
+            .unwrap();
+        let done = repo.commit("me", "pick, theirs").unwrap();
+
+        assert_eq!(
+            protected_blob_at(&repo, done, "secret/a.txt"),
+            protected_blob_at(&repo, picked, "secret/a.txt"),
+            "a --theirs pick resolution keeps the picked ciphertext"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_hand_edit_after_resolve_theirs_still_seals_fresh() {
+        let root = tmp_root("resolve-theirs-edit");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("secret/a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours edits secret").unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"theirs\n").unwrap();
+        let theirs_tip = repo.commit("me", "theirs edits secret").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        repo.merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
+        repo.resolve_path("secret/a.txt", ResolveSide::Theirs, Some(&alice_sk))
+            .unwrap();
+        // The cache holds "theirs"; different bytes must not ride along.
+        std::fs::write(root.join("secret/a.txt"), b"edited\n").unwrap();
+        let merged = repo.commit("me", "edited").unwrap();
+
+        assert_ne!(
+            protected_blob_at(&repo, merged, "secret/a.txt"),
+            protected_blob_at(&repo, theirs_tip, "secret/a.txt")
         );
 
         drop(repo);
