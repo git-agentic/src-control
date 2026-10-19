@@ -81,15 +81,17 @@ pub fn pack_chunk_size() -> usize {
 
 /// The `SC_PACK_CHUNK` decision, pure so it can be tested without touching the
 /// process environment: an unset, unparsable or zero value is the default, and
-/// anything above `MAX_OBJECT_SIZE` is clamped to it (a chunk above it is a
-/// frame the receiver's length cap refuses, so an oversized setting would fail
-/// every transfer with a confusing error).
+/// anything larger than a frame can carry is clamped. A chunk frame is the
+/// `ST_PACK_CHUNK` tag byte plus the data, and the receiver refuses a frame
+/// above `MAX_OBJECT_SIZE`, so the data is capped one byte below it; an
+/// oversized setting would otherwise fail every large transfer with a
+/// confusing error.
 fn chunk_from(value: Option<&str>) -> usize {
     value
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(CHUNK_SIZE)
-        .min(scl_core::MAX_OBJECT_SIZE)
+        .min(scl_core::MAX_OBJECT_SIZE - 1)
 }
 
 // Wire error codes. Typed errors that sync logic relies on get their own code;
@@ -1875,10 +1877,22 @@ mod tests {
         assert_eq!(chunk_from(Some("0")), CHUNK_SIZE);
         assert_eq!(chunk_from(Some("junk")), CHUNK_SIZE);
         assert_eq!(chunk_from(Some("4096")), 4096);
+        // A chunk frame carries a tag byte too: data at the cap would make a
+        // frame one byte over what the receiver accepts.
+        let cap = scl_core::MAX_OBJECT_SIZE - 1;
         assert_eq!(
             chunk_from(Some(&(scl_core::MAX_OBJECT_SIZE * 8).to_string())),
-            scl_core::MAX_OBJECT_SIZE,
+            cap,
             "an oversized setting is clamped, not passed through"
+        );
+        assert_eq!(
+            chunk_from(Some(&scl_core::MAX_OBJECT_SIZE.to_string())),
+            cap
+        );
+        assert_eq!(chunk_from(Some(&cap.to_string())), cap);
+        assert!(
+            cap + 1 <= scl_core::MAX_OBJECT_SIZE,
+            "tag + data fits a frame"
         );
     }
 

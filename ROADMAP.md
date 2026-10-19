@@ -807,7 +807,7 @@ scale-&-reach horizon):
   (256 MiB) is a compile-time constant anchoring every untrusted-length
   guard; letting an operator raise or lower it per-deployment is deferred.
 - **P28 review follow-ons — shipped.** `refs::write_head`/`delete_branch` run
-  `validate_branch_name`; `SC_PACK_CHUNK` is clamped to `MAX_OBJECT_SIZE` (an
+  `validate_branch_name`; `SC_PACK_CHUNK` is clamped to `MAX_OBJECT_SIZE - 1` (a chunk frame carries a tag byte too; an
   oversized value used to make every transfer fail with a confusing receiver
   error); `Repo::worktree_paths` is a paths-only walk (`list_worktree_paths`,
   the same ignore and tracked-path rules as `read_worktree`, no file read); and
