@@ -4309,7 +4309,12 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool, rotate: bool) -> Result<
         for (entry, reason) in &report.skipped {
             eprintln!("  {entry}: {reason}");
         }
-        eprintln!("re-run `sc rewrap` with an identity that can open them to complete the sweep");
+        let again = if rotate {
+            "sc rewrap --rotate"
+        } else {
+            "sc rewrap"
+        };
+        eprintln!("re-run `{again}` with an identity that can open them to complete the sweep");
     }
     eprintln!(
         "note: rewrap cuts the live tip only — snapshots already in history keep \
