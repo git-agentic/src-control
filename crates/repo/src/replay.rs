@@ -325,7 +325,7 @@ impl Repo {
     /// update is the atomic commit point — a crash before it leaves tip and
     /// tree consistently pre-pick), with the oplog record written last, after
     /// the ref write it describes. A conflicting replay writes conflict markers
-    /// + sidecars over the working tree and records pick state
+    /// and sidecars over the working tree and records pick state
     /// (`PICK_HEAD`/`PICK_CONFLICTS`/`PICK_DECIDED_ROOT`) — no ref moves, no
     /// oplog entry, so the current branch tip is unchanged until the conflicts
     /// are resolved and committed. An empty replay is `AlreadyApplied` only

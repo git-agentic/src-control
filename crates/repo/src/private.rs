@@ -1525,7 +1525,7 @@ impl Repo {
             let snap = self.get_inner_snapshot(&mut store, &ctx, inner_id)?;
             let files = self.inner_tree_files(&mut store, &ctx, snap.root)?;
             let mut plain: Vec<(String, Vec<u8>, FileMode)> = Vec::new();
-            let mut to_encrypt: Vec<(String, Vec<u8>, FileMode, Vec<[u8; 32]>)> = Vec::new();
+            let mut to_encrypt: Vec<crate::protect::SealInput> = Vec::new();
             let mut published: BTreeMap<String, (ObjectId, FileMode, u8)> = BTreeMap::new();
             let mut wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
             for (path, (id, mode, perms)) in &files {
