@@ -173,10 +173,9 @@ fn prefix_present(
     root: scl_core::ObjectId,
     bare: &str,
 ) -> Option<bool> {
-    let comps: Vec<&str> = bare.split('/').filter(|c| !c.is_empty()).collect();
-    if comps.is_empty() {
-        return Some(true);
-    }
+    // Literal components, as `Sparse::matches` reads the prefix: a leading
+    // slash or a doubled one names nothing, it is not skipped.
+    let comps: Vec<&str> = bare.split('/').collect();
     let mut cur = root;
     for (i, comp) in comps.iter().enumerate() {
         if !store.contains(&cur) {
@@ -830,6 +829,10 @@ mod tests {
             ask(&["sorc/", "src/nope", "top.txt/x", "src/deep/a.txt/y"]).len(),
             4
         );
+        // Literal, like `Sparse::matches`: a leading or doubled slash names
+        // nothing, so these are reported rather than read as `src/`.
+        let odd = ask(&["/src/", "src//deep", "/"]);
+        assert_eq!(odd.len(), 3, "got {odd:?}");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
