@@ -698,19 +698,11 @@ sparse checkouts → P24, streaming (>4 GiB) wire frames → P25, sc-native
 HTTP transport → P26, and partial clone → P27 — this closes the P25–P27
 scale-&-reach horizon):
 
-- **Unbounded thread-per-connection in `sc serve --http` (P26).**
-  `serve_http_listener` spawns one OS thread per accepted socket with no
-  pool, cap, or backpressure — a connection-churn client can exhaust
-  server threads/fds. A bounded connection pool is the follow-on.
-- **No idle-transfer watchdog in `sc serve --http` (P26).** The
-  opening-read timeout is cleared once `wire::serve` takes over, so a
-  client that completes the opening and then stalls mid-transfer holds
-  its thread indefinitely. An idle-transfer watchdog distinct from the
-  opening-read timeout is the follow-on.
-- **No accept-loop backoff in `sc serve --http` (P26).** A sustained
-  `EMFILE`/`ENFILE` (fd exhaustion) makes the accept loop hot-spin on
-  back-to-back errors instead of backing off. Bounded backoff on repeated
-  accept errors is the follow-on.
+- **`sc serve --http` connection limits (P26) — shipped in P31
+  (ADR-0041).** The three gaps recorded here are closed: a connection cap
+  (`--max-connections`, default 32), a per-connection idle/session timeout
+  (`--timeout`, default 300 s, covering the transfer after the opening
+  read), and bounded accept-loop backoff on repeated accept errors.
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
