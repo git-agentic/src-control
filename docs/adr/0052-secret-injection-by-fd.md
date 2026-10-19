@@ -20,6 +20,8 @@
 - The requested descriptor is held open (close-on-exec) across the spawn when it is free, so the standard library cannot pick it for its own exec-error pipe and have the `dup2` clobber it; without that, asking for the descriptor `std` happens to choose makes a failed `exec` abort the child instead of reporting the error.
 - The write end is non-blocking and fed by its own thread, so a payload larger than the pipe buffer cannot block the parent before the child has read it. The thread stops when the child has exited (the parent sets a flag and joins it), so a child that never reads does not hang `sc run` and a grandchild that keeps the descriptor open cannot pin the thread or the plaintext buffer. The payload is allocated once at its exact size, because a growing `Vec` leaves freed copies that `Zeroizing` never wipes, and the thread's drop wipes it.
 - A descendant that inherits the descriptor and keeps it can still read it: closing or sealing the descriptor is the consumer's job.
+- A payload larger than the pipe buffer (64 KiB on Linux) is delivered only while the command is running. Once the command exits the writer stops, so a command that daemonizes a consumer must read before it exits; waiting for a reader that may never come would pin the writer and the plaintext (the grandchild case). A smaller payload sits whole in the pipe and survives the exit.
+- A secret name already present in the caller's environment is removed from the child's, so the descriptor holds the only value.
 - The decrypted values now stay in `Zeroizing` buffers from `secret_values` all the way to the pipe; the environment path converts them to `OsString` as before (the un-zeroizable hand-off the threat model already names).
 
 ## Not decided here

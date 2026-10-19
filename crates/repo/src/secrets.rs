@@ -434,6 +434,11 @@ impl Repo {
     /// not isolation: a same-user process can read the child's fd table, and
     /// the child decides what happens to what it read.
     ///
+    /// A payload larger than the pipe buffer (64 KiB on Linux) is delivered only
+    /// while the command is running: once it exits the writer stops, so a
+    /// command that backgrounds its consumer must read before it exits (a
+    /// smaller payload already sits whole in the pipe and survives).
+    ///
     /// `fd` must be 3 or higher; a secret whose value holds a NUL byte is
     /// refused (it could not be framed, and could not be an environment
     /// value either). Unix only.
@@ -484,6 +489,9 @@ impl Repo {
             payload.extend_from_slice(value);
             payload.push(0);
         }
+        // The names delivered here must not also reach the child through an
+        // environment variable the caller already had set.
+        let delivered: Vec<String> = values.iter().map(|(n, _)| n.clone()).collect();
         drop(values);
 
         let (reader, writer) = std::io::pipe()?;
@@ -496,6 +504,9 @@ impl Repo {
         let _reserved = reserve_fd(fd);
         let mut command = Command::new(exe);
         command.args(args);
+        for name in &delivered {
+            command.env_remove(name);
+        }
         command.env("SC_SECRETS_FD", fd.to_string());
         // SAFETY: the closure only calls dup2 and fcntl, both async-signal-safe.
         // The pipe's read end is close-on-exec, so it needs to land on `fd`

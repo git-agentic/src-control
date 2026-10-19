@@ -314,3 +314,34 @@ fn a_secret_name_that_cannot_be_framed_is_refused() {
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::remove_dir_all(&keys).unwrap();
 }
+
+/// A secret name already set in the caller's environment is removed from the
+/// child's: the value delivered on the descriptor is the only one it sees.
+#[test]
+fn an_inherited_value_for_a_delivered_name_is_removed_from_the_environment() {
+    let (repo, id, keys) = repo_with("inherit", &[("DB_URL", b"real".to_vec())]);
+    let out = Command::new(env!("CARGO_BIN_EXE_sc"))
+        .args([
+            "run",
+            "--identity",
+            id.to_str().unwrap(),
+            "--secrets-fd",
+            "3",
+            "--",
+            "sh",
+            "-c",
+            r#"test -z "${DB_URL+set}" && cat <&3"#,
+        ])
+        .current_dir(&repo)
+        .env("DB_URL", "stale-from-the-caller")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"DB_URL=real\0");
+    std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+    std::fs::remove_dir_all(&keys).unwrap();
+}
