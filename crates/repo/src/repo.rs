@@ -1408,6 +1408,7 @@ impl Repo {
                 // the fill takes the store lock, so release ours around it.
                 drop(store);
                 self.ensure_view(theirs_root, &self.sparse_spec()?)?;
+                self.refuse_untracked_overwrite("merge", Some(ours_root), theirs_root)?;
                 let mut store = store_arc.lock().unwrap();
                 let mut cache = self.open_protected_cache()?;
                 let skipped = worktree::materialize(
@@ -1579,6 +1580,7 @@ impl Repo {
                 None => &[],
             };
             let conflict_root = self.materialize_conflict_state(
+                "merge",
                 &carried,
                 carried_subtrees,
                 &to_encrypt,
@@ -1662,6 +1664,7 @@ impl Repo {
         // view: fill its closure now (lazy partial clones only), before any ref,
         // spec or working-tree write and outside the store lock.
         self.ensure_view(merged_root, &self.sparse_spec()?)?;
+        self.refuse_untracked_overwrite("merge", Some(ours_root), merged_root)?;
 
         // Materialize the merged tree into the working dir. Protection-aware:
         // a merged PROTECTED entry decrypts for `identity` when possible, else
@@ -1744,6 +1747,7 @@ impl Repo {
     /// materialize skip-write path (P24 Task 3), no markers involved.
     pub(crate) fn materialize_conflict_state(
         &self,
+        op: &str,
         carried: &[(String, Vec<u8>, scl_core::FileMode, u8)],
         carried_subtrees: &[(String, scl_core::TreeEntry)],
         to_encrypt: &[(String, Vec<u8>, scl_core::FileMode, Vec<[u8; 32]>)],
@@ -1775,7 +1779,7 @@ impl Repo {
         if self.promisor()?.is_some() {
             if let Some((path, ..)) = to_encrypt.iter().find(|(p, ..)| !sparse.matches(p)) {
                 return Err(Error::InvalidArgument(format!(
-                    "merge has conflicts, and {path} (outside your sparse checkout) needs sealing at completion; \
+                    "{op} has conflicts, and {path} (outside your sparse checkout) needs sealing at completion; \
                      run `sc sparse set` to include it, or `sc backfill --all`, then retry"
                 )));
             }
@@ -1786,7 +1790,7 @@ impl Repo {
         if self.promisor()?.is_some() {
             if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !sparse.matches(r)) {
                 return Err(Error::InvalidArgument(format!(
-                    "merge has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
+                    "{op} has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
                      run `sc sparse set` to include it, or `sc backfill --all`, then retry"
                 )));
             }
@@ -1812,7 +1816,7 @@ impl Repo {
                 });
                 if tracked {
                     return Err(Error::InvalidArgument(format!(
-                        "merge has conflicts, and its sidecar {rel} would overwrite a tracked file; \
+                        "{op} has conflicts, and its sidecar {rel} would overwrite a tracked file; \
                          rename or remove that file, then retry"
                     )));
                 }
@@ -1846,13 +1850,13 @@ impl Repo {
                     None => {}
                     Some(StopBlocker::ParentFile) => {
                         return Err(Error::InvalidArgument(format!(
-                            "merge has conflicts, and a file stands where a directory for {rel} \
+                            "{op} has conflicts, and a file stands where a directory for {rel} \
                              must be; move that file away, then retry"
                         )))
                     }
                     Some(StopBlocker::Occupied) => {
                         return Err(Error::InvalidArgument(format!(
-                            "merge has conflicts, and writing {rel} would overwrite an untracked \
+                            "{op} has conflicts, and writing {rel} would overwrite an untracked \
                              or ignored file or directory (possibly a sidecar left by an earlier \
                              stop); move it away, then retry"
                         )))
@@ -1864,6 +1868,7 @@ impl Repo {
         // the first working-tree write (lazy partial clones only), outside
         // the store lock.
         self.ensure_view(conflict_root, &sparse)?;
+        self.refuse_untracked_overwrite(op, Some(old_root), conflict_root)?;
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
@@ -1944,6 +1949,105 @@ impl Repo {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Repo::refuse_untracked_overwrite_vs`] against the tree `old_root`
+    /// reflects on disk.
+    pub(crate) fn refuse_untracked_overwrite(
+        &self,
+        op: &str,
+        old_root: Option<ObjectId>,
+        target_root: ObjectId,
+    ) -> Result<()> {
+        let sparse = self.sparse_spec()?;
+        let partial = self.promisor()?.is_some();
+        let old: std::collections::BTreeSet<String> = match old_root {
+            None => std::collections::BTreeSet::new(),
+            Some(old) => {
+                let store_arc = self.vfs.store();
+                let mut store = store_arc.lock().unwrap();
+                if partial {
+                    worktree::tree_file_entries_with_perms_sparse_present(&mut store, old, &sparse)?
+                } else {
+                    worktree::tree_file_entries_with_perms_sparse(&mut store, old, &sparse)?
+                }
+                .into_keys()
+                .collect()
+            }
+        };
+        self.refuse_untracked_overwrite_vs(op, &old, target_root)
+    }
+
+    /// Refuse, before any write, a forward operation (`op`) whose result would
+    /// lay a file or directory on top of one the user owns: a path the target
+    /// tree has and `tracked` (the paths the working tree reflects) does not
+    /// contain, yet something already sits there (an untracked or ignored
+    /// copy), or an untracked file where a parent directory must be. The check
+    /// reads the working tree only; a path outside the sparse view is skipped
+    /// because nothing is written there, and on a partial clone a gap in the
+    /// target is left for `materialize`'s own view check to report. Git
+    /// refuses the same case.
+    pub(crate) fn refuse_untracked_overwrite_vs(
+        &self,
+        op: &str,
+        tracked: &std::collections::BTreeSet<String>,
+        target_root: ObjectId,
+    ) -> Result<()> {
+        let sparse = self.sparse_spec()?;
+        let partial = self.promisor()?.is_some();
+        let target = {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            if partial {
+                worktree::tree_file_entries_with_perms_sparse_present(
+                    &mut store,
+                    target_root,
+                    &sparse,
+                )?
+            } else {
+                worktree::tree_file_entries_with_perms_sparse(&mut store, target_root, &sparse)?
+            }
+        };
+        self.refuse_untracked_paths(op, tracked, target.keys())
+    }
+
+    /// The path-list core of [`Repo::refuse_untracked_overwrite_vs`], for a
+    /// caller that already holds the target's paths (a private branch's
+    /// decrypted tree).
+    pub(crate) fn refuse_untracked_paths<'a>(
+        &self,
+        op: &str,
+        tracked: &std::collections::BTreeSet<String>,
+        target: impl Iterator<Item = &'a String>,
+    ) -> Result<()> {
+        let sparse = self.sparse_spec()?;
+        // A path outside the view was never laid out: whatever is on disk
+        // there is the user's, even if the tree tracks it. On a
+        // case-insensitive filesystem a tracked file may answer to another
+        // spelling (a case-only rename): it counts as tracked only when it is
+        // provably the same file.
+        let root = &self.layout.root;
+        let mut is_tracked = |p: &str| {
+            sparse.matches(p) && (tracked.contains(p) || is_tracked_case_alias(root, tracked, p))
+        };
+        for rel in target.filter(|p| sparse.matches(p)) {
+            match stop_write_blocker(&self.layout.root, rel, &mut is_tracked)? {
+                None => {}
+                Some(StopBlocker::ParentFile) => {
+                    return Err(Error::InvalidArgument(format!(
+                        "{op} would fail: a file stands where a directory for {rel} must be; \
+                         move that file away, then retry"
+                    )))
+                }
+                Some(StopBlocker::Occupied) => {
+                    return Err(Error::InvalidArgument(format!(
+                        "{op} would overwrite an untracked or ignored file or directory at \
+                         {rel}; move it away, then retry"
+                    )))
                 }
             }
         }
@@ -2166,8 +2270,10 @@ impl Repo {
     /// Switch HEAD to `name` and materialize its tip into the working tree.
     ///
     /// Refuses to switch when the working tree has uncommitted modifications or
-    /// deletions, because `materialize` would silently overwrite them. (New,
-    /// untracked files are left in place and so don't block the switch.) The
+    /// deletions, because `materialize` would silently overwrite them. New,
+    /// untracked files are left in place and don't block the switch, unless the
+    /// target branch tracks a file at the same path (or needs a directory where
+    /// one stands): that fails with `InvalidArgument` before any write. The
     /// dirty check is protection-aware (see `status`/`diff_worktree`): a
     /// decrypted protected file that matches HEAD is clean and a skipped/absent
     /// protected file is clean, but a genuine edit to a protected file blocks
@@ -2245,6 +2351,7 @@ impl Repo {
         // A lazy, online partial clone fills the target view's closure now,
         // before the first stale file is removed or written (ADR-0048).
         self.ensure_view(target_root, &self.sparse_spec()?)?;
+        self.refuse_untracked_overwrite_vs("switch", &old_paths, target_root)?;
         if head_priv.is_some() {
             // Remove private-tip paths the public target doesn't track,
             // BEFORE materialize lays the target down.
@@ -2396,6 +2503,47 @@ impl Repo {
     }
 }
 
+/// Whether `rel` is, on this filesystem, the same file as a tracked path that
+/// differs from it only in case (a case-insensitive checkout where `foo` was
+/// renamed to `Foo`). The filesystem must be case-insensitive and the two
+/// spellings the same device and inode, or it is not an alias: a separate user
+/// file, or a hard link to the tracked one, must stay protected.
+#[cfg(unix)]
+fn is_tracked_case_alias(
+    root: &std::path::Path,
+    tracked: &std::collections::BTreeSet<String>,
+    rel: &str,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // Inode identity alone proves nothing: on a case-sensitive filesystem an
+    // untracked `Foo` can be a hard link to the tracked `foo`. Only a
+    // filesystem that answers to both spellings of a name that certainly
+    // exists (`.sc`) aliases case.
+    if root.join(".SC").symlink_metadata().is_err() {
+        return false;
+    }
+    let Ok(here) = root.join(rel).symlink_metadata() else {
+        return false;
+    };
+    tracked
+        .iter()
+        .filter(|t| t.as_str() != rel && t.eq_ignore_ascii_case(rel))
+        .any(|t| {
+            root.join(t)
+                .symlink_metadata()
+                .is_ok_and(|m| m.dev() == here.dev() && m.ino() == here.ino())
+        })
+}
+
+#[cfg(not(unix))]
+fn is_tracked_case_alias(
+    _root: &std::path::Path,
+    _tracked: &std::collections::BTreeSet<String>,
+    _rel: &str,
+) -> bool {
+    false
+}
+
 /// What stands in the way of a conflict stop's direct write to `rel`.
 #[derive(Debug, PartialEq, Eq)]
 enum StopBlocker {
@@ -2422,14 +2570,22 @@ fn stop_write_blocker(
     for i in 1..comps.len() {
         let prefix = comps[..i].join("/");
         let full = worktree::safe_join(root, &prefix)?;
-        if full.symlink_metadata().is_ok_and(|m| !m.is_dir()) && !tracked(&prefix) {
-            return Ok(Some(StopBlocker::ParentFile));
+        // A symlink is never the tracked file (a write would follow it, or the
+        // materialize removal would delete the user's link), so it blocks
+        // whether or not the old tree tracks that name.
+        if let Ok(m) = full.symlink_metadata() {
+            if !m.is_dir() && (m.file_type().is_symlink() || !tracked(&prefix)) {
+                return Ok(Some(StopBlocker::ParentFile));
+            }
         }
     }
     let full = worktree::safe_join(root, rel)?;
     match full.symlink_metadata() {
         Err(_) => Ok(None),
         Ok(m) if m.is_dir() => Ok(Some(StopBlocker::Occupied)),
+        // A symlink is never the tracked file: a write would follow it to
+        // whatever it points at, outside the repository.
+        Ok(m) if m.file_type().is_symlink() => Ok(Some(StopBlocker::Occupied)),
         Ok(_) if tracked(rel) => Ok(None),
         Ok(_) => Ok(Some(StopBlocker::Occupied)),
     }
@@ -6586,6 +6742,71 @@ mod stop_blocker_tests {
             Some(StopBlocker::Occupied)
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A symlink is never the tracked file: writing would follow it out of the
+    /// repository (a protected path skipped for want of an identity leaves
+    /// room for one).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_target_is_occupied_even_when_tracked() {
+        let root = tmp("stop-symlink");
+        let outside = tmp("stop-symlink-outside").join("personal.txt");
+        std::fs::write(&outside, b"personal\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("p.txt")).unwrap();
+        let tracked = |_: &str| true;
+        assert_eq!(
+            stop_write_blocker(&root, "p.txt", &mut { tracked }).unwrap(),
+            Some(StopBlocker::Occupied)
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(outside.parent().unwrap()).ok();
+    }
+
+    /// On a case-insensitive checkout `foo` renamed to `Foo` is one file under
+    /// two spellings. On a case-sensitive one nothing aliases: a separate user
+    /// file called `Foo`, or even a hard link to the tracked `foo`, stays
+    /// protected.
+    #[cfg(unix)]
+    #[test]
+    fn a_case_alias_of_a_tracked_file_needs_a_case_insensitive_filesystem() {
+        let root = tmp("case-alias");
+        std::fs::create_dir_all(root.join(".sc")).unwrap();
+        std::fs::write(root.join("foo"), b"tracked\n").unwrap();
+        let tracked: std::collections::BTreeSet<String> = ["foo".to_string()].into();
+        let case_insensitive = root.join("Foo").exists();
+
+        if case_insensitive {
+            // `Foo` already names the tracked file: an alias.
+            assert!(is_tracked_case_alias(&root, &tracked, "Foo"));
+        } else {
+            std::fs::write(root.join("Foo"), b"user's own\n").unwrap();
+            assert!(!is_tracked_case_alias(&root, &tracked, "Foo"));
+            // A hard link shares the inode but is still the user's file here.
+            std::fs::remove_file(root.join("Foo")).unwrap();
+            std::fs::hard_link(root.join("foo"), root.join("Foo")).unwrap();
+            assert!(!is_tracked_case_alias(&root, &tracked, "Foo"));
+        }
+        assert!(!is_tracked_case_alias(&root, &tracked, "Other"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A symlink standing where a parent directory must be blocks even when
+    /// the old tree tracks that name (a protected file skipped for want of an
+    /// identity leaves room for one).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_parent_blocks_even_when_the_name_is_tracked() {
+        let root = tmp("symlink-parent");
+        let outside = tmp("symlink-parent-outside");
+        std::os::unix::fs::symlink(&outside, root.join("a")).unwrap();
+        let tracked = |_: &str| true;
+        assert_eq!(
+            stop_write_blocker(&root, "a/b", &mut { tracked }).unwrap(),
+            Some(StopBlocker::ParentFile)
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

@@ -370,6 +370,7 @@ impl Repo {
     /// doesn't track (or that falls outside `sparse`) is removed.
     fn materialize_private(
         &self,
+        op: &str,
         store: &mut Store,
         ctx: &PrivateCtx,
         target_root: ObjectId,
@@ -379,6 +380,9 @@ impl Repo {
     ) -> Result<Vec<String>> {
         let sparse = self.sparse_spec()?;
         let target = self.inner_tree_files(store, ctx, target_root)?;
+        // Before the first removal or write: nothing of the user's may be
+        // replaced (see `refuse_untracked_paths`).
+        self.refuse_untracked_paths(op, old_paths, target.keys())?;
         for p in old_paths {
             if !target.contains_key(p) || !sparse.matches(p) {
                 let full = worktree::safe_join(&self.layout.root, p)?;
@@ -448,6 +452,7 @@ impl Repo {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
             self.materialize_private(
+                "switch",
                 &mut store,
                 &ctx,
                 tip_snap.root,
@@ -1235,6 +1240,7 @@ impl Repo {
                 index,
             };
             let skipped = self.materialize_private(
+                "merge",
                 &mut store,
                 &ff_ctx,
                 theirs_snap.root,
@@ -1408,6 +1414,7 @@ impl Repo {
             .get_inner_snapshot(&mut store, &merged_ctx, &new_tip)?
             .protection;
         let skipped = self.materialize_private(
+            "merge",
             &mut store,
             &merged_ctx,
             merged_root,
@@ -1742,6 +1749,36 @@ mod tests {
             "pub fn hello() {}\n"
         );
 
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Switching to a private branch that tracks `fix.txt` must not replace an
+    /// untracked `fix.txt` on the public checkout.
+    #[test]
+    fn switching_to_a_private_branch_refuses_to_overwrite_an_untracked_file() {
+        let (root, repo, (alice_sk, _alice_pk), _bob) = setup("guard-private");
+        repo.branch_private("fix", &alice_sk, &[], &[]).unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        write(&root, "fix.txt", "PRIVATE\n");
+        repo.commit_private("alice", "adds fix.txt", Some(&alice_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        assert!(!root.join("fix.txt").exists());
+        write(&root, "fix.txt", "MINE\n");
+
+        let err = repo
+            .switch_with_identity("fix", Some(&alice_sk))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("would overwrite")),
+            "got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("fix.txt")).unwrap(),
+            "MINE\n"
+        );
+        assert!(repo.head_private().unwrap().is_none(), "HEAD did not move");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

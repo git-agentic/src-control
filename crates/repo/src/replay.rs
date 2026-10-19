@@ -507,6 +507,7 @@ impl Repo {
                 // the view: fill its closure before any ref, spec or file
                 // write (lazy partial clones only), outside the store lock.
                 self.ensure_view(root, &self.sparse_spec()?)?;
+                self.refuse_untracked_overwrite("cherry-pick", Some(ours_root), root)?;
                 let mut cache = self.open_protected_cache()?;
                 {
                     let store_arc = self.vfs().store();
@@ -579,6 +580,7 @@ impl Repo {
                     wrapped,
                 };
                 let conflict_root = self.materialize_conflict_state(
+                    "cherry-pick",
                     &carried,
                     &carried_subtrees,
                     &to_encrypt,
@@ -768,6 +770,7 @@ impl Repo {
                 // the fill takes the store lock, so release ours around it.
                 drop(store);
                 self.ensure_view(target_root, &self.sparse_spec()?)?;
+                self.refuse_untracked_overwrite("rebase", Some(ours_root), target_root)?;
                 let mut store = store_arc.lock().unwrap();
                 let mut cache = self.open_protected_cache()?;
                 worktree::materialize(
@@ -1011,6 +1014,7 @@ impl Repo {
                         wrapped,
                     };
                     let conflict_root = self.materialize_conflict_state(
+                        "rebase",
                         &carried,
                         &carried_subtrees,
                         &to_encrypt,
@@ -1060,6 +1064,7 @@ impl Repo {
         // view: fill its closure before any ref, spec or file write (lazy
         // partial clones only), outside the store lock.
         self.ensure_view(acc_root, &self.sparse_spec()?)?;
+        self.refuse_untracked_overwrite("rebase", Some(disk_root), acc_root)?;
         // Cache hoisted above the block so its save follows the ref move
         // below, matching commit/amend's discipline (P33 Task 7).
         let mut cache = self.open_protected_cache()?;
@@ -3288,6 +3293,232 @@ mod tests {
         repo.commit("me", "adds x.theirs").unwrap();
         assert!(repo.tracked_paths().unwrap().contains("x.theirs"));
         assert_eq!(std::fs::read(root.join("x.theirs")).unwrap(), b"mine\n");
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// `main` adds `new.txt`; `work` does not. The user has an untracked
+    /// `new.txt`. Returns the repo on `work`, with `main` the other branch.
+    fn branches_where_main_adds_a_file_the_user_already_has(
+        name: &str,
+    ) -> (std::path::PathBuf, Repo) {
+        let root = tmp_root(name);
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("other").unwrap();
+        repo.switch("other").unwrap();
+        std::fs::write(root.join("new.txt"), b"from other\n").unwrap();
+        repo.commit("me", "other adds new.txt").unwrap();
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("a.txt"), b"a2\n").unwrap();
+        repo.commit("me", "main edits a").unwrap();
+        std::fs::write(root.join("new.txt"), b"MINE\n").unwrap();
+        (root, repo)
+    }
+
+    fn assert_mine(root: &std::path::Path) {
+        assert_eq!(
+            std::fs::read(root.join("new.txt")).unwrap(),
+            b"MINE\n",
+            "the user's untracked file must survive"
+        );
+    }
+
+    #[test]
+    fn a_clean_merge_refuses_to_overwrite_an_untracked_file() {
+        let (root, repo) = branches_where_main_adds_a_file_the_user_already_has("guard-merge");
+        let before = repo.head_tip().unwrap();
+        let err = repo.merge("other", "me").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("would overwrite")),
+            "got {err:?}"
+        );
+        assert_eq!(repo.head_tip().unwrap(), before, "no merge commit");
+        assert_mine(&root);
+        drop(repo);
+        remove_root(&root);
+    }
+
+    #[test]
+    fn a_fast_forward_merge_and_a_switch_refuse_to_overwrite_an_untracked_file() {
+        let root = tmp_root("guard-ff");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("other").unwrap();
+        repo.switch("other").unwrap();
+        std::fs::write(root.join("new.txt"), b"from other\n").unwrap();
+        repo.commit("me", "other adds new.txt").unwrap();
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("new.txt"), b"MINE\n").unwrap();
+
+        assert!(matches!(
+            repo.merge("other", "me").unwrap_err(),
+            Error::InvalidArgument(m) if m.contains("would overwrite")
+        ));
+        assert!(matches!(
+            repo.switch("other").unwrap_err(),
+            Error::InvalidArgument(m) if m.contains("would overwrite")
+        ));
+        assert_mine(&root);
+        assert!(!repo.merge_in_progress());
+        drop(repo);
+        remove_root(&root);
+    }
+
+    #[test]
+    fn a_cherry_pick_and_a_rebase_refuse_to_overwrite_an_untracked_file() {
+        let (root, repo) = branches_where_main_adds_a_file_the_user_already_has("guard-replay");
+        let before = repo.head_tip().unwrap();
+        assert!(matches!(
+            repo.cherry_pick("other", "me", None, None).unwrap_err(),
+            Error::InvalidArgument(m) if m.contains("would overwrite")
+        ));
+        assert_eq!(repo.head_tip().unwrap(), before);
+        assert!(!repo.pick_in_progress());
+        assert_mine(&root);
+        drop(repo);
+        remove_root(&root);
+
+        // Rebase `main` onto `other`, which tracks the file the user has
+        // untracked on `main`: the fold's final write would replace it.
+        let (root, repo) = branches_where_main_adds_a_file_the_user_already_has("guard-rebase");
+        let before = repo.head_tip().unwrap();
+        assert!(matches!(
+            repo.rebase("other", "me", None).unwrap_err(),
+            Error::InvalidArgument(m) if m.contains("would overwrite")
+        ));
+        assert_eq!(repo.head_tip().unwrap(), before);
+        assert!(!repo.rebase_in_progress());
+        assert_mine(&root);
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// The guard must not mistake what a conflict stop itself wrote for the
+    /// user's files: a stopped rebase whose target adds a file lays that file
+    /// down, and `--continue` must still finish.
+    /// A conflict stop names the operation that is running, and refuses before
+    /// any write when a clean-added file would land on an untracked one.
+    #[test]
+    fn a_conflict_stop_names_its_operation_when_it_refuses() {
+        let root = tmp_root("guard-stop-names-op");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+        repo.switch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nOTHER\nc\n").unwrap();
+        std::fs::write(root.join("new.txt"), b"from other\n").unwrap();
+        repo.commit("me", "other edits x, adds new.txt").unwrap();
+        repo.switch("main").unwrap();
+        std::fs::write(root.join("new.txt"), b"MINE\n").unwrap();
+
+        let err = repo.cherry_pick("other", "me", None, None).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.starts_with("cherry-pick")),
+            "got {err:?}"
+        );
+        let err = repo.merge("other", "me").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.starts_with("merge")),
+            "got {err:?}"
+        );
+        assert_mine(&root);
+        assert!(!repo.pick_in_progress() && !repo.merge_in_progress());
+        drop(repo);
+        remove_root(&root);
+    }
+
+    #[test]
+    fn rebase_continue_is_not_blocked_by_files_the_stop_wrote() {
+        let root = tmp_root("guard-rebase-continue");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        std::fs::write(root.join("added.txt"), b"from main\n").unwrap();
+        repo.commit("me", "main edits x, adds a file").unwrap();
+        repo.switch("feature").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nFEATURE\nc\n").unwrap();
+        repo.commit("me", "feature edits x").unwrap();
+        assert!(matches!(
+            repo.rebase("main", "me", None).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        assert!(root.join("added.txt").exists(), "setup: the stop wrote it");
+        std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
+        repo.rebase_continue("me", None).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("added.txt")).unwrap(),
+            b"from main\n"
+        );
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// Same for a conflicted merge and pick: completing must not trip over the
+    /// clean-added files the stop wrote.
+    #[test]
+    fn a_stopped_merge_still_completes_with_a_file_the_stop_wrote() {
+        let root = tmp_root("guard-merge-continue");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nb\nc\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nMAIN\nc\n").unwrap();
+        repo.commit("me", "main edits x").unwrap();
+        repo.switch("other").unwrap();
+        std::fs::write(root.join("x.txt"), b"a\nOTHER\nc\n").unwrap();
+        std::fs::write(root.join("added.txt"), b"from other\n").unwrap();
+        repo.commit("me", "other edits x, adds a file").unwrap();
+        repo.switch("main").unwrap();
+        repo.merge("other", "me").unwrap_err();
+        assert!(root.join("added.txt").exists());
+        std::fs::write(root.join("x.txt"), b"a\nresolved\nc\n").unwrap();
+        repo.commit("me", "merge").unwrap();
+        assert!(repo.tracked_paths().unwrap().contains("added.txt"));
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// A tracked path outside the sparse view was never laid out, so a user
+    /// file standing where a directory for an in-view path must be is not the
+    /// tracked file: the guard must not count the old tree's `a` as it.
+    #[test]
+    fn a_tracked_path_outside_the_view_does_not_excuse_a_user_file_in_the_way() {
+        let root = tmp_root("guard-sparse");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/b"), b"b\n").unwrap();
+        std::fs::write(root.join("keep.txt"), b"k\n").unwrap();
+        let target = repo.commit("me", "target tree has a/b").unwrap();
+        let target_root = repo.snapshot(&target).unwrap().root;
+        // The user's own file where the directory `a` must be.
+        std::fs::remove_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a"), b"MINE\n").unwrap();
+        // The tree being left tracks a regular file `a`.
+        let old: std::collections::BTreeSet<String> =
+            ["a".to_string(), "keep.txt".to_string()].into();
+
+        // Full view: the old tree's `a` is on disk, so it is the tracked file.
+        repo.refuse_untracked_overwrite_vs("switch", &old, target_root)
+            .unwrap();
+        // Narrowed view: `a` was never laid out, so the file in the way is the
+        // user's and the guard refuses.
+        std::fs::write(repo.layout().dot_sc.join("sparse"), "a/b\n").unwrap();
+        let err = repo
+            .refuse_untracked_overwrite_vs("switch", &old, target_root)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("would fail")),
+            "got {err:?}"
+        );
+        assert_eq!(std::fs::read(root.join("a")).unwrap(), b"MINE\n");
         drop(repo);
         remove_root(&root);
     }
