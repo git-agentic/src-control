@@ -89,7 +89,14 @@ fn remove_if_exists(path: &std::path::Path) -> Result<()> {
 pub fn load(layout: &Layout) -> Result<Sparse> {
     match std::fs::read_to_string(layout.sparse_path()) {
         Ok(text) => {
-            let prefixes = text.lines().map(|l| l.to_string()).collect();
+            // Blank lines (a hand edit, a trailing newline doubled) name no
+            // prefix; keep them out of the spec.
+            let prefixes = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect();
             Ok(Sparse { prefixes })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Sparse::default()),
@@ -301,6 +308,32 @@ impl Repo {
             clear_prev(self.layout())?;
         }
         Ok(skipped)
+    }
+
+    /// The prefixes in `prefixes` that match no tracked path at HEAD, so a
+    /// typo or a path that does not exist is not silently taken for a narrow
+    /// view that happens to be empty. On a partial clone only what the store
+    /// holds is searched, so a prefix inside a gap can be reported here too:
+    /// the report is advice, never a refusal. An unborn HEAD has no paths and
+    /// reports nothing.
+    pub fn sparse_prefixes_matching_nothing(&self, prefixes: &[String]) -> Result<Vec<String>> {
+        let Some(tip) = self.head_tip()? else {
+            return Ok(Vec::new());
+        };
+        let root = self.snapshot(&tip)?.root;
+        let store_arc = self.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let mut none = Vec::new();
+        for p in prefixes {
+            let spec = Sparse::new(vec![p.clone()]);
+            let found = crate::worktree::tree_file_entries_with_perms_sparse_present(
+                &mut store, root, &spec,
+            )?;
+            if found.is_empty() {
+                none.push(p.clone());
+            }
+        }
+        Ok(none)
     }
 
     /// Disable sparse checkout: clear the persisted spec and re-materialize
@@ -697,5 +730,18 @@ mod tests {
         drop(dst);
         std::fs::remove_dir_all(&src_root).unwrap();
         std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn load_ignores_blank_lines_in_a_hand_edited_spec() {
+        let layout = tmp_layout("blank-lines");
+        std::fs::write(layout.sparse_path(), "src/\n\n  \ndocs/\n\n").unwrap();
+        let spec = load(&layout).unwrap();
+        assert_eq!(spec.prefixes(), ["src/", "docs/"]);
+        assert!(
+            !spec.matches("lib/x.txt"),
+            "a blank line must not widen the view"
+        );
+        std::fs::remove_dir_all(&layout.root).unwrap();
     }
 }

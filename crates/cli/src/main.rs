@@ -1088,9 +1088,25 @@ fn run_sparse(op: SparseOp) -> Result<()> {
         }
         SparseOp::Set { prefixes, identity } => {
             let repo = open_repo()?;
+            // No prefix is a full checkout, which is what `sparse disable`
+            // says. A partial clone still reaches the library, whose refusal
+            // names `sc backfill`.
+            if prefixes.is_empty() && repo.promisor()?.is_none() {
+                anyhow::bail!(
+                    "no prefix given: `sc sparse set` needs at least one path prefix; \
+                     use `sc sparse disable` for a full checkout"
+                );
+            }
             let sk = resolve_identity_opt(identity)?;
+            let unmatched = repo.sparse_prefixes_matching_nothing(&prefixes)?;
             let skipped = repo.set_sparse(&prefixes, sk.as_ref())?;
             println!("sparse set: {} prefix(es)", prefixes.len());
+            for p in &unmatched {
+                eprintln!(
+                    "warning: prefix {p:?} matches no tracked path at HEAD, so none of it is on \
+                     disk; `sc sparse disable` restores the full checkout"
+                );
+            }
             for path in &skipped {
                 eprintln!("skipped (no key): {path}");
             }

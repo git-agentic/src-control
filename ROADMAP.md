@@ -743,11 +743,12 @@ scale-&-reach horizon):
   not a disclosure (an authorized identity produced it), documented in
   ADR-0034 — but the sparse view is briefly wider than advertised. Extend
   the gate to those write loops.
-- **Sparse ergonomics (P24 final-review Minors).** A bogus/no-match
-  `sc sparse set <prefix>` empties the working tree with no warning
-  (recoverable via disable); a zero-arg `sc sparse set` silently equals
-  `disable`; blank lines in a hand-edited `.sc/sparse` want tolerant
-  parsing. Small usability hardening.
+- **Sparse ergonomics (P24 final-review Minors) — shipped.** `sc sparse set`
+  warns for each prefix that matches no tracked path at HEAD (the tree is still
+  laid out, empty, and `sc sparse disable` is named as the way back); a bare
+  `sc sparse set` on a full clone is refused with a pointer to `sc sparse
+  disable` (a partial clone keeps its `sc backfill` refusal); and `.sc/sparse`
+  parsing ignores blank lines.
 - **Transparent lazy-fetch for partial clones (P27).** `sc backfill` is
   explicit-only by design (ADR-0037's "no network in read paths" choice);
   the identical filtered-walk/gap infra could instead dial the promisor
