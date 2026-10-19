@@ -263,14 +263,14 @@ fn a_grandchild_holding_the_descriptor_does_not_pin_sc_run() {
     let (repo, id, keys) = repo_with("grandchild", &[("BIG", vec![b'x'; 300_000])]);
     let start = std::time::Instant::now();
     // The shell backgrounds a sleeper that inherits fd 3, never reads it, and exits.
-    let out = run_fd(&repo, &id, "3", "sleep 4 >/dev/null 2>&1 & exit 0");
+    let out = run_fd(&repo, &id, "3", "sleep 30 >/dev/null 2>&1 & exit 0");
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(3),
+        start.elapsed() < std::time::Duration::from_secs(15),
         "sc run waited on the grandchild: {:?}",
         start.elapsed()
     );

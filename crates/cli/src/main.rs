@@ -253,8 +253,8 @@ enum Cmd {
         /// Identity file (default ~/.sc/identity or $SC_IDENTITY).
         #[arg(long)]
         identity: Option<PathBuf>,
-        /// Hand the secrets to the command on this file descriptor (3 or
-        /// higher) instead of in its environment. Unix only.
+        /// Hand the secrets to the command on this file descriptor (3 to
+        /// 1023) instead of in its environment. Unix only.
         #[arg(long, value_name = "FD")]
         secrets_fd: Option<i32>,
         /// Command and args after `--`.

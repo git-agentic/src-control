@@ -96,7 +96,7 @@ cargo run --bin sc -- secret grant <name> --to <recipient> --identity <key>
 cargo run --bin sc -- secret revoke <name> --recipient-id <id>
 cargo run --bin sc -- secret list
 cargo run --bin sc -- run [--secrets-fd N] -- <cmd> [args…]   # inject decrypted secrets + run command;
-                                              # --secrets-fd N (unix, N>=3) passes them on fd N as
+                                              # --secrets-fd N (unix, N in 3..=1023) passes them on fd N as
                                               # NUL-terminated NAME=VALUE records instead of env vars
                                               # (SC_SECRETS_FD names N); ADR-0052
 cargo run --bin sc -- gc                      # pack reachable objects + prune unreachable

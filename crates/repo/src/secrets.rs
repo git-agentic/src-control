@@ -439,7 +439,7 @@ impl Repo {
     /// command that backgrounds its consumer must read before it exits (a
     /// smaller payload already sits whole in the pipe and survives).
     ///
-    /// `fd` must be 3 or higher; a secret whose value holds a NUL byte is
+    /// `fd` must be between 3 and 1023; a secret whose value holds a NUL byte is
     /// refused (it could not be framed, and could not be an environment
     /// value either). Unix only.
     #[cfg(unix)]
