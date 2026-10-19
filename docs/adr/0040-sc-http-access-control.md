@@ -90,4 +90,6 @@ the `Authorization` header. `wire::serve` stays a thin wrapper delegating to
   (`401`) from "no repo here" (`404`). The `404` now follows the gate: behind mandatory auth
   a client without a valid token gets `401` either way. With no tokens configured (open
   loopback, `--read-only`, `--allow-public`) there is no gate to leak around and the `404`
-  remains.
+  remains. The two answers are status-indistinguishable, not timing-identical. A client
+  holding a valid token sees the `401` authentication error rather than `NotARepo` if the
+  repo is removed while the server runs.

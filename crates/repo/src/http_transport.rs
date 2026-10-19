@@ -1051,10 +1051,15 @@ fn handle_http_connection(
         if mandatory_auth {
             // The public bind's sole justification (tokens) was removed while
             // running — fail closed, do NOT serve an open unauthenticated server.
+            let why = if has_repo {
+                "none are configured (re-add a token, or restart with --read-only / \
+                 --allow-public)"
+            } else {
+                "the served root has no `.sc/` directory (the repo was removed while running)"
+            };
             eprintln!(
                 "sc serve --http: refusing connection — this non-loopback server was \
-                 justified only by tokens, but none are configured (re-add a token, or \
-                 restart with --read-only / --allow-public)"
+                 justified only by tokens, but {why}"
             );
             write_status(&mut writer, 401)?;
             return Ok(());
