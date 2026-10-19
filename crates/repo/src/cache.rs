@@ -124,6 +124,31 @@ pub(crate) struct ProtectedCache {
     entries: BTreeMap<String, CacheEntry>,
 }
 
+/// Whether `rel` under `root` is a regular file reached without crossing a
+/// symlink, the only kind the worktree walker reads. Every component is checked
+/// with `symlink_metadata`, so a file replaced by a symlink, or a directory
+/// replaced by one, counts as gone.
+fn is_plain_file(root: &Path, rel: &str) -> bool {
+    let mut cur = root.to_path_buf();
+    let mut comps = rel.split('/').peekable();
+    while let Some(c) = comps.next() {
+        cur.push(c);
+        let Ok(md) = std::fs::symlink_metadata(&cur) else {
+            return false;
+        };
+        let ft = md.file_type();
+        let ok = if comps.peek().is_some() {
+            ft.is_dir()
+        } else {
+            ft.is_file()
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
 impl ProtectedCache {
     pub(crate) fn open(key: [u8; 32], root: PathBuf, path: Option<PathBuf>) -> ProtectedCache {
         let mut entries = BTreeMap::new();
@@ -230,7 +255,7 @@ impl ProtectedCache {
         };
         let mut out = String::new();
         for (p, e) in &self.entries {
-            if !self.root.join(p).is_file() {
+            if !is_plain_file(&self.root, p) {
                 continue;
             }
             out.push_str(&format!(
@@ -436,6 +461,44 @@ mod tests {
         assert_eq!(after.unchanged("gone", b"v"), None);
         assert_eq!(after.unchanged("moved", b"v"), None);
         assert_eq!(after.entries.len(), 2, "dead entries are pruned on save");
+        cleanup(&layout);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_drops_entries_behind_a_symlink() {
+        let layout = tmp("prune-symlink");
+        let key = local_key(&layout).unwrap();
+        let open = || {
+            ProtectedCache::open(
+                key,
+                layout.root.clone(),
+                Some(layout.protected_cache_path()),
+            )
+        };
+        std::fs::create_dir(layout.root.join("d")).unwrap();
+        std::fs::write(layout.root.join("d/inner"), b"v").unwrap();
+        std::fs::write(layout.root.join("file"), b"v").unwrap();
+        std::fs::write(layout.root.join("target"), b"v").unwrap();
+        let id = ObjectId::of(b"c");
+        let mut c = open();
+        c.record("d/inner", b"v", id);
+        c.record("file", b"v", id);
+        c.save().unwrap();
+        assert_eq!(open().entries.len(), 2);
+
+        // The file becomes a symlink to an existing file, and its parent
+        // directory becomes a symlink to a directory that still holds `inner`.
+        std::fs::remove_file(layout.root.join("file")).unwrap();
+        std::os::unix::fs::symlink("target", layout.root.join("file")).unwrap();
+        std::fs::rename(layout.root.join("d"), layout.root.join("real-d")).unwrap();
+        std::os::unix::fs::symlink("real-d", layout.root.join("d")).unwrap();
+        open().save().unwrap();
+        assert_eq!(
+            open().entries.len(),
+            0,
+            "the walker never reads through a symlink"
+        );
         cleanup(&layout);
     }
 
