@@ -3187,6 +3187,23 @@ mod tests {
         remove_root(&root);
     }
 
+    /// A sidecar record left by a crash mid-stop (no operation in progress)
+    /// names nothing of ours: an ordinary commit takes a file at that path.
+    #[test]
+    fn an_orphan_sidecar_record_does_not_touch_an_ordinary_commit() {
+        let root = tmp_root("sweep-orphan-record");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"a\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        crate::conflict_plaintext::write_sidecars(&repo.layout, &["x.theirs".to_string()]).unwrap();
+        std::fs::write(root.join("x.theirs"), b"mine\n").unwrap();
+        repo.commit("me", "adds x.theirs").unwrap();
+        assert!(repo.tracked_paths().unwrap().contains("x.theirs"));
+        assert_eq!(std::fs::read(root.join("x.theirs")).unwrap(), b"mine\n");
+        drop(repo);
+        remove_root(&root);
+    }
+
     #[test]
     fn merge_abort_keeps_a_user_theirs_file_beside_a_text_conflict() {
         let (root, repo) = text_conflict_with_user_theirs_file("sweep-merge-abort");

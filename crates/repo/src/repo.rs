@@ -1944,6 +1944,16 @@ impl Repo {
         Ok(())
     }
 
+    /// The sidecars the in-progress stop recorded writing. A record with no
+    /// merge, pick or rebase in progress is residue of a crash mid-stop, and
+    /// names nothing that is ours: it reads as empty.
+    fn recorded_sidecars(&self) -> Result<std::collections::BTreeSet<String>> {
+        if self.active_conflict_op()?.is_none() {
+            return Ok(std::collections::BTreeSet::new());
+        }
+        crate::conflict_plaintext::read_sidecars(&self.layout)
+    }
+
     /// Drop from `files` the sidecars the stop recorded writing
     /// (`conflict_plaintext::read_sidecars`) that no snapshot in `snapshots`
     /// nor `decided_root` tracks. No record, no change.
@@ -1953,7 +1963,7 @@ impl Repo {
         snapshots: &[Option<ObjectId>],
         decided_root: Option<ObjectId>,
     ) -> Result<Vec<(String, Vec<u8>, scl_core::FileMode)>> {
-        let sidecars = crate::conflict_plaintext::read_sidecars(&self.layout)?;
+        let sidecars = self.recorded_sidecars()?;
         if sidecars.is_empty() {
             return Ok(files);
         }
@@ -1988,7 +1998,7 @@ impl Repo {
     /// a restore that fails leaves the sidecars to retry. The record is retired
     /// once swept.
     pub(crate) fn remove_conflict_sidecars(&self, roots: &[ObjectId]) -> Result<()> {
-        let sidecars = crate::conflict_plaintext::read_sidecars(&self.layout)?;
+        let sidecars = self.recorded_sidecars()?;
         if sidecars.is_empty() {
             return Ok(());
         }
