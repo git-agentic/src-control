@@ -104,10 +104,27 @@ pub fn load(layout: &Layout) -> Result<Sparse> {
     }
 }
 
+/// Refuse a blank prefix (empty or whitespace-only). It would be persisted as a
+/// blank line, which `load` reads back as no prefix at all: a laid-out empty
+/// view would turn into a full checkout on the next process, and every absent
+/// file would then read as a deletion. No prefix at all (an empty list) is the
+/// one spelling of a full view and is accepted.
+pub(crate) fn validate_prefixes(prefixes: &[String]) -> Result<()> {
+    match prefixes.iter().find(|p| p.trim().is_empty()) {
+        Some(p) => Err(crate::error::Error::InvalidArgument(format!(
+            "empty sparse prefix {p:?}; name a path, or use `sc sparse disable` for a full checkout"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Persist the repo's sparse spec, atomically. An empty spec removes the
 /// file entirely rather than writing an empty one, so `load` sees the same
 /// "no sparseness" state whether the file was never written or was cleared.
 pub fn store(layout: &Layout, s: &Sparse) -> Result<()> {
+    // The shared persistence boundary: a blank prefix would become a blank
+    // line that `load` reads back as no prefix.
+    validate_prefixes(&s.prefixes)?;
     if s.prefixes.is_empty() {
         return remove_if_exists(&layout.sparse_path());
     }
@@ -224,15 +241,8 @@ impl Repo {
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<Vec<String>> {
         self.refuse_on_private("sc sparse set")?;
-        // A blank prefix would be stored as a blank line, which `load` reads
-        // back as no prefix: a laid-out empty view would turn into a full
-        // checkout on the next process. `set_sparse(&[])` (no prefix at all)
-        // is the one spelling of a full view.
-        if let Some(p) = prefixes.iter().find(|p| p.trim().is_empty()) {
-            return Err(Error::InvalidArgument(format!(
-                "empty sparse prefix {p:?}; name a path, or use `sc sparse disable` for a full checkout"
-            )));
-        }
+        // Before any side effect (the shared `store` checks again).
+        validate_prefixes(prefixes)?;
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -836,5 +846,42 @@ mod tests {
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_blank_clone_filter_is_refused_before_anything_is_created() {
+        let src = std::env::temp_dir().join(format!("scl-blank-filter-src-{}", std::process::id()));
+        let dst = std::env::temp_dir().join(format!("scl-blank-filter-dst-{}", std::process::id()));
+        for r in [&src, &dst] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+        std::fs::create_dir_all(&src).unwrap();
+        let origin = Repo::init(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a\n").unwrap();
+        origin.commit("t", "c1").unwrap();
+        for bad in ["", "  "] {
+            let Err(err) =
+                Repo::clone_url_filtered(src.to_str().unwrap(), &dst, Some(&[bad.to_string()]))
+            else {
+                panic!("a blank clone filter must be refused");
+            };
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains("empty sparse prefix")),
+                "got {err:?}"
+            );
+            assert!(!dst.exists(), "no clone directory may be left behind");
+        }
+        drop(origin);
+        std::fs::remove_dir_all(&src).unwrap();
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn store_refuses_a_blank_prefix() {
+        let layout = tmp_layout("store-blank");
+        let err = store(&layout, &Sparse::new(vec!["src/".into(), " ".into()])).unwrap_err();
+        assert!(matches!(&err, Error::InvalidArgument(_)), "got {err:?}");
+        assert!(!layout.sparse_path().exists(), "nothing was written");
+        std::fs::remove_dir_all(&layout.root).unwrap();
     }
 }
