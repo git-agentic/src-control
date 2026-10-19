@@ -1043,7 +1043,18 @@ fn handle_http_connection(
     // connection with no status instead of answering below.
     let has_repo = root.join(".sc").is_dir();
     let tokens = if has_repo {
-        crate::serve_tokens::load(&crate::layout::Layout::at(root))?
+        match crate::serve_tokens::load(&crate::layout::Layout::at(root)) {
+            Ok(tokens) => tokens,
+            // A token store that cannot be read is a refusal, not a dropped
+            // connection: behind mandatory auth every unauthenticated client
+            // gets the same 401, so a broken store is not a presence signal.
+            Err(e) if mandatory_auth => {
+                eprintln!("sc serve --http: refusing connection — token store unavailable: {e}");
+                write_status(&mut writer, 401)?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         Vec::new()
     };
@@ -1872,6 +1883,18 @@ mod tests {
 
         std::fs::remove_dir_all(&bare).unwrap();
         assert!(!bare.exists(), "test must leave no residue");
+
+        // A malformed token store behind mandatory auth is a 401 too.
+        let broken = tmp_repo("oracle-broken-tokens");
+        std::fs::write(
+            crate::layout::Layout::at(&broken).serve_tokens_path(),
+            b"this is = not [valid toml",
+        )
+        .unwrap();
+        let gated = spawn_real_http_server_policy_auth(broken.clone(), false, true);
+        assert_eq!(connect_raw_status(gated, None), 401);
+        std::fs::remove_dir_all(&broken).unwrap();
+        assert!(!broken.exists(), "test must leave no residue");
     }
 
     // ── Task 5: client-side `SC_HTTP_TOKEN` support (`connect_with_token`). ──
