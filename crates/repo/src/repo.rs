@@ -1953,13 +1953,19 @@ impl Repo {
                     .map_or(true, |e| e.is_some())
             });
             if !tracked {
-                let _ = std::fs::remove_file(self.layout.root.join(sidecar));
+                // Only an already-absent file is fine: any other failure stops
+                // the sweep with the record intact, so a retry can finish it.
+                match std::fs::remove_file(worktree::safe_join(&self.layout.root, &sidecar)?) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
+            // Handled: retire it, so a retry (a `--continue` whose fold fails
+            // later) cannot sweep a file the user creates at that path.
+            crate::conflict_plaintext::retire_sidecar(&self.layout, &sidecar)?;
         }
-        // Handled: retire the record, so a retry (a `--continue` whose fold
-        // fails later) cannot sweep a file the user creates at that path.
-        drop(store);
-        crate::conflict_plaintext::write_sidecars(&self.layout, &[])
+        Ok(())
     }
 
     /// Abandon an in-progress merge: restore the working tree to the current tip

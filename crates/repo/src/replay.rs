@@ -3085,6 +3085,44 @@ mod tests {
         remove_root(&root);
     }
 
+    /// A sweep that cannot remove a sidecar fails with the record intact, so a
+    /// retry can finish the job.
+    #[test]
+    fn a_failed_sidecar_removal_keeps_the_record_for_a_retry() {
+        let root = tmp_root("sweep-remove-fails");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfebase\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeOURS\n").unwrap();
+        let ours = repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("bin.dat"), b"\xff\xfeTHEIRS\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        repo.merge("work", "me").unwrap_err();
+        let ours_root = repo.snapshot(&ours).unwrap().root;
+        // Replace the sidecar with a directory: `remove_file` cannot unlink it.
+        std::fs::remove_file(root.join("bin.dat.theirs")).unwrap();
+        std::fs::create_dir(root.join("bin.dat.theirs")).unwrap();
+        repo.remove_conflict_sidecars(&[ours_root]).unwrap_err();
+        assert!(
+            crate::conflict_plaintext::read_sidecars(&repo.layout)
+                .unwrap()
+                .contains("bin.dat.theirs"),
+            "the record survives a failed removal"
+        );
+        std::fs::remove_dir(root.join("bin.dat.theirs")).unwrap();
+        std::fs::write(root.join("bin.dat.theirs"), b"x\n").unwrap();
+        repo.remove_conflict_sidecars(&[ours_root]).unwrap();
+        assert!(
+            !root.join("bin.dat.theirs").exists(),
+            "the retry finishes it"
+        );
+        drop(repo);
+        remove_root(&root);
+    }
+
     #[test]
     fn merge_abort_keeps_a_user_theirs_file_beside_a_text_conflict() {
         let (root, repo) = text_conflict_with_user_theirs_file("sweep-merge-abort");
