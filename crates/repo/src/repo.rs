@@ -2503,8 +2503,9 @@ impl Repo {
 
 /// Whether `rel` is, on this filesystem, the same file as a tracked path that
 /// differs from it only in case (a case-insensitive checkout where `foo` was
-/// renamed to `Foo`). Same device and inode, or it is not an alias: a separate
-/// user file that happens to share the spelling must stay protected.
+/// renamed to `Foo`). The filesystem must be case-insensitive and the two
+/// spellings the same device and inode, or it is not an alias: a separate user
+/// file, or a hard link to the tracked one, must stay protected.
 #[cfg(unix)]
 fn is_tracked_case_alias(
     root: &std::path::Path,
@@ -2512,6 +2513,13 @@ fn is_tracked_case_alias(
     rel: &str,
 ) -> bool {
     use std::os::unix::fs::MetadataExt;
+    // Inode identity alone proves nothing: on a case-sensitive filesystem an
+    // untracked `Foo` can be a hard link to the tracked `foo`. Only a
+    // filesystem that answers to both spellings of a name that certainly
+    // exists (`.sc`) aliases case.
+    if root.join(".SC").symlink_metadata().is_err() {
+        return false;
+    }
     let Ok(here) = root.join(rel).symlink_metadata() else {
         return false;
     };
@@ -2560,8 +2568,13 @@ fn stop_write_blocker(
     for i in 1..comps.len() {
         let prefix = comps[..i].join("/");
         let full = worktree::safe_join(root, &prefix)?;
-        if full.symlink_metadata().is_ok_and(|m| !m.is_dir()) && !tracked(&prefix) {
-            return Ok(Some(StopBlocker::ParentFile));
+        // A symlink is never the tracked file (a write would follow it, or the
+        // materialize removal would delete the user's link), so it blocks
+        // whether or not the old tree tracks that name.
+        if let Ok(m) = full.symlink_metadata() {
+            if !m.is_dir() && (m.file_type().is_symlink() || !tracked(&prefix)) {
+                return Ok(Some(StopBlocker::ParentFile));
+            }
         }
     }
     let full = worktree::safe_join(root, rel)?;
@@ -6749,31 +6762,49 @@ mod stop_blocker_tests {
     }
 
     /// On a case-insensitive checkout `foo` renamed to `Foo` is one file under
-    /// two spellings; only the same device and inode makes it an alias. On a
-    /// case-sensitive one a separate user file called `Foo` stays protected.
+    /// two spellings. On a case-sensitive one nothing aliases: a separate user
+    /// file called `Foo`, or even a hard link to the tracked `foo`, stays
+    /// protected.
     #[cfg(unix)]
     #[test]
-    fn a_case_alias_of_a_tracked_file_is_tracked_only_when_it_is_the_same_file() {
+    fn a_case_alias_of_a_tracked_file_needs_a_case_insensitive_filesystem() {
         let root = tmp("case-alias");
+        std::fs::create_dir_all(root.join(".sc")).unwrap();
         std::fs::write(root.join("foo"), b"tracked\n").unwrap();
         let tracked: std::collections::BTreeSet<String> = ["foo".to_string()].into();
-        // The filesystem under test decides whether `Foo` is a second file.
         let case_insensitive = root.join("Foo").exists();
 
         if case_insensitive {
             // `Foo` already names the tracked file: an alias.
             assert!(is_tracked_case_alias(&root, &tracked, "Foo"));
         } else {
-            // A separate file `Foo`: different inode, not an alias.
             std::fs::write(root.join("Foo"), b"user's own\n").unwrap();
             assert!(!is_tracked_case_alias(&root, &tracked, "Foo"));
-            // The same file under a second spelling: an alias.
+            // A hard link shares the inode but is still the user's file here.
             std::fs::remove_file(root.join("Foo")).unwrap();
             std::fs::hard_link(root.join("foo"), root.join("Foo")).unwrap();
-            assert!(is_tracked_case_alias(&root, &tracked, "Foo"));
+            assert!(!is_tracked_case_alias(&root, &tracked, "Foo"));
         }
         assert!(!is_tracked_case_alias(&root, &tracked, "Other"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A symlink standing where a parent directory must be blocks even when
+    /// the old tree tracks that name (a protected file skipped for want of an
+    /// identity leaves room for one).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_parent_blocks_even_when_the_name_is_tracked() {
+        let root = tmp("symlink-parent");
+        let outside = tmp("symlink-parent-outside");
+        std::os::unix::fs::symlink(&outside, root.join("a")).unwrap();
+        let tracked = |_: &str| true;
+        assert_eq!(
+            stop_write_blocker(&root, "a/b", &mut { tracked }).unwrap(),
+            Some(StopBlocker::ParentFile)
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
