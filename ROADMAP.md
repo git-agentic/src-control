@@ -558,12 +558,12 @@ clone: the view closure is filled by id before switch, fast-forward, undo and
 `sparse disable` stay refused. Design and open questions in
 [ADR-0048](docs/adr/0048-presence-based-partial-clones.md).
 
-**P37c — merge on partial clones (proposed; 37c-i engine, 37c-ii clean merge, 37c-iii conflicts and 37c-iv replay built).** A tree-recursive three-way merge
+**P37c — merge on partial clones (built; 37c-i engine, 37c-ii clean merge, 37c-iii conflicts and 37c-iv replay).** A tree-recursive three-way merge
 that carries a subtree by id where the three sides agree, checks protection
 rules before carrying, never drops wraps for subtrees it does not enumerate,
 and fills (lazy) or refuses (otherwise) the region where the sides differ,
-the region that intersects a protection rule, and the sparse view's closure. Merges are built (`sc merge` on a partial clone): a conflict inside the view is marked, resolved with `sc conflicts`/`sc resolve`, aborted or committed like on a full clone; a conflict outside the view, or one that needs sealing outside it, is refused before any write. Cherry-pick and rebase use the same engine and conflict contract (`sc cherry-pick`, `sc rebase` and their `--continue`/`--abort` work on a partial clone); sessions
-are undecided. Design in
+the region that intersects a protection rule, and the sparse view's closure. Merges are built (`sc merge` on a partial clone): a conflict inside the view is marked, resolved with `sc conflicts`/`sc resolve`, aborted or committed like on a full clone; a conflict outside the view, or one that needs sealing outside it, is refused before any write. Cherry-pick and rebase use the same engine and conflict contract (`sc cherry-pick`, `sc rebase` and their `--continue`/`--abort` work on a partial clone); sessions are built (P37d, [ADR-0050](docs/adr/0050-sessions-on-partial-clones.md)): workspaces and
+agents see the clone's view, and harvest lands through this merge. Design in
 [ADR-0049](docs/adr/0049-merge-on-partial-clones.md).
 
 ## Completed phases (usability-first ordering)
@@ -774,7 +774,7 @@ scale-&-reach horizon):
   workaround proves too coarse in practice.
   **Now scoped as P37b (ADR-0048) and P37c (ADR-0049, Proposed):** push,
   verify and gc are presence-based (built); merge is designed in ADR-0049,
-  with replay following it and sessions undecided.
+  with replay and sessions (ADR-0050) following it.
 - **Blob-size/object-count clone filters (P27).** `sc clone --filter` is
   prefix-only, matching the sparse path-boundary machinery already built;
   git's `--filter=blob:limit` size-based filtering is a separate axis,
