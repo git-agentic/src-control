@@ -720,12 +720,17 @@ scale-&-reach horizon):
   limitation across different Git repos).
 - **Richer trust models** beyond trusted-key lists (delegation, expiry) —
   P22 ships the key-list model.
-- **Sidecar-cleanup footgun in `rebase_continue` — half fixed (P37c).**
-  `remove_conflict_sidecars` now skips paths the completion's parent tree
-  tracks, but it still has no non-text-kind gate: a text conflict writes no
-  `.theirs` sidecar, so an untracked user file named `foo.txt.theirs` is
-  still deleted when the stop's conflict path is `foo.txt`. Pass the conflict
-  kind (or the written sidecar list) to the sweep to close it.
+- **Sidecar-cleanup footgun in `rebase_continue` — fixed.** A stop records the
+  `.theirs` sidecars it actually wrote in `.sc/CONFLICT_SIDECARS`; merge/pick/
+  rebase abort, `rebase --continue` and `sc resolve` unlink only those (and
+  never a path the restored tree tracks), so an untracked user `foo.txt.theirs`
+  survives whatever the conflict kind.
+- **Completion commits a leftover `.theirs` sidecar.** A binary conflict's
+  `<path>.theirs` is working-tree scratch, but if the user resolves by editing
+  `<path>` (not `sc resolve`) and leaves the sidecar, the completing `sc commit`
+  or `rebase --continue` snapshots it as a tracked file (reproduced on main with
+  a merge). Exclude recorded sidecars (`.sc/CONFLICT_SIDECARS`) that no input
+  root tracks from the completion snapshot.
 - **In-progress guard for the RECEIVING repo on push.**
   `LocalTransport::update_ref` moves a branch tip with only a CAS/ff gate
   and no in-progress check on the receiving side — a push into a repo

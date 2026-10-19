@@ -1877,6 +1877,10 @@ impl Repo {
                 .map(|(p, ..)| p.clone())
                 .collect::<Vec<_>>(),
         )?;
+        crate::conflict_plaintext::write_sidecars(
+            &self.layout,
+            &sidecars.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        )?;
         for (path, bytes, _mode, _recipients) in to_encrypt {
             let full = worktree::safe_join(&self.layout.root, path)?;
             if let Some(parent) = full.parent() {
@@ -1927,27 +1931,47 @@ impl Repo {
         Ok(())
     }
 
-    /// Remove the `<path>.theirs` sidecars a stopped merge, pick or rebase
-    /// wrote for `paths`, except a file any of `roots` tracks: that one is the
-    /// user's own and was just restored. A failed lookup counts as tracked: a
-    /// stray sidecar is harmless, deleting a tracked file is not. Call it after
-    /// the restore, so a restore that fails leaves the sidecars to retry.
-    pub(crate) fn remove_conflict_sidecars(
-        &self,
-        paths: &[String],
-        roots: &[ObjectId],
-    ) -> Result<()> {
+    /// Remove the `<path>.theirs` sidecars the stop recorded writing
+    /// (`conflict_plaintext::read_sidecars`), except a file any of `roots`
+    /// tracks: that one is the user's own and was just restored. A `.theirs`
+    /// file the stop did not write is the user's, whatever kind of conflict
+    /// sits beside it. A failed lookup counts as tracked: a stray sidecar is
+    /// harmless, deleting a tracked file is not. Call it after the restore, so
+    /// a restore that fails leaves the sidecars to retry. The record is retired
+    /// once swept.
+    pub(crate) fn remove_conflict_sidecars(&self, roots: &[ObjectId]) -> Result<()> {
+        let sidecars = crate::conflict_plaintext::read_sidecars(&self.layout)?;
+        if sidecars.is_empty() {
+            return Ok(());
+        }
+        // Retire the whole record before unlinking anything, in one write: a
+        // crash then leaves harmless residue, never a record naming a path the
+        // user may recreate before the retry. A removal that fails puts the
+        // failed and unprocessed paths back so the retry can finish the job.
+        crate::conflict_plaintext::write_sidecars(&self.layout, &[])?;
         let partial = self.promisor()?.is_some();
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
-        for path in paths {
-            let sidecar = format!("{path}.theirs");
+        let sidecars: Vec<String> = sidecars.into_iter().collect();
+        for (i, sidecar) in sidecars.iter().enumerate() {
             let tracked = roots.iter().any(|root| {
-                worktree::tree_entry_at(&mut store, *root, &sidecar, partial)
+                worktree::tree_entry_at(&mut store, *root, sidecar, partial)
                     .map_or(true, |e| e.is_some())
             });
-            if !tracked {
-                let _ = std::fs::remove_file(self.layout.root.join(sidecar));
+            if tracked {
+                continue;
+            }
+            let removed = worktree::safe_join(&self.layout.root, sidecar).and_then(|full| {
+                match std::fs::remove_file(full) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e.into()),
+                }
+            });
+            if let Err(e) = removed {
+                // Best effort: the removal error is the one worth reporting.
+                let _ = crate::conflict_plaintext::write_sidecars(&self.layout, &sidecars[i..]);
+                return Err(e);
             }
         }
         Ok(())
@@ -2007,10 +2031,7 @@ impl Repo {
         if let Some(root) = sidecar_roots.first() {
             self.remove_conflict_plaintext(*root)?;
         }
-        self.remove_conflict_sidecars(
-            &crate::merge_state::read_conflicts(&self.layout)?,
-            &sidecar_roots,
-        )?;
+        self.remove_conflict_sidecars(&sidecar_roots)?;
         crate::merge_state::clear(&self.layout)?;
         Ok(skipped)
     }

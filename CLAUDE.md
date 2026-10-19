@@ -241,7 +241,10 @@ transport-adjacent. The rest, imperatively:
 - **A stopped merge/pick/rebase lists the paths it wrote as plaintext in
   `.sc/CONFLICT_PLAINTEXT`.** Protected conflict text never enters the CAS, so no
   tree records it; completion treats a listed path absent from disk as deleted,
-  and abort removes listed paths the restored tree does not track as plain files.
+  and abort removes listed paths the restored tree does not track as plain files. The `<path>.theirs`
+  sidecars it wrote are listed apart in `.sc/CONFLICT_SIDECARS`; abort, `rebase
+  --continue` and `sc resolve` remove only those, never a `.theirs` file the stop
+  did not write.
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first.
