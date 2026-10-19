@@ -2086,6 +2086,54 @@ mod tests {
         assert!(!broot.exists());
     }
 
+    /// A bucket-backed serve session refuses `GetObjects` (by-id reads exist
+    /// only for partial clones, which bucket remotes refuse, ADR-0046) with a
+    /// typed error, and the session stays usable afterwards.
+    #[test]
+    fn bucket_serve_refuses_get_objects_and_keeps_the_session() {
+        let pid = std::process::id();
+        let broot = std::env::temp_dir().join(format!("scl-wire-bucket-byid-{pid}"));
+        let _ = std::fs::remove_dir_all(&broot);
+        let url = format!("sc+wal://{}", broot.display());
+        let home = tmp_repo("bucket-byid-home");
+        let (tip, objects) = tiny_history_for_bucket("byid", b"hello by-id");
+        {
+            let t = crate::bucket_transport::BucketTransport::open(&url).unwrap();
+            let (pack, _idx) = scl_core::pack::build_pack(&objects).unwrap();
+            t.put_pack(&mut std::io::Cursor::new(pack)).unwrap();
+            t.update_ref("main", &tip, None).unwrap();
+        }
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let (url_s, home_s) = (url.clone(), home.clone());
+        let srv = std::thread::spawn(move || {
+            serve_bucket_with_policy(
+                &url_s,
+                &home_s,
+                &mut server_read,
+                &mut server_write,
+                WirePolicy::default(),
+            )
+        });
+        let client =
+            crate::stdio_transport::WireClient::handshake(client_read, client_write).unwrap();
+
+        let err = client.get_objects(&[tip], &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) | Error::Remote(m) if m.contains("by-id")),
+            "got {err:?}"
+        );
+        // The refusal failed the request, not the session.
+        assert_eq!(client.list_refs().unwrap().len(), 1);
+
+        client.bye().unwrap();
+        drop(client);
+        srv.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&broot).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(!broot.exists());
+    }
+
     /// Regression for a review finding: a bucket-backed serve session's pack
     /// spool dir must live under the serve HOME's own `.sc/tmp/`, not the
     /// process-wide `std::env::temp_dir()` (CLAUDE.md / THREAT-MODEL.md's
