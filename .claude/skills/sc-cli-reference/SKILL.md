@@ -114,7 +114,7 @@ cargo run --bin sc -- secret rotate <name> --identity <key>    # same value, fre
 cargo run --bin sc -- escrow set <pubkey-or-name>              # break-glass recovery key
                                                                 # (replace-with-one sugar, P17)
 bash demo/run_lifecycle_demo.sh                                # rotation + escrow proof
-cargo run --bin sc -- rewrap [--identity <key>] [--dry-run]   # one-commit bulk reseal of all
+cargo run --bin sc -- rewrap [--identity <key>] [--dry-run] [--rotate]   # one-commit bulk reseal of all
                                               # secrets + protected wrap lists to current
                                               # recipient/escrow sets (skip-and-report;
                                               # exits 1 when entries were skipped); also
@@ -122,7 +122,9 @@ cargo run --bin sc -- rewrap [--identity <key>] [--dry-run]   # one-commit bulk 
                                               # protected blob RANDOMIZED (P33) — so a rewrap
                                               # that upgrades content is no longer tree-identical,
                                               # while a second rewrap over an all-randomized tip
-                                              # converges back to policy-only
+                                              # converges back to policy-only; --rotate also re-seals
+                                              # every protected blob under a FRESH key (ADR-0051), so
+                                              # a recipient with an old wrap cannot open the tip
 cargo run --bin sc -- escrow add <pubkey-or-name>    # append a break-glass key (list)
 cargo run --bin sc -- escrow remove <id-or-name>
 cargo run --bin sc -- escrow show                    # lists all escrow keys

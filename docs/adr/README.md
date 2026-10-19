@@ -61,6 +61,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0048](0048-presence-based-partial-clones.md) | Presence-based walks for partial clones | Accepted (37b-i, 37b-ii built) | 37b |
 | [0049](0049-merge-on-partial-clones.md) | Merge on partial clones | Proposed (37c-i to 37c-iv built) | 37c |
 | [0050](0050-sessions-on-partial-clones.md) | Agent sessions on partial clones | Accepted | 37d |
+| [0051](0051-rotate-protected-paths.md) | Rotating protected paths (`sc rewrap --rotate`) | Accepted | — |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

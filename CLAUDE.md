@@ -194,14 +194,17 @@ transport-adjacent. The rest, imperatively:
   their prior wrap list. Use `sc grant` (or `sc rewrap`) to add a recipient to
   existing content. Fails safe: under-grants, never over-grants.
 - **`sc rewrap` is content-changing when it upgrades** still-convergent blobs
-  to randomized; only a rewrap over an all-randomized tip is policy-only.
+  to randomized, or with `--rotate`; only a plain rewrap over an all-randomized
+  tip is policy-only.
 - **`.sc/local-key` and the per-checkout protected caches
   (`.sc/protected-cache`, `.sc/ws/cache-<i>`) are never committed and never
   transferred.** Cache saves are best-effort and ordered after ref moves; a
   cache failure may cause a spurious re-seal but never incorrectness.
 - **Revoke is standing-only.** A revoked recipient keeps decrypting ciphertext
   sealed before the revoke (they hold the old wraps); cryptographic cutover is
-  `sc rewrap` at the tip plus rotating the underlying credential.
+  `sc rewrap --rotate` at the tip (fresh key per protected blob; a plain
+  `sc rewrap` only replaces wrap lists) plus rotating the underlying credential.
+  History keeps the old ciphertext (rotation is not erasure).
 - **The oplog is local-only** (like a reflog) — it never travels over
   fetch/push/clone. `sc undo` twice = redo; undoing the initial commit is
   refused.
@@ -260,7 +263,7 @@ transport-adjacent. The rest, imperatively:
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here). Notable standing entries: transparent
 lazy-fetch for partial clones, per-case gap-tolerant merge/replay on partial
-clones, rotate-for-paths (unlocked by P33, recorded not built), fd/stdin
+clones, fd/stdin
 secret injection, CA-path validation alongside TOFU pinning, and pin-management
 UX (`sc tls`).
 

@@ -786,12 +786,9 @@ scale-&-reach horizon):
   it: all new protected content seals under a fresh random DEK + nonce
   (dual-read for pre-P33 convergent history; `sc rewrap` upgrades a tip on
   demand). Moved from deferred to Done above.
-- **Rotate-for-paths (P33 follow-on).** ADR-0019 declared per-path DEK rotation
-  "security-meaningless" under convergent encryption. That objection dissolves
-  for randomized content (a random DEK is independent of the plaintext), so a
-  `sc protect … rotate`-style genuine per-path cryptographic cutover — the
-  protected-path analogue of `sc secret rotate` — is now coherent. Recorded in
-  ADR-0043, not built.
+- **Rotate-for-paths — shipped (ADR-0051).** `sc rewrap --rotate` re-seals every
+  protected blob at the tip under a fresh DEK (the path analogue of `sc secret
+  rotate`); history keeps the old ciphertext (rotation is not erasure).
 - **`sc rewrap` on partial clones — refused (P37).** `Repo::rewrap` calls
   `refuse_on_partial`; a paths-only/streaming rebuild that would lift the
   refusal remains a possible follow-on.

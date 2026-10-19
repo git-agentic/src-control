@@ -508,7 +508,7 @@ re-wrap (`grant`/`revoke`). `sc secret revoke` remains metadata-only and now
 hints to run `rotate` for the actual cryptographic cutover. (**P33/ADR-0043:**
 the security-meaningless objection dissolves for **randomized** content — a
 random DEK is independent of the plaintext — so a genuine rotate-for-paths
-cutover is now coherent and recorded as an unlocked follow-on, not yet built.)
+cutover is coherent, and is built as `sc rewrap --rotate` (ADR-0051).)
 
 `sc escrow set <pubkey-or-name>` / `sc escrow show` configure a single
 break-glass recipient key (`[escrow]` in `.sc/recipients.toml`) that is
