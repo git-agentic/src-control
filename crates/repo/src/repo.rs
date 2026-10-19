@@ -6749,24 +6749,29 @@ mod stop_blocker_tests {
     }
 
     /// On a case-insensitive checkout `foo` renamed to `Foo` is one file under
-    /// two spellings; only the same device and inode makes it an alias. A
-    /// separate user file called `Foo` stays protected.
+    /// two spellings; only the same device and inode makes it an alias. On a
+    /// case-sensitive one a separate user file called `Foo` stays protected.
     #[cfg(unix)]
     #[test]
     fn a_case_alias_of_a_tracked_file_is_tracked_only_when_it_is_the_same_file() {
         let root = tmp("case-alias");
         std::fs::write(root.join("foo"), b"tracked\n").unwrap();
         let tracked: std::collections::BTreeSet<String> = ["foo".to_string()].into();
+        // The filesystem under test decides whether `Foo` is a second file.
+        let case_insensitive = root.join("Foo").exists();
 
-        // A separate file `Foo`: different inode, not an alias.
-        std::fs::write(root.join("Foo"), b"user's own\n").unwrap();
-        assert!(!is_tracked_case_alias(&root, &tracked, "Foo"));
-
-        // The same file under a second spelling (what a case-insensitive
-        // filesystem presents): an alias.
-        std::fs::remove_file(root.join("Foo")).unwrap();
-        std::fs::hard_link(root.join("foo"), root.join("Foo")).unwrap();
-        assert!(is_tracked_case_alias(&root, &tracked, "Foo"));
+        if case_insensitive {
+            // `Foo` already names the tracked file: an alias.
+            assert!(is_tracked_case_alias(&root, &tracked, "Foo"));
+        } else {
+            // A separate file `Foo`: different inode, not an alias.
+            std::fs::write(root.join("Foo"), b"user's own\n").unwrap();
+            assert!(!is_tracked_case_alias(&root, &tracked, "Foo"));
+            // The same file under a second spelling: an alias.
+            std::fs::remove_file(root.join("Foo")).unwrap();
+            std::fs::hard_link(root.join("foo"), root.join("Foo")).unwrap();
+            assert!(is_tracked_case_alias(&root, &tracked, "Foo"));
+        }
         assert!(!is_tracked_case_alias(&root, &tracked, "Other"));
         std::fs::remove_dir_all(&root).ok();
     }
