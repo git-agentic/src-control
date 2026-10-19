@@ -669,14 +669,18 @@ fn connect_within(authority: &str, timeout: Duration) -> std::io::Result<TcpStre
         )
     })??;
     let mut last = None;
-    for addr in addrs {
+    let total = addrs.len();
+    for (i, addr) in addrs.into_iter().enumerate() {
         // One deadline for the whole connect, not one bound per address: a
         // dual-stack host with unreachable addresses must not take n x timeout.
+        // Each attempt gets an even share of what is left, so a first address
+        // that silently drops packets cannot starve a reachable later one.
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
-        match TcpStream::connect_timeout(&addr, remaining) {
+        let slice = attempt_share(remaining, total - i);
+        match TcpStream::connect_timeout(&addr, slice) {
             Ok(s) => return Ok(s),
             Err(e) => last = Some(e),
         }
@@ -687,6 +691,13 @@ fn connect_within(authority: &str, timeout: Duration) -> std::io::Result<TcpStre
             "no address connected within the bound",
         )
     }))
+}
+
+/// The share of `remaining` one connect attempt may use when `left` addresses
+/// (itself included) are still to try: an even split, so every address gets a
+/// turn inside the overall deadline.
+fn attempt_share(remaining: Duration, left: usize) -> Duration {
+    remaining / u32::try_from(left.max(1)).unwrap_or(u32::MAX)
 }
 
 /// A timeout from the client's opening bound, in whatever shape the layer that
@@ -2156,6 +2167,22 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(connect_within("host.invalid:1", Duration::from_secs(5)).is_err());
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn each_connect_attempt_gets_an_even_share_of_the_deadline() {
+        let t = Duration::from_secs(30);
+        assert_eq!(attempt_share(t, 1), t, "the only address gets everything");
+        assert_eq!(attempt_share(t, 2), Duration::from_secs(15));
+        assert_eq!(attempt_share(t, 3), Duration::from_secs(10));
+        // Run three attempts back to back, each using its whole share: the
+        // deadline is used up exactly, never exceeded.
+        let mut left = t;
+        for remaining in (1..=3).rev() {
+            left -= attempt_share(left, remaining);
+        }
+        assert_eq!(left, Duration::ZERO);
+        assert_eq!(attempt_share(t, 0), t, "no divide by zero");
     }
 
     /// A peer that accepts but never reads must fail the connect when the
