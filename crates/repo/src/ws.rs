@@ -225,6 +225,15 @@ impl Repo {
         // fail with the gap error before any checkout is written.
         let tip_root = self.snapshot(&tip)?.root;
         self.ensure_view(tip_root, &sparse)?;
+        // `ensure_view` fills only when it can; on a non-lazy or offline clone
+        // the view may still hold a gap. Check presence against the HOST's
+        // layout now: a workspace's own layout is not a partial clone, so its
+        // materialize would not, and the gap would surface mid-write.
+        {
+            let store_arc = self.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            crate::worktree::preflight_view(self.layout(), &mut store, tip_root, &sparse)?;
+        }
 
         let root = ws_dir(self.layout());
         // No manifest proves any .sc/ws content is crash residue from a
@@ -794,7 +803,17 @@ impl Repo {
                 crate::workspace::HarvestResult::Committed(id) => {
                     let current_tip =
                         refs::read_branch_tip(self.layout(), &landing)?.ok_or(Error::Unborn)?;
-                    let clean = self.would_merge_cleanly(current_tip, id, identity)?;
+                    // The candidate branch exists only to be landed or kept for
+                    // a conflict. A failing probe leaves the workspace live for
+                    // a retry, which would mint another candidate: remove this
+                    // one first.
+                    let clean = match self.would_merge_cleanly(current_tip, id, identity) {
+                        Ok(clean) => clean,
+                        Err(e) => {
+                            let _ = refs::delete_branch(self.layout(), &branch);
+                            return Err(e);
+                        }
+                    };
                     if clean {
                         // The second tuple element on `Ok` is skipped
                         // protected paths (missing-identity skips), not
@@ -856,6 +875,14 @@ impl Repo {
                                 // of three_way's parameters is wrong, not a
                                 // normal user-facing conflict. Bail loudly
                                 // before any teardown.
+                                if !matches!(e, Error::MergeConflicts(_)) {
+                                    // Refused before any write (a gap, a policy
+                                    // error): the workspace stays live, so drop
+                                    // the candidate rather than leak one per
+                                    // retry. A real conflict keeps it: its
+                                    // markers are on disk.
+                                    let _ = refs::delete_branch(self.layout(), &branch);
+                                }
                                 return Err(if matches!(e, Error::MergeConflicts(_)) {
                                     Error::BadRef(format!(
                                         "ws harvest: probe predicted a clean merge of {branch} \

@@ -255,6 +255,14 @@ impl Repo {
             let view = self.sparse_spec()?;
             let tip_root = self.snapshot(&tip)?.root;
             self.ensure_view(tip_root, &view)?;
+            // Presence against the host's layout, before any checkout: a
+            // workspace's own layout is not a partial clone, so its
+            // materialize would not catch a gap (non-lazy or offline clone).
+            {
+                let store_arc = self.vfs().store();
+                let mut store = store_arc.lock().unwrap();
+                crate::worktree::preflight_view(self.layout(), &mut store, tip_root, &view)?;
+            }
             view
         } else {
             crate::sparse::Sparse::default()

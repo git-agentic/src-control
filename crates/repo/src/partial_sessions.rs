@@ -168,3 +168,88 @@ fn work_agents_see_the_view_and_harvest_without_reading_the_rest() {
     drop(clone);
     fx.cleanup();
 }
+
+/// A non-lazy clone whose HEAD view holds a gap: fork and `sc work` fail with
+/// the gap error before any session state or checkout exists.
+#[test]
+fn fork_and_work_refuse_a_view_gap_before_writing_anything() {
+    let fx = Fx::origin("ws-gap", |_| {});
+    let clone = fx.clone(false);
+    // The origin adds src/copy.md with the bytes of docs/a.md. The clone never
+    // fetched that blob (docs/ is outside its filter), so after a fetch an
+    // in-filter object is absent. Its main is pointed at the new tip.
+    std::fs::write(fx.origin_root.join("src/copy.md"), b"a\n").unwrap();
+    fx.origin
+        .commit("t", "adds a src file sharing a docs blob")
+        .unwrap();
+    clone.fetch("origin").unwrap();
+    let tip = refs::resolve_tip(clone.layout(), "origin/main")
+        .unwrap()
+        .unwrap();
+    refs::write_branch_tip(clone.layout(), "main", &tip).unwrap();
+    assert!(
+        !has(&clone, &crate::partial_merge::blob_id(b"a\n")),
+        "premise: a gap"
+    );
+
+    let err = clone.ws_fork(1, "t", None).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::GapInView { .. }),
+        "got {err:?}"
+    );
+    assert!(clone.ws_session().unwrap().is_none());
+    assert!(!clone.layout().dot_sc.join("ws").exists(), "no session dir");
+
+    let scratch = std::env::temp_dir().join(format!("scl-work-gap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    let err = clone.work(work_opts(&["true"], &scratch)).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::GapInView { .. }),
+        "got {err:?}"
+    );
+    assert!(!scratch.join("session").exists(), "no session residue");
+    std::fs::remove_dir_all(&scratch).unwrap();
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A probe that cannot be answered (the host moved a protected region the
+/// clone does not hold) fails the harvest, and must not leave a candidate
+/// `work-<i>` branch behind: a retry would mint another one.
+#[test]
+fn a_failing_probe_leaves_no_candidate_branch() {
+    let (_sk, pk) = scl_crypto::generate_keypair();
+    let fx = crate::partial_merge::protected_origin("ws-probe", &pk);
+    let b1 = fx.origin_branch("b1", &[("vault/s.txt", b"L1\nl2\nl3\n")]);
+    let clone = fx.clone(false);
+    let session = clone.ws_fork(1, "t", None).unwrap();
+    std::fs::write(session.workspaces[0].dir.join("src/a.txt"), SRC_FIRST).unwrap();
+    // The host fast-forwards to a commit that changed the protected vault/,
+    // which the clone does not hold and cannot fetch.
+    clone.merge("origin/b1", "t").unwrap();
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        Some(b1)
+    );
+
+    let err = clone.ws_harvest(None, "t", None).unwrap_err();
+    eprintln!("probe error: {err:?}");
+    assert!(
+        refs::read_branch_tip(clone.layout(), "work-1")
+            .unwrap()
+            .is_none(),
+        "no candidate branch may survive a failed harvest ({err:?})"
+    );
+    assert!(
+        clone.ws_session().unwrap().is_some(),
+        "the workspace stays live"
+    );
+    assert_eq!(
+        refs::read_branch_tip(clone.layout(), "main").unwrap(),
+        Some(b1)
+    );
+    clone.ws_abandon(None).unwrap();
+    drop(clone);
+    fx.cleanup();
+}
