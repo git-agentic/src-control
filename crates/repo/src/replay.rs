@@ -3632,7 +3632,9 @@ mod tests {
             decided,
             &Sparse::new(vec!["src/".into(), "docs/".into()]),
         );
-        let recorded = crate::sparse::load_widen(repo.layout(), decided).unwrap();
+        let recorded = crate::sparse::load_widen(repo.layout(), decided)
+            .unwrap()
+            .unwrap();
         let want: std::collections::BTreeSet<String> = odd.iter().map(|p| p.to_string()).collect();
         assert_eq!(recorded, want, "exactly the laid paths, byte for byte");
         for p in odd {

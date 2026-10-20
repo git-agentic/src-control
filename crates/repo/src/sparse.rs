@@ -174,21 +174,23 @@ pub(crate) fn clear_prev(layout: &Layout) -> Result<()> {
 }
 
 /// The paths an in-flight stopped-op widen recorded writing, if the record
-/// belongs to the stop whose decided root is `decided` (its first line); a
-/// record from another stop is stale and reads as empty.
+/// belongs to the stop whose decided root is `decided` (its header); a record
+/// from another stop is stale and reads as `None`. `Some` of an empty set is a
+/// header-only record: a widen that added no plain file, which still left a
+/// pending widen (its `sparse-prev` bound).
 pub(crate) fn load_widen(
     layout: &Layout,
     decided: scl_core::ObjectId,
-) -> Result<std::collections::BTreeSet<String>> {
+) -> Result<Option<std::collections::BTreeSet<String>>> {
     match std::fs::read_to_string(layout.sparse_widen_path()) {
         Ok(text) => {
             let mut fields = widen_fields(&text);
             if fields.next() != Some(decided.to_hex().as_str()) {
-                return Ok(Default::default());
+                return Ok(None);
             }
-            Ok(fields.map(String::from).collect())
+            Ok(Some(fields.map(String::from).collect()))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
@@ -525,7 +527,7 @@ impl Repo {
         // Files an interrupted run of this same widen already wrote (recorded
         // in `.sc/sparse-widen`, bytes equal to the decided root's): a retry
         // may rewrite them. Anything else at those paths is the user's.
-        let recorded = load_widen(self.layout(), decided)?;
+        let recorded = load_widen(self.layout(), decided)?.unwrap_or_default();
         let already_laid = {
             let mut s = store_arc.lock().unwrap();
             crate::worktree::added_view_already_laid(
@@ -636,10 +638,10 @@ impl Repo {
         let Some(decided) = decided else {
             return Ok(None);
         };
-        let recorded = load_widen(self.layout(), decided)?;
-        if recorded.is_empty() {
+        // A header-only record is a pending widen too.
+        let Some(recorded) = load_widen(self.layout(), decided)? else {
             return Ok(None);
-        }
+        };
         let view = self.sparse_spec()?;
         let outside: std::collections::BTreeSet<String> =
             recorded.into_iter().filter(|p| !view.matches(p)).collect();

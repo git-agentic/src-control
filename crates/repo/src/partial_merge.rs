@@ -529,6 +529,44 @@ fn completing_after_an_interrupted_partial_widen_clears_the_bound() {
     }
 }
 
+/// A widen whose newly included paths are all protected writes no file, so its
+/// record has only a header, yet on a partial clone it still left the wider
+/// `sparse-prev` bound. Completion treats that record as pending too.
+#[test]
+fn completing_after_an_interrupted_protected_only_widen_clears_the_bound() {
+    let (_sk, pk) = scl_crypto::generate_keypair();
+    let fx = protected_origin("complete-widen-prot", &pk);
+    fx.origin_branch("b1", &[("src/a.txt", b"ONE\ntwo\nthree\n")]);
+    let clone = fx.clone(true);
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    let old = clone.sparse_spec().unwrap();
+    let wide = crate::Sparse::new(vec!["src/".to_string(), "vault/".to_string()]);
+    let decided = crate::merge_state::read_decided_root(clone.layout())
+        .unwrap()
+        .unwrap();
+    let (skipped, _) = clone.lay_out_widened_view(decided, &old, &wide).unwrap();
+    assert_eq!(skipped, vec!["vault/s.txt".to_string()], "protected only");
+    assert_eq!(
+        crate::sparse::load_widen(clone.layout(), decided).unwrap(),
+        Some(Default::default()),
+        "a header-only record"
+    );
+    assert!(clone.layout().sparse_prev_path().exists(), "premise");
+
+    clone
+        .resolve_path("src/a.txt", crate::conflicts::ResolveSide::Theirs, None)
+        .unwrap();
+    clone.commit("t", "merge").unwrap();
+    assert!(!clone.layout().sparse_prev_path().exists());
+    assert!(!clone.layout().sparse_widen_path().exists());
+    drop(clone);
+    fx.cleanup();
+}
+
 /// Aborting restores ours and removes the markers; the carried subtree was
 /// never on disk and the ref never moved.
 #[test]
