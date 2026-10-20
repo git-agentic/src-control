@@ -235,10 +235,9 @@ transport-adjacent. The rest, imperatively:
   environment (they arrive on fd N as NUL-terminated `NAME=VALUE` records,
   `SC_SECRETS_FD` names it): hygiene against env dumps and inheritance, still
   not isolation. `sc ws run` and `sc work --with-secrets` use the environment.
-- **Sparse is checkout-only** and has one disk-hygiene boundary: an in-sparse
-  conflict co-occurring with an out-of-sparse protected/plain clean change can
-  leave that out-of-sparse plaintext on disk until the next materializing
-  operation re-lays the tree (not data loss, not a new disclosure — ADR-0034).
+- **Sparse is checkout-only**, and a stopped merge/pick/rebase never writes
+  outside the view: an out-of-sparse conflicted path, sealing input or sidecar
+  refuses with a `sc sparse set` hint before any write (ADR-0034, #210).
 - **`.sc/git-remotes/<name>/marks` carries `git_oid ↔ sc_id` identity —
   deleting it is destructive.** Deleting the sibling `mirror.git` is always
   safe (reconstructed on next use). Stale marks self-heal on push/export.

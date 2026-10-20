@@ -2820,7 +2820,8 @@ mod tests {
     /// A full clone with a sparse view: the tree tracks a protected path the
     /// view never materialized, and the user keeps an ignored local copy there.
     /// An in-view conflict together with a clean protected merge of that path
-    /// would write plaintext over it, so the stop refuses.
+    /// would write plaintext over it, so the stop refuses (since #210 on the
+    /// sparse gate, before the untracked-overwrite check is reached).
     #[test]
     fn a_conflict_stop_does_not_treat_an_out_of_view_path_as_materialized() {
         let root = tmp_root("mg-sparse-untracked");
@@ -2851,7 +2852,7 @@ mod tests {
             .merge_with_identity("work", "me", Some(&alice_sk))
             .unwrap_err();
         assert!(
-            matches!(&err, Error::InvalidArgument(m) if m.contains("overwrite an untracked")),
+            matches!(&err, Error::InvalidArgument(m) if m.contains("outside your sparse checkout")),
             "got {err:?}"
         );
         assert!(!repo.merge_in_progress());
