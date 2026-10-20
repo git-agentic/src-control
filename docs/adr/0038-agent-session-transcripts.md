@@ -158,22 +158,39 @@ pipe-safety discipline).
    client already has control:
    - `push`: the client builds the outgoing set, so it leaves out indexed
      transcripts and the signatures keyed by them. This saves bandwidth.
-   - `fetch` / `clone`: the server still sends them. The receiver verifies
-     every record in pass 1 of `ingest_pack_file` as usual, then pass 2 does
-     not write `Transcript` objects, nor a signature whose target is a
-     transcript dropped from the same pack. This saves disk and exposure
-     (no ciphertext, no index entry), **not** bandwidth. A server-side skip
-     would need a new `GetPack` field and a version bump; it is a deferred
-     follow-on in `ROADMAP.md`.
+   - `fetch` / `clone`: the server still sends them. The receiver
+     hash-checks every record in pass 1 of `ingest_pack_file` as usual (a
+     hash check, not signature verification), then pass 2 does not write
+     `Transcript` objects, nor a signature whose target is a transcript
+     dropped from the same pack. This transfer therefore writes and indexes
+     no transcript. It saves disk and exposure (no ciphertext, no index
+     entry), **not** bandwidth. A server-side skip would need a new
+     `GetPack` field and a version bump; it is a deferred follow-on in
+     `ROADMAP.md`.
 2. **Per command, not persisted.** A clone made with `--no-transcripts`
    records nothing; a later plain `sc fetch` brings every indexed transcript
-   in (the sender's over-send covers snapshots the receiver already has).
-   A plain `sc push` after a `--no-transcripts` push carries them only once
-   the branch moves again, because `push` returns early when the remote tip
-   already equals the local tip (the same limit a retroactive attach has).
+   in (the sender re-sends all of them each time, because they are never
+   subtracted via the have-set). The same re-send means a `--no-transcripts`
+   fetch also drops a new signature over a transcript the receiver already
+   holds; the next plain fetch brings it in. A plain `sc push` after a
+   `--no-transcripts` push carries them only once the branch moves again,
+   because `push` returns early when the remote tip already equals the local
+   tip (the same limit a retroactive attach has).
 3. **Sealing and integrity unchanged.** Bodies stay sealed whether or not they
    travel. Snapshots, trees, blobs and the snapshot's own signatures transfer
-   and verify exactly as before. Index entries are left out with the objects,
-   so no `.sc/transcripts` or `.sc/signatures` entry points at a transcript
-   the repo does not hold. Git remotes never carry transcripts, so the flag is
-   a no-op there.
+   and are hash-checked exactly as before. Index entries are left out with the
+   objects, so no `.sc/transcripts` or `.sc/signatures` entry created by this
+   transfer points at a transcript the repo does not hold.
+4. **Remotes where the flag does nothing.** Git remotes never carry
+   transcripts. Bucket remotes (`sc+wal://`, `sc+s3://`) do not either:
+   `BucketTransport::get_pack` walks reachability only, so a fetch or clone
+   from a bucket delivers no transcripts or transcript signatures whether or
+   not the flag is given, and a plain fetch does not change that. (A push to a
+   bucket still honours the flag by not uploading them.) That gap is tracked
+   in #229.
+5. **Interaction with transcript-drop tombstones (PR #226).** A tombstone is
+   an empty-envelope `Transcript` object, so `--no-transcripts` drops it like
+   any other transcript: a receiver keeps showing a dropped transcript after a
+   `--no-transcripts` fetch until a plain fetch brings the tombstone in.
+   Whether tombstones should be exempt is for #226 to decide; this change
+   does not special-case them.

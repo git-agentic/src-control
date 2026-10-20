@@ -85,8 +85,10 @@ impl Repo {
 
     /// [`Repo::clone_url_filtered`] with the `--no-transcripts` switch
     /// (ADR-0038 addendum, #211). With `no_transcripts`, transcript objects
-    /// (and signatures over them) in the received pack are verified but not
-    /// stored, so the clone holds no transcript object and no index entry.
+    /// (and signatures over them) in the received pack are hash-checked but
+    /// not written, so this clone holds no transcript object and no index
+    /// entry. Bucket remotes never serve transcripts, so the flag does
+    /// nothing there.
     /// Snapshots, trees and blobs transfer unchanged. Per command, not
     /// persisted: a later plain `fetch` brings the transcripts in.
     pub fn clone_url_opts(
@@ -371,10 +373,13 @@ impl Repo {
     }
 
     /// [`Repo::fetch`] with the `--no-transcripts` switch (ADR-0038
-    /// addendum, #211): received transcript objects and their signatures are
-    /// verified and discarded, never stored or indexed. The sender still
-    /// puts them on the wire (no wire flag), so this saves disk and
-    /// exposure, not bandwidth. A later plain fetch brings them in.
+    /// addendum, #211): received transcript objects, and signatures over
+    /// them, are hash-checked and then not written by this fetch. The
+    /// sender re-sends every indexed transcript each time (they are never
+    /// subtracted via the have-set), so a transcript you already hold is
+    /// re-sent and its new signature, if any, is dropped too; the next plain
+    /// fetch brings both in. No wire flag exists, so this saves disk and
+    /// exposure, not bandwidth.
     pub fn fetch_opts(
         &self,
         remote: &str,

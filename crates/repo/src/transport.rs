@@ -457,7 +457,8 @@ pub(crate) fn ingest_pack_file_checked(
 }
 
 /// [`ingest_pack_file`] for a `--no-transcripts` receiver (ADR-0038 addendum,
-/// #211): every record is still hash-verified in pass 1, but pass 2 does not
+/// #211): every record is still hash-checked in pass 1 (not
+/// signature-verified), but pass 2 does not
 /// write `Transcript` objects, nor a signature whose target is a transcript
 /// dropped from this same pack (it would index against a transcript that is
 /// not here). The sender over-sends regardless of what the receiver wants (no

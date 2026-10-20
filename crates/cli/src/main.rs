@@ -317,9 +317,12 @@ enum Cmd {
         /// process. Requires `--filter`.
         #[arg(long, requires = "filter")]
         lazy: bool,
-        /// Leave transcript objects (P30) out of this transfer: they are
-        /// verified and discarded, never stored or indexed. Per command, not
-        /// remembered by the clone. Git remotes carry no transcripts anyway.
+        /// Leave transcript objects (P30) out of this transfer: the server
+        /// still sends them, the client hash-checks and discards them, so
+        /// this transfer writes none and indexes none. Per command, not
+        /// remembered by the clone; a later plain fetch brings them in.
+        /// Does nothing for git remotes and bucket remotes (sc+wal://,
+        /// sc+s3://), which carry no transcripts.
         #[arg(long)]
         no_transcripts: bool,
     },
@@ -398,9 +401,13 @@ enum Cmd {
     Fetch {
         #[arg(default_value = "origin")]
         remote: String,
-        /// Leave transcript objects (P30) out of this fetch: they are
-        /// verified and discarded, never stored or indexed. Per command, not
-        /// remembered; a later plain fetch brings them in. Git remotes carry no transcripts anyway.
+        /// Leave transcript objects (P30) out of this fetch: the server
+        /// still sends them, the client hash-checks and discards them, so
+        /// this fetch writes none and indexes none (a new signature over a
+        /// transcript you already hold is dropped too). Per command, not
+        /// remembered; a later plain fetch brings them in. Does nothing for
+        /// git remotes and bucket remotes (sc+wal://, sc+s3://), which
+        /// carry no transcripts.
         #[arg(long)]
         no_transcripts: bool,
     },
@@ -412,8 +419,10 @@ enum Cmd {
         #[arg(long)]
         include_encrypted: bool,
         /// Do not send transcript objects (P30) or their signatures. Sealed
-        /// bodies stay sealed either way; snapshots still transfer. Ignored
-        /// for git remotes, which never carry transcripts.
+        /// bodies stay sealed either way; snapshots still transfer. Does
+        /// nothing for git remotes, which never carry transcripts. A bucket
+        /// remote (sc+wal://, sc+s3://) is stored but never served them, so
+        /// there the flag only spares the upload.
         #[arg(long)]
         no_transcripts: bool,
     },
