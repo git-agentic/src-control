@@ -24,7 +24,7 @@ ADR-0049 left sessions "undecided" as a product question. The question was wheth
 
 4. **Landing uses the ADR-0049 engine.** `ws_harvest` lands a clean workspace with `merge_with_identity`, which on a partial clone is the tree-recursive merge. The probe that decides "lands cleanly or falls back to `work-<i>`" is the same question answered by `tree_merge_filled` (`would_merge_cleanly_partial`): any conflict, inside the view or not, is "not clean", and the workspace becomes a `work-<i>` branch exactly as on a full clone. A conflict outside the view cannot arise from a workspace edit, which holds only the view, but it can arise from the host moving on; it falls back like any other.
 
-5. **Nothing else changes.** The one-session-per-repo rule, the landing-branch rule, `ws run`/`list`/`abandon`, scanner gating, protected-path carry and the oplog are unchanged. A `sc work` session still leaves no residue.
+5. **Nothing else changes.** The landing-branch rule (the one-session-per-repo rule was relaxed by ADR-0055, which keeps this ADR's view rules per session), `ws run`/`list`/`abandon`, scanner gating, protected-path carry and the oplog are unchanged. A `sc work` session still leaves no residue.
 
 ## Consequences
 
