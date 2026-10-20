@@ -931,7 +931,9 @@ a transfer-relevant snapshot, and the receiver reindexes idempotently. `sc
 gc` roots live transcript ids into reachability before signature pruning
 runs, so a signed transcript survives exactly as long as the transcript
 itself does. `sc export --to <git-repo>` drops transcripts (no Git-native
-form exists) and reports a count. See ADR-0038.
+form exists) and reports a count. A bucket remote (P36) has no index, so its
+`get_pack` rebuilds the same over-send from the packs the manifest chain names
+(#229, no format change). See ADR-0038.
 
 ## Phase 31 — listener resource limits (built)
 

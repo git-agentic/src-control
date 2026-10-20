@@ -410,6 +410,18 @@ too, not just the src-control-side metadata.
   described above, so a hostile or corrupted bucket gets no more leverage
   against a serve instance than it would against a direct `sc` client.
 
+- **Signatures, transcripts and drop tombstones are served from what the
+  bucket holds (#229).** The bucket does not judge them: it returns every
+  signature over a snapshot in the transfer and every transcript or signed
+  tombstone attached to one. A writer with raw bucket access can therefore add
+  a tombstone or a signature, but the receiver's checks are unchanged: a
+  signature is verified against `[signers] trusted` when read, and a tombstone
+  is honored only with a valid drop-digest signature from a trusted signer.
+  A hostile bucket can also make `get_pack` read every pack on the chain (the
+  scan is not limited to packs holding wanted objects); each pack stays under
+  the `MAX_OBJECT_SIZE` guards, so this costs bandwidth and CPU, not memory
+  beyond one pack body.
+
 ## By-id object reads (`GetObjects`, `sc cat`) — ADR-0047
 
 - **A hash is not a capability.** Anyone who can reach a served repo and

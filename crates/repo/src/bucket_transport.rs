@@ -66,6 +66,26 @@ pub struct BucketTransport {
     /// (possibly long-lived, e.g. `wire::serve`-hosted) transport regardless
     /// of whether this call succeeds or fails.
     pending_packs: RefCell<Vec<String>>,
+    /// Signature and transcript objects found in each scanned pack, keyed by
+    /// pack hash (#229). Packs are immutable, so an entry never goes stale;
+    /// it spares a long-lived `serve --store` session from re-reading every
+    /// pack body on each `get_pack`.
+    leaf_cache: RefCell<BTreeMap<String, Vec<Leaf>>>,
+}
+
+/// A leaf object a pack holds that no tree or snapshot references, so the
+/// reachability walk cannot find it (#229). Only the fields the sender seam
+/// needs are kept.
+#[derive(Clone)]
+enum Leaf {
+    /// A signature `id` over `target` (a snapshot, transcript or tombstone).
+    Signature { id: ObjectId, target: ObjectId },
+    /// A transcript or drop tombstone `id` attached to `snapshot`.
+    Transcript {
+        id: ObjectId,
+        snapshot: ObjectId,
+        tombstone: bool,
+    },
 }
 
 /// Untrusted-length guard (P28 parity): refuse any WAL metadata value —
@@ -197,6 +217,7 @@ impl BucketTransport {
             pack_cache: RefCell::new(None),
             staged: RefCell::new(Vec::new()),
             pending_packs: RefCell::new(Vec::new()),
+            leaf_cache: RefCell::new(BTreeMap::new()),
         };
         t.refresh()?;
         Ok(t)
@@ -332,6 +353,89 @@ impl BucketTransport {
         }
         let (_, pack) = cache.as_ref().unwrap();
         Ok(read_object_at_bounded(pack, offset, id, scl_core::max_object_size())?.encode())
+    }
+
+    /// Signature and transcript objects of one on-chain pack, found by
+    /// decoding its records (the idx carries no object kind). Reads through
+    /// `parse_pack_reader`, so it keeps the untrusted-source guards (hash
+    /// check, `MAX_OBJECT_SIZE` caps); peak RAM is the pack body plus one
+    /// decoded object. Does not touch `pack_cache`, which the reachability
+    /// walk and the pack writer rely on for locality.
+    fn pack_leaves(&self, hash: &str) -> Result<Vec<Leaf>> {
+        if let Some(hit) = self.leaf_cache.borrow().get(hash) {
+            return Ok(hit.clone());
+        }
+        let Fetched::New { bytes, .. } = self.bucket.get(&pack_key(hash), None)? else {
+            return Err(Error::Wal(format!("pack {hash} on chain but body absent")));
+        };
+        let mut leaves = Vec::new();
+        scl_core::pack::parse_pack_reader(std::io::Cursor::new(&bytes[..]), |id, obj| {
+            match obj {
+                Object::Signature(s) => leaves.push(Leaf::Signature {
+                    id,
+                    target: s.snapshot,
+                }),
+                Object::Transcript(t) => leaves.push(Leaf::Transcript {
+                    id,
+                    snapshot: t.snapshot,
+                    tombstone: t.dropped_id().is_some(),
+                }),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        self.leaf_cache
+            .borrow_mut()
+            .insert(hash.to_string(), leaves.clone());
+        Ok(leaves)
+    }
+
+    /// The bucket-side sender seam (#229, ADR-0038/ADR-0046): the ids of
+    /// every transcript and signature `LocalTransport::build_pack_tempfile`
+    /// would over-send for a transfer whose snapshots are `snaps` — transcripts
+    /// and signed drop tombstones attached to them, and signatures over
+    /// snapshots, transcripts and tombstones. A bucket keeps no
+    /// `.sc/transcripts` or `.sc/signatures` index, so it is rebuilt from the
+    /// packs the manifest chain names; whatever a pusher uploaded is served.
+    /// An unsigned tombstone is withheld, as on `LocalTransport`. Whether a
+    /// tombstone is honored is the receiver's call (`index_incoming`).
+    fn leaf_ids_for(&self, snaps: &std::collections::BTreeSet<ObjectId>) -> Result<Vec<ObjectId>> {
+        let packs = match self.view.borrow().as_ref() {
+            Some(v) => v.packs.clone(),
+            None => return Ok(Vec::new()),
+        };
+        // target -> signature ids; (snapshot, id, tombstone) per transcript.
+        // Drop the walk's cached pack body first so the scan never holds two.
+        *self.pack_cache.borrow_mut() = None;
+        let mut sigs: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+        let mut transcripts: Vec<(ObjectId, ObjectId, bool)> = Vec::new();
+        for hash in &packs {
+            for leaf in self.pack_leaves(hash)? {
+                match leaf {
+                    Leaf::Signature { id, target } => sigs.entry(target).or_default().push(id),
+                    Leaf::Transcript {
+                        id,
+                        snapshot,
+                        tombstone,
+                    } => transcripts.push((snapshot, id, tombstone)),
+                }
+            }
+        }
+        let mut out: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
+        for (snapshot, id, tombstone) in transcripts {
+            if snaps.contains(&snapshot) && (!tombstone || sigs.contains_key(&id)) {
+                out.insert(id);
+            }
+        }
+        // A transcript's own signature is keyed by the transcript id, so the
+        // targets are the snapshots plus the transcripts chosen above.
+        let chosen = out.clone();
+        for (target, ids) in &sigs {
+            if snaps.contains(target) || chosen.contains(target) {
+                out.extend(ids.iter().copied());
+            }
+        }
+        Ok(out.into_iter().collect())
     }
 
     /// Upload one pack (+ its idx) content-addressed by BLAKE3 of the pack
@@ -526,7 +630,16 @@ impl Transport for BucketTransport {
         };
         let have_set = crate::reachable::reachable_objects(&mut src, &known_haves)?;
         let want_set = crate::reachable::reachable_objects(&mut src, wants)?;
-        let ids: Vec<ObjectId> = want_set.difference(&have_set).copied().collect();
+        // Sender seam (#229): signatures and transcripts are leaves no walk
+        // reaches. Over-send them for every snapshot in play, never
+        // subtracting any via `have_set`, exactly as `LocalTransport` does.
+        let snaps: std::collections::BTreeSet<ObjectId> =
+            want_set.union(&have_set).copied().collect();
+        let leaf_ids = self.leaf_ids_for(&snaps)?;
+        let mut ids: Vec<ObjectId> = want_set.difference(&have_set).copied().collect();
+        ids.extend(leaf_ids.into_iter().filter(|id| !have_set.contains(id)));
+        ids.sort();
+        ids.dedup();
         let mut writer = PackWriter::new(out, ids.len() as u32)?;
         for id in &ids {
             let bytes = self.object_bytes(id)?;
@@ -1734,5 +1847,251 @@ mod tests {
         drop(t);
         std::fs::remove_dir_all(&broot).unwrap();
         assert!(!broot.exists());
+    }
+
+    // ---- #229: signatures, transcripts and drop tombstones round-trip ----
+
+    /// An origin repo pushed to a fresh `DirBucket`: one snapshot signed by
+    /// `identity`, carrying a transcript that is signed too. Returns
+    /// (origin, url, snapshot, transcript id, identity, scratch dir).
+    fn signed_bucket_origin(
+        tag: &str,
+    ) -> (
+        crate::repo::Repo,
+        String,
+        ObjectId,
+        ObjectId,
+        scl_crypto::Identity,
+        std::path::PathBuf,
+    ) {
+        let base = std::env::temp_dir().join(format!("scl-bt-229-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        let url = format!("sc+wal://{}", base.join("bucket").display());
+        let a = crate::repo::Repo::init(base.join("a")).unwrap();
+        std::fs::write(base.join("a/f1"), b"one").unwrap();
+        let snap = a.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        a.sign_snapshot(snap, &identity).unwrap();
+        let tid = a
+            .attach_transcript(snap, "claude-code", "s1", b"body", &[identity.enc.public()])
+            .unwrap();
+        a.sign_transcript(tid, &identity).unwrap();
+        a.remote_add("origin", &url).unwrap();
+        a.push("origin").unwrap();
+        (a, url, snap, tid, identity, base)
+    }
+
+    fn trust_map(identity: &scl_crypto::Identity) -> std::collections::HashMap<[u8; 32], String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            identity.signing.as_ref().unwrap().public().to_bytes(),
+            "alice".to_string(),
+        );
+        m
+    }
+
+    #[test]
+    fn clone_from_a_bucket_delivers_snapshot_and_transcript_signatures_and_transcripts() {
+        let (a, url, snap, tid, identity, base) = signed_bucket_origin("clone");
+        let b = crate::repo::Repo::clone_url(&url, base.join("b")).unwrap();
+
+        assert_eq!(
+            b.sig_status(&snap, &trust_map(&identity)).unwrap(),
+            crate::signatures::SigStatus::Trusted("alice".to_string()),
+            "a signed snapshot keeps its signature through a bucket"
+        );
+        assert!(b
+            .transcripts_for(&snap)
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t == tid));
+        assert_eq!(b.signatures_for(&tid).unwrap().len(), 1);
+        assert_eq!(
+            b.open_transcript(&tid, &identity.enc).unwrap().as_slice(),
+            b"body"
+        );
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn fetch_from_a_bucket_delivers_a_later_transcript_and_signature() {
+        let (a, url, snap, tid, identity, base) = signed_bucket_origin("fetch");
+        let b = crate::repo::Repo::clone_url(&url, base.join("b")).unwrap();
+
+        // Origin signs a second commit and attaches a signed transcript to it.
+        std::fs::write(base.join("a/f2"), b"two").unwrap();
+        let snap2 = a.commit("t", "c2").unwrap();
+        a.sign_snapshot(snap2, &identity).unwrap();
+        let tid2 = a
+            .attach_transcript(snap2, "claude-code", "s2", b"two", &[identity.enc.public()])
+            .unwrap();
+        a.sign_transcript(tid2, &identity).unwrap();
+        a.push("origin").unwrap();
+
+        b.fetch("origin").unwrap();
+        assert_eq!(
+            b.sig_status(&snap2, &trust_map(&identity)).unwrap(),
+            crate::signatures::SigStatus::Trusted("alice".to_string())
+        );
+        assert!(b
+            .transcripts_for(&snap2)
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t == tid2));
+        assert_eq!(b.signatures_for(&tid2).unwrap().len(), 1);
+        assert!(b
+            .transcripts_for(&snap)
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t == tid));
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn no_transcripts_clone_and_fetch_from_a_bucket_skip_transcripts_but_keep_signatures() {
+        let (a, url, snap, tid, identity, base) = signed_bucket_origin("notrans");
+        let b = crate::repo::Repo::clone_url_opts(&url, base.join("b"), None, true).unwrap();
+
+        assert_eq!(
+            b.sig_status(&snap, &trust_map(&identity)).unwrap(),
+            crate::signatures::SigStatus::Trusted("alice".to_string())
+        );
+        assert!(!b.store_arc().lock().unwrap().contains(&tid));
+        assert!(b.transcripts_for(&snap).unwrap().is_empty());
+        assert!(b.signatures_for(&tid).unwrap().is_empty());
+
+        // Per command, not persisted: a plain fetch brings it in.
+        b.fetch("origin").unwrap();
+        assert!(b
+            .transcripts_for(&snap)
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t == tid));
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn signed_drop_tombstone_propagates_through_a_bucket_only_to_trusted_signers() {
+        let (a, url, snap, tid, identity, base) = signed_bucket_origin("drop");
+        let b = crate::repo::Repo::clone_url(&url, base.join("b")).unwrap();
+        let c = crate::repo::Repo::clone_url(&url, base.join("c")).unwrap();
+        assert_eq!(b.transcripts_for(&snap).unwrap().len(), 1);
+
+        // Origin drops the transcript (signed tombstone) and pushes.
+        crate::transcripts::tests::trust_signer(&a, &identity);
+        a.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        std::fs::write(base.join("a/f2"), b"two").unwrap();
+        a.commit("t", "c2").unwrap();
+        a.push("origin").unwrap();
+
+        // B does not trust the signer: the tombstone is inert, transcript stays.
+        b.fetch("origin").unwrap();
+        assert_eq!(b.transcripts_for(&snap).unwrap().len(), 1);
+        // Once trusted, the next fetch honors the (re-served) tombstone.
+        crate::transcripts::tests::trust_signer(&b, &identity);
+        b.fetch("origin").unwrap();
+        assert!(b.transcripts_for(&snap).unwrap().is_empty());
+
+        // A peer that trusts the signer up front ends in the same state.
+        crate::transcripts::tests::trust_signer(&c, &identity);
+        c.fetch("origin").unwrap();
+        assert!(c.transcripts_for(&snap).unwrap().is_empty());
+
+        // --no-transcripts leaves the tombstone out like any transcript.
+        let d = crate::repo::Repo::clone_url_opts(&url, base.join("d"), None, true).unwrap();
+        assert!(d.transcripts_for(&snap).unwrap().is_empty());
+        assert!(crate::transcripts::load(d.layout()).unwrap().is_empty());
+        let tomb = ObjectId::of(
+            &Object::Transcript(scl_core::Transcript::drop_tombstone(snap, &tid)).encode(),
+        );
+        assert!(
+            !d.store_arc().lock().unwrap().contains(&tomb),
+            "the tombstone object itself is skipped"
+        );
+        assert!(
+            c.store_arc().lock().unwrap().contains(&tomb),
+            "a plain fetch from the bucket does receive the tombstone"
+        );
+
+        drop(a);
+        drop(b);
+        drop(c);
+        drop(d);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn a_signature_added_later_to_a_held_snapshot_rides_a_bucket_fetch() {
+        // The have side of the over-send: B already holds `snap`, so it sits in
+        // the have closure; its retroactive signature must still be served.
+        let base = std::env::temp_dir().join(format!("scl-bt-229-retro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        let url = format!("sc+wal://{}", base.join("bucket").display());
+        let a = crate::repo::Repo::init(base.join("a")).unwrap();
+        std::fs::write(base.join("a/f1"), b"one").unwrap();
+        let snap = a.commit("t", "c1").unwrap();
+        a.remote_add("origin", &url).unwrap();
+        a.push("origin").unwrap();
+        let b = crate::repo::Repo::clone_url(&url, base.join("b")).unwrap();
+
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        a.sign_snapshot(snap, &identity).unwrap();
+        std::fs::write(base.join("a/f2"), b"two").unwrap();
+        a.commit("t", "c2").unwrap();
+        a.push("origin").unwrap();
+
+        b.fetch("origin").unwrap();
+        assert_eq!(
+            b.sig_status(&snap, &trust_map(&identity)).unwrap(),
+            crate::signatures::SigStatus::Trusted("alice".to_string())
+        );
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn an_unsigned_drop_tombstone_in_the_bucket_is_not_served() {
+        let (a, url, snap, tid, _identity, base) = signed_bucket_origin("unsigned-tomb");
+        // A local-only drop (no identity) makes an unsigned tombstone; `push`
+        // would never send it, so put it into the bucket by hand.
+        let tomb_obj = Object::Transcript(scl_core::Transcript::drop_tombstone(snap, &tid));
+        let tomb = ObjectId::of(&tomb_obj.encode());
+        std::fs::write(base.join("a/f2"), b"two").unwrap();
+        let tip2 = a.commit("t", "c2").unwrap();
+        a.push("origin").unwrap();
+        let t = BucketTransport::open(&url).unwrap();
+        t.put_object(&tomb, &tomb_obj.encode()).unwrap();
+        t.update_ref("side", &tip2, None).unwrap();
+        assert!(t.has_object(&tomb).unwrap(), "the bucket holds it");
+
+        let b = crate::repo::Repo::clone_url(&url, base.join("b")).unwrap();
+        assert!(
+            !b.store_arc().lock().unwrap().contains(&tomb),
+            "an unsigned tombstone is withheld, as LocalTransport does"
+        );
+        assert_eq!(b.transcripts_for(&snap).unwrap().len(), 1);
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!base.exists());
     }
 }
