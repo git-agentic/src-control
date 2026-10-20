@@ -136,6 +136,40 @@ fn tracked_under(tracked: &BTreeSet<String>, dir: &str) -> bool {
         .is_some_and(|p| p.starts_with(&prefix))
 }
 
+/// Write `bytes` to `path` and lay down the recorded `mode`'s executable bit,
+/// the one place checkout-style writes go through so `read_worktree` (which
+/// reads the mode back from the filesystem) round-trips. EXEC adds an execute
+/// bit wherever the file already has a read bit (the umask-respecting default
+/// stays); FILE clears any execute bits an existing file had. A no-op off unix;
+/// a filesystem that refuses the chmod (no mode bits) is not an error.
+pub(crate) fn write_file(path: &Path, bytes: &[u8], mode: FileMode) -> std::io::Result<()> {
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let cur = std::fs::metadata(path)?.permissions().mode();
+        let want = if mode.0 & 0o111 != 0 {
+            cur | ((cur & 0o444) >> 2)
+        } else {
+            cur & !0o111
+        };
+        if want != cur {
+            match std::fs::set_permissions(path, std::fs::Permissions::from_mode(want)) {
+                Err(e)
+                    if e.kind() != std::io::ErrorKind::Unsupported
+                        && e.kind() != std::io::ErrorKind::PermissionDenied =>
+                {
+                    return Err(e)
+                }
+                _ => {}
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn file_mode(path: &Path) -> FileMode {
     use std::os::unix::fs::PermissionsExt;
@@ -994,7 +1028,7 @@ pub(crate) fn materialize_with_old_view(
         }
     }
     let mut skipped = Vec::new();
-    for (path, (blob_id, _mode, perms)) in &target {
+    for (path, (blob_id, mode, perms)) in &target {
         if !sparse.matches(path) {
             continue;
         }
@@ -1022,7 +1056,7 @@ pub(crate) fn materialize_with_old_view(
                     if let Some(parent) = full.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::write(&full, &pt[..])?;
+                    write_file(&full, &pt[..], *mode)?;
                     // Record a randomized entry's cache entry right after the
                     // write (P33): without this, the next `diff_worktree`/
                     // `status` on this exact, unmodified plaintext has no
@@ -1056,7 +1090,7 @@ pub(crate) fn materialize_with_old_view(
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&full, &bytes[..])?;
+            write_file(&full, &bytes[..], *mode)?;
         }
     }
     // The removal walk above covered the replaced view, and the tree is now
