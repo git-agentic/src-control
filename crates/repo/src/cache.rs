@@ -7,11 +7,11 @@
 //! The tag is `blake3::keyed_hash(local_key, plaintext)` under a random
 //! per-repo key (`.sc/local-key`, 0600), so the cache file alone leaks
 //! nothing — it does not reintroduce the equality oracle this phase closes.
-//! Where the key file's permissions cannot be restricted (non-unix; #214) no
-//! key file is created and no cache is read or written: see
-//! [`can_restrict_permissions`].
 //! A lost/stale/corrupt cache degrades to spurious re-seals, never
 //! incorrectness and never a hard error.
+//! Where the key file cannot be made owner-only (non-unix; #214) it is
+//! still written with default permissions and a one-time warning is printed
+//! once the cache holds a protected entry: see [`can_restrict_permissions`].
 //!
 //! **The keyed tag is the sole authority for a hit.** `mtime_ns`/`size` are
 //! recorded for documentation (when the entry was observed) and as a
@@ -36,11 +36,11 @@ use crate::layout::Layout;
 
 /// Whether `.sc/local-key` can be created readable by its owner only. Only
 /// unix can (`mode(0o600)` from the first byte); there is no Windows ACL path
-/// (#214), so elsewhere the cache runs cacheless rather than leave the key
-/// world-readable. Tests force `false` via `FORCE_CACHELESS` to exercise it.
+/// yet (#214), so elsewhere the key keeps default permissions and a warning is
+/// printed. Tests force `false` via `force_unrestricted_for_test`.
 fn can_restrict_permissions() -> bool {
     #[cfg(test)]
-    if FORCE_CACHELESS.with(|f| f.get()) {
+    if FORCE_UNRESTRICTED.with(|f| f.get()) {
         return false;
     }
     cfg!(unix)
@@ -48,38 +48,42 @@ fn can_restrict_permissions() -> bool {
 
 #[cfg(test)]
 thread_local! {
-    static FORCE_CACHELESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_UNRESTRICTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Test seam: make this thread behave like a non-unix target.
 #[cfg(test)]
-pub(crate) fn force_cacheless_for_test(on: bool) {
-    FORCE_CACHELESS.with(|f| f.set(on));
+pub(crate) fn force_unrestricted_for_test(on: bool) {
+    FORCE_UNRESTRICTED.with(|f| f.set(on));
 }
 
-/// Print the cacheless warning the first time `flag` is unset; `true` iff it
-/// printed. The flag is a parameter so a test can use a private one.
-fn warn_cacheless_once(flag: &std::sync::atomic::AtomicBool) -> bool {
+/// Print the unrestricted-key warning the first time `flag` is unset; `true`
+/// iff it printed. The flag is a parameter so a test can use a private one.
+fn warn_unrestricted_once(flag: &std::sync::atomic::AtomicBool) -> bool {
     if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
     eprintln!(
-        "warning: this platform cannot restrict .sc/local-key to its owner; the \
-         protected-file cache is disabled (unchanged protected files will be \
-         re-sealed on each commit and may show as modified)"
+        "warning: this platform cannot restrict .sc/local-key to its owner; other \
+         local users may be able to read it and test guesses against the \
+         protected-file cache tags (the protected plaintext checked out in the \
+         working tree is equally readable by default)"
     );
     true
+}
+
+/// Warn (once per process) when a cache that holds protected entries is
+/// backed by a key whose permissions could not be restricted.
+fn warn_if_unrestricted(has_entries: bool) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if has_entries && !can_restrict_permissions() {
+        warn_unrestricted_once(&WARNED);
+    }
 }
 
 /// Load (minting if absent) the per-repo random cache key. The key file is
 /// the only hard-error surface here: if it can't be created/read, the cache
 /// cannot be safely keyed, so surface it rather than running unkeyed.
-///
-/// When permissions cannot be restricted (see [`can_restrict_permissions`])
-/// this touches no file: it warns once and returns a fresh in-memory key, and
-/// [`ProtectedCache::open`] then drops its path so nothing keyed by that
-/// throwaway key is read or persisted. A pre-existing `.sc/local-key` is
-/// deleted in that mode.
 ///
 /// Mirrors the serve-TLS key discipline (`crates/tlsio/src/identity.rs`):
 /// the file is created 0600 from its first byte via `create_new`, so there
@@ -87,14 +91,6 @@ fn warn_cacheless_once(flag: &std::sync::atomic::AtomicBool) -> bool {
 /// concurrent minter losing the `create_new` race falls through to reading
 /// the winner's file rather than erroring or clobbering it.
 pub(crate) fn local_key(layout: &Layout) -> Result<[u8; 32]> {
-    if !can_restrict_permissions() {
-        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        warn_cacheless_once(&WARNED);
-        // An earlier build may have left a world-readable key; the cache is
-        // off, so drop it rather than leave it guessable-against.
-        let _ = std::fs::remove_file(layout.local_key_path());
-        return Ok(*blake3::hash(scl_crypto::random_hex(32).as_bytes()).as_bytes());
-    }
     let path = layout.local_key_path();
     let hex_str = match std::fs::read_to_string(&path) {
         Ok(s) => s.trim().to_string(),
@@ -119,25 +115,27 @@ pub(crate) fn local_key(layout: &Layout) -> Result<[u8; 32]> {
         .map_err(|_| Error::InvalidArgument("malformed .sc/local-key".into()))
 }
 
-/// Create the key file owner-only from its first byte. Unreachable off unix:
-/// `local_key` goes cacheless first.
+#[cfg(unix)]
 fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, bytes);
-        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
-    }
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+/// Non-unix: default (inherited) permissions; see [`can_restrict_permissions`].
+#[cfg(not(unix))]
+fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(bytes)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -204,9 +202,6 @@ fn is_plain_file(root: &Path, rel: &str) -> bool {
 
 impl ProtectedCache {
     pub(crate) fn open(key: [u8; 32], root: PathBuf, path: Option<PathBuf>) -> ProtectedCache {
-        // Cacheless platform: `key` is a throwaway, so a persisted file could
-        // never be matched or reused; keep the cache in memory only.
-        let path = path.filter(|_| can_restrict_permissions());
         let mut entries = BTreeMap::new();
         if let Some(p) = &path {
             if let Ok(text) = std::fs::read_to_string(p) {
@@ -241,6 +236,9 @@ impl ProtectedCache {
                     }
                 }
             }
+        }
+        if path.is_some() {
+            warn_if_unrestricted(!entries.is_empty());
         }
         ProtectedCache {
             key,
@@ -309,6 +307,7 @@ impl ProtectedCache {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        warn_if_unrestricted(!self.entries.is_empty());
         let mut out = String::new();
         for (p, e) in &self.entries {
             if !is_plain_file(&self.root, p) {
@@ -379,13 +378,12 @@ mod tests {
     }
 
     #[test]
-    fn cacheless_mints_no_key_and_persists_nothing() {
-        FORCE_CACHELESS.with(|f| f.set(true));
-        let layout = tmp("cacheless");
-        std::fs::write(layout.local_key_path(), "legacy").unwrap();
+    fn unrestricted_key_still_persists_and_hits() {
+        force_unrestricted_for_test(true);
+        let layout = tmp("unrestricted");
         let key = local_key(&layout).unwrap();
-        assert_ne!(key, local_key(&layout).unwrap(), "throwaway key per call");
-        assert!(!layout.local_key_path().exists(), "legacy key removed");
+        assert_eq!(key, local_key(&layout).unwrap(), "key persisted");
+        assert!(layout.local_key_path().exists());
 
         let abs = layout.root.join("secret.txt");
         std::fs::write(&abs, b"v1").unwrap();
@@ -396,35 +394,23 @@ mod tests {
             Some(layout.protected_cache_path()),
         );
         c.record("secret.txt", b"v1", id);
-        assert_eq!(c.unchanged("secret.txt", b"v1"), Some(id), "in-process hit");
         c.save().unwrap();
-        assert!(!layout.protected_cache_path().exists(), "nothing persisted");
-
-        // A cache file left by a unix run is not consulted.
-        FORCE_CACHELESS.with(|f| f.set(false));
-        let mut c = ProtectedCache::open(
-            key,
-            layout.root.clone(),
-            Some(layout.protected_cache_path()),
-        );
-        c.record("secret.txt", b"v1", id);
-        c.save().unwrap();
-        FORCE_CACHELESS.with(|f| f.set(true));
+        assert!(layout.protected_cache_path().exists(), "cache persisted");
         let c = ProtectedCache::open(
             key,
             layout.root.clone(),
             Some(layout.protected_cache_path()),
         );
-        assert_eq!(c.unchanged("secret.txt", b"v1"), None);
-        FORCE_CACHELESS.with(|f| f.set(false));
+        assert_eq!(c.unchanged("secret.txt", b"v1"), Some(id), "hit survives");
+        force_unrestricted_for_test(false);
         cleanup(&layout);
     }
 
     #[test]
-    fn cacheless_warning_prints_once() {
+    fn unrestricted_warning_prints_once() {
         let flag = std::sync::atomic::AtomicBool::new(false);
-        assert!(warn_cacheless_once(&flag));
-        assert!(!warn_cacheless_once(&flag));
+        assert!(warn_unrestricted_once(&flag));
+        assert!(!warn_unrestricted_once(&flag));
     }
 
     #[test]

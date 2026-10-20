@@ -81,20 +81,19 @@ too, not just the src-control-side metadata.
   protected blob under a fresh key (ADR-0051), whereas a plain `sc rewrap` only
   replaces wrap lists and leaves the key a revoked holder already has. History
   keeps the old wraps and ciphertext regardless.
-- **Local cache key is unix-only (P33, #214):** the unchanged-detection cache is
-  keyed by `.sc/local-key`, created `0600` from its first byte. Leaking that key
-  lets a local reader test guesses against cached plaintext tags. Only unix can
-  restrict the file this way; on a non-unix target `sc` creates no key file,
-  deletes any existing one (it may have been created world-readable by an earlier
-  build), reads and writes no `.sc/protected-cache` or
-  `.sc/ws/cache-<i>`, and prints a one-time stderr warning. It runs cacheless:
-  unchanged protected files re-seal on each commit (new random ciphertext ids)
-  and `status` lists every authorized randomized protected file as modified, so
-  the clean-tree gates (switch, merge, ...) refuse while one is checked out. No
-  wrong data is committed, but this is a known usability gap on those targets. The
-  non-unix branch has not been compiled or run on a Windows host; there is no
-  ACL hardening. A unix filesystem that ignores mode bits (vfat, exFAT, some
-  network mounts) is not detected.
+- **Local cache key is owner-only on unix only (P33, #214):** the
+  unchanged-detection cache is keyed by `.sc/local-key`, created `0600` from its
+  first byte. Only unix can do that; on a non-unix target the key and the cache
+  files are written with inherited default permissions, and `sc` prints a
+  one-time stderr warning once a cache holds a protected entry. The exposure is
+  small: checkout already writes protected plaintext into the working tree with
+  default permissions on every platform, and the cache holds tags only for files
+  whose plaintext is on disk, so a reader of the key could read that plaintext
+  directly. What remains is the tags of the last-committed version of a file
+  edited since, and stale entries until the next save. The real fix is an
+  owner-only Windows ACL (`windows-sys` is already a transitive dependency); it is
+  unverified without a Windows host and tracked in ROADMAP.md. A unix filesystem
+  that ignores mode bits (vfat, exFAT, some network mounts) is not detected.
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 
