@@ -15,9 +15,11 @@ cd apps/desktop && npm run tauri dev         # native desktop development app
 cd apps/desktop && npm run tauri build -- --bundles app  # validated macOS production bundle
 cargo run --bin sc -- demo --agents 4        # parallel-agent demo
 cargo run --bin sc -- demo --agents 6 --budget-mb 4 --spill   # exercise eviction
+cargo run --bin sc -- demo --agents 4 --checkout   # also materialize each worktree to a session
+                                             # temp dir (the one disk-writing path), then clean up
 cargo run --bin sc -- import --repo <path>   # import a Git repo's HEAD
 bash demo/run_demo.sh                         # independent zero-residue proof
-cargo run --bin sc -- keygen                 # v2 identity: one seed derives BOTH an X25519
+cargo run --bin sc -- keygen [--out <file>]  # (default ~/.sc/identity; 0600 on unix only) v2 identity: one seed derives BOTH an X25519
                                              # encryption key and an Ed25519 signing key (P22);
                                              # a pre-P22 v1 (scl-sk-) identity still parses and
                                              # still encrypts, but cannot sign
@@ -80,7 +82,9 @@ cargo run --bin sc -- resolve --ours|--theirs <path>... [--identity <key>]
                                              # merge/pick/rebase conflict record (P23)
 cargo run --bin sc -- scan                   # preview the commit-time secret scan
 cargo run --bin sc -- clone <src> <dst>      # copy a repo (objects + refs)
-cargo run --bin sc -- protect <prefix> --to <recipient>   # encrypt matching paths (P7)
+cargo run --bin sc -- protect <prefix> --to <recipient>   # encrypt matching paths (P7); sealing
+                                             # is randomized since P33 (ADR-0043)
+cargo run --bin sc -- protect [--list] [--json]   # list the protection rules (no prefix = list)
 cargo run --bin sc -- grant <prefix> --to <recipient> --identity <key>   # path-protection grant
 cargo run --bin sc -- revoke <prefix> --recipient-id <id>                # path-protection revoke;
                                              # tombstone-durable across merges of pre-revoke
@@ -105,8 +109,13 @@ cargo run --bin sc -- run [--secrets-fd N] -- <cmd> [args…]   # inject decrypt
 cargo run --bin sc -- gc                      # pack reachable objects + prune unreachable
 cargo run --bin sc -- gc --prune-expire 7d    # custom grace window
 cargo run --bin sc -- export --to <git-repo>  # write current branch history to Git
+cargo run --bin sc -- export --to <git-repo> --ref <ref>  # update this Git ref instead of
+                                             # refs/heads/<current-branch>
 cargo run --bin sc -- export --to <git-repo> --include-encrypted  # allow protected ciphertext
 bash demo/run_repo_demo.sh                   # end-to-end persistent repo proof
+bash demo/run_remote_demo.sh                 # local-path remote round trip (P6): clone, then
+                                             # fetch+merge and push between two local repos
+cargo run --bin sc -- remote list            # name, URL and kind ([sc] / [git]) of each remote
 cargo run --bin sc -- remote add <name> <git-path> --git   # register a git-backed remote
 cargo run --bin sc -- fetch <git-remote>                    # import git history -> remote-tracking ref
 cargo run --bin sc -- push <git-remote> [--include-encrypted]  # export sc history -> git ref (ff-only)
@@ -144,8 +153,9 @@ bash demo/run_randomized_demo.sh                      # randomized protected-enc
                                               # rewrap UPGRADE and pre-P33 dual-read are unit-
                                               # test-pinned, since the current binary can no
                                               # longer write a convergent blob)
-cargo run --bin sc -- work --agents 3 -- <cmd>   # fork agent workspaces, run <cmd> in each,
-                                                 # harvest changed ones to work-<i> branches
+cargo run --bin sc -- work --agents 3 [--name <base>] -- <cmd>   # fork agent workspaces, run
+                                                 # <cmd> in each, harvest changed ones to
+                                                 # <base>-<i> branches (default base `work`)
                                                  # (--with-secrets --identity <key> injects
                                                  # decrypted secrets into each agent env)
 bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
@@ -159,7 +169,8 @@ cargo run --bin sc -- ws harvest [--into <branch>] [--identity <key>]   # probe 
                                               # every live workspace onto the landing branch
                                               # (default the session's base branch, which must
                                               # be checked out); clean lands cumulatively,
-                                              # conflicts fall back to work-<i>
+                                              # conflicts fall back to work-<i> (always `work`;
+                                              # `--name` is `sc work` only)
 cargo run --bin sc -- ws abandon [<i>]        # drop one workspace or the whole session
 bash demo/run_ws_demo.sh                      # multi-invocation session + auto-merge proof (P20)
 cargo run --bin sc -- cherry-pick <ref> [--identity <key>]   # replay one commit onto the
@@ -336,6 +347,21 @@ cargo run --bin sc -- serve token list [--json]    # list labels, scopes, expiry
 cargo run --bin sc -- clone sc+http://host[:port]/repo <dst>   # clone over sc+http:// (P26;
                                               # port defaults to 8730); sc remote add/fetch/push
                                               # accept the same sc+http:// URL form
+cargo run --bin sc -- remote add <name> sc+wal://<dir>          # bucket WAL remote on a local
+                                              # directory (P36, ADR-0046); `clone` takes the URL
+                                              # directly, `fetch`/`push` use the remote's name
+cargo run --bin sc -- remote add <name> sc+s3://<bucket>/<prefix>   # same, on an S3-compatible
+                                              # store; a malformed URL (e.g. no bucket) is rejected
+                                              # at `remote add` time. Public content is plaintext at
+                                              # rest (the bucket ACL is the perimeter; sealed
+                                              # content stays ciphertext); `clone --filter` is
+                                              # refused; signatures, transcripts and drop
+                                              # tombstones travel like on any native remote (#229)
+cargo run --bin sc -- serve --http <addr> <home> --store sc+wal://<dir>|sc+s3://<bucket>/<prefix>
+                                              # serve a bucket remote over sc+http(s):// (P36c):
+                                              # all content lives in the bucket (instance is
+                                              # disposable); <home> still needs `.sc/` for tokens,
+                                              # the TLS identity and scratch space
 bash demo/run_http_remote_demo.sh             # sc-native HTTP transport proof (P26): real
                                               # loopback TCP (no shim, unlike ssh://), clone +
                                               # push + fetch over sc+http://, a signed ~1 MiB
@@ -381,6 +407,10 @@ bash demo/run_partial_clone_demo.sh           # partial clone proof (P27): sc cl
                                               # edit AND byte-identical docs/lib); sc backfill
                                               # docs/ shrinks the gap count; sc gc succeeds and
                                               # preserves everything; run twice
+bash demo/run_limits_demo.sh                  # listener-limits proof (P31): --max-connections
+                                              # busy shed and slot reuse; --timeout and
+                                              # --max-pack-size are accepted (timeout expiry
+                                              # itself is unit-tested, not shown here)
 bash demo/run_http_auth_demo.sh               # sc+http access-control proof (P29): a no-token
                                               # clone is rejected with an authentication error,
                                               # an ro-token clone reads but its push is rejected

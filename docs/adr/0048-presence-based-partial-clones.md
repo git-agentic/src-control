@@ -1,6 +1,6 @@
 # ADR-0048: Presence-based walks for partial clones (P37b)
 
-- **Status:** Accepted (37b-i, 37b-ii built)
+- **Status:** Accepted (built)
 - **Date:** 2026-10-16
 - **Phase:** 37b
 - **Builds on:** ADR-0047 (want-by-id fetch, 37a), ADR-0037 (partial clone), ADR-0034 (sparse), ADR-0035 (streaming transfer), ADR-0039/0041 (size limits)
@@ -347,8 +347,9 @@ review established, as constraints on that work:
   site with the ordering tests, reply-cap alignment with batch splitting,
   `sparse set` outside the filter. Demo: widen, commit, push, a second clone
   sees it; gc and verify after; undo after a widen while offline.
-- **37b-iii onward.** Merge design record after a spike, then replay, then a
-  decision on sessions.
+- **37b-iii onward (since built).** Merge design record after a spike, then replay,
+  then a decision on sessions: merge and replay are ADR-0049 (P37c), sessions
+  are ADR-0050 (P37d).
 
 ## Consequences
 

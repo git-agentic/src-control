@@ -884,7 +884,7 @@ impl Repo {
 
     /// Snapshot the working tree into a new commit on the current branch. When a
     /// merge is in progress, records both parents and clears the merge state.
-    /// Files under a protected prefix are convergently encrypted (scanner-exempt);
+    /// Files under a protected prefix are sealed (randomized since P33; scanner-exempt);
     /// only plaintext files are scanned.
     pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
         if crate::rebase_state::in_progress(&self.layout) {

@@ -25,12 +25,12 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0012](0012-three-way-merge.md) | Three-way merge with a snapshot common ancestor | Accepted | 4 |
 | [0017](0017-secret-scanner.md) | Accidental-plaintext secret scanner at commit time | Accepted | 5 |
 | [0013](0013-remote-sync-model.md) | Remote sync via object + ref transfer over a pluggable transport | Accepted | 6 |
-| [0014](0014-per-file-permissions-encrypted-paths.md) | Per-file permissions as encrypted paths (convergent encryption) | Accepted | 7 |
+| [0014](0014-per-file-permissions-encrypted-paths.md) | Per-file permissions as encrypted paths (convergent encryption) | Accepted; new content superseded by 0043, rotation added by 0051 | 7 |
 | [0015](0015-packfiles-and-gc.md) | Packfiles and reachability-based garbage collection | Accepted | 8 |
 | [0016](0016-git-export.md) | Git export for round-trip interop | Accepted | 9 |
 | [0018](0018-git-as-a-remote.md) | Git as a remote (bidirectional sync) | Accepted | 10 |
-| [0019](0019-secret-lifecycle.md) | Secret/permission lifecycle (rotation + escrow) | Accepted | 11 |
-| [0020](0020-six-crate-workspace.md) | Six-crate workspace with a strict dependency direction | Accepted | foundation |
+| [0019](0019-secret-lifecycle.md) | Secret/permission lifecycle (rotation + escrow) | Accepted; per-path rotation added by 0051 | 11 |
+| [0020](0020-six-crate-workspace.md) | Six-crate workspace with a strict dependency direction | Accepted; crate set extended by 0042, 0045, 0046 | foundation |
 | [0021](0021-durability-and-concurrency-hardening.md) | Durability and concurrency hardening for `.sc/` | Accepted | hardening |
 | [0022](0022-ssh-native-transport.md) | sc-native network transport over SSH (trait-mirror wire protocol) | Accepted | 12 |
 | [0023](0023-agent-workspaces.md) | Agent workspaces — vfs-backed sessions over the persistent store | Accepted | 13 |
@@ -44,27 +44,27 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0031](0031-hardening-consolidation.md) | Hardening & consolidation sweep — closing the P16–P20 review tail | Accepted | 21 |
 | [0032](0032-signed-commits-provenance.md) | Signed commits & provenance | Accepted | 22 |
 | [0033](0033-merge-ergonomics.md) | Merge ergonomics — conflict UX beyond markers | Accepted | 23 |
-| [0034](0034-sparse-checkouts.md) | Sparse checkouts / sub-tree sharing | Accepted | 24 |
+| [0034](0034-sparse-checkouts.md) | Sparse checkouts / sub-tree sharing | Accepted; private merge-in under sparse in 0044 | 24 |
 | [0035](0035-streaming-transfer.md) | Streaming pack transfer (bounded-RAM, >4 GiB) | Accepted | 25 |
-| [0036](0036-http-transport.md) | sc-native HTTP transport (`sc+http://`) | Accepted | 26 |
-| [0037](0037-partial-clone.md) | Partial clone (promisor store + prefix-scoped fetch) | Accepted | 27 |
+| [0036](0036-http-transport.md) | sc-native HTTP transport (`sc+http://`) | Accepted; gaps closed by 0040, 0041, 0042 | 26 |
+| [0037](0037-partial-clone.md) | Partial clone (promisor store + prefix-scoped fetch) | Accepted; refusals lifted by 0048, 0049, 0050 | 27 |
 | [0038](0038-agent-session-transcripts.md) | Agent session transcripts as CAS objects | Accepted | 30 |
 | [0039](0039-security-hardening-sweep.md) | Security hardening sweep (audit fix-now items) | Accepted | 28 |
-| [0040](0040-sc-http-access-control.md) | sc+http access control (read-only, fail-closed bind, bearer tokens) | Accepted | 29 |
+| [0040](0040-sc-http-access-control.md) | sc+http access control (read-only, fail-closed bind, bearer tokens) | Accepted; bind gate narrowed by 0042 | 29 |
 | [0041](0041-listener-resource-limits.md) | Listener resource limits (connection cap, session timeout, spool cap, accept backoff) | Accepted | 31 |
-| [0042](0042-in-binary-tls-sc-https.md) | In-binary TLS — `sc+https://` via rustls | Accepted | 32 |
-| [0043](0043-randomized-protected-encryption.md) | Randomized protected-path encryption (dual-read, randomized-write) | Accepted | 33 |
-| [0044](0044-per-branch-access-control.md) | Per-branch access control with opaque private branches | Accepted | 34 |
+| [0042](0042-in-binary-tls-sc-https.md) | In-binary TLS — `sc+https://` via rustls | Accepted; CA validation 0054, pin management 0053 | 32 |
+| [0043](0043-randomized-protected-encryption.md) | Randomized protected-path encryption (dual-read, randomized-write) | Accepted; rotate-for-paths built as 0051 | 33 |
+| [0044](0044-per-branch-access-control.md) | Per-branch access control with opaque private branches | Accepted; sparse merge-in section (#240) | 34 |
 | [0045](0045-native-desktop-read-model.md) | Native desktop adapter and keyless read model | Accepted | 35 |
 | [0046](0046-wal-bucket-remotes.md) | Bucket remotes via an immutable-pack WAL + one CAS'd manifest | Accepted | 36 |
-| [0047](0047-want-by-id-fetch-and-gap-fill.md) | Want-by-id fetch and explicit gap fill for partial clones | Accepted (37a built) | 37 |
-| [0048](0048-presence-based-partial-clones.md) | Presence-based walks for partial clones | Accepted (37b-i, 37b-ii built) | 37b |
-| [0049](0049-merge-on-partial-clones.md) | Merge on partial clones | Proposed (37c-i to 37c-iv built) | 37c |
-| [0050](0050-sessions-on-partial-clones.md) | Agent sessions on partial clones | Accepted | 37d |
-| [0051](0051-rotate-protected-paths.md) | Rotating protected paths (`sc rewrap --rotate`) | Accepted | — |
-| [0052](0052-secret-injection-by-fd.md) | Secret injection by file descriptor (`sc run --secrets-fd`) | Accepted | — |
-| [0053](0053-tls-pin-management.md) | TLS pin management (`sc tls`) | Accepted | — |
-| [0054](0054-tls-ca-validation.md) | CA-path validation for `sc+https://` | Accepted | — |
+| [0047](0047-want-by-id-fetch-and-gap-fill.md) | Want-by-id fetch and explicit gap fill for partial clones | Accepted (built) | 37 |
+| [0048](0048-presence-based-partial-clones.md) | Presence-based walks for partial clones | Accepted (built) | 37b |
+| [0049](0049-merge-on-partial-clones.md) | Merge on partial clones | Accepted (built) | 37c |
+| [0050](0050-sessions-on-partial-clones.md) | Agent sessions on partial clones | Accepted (built) | 37d |
+| [0051](0051-rotate-protected-paths.md) | Rotating protected paths (`sc rewrap --rotate`) | Accepted (built) | — |
+| [0052](0052-secret-injection-by-fd.md) | Secret injection by file descriptor (`sc run --secrets-fd`) | Accepted (built) | — |
+| [0053](0053-tls-pin-management.md) | TLS pin management (`sc tls`) | Accepted (built) | — |
+| [0054](0054-tls-ca-validation.md) | CA-path validation for `sc+https://` | Accepted (built) | — |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
@@ -73,5 +73,11 @@ ahead of 0015–0016.
 ## Status legend
 
 - **Proposed** — under discussion, not yet built.
-- **Accepted** — decided and implemented.
+- **Accepted** — decided and implemented. `Accepted (built)` is the same state
+  stated explicitly: the ADR was written ahead of, or in steps with, its
+  implementation (such as 37b-i and 37b-ii in ADR-0048, or ADR-0051 to 0054),
+  and everything it decides has landed.
+- **Accepted; … by ADR-NNNN** — still the record of its decision, but a later ADR
+  changed a current fact (a refusal lifted, a deferred item built, a default
+  narrowed). The body is left as written; read the pointer for today's behavior.
 - **Superseded by ADR-NNNN** — replaced; kept for history.

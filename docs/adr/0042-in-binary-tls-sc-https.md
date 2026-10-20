@@ -1,6 +1,6 @@
 # ADR-0042: In-binary TLS — `sc+https://` via rustls
 
-- **Status:** Accepted
+- **Status:** Accepted; deferred CA validation built as [ADR-0054](0054-tls-ca-validation.md), pin management as [ADR-0053](0053-tls-pin-management.md)
 - **Date:** 2026-07-10
 - **Phase:** 32
 - **Builds on:** ADR-0036 (P26 sc-native HTTP transport — reserved the
