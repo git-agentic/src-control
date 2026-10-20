@@ -382,7 +382,8 @@ cargo run --bin sc -- clone --filter blob:limit=<size> [--filter <prefix…>] [-
                                               # left out (old revisions of large files), every tip
                                               # and the checkout stay complete; blob:limit=0 = no
                                               # blobs beyond the tips. `blob:` is reserved in
-                                              # --filter (blob:none is an error), once only.
+                                              # --filter (blob:none is an error), once only; a
+                                              # limit above 1 GiB is an error.
                                               # Server-evaluated: wire v6, upgrade both sides.
                                               # Repair: `sc backfill <file>`, a lazy fill, or
                                               # `backfill --all`; fetch is not limit-aware

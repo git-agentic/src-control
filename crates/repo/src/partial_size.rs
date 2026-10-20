@@ -14,6 +14,7 @@ use crate::promisor::{PackFilter, Scope};
 use crate::refs;
 use crate::replay::{PickResult, RebaseResult};
 use crate::repo::Repo;
+use crate::sparse::Sparse;
 
 const LIMIT: u64 = 1024;
 
@@ -375,6 +376,126 @@ fn filter_grammar_rejects_duplicates_and_unknown_blob_forms() {
     assert!(other.to_string().contains("reserved"), "{other}");
     assert!(parse(&v(&["blob:limit=lots"])).is_err());
     assert!(parse(&v(&["blob:limit="])).is_err());
+
+    // The reserved grammar is matched case-insensitively and untrimmed, so a
+    // variant spelling is the size filter or an error, never a path prefix.
+    for spelling in ["Blob:limit=1KiB", " blob:limit=1KiB", "BLOB:LIMIT=1KiB"] {
+        assert_eq!(
+            parse(&v(&[spelling])).unwrap(),
+            (vec![], Some(1024)),
+            "{spelling:?}"
+        );
+    }
+    for bad in ["Blob:none", " blob:oops", "BLOB:", "Blob:limit"] {
+        let e = parse(&v(&[bad])).unwrap_err();
+        assert!(e.to_string().contains("blob:"), "{bad:?}: {e}");
+    }
+    // Names that merely start with `blob` stay ordinary prefixes.
+    assert_eq!(
+        parse(&v(&["blobs/", "blob"])).unwrap(),
+        (vec!["blobs/".to_string(), "blob".to_string()], None)
+    );
+
+    // A limit above the largest transferable object filters nothing.
+    for huge in ["18446744073709551615", "2GiB", "1073741825"] {
+        let e = parse(&v(&[&format!("blob:limit={huge}")])).unwrap_err();
+        assert!(
+            e.to_string().contains("would filter nothing"),
+            "{huge}: {e}"
+        );
+    }
+    assert_eq!(parse(&v(&["blob:limit=1GiB"])).unwrap().1, Some(1 << 30));
+}
+
+/// A size limit with no path filter is a caller bug: the walk refuses instead
+/// of silently ignoring the limit.
+#[test]
+fn limited_walk_without_a_filter_is_refused() {
+    let sz = Sz::new("nofilter");
+    let arc = sz.origin.vfs().store();
+    let mut store = arc.lock().unwrap();
+    let err = crate::reachable::reachable_objects_limited(&mut *store, &[sz.c2], None, Some(1))
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    drop(store);
+    drop(arc);
+    sz.cleanup();
+}
+
+/// `promisor::remove` deletes `.sc/promisor` before the limit marker, so an
+/// interrupted removal leaves a stray limit file that `load` ignores.
+#[test]
+fn remove_deletes_the_marker_before_the_limit_file() {
+    let root = std::env::temp_dir().join(format!("scl-p27sz-rm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let layout = crate::layout::Layout::at(&root);
+    std::fs::create_dir_all(&layout.dot_sc).unwrap();
+    crate::promisor::store(&layout, &crate::Promisor::with_blob_limit("o", vec![], 5)).unwrap();
+    crate::promisor::remove(&layout).unwrap();
+    assert!(!layout.promisor_path().exists());
+    assert!(!layout.promisor_blob_limit_path().exists());
+    // The state a crash between the two removals leaves: only the stray file.
+    std::fs::write(
+        layout.promisor_blob_limit_path(),
+        "limit 5\nscope all-paths\n",
+    )
+    .unwrap();
+    assert_eq!(crate::promisor::load(&layout).unwrap(), None);
+    remove_all(&[&root]);
+}
+
+/// A missing directory (a fetch left it out) is not blamed on the blob limit
+/// and is named by its path; a missing root tree points at `--all`, not at an
+/// empty `sc backfill `.
+#[test]
+fn directory_and_root_gaps_do_not_blame_the_limit() {
+    let sz = Sz::new("dirgap");
+    let clone = sz.clone(&[], LIMIT, false);
+    let src_tree = {
+        let arc = clone.vfs().store();
+        let mut s = arc.lock().unwrap();
+        let root = s.get_snapshot(&sz.c2).unwrap().root;
+        s.get_tree(&root).unwrap().get("src").unwrap().id
+    };
+    let root = {
+        let arc = clone.vfs().store();
+        let mut s = arc.lock().unwrap();
+        s.delete(&src_tree).unwrap();
+        s.get_snapshot(&sz.c2).unwrap().root
+    };
+    let err = {
+        let arc = clone.vfs().store();
+        let mut s = arc.lock().unwrap();
+        crate::worktree::preflight_view(clone.layout(), &mut s, root, &Sparse::default())
+            .unwrap_err()
+    };
+    match &err {
+        Error::GapInView {
+            path,
+            prefix,
+            blob_limit,
+        } => {
+            assert_eq!(path, "src");
+            assert_eq!(prefix, "src", "names the path");
+            assert_eq!(*blob_limit, None, "a directory is not a size gap");
+        }
+        other => panic!("expected GapInView, got {other:?}"),
+    }
+    assert!(!err.to_string().contains("blob:limit"), "{err}");
+
+    let root_gap = Error::GapInView {
+        path: "(root tree)".into(),
+        prefix: String::new(),
+        blob_limit: None,
+    };
+    assert!(
+        root_gap
+            .to_string()
+            .ends_with("Run `sc backfill --all` to repair it"),
+        "{root_gap}"
+    );
+    drop(clone);
+    sz.cleanup();
 }
 
 /// gc, verify and push on a size-limited clone (presence-based, ADR-0048).

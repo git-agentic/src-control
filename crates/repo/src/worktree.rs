@@ -734,13 +734,15 @@ pub(crate) fn preflight_view(
     let Some(promisor) = crate::promisor::load(layout)? else {
         return Ok(());
     };
-    let gap = |path: &str| {
-        // With a blob limit the missing object is a file, and `sc backfill`
-        // repairs it by its own path rather than a covering prefix (ADR-0055).
-        // The limit is the cause only for a path in the clone's scope; a path
-        // outside it (a view widened past the filter) was left out by the filter.
-        let sized = promisor.blob_limit().filter(|_| promisor.matches(path));
-        let prefix = if sized.is_some() && !path.is_empty() {
+    let gap = |path: &str, is_blob: bool| {
+        // With a blob limit `sc backfill` repairs a gap by its own path rather
+        // than a covering prefix (ADR-0055). The limit is named as a cause only
+        // for a missing file in the clone's scope: a missing directory, or a path
+        // outside the scope, was left out by a fetch or by the filter.
+        let sized = promisor
+            .blob_limit()
+            .filter(|_| is_blob && promisor.matches(path));
+        let prefix = if promisor.blob_limit().is_some() && !path.is_empty() {
             path.to_string()
         } else {
             promisor
@@ -769,7 +771,7 @@ pub(crate) fn preflight_view(
         }
     };
     if !store.contains(&root) {
-        return Err(gap(""));
+        return Err(gap("", false));
     }
     let mut stack = vec![(root, String::new())];
     while let Some((tree_id, path)) = stack.pop() {
@@ -783,13 +785,13 @@ pub(crate) fn preflight_view(
             match e.kind {
                 EntryKind::Blob => {
                     if sparse.matches(&child) && !store.contains(&e.id) {
-                        return Err(gap(&child));
+                        return Err(gap(&child, true));
                     }
                 }
                 EntryKind::Tree => {
                     if sparse.should_descend(&child) {
                         if !store.contains(&e.id) {
-                            return Err(gap(&child));
+                            return Err(gap(&child, false));
                         }
                         stack.push((e.id, child));
                     }

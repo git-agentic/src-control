@@ -212,7 +212,10 @@ pub fn parse_clone_filters(values: &[String]) -> Result<(Vec<String>, Option<u64
     let mut prefixes = Vec::new();
     let mut limit = None;
     for v in values {
-        let Some(spec) = v.strip_prefix("blob:") else {
+        // Reserved however it is spelled: ` Blob:limit=1KiB` must not slip
+        // through as a path prefix that matches nothing.
+        let norm = v.trim().to_ascii_lowercase();
+        let Some(spec) = norm.strip_prefix("blob:") else {
             prefixes.push(v.clone());
             continue;
         };
@@ -235,7 +238,17 @@ pub fn parse_clone_filters(values: &[String]) -> Result<(Vec<String>, Option<u64
                     .into(),
             ));
         }
-        limit = Some(scl_core::parse_byte_size(size).map_err(Error::InvalidArgument)?);
+        let n = scl_core::parse_byte_size(size).map_err(Error::InvalidArgument)?;
+        // No object above the largest configurable cap can be transferred, so
+        // a limit above it filters nothing and is almost certainly a mistake.
+        if n > scl_core::MAX_MAX_OBJECT_SIZE as u64 {
+            return Err(Error::InvalidArgument(format!(
+                "`blob:limit={size}` is above the largest transferable object ({} bytes, 1 GiB) \
+                 and would filter nothing; give a smaller limit, or omit the filter",
+                scl_core::MAX_MAX_OBJECT_SIZE
+            )));
+        }
+        limit = Some(n);
     }
     Ok((prefixes, limit))
 }
@@ -249,11 +262,12 @@ pub fn partial_gap_hint(path: &str) -> Error {
 }
 
 /// The gap error for `path` on this partial clone: [`Error::GapBySize`] when
-/// the clone has a blob-size limit and `path` is in its scope (the file's own
-/// path is what `sc backfill` repairs), otherwise the prefix hint.
-pub fn gap_error(promisor: Option<&Promisor>, path: &str) -> Error {
+/// the clone has a blob-size limit, `path` is in its scope and the missing
+/// object is a file (`tree` false; a missing directory was left out by a fetch,
+/// not by the limit), otherwise the prefix hint naming the path.
+pub fn gap_error(promisor: Option<&Promisor>, path: &str, tree: bool) -> Error {
     match promisor {
-        Some(p) if !path.is_empty() && p.matches(path) => match p.blob_limit() {
+        Some(p) if !tree && !path.is_empty() && p.matches(path) => match p.blob_limit() {
             Some(limit) => Error::GapBySize {
                 path: path.to_string(),
                 limit,
@@ -388,9 +402,11 @@ fn remove_file_if_exists(path: &std::path::Path) -> Result<()> {
 /// after independently confirming the object closure is actually
 /// complete — this function does not itself verify anything.
 pub fn remove(layout: &Layout) -> Result<()> {
-    set_lazy(layout, false)?;
+    // `.sc/promisor` first: a crash after it leaves only a stray limit file,
+    // which `load` ignores, never a marker that lost its limit and matches nothing.
+    remove_file_if_exists(&layout.promisor_path())?;
     remove_file_if_exists(&layout.promisor_blob_limit_path())?;
-    remove_file_if_exists(&layout.promisor_path())
+    set_lazy(layout, false)
 }
 
 /// True when this partial clone has opted in to filling gaps by object id

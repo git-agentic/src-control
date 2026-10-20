@@ -52,13 +52,16 @@ unless decision 4 keeps it".
 leaves out every non-empty blob outside the tips). `blob:limit=0` leaves out
 every blob no ref tip reaches. Size is the stored object's payload length.
 
-**Grammar.** `blob:` is reserved in `--filter`: only `blob:limit=<size>` is
+**Grammar.** `blob:` is reserved in `--filter`, matched after trimming and
+lower-casing (so `Blob:limit=1KiB` is the filter, never a path prefix that
+matches nothing): only `blob:limit=<size>` is
 accepted, once. A second `blob:limit` is an error. `blob:none` is an error that
 points at `blob:limit=0`. Any other `blob:` form is an error naming the one
 supported form. Cost: a path prefix that literally begins with `blob:` can no
 longer be named in `--filter`. `sc clone --help` documents this. `--lazy`
 requires `--filter`, which a lone `blob:limit=` satisfies, and works with it.
-Rejected: a separate `--blob-limit` flag, which has no collision but diverges
+A limit above the largest transferable object (1 GiB, `MAX_MAX_OBJECT_SIZE`)
+filters nothing and is an error. Rejected: a separate `--blob-limit` flag, which has no collision but diverges
 from the issue and from git.
 
 ### 2. Deferred
@@ -204,7 +207,10 @@ orders.
   pick, rebase, session or `sc cat` on a clone with a limit are
   `GapBySize { path, limit }`: "`<path>` was left out of this partial clone
   (blob:limit=<n>); run `sc backfill <path>` to fetch it first". A prefix-only
-  clone keeps every old message byte for byte.
+  clone keeps every old message byte for byte. The limit is named only for a
+  missing file in scope; a missing directory (a fetch left it out) is named by its
+  path, and a missing root tree points at `sc backfill --all` (merge needs carry
+  a tree/blob flag for this).
 - **Repair, lazy and online:** nothing to do. `ensure_view`, `sc cat` and the
   ADR-0049 merge fill by id.
 - **Repair, otherwise:** `sc backfill <path>` fetches every version of that path

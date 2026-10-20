@@ -161,6 +161,13 @@ pub fn reachable_objects_limited(
     filter: Option<&dyn PrefixFilter>,
     blob_limit: Option<u64>,
 ) -> Result<Reachable> {
+    // A limit needs a scope to apply to (an all-paths filter for a size-only
+    // walk). Failing here is safer than silently sending everything.
+    if blob_limit.is_some() && filter.is_none() {
+        return Err(Error::InvalidArgument(
+            "blob limit without a path filter".into(),
+        ));
+    }
     let mut gaps = BTreeSet::new();
     let tip_set: HashSet<ObjectId> = tips.iter().copied().collect();
     // Size verdicts by blob id: a blob shared by many paths or versions is

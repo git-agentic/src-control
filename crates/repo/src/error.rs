@@ -53,7 +53,7 @@ pub enum Error {
     /// out of the reply. Raised before anything is written, so the working
     /// tree and refs are untouched. `prefix` is the filter prefix that
     /// `sc backfill` can act on.
-    #[error("{path} is missing from this partial clone's local objects ({}); nothing was changed. Run `sc backfill {prefix}` to repair it", gap_cause(*.blob_limit))]
+    #[error("{path} is missing from this partial clone's local objects ({}); nothing was changed. Run {} to repair it", gap_cause(*.blob_limit), repair_command(.prefix))]
     GapInView {
         path: String,
         prefix: String,
@@ -210,5 +210,15 @@ fn gap_cause(blob_limit: Option<u64>) -> String {
             "blob:limit={limit} left this out of the clone, or an earlier fetch left a gap inside the checked-out view"
         ),
         None => "an earlier fetch left a gap inside the checked-out view".to_string(),
+    }
+}
+
+/// The `sc backfill` command that repairs a gap: a prefix names a path; a gap
+/// at the root tree has none, and only a full backfill covers it.
+fn repair_command(prefix: &str) -> String {
+    if prefix.is_empty() {
+        "`sc backfill --all`".to_string()
+    } else {
+        format!("`sc backfill {prefix}`")
     }
 }

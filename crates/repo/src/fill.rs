@@ -235,7 +235,7 @@ impl Repo {
         let mut filler = Filler::new(self, offline)?;
         let mut cur = root;
         for (i, comp) in comps.iter().enumerate() {
-            filler.ensure_present(&cur, path)?;
+            filler.ensure_present(&cur, path, true)?;
             let entry = {
                 let store_arc = self.vfs.store();
                 let mut store = store_arc.lock().unwrap();
@@ -258,7 +258,7 @@ impl Repo {
                             "{path} is a protected path; sc cat prints public content only"
                         )));
                     }
-                    filler.ensure_present(&entry.id, path)?;
+                    filler.ensure_present(&entry.id, path, false)?;
                     let store_arc = self.vfs.store();
                     let mut store = store_arc.lock().unwrap();
                     return match store.get(&entry.id)? {
@@ -286,13 +286,13 @@ impl NeedsFiller<'_> {
     /// can repair. Call it with the store lock released: the fill takes it.
     /// Fetched objects stay (they are immutable CAS additions), so a retry
     /// resumes from current presence. Returns what this call cost.
-    pub(crate) fn fill(&mut self, needs: &[(ObjectId, String)]) -> Result<FillStats> {
-        let Some((_, first)) = needs.first() else {
+    pub(crate) fn fill(&mut self, needs: &[crate::merge_tree::Need]) -> Result<FillStats> {
+        let Some(first) = needs.first() else {
             return Ok(FillStats::default());
         };
         let before = self.filler.stats;
-        let ids: BTreeSet<ObjectId> = needs.iter().map(|(id, _)| *id).collect();
-        if let Err(e) = self.filler.ensure_many(&ids, first) {
+        let ids: BTreeSet<ObjectId> = needs.iter().map(|n| n.id).collect();
+        if let Err(e) = self.filler.ensure_many(&ids, &first.path, first.tree) {
             return Err(match e {
                 Error::GapOutsideFilter(p) if p.is_empty() => {
                     crate::promisor::partial_clone_unsupported("merge")
@@ -342,14 +342,14 @@ impl<'a> Filler<'a> {
 
     /// Ensure `id` is in the local store. `path` names what the caller is
     /// reading, for the gap error.
-    fn ensure_present(&mut self, id: &ObjectId, path: &str) -> Result<()> {
+    fn ensure_present(&mut self, id: &ObjectId, path: &str, tree: bool) -> Result<()> {
         let present = self.repo.vfs.store().lock().unwrap().contains(id);
         if present {
             return Ok(());
         }
         let Some(origin) = self.origin.clone() else {
             return Err(match self.repo.promisor()? {
-                Some(p) => crate::promisor::gap_error(Some(&p), path),
+                Some(p) => crate::promisor::gap_error(Some(&p), path, tree),
                 None => Error::Core(scl_core::Error::NotFound(*id)),
             });
         };
@@ -366,7 +366,7 @@ impl<'a> Filler<'a> {
     /// Ensure every id in `ids` is in the local store, fetching the absent
     /// ones in batches. `path` names what the caller is laying out, for the
     /// gap error when filling is not allowed.
-    fn ensure_many(&mut self, ids: &BTreeSet<ObjectId>, path: &str) -> Result<()> {
+    fn ensure_many(&mut self, ids: &BTreeSet<ObjectId>, path: &str, tree: bool) -> Result<()> {
         let absent: Vec<ObjectId> = {
             let store_arc = self.repo.vfs.store();
             let store = store_arc.lock().unwrap();
@@ -380,7 +380,7 @@ impl<'a> Filler<'a> {
         };
         let Some(origin) = self.origin.clone() else {
             return Err(match self.repo.promisor()? {
-                Some(p) => crate::promisor::gap_error(Some(&p), path),
+                Some(p) => crate::promisor::gap_error(Some(&p), path, tree),
                 None => Error::Core(scl_core::Error::NotFound(*first)),
             });
         };
@@ -400,7 +400,7 @@ impl<'a> Filler<'a> {
     /// subtree is read once per path. Progress is by presence, so an
     /// interrupted fill resumes where it stopped.
     fn fill_view(&mut self, root: ObjectId, sparse: &Sparse) -> Result<()> {
-        self.ensure_many(&BTreeSet::from([root]), "")?;
+        self.ensure_many(&BTreeSet::from([root]), "", true)?;
         let mut frontier: Vec<(ObjectId, String)> = vec![(root, String::new())];
         // Under a path the view matches, every descendant is in view whatever
         // its path, so a repeated subtree is read once by id. Above that (the
@@ -440,7 +440,7 @@ impl<'a> Filler<'a> {
                 }
             }
             let hint = frontier.first().map(|(_, p)| p.clone()).unwrap_or_default();
-            self.ensure_many(&want, &hint)?;
+            self.ensure_many(&want, &hint, true)?;
             frontier = next;
         }
         Ok(())
