@@ -517,6 +517,7 @@ pub(crate) fn index_incoming(
 /// bounded by [`MAX_PENDING`] and zero when nothing is pending. An entry whose
 /// object is gone, or that no longer decodes as a tombstone, is forgotten.
 /// Returns how many drops were honored.
+#[cfg(test)]
 pub(crate) fn reevaluate_pending(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
     Ok(reevaluate_inner(layout, store)?.0)
 }
