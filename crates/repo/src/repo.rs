@@ -1807,10 +1807,12 @@ impl Repo {
         conflicted_paths: &[String],
     ) -> Result<ObjectId> {
         let sparse = self.sparse_spec()?;
-        // `sc sparse set` is refused while a rebase is stopped, so a refusal
-        // reached from `rebase --continue` cannot be fixed by widening in place.
+        // A stopped op can be widened in place (`sc sparse set`, additive
+        // only; ADR-0034), so the stopped-op refusal from `--continue` names
+        // that instead of an abort.
         let widen = if crate::rebase_state::in_progress(&self.layout) {
-            "abort the rebase (`sc rebase --abort`), widen with `sc sparse set`, then rerun the rebase"
+            "add it to the current prefixes with `sc sparse set` (it may only widen the view \
+             while the rebase is stopped), then rerun `sc rebase --continue`"
         } else {
             "run `sc sparse set` to include it, then retry"
         };
@@ -1841,14 +1843,15 @@ impl Repo {
             )));
         }
         // A sidecar is `<conflicted path>.theirs`, and the conflicted path
-        // passed the gate above, so on a full clone it is beside an in-view
-        // file (a file-exact spec such as `src/a.bin` does not match
+        // passed the gate above, so it is beside an in-view file (a
+        // file-exact spec such as `src/a.bin` does not match
         // `src/a.bin.theirs`, yet that sidecar is in view) and `abort` and
-        // completion remove it. A partial clone keeps the stricter ADR-0049
-        // refusal: outside the view its sidecar would sit where completion
-        // neither expects nor protects it.
+        // completion remove it. A partial clone still checks it, by its base
+        // path: outside the view it would sit where completion neither
+        // expects nor protects it (ADR-0049).
         if self.promisor()?.is_some() {
-            if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !sparse.matches(r)) {
+            let in_view = |r: &str| sparse.matches(r.strip_suffix(".theirs").unwrap_or(r));
+            if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !in_view(r)) {
                 return Err(Error::InvalidArgument(format!(
                     "{op} has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
                      {widen}"

@@ -63,12 +63,13 @@ review fix — see Consequences).
   (`sc sparse set`) before anything is written, exactly like an
   out-of-sparse conflicted path, so a stop, its completion and its abort
   leave nothing out of view on disk. From `rebase --continue` the hint
-  says to abort the rebase first, because `sparse set` is refused while a
-  rebase is stopped. Sidecars need no gate on a full clone: each is
-  `<conflicted path>.theirs` beside a conflicted path that already passed
-  the gate (so it is in view even under a file-exact spec such as
-  `src/a.bin`), and abort and completion remove it; a partial clone keeps
-  its stricter sidecar refusal (ADR-0049). The earlier build wrote that
+  says to widen with `sc sparse set` and rerun `--continue` (a widen is
+  allowed mid-stop since #224, see refinement 5). Sidecars need no gate on
+  a full clone: each is `<conflicted path>.theirs` beside a conflicted path
+  that already passed the gate (so it is in view even under a file-exact
+  spec such as `src/a.bin`), and abort and completion remove it; a partial
+  clone checks the sidecar by its base path (#224), so a file-exact spec no
+  longer refuses a valid in-view binary conflict (ADR-0049). The earlier build wrote that
   plaintext outside the view and left it there after completion (only
   abort removed it); this was never data loss or a new disclosure, only a
   view wider than advertised. The cost is that such a merge now needs the
@@ -161,10 +162,36 @@ every claim below is checked against the shipped code, not the plan.
    narrow view during harvest and silently revert an agent's genuine
    deletion of an out-of-sparse path, pinned by
    `sc_work_full_agent_deletion_survives_host_sparse`.
-5. **`set_sparse`/`disable_sparse` refuse mid-conflict.** Re-laying the
-   working tree while a merge/pick/rebase is in progress would either
-   destroy in-progress conflict markers or narrow away a path a
-   conflicted operation still needs on disk — both refuse with the same
-   `MergeInProgress`/`PickInProgress`/`RebaseInProgress` errors the P21
-   policy-op guards already use elsewhere, added in review before Task 4
-   landed rather than discovered after.
+5. **`set_sparse`/`disable_sparse` refuse mid-conflict, except a strict
+   widen.** Re-laying the working tree while a merge/pick/rebase is in
+   progress would either destroy in-progress conflict markers or narrow
+   away a path a conflicted operation still needs on disk — both refuse
+   with the same `MergeInProgress`/`PickInProgress`/`RebaseInProgress`
+   errors the P21 policy-op guards already use elsewhere, added in review
+   before Task 4 landed rather than discovered after. `disable_sparse`,
+   narrowing and sideways specs still refuse. Since #224 `set_sparse` accepts
+   a spec that `Sparse::covers` the current one (every old prefix is matched
+   by a new one) while the stop has a recorded decided root
+   (`MERGE`/`PICK`/`REBASE_DECIDED_ROOT`), so `rebase --continue`'s
+   out-of-view refusal can be fixed without losing the resolved commits.
+   `Repo::widen_while_stopped` (`crates/repo/src/sparse.rs`) does not
+   re-lay HEAD. For the decided root, the tip and (rebase) the accumulator
+   it fills the new view's closure (lazy partial clones), preflights the
+   view and runs `refuse_untracked_for_view_change`, then writes
+   only the files `old` did not match (`worktree::lay_out_added_view`) and
+   stores the spec last, so a crash leaves extra out-of-view files, never a
+   view with files missing (a retry of the same widen after such a crash is
+   refused by the untracked-file guard; delete the laid files and rerun). The
+   decided root is the right source: it is what completion carries an
+   out-of-view path from. For a resumed rebase (`resolved`) the accumulator
+   can differ from it outside the view, but the next `--continue` re-lays
+   the tree from the accumulator under the new spec, so what the widen laid
+   is overwritten there. A full spec is `disable` and stays refused. Markers, the resolution,
+   `CONFLICT_PLAINTEXT` and sidecars are all in the old view, so they are not
+   touched; the dirty-tree check is skipped (HEAD is stale mid-op). A
+   protected file that comes into view is not decrypted (the stop does not
+   persist its wrap map): it stays absent, is reported as skipped, and
+   completion carries it from the decided root as for any absent protected
+   path. Abort restores the original tip over the widened view and the spec
+   stays widened. No oplog record is written (the spec change moves no
+   ref); the repo lock is held by the CLI as for any mutation.

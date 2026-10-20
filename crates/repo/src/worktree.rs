@@ -774,6 +774,39 @@ pub(crate) fn preflight_view(
     Ok(())
 }
 
+/// Lay out the files that a widened view (`new`, which covers `old`) brings
+/// in from `root`, and nothing else: no removal pass, and no rewrite of a path
+/// `old` already laid out (it may hold conflict markers or the user's
+/// resolution). A protected entry is not decrypted: it is left absent and
+/// returned, since the caller has no wrap map for `root`.
+pub(crate) fn lay_out_added_view(
+    layout: &Layout,
+    store: &mut Store,
+    root: ObjectId,
+    old: &Sparse,
+    new: &Sparse,
+) -> Result<Vec<String>> {
+    let mut skipped = Vec::new();
+    for (path, (blob_id, _mode, perms)) in tree_file_entries_with_perms_sparse(store, root, new)? {
+        if old.matches(&path) {
+            continue;
+        }
+        if perms & PROTECTED != 0 {
+            skipped.push(path);
+            continue;
+        }
+        let Object::Blob(bytes) = store.get(&blob_id)? else {
+            continue;
+        };
+        let full = safe_join(&layout.root, &path)?;
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&full, &bytes[..])?;
+    }
+    Ok(skipped)
+}
+
 /// Materialize a snapshot's file tree into the working dir.
 ///
 /// `sparse` filters the disk view: a target entry outside `sparse` is never

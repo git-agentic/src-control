@@ -50,6 +50,19 @@ impl Sparse {
             })
     }
 
+    /// Whether every path `other` matches is also matched here: the widen-only
+    /// test for a spec change while an op is stopped. A prefix names its bare
+    /// path and everything under it, so `other`'s prefix is covered exactly
+    /// when this spec matches that bare path.
+    pub fn covers(&self, other: &Sparse) -> bool {
+        self.is_full()
+            || (!other.is_full()
+                && other
+                    .prefixes
+                    .iter()
+                    .all(|p| self.matches(p.trim_end_matches('/'))))
+    }
+
     /// The recorded prefixes, in the order they were set.
     pub fn prefixes(&self) -> &[String] {
         &self.prefixes
@@ -226,6 +239,11 @@ impl Repo {
     /// spec. An unborn HEAD has no working tree to re-lay; the spec is still
     /// persisted so it takes effect on the first commit/checkout.
     ///
+    /// While a merge, pick or rebase is stopped it refuses with that op's
+    /// `*InProgress` error unless `prefixes` cover the current spec (a strict
+    /// widen) and the stop recorded its decided root; a widen then lays out
+    /// only the files that come into view (see `widen_while_stopped`).
+    ///
     /// Refuses (same as [`Repo::switch_with_identity`]) when the working tree
     /// has uncommitted modifications or deletions: `materialize`'s write loop
     /// rewrites every in-sparse target entry from HEAD's blob unconditionally,
@@ -243,15 +261,20 @@ impl Repo {
         self.refuse_on_private("sc sparse set")?;
         // Before any side effect (the shared `store` checks again).
         validate_prefixes(prefixes)?;
-        if crate::merge_state::in_progress(&self.layout) {
-            return Err(Error::MergeInProgress);
-        }
-        if crate::pick_state::in_progress(&self.layout) {
-            return Err(Error::PickInProgress);
-        }
-        if crate::rebase_state::in_progress(&self.layout) {
-            return Err(Error::RebaseInProgress);
-        }
+        let spec = Sparse::new(prefixes.to_vec());
+        // The view in effect now, read before it is replaced: it bounds the
+        // removal walk in the re-lay below.
+        let old_spec = self.sparse_spec()?;
+        // A stopped merge, pick or rebase refuses a narrowing or sideways
+        // change (the re-lay would clobber its markers). A strict widen is
+        // allowed when the stop recorded its decided root: see
+        // `widen_while_stopped`.
+        let stopped = match self.stopped_op()? {
+            None => None,
+            // A full spec is `disable`, which stays refused.
+            Some((_, Some(decided))) if !spec.is_full() && spec.covers(&old_spec) => Some(decided),
+            Some((refusal, _)) => return Err(refusal),
+        };
         // Gap error on sparse-widen (P27 Task 5): a partial clone never
         // fetched anything outside its promisor filter, so narrowing the
         // sparse view to a prefix that isn't itself covered by the filter
@@ -281,6 +304,9 @@ impl Repo {
                 }
             }
         }
+        if let Some(decided) = stopped {
+            return self.widen_while_stopped(decided, &old_spec, &spec);
+        }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
             return Err(crate::error::Error::InvalidArgument(
@@ -288,10 +314,6 @@ impl Repo {
                     .into(),
             ));
         }
-        let spec = Sparse::new(prefixes.to_vec());
-        // The view in effect now, read before it is replaced: it bounds the
-        // removal walk in the re-lay below.
-        let old_spec = self.sparse_spec()?;
         let tip = self.head_tip()?;
         let snap = match tip {
             Some(tip) => Some(self.snapshot(&tip)?),
@@ -355,6 +377,80 @@ impl Repo {
         if partial {
             clear_prev(self.layout())?;
         }
+        Ok(skipped)
+    }
+
+    /// The in-progress merge, pick or rebase, if any, as the refusal a
+    /// spec change gets and the decided root the stop recorded (the tree its
+    /// working tree was laid out from).
+    fn stopped_op(&self) -> Result<Option<(Error, Option<scl_core::ObjectId>)>> {
+        Ok(if crate::merge_state::in_progress(&self.layout) {
+            Some((
+                Error::MergeInProgress,
+                crate::merge_state::read_decided_root(&self.layout)?,
+            ))
+        } else if crate::pick_state::in_progress(&self.layout) {
+            Some((
+                Error::PickInProgress,
+                crate::pick_state::read_decided_root(&self.layout)?,
+            ))
+        } else if crate::rebase_state::in_progress(&self.layout) {
+            Some((
+                Error::RebaseInProgress,
+                crate::rebase_state::read_decided_root(&self.layout)?,
+            ))
+        } else {
+            None
+        })
+    }
+
+    /// Widen the view (`new` covers `old`) while a merge, pick or rebase is
+    /// stopped, laying out only the files that come into view, from the
+    /// stop's decided root. A normal `set_sparse` re-lays HEAD, which would
+    /// overwrite the conflict markers and the user's resolution, and its
+    /// dirty-tree check reads those as uncommitted edits.
+    ///
+    /// The decided root is right for every path the stop did not write: it is
+    /// what completion carries an out-of-view path from, so laying a path out
+    /// from it changes nothing the completion would compute, while leaving
+    /// it off disk would read as a deletion. Marker, plaintext and sidecar
+    /// paths are all in the old view (the stop gates them), so none is
+    /// touched. Protected entries are not decrypted here: they stay absent,
+    /// and completion carries them from the decided root as it does for any
+    /// absent protected file. Files are written before the spec, so a crash
+    /// leaves only extra out-of-view files, never a view with files missing.
+    fn widen_while_stopped(
+        &self,
+        decided: scl_core::ObjectId,
+        old: &Sparse,
+        new: &Sparse,
+    ) -> Result<Vec<String>> {
+        // Before any write, for every tree the stopped op still reads over
+        // the new view (the decided root; the tip, which `--abort` and the
+        // completion's `tracked_paths_at` read; a rebase's accumulator):
+        // fill the closure (lazy partial clones), check it is present, and
+        // refuse to lay a file over one the user owns.
+        let mut roots = vec![decided];
+        if let Some(tip) = self.head_tip()? {
+            roots.push(self.snapshot(&tip)?.root);
+        }
+        if let Some(st) = crate::rebase_state::read(&self.layout)? {
+            roots.push(self.snapshot(&st.acc_tip)?.root);
+        }
+        let store_arc = self.vfs().store();
+        for root in roots {
+            self.ensure_view(root, new)?;
+            {
+                let mut s = store_arc.lock().unwrap();
+                crate::worktree::preflight_view(self.layout(), &mut s, root, new)?;
+            }
+            self.refuse_untracked_for_view_change("sparse set", root, old, new)?;
+        }
+        let skipped = {
+            let mut s = store_arc.lock().unwrap();
+            crate::worktree::lay_out_added_view(self.layout(), &mut s, decided, old, new)?
+        };
+        store(self.layout(), new)?;
         Ok(skipped)
     }
 
@@ -526,6 +622,20 @@ mod tests {
         clear(&layout).unwrap();
 
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn covers_is_a_strict_superset_test_on_path_boundaries() {
+        let sp = |v: &[&str]| Sparse::new(v.iter().map(|s| s.to_string()).collect());
+        assert!(sp(&["src/", "docs/"]).covers(&sp(&["src"])));
+        assert!(sp(&["src"]).covers(&sp(&["src/a/", "src/b.txt"])));
+        assert!(sp(&["src"]).covers(&sp(&["src"])));
+        assert!(sp(&[]).covers(&sp(&["src"])), "full covers everything");
+        assert!(sp(&[]).covers(&sp(&[])));
+        assert!(!sp(&["src"]).covers(&sp(&[])), "full is wider than any set");
+        assert!(!sp(&["src/a.txt"]).covers(&sp(&["src"])), "narrower");
+        assert!(!sp(&["docs"]).covers(&sp(&["src"])), "sideways");
+        assert!(!sp(&["src"]).covers(&sp(&["srcfoo"])), "boundary, not text");
     }
 
     #[test]

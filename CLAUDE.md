@@ -240,10 +240,14 @@ transport-adjacent. The rest, imperatively:
 - **Sparse is checkout-only**, and a stopped merge/pick/rebase writes no
   conflict marker or sealing-input plaintext outside the view: an out-of-sparse
   conflicted path or sealing input refuses with a `sc sparse set` hint before
-  any write (ADR-0034, #210; from `rebase --continue` the hint says to abort
-  first, since `sparse set` is refused mid-rebase). A binary conflict's
-  `<path>.theirs` sidecar sits beside its in-view file and may not match a
-  file-exact spec; completion and abort remove it.
+  any write (ADR-0034, #210). While a merge/pick/rebase is stopped, `sparse
+  set` accepts only a strict widen (new spec covers the old; narrowing,
+  sideways and `disable` still refuse): it lays out just the newly in-view
+  files from the stop's decided root and leaves protected ones absent, so a
+  `rebase --continue` refusal is fixed by widening and rerunning it (#224). A
+  binary conflict's `<path>.theirs` sidecar sits beside its in-view file and
+  may not match a file-exact spec (partial clones check it by its base path);
+  completion and abort remove it.
 - **`.sc/git-remotes/<name>/marks` carries `git_oid ↔ sc_id` identity —
   deleting it is destructive.** Deleting the sibling `mirror.git` is always
   safe (reconstructed on next use). Stale marks self-heal on push/export.
