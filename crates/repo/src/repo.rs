@@ -2250,7 +2250,10 @@ impl Repo {
         // Relies on `stop_write_blocker` treating whatever stands at `rel` (any
         // directory included) as the user's: nothing outside the view is laid
         // out, so no tracked file can be on disk there.
-        let mut is_tracked = |_: &str| false;
+        // Only a case alias of a path `old` laid out (a case-only rename on a
+        // case-insensitive filesystem) is the tracked file.
+        let root = &self.layout.root;
+        let mut is_tracked = |p: &str| is_tracked_case_alias(root, old, p);
         for rel in target
             .iter()
             .filter(|p| !sparse.matches(p) && !old.contains(*p))

@@ -216,3 +216,22 @@ fn leaving_a_private_branch_refuses_an_untracked_file_where_main_has_one_out_of_
     std::fs::remove_dir_all(&f.root).unwrap();
     assert!(!f.root.exists(), "test dir left behind");
 }
+
+#[test]
+fn aborting_a_private_stop_ignores_a_file_at_an_out_of_view_tracked_path() {
+    let f = fixture("abort", true, false);
+    let sk = Some(&f.sk);
+    assert!(matches!(
+        f.repo.merge_into_private("main", "alice", sk),
+        Err(Error::MergeConflicts(1))
+    ));
+    // `docs/ours.txt` is tracked by the private tip, outside the view.
+    put(&f.root, "docs/ours.txt", "MINE\n");
+    f.repo.merge_abort_with_identity(sk).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("docs/ours.txt")).unwrap(),
+        "MINE\n"
+    );
+    std::fs::remove_dir_all(&f.root).unwrap();
+    assert!(!f.root.exists(), "test dir left behind");
+}
