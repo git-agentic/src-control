@@ -65,7 +65,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0052](0052-secret-injection-by-fd.md) | Secret injection by file descriptor (`sc run --secrets-fd`) | Accepted (built) | — |
 | [0053](0053-tls-pin-management.md) | TLS pin management (`sc tls`) | Accepted (built) | — |
 | [0054](0054-tls-ca-validation.md) | CA-path validation for `sc+https://` | Accepted (built) | — |
-| [0055](0055-blob-size-clone-filter.md) | Blob-size clone filter (`--filter blob:limit=<size>`) | Proposed (needs wire v6 decision) | 27 |
+| [0055](0055-blob-size-clone-filter.md) | Blob-size clone filter (`--filter blob:limit=<size>`) | Accepted (built) | 27 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
