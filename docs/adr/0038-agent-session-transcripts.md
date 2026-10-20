@@ -533,6 +533,16 @@ never re-runs.
 
 ### Other accepted limits
 
+- Ordering across separate pushes on a push-only remote. A tombstone that
+  arrives before its snapshot is not kept as pending, and a signature that
+  arrives before its target is not indexed (the target must be held); a later
+  push resends neither, because the remote already has the object. Within one
+  pack (the normal case: snapshot, transcript, tombstone and signature travel
+  together) the order does not matter, and a fetching peer is re-sent
+  everything. The signature-driven lookup of a late signature is capped at
+  1024 distinct held targets per batch, so a pack that signs more held objects
+  than that before the tombstone's signature can skip it.
+
 - Verifying a signature before indexing costs one Ed25519 check per incoming
   signature object, linear in the pack size like hash-checking its records. A
   per-ingest verification budget was considered and refused: it would drop

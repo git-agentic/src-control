@@ -122,12 +122,18 @@ fn append_drop(layout: &Layout, entry: DropEntry) -> Result<()> {
         entry.1.to_hex(),
         entry.2.to_hex()
     );
+    let path = layout.transcript_drops_path();
+    let is_new = !path.exists();
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(layout.transcript_drops_path())?;
+        .open(&path)?;
     f.write_all(line.as_bytes())?;
     f.sync_data()?;
+    if is_new {
+        // Make the new directory entry durable too.
+        std::fs::File::open(&layout.dot_sc)?.sync_all()?;
+    }
     Ok(())
 }
 
