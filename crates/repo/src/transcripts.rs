@@ -160,6 +160,9 @@ fn write_pending(layout: &Layout, ids: &[ObjectId]) -> Result<()> {
 /// Remember `new` tombstones for re-evaluation, deduped, newest last, capped
 /// at [`MAX_PENDING`]. Writes only when the set changes.
 fn note_pending(layout: &Layout, new: &[ObjectId]) -> Result<()> {
+    if new.is_empty() {
+        return Ok(());
+    }
     // Dedupe the batch (order kept), then only its newest MAX_PENDING can
     // survive.
     let mut once = BTreeSet::new();
