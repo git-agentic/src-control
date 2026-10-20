@@ -279,12 +279,17 @@ cargo run --bin sc -- serve --http <addr> <path> [--read-only] [--allow-public]
                                               # cap, both --http and --stdio, default 16 GiB,
                                               # 0=unlimited, floor 256 MiB (MAX_OBJECT_SIZE);
                                               # counted mid-stream abort -> EC_TOO_LARGE (P31)
-cargo run --bin sc -- serve token add --label <name> --scope ro|rw   # mint an
-                                              # sct-<hex> bearer token in .sc/serve-tokens.toml;
-                                              # raw value prints once on stdout (P29)
+cargo run --bin sc -- serve token add --label <name> --scope ro|rw [--expires <30m|12h|7d|2w|YYYY-MM-DD>]
+                                              # mint an sct-<hex> bearer token in
+                                              # .sc/serve-tokens.toml; raw value prints once on
+                                              # stdout; --expires: duration or 00:00 UTC date;
+                                              # value must be in the future; default never (P29, #209)
+cargo run --bin sc -- serve token rotate <label>   # new secret, same label/scope and the same
+                                              # ABSOLUTE expires_at (no renewed duration); old one
+                                              # dies at once; refused if expired (#209)
 cargo run --bin sc -- serve token remove <label>   # drop a token by label (P29)
-cargo run --bin sc -- serve token list [--json]    # list token labels + scopes, never the
-                                              # raw value (P29)
+cargo run --bin sc -- serve token list [--json]    # list labels, scopes, expiry (EXPIRED
+                                              # flagged), never the raw value (P29)
                                               # client: SC_HTTP_TOKEN=<raw> sc clone/fetch/push
                                               # sc+http://... presents the bearer on every
                                               # connection once any token is configured (P29)

@@ -84,11 +84,11 @@ fn ancestors(store: &mut Store, id: ObjectId) -> Result<BTreeSet<ObjectId>> {
     Ok(set)
 }
 
-/// One merged file in a [`FileMerge`] working set.
+/// One merged file in a `FileMerge` working set.
 ///
 /// `bytes` carries ciphertext when a protected entry was resolved by
 /// ciphertext-id fast path (`needs_encrypt: false` — the blob survives as-is,
-/// its wraps travel in [`FileMerge::wrapped_carry`]); it carries plaintext when
+/// its wraps travel in `FileMerge::wrapped_carry`); it carries plaintext when
 /// a protected entry was content-merged (`needs_encrypt: true` — a later stage
 /// must re-encrypt before committing). Plain files are always plaintext with
 /// `perms: 0, needs_encrypt: false`.
@@ -136,7 +136,7 @@ pub struct Merge {
     /// Merged secret registry.
     pub secrets: BTreeMap<String, ObjectId>,
     /// Wrapped DEKs for every surviving carried ciphertext blob (see
-    /// [`FileMerge::wrapped_carry`]) — threaded up from `three_way_files` so
+    /// `FileMerge::wrapped_carry`) — threaded up from `three_way_files` so
     /// `Repo::merge_with_identity` (P15) can union it with freshly-encrypted
     /// wraps without a second file-tree walk. Extending `Merge` rather than
     /// having callers reach into `FileMerge` directly keeps `three_way`'s
