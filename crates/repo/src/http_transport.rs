@@ -899,10 +899,7 @@ fn bind_is_allowed(
     allow_public: bool,
     tls: bool,
 ) -> Result<bool> {
-    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-    // Strip optional [..] brackets around an IPv6 literal.
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if is_loopback_host(host) {
+    if addr_is_loopback(addr) {
         return Ok(true);
     }
     if read_only || allow_public {

@@ -316,9 +316,12 @@ protect RAM or disk in any practical sense, and with `--max-connections`
 lowers `--max-pack-size` and `--max-conn-bytes` together; `sc serve --http`
 prints a startup warning for a writable, non-loopback listener left on the
 default.
-The single-connection push path (one `PutPack` within `--max-pack-size`)
-is unaffected by the default; a workload that pushes more than the budget
-over one connection must raise the flag or push over several.
+A pack is bounded by its *decoded* size, not just `--max-pack-size`: on a
+bucket `--store` a compressible pack's decoded size is usually 2-4x its spool
+and can exceed the default, and on a local store a tree-dominated pack can
+too. Refusing those is intended; they are the retention this budget exists to
+bound. A workload that legitimately pushes more than the budget over one
+connection must raise `--max-conn-bytes` or push over several connections.
 
 **Not covered.** The budget bounds bytes accepted, not request count or
 CPU. A budgeted peer can still use `--max-connections` x the budget, and

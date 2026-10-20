@@ -3843,7 +3843,8 @@ fn run_serve(
     path: PathBuf,
 ) -> Result<()> {
     let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
-    let default_budget = max_conn_bytes.is_none();
+    // An explicit --max-pack-size already lowers the default budget with it.
+    let default_budget = max_conn_bytes.is_none() && max_pack_size.is_none();
     let conn_bytes = match max_conn_bytes {
         Some(raw) => {
             scl_core::parse_byte_size(&raw).map_err(|e| anyhow::anyhow!("--max-conn-bytes: {e}"))?

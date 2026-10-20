@@ -827,7 +827,7 @@ pub fn validate_max_conn_bytes(budget: u64, max_pack_size: u64, object_cap: usiz
     }
     if max_pack_size != 0 && budget < max_pack_size {
         return Err(Error::InvalidArgument(format!(
-            "--max-conn-bytes {budget} is below --max-pack-size ({max_pack_size}); a budget that cannot fit one maximal pack is a misconfiguration"
+            "--max-conn-bytes {budget} is below --max-pack-size ({max_pack_size}); a budget below the pack cap is a misconfiguration (a pack is charged by its decoded size, which can still exceed the budget)"
         )));
     }
     Ok(())
@@ -2591,6 +2591,34 @@ mod tests {
         // The same blob pack alone fits.
         let frames = run_budget_session(&root, policy, &[put_blob_pack(36, 700_000)]);
         assert!(frames[0].is_ok(), "{frames:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// The spool half of the max charge: an incompressible blob pack has no
+    /// structural bytes, so only its spooled size can use up the budget for
+    /// the request that follows (charging the tally alone would pass this).
+    #[test]
+    fn spool_bytes_of_a_pack_count_toward_later_requests() {
+        let root = tmp_repo("budget-spool-count");
+        let policy = WirePolicy {
+            max_pack_size: 0,
+            max_conn_bytes: 1 << 20,
+            ..Default::default()
+        };
+        let frames = run_budget_session(
+            &root,
+            policy,
+            &[put_blob_pack(37, 600_000), put_tree(38, 500_000)],
+        );
+        assert!(frames[0].is_ok(), "{frames:?}");
+        assert!(
+            matches!(
+                frames[1].as_ref().unwrap_err(),
+                Error::ConnectionBudgetExceeded(_)
+            ),
+            "{frames:?}"
+        );
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
     }
