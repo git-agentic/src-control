@@ -191,14 +191,14 @@ across every phase.
   `demo/run_ws_demo.sh` (fork/edit/harvest across separate invocations:
   two cumulative clean auto-merges, one conflict fallback, an `sc undo`
   of a landing, zero residue at session end). (ADR-0030.) Follow-on (#215,
-  ADR-0055): `sc ws fork --name <n>` opens further named sessions beside the
+  ADR-0056): `sc ws fork --name <n>` opens further named sessions beside the
   unnamed one, each in `.sc/ws-<n>/` with its own manifest and caches
   (`--session <n>` on `list`/`run`/`harvest`/`abandon`; fallback branches and
   `SC_WORKSPACE` are `<n>-<i>`); the unnamed layout is unchanged, no migration.
   Harvests of different sessions are serialized by the repo lock and land in
   invocation order (first wins, a later conflict falls back); `sc ws run`
   releases the repo lock while its command runs, so other sessions stay usable.
-  Workspace refresh is designed in ADR-0055 and still deferred.
+  Workspace refresh is designed in ADR-0056 and still deferred.
 - **Phase 21 — Hardening & consolidation.** Closes the P16–P20 review
   tail with no new capability axis. Every commit-creating policy op
   (`protect`/`grant`/`revoke`/`secret add`/`secret rotate`/`secret
@@ -759,7 +759,7 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
 - **`sc ws` workspace refresh (#215, P20).** Named and concurrent sessions
-  shipped (ADR-0055). Moving a live workspace onto a newer tip is designed there
+  shipped (ADR-0056). Moving a live workspace onto a newer tip is designed there
   (replay the workspace's commit with the ADR-0049 engine, refuse on any
   conflict, re-materialize under the recorded view) but not built: it needs a
   headless merge-into-tree entry point and a re-materialize that keeps files an

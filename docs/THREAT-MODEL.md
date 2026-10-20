@@ -522,7 +522,7 @@ too, not just the src-control-side metadata.
   store and working tree and, on a lazy clone, fetch more (`sc sparse set`,
   `sc cat`, `sc backfill`). It is not an isolation boundary (compare Secret
   injection). A command run by `sc ws run`
-  no longer holds the repo lock (ADR-0055), so an `sc` it runs from inside the
+  no longer holds the repo lock (ADR-0056), so an `sc` it runs from inside the
   workspace finds the host repo and can change it, as a hand-started agent always
   could.
 - **Operations that need a complete closure refuse on a partial clone, fail

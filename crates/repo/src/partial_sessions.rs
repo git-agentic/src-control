@@ -102,7 +102,7 @@ fn harvest_conflict_falls_back_to_a_branch() {
     fx.cleanup();
 }
 
-/// Two named sessions on one partial clone (ADR-0055): each is forked under the
+/// Two named sessions on one partial clone (ADR-0056): each is forked under the
 /// host's view, they edit different lines of one file, and they land one after
 /// the other. The second is a real merge over the first, and `docs/` is carried
 /// by id the whole time, never read.

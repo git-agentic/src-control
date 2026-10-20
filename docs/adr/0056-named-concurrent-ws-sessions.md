@@ -1,4 +1,4 @@
-# ADR-0055: Named and concurrent `sc ws` sessions (P20, #215)
+# ADR-0056: Named and concurrent `sc ws` sessions (P20, #215)
 
 - **Status:** Accepted (built, except workspace refresh, which is designed here and deferred)
 - **Date:** 2026-10-20

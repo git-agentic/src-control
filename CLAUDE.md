@@ -135,7 +135,7 @@ the code, those win.
 | P17 | `sc rewrap`: one-commit bulk cutover of secrets + protected wrap lists to current recipients/escrow; escrow is a managed list; `--rotate` also re-seals every protected blob under a fresh key | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md), [0051](docs/adr/0051-rotate-protected-paths.md) |
 | P18 | Hosted Git (GitHub https/ssh) via system-git mirror bridge (`SC_GIT` overrides); auth delegated to git | [0028](docs/adr/0028-network-git-remotes.md) |
 | P19 | Resumable rebase (stop → resolve → `--continue`; one oplog record total), `cherry-pick --abort`/`--mainline <N>`, `sc amend` | [0029](docs/adr/0029-history-editing-polish.md) |
-| P20 | Durable multi-invocation agent sessions: `sc ws fork/list/run/harvest/abandon` under `.sc/ws/`; harvest auto-merges, conflicts fall back to `work-<i>`. `fork --name <n>` opens a further named session in `.sc/ws-<n>/` (`--session <n>` on the other verbs; fallback branches and `SC_WORKSPACE` are `<n>-<i>`); sessions are harvested independently, first harvest wins; `ws run` releases the repo lock while the command runs; refresh is designed, not built (#215) | [0030](docs/adr/0030-agent-sessions-and-automerge.md), [0055](docs/adr/0055-named-concurrent-ws-sessions.md) |
+| P20 | Durable multi-invocation agent sessions: `sc ws fork/list/run/harvest/abandon` under `.sc/ws/`; harvest auto-merges, conflicts fall back to `work-<i>`. `fork --name <n>` opens a further named session in `.sc/ws-<n>/` (`--session <n>` on the other verbs; fallback branches and `SC_WORKSPACE` are `<n>-<i>`); sessions are harvested independently, first harvest wins; `ws run` releases the repo lock while the command runs; refresh is designed, not built (#215) | [0030](docs/adr/0030-agent-sessions-and-automerge.md), [0056](docs/adr/0056-named-concurrent-ws-sessions.md) |
 | P21 | Hardening sweep: in-progress guards on all policy ops, git-marks self-heal, abort protected-skip parity, ws `"landed"` status | [0031](docs/adr/0031-hardening-consolidation.md) |
 | P22 | Signed commits: v2 identities (one seed → X25519 + Ed25519), signatures as CAS objects, `sc sign`/`sc verify [--require]` | [0032](docs/adr/0032-signed-commits-provenance.md) |
 | P23 | `sc conflicts`/`sc resolve --ours\|--theirs`: whole-file conflict resolution without hand-edited markers | [0033](docs/adr/0033-merge-ergonomics.md) |
@@ -280,7 +280,7 @@ transport-adjacent. The rest, imperatively:
   `abandon` take `--session <name>` and never guess a named session when none
   is given. Harvests of different sessions run one at a time (repo lock), in
   invocation order: the first lands, a later conflicting one falls back to
-  `<name>-<i>`. Do not run a pre-ADR-0055 `sc` against a repo with named
+  `<name>-<i>`. Do not run a pre-ADR-0056 `sc` against a repo with named
   sessions open (its gc would not root their bases).
 - **A stopped merge/pick/rebase lists the paths it wrote as plaintext in
   `.sc/CONFLICT_PLAINTEXT`.** Protected conflict text never enters the CAS, so no

@@ -350,7 +350,7 @@ phases but the shape is stable:
   for protected paths; never committed, never transferred.
 - `tmp/` — guard-cleaned scratch for streaming pack transfer (P25).
 - `ws/` — durable agent-session workspaces: `session.toml` manifest + per-agent
-  checkouts (P20); `ws-<name>/` — the same for a named session (ADR-0055). `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
+  checkouts (P20); `ws-<name>/` — the same for a named session (ADR-0056). `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
   lazily-built bare `mirror.git` for network Git (P10/P18).
 - Transient in-progress state (removed on completion/abort): `MERGE_HEAD`,
   `PICK_HEAD`, `REBASE_STATE`, and their `*_DECIDED_ROOT` records, plus
@@ -781,7 +781,7 @@ guard family as a ref-mover.
 directory, so a crash between the two never strands a `live = true` entry
 pointing at a directory that no longer exists. See ADR-0030.
 
-Named sessions (ADR-0055). `sc ws fork --name <n>` opens a further session in a
+Named sessions (ADR-0056). `sc ws fork --name <n>` opens a further session in a
 sibling root, `.sc/ws-<n>/` (manifest, `<i>/` checkouts and `cache-<i>` inside),
 so the unnamed session's layout is untouched and tearing one session down never
 touches another. `list`/`run`/`harvest`/`abandon` take `--session <n>`; without

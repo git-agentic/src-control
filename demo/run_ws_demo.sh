@@ -3,7 +3,7 @@
 # edit across separate `sc` process invocations, list, cumulative
 # auto-merge harvest (some workspaces land, a conflicting one falls back),
 # undo/redo of the landings, then manual conflict resolution of the
-# fallback branch, then two named sessions open at once (ADR-0055). Ends
+# fallback branch, then two named sessions open at once (ADR-0056). Ends
 # with zero `.sc/ws*` residue.
 #
 # Self-checking: every claim is an assertion; any failure exits non-zero
@@ -155,7 +155,7 @@ echo "=== 8: zero residue — .sc/ws does not exist ==="
 echo "no .sc/ws residue ✔"
 
 echo
-echo "=== 9: two named sessions open at once (ADR-0055) ==="
+echo "=== 9: two named sessions open at once (ADR-0056) ==="
 fork_a=$("$SC" ws fork --agents 1 --name a --author demo)
 fork_b=$("$SC" ws fork --agents 1 --name b --author demo)
 dir_a=$(echo "$fork_a" | sed -n 2p | awk '{print $2}')

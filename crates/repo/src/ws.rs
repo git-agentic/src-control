@@ -54,7 +54,7 @@ pub struct WsEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsSession {
     /// `None` for the unnamed session (`.sc/ws`), `Some(name)` for a named one
-    /// (`.sc/ws-<name>`, ADR-0055). Derived from where the manifest lives and
+    /// (`.sc/ws-<name>`, ADR-0056). Derived from where the manifest lives and
     /// never stored in it, so the format is unchanged.
     pub name: Option<String>,
     /// The snapshot every workspace was forked from.
@@ -564,7 +564,7 @@ impl Repo {
     /// Run a command in one workspace checkout. Convenience over
     /// [`Self::ws_run_plan`] + [`WsRunPlan::run`] that keeps this `Repo` (and so
     /// the single-writer lock) alive for the child's lifetime; the CLI drops the
-    /// repo between the two so other sessions stay usable meanwhile (ADR-0055).
+    /// repo between the two so other sessions stay usable meanwhile (ADR-0056).
     pub fn ws_run(
         &self,
         name: Option<&str>,
@@ -2295,7 +2295,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // ---- Named and concurrent sessions (ADR-0055) -------------------------
+    // ---- Named and concurrent sessions (ADR-0056) -------------------------
 
     /// Fork a one-workspace session called `name` and write `file` in it.
     fn fork_and_edit(repo: &Repo, name: Option<&str>, file: &str, content: &str) -> WsEntry {

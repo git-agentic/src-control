@@ -1,6 +1,6 @@
 # ADR-0030: Agent sessions and auto-merge of clean results
 
-- **Status:** Accepted; the one-session-per-repo rule is superseded by ADR-0055 (named and concurrent sessions)
+- **Status:** Accepted; the one-session-per-repo rule is superseded by ADR-0056 (named and concurrent sessions)
 - **Date:** 2026-07-07
 - **Phase:** 20
 - **Builds on:** ADR-0023 (agent workspaces), ADR-0012 (three-way merge), ADR-0024 (oplog)
@@ -16,7 +16,7 @@ mechanical toil the tool can absorb.
 ## Decision
 
 Durable sessions whose workspace state IS the checkout directory. One
-unnamed session per repo (ADR-0055 later added named sessions beside it,
+unnamed session per repo (ADR-0056 later added named sessions beside it,
 each in its own `.sc/ws-<name>/` root; the unnamed session described here is
 unchanged): `sc ws fork --agents N` materializes N
 checkouts from the current tip into `.sc/ws/<i>/` (P7-aware) and writes

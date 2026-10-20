@@ -151,7 +151,7 @@ impl Layout {
     }
 
     /// A `sc ws` session's root: `.sc/ws` for the unnamed session (the
-    /// original layout, unchanged) or `.sc/ws-<name>` for a named one (ADR-0055).
+    /// original layout, unchanged) or `.sc/ws-<name>` for a named one (ADR-0056).
     /// A sibling, not a child, so tearing one session down never touches another.
     pub fn ws_root(&self, session: Option<&str>) -> PathBuf {
         match session {

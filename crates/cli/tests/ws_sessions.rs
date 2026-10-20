@@ -1,5 +1,5 @@
 //! Named, concurrently open `sc ws` sessions through the real binary
-//! (ADR-0055): addressing by `--session`, independent harvests with first-wins
+//! (ADR-0056): addressing by `--session`, independent harvests with first-wins
 //! ordering, and `sc ws run` not holding the repo lock while its command runs.
 
 use std::path::{Path, PathBuf};
@@ -114,7 +114,7 @@ fn two_named_sessions_fork_list_run_and_harvest_independently() {
 }
 
 /// While one session's command runs, the repo is free: another `sc` can list,
-/// harvest or abandon the other session. (Before ADR-0055 the run held the
+/// harvest or abandon the other session. (Before ADR-0056 the run held the
 /// single-writer lock for the child's whole life and these failed with `Locked`.)
 #[test]
 fn a_running_session_does_not_block_the_others() {

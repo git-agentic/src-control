@@ -163,7 +163,7 @@ cargo run --bin sc -- ws fork --agents N [--name <n>] [--identity <key>]  # dura
                                               # session: materializes N checkouts under
                                               # .sc/ws/<i>/ and persists a manifest (P20).
                                               # --name opens a further named session in
-                                              # .sc/ws-<n>/ beside the unnamed one (ADR-0055);
+                                              # .sc/ws-<n>/ beside the unnamed one (ADR-0056);
                                               # a name already open is refused
 cargo run --bin sc -- ws list [--session <n>] # every open session's workspaces, changed/unchanged
                                               # (or just session <n>'s)

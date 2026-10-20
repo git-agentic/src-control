@@ -3494,7 +3494,7 @@ fn run_ws(op: WsOp) -> Result<()> {
             let plan = repo.ws_run_plan(session.as_deref(), index, with_secrets, sk.as_ref())?;
             // Release the repo lock before the (possibly long) command runs, so
             // other sessions can be listed, harvested or abandoned meanwhile
-            // (ADR-0055); process::exit would skip the RepoLock's Drop anyway.
+            // (ADR-0056); process::exit would skip the RepoLock's Drop anyway.
             drop(repo);
             std::process::exit(plan.run(&cmd)?);
         }
