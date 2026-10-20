@@ -921,6 +921,30 @@ pub(crate) fn lay_out_added_view(
     Ok(protected)
 }
 
+/// Make room for a file at `full` (tracked path `path`) where a directory
+/// stands: the removal pass has deleted the tracked files under it, so what is
+/// left is a husk of empty directories, which goes. A directory that still
+/// holds anything (an untracked or ignored file of the user's) is never
+/// touched: the error names it, and the caller's state stays retryable (#247).
+pub(crate) fn clear_dir_obstruction(full: &Path, path: &str) -> Result<()> {
+    fn prune(dir: &Path) -> std::io::Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            if e.file_type()?.is_dir() {
+                prune(&e.path())?;
+            }
+        }
+        std::fs::remove_dir(dir)
+    }
+    if full.symlink_metadata().is_ok_and(|m| m.is_dir()) && prune(full).is_err() {
+        return Err(Error::InvalidArgument(format!(
+            "cannot write {path}: a directory with untracked or ignored content stands there; \
+             move it away, then retry"
+        )));
+    }
+    Ok(())
+}
+
 /// Materialize a snapshot's file tree into the working dir.
 ///
 /// `sparse` filters the disk view: a target entry outside `sparse` is never
@@ -1060,6 +1084,7 @@ pub(crate) fn materialize_with_old_view(
             })();
             match decrypted {
                 Some(pt) => {
+                    clear_dir_obstruction(&full, path)?;
                     if let Some(parent) = full.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -1085,6 +1110,7 @@ pub(crate) fn materialize_with_old_view(
                     // can't linger when a path becomes protected across a switch for
                     // a non-recipient (confidentiality). A failed removal must
                     // surface — swallowing it leaves plaintext on disk.
+                    clear_dir_obstruction(&full, path)?;
                     match std::fs::remove_file(&full) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1094,6 +1120,7 @@ pub(crate) fn materialize_with_old_view(
                 }
             }
         } else {
+            clear_dir_obstruction(&full, path)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
             }

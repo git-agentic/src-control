@@ -1,0 +1,254 @@
+//! Tests for #247: aborting (or otherwise leaving) a tree where the other side
+//! turned a file into a directory, or the reverse. The restore must replace
+//! the stop's layout at that path, never fail with `IsADirectory` /
+//! `NotADirectory`, and never delete anything the tree being replaced does not
+//! track.
+
+use std::path::{Path, PathBuf};
+
+use crate::error::Error;
+use crate::repo::Repo;
+use crate::RebaseResult;
+
+/// How the path `x` is laid out on a side.
+#[derive(Clone, Copy, Debug)]
+enum Shape {
+    File,
+    Dir,
+}
+
+fn tmp_root(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("scl-repo-abort-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn lay(root: &Path, shape: Shape) {
+    let _ = std::fs::remove_file(root.join("x"));
+    let _ = std::fs::remove_dir_all(root.join("x"));
+    match shape {
+        Shape::File => std::fs::write(root.join("x"), b"file\n").unwrap(),
+        Shape::Dir => {
+            std::fs::create_dir_all(root.join("x")).unwrap();
+            std::fs::write(root.join("x/a"), b"a\n").unwrap();
+        }
+    }
+}
+
+fn assert_shape(root: &Path, shape: Shape) {
+    match shape {
+        Shape::File => assert_eq!(std::fs::read(root.join("x")).unwrap(), b"file\n"),
+        Shape::Dir => {
+            assert!(root.join("x").is_dir());
+            assert_eq!(std::fs::read(root.join("x/a")).unwrap(), b"a\n");
+            assert_eq!(std::fs::read_dir(root.join("x")).unwrap().count(), 1);
+        }
+    }
+}
+
+/// `main` keeps `x` as `ours`; branch `other` turns it into `theirs` and both
+/// edit `c.txt`'s first line, so combining them stops on a conflict.
+fn fixture(tag: &str, ours: Shape, theirs: Shape) -> (PathBuf, Repo) {
+    let root = tmp_root(tag);
+    let repo = Repo::init(&root).unwrap();
+    std::fs::write(root.join("c.txt"), b"1\n2\n3\n").unwrap();
+    lay(&root, ours);
+    repo.commit("me", "base").unwrap();
+    repo.branch("other").unwrap();
+    std::fs::write(root.join("c.txt"), b"OURS\n2\n3\n").unwrap();
+    repo.commit("me", "main").unwrap();
+    repo.switch("other").unwrap();
+    lay(&root, theirs);
+    std::fs::write(root.join("c.txt"), b"THEIRS\n2\n3\n").unwrap();
+    repo.commit("me", "other").unwrap();
+    repo.switch("main").unwrap();
+    (root, repo)
+}
+
+fn assert_restored(root: &Path, repo: &Repo, ours: Shape) {
+    assert_shape(root, ours);
+    assert_eq!(std::fs::read(root.join("c.txt")).unwrap(), b"OURS\n2\n3\n");
+    let st = repo.status().unwrap();
+    assert!(st.modified.is_empty() && st.deleted.is_empty(), "{st:?}");
+}
+
+fn finish(root: &Path, repo: Repo) {
+    drop(repo);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+const TRANSITIONS: [(&str, Shape, Shape); 2] = [
+    ("f2d", Shape::File, Shape::Dir),
+    ("d2f", Shape::Dir, Shape::File),
+];
+
+#[test]
+fn merge_abort_restores_a_file_dir_transition() {
+    for (tag, ours, theirs) in TRANSITIONS {
+        let (root, repo) = fixture(&format!("merge-{tag}"), ours, theirs);
+        assert!(matches!(
+            repo.merge("other", "me").unwrap_err(),
+            Error::MergeConflicts(_)
+        ));
+        assert_shape(&root, theirs);
+        repo.merge_abort().unwrap();
+        assert_restored(&root, &repo, ours);
+        finish(&root, repo);
+    }
+}
+
+#[test]
+fn cherry_pick_abort_restores_a_file_dir_transition() {
+    for (tag, ours, theirs) in TRANSITIONS {
+        let (root, repo) = fixture(&format!("pick-{tag}"), ours, theirs);
+        let r = repo.cherry_pick("other", "me", None, None);
+        assert!(matches!(r, Err(Error::PickConflicts(_))), "{r:?}");
+        assert_shape(&root, theirs);
+        repo.cherry_pick_abort().unwrap();
+        assert_restored(&root, &repo, ours);
+        finish(&root, repo);
+    }
+}
+
+#[test]
+fn rebase_abort_restores_a_file_dir_transition() {
+    for (tag, ours, theirs) in TRANSITIONS {
+        let (root, repo) = fixture(&format!("rebase-{tag}"), ours, theirs);
+        let r = repo.rebase("other", "me", None).unwrap();
+        assert!(matches!(r, RebaseResult::Stopped { .. }), "{r:?}");
+        assert_shape(&root, theirs);
+        repo.rebase_abort().unwrap();
+        assert_restored(&root, &repo, ours);
+        finish(&root, repo);
+    }
+}
+
+/// An untracked file inside the directory the abort must replace with a file
+/// is the user's: the abort fails loudly and keeps it, and the stopped op
+/// stays open to retry.
+#[test]
+fn merge_abort_keeps_untracked_content_in_the_obstructing_directory() {
+    let (root, repo) = fixture("merge-untracked", Shape::File, Shape::Dir);
+    assert!(matches!(
+        repo.merge("other", "me").unwrap_err(),
+        Error::MergeConflicts(_)
+    ));
+    std::fs::write(root.join("x/mine.txt"), b"mine\n").unwrap();
+    assert!(repo.merge_abort().is_err());
+    assert_eq!(std::fs::read(root.join("x/mine.txt")).unwrap(), b"mine\n");
+    assert!(repo.merge_in_progress());
+    std::fs::remove_file(root.join("x/mine.txt")).unwrap();
+    repo.merge_abort().unwrap();
+    assert_restored(&root, &repo, Shape::File);
+    finish(&root, repo);
+}
+
+/// `switch` and `undo` across a file/directory change at one path.
+#[test]
+fn switch_and_undo_cross_a_file_dir_transition() {
+    for (tag, ours, theirs) in TRANSITIONS {
+        let root = tmp_root(&format!("switch-{tag}"));
+        let repo = Repo::init(&root).unwrap();
+        lay(&root, ours);
+        repo.commit("me", "base").unwrap();
+        repo.branch("other").unwrap();
+        repo.switch("other").unwrap();
+        lay(&root, theirs);
+        repo.commit("me", "other").unwrap();
+        repo.switch("main").unwrap();
+        assert_shape(&root, ours);
+        repo.switch("other").unwrap();
+        assert_shape(&root, theirs);
+        repo.switch("main").unwrap();
+        assert_shape(&root, ours);
+        lay(&root, theirs);
+        repo.commit("me", "flip").unwrap();
+        repo.undo().unwrap();
+        assert_shape(&root, ours);
+        finish(&root, repo);
+    }
+}
+
+/// `rebase --continue` lays a later commit's file/directory change over the
+/// resolved stop.
+#[test]
+fn rebase_continue_crosses_a_file_dir_transition() {
+    for (tag, from, to) in TRANSITIONS {
+        let root = tmp_root(&format!("continue-{tag}"));
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("c.txt"), b"1\n2\n3\n").unwrap();
+        lay(&root, from);
+        repo.commit("me", "base").unwrap();
+        repo.branch("other").unwrap();
+        std::fs::write(root.join("c.txt"), b"OURS\n2\n3\n").unwrap();
+        repo.commit("me", "a").unwrap();
+        lay(&root, to);
+        repo.commit("me", "b").unwrap();
+        repo.switch("other").unwrap();
+        std::fs::write(root.join("c.txt"), b"THEIRS\n2\n3\n").unwrap();
+        repo.commit("me", "other").unwrap();
+        repo.switch("main").unwrap();
+        assert!(matches!(
+            repo.rebase("other", "me", None).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        std::fs::write(root.join("c.txt"), b"RESOLVED\n2\n3\n").unwrap();
+        let r = repo.rebase_continue("me", None).unwrap();
+        assert!(matches!(r, RebaseResult::Rebased { .. }), "{r:?}");
+        assert_shape(&root, to);
+        finish(&root, repo);
+    }
+}
+
+/// The same abort on a `--filter src/` partial clone, with `src/x` changing
+/// between file and directory on the other side.
+#[test]
+fn merge_abort_restores_a_file_dir_transition_on_a_partial_clone() {
+    use crate::partial_merge::{clone_edit_src, Fx};
+    for (tag, ours, theirs) in TRANSITIONS {
+        let fx = Fx::origin(&format!("abort-fd-{tag}"), |root| {
+            lay(&root.join("src"), ours);
+        });
+        fx.origin.branch("b1").unwrap();
+        fx.origin.switch("b1").unwrap();
+        lay(&fx.origin_root.join("src"), theirs);
+        std::fs::write(fx.origin_root.join("src/a.txt"), b"ONE\ntwo\nthree\n").unwrap();
+        fx.origin.commit("t", "b1").unwrap();
+        fx.origin.switch("main").unwrap();
+        let clone = fx.clone(false);
+        clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+        assert!(matches!(
+            clone.merge("origin/b1", "t").unwrap_err(),
+            Error::MergeConflicts(_)
+        ));
+        assert_shape(&fx.clone_root.join("src"), theirs);
+        clone.merge_abort().unwrap();
+        assert_shape(&fx.clone_root.join("src"), ours);
+        let st = clone.status().unwrap();
+        assert!(st.modified.is_empty() && st.deleted.is_empty(), "{st:?}");
+        drop(clone);
+        fx.cleanup();
+    }
+}
+
+/// A forward `switch` onto a file where a directory with an untracked file
+/// stands still refuses, and deletes nothing.
+#[test]
+fn switch_refuses_a_file_over_a_directory_holding_untracked_content() {
+    let root = tmp_root("switch-untracked");
+    let repo = Repo::init(&root).unwrap();
+    lay(&root, Shape::Dir);
+    repo.commit("me", "base").unwrap();
+    repo.branch("other").unwrap();
+    repo.switch("other").unwrap();
+    lay(&root, Shape::File);
+    repo.commit("me", "other").unwrap();
+    repo.switch("main").unwrap();
+    std::fs::write(root.join("x/mine.txt"), b"mine\n").unwrap();
+    let err = repo.switch("other").unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    assert_eq!(std::fs::read(root.join("x/mine.txt")).unwrap(), b"mine\n");
+    assert_eq!(std::fs::read(root.join("x/a")).unwrap(), b"a\n");
+    finish(&root, repo);
+}

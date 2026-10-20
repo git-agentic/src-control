@@ -283,7 +283,7 @@ transport-adjacent. The rest, imperatively:
   the view.
 - **A merge, switch, cherry-pick, rebase, undo or sparse-spec change refuses, before any write, to lay a file or
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
-  away and retry. Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded.
+  away and retry. A directory holding only tracked files is not such a case: a file/directory change at one path crosses switch, undo, abort and `--continue`, and the emptied directories are cleared (#247). Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded.
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first. A push into a repo with a stopped op is
