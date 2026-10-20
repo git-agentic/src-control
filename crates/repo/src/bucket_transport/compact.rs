@@ -362,20 +362,27 @@ impl BucketTransport {
                 }
             }
 
-            rep.cutoff = cutoff;
-            rep.logs_deleted = del_logs.len();
-            rep.checkpoints_deleted = del_ckpts.len();
-            rep.packs_deleted = del_packs.len();
-            rep.bytes_deleted = del_logs
+            // Log entries and checkpoints behind the cutoff are safe whatever
+            // the manifest does meanwhile: the cutoff only ever grows, so they
+            // stay unreachable. Counters add up across replans.
+            rep.cutoff = rep.cutoff.max(cutoff);
+            rep.logs_deleted += del_logs.len();
+            rep.checkpoints_deleted += del_ckpts.len();
+            rep.bytes_deleted += del_logs
                 .iter()
                 .chain(del_ckpts.iter())
                 .map(|m| m.size)
-                .chain(
-                    del_packs
-                        .iter()
-                        .flat_map(|(_, ms)| ms.iter().map(|m| m.size)),
-                )
-                .sum();
+                .sum::<u64>();
+            if !opts.dry_run {
+                for m in del_logs.iter().chain(del_ckpts.iter()) {
+                    self.bucket.delete(&m.key)?;
+                }
+            }
+            rep.packs_deleted += del_packs.len();
+            rep.bytes_deleted += del_packs
+                .iter()
+                .flat_map(|(_, ms)| ms.iter().map(|m| m.size))
+                .sum::<u64>();
             if opts.dry_run {
                 if rep.packs_created > 0 {
                     rep.notes.push(
@@ -386,18 +393,16 @@ impl BucketTransport {
                 }
                 return Ok(());
             }
-            // The manifest moving means a push or fold landed during planning:
-            // replan rather than delete against a stale picture. Log entries
-            // and checkpoints stay safe regardless (the cutoff only grows),
-            // but the pack candidates may just have been committed.
+            // A pack nothing names can still be named by a push that lands
+            // while we plan: if the manifest moved, replan the pack set
+            // (nothing is deleted against a stale picture).
             if !matches!(self.bucket.get("manifest", Some(&tag))?, Fetched::Unchanged) {
+                rep.packs_deleted -= del_packs.len();
+                rep.bytes_deleted -= del_packs
+                    .iter()
+                    .flat_map(|(_, ms)| ms.iter().map(|m| m.size))
+                    .sum::<u64>();
                 continue;
-            }
-            for m in &del_logs {
-                self.bucket.delete(&m.key)?;
-            }
-            for m in &del_ckpts {
-                self.bucket.delete(&m.key)?;
             }
             for (hash, _) in &del_packs {
                 // idx first: a half-deleted pack is then plain debris.
@@ -406,8 +411,9 @@ impl BucketTransport {
             }
             return Ok(());
         }
-        rep.notes
-            .push("manifest kept moving during the sweep: rerun".into());
+        rep.notes.push(
+            "the manifest kept moving during the sweep: unreferenced packs were kept, rerun".into(),
+        );
         Ok(())
     }
 

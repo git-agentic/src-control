@@ -278,15 +278,14 @@ impl BucketTransport {
     }
 
     /// Run a read against the current view; if it finds a named object gone
-    /// (a compaction deleted it), drop the view, re-read the manifest and run
-    /// it again. An unchanged manifest means the absence is real: fail closed.
+    /// (a compaction deleted it), re-read the manifest and run it again. An unchanged manifest means the absence is real: fail closed.
     fn restarting<T>(&self, mut f: impl FnMut() -> Result<T>) -> Result<T> {
         for _ in 0..MAX_RESTARTS {
             self.saw_absent.set(false);
             let before = self.view.borrow().as_ref().map(|v| v.tag.clone());
             match f() {
                 Err(e) if self.saw_absent.get() => {
-                    *self.view.borrow_mut() = None;
+                    // A conditional read: `Unchanged` keeps the view and its tag.
                     self.refresh()?;
                     let after = self.view.borrow().as_ref().map(|v| v.tag.clone());
                     if before == after {
