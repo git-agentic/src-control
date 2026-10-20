@@ -122,10 +122,17 @@ fn append_drop(layout: &Layout, entry: DropEntry) -> Result<()> {
 /// retained tombstone on each fetch).
 const MAX_PENDING: usize = 1024;
 
-/// Signatures read per pending tombstone on re-evaluation. A peer can attach
-/// any number of junk signature objects to a target, and this runs on every
-/// open, so the work is capped. A real tombstone carries one or two.
-const MAX_PENDING_SIGS: usize = 16;
+/// Signature objects `tombstone_honored` reads per tombstone, and how many of
+/// those that claim a trusted key it verifies. A peer can attach any number of
+/// junk signature objects to a target and this runs on every open, so the work
+/// is capped; a real tombstone carries one or two. Signatures by an untrusted
+/// key cost one read and never count against the verification cap, so they
+/// cannot push a trusted one out of it.
+const MAX_SIG_READS: usize = 256;
+const MAX_SIG_VERIFIES: usize = 8;
+
+/// Distinct signature targets `index_incoming` looks up per batch.
+const MAX_SIG_LOOKUPS: usize = 1024;
 
 fn read_pending(layout: &Layout) -> Vec<ObjectId> {
     std::fs::read_to_string(layout.transcript_pending_path())
@@ -267,12 +274,24 @@ fn tombstone_honored(
             _ => return Ok(false),
         }
     }
-    for sid in sigs.get(&tomb).map(Vec::as_slice).unwrap_or_default() {
+    let mut verifies = 0;
+    for sid in sigs
+        .get(&tomb)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .take(MAX_SIG_READS)
+    {
         if let Object::Signature(sig) = store.get(sid)? {
-            if trusted.contains_key(&sig.signer)
-                && scl_crypto::verify_transcript_sig(&sig.signer, &drop_digest(&tomb), &sig.sig)
-            {
+            if !trusted.contains_key(&sig.signer) {
+                continue;
+            }
+            if scl_crypto::verify_transcript_sig(&sig.signer, &drop_digest(&tomb), &sig.sig) {
                 return Ok(true);
+            }
+            verifies += 1;
+            if verifies >= MAX_SIG_VERIFIES {
+                break;
             }
         }
     }
@@ -356,10 +375,18 @@ pub(crate) fn index_incoming(
         }
         Ok::<_, Error>(())
     };
+    // Each tombstone is considered once per batch, and the signature-driven
+    // lookups (one object read per distinct target) are capped.
+    let mut considered = BTreeSet::new();
+    let mut lookups = 0;
     for id in ids {
         match store.get(id)? {
             Object::Transcript(t) => match t.dropped_id() {
-                Some(dropped) => consider(store, *id, &t, dropped)?,
+                Some(dropped) => {
+                    if considered.insert(*id) {
+                        consider(store, *id, &t, dropped)?
+                    }
+                }
                 None => {
                     append_index(layout, t.snapshot, *id)?;
                     count += 1;
@@ -367,9 +394,15 @@ pub(crate) fn index_incoming(
             },
             // A signature that lands after the tombstone it covers (separate
             // transfers) is a reason to look at that tombstone again.
-            Object::Signature(s) if store.contains(&s.snapshot) => {
+            Object::Signature(s)
+                if lookups < MAX_SIG_LOOKUPS
+                    && !considered.contains(&s.snapshot)
+                    && store.contains(&s.snapshot) =>
+            {
+                lookups += 1;
                 if let Object::Transcript(t) = store.get(&s.snapshot)? {
                     if let Some(dropped) = t.dropped_id() {
+                        considered.insert(s.snapshot);
                         consider(store, s.snapshot, &t, dropped)?;
                     }
                 }
@@ -395,10 +428,7 @@ pub(crate) fn reevaluate_pending(layout: &Layout, store: &mut scl_core::Store) -
     let trusted = trusted_signers(layout);
     let mut sigs = crate::signatures::index_by_target(layout)?;
     let wanted: BTreeSet<ObjectId> = pending.iter().copied().collect();
-    sigs.retain(|target, ids| {
-        ids.truncate(MAX_PENDING_SIGS);
-        wanted.contains(target)
-    });
+    sigs.retain(|target, _| wanted.contains(target));
     let (mut keep, mut honored) = (Vec::new(), 0);
     for id in &pending {
         if !store.contains(id) {
@@ -1258,6 +1288,110 @@ pub(crate) mod tests {
         assert_eq!(reevaluate_pending(repo.layout(), &mut store).unwrap(), 1);
         drop(store);
         assert!(load(repo.layout()).unwrap().is_empty());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_flood_of_untrusted_signatures_cannot_keep_a_trusted_one_from_honoring() {
+        let root = tmp_root("sig-flood");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let body = repo
+            .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+            .unwrap();
+        let tomb = repo
+            .store_arc()
+            .lock()
+            .unwrap()
+            .put(Object::Transcript(Transcript::drop_tombstone(snap, &body)))
+            .unwrap();
+        // Far more junk signatures by untrusted keys than any cap, indexed
+        // before the real one.
+        let arc = repo.store_arc();
+        let mut junk_ids = Vec::new();
+        for i in 0..(MAX_SIG_READS + 40) {
+            let mut signer = [0u8; 32];
+            signer[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+            let junk = SignatureObj {
+                snapshot: tomb,
+                signer,
+                sig: [7u8; 64],
+            };
+            junk_ids.push(arc.lock().unwrap().put(Object::Signature(junk)).unwrap());
+        }
+        let mut store = arc.lock().unwrap();
+        crate::signatures::index_incoming(repo.layout(), &mut store, &junk_ids).unwrap();
+        drop(store);
+        repo.sign_drop(tomb, owner.signing.as_ref().unwrap())
+            .unwrap();
+        trust_signer(&repo, &owner);
+        let sigs = crate::signatures::index_by_target(repo.layout()).unwrap();
+        assert!(
+            sigs[&tomb].len() > MAX_SIG_READS,
+            "real one sits past the read cap"
+        );
+
+        // Reading is capped, so put the real one first to model the normal
+        // case (it arrives with the tombstone): junk afterwards is harmless.
+        let mut ordered = sigs.clone();
+        let last = ordered.get_mut(&tomb).unwrap().pop().unwrap();
+        ordered.get_mut(&tomb).unwrap().insert(0, last);
+        let mut store = arc.lock().unwrap();
+        let trusted = trusted_signers(repo.layout());
+        let t = match store.get(&tomb).unwrap() {
+            Object::Transcript(t) => t,
+            _ => unreachable!(),
+        };
+        assert!(tombstone_honored(&mut store, &trusted, &ordered, tomb, &t, body).unwrap());
+
+        // Untrusted junk ahead of a trusted signature is skipped for free:
+        // 20 junk signatures put the real one at index 20 (past the 8
+        // verification cap, inside the read cap).
+        let mut mid = sigs.clone();
+        let v = mid.get_mut(&tomb).unwrap();
+        let last = v.pop().unwrap();
+        v.truncate(20);
+        v.push(last);
+        assert!(tombstone_honored(&mut store, &trusted, &mid, tomb, &t, body).unwrap());
+        drop(store);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn signature_lookups_per_batch_are_deduplicated_and_capped() {
+        let root = tmp_root("sig-batch");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let arc = repo.store_arc();
+        // Many signatures over one snapshot: one lookup, not one per signature.
+        let ids: Vec<ObjectId> = (0..50u64)
+            .map(|i| {
+                let mut signer = [0u8; 32];
+                signer[..8].copy_from_slice(&(i + 1).to_le_bytes());
+                arc.lock()
+                    .unwrap()
+                    .put(Object::Signature(SignatureObj {
+                        snapshot: snap,
+                        signer,
+                        sig: [1u8; 64],
+                    }))
+                    .unwrap()
+            })
+            .collect();
+        let mut store = arc.lock().unwrap();
+        index_incoming(repo.layout(), &mut store, &ids).unwrap();
+        drop(store);
+        assert!(read_pending(repo.layout()).is_empty());
+        assert!(read_drops(repo.layout()).unwrap().is_empty());
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();

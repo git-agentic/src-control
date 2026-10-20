@@ -475,16 +475,25 @@ re-runs. Fix: a small local index plus re-evaluation.
   long-lived server process.
 - **Bounded.** The file is a FIFO ring of 1024 ids. A peer that pushes many
   signed junk tombstones evicts older entries, so the work per trigger is at
-  most 1024 tombstone reads and, per tombstone, its first 16 indexed
-  signatures (`MAX_PENDING_SIGS`; a peer can attach any number of junk
-  signature objects to a target, and this runs on every open), and the file
-  stays under about 70 KiB. The cap means 16 junk signatures indexed before
-  the real one keep that drop inert here; a fetch from the dropper still
-  evaluates it uncapped through `index_incoming`. A pack's batch is
-  deduplicated and cut to the newest 1024 before it touches the file. An evicted legitimate entry is lost only for a push-only
-  remote; a fetching peer is re-sent every retained tombstone (part 1). A
-  writer with push access can still push out a genuine pending entry; it
-  cannot make one honored.
+  most 1024 tombstone reads plus the per-tombstone signature work below.
+  A pack's batch is deduplicated and cut to the newest 1024 before it
+  touches the file; the file stays under about 70 KiB. An evicted legitimate
+  entry is lost only for a push-only remote; a fetching peer is re-sent every
+  retained tombstone (part 1). A writer with push access can still push out a
+  genuine pending entry; it cannot make one honored.
+- **Signature work is capped inside `tombstone_honored`** (so it bounds
+  ingest and re-evaluation alike): at most `MAX_SIG_READS` (256) indexed
+  signatures are read per tombstone, and at most `MAX_SIG_VERIFIES` (8) of
+  those that claim a trusted key are verified. A signature by an untrusted
+  key costs one read and does not count against the verification cap, so a
+  flood from untrusted keys cannot push a trusted signature out of it. Limit:
+  a writer who indexes more than 256 junk signatures, or 8 junk ones claiming
+  a trusted key (public, since it appears on every signature), ahead of the
+  real one keeps the drop inert on that peer. That is a denial of the drop,
+  never an honored one, and the real signature normally arrives with its
+  tombstone, before any junk. Signature-driven lookups in `index_incoming`
+  (a signature that lands after its tombstone) read each distinct target at
+  most once per batch and at most 1024 targets per batch.
 - **gc** roots pending tombstones like drop lines, so they survive the
   loose-object sweep and the signature index keeps their signatures
   (`transcripts::gc_prune` runs before `signatures::gc_prune`).
