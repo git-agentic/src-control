@@ -423,13 +423,7 @@ impl BucketTransport {
         }
         let mut out: std::collections::BTreeSet<ObjectId> = std::collections::BTreeSet::new();
         for (snapshot, id, tombstone) in transcripts {
-            // A signed tombstone goes out whatever its snapshot (#230).
-            let send = if tombstone {
-                sigs.contains_key(&id)
-            } else {
-                snaps.contains(&snapshot)
-            };
-            if send {
+            if snaps.contains(&snapshot) && (!tombstone || sigs.contains_key(&id)) {
                 out.insert(id);
             }
         }
@@ -2097,33 +2091,6 @@ mod tests {
 
         drop(a);
         drop(b);
-        std::fs::remove_dir_all(&base).unwrap();
-        assert!(!base.exists());
-    }
-
-    #[test]
-    fn a_signed_tombstone_is_served_whatever_the_transfer_set() {
-        // #230: the sender no longer selects tombstones through the snapshots
-        // of the transfer set, a bucket included.
-        let (a, url, snap, tid, identity, base) = signed_bucket_origin("tomb-any");
-        a.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
-        std::fs::write(base.join("a/f2"), b"two").unwrap();
-        a.commit("t", "c2").unwrap();
-        a.push("origin").unwrap();
-        let tomb = ObjectId::of(
-            &Object::Transcript(scl_core::Transcript::drop_tombstone(snap, &tid)).encode(),
-        );
-
-        let t = BucketTransport::open(&url).unwrap();
-        t.list_refs().unwrap();
-        let served = t.leaf_ids_for(&std::collections::BTreeSet::new()).unwrap();
-        assert!(
-            served.contains(&tomb),
-            "signed tombstone, empty transfer set"
-        );
-        assert!(!served.contains(&tid), "the body still needs its snapshot");
-
-        drop(a);
         std::fs::remove_dir_all(&base).unwrap();
         assert!(!base.exists());
     }

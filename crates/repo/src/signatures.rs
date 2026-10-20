@@ -145,11 +145,43 @@ pub(crate) fn index_incoming(
     let mut count = 0;
     for id in ids {
         if let Object::Signature(sig) = store.get(id)? {
-            append_index(layout, sig.snapshot, *id)?;
-            count += 1;
+            // Only a signature that checks out for a target this store holds
+            // is indexed (and so forwarded and kept by gc): nothing forged or
+            // dangling can crowd out a real one (#230, ADR-0038).
+            if acceptable(store, &sig)? {
+                append_index(layout, sig.snapshot, *id)?;
+                count += 1;
+            }
         }
     }
     Ok(count)
+}
+
+/// Whether `sig` may enter the index: its target is held, and the signature
+/// verifies under the key it names in the domain its target kind uses. A
+/// snapshot takes the snapshot domain; a transcript the transcript domain; a
+/// drop tombstone only the domain-separated drop digest (a plain signature
+/// over a tombstone id never authorizes a drop). Any other target kind is
+/// refused. Trust is not judged here: that is the reader's call.
+pub(crate) fn acceptable(store: &mut scl_core::Store, sig: &SignatureObj) -> Result<bool> {
+    if !store.contains(&sig.snapshot) {
+        return Ok(false);
+    }
+    let target = sig.snapshot;
+    Ok(match store.get(&target)? {
+        Object::Snapshot(_) => {
+            scl_crypto::verify_snapshot_sig(&sig.signer, target.as_bytes(), &sig.sig)
+        }
+        Object::Transcript(t) if t.dropped_id().is_some() => scl_crypto::verify_transcript_sig(
+            &sig.signer,
+            &crate::transcripts::drop_digest(&target),
+            &sig.sig,
+        ),
+        Object::Transcript(_) => {
+            scl_crypto::verify_transcript_sig(&sig.signer, target.as_bytes(), &sig.sig)
+        }
+        _ => false,
+    })
 }
 
 /// Full-store rebuild of the signature index (Task 3): scan every object the
@@ -171,7 +203,7 @@ pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<us
     let mut entries: Vec<(ObjectId, ObjectId)> = Vec::new();
     for id in store.all_ids()? {
         if let Object::Signature(sig) = store.get(&id)? {
-            if store.contains(&sig.snapshot) {
+            if acceptable(store, &sig)? {
                 entries.push((sig.snapshot, id));
             }
         }

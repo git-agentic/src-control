@@ -481,11 +481,12 @@ across every phase.
   hides the body from `list`/`show`, travels with fetch/clone, blocks
   resurrection in either arrival order, and is kept by gc while the dropped
   body is swept at gc (after the grace window if loose). (ADR-0038 addendum.)
-  Issue #230 closed the delivery gaps: every retained signed tombstone rides
-  every transfer (so a stale peer is told after the dropper's gc collected the
-  snapshot), and a remote that held a tombstone before trusting the signer
-  re-evaluates it from a capped `.sc/transcript-pending` index on open and
-  ingest.
+  Issue #230 closed the delivery gaps: a retained signed tombstone rides
+  a transfer when its snapshot is in it or was collected by the sender's gc (so
+  a stale peer is told), only verifying signatures enter the signature index,
+  and a remote that held a tombstone before trusting the signer re-judges it
+  from a capped `.sc/transcript-pending` index when the trusted-signer set
+  changes. Crowding by valid signatures from attacker keys is tracked in #257.
 
 - **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
   (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"

@@ -531,7 +531,9 @@ impl Repo {
             let transcript_ids = if no_transcripts {
                 Vec::new()
             } else {
-                crate::transcripts::indexed_transcript_ids_for(&self.layout, &snaps)?
+                crate::transcripts::indexed_transcript_ids_for(&self.layout, &snaps, &|id| {
+                    store.contains(id)
+                })?
             };
             let sig_targets: Vec<ObjectId> =
                 snaps.iter().chain(transcript_ids.iter()).copied().collect();

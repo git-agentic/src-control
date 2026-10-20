@@ -208,12 +208,20 @@ too, not just the src-control-side metadata.
   bodies. Drop is not erasure: peers without the tombstone keep the body,
   `GetObjects` serves it until gc sweeps it, and a peer that still holds it can
   re-send it. A tombstone held while its signer is untrusted is remembered
-  (`.sc/transcript-pending`, capped at 1024, FIFO) and re-evaluated on open and
-  after each ingest, so trusting the signer later is enough on a push-only or
-  served remote. Every retained signed tombstone is sent on every transfer, so
-  a peer is told even after gc collected the snapshot; a peer that pushes junk
-  can only evict pending entries, not get one honored. Trust is checked at
-  evaluation and is not retroactive. A tombstone a remote already held before
+  (`.sc/transcript-pending`, capped at 1024, FIFO) and judged again when the
+  trusted-signer set changes (on open, transport open and ingest), so trusting
+  the signer later is enough on a push-only or served remote. A retained signed
+  tombstone is also sent when its snapshot was collected by the sender's gc, so
+  a stale peer is told; this discloses the snapshot id, dropped transcript id
+  and signer public key of such drops to any peer the dropper transfers with,
+  including one that never had the snapshot (ids are hashes, bodies stay
+  sealed). Only signatures that verify for a held target are indexed, so
+  forged signatures are never stored or forwarded. A writer to a shared remote
+  who signs with keys of their own can still crowd more than 256 valid
+  signatures ahead of the real one, which keeps the drop inert on every peer
+  that ingests them (a denial of the drop, never an honored one; #257). Writers
+  can also evict pending entries from a push-only remote (trust the signer
+  before the push). Trust is checked at evaluation and is not retroactive. A tombstone a remote already held before
   upgrading to a build with the pending index is not remembered: trust the
   signer before the drop is pushed, or have a fetching peer re-send it.
 

@@ -988,9 +988,9 @@ without a new object tag or wire change: a drop is a **tombstone**, a
 dropped id, recorded in a local `.sc/transcript-drops` index and treated as a
 grow-only set (no undrop; re-attach to restore). Reads, `sc log` markers and
 the over-send filter through the drop set, and `sc gc` reclaims the body. A
-tombstone travels with fetch and push only when it is signed, and every
-retained signed tombstone rides every transfer, so a peer is told even after
-the dropper's gc collected the snapshot (a push that finds the remote already at
+tombstone travels with fetch and push only when it is signed, and a
+retained signed tombstone rides a transfer when its snapshot is in it or was
+collected by the sender's gc, so a stale peer is told (a push that finds the remote already at
 the same branch tip sends nothing, so a drop made afterwards propagates once a
 push moves the branch or the remote fetches), and
 a receiving peer honors it only if the signature comes from a key in its `[signers]
