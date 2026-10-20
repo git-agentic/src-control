@@ -147,7 +147,13 @@ store offers no atomic "delete if the manifest is unchanged". Two defenses:
 `grace` between uploading a pack and its CAS, or re-pushes byte-identical
 content to an old orphan in the same instant a sweep selects it, can still
 commit an entry naming a deleted pack. Closing that needs a lease or a
-conditional delete, which the `Bucket` trait lacks (ROADMAP "Leases"). Run
+conditional delete, which the `Bucket` trait lacks (ROADMAP "Leases"). The
+same staleness has a second, milder form: a writer paused longer than `grace`
+between reading the manifest and claiming a log slot can claim a slot the
+sweep freed behind the cutoff. Its manifest CAS fails, but a reader equally
+stale (older than `grace`, still walking the chain it read) could read that
+phantom entry instead of seeing the slot absent. Both need a participant stalled
+past the window; neither affects anyone who read the manifest within it. Run
 compaction with a `grace` well above any plausible writer stall; the 24 h
 default matches `sc gc --prune-expire`.
 
