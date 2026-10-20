@@ -390,7 +390,7 @@ impl Repo {
             }
         }
         let mut skipped = Vec::new();
-        for (path, (blob_id, _mode, perms)) in &target {
+        for (path, (blob_id, mode, perms)) in &target {
             if !sparse.matches(path) {
                 continue;
             }
@@ -404,7 +404,7 @@ impl Repo {
                         if let Some(parent) = full.parent() {
                             std::fs::create_dir_all(parent)?;
                         }
-                        std::fs::write(&full, &pt[..])?;
+                        worktree::write_file(&full, &pt[..], *mode)?;
                     }
                     Err(_) => {
                         // KEK recipient without path access: skip, never
@@ -422,7 +422,7 @@ impl Repo {
                 if let Some(parent) = full.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&full, &bytes[..])?;
+                worktree::write_file(&full, &bytes[..], *mode)?;
             }
         }
         Ok(skipped)
@@ -1335,11 +1335,11 @@ impl Repo {
                         wrapped: fm.wrapped_carry.clone(),
                     };
                     match crate::protect::decrypt_with(&f.bytes, &id, &[&prots], sk, &f.path) {
-                        Ok(pt) => std::fs::write(&full, &pt[..])?,
+                        Ok(pt) => worktree::write_file(&full, &pt[..], f.mode)?,
                         Err(_) => continue, // undecryptable: leave prior state
                     }
                 } else {
-                    std::fs::write(&full, &f.bytes)?;
+                    worktree::write_file(&full, &f.bytes, f.mode)?;
                 }
             }
             for (name, bytes) in &fm.sidecars {
