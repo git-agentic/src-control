@@ -90,6 +90,19 @@ impl Layout {
     pub fn transcript_drops_path(&self) -> PathBuf {
         self.dot_sc.join("transcript-drops")
     }
+    /// `.sc/transcript-pending` — tombstone object ids this repo holds, has a
+    /// signature for, and has not honored yet (untrusted signer, or snapshot
+    /// not held), one hex id per line, newest last, capped. Re-evaluated on
+    /// every open and ingest; gc roots them (ADR-0038, #230).
+    pub fn transcript_pending_path(&self) -> PathBuf {
+        self.dot_sc.join("transcript-pending")
+    }
+    /// `.sc/transcript-pending-trust` — fingerprint of the trusted-signer set
+    /// the pending tombstones were last judged under; a different set is the
+    /// trigger to judge them again.
+    pub fn transcript_pending_trust_path(&self) -> PathBuf {
+        self.dot_sc.join("transcript-pending-trust")
+    }
     /// `.sc/tmp` — scratch space for transient files (P25 streaming pack
     /// transfer: spilled sender/receiver pack bodies). Never durable state —
     /// safe to delete at any time; callers that write here are responsible
