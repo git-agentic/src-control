@@ -87,7 +87,7 @@ impl Repo {
     /// (ADR-0038 addendum, #211). With `no_transcripts`, transcript objects
     /// (and signatures over them) in the received pack are hash-checked but
     /// not written, so this clone holds no transcript object and no index
-    /// entry. Bucket remotes never serve transcripts, so the flag does
+    /// entry. Git remotes never carry transcripts, so the flag does
     /// nothing there.
     /// Snapshots, trees and blobs transfer unchanged. Per command, not
     /// persisted: a later plain `fetch` brings the transcripts in.

@@ -228,8 +228,9 @@ cargo run --bin sc -- clone|fetch|push --no-transcripts ...   # leave transcript
                                               # a later plain fetch brings them in; a plain push
                                               # carries them only once the branch moves again.
                                               # Snapshots transfer and verify as usual; no-op for
-                                              # git and bucket (sc+wal://, sc+s3://) remotes
-                                              # (push to a bucket still skips the upload)
+                                              # git remotes. Bucket remotes (sc+wal://, sc+s3://)
+                                              # serve transcripts and signatures (#229), so the
+                                              # flag works there like on any native remote
 cargo run --bin sc -- transcript drop <id> [--identity <key>]   # drop a transcript by id/hex prefix (see `list`): writes
                                               # a tombstone that travels with fetch/clone so a peer
                                               # that still has it cannot restore it; gc reclaims the
