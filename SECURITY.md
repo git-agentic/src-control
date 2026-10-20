@@ -17,16 +17,30 @@ it are consolidated in [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md). In brief:
   nonce per seal). Content sealed *before* P33 used convergent encryption and
   remains **equality-confirmable forever** — rotation cannot erase ciphertext
   already in history.
-- **Two confidential transports ship:** `sc+https://` (in-binary TLS with
-  accept-new TOFU pinning; the *first* connection to a host is unverified by
-  construction, and `SC_HTTPS_FINGERPRINT` / `SC_HTTPS_STRICT=1` close that
-  window) and `ssh://`. Plain `sc serve --http` remains **plaintext** and its
-  bearer tokens cross the wire in the clear — use it only on loopback or behind
-  the documented stream-mode proxy setup; prefer `sc+https://` for any public
-  bind.
+- **Two confidential sc-native transports ship:** `sc+https://` (in-binary
+  TLS; by default accept-new TOFU pinning, so the *first* connection to a host
+  is unverified by construction, and `SC_HTTPS_FINGERPRINT`, `sc tls pin` or
+  `SC_HTTPS_STRICT=1` close that window; `SC_HTTPS_CA_FILE` / `SC_HTTPS_CA=system`
+  switch a client to CA validation instead, with no revocation checking) and
+  `ssh://`. Plain `sc serve --http` remains **plaintext** and its bearer
+  tokens (which can carry an expiry and be rotated) cross the wire in the
+  clear — use it only on loopback or behind the documented stream-mode proxy
+  setup; prefer `sc+https://` for any public bind.
+- **Bucket remotes (`sc+wal://`, `sc+s3://`) put the bucket's ACL on the
+  perimeter.** Public content sits in the bucket as plaintext at rest and a
+  writer with raw bucket access can move refs outside the `sc` client; sealed
+  content stays ciphertext. A bucket cannot judge a transcript drop tombstone, so
+  it serves a dropped transcript's body next to the tombstone; the receiver
+  honors the drop only for a signer in its `[signers] trusted` list.
 - Committed secrets injected by `sc run` live in an **authorized local process
   context, not strong isolation** — same-user processes can observe the child
-  environment.
+  environment. `sc run --secrets-fd N` (unix only; other platforms refuse it) keeps them
+  out of the environment but is still not isolation.
+- **`sc transcript drop` is not erasure either.** A drop travels as a signed
+  tombstone that a peer honors only when the signature comes from a key in its
+  `[signers] trusted` list; an unsigned drop is local-only, and any trusted
+  signer can hide transcripts on every peer that trusts them. Peers without
+  the tombstone keep the sealed body.
 - **Rotation/revocation ≠ erasure.** They cut off *future* reads through the
   current registry but cannot erase ciphertext already in history and copied to
   other clones; real cutover of a leaked credential always means rotating the
