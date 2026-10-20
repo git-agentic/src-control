@@ -272,12 +272,12 @@ fn apply_plan(
         injected_failure()?;
         let full = safe_join(&job.dir, p)?;
         check_prior(&full, p, Some((*blob, *perms)), None, &job.cache)?;
+        *done += 1; // from here on the checkout may differ from the old state
         match std::fs::remove_file(&full) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        *done += 1;
     }
     for (p, blob, mode, perms, prior) in &job.plan.writes {
         injected_failure()?;
@@ -287,6 +287,7 @@ fn apply_plan(
         };
         let protected = perms & PROTECTED != 0;
         check_prior(&full, p, *prior, (!protected).then_some(*blob), &job.cache)?;
+        *done += 1; // from here on the checkout may differ from the old state
         clear_dir_obstruction(&full, p)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
@@ -305,7 +306,6 @@ fn apply_plan(
             scl_core::fsutil::atomic_write_durable(&full, &bytes[..])?;
             apply_file_mode(&full, *mode)?;
         }
-        *done += 1;
     }
     // Only directories a removal emptied: `remove_dir` fails on anything else.
     for (p, ..) in &job.plan.removals {
@@ -385,6 +385,7 @@ impl Repo {
     ) -> Result<WsRefresh> {
         let branch = branch.to_string();
         let mut session = open_session(self.layout(), name)?;
+        let prior_pending = session.pending_refresh;
         let from = session.base_snapshot;
         if to == from && branch == session.base_branch && session.pending_refresh.is_none() {
             return Ok(WsRefresh {
@@ -531,8 +532,9 @@ impl Repo {
         };
         if let Err(e) = applied {
             if done == 0 {
-                // Refused at the first file: nothing was written, nothing is pending.
-                session.pending_refresh = None;
+                // Refused before the first file was touched: back to what was
+                // there (an earlier crash's marker stays, a fresh one goes).
+                session.pending_refresh = prior_pending;
                 write_manifest(self.layout(), &session)?;
             }
             return Err(e);
@@ -986,6 +988,32 @@ mod tests {
         for p in ["c.txt", "w2.txt"] {
             assert!(tree_has(&repo, head, p).is_some(), "{p} must survive");
         }
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_refused_retry_keeps_the_marker_of_an_earlier_crash() {
+        let (repo, root, dirs, ..) = crash_fixture("crash-retry-refused");
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        // The retry's first file is refused: workspace 1 has since gained a c.txt.
+        let d = dirs[0].clone();
+        BEFORE_APPLY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(d.join("c.txt"), "late\n").unwrap();
+            }))
+        });
+        let _reset = HookGuard;
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("c.txt"), "{err}");
+        assert!(repo
+            .ws_session(None)
+            .unwrap()
+            .unwrap()
+            .pending_refresh
+            .is_some());
         cleanup(repo, &root);
     }
 
