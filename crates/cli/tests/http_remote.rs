@@ -258,6 +258,9 @@ fn serve_token_expires_and_rotate() {
             .success(),
         "rotating an expired token is refused"
     );
+
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists(), "test must leave no residue");
 }
 
 /// An invalid `--scope` is rejected with a clear message rather than
