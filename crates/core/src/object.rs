@@ -213,6 +213,36 @@ pub struct Transcript {
     pub wrapped_keys: Vec<WrappedKey>,
 }
 
+impl Transcript {
+    /// `agent` marker of a drop tombstone (ADR-0038 addendum).
+    pub const DROP_AGENT: &'static str = "sc-transcript-drop-v1";
+
+    /// The tombstone for transcript `dropped` on `snapshot`: a transcript-shaped
+    /// object with no envelope, so it rides existing packs with no wire change.
+    pub fn drop_tombstone(snapshot: ObjectId, dropped: &ObjectId) -> Self {
+        Transcript {
+            snapshot,
+            agent: Self::DROP_AGENT.to_string(),
+            session: dropped.to_hex(),
+            nonce: Vec::new(),
+            ciphertext: Vec::new(),
+            wrapped_keys: Vec::new(),
+        }
+    }
+
+    /// The transcript id this object drops, or `None` for a real transcript
+    /// (a sealed one always has a ciphertext and at least one wrap).
+    pub fn dropped_id(&self) -> Option<ObjectId> {
+        let bare =
+            self.nonce.is_empty() && self.ciphertext.is_empty() && self.wrapped_keys.is_empty();
+        if bare && self.agent == Self::DROP_AGENT {
+            self.session.parse().ok()
+        } else {
+            None
+        }
+    }
+}
+
 /// A sealed private-branch object (P34, ADR-0044): the canonical encoding of
 /// some inner object (snapshot, tree, or blob) encrypted under a fresh random
 /// per-object DEK — payload is `nonce(24) ‖ AEAD ciphertext`. Which inner kind
@@ -1133,6 +1163,22 @@ mod tests {
             ObjectId::of(&bytes),
             ObjectId::of(&Object::Transcript(t).encode())
         );
+    }
+
+    #[test]
+    fn drop_tombstone_round_trips_and_is_distinct_from_a_real_transcript() {
+        let snap = ObjectId::of(b"snap");
+        let dropped = ObjectId::of(b"dropped");
+        let tomb = Transcript::drop_tombstone(snap, &dropped);
+        let back = Object::decode(&Object::Transcript(tomb.clone()).encode()).unwrap();
+        assert_eq!(back, Object::Transcript(tomb.clone()));
+        assert_eq!(tomb.dropped_id(), Some(dropped));
+        // Same agent marker but a real envelope is not a tombstone.
+        let real = Transcript {
+            ciphertext: vec![1],
+            ..tomb
+        };
+        assert_eq!(real.dropped_id(), None);
     }
 
     #[test]

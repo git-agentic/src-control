@@ -787,6 +787,46 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[test]
+    fn gc_reclaims_a_dropped_transcript_and_keeps_its_tombstone() {
+        let root = tmp_root("transcript-drop");
+        let repo = crate::repo::Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"base").unwrap();
+        let base = repo.commit("t", "base").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let keep = repo
+            .attach_transcript(base, "a", "keep", b"keep", &[identity.enc.public()])
+            .unwrap();
+        let gone = repo
+            .attach_transcript(base, "a", "gone", b"gone", &[identity.enc.public()])
+            .unwrap();
+        repo.sign_transcript(gone, &identity).unwrap();
+        repo.drop_transcript(&gone.to_hex()).unwrap();
+
+        repo.gc(Duration::from_secs(0)).unwrap();
+
+        let tomb = {
+            let drops = std::fs::read_to_string(repo.layout().transcript_drops_path()).unwrap();
+            let line = drops.lines().next().expect("tombstone line survives gc");
+            line.split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<ObjectId>()
+                .unwrap()
+        };
+        let arc = repo.vfs().store();
+        let s = arc.lock().unwrap();
+        assert!(!s.contains(&gone), "dropped body is reclaimed");
+        assert!(s.contains(&keep), "other transcripts survive");
+        assert!(s.contains(&tomb), "tombstone is rooted");
+        drop(s);
+        assert!(repo.signatures_for(&gone).unwrap().is_empty());
+        assert_eq!(transcripts::load(repo.layout()).unwrap().len(), 1);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Build a repo at `root` with `src/a.txt` and `docs/b.txt` in separate
     /// subtrees, one commit. Returns `(repo, src blob id, docs blob id)`.
     fn tmp_repo_with_src_and_docs(

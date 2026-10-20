@@ -220,6 +220,12 @@ cargo run --bin sc -- transcript show <ref> [--identity <key>]   # decrypt + pri
 cargo run --bin sc -- transcript list [<ref>] [--json]   # list transcripts (never decrypts)
 cargo run --bin sc -- transcript sign <ref> [--identity <key>]   # retroactively sign a tip's
                                               # transcript(s) (P30)
+cargo run --bin sc -- transcript drop <id>    # drop a transcript by id/hex prefix (see `list`): writes
+                                              # a tombstone that travels with fetch/clone so a peer
+                                              # that still has it cannot restore it; gc reclaims the
+                                              # body after the grace window. Not erasure; propagates
+                                              # on the peer's next fetch (push at an equal tip sends
+                                              # nothing). (ADR-0038 addendum)
 cargo run --bin sc -- ws harvest --transcript <path> [--sign] [--identity <key>]   # attach the
                                               # file to each harvested workspace's landed snapshot
                                               # (P30; landing status prints before the attach)

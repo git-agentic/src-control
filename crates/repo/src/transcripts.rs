@@ -18,6 +18,12 @@
 //! `gc` rewrites the file atomically when it prunes dead entries; every
 //! other writer treats the file as append-only. Mirrors `signatures.rs`'s
 //! index discipline verbatim.
+//!
+//! Drops (ADR-0038 addendum): a second file `.sc/transcript-drops` holds one
+//! `<snapshot-hex> <tombstone-hex> <dropped-hex>` line per drop tombstone (a
+//! bare `Transcript`, see `Transcript::drop_tombstone`). The grow-only set of
+//! dropped ids filters every read of the live index, so a dropped transcript
+//! stays invisible whatever order its lines and objects arrive in.
 
 use std::collections::BTreeSet;
 
@@ -42,7 +48,9 @@ fn parse_line(line: &str) -> Option<(ObjectId, ObjectId)> {
     Some((snap, tid))
 }
 
-fn read_index(layout: &Layout) -> Result<Vec<(ObjectId, ObjectId)>> {
+/// The live index file as written, including entries a tombstone has since
+/// hidden (gc purges those).
+fn read_raw(layout: &Layout) -> Result<Vec<(ObjectId, ObjectId)>> {
     let path = layout.transcripts_path();
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -50,6 +58,62 @@ fn read_index(layout: &Layout) -> Result<Vec<(ObjectId, ObjectId)>> {
         Err(e) => return Err(Error::Io(e)),
     };
     Ok(contents.lines().filter_map(parse_line).collect())
+}
+
+/// The live index minus every dropped transcript.
+fn read_index(layout: &Layout) -> Result<Vec<(ObjectId, ObjectId)>> {
+    let dropped = dropped_ids(layout)?;
+    Ok(read_raw(layout)?
+        .into_iter()
+        .filter(|(_, tid)| !dropped.contains(tid))
+        .collect())
+}
+
+/// One drop-tombstone line: `(snapshot, tombstone object, dropped transcript)`.
+type DropEntry = (ObjectId, ObjectId, ObjectId);
+
+fn read_drops(layout: &Layout) -> Result<Vec<DropEntry>> {
+    let contents = match std::fs::read_to_string(layout.transcript_drops_path()) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    Ok(contents
+        .lines()
+        .filter_map(|line| {
+            let mut p = line.split_whitespace().map(|f| f.parse::<ObjectId>().ok());
+            let e = (p.next()??, p.next()??, p.next()??);
+            p.next().is_none().then_some(e)
+        })
+        .collect())
+}
+
+fn write_drops(layout: &Layout, entries: &[DropEntry]) -> Result<()> {
+    let mut out = String::new();
+    for (snap, tomb, dropped) in entries {
+        out.push_str(&format!(
+            "{} {} {}\n",
+            snap.to_hex(),
+            tomb.to_hex(),
+            dropped.to_hex()
+        ));
+    }
+    scl_core::fsutil::atomic_write_durable(&layout.transcript_drops_path(), out.as_bytes())?;
+    Ok(())
+}
+
+fn dropped_ids(layout: &Layout) -> Result<BTreeSet<ObjectId>> {
+    Ok(read_drops(layout)?.into_iter().map(|(_, _, d)| d).collect())
+}
+
+/// Record one tombstone, deduping an identical existing line.
+fn append_drop(layout: &Layout, entry: DropEntry) -> Result<()> {
+    let mut entries = read_drops(layout)?;
+    if !entries.contains(&entry) {
+        entries.push(entry);
+        write_drops(layout, &entries)?;
+    }
+    Ok(())
 }
 
 /// Rewrite the whole index file atomically (temp file + rename), so a
@@ -70,6 +134,9 @@ pub(crate) fn append_index(
     snapshot: ObjectId,
     transcript_id: ObjectId,
 ) -> Result<()> {
+    if dropped_ids(layout)?.contains(&transcript_id) {
+        return Ok(());
+    }
     let mut entries = read_index(layout)?;
     if entries
         .iter()
@@ -101,22 +168,30 @@ pub fn load(layout: &Layout) -> Result<Vec<(ObjectId, ObjectId)>> {
 /// Returns the number of dropped entries (0 when nothing needed pruning, in
 /// which case the index file is left untouched rather than rewritten).
 pub(crate) fn gc_prune(layout: &Layout, reachable: &mut BTreeSet<ObjectId>) -> Result<usize> {
-    let entries = read_index(layout)?;
-    if entries.is_empty() {
-        return Ok(0);
-    }
+    // Tombstones are load-bearing against resurrection: root them (and keep
+    // their lines) even when their snapshot is dead. The dropped transcript
+    // itself is never rooted, so it is swept after the grace window.
+    let drops = read_drops(layout)?;
+    reachable.extend(drops.iter().map(|(_, tomb, _)| *tomb));
+    let dropped: BTreeSet<ObjectId> = drops.iter().map(|(_, _, d)| *d).collect();
+    let entries = read_raw(layout)?;
     let mut kept = Vec::with_capacity(entries.len());
+    let mut dead = 0;
     for (snap, tid) in &entries {
+        if dropped.contains(tid) {
+            continue;
+        }
         if reachable.contains(snap) {
             reachable.insert(*tid);
             kept.push((*snap, *tid));
+        } else {
+            dead += 1;
         }
     }
-    let dropped = entries.len() - kept.len();
-    if dropped > 0 {
+    if kept.len() != entries.len() {
         write_index(layout, &kept)?;
     }
-    Ok(dropped)
+    Ok(dead)
 }
 
 /// Receiver-side seam (Task 3/4): given a batch of object ids just written
@@ -139,7 +214,10 @@ pub(crate) fn index_incoming(
     let mut count = 0;
     for id in ids {
         if let Object::Transcript(t) = store.get(id)? {
-            append_index(layout, t.snapshot, *id)?;
+            match t.dropped_id() {
+                Some(dropped) => append_drop(layout, (t.snapshot, *id, dropped))?,
+                None => append_index(layout, t.snapshot, *id)?,
+            }
             count += 1;
         }
     }
@@ -154,22 +232,32 @@ pub(crate) fn index_incoming(
 /// stale entries from a half-written prior index are dropped too).
 pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
     let mut entries: Vec<(ObjectId, ObjectId)> = Vec::new();
+    let mut drops: Vec<DropEntry> = Vec::new();
     for id in store.all_ids()? {
         if let Object::Transcript(t) = store.get(&id)? {
-            if store.contains(&t.snapshot) {
-                entries.push((t.snapshot, id));
+            if !store.contains(&t.snapshot) {
+                continue;
+            }
+            match t.dropped_id() {
+                Some(dropped) => drops.push((t.snapshot, id, dropped)),
+                None => entries.push((t.snapshot, id)),
             }
         }
     }
+    drops.sort();
+    drops.dedup();
+    let dropped: BTreeSet<ObjectId> = drops.iter().map(|(_, _, d)| *d).collect();
+    entries.retain(|(_, tid)| !dropped.contains(tid));
     entries.sort();
     entries.dedup();
     let count = entries.len();
     write_index(layout, &entries)?;
+    write_drops(layout, &drops)?;
     Ok(count)
 }
 
-/// Sender-side seam (Task 3/4): the indexed transcript object ids covering
-/// any of `snapshots`, deduped and sorted — the set a push/export needs to
+/// Sender-side seam (Task 3/4): the indexed transcript object ids (and drop
+/// tombstones) covering any of `snapshots`, deduped and sorted — the set a push/export needs to
 /// carry alongside the snapshots themselves so the receiving repo's index
 /// stays complete.
 pub(crate) fn indexed_transcript_ids_for(
@@ -181,6 +269,12 @@ pub(crate) fn indexed_transcript_ids_for(
     for (snap, tid) in read_index(layout)? {
         if wanted.contains(&snap) {
             out.insert(tid);
+        }
+    }
+    // Tombstones travel with their snapshot so a drop propagates.
+    for (snap, tomb, _) in read_drops(layout)? {
+        if wanted.contains(&snap) {
+            out.insert(tomb);
         }
     }
     Ok(out.into_iter().collect())
@@ -238,6 +332,39 @@ impl Repo {
         };
         append_index(self.layout(), snapshot, id)?;
         Ok(id)
+    }
+
+    /// Drop the live transcript whose id starts with `id_prefix`: store a drop
+    /// tombstone and record it, so the transcript vanishes from `list`/`show`
+    /// and no later fetch can restore it (ADR-0038 addendum). The body object
+    /// is reclaimed by `gc` after its grace window. Returns the dropped id.
+    pub fn drop_transcript(&self, id_prefix: &str) -> Result<ObjectId> {
+        let prefix = id_prefix.to_ascii_lowercase();
+        let matches: BTreeSet<(ObjectId, ObjectId)> = read_index(self.layout())?
+            .into_iter()
+            .filter(|(_, tid)| !prefix.is_empty() && tid.to_hex().starts_with(&prefix))
+            .collect();
+        let mut it = matches.into_iter();
+        let (snap, tid) = match (it.next(), it.next()) {
+            (Some(m), None) => m,
+            (None, _) => {
+                return Err(Error::InvalidArgument(format!(
+                    "no live transcript matches {id_prefix:?} (see `sc transcript list`)"
+                )))
+            }
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "transcript id prefix {id_prefix:?} is ambiguous"
+                )))
+            }
+        };
+        let tomb = {
+            let arc = self.store_arc();
+            let mut store = arc.lock().unwrap();
+            store.put(Object::Transcript(Transcript::drop_tombstone(snap, &tid)))?
+        };
+        append_drop(self.layout(), (snap, tomb, tid))?;
+        Ok(tid)
     }
 
     /// All indexed transcripts for `snapshot`, loaded from the CAS (id +
@@ -458,5 +585,75 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn drop_hides_transcript_and_blocks_resurrection_in_either_order() {
+        let root = tmp_root("drop");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, id) = scl_crypto::generate_identity_v2();
+        let keep = repo
+            .attach_transcript(snap, "a", "keep", b"keep", &[id.enc.public()])
+            .unwrap();
+        let gone = repo
+            .attach_transcript(snap, "a", "gone", b"gone", &[id.enc.public()])
+            .unwrap();
+
+        // Prefix resolution: empty and unknown prefixes are refused.
+        assert!(repo.drop_transcript("").is_err());
+        assert!(repo.drop_transcript("zz").is_err());
+
+        assert_eq!(repo.drop_transcript(&gone.to_hex()[..12]).unwrap(), gone);
+        let live: Vec<_> = repo
+            .transcripts_for(&snap)
+            .unwrap()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(live, vec![keep], "only the kept transcript is listed");
+        assert!(
+            repo.drop_transcript(&gone.to_hex()).is_err(),
+            "a dropped id is no longer live"
+        );
+
+        // Resurrection attempt: a fetch re-indexes the dropped body.
+        append_index(repo.layout(), snap, gone).unwrap();
+        assert!(load(repo.layout()).unwrap().iter().all(|(_, t)| *t != gone));
+
+        // Opposite order: a receiver that sees the body BEFORE the tombstone.
+        let other_root = tmp_root("drop-order");
+        let other = Repo::init(&other_root).unwrap();
+        append_index(other.layout(), snap, gone).unwrap();
+        assert_eq!(load(other.layout()).unwrap().len(), 1);
+        let tomb = {
+            let arc = repo.store_arc();
+            let mut store = arc.lock().unwrap();
+            store
+                .put(Object::Transcript(Transcript::drop_tombstone(snap, &gone)))
+                .unwrap()
+        };
+        {
+            let arc = other.store_arc();
+            let mut store = arc.lock().unwrap();
+            store
+                .put(Object::Transcript(Transcript::drop_tombstone(snap, &gone)))
+                .unwrap();
+            index_incoming(other.layout(), &mut store, &[tomb]).unwrap();
+        }
+        assert!(
+            load(other.layout()).unwrap().is_empty(),
+            "an incoming tombstone hides an already-indexed transcript"
+        );
+        // The sender ships the tombstone with its snapshot.
+        assert!(indexed_transcript_ids_for(repo.layout(), &[snap])
+            .unwrap()
+            .contains(&tomb));
+
+        drop(repo);
+        drop(other);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&other_root).unwrap();
     }
 }

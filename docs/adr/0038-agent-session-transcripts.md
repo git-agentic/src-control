@@ -148,3 +148,93 @@ pipe-safety discipline).
   Also does not defend: secrets echoed into a transcript remaining readable to
   *authorized* transcript recipients (scan-and-warn mitigates, rotation
   remedies); content quality or truthfulness of the recorded session.
+
+## Addendum: `sc transcript drop` and the drop tombstone (issue #212)
+
+Closes the deferral in D6 and the "Deletion semantics deferred" consequence.
+
+### Tombstone format
+
+A drop is recorded as a **drop tombstone: a `Transcript` object with an
+empty `nonce`, `ciphertext` and `wrapped_keys`**, `agent` set to the marker
+`sc-transcript-drop-v1`, `snapshot` copied from the dropped transcript, and
+`session` set to the hex id of the dropped transcript. A real transcript is
+always sealed to at least one recipient, so it never has an empty ciphertext
+or wrap list; the two shapes cannot collide. `core` exposes
+`Transcript::drop_tombstone` / `Transcript::dropped_id` (bytes only, no new
+crypto).
+
+Reusing `TAG_TRANSCRIPT` is deliberate. A new object tag would be refused by
+peers that predate it and force a `PROTOCOL_VERSION` bump (the P34 route). A
+tombstone shaped as a transcript decodes everywhere and rides the existing
+pack format, the existing `snapshot -> transcripts` over-send and the
+existing receiver seam (`index_incoming`) with no wire change.
+
+### Semantics: grow-only set, not an epoch register
+
+P16 needs a last-writer-wins epoch because a recipient can be revoked and
+then legitimately re-granted. A transcript cannot come back under the same
+id: transcript ids are content hashes over a randomly sealed envelope, so
+re-attaching a body mints a new id. Each `(snapshot, dropped id)` pair
+therefore has exactly one transition, live to dropped, and the register
+collapses to a grow-only set of dropped ids. A concurrent drop and keep
+always resolve to dropped (the P16 tie rule, fail-closed). There is no
+undrop; to restore a body, attach it again.
+
+### Local index and convergence
+
+A second local file, `.sc/transcript-drops`, holds one
+`<snapshot-hex> <tombstone-hex> <dropped-hex>` line per tombstone. It is a
+derived cache like `.sc/transcripts`: `sc clone` rebuilds it with the same
+full-store scan (`reindex`). The live index is read through the drop set, so
+a dropped id is invisible to `list`, `show`, `sc log` markers and the
+over-send, whatever order the lines landed in.
+
+- **drop:** write the tombstone object, append the drop line, then remove the
+  live entry. A crash between steps leaves the drop line present, so the
+  transcript is still hidden (fail-closed).
+- **fetch/clone/push receive:** `index_incoming` records an incoming
+  tombstone as a drop and never indexes a transcript whose id is already
+  dropped, so a pack from a peer that still has the transcript cannot
+  restore it, in either arrival order.
+- **sender:** the over-send for a transfer set includes the tombstones of its
+  snapshots, so fetching from the dropper (or a push that moves the ref)
+  propagates the drop. A peer that still holds the transcript object hides
+  it as soon as it ingests the tombstone. `push` still skips all I/O when
+  the remote tip already equals the local tip, so a drop alone does not push,
+  the same pre-existing behavior as a retroactive attach.
+- **merge, cherry-pick, rebase:** transcripts are not part of snapshots, so
+  history operations neither carry nor restore them; only transfer can
+  reintroduce one, and that path is covered above.
+
+### gc
+
+The dropped transcript is no longer rooted, so its object falls to the
+ordinary loose-object grace window and repack like any other unreachable
+object, and its own signature entry is pruned with it (`signatures::gc_prune`
+keys off the same `reachable` set). Tombstones are the opposite: gc roots
+every tombstone object and keeps every drop line, **even when its snapshot is
+dead**, as P16 keeps revocation tombstones forever. They are load-bearing
+against a later fetch of the same history from a stale peer, and cost about
+100 bytes each. This is the one place the drop index outlives its snapshot;
+no transcript content does.
+
+### `sc verify`
+
+`sc verify` checks snapshot signatures only and never inspects transcripts,
+so it is unchanged. A dropped transcript's own signature is no longer
+reported anywhere (it is pruned by gc, hidden before that).
+
+### Limits
+
+- **Drop is not authenticated.** Anyone who can write to a store can drop any
+  transcript, the same trust level as attaching one. Signed drops are a
+  follow-on.
+- **Drop is not erasure.** Peers that never receive the tombstone keep the
+  sealed body, and a recipient who already decrypted it keeps the plaintext.
+  Rotation is not erasure here either.
+- **Older peers** that predate this change see a tombstone as an unopenable
+  transcript and do not honor it. Upgrade before relying on drop across a
+  shared remote.
+- `sc export` still counts only transcripts that are not tombstones; a
+  dropped body that gc has not swept yet is still counted as dropped history.

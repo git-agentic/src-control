@@ -591,6 +591,15 @@ enum TranscriptOp {
         #[arg(long)]
         json: bool,
     },
+    /// Drop a transcript by id (or unique id prefix) from `sc transcript
+    /// list`. Records a tombstone that travels with fetch/push, so a peer
+    /// that still has the transcript cannot bring it back; `sc gc` reclaims
+    /// the body after its grace window. Not erasure: peers that never
+    /// receive the tombstone keep the sealed body.
+    Drop {
+        /// Transcript id as shown by `sc transcript list` (hex prefix).
+        id: String,
+    },
     /// Sign every transcript attached to a ref's tip snapshot.
     Sign {
         /// Branch or remote-tracking ref whose tip snapshot's transcripts
@@ -3001,6 +3010,11 @@ fn run_transcript(op: TranscriptOp) -> Result<()> {
                     transcript_sig_label(status)
                 ));
             }
+            Ok(())
+        }
+        TranscriptOp::Drop { id } => {
+            let tid = repo.drop_transcript(&id)?;
+            println!("dropped transcript {}", tid.short());
             Ok(())
         }
         TranscriptOp::Sign { r#ref, identity } => {
