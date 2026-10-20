@@ -547,7 +547,9 @@ across every phase.
   branch remain individually sealed under a branch KEK. Grant is O(1), revoke
   rotates the KEK, and publish atomically replays scanner-gated public history.
   A conflicted merge of a public branch into a private one under a sparse spec honors the view and decides
-  out-of-view paths by the merge, not the prior tip (#240). (ADR-0044.)
+  out-of-view paths by the merge, not the prior tip (#240). A stopped merge into
+  a private branch aborts with `--identity` and records its `.theirs` sidecars
+  and plaintext like the public stop (#246). (ADR-0044.)
 - **Phase 35 — Native desktop browser.** A bundled Tauri v2 application opens
   `.sc` repositories through the Rust crates and renders local/remote refs, the
   all-parent snapshot DAG, provenance, public files, and first-parent diffs.
@@ -605,8 +607,8 @@ across every phase.
     path, and `sc sparse set` may widen while a merge, pick or rebase is stopped
     (#224, #236); a stopped completion no longer resurrects out-of-view
     deletions (#239).
-  - Checkout restores the executable bit on the write-out paths (#242); `sc resolve`
-    after the user deleted a conflicted file still drops it (#243).
+  - Checkout restores the executable bit on the write-out paths (#242, #243);
+    `sc resolve` after a deleted conflicted file restores it too.
   - A warning when the protected-cache key cannot be permission-restricted on a
     non-unix target (#225; the owner-only ACL is #214).
 
@@ -764,10 +766,6 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   sidecar is committed into the sealed tree. #247: `--abort` of a stopped
   merge, pick or rebase fails with `IsADirectory` when the decided root replaced
   a file with a directory.
-- **Exec-bit review follow-ups (#243, from #242).** Mask setuid/setgid/sticky in
-  `worktree::write_file`, tests for the protected and private write-out paths,
-  `sc resolve` after a deleted conflicted file loses the execute bit, and
-  `vfs::Worktree::checkout` should tolerate `Unsupported` like `write_file`.
 - **Network-Git same-remote edge cases** (ADR-0018's re-synthesis
   limitation across different Git repos).
 - **Richer signer trust models** beyond trusted-key lists (delegation, expiry)
