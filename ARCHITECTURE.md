@@ -372,9 +372,11 @@ operation if tracked files are modified or deleted (to prevent data loss). New,
 untracked files are left in place. `status` diffs the working tree against HEAD.
 The write-out paths (switch, merge, rebase, `sparse set`, clone, `ws fork`,
 private and conflict write-outs) apply the recorded file mode through one
-helper, so an executable file stays executable on unix and a stale execute bit
-is cleared on a plain file (#242). `sc resolve` after the user deleted a
-conflicted file does not use it yet (#243).
+helper (`scl_vfs::apply_file_mode`, also used by `Worktree::checkout`), so an
+executable file stays executable on unix, a stale execute bit is cleared on a
+plain file, and setuid/setgid/sticky are always cleared (#242, #243). `sc
+resolve` applies the chosen side's mode after rewriting a deleted conflicted
+file. A chmod the filesystem refuses is tolerated with a one-time warning.
 
 ### Mode-scoped disk invariant
 
