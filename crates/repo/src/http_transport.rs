@@ -1851,9 +1851,10 @@ mod tests {
             .any(|(t, _)| *t == tid1));
 
         drop(dst2);
-        let _ = std::fs::remove_dir_all(&src_root);
-        let _ = std::fs::remove_dir_all(&dst_root);
-        let _ = std::fs::remove_dir_all(&dst2_root);
+        for root in [&src_root, &dst_root, &dst2_root] {
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
+        }
     }
 
     // ── Task 4: loopback classifier + fail-closed bind gate + bearer auth

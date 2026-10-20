@@ -182,12 +182,13 @@ pipe-safety discipline).
    objects, so no `.sc/transcripts` or `.sc/signatures` entry created by this
    transfer points at a transcript the repo does not hold.
 4. **Remotes where the flag does nothing.** Git remotes never carry
-   transcripts. Bucket remotes (`sc+wal://`, `sc+s3://`) do not either:
+   transcripts. Bucket remotes (`sc+wal://`, `sc+s3://`) never serve them:
    `BucketTransport::get_pack` walks reachability only, so a fetch or clone
    from a bucket delivers no transcripts or transcript signatures whether or
-   not the flag is given, and a plain fetch does not change that. (A push to a
-   bucket still honours the flag by not uploading them.) That gap is tracked
-   in #229.
+   not the flag is given, and a plain fetch does not change that. For `push`
+   the flag still works: a normal bucket push uploads and stores the
+   transcripts (they are simply never served back), and `--no-transcripts`
+   skips that upload. The serving gap is tracked in #229.
 5. **Interaction with transcript-drop tombstones (PR #226).** A tombstone is
    an empty-envelope `Transcript` object, so `--no-transcripts` drops it like
    any other transcript: a receiver keeps showing a dropped transcript after a
