@@ -897,6 +897,43 @@ pub(crate) fn lay_out_added_view(
     Ok(protected)
 }
 
+/// Refuse, before anything is written, a target path (`paths`) with a file or
+/// symlink standing where one of its parent directories must be, unless
+/// `removable` names it (the removal pass is about to delete it). Writing
+/// through it would fail halfway (a file) or land outside the working tree
+/// (a symlink to a directory). Reads only; each directory is looked at once.
+pub(crate) fn refuse_blocked_parents<'a>(
+    root: &Path,
+    paths: impl Iterator<Item = &'a String>,
+    removable: &dyn Fn(&str) -> bool,
+) -> Result<()> {
+    let mut checked: BTreeSet<&str> = BTreeSet::new();
+    for path in paths {
+        let mut end = 0;
+        while let Some(i) = path[end..].find('/') {
+            end += i;
+            let parent = &path[..end];
+            end += 1;
+            if checked.contains(parent) {
+                continue;
+            }
+            let blocked = root
+                .join(parent)
+                .symlink_metadata()
+                .is_ok_and(|m| !m.is_dir())
+                && !removable(parent);
+            if blocked {
+                return Err(Error::InvalidArgument(format!(
+                    "cannot write {path}: {parent} is a file or symlink of yours where a \
+                     directory must be; move it away, then retry"
+                )));
+            }
+            checked.insert(parent);
+        }
+    }
+    Ok(())
+}
+
 /// Make room for a file at `full` (tracked path `path`) where a directory
 /// stands: the removal pass has deleted the tracked files under it, so what is
 /// left is a husk of empty directories, which goes. A directory that still
@@ -1064,12 +1101,15 @@ pub(crate) fn materialize_restore(
     )
 }
 
-// The rule for removing a file the old tree tracks: it goes only if the
-/// disk copy is still exactly the tracked bytes (so an edit, a replacement or
-/// a symlink the user put there survives), or, for a protected path (whose
-/// plaintext cannot be compared without a key), if the caller is not
-/// restoring or the stop recorded it. A path outside the view is never
-/// reported: nothing is laid there, so a copy is the user's own (#256).
+/// The one implementation behind [`materialize`], [`materialize_with_old_view`]
+/// and [`materialize_restore`] (`restore_owned` is `Some` for the last).
+///
+/// A file the old tree tracks is removed only if the disk copy is still
+/// exactly the tracked bytes (so an edit, a replacement or a symlink the user
+/// put there survives). A protected path's plaintext cannot be compared
+/// without a key: it goes only as a regular file and, on a restore, only if the
+/// stop recorded it. A path outside the view is never reported: nothing is
+/// laid there, so a copy is the user's own (#256).
 #[allow(clippy::too_many_arguments)]
 fn materialize_impl(
     layout: &Layout,
@@ -1146,7 +1186,12 @@ fn materialize_impl(
                 continue;
             }
             let ours = if perms & PROTECTED != 0 {
-                restore_owned.is_none_or(|owned| owned.contains(p))
+                // Plaintext cannot be compared without a key, and leftover
+                // plaintext of a protected file must not linger: a forward op
+                // removes it, a restore only if the stop recorded it. Only a
+                // file is ever unlinked.
+                full.symlink_metadata().is_ok_and(|m| m.is_file())
+                    && restore_owned.is_none_or(|owned| owned.contains(p))
             } else {
                 disk_is_blob(&full, blob_id)
             };
@@ -1171,6 +1216,11 @@ fn materialize_impl(
                 )));
             }
         }
+        refuse_blocked_parents(
+            &layout.root,
+            target.keys().filter(|p| sparse.matches(p)),
+            &|c| removals.contains(c),
+        )?;
         for p in removals {
             match std::fs::remove_file(safe_join(&layout.root, p)?) {
                 Ok(()) => {}
@@ -1190,9 +1240,8 @@ fn materialize_impl(
         // markers, or a file the user edited, are discarded by design) and
         // what the stop recorded, never a file or symlink of the user's at a
         // path neither covers. A directory is for `clear` to judge.
-        if let Some(owned) = restore_owned {
-            if perms & PROTECTED == 0
-                && !old_tracked.contains(path)
+        if let Some(owned) = restore_owned.filter(|_| old_root.is_some()) {
+            if !old_tracked.contains(path)
                 && !owned.contains(path)
                 && full.symlink_metadata().is_ok_and(|m| !m.is_dir())
                 && !disk_is_blob(&full, blob_id)

@@ -397,6 +397,11 @@ impl Repo {
         // A path outside the view is never laid out, so a copy on disk is the
         // user's own (#256). A failed removal is an error: the file may be
         // decrypted plaintext that must not linger.
+        worktree::refuse_blocked_parents(
+            &self.layout.root,
+            target.keys().filter(|p| sparse.matches(p)),
+            &|c| old_paths.contains(c) && !target.contains_key(c),
+        )?;
         for p in old_paths {
             if !target.contains_key(p) && sparse.matches(p) {
                 let full = worktree::safe_join(&self.layout.root, p)?;

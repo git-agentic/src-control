@@ -2011,8 +2011,10 @@ impl Repo {
             .map(|(p, _)| p)
             .collect();
         }
-        // Record what is about to be written in plaintext, before writing it:
-        // completion and abort need the list (see `conflict_plaintext`).
+        // Record the plaintext on disk: what is about to be written
+        // (`to_encrypt`, before writing it) and what `materialize` just
+        // decrypted. Completion and abort need the list (see
+        // `conflict_plaintext`).
         crate::conflict_plaintext::write(
             &self.layout,
             &to_encrypt
@@ -2496,7 +2498,7 @@ impl Repo {
         }
         self.remove_conflict_sidecars(&sidecar_roots)?;
         // What an interrupted stopped-op widen laid, which the walk above
-        // (over theirs' tree) cannot see.
+        // (over the decided tree) cannot see.
         self.remove_widen_residue(crate::merge_state::read_decided_root(&self.layout)?)?;
         crate::merge_state::clear(&self.layout)?;
         Ok(report)
@@ -2700,10 +2702,16 @@ impl Repo {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
             let target_paths = worktree::tree_file_entries_with_perms(&mut store, target_root)?;
+            let sparse = self.sparse_spec()?;
             for p in &old_paths {
-                if !target_paths.contains_key(p) {
+                // Out of the view nothing was laid: a copy is the user's (#256).
+                if !target_paths.contains_key(p) && sparse.matches(p) {
                     let full = worktree::safe_join(&self.layout.root, p)?;
-                    let _ = std::fs::remove_file(full);
+                    match std::fs::remove_file(full) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             }
         }

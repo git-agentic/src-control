@@ -301,6 +301,14 @@ every claim below is checked against the shipped code, not the plan.
    (the guards of refinement 7 and #250 still do). A restore also does not write
    over a file or symlink of the user's at a path the restored tree needs but
    the stopped tree did not track and the stop did not record.
+   A kept file or symlink standing where a parent directory of a target path
+   must be (a stop laid a file `zz` over a tracked `zz/a`, and the user changed
+   it) is refused before any removal or write with a message naming it
+   (`worktree::refuse_blocked_parents`, also in `materialize_private`): writing
+   through it would fail halfway or, for a symlink to a directory, land outside
+   the working tree. A restore with no replaced tree (residue without a decided
+   root) skips the "not tracked by the stopped tree" check, which would
+   otherwise keep every differing tip path.
    Details: `merge_abort` now takes the stop's decided root as the replaced
    tree (theirs' tree also holds paths the result deleted, which the stop never
    wrote), falling back to theirs only without one. A protected old path is
@@ -309,7 +317,16 @@ every claim below is checked against the shipped code, not the plan.
    public stop now records the carried protected files it decrypted, as the
    private stop already did. Recorded plaintext and sidecars are removed
    without a byte check: the user's edit of them is the resolution abort
-   discards. Limits: a user file whose bytes equal the tracked or laid ones is
+   discards. Recording the decrypted files also changes completion: a recorded protected
+   path the user deleted during the stop is committed as deleted instead of
+   being carried back from a parent (the rule plain files already followed).
+   Only a regular file is unlinked as protected plaintext. A forward op still
+   removes a user's plaintext copy at an out-of-view protected tracked path
+   (leftover plaintext of a protected file must not linger; `sparse set` and
+   `switch` do the same), a stated limit. A stop recorded by an older
+   build lacks the decrypted entries, so aborting it keeps such a file
+   (reported as kept); delete it by hand. The private-to-public switch's own
+   removal skips out-of-view paths and surfaces unlink errors too. Limits: a user file whose bytes equal the tracked or laid ones is
    indistinguishable from the stop's own write and goes; a failed unlink other
    than "not found" is now an error instead of being swallowed. Pinned by
    `user_file_safety.rs` (merge, pick, rebase) and `private_abort.rs`.

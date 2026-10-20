@@ -242,3 +242,93 @@ fn an_edited_out_of_view_file_is_committed_as_the_users_edit() {
         finish(&root, repo);
     }
 }
+
+/// `zz/a` is tracked; theirs replaces it with a file `zz`, and `x.txt`
+/// conflicts. The stop removes `zz/a` and lays the file `zz`.
+fn stopped_with_a_file_over_a_directory(tag: &str, op: Op) -> (PathBuf, Repo) {
+    let root = root_for(tag, op);
+    let repo = Repo::init(&root).unwrap();
+    put(&root, "x.txt", b"a\nb\nc\n");
+    put(&root, "zz/a", b"a\n");
+    repo.commit("me", "base").unwrap();
+    repo.branch("feature").unwrap();
+    put(&root, "x.txt", b"a\nMAIN\nc\n");
+    repo.commit("me", "main").unwrap();
+    repo.switch("feature").unwrap();
+    put(&root, "x.txt", b"a\nFEATURE\nc\n");
+    std::fs::remove_dir_all(root.join("zz")).unwrap();
+    put(&root, "zz", b"file\n");
+    repo.commit("me", "feature").unwrap();
+    repo.switch("main").unwrap();
+    stop(&repo, op);
+    assert_eq!(read(&root, "zz"), b"file\n", "{op:?}: setup");
+    (root, repo)
+}
+
+#[test]
+fn abort_refuses_before_any_write_when_a_kept_file_blocks_a_directory() {
+    for op in [Op::Merge, Op::Pick] {
+        let (root, repo) = stopped_with_a_file_over_a_directory("blocked", op);
+        put(&root, "zz", b"MINE\n");
+        let markers = read(&root, "x.txt");
+        let err = match op {
+            Op::Merge => repo.merge_abort(),
+            _ => repo.cherry_pick_abort(),
+        }
+        .unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::InvalidArgument(m) if m.contains("move it away")),
+            "{op:?}: {err:?}"
+        );
+        assert_eq!(read(&root, "x.txt"), markers, "{op:?}: nothing written");
+        assert_eq!(read(&root, "zz"), b"MINE\n", "{op:?}");
+        // The stop is intact and the abort works once the file is moved.
+        std::fs::remove_file(root.join("zz")).unwrap();
+        let report = abort(&repo, op);
+        assert!(report.kept.is_empty(), "{op:?}: {report:?}");
+        assert_eq!(read(&root, "zz/a"), b"a\n", "{op:?}");
+        finish(&root, repo);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn abort_never_writes_through_a_symlink_where_a_directory_must_be() {
+    let (root, repo) = stopped_with_a_file_over_a_directory("symlink-dir", Op::Merge);
+    let outside = root.with_extension("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::remove_file(root.join("zz")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("zz")).unwrap();
+    repo.merge_abort().unwrap_err();
+    assert!(!outside.join("a").exists(), "wrote through the symlink");
+    std::fs::remove_dir_all(&outside).unwrap();
+    finish(&root, repo);
+}
+
+#[test]
+fn abort_removes_a_protected_file_the_stop_decrypted_and_recorded() {
+    let (sk, pk) = scl_crypto::generate_keypair();
+    let root = root_for("protected", Op::Merge);
+    let repo = Repo::init(&root).unwrap();
+    repo.protect("secret/", &[pk], None).unwrap();
+    put(&root, "x.txt", b"a\nb\nc\n");
+    repo.commit("me", "base").unwrap();
+    repo.branch("feature").unwrap();
+    put(&root, "x.txt", b"a\nMAIN\nc\n");
+    repo.commit("me", "main").unwrap();
+    repo.switch_with_identity("feature", Some(&sk)).unwrap();
+    put(&root, "x.txt", b"a\nFEATURE\nc\n");
+    put(&root, "secret/new.txt", b"top secret\n");
+    repo.commit("me", "feature").unwrap();
+    repo.switch_with_identity("main", Some(&sk)).unwrap();
+    repo.merge_with_identity("feature", "me", Some(&sk))
+        .unwrap_err();
+    assert_eq!(read(&root, "secret/new.txt"), b"top secret\n", "setup");
+    assert!(crate::conflict_plaintext::read(repo.layout())
+        .unwrap()
+        .contains("secret/new.txt"));
+    let report = repo.merge_abort().unwrap();
+    assert!(!root.join("secret/new.txt").exists(), "plaintext survived");
+    assert!(report.kept.is_empty(), "{report:?}");
+    finish(&root, repo);
+}
