@@ -509,18 +509,23 @@ too, not just the src-control-side metadata.
     `LocalTransport::get_object` (load plus encode) before the receiver's cap
     rejects it, bounded by the local store budget. Wire sources refuse in
     `WireClient::get_object`, before decoding.
-  - **Writes are budgeted per connection (`--max-conn-bytes`, #233).**
-    `Object::blob_size` is 0 for trees, snapshots, secrets and transcripts, so
-    the store budget does not see them; a running per-connection counter now
-    covers every `PutObject` (decoded length) and every `PutPack` (spooled
-    bytes plus the encoded size of its structural records), and a request
-    that would exceed it gets `ConnectionBudgetExceeded` and the connection
-    closes. The default is `--max-pack-size` plus the max object size
-    (about 16.25 GiB), so the sum a peer can make one connection retain is
-    finite but not small: lower `--max-conn-bytes` and `--max-pack-size`
-    together on a writable listener, and keep `--max-connections` sized for
-    budget x connections. Reads are not budgeted. See the ADR-0039 #233
-    addendum.
+  - **Writes are budgeted per connection (`--max-conn-bytes`, #233), but the
+    default does not protect RAM.** `Object::blob_size` is 0 for trees,
+    snapshots, secrets and transcripts, so the store budget does not see them;
+    a running per-connection counter now covers every `PutObject` (decoded
+    length) and every `PutPack` (the larger of its spooled bytes and the
+    decoded bytes the receiver holds: structural records on a local store,
+    every record on a `--store` bucket, which decodes them all before upload).
+    A request that would exceed it gets `ConnectionBudgetExceeded` and the
+    connection closes. The default is `--max-pack-size` plus the max object
+    size, about 16.25 GiB per connection, times `--max-connections` (default
+    32): finite, but not a meaningful memory or disk bound. On a writable
+    listener, lower `--max-conn-bytes` and `--max-pack-size` together (the
+    budget must stay at least the pack cap); `sc serve --http` warns at
+    startup when a writable non-loopback listener runs on the default. Objects
+    the store already holds still count. A client sees the typed error only if
+    it overshoots by less than the 8 MiB drain cap; otherwise the connection
+    may reset. Reads are not budgeted. See the ADR-0039 #233 addendum.
   - **One length is checked after allocation:** bucket WAL metadata (manifest,
     log entry, idx) is capped at a fixed 256 MiB after the bucket GET has
     buffered it, so it bounds decode work, not the download. It is not tied to

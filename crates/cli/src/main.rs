@@ -368,8 +368,8 @@ enum Cmd {
         #[arg(long)]
         max_pack_size: Option<u64>,
         /// Per-connection budget over everything a peer makes the server
-        /// write (every PutObject, structural objects included, plus
-        /// PutPack spool bytes and the structural records inside a pack):
+        /// write (every PutObject, structural objects included, plus per
+        /// PutPack the larger of its spool bytes and the decoded bytes held):
         /// bytes, or a number with a KiB/MiB/GiB suffix (both --http and
         /// --stdio). Exceeding it replies an error and closes the
         /// connection; reads are not budgeted. Default: --max-pack-size (16
@@ -3843,6 +3843,7 @@ fn run_serve(
     path: PathBuf,
 ) -> Result<()> {
     let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
+    let default_budget = max_conn_bytes.is_none();
     let conn_bytes = match max_conn_bytes {
         Some(raw) => {
             scl_core::parse_byte_size(&raw).map_err(|e| anyhow::anyhow!("--max-conn-bytes: {e}"))?
@@ -3919,6 +3920,14 @@ fn run_serve(
                 limits.max_pack_size = m;
             }
             limits.max_conn_bytes = conn_bytes;
+            if default_budget && !read_only && !scl_repo::http_transport::addr_is_loopback(&addr) {
+                eprintln!(
+                    "warning: writable listener on {addr} runs with the default --max-conn-bytes \
+                     ({conn_bytes} bytes per connection, times --max-connections); this does not \
+                     bound server memory or disk tightly. Lower --max-conn-bytes and \
+                     --max-pack-size together."
+                );
+            }
             let tls_mode = match (tls, tls_cert, tls_key) {
                 (false, None, None) => scl_repo::http_transport::TlsMode::Off,
                 (false, _, _) => anyhow::bail!("--tls-cert/--tls-key require --tls"),

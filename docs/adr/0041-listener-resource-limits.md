@@ -198,3 +198,14 @@ scoped to the listener (`--stdio` is unaffected except where noted):
   cap is still trusting the OS's own thread/fd limits as the only backstop.
   `--max-connections 0` is an explicit opt-out of this phase's shedding
   behavior, not a claim that unlimited connections are safe.
+
+## Addendum (#233): the drain now covers `EC_TOO_LARGE` too
+
+Decision 3 tore the connection down right after the best-effort `EC_TOO_LARGE`
+reply. Since #233 the PutPack arm, after replying to a *well-formed but too
+large* stream (the `--max-pack-size` cap or the new per-connection budget,
+ADR-0039 second addendum), drains up to `ro_drain_cap` (decision 4's 8 MiB)
+before closing. Closing with unread bytes makes the OS reset the socket and
+can destroy the reply; the drain keeps it deliverable when the client
+overshoots by less than the cap. A malformed frame still tears down at once.
+

@@ -806,7 +806,7 @@ scale-&-reach horizon):
   negotiation: each receiver applies its own cap.
 - **Per-connection write budget — shipped (#233, ADR-0039 second addendum).**
   `sc serve --max-conn-bytes` bounds the sum of `PutObject` bytes and `PutPack`
-  bytes (spool plus the encoded size of structural records) one connection can
+  bytes (per pack, the larger of spool bytes and decoded bytes held) one connection can
   make the server retain; over it the server replies
   `ConnectionBudgetExceeded` and closes. No `PROTOCOL_VERSION` bump. Not built:
   a request-count or CPU budget, and a per-peer (cross-connection) budget.

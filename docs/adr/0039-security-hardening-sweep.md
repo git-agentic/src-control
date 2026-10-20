@@ -247,27 +247,31 @@ pack, not the connection.
 `scl_core::parse_byte_size`). It counts, per request:
 
 - `PutObject`: the frame's decoded length, every time, structural or not.
-  A repeated or already-present object still counts (the server cannot
-  know cheaply, and a replaying peer costs nothing to refuse).
-- `PutPack`: the exact spooled bytes (`spill_pack_stream` now returns the
-  count), plus the encoded size of the pack's structural records.
+  An object the store already holds still counts: checking would cost a
+  lookup per request and a replaying peer gains nothing from it.
+- `PutPack`: the larger of the pack's spooled bytes and the decoded bytes
+  the receiver holds for it (below). It is `max`, not a sum, because the
+  spool is the compressed form of the same records: summing would refuse a
+  maximal pack of incompressible structure on a budget the startup bounds
+  say fits it.
 
 Reads (`GetObject`, `GetObjects`, `GetPack`, ref listing) are not budgeted.
 
-**Why a pack's structural records are counted.** Reading `ingest_pack_file_impl`:
-a pack is spooled to disk, verified in pass 1, then every record is
-`Store::put` in pass 2. The store keeps trees, snapshots, secrets and
-transcripts resident (CLAUDE.md: "small, not evicted") and only blobs and
-sealed payloads are budgeted, so structural records of a pack are retained
-exactly like `PutObject` ones. The spool size alone understates them by the
-zstd ratio (a 3 MB tree with one long name packs to a few KB), so a
-`--max-pack-size` pack could carry far more resident structure than its
-byte count. Pass 1 therefore sums `Object::encode().len()` for every record
-whose `blob_size` is 0 (`StructuralTally`) and refuses before pass 2 if the
-remaining budget is exceeded. Blobs are not added again: they are bounded
-by the store budget and already counted via the spool. A bucket-backed
-`--store` keeps the pack as an immutable object and holds no resident
-structure, so only the spool bytes count there.
+**What a pack holds (ingest-path finding).** Reading
+`ingest_pack_file_impl`: a pack is spooled to disk, verified in pass 1, then
+every record is `Store::put` in pass 2. The store keeps trees, snapshots,
+secrets and transcripts resident (CLAUDE.md: "small, not evicted") and only
+blobs and sealed payloads are budgeted, so a pack's structural records are
+retained exactly like `PutObject` ones. The spool size understates them by
+the zstd ratio (a 3 MB tree with one long name packs to a few KB). Pass 1
+therefore sums `Object::encode().len()` for every record whose `blob_size`
+is 0 (`PackTally`) and refuses before pass 2 if the sum exceeds the whole
+remaining budget. Blobs are not added on a local store: the store budget
+bounds them and the spool already covers their bytes. A bucket-backed
+`--store` is different: `BucketTransport::put_pack` decodes every record,
+blobs included, into a `Vec` until the upload, so there `scan_pack_tally`
+(one extra verify pass over the spool) counts every record before the
+upload starts.
 
 **Enforcement and state.** A `PutObject` that would exceed the budget is
 refused before the store write; a `PutPack` is cut off mid-stream at the
@@ -279,7 +283,19 @@ the same path as the `PutPack` Protocol-error arm: the spool guard drops,
 no later request is served, and a retry on a fresh connection starts at
 zero. Bytes of the refused request are counted (the counter is not
 rolled back), which is moot because the connection ends. The comparison is
-`used > limit`, so a total exactly equal to the budget is accepted.
+`used > limit`, so a total exactly equal to the budget is accepted. A pack's
+cost is charged even when ingest then fails, since an error after pass 2
+began (an index write) can leave records stored on an open connection.
+
+**Delivery of the typed error.** After a mid-stream cap abort the server
+drains up to `ro_drain_cap` (8 MiB, reused: it is the same "keep the socket
+from being reset over unread bytes" job as the read-only path) before
+closing. A client therefore sees the typed error when it overshoots by less
+than that; past it the OS may reset the connection and the reply is lost.
+`WireClient::put_pack` also tries to read a reply after a write fails on a
+dead socket (broken pipe or reset), so a refusal that did get through is
+reported instead of the I/O error. ADR-0041 decision 3 (immediate teardown
+on `EC_TOO_LARGE`) is amended the same way: see its #233 note.
 
 **Wire.** New error code `EC_BUDGET = 7` mapped to
 `Error::ConnectionBudgetExceeded(String)` (payload is the server's own
@@ -287,19 +303,24 @@ text, like `PackTooLarge`). `PROTOCOL_VERSION` is unchanged: an older client
 degrades an unknown code to `Error::Remote(msg)`, which still carries the
 message.
 
-**Bounds and default.** The flag must be greater than zero (there is no
-unlimited setting from the CLI), at least the max object size (a smaller
+**Bounds and default.** The flag must be greater than zero (`sc serve` has no
+unlimited setting), at least the max object size (a smaller
 budget could not admit one object) and at least a nonzero
 `--max-pack-size` (a smaller one would silently lower the pack cap);
 violations abort startup, never clamped. Default: `--max-pack-size`
 (16 GiB when unlimited) plus the max object size, so a legitimate push that
 fills the pack cap and adds one more object still fits one connection. That
-default bounds the sum at about 16 GiB, not tightly: an operator who wants
-a small budget lowers `--max-pack-size` and `--max-conn-bytes` together.
+default bounds the sum at about 16.25 GiB per connection. It does **not**
+protect RAM or disk in any practical sense, and with `--max-connections`
+(default 32) the product is far larger. An operator who wants a real bound
+lowers `--max-pack-size` and `--max-conn-bytes` together; `sc serve --http`
+prints a startup warning for a writable, non-loopback listener left on the
+default.
 The single-connection push path (one `PutPack` within `--max-pack-size`)
 is unaffected by the default; a workload that pushes more than the budget
 over one connection must raise the flag or push over several.
 
 **Not covered.** The budget bounds bytes accepted, not request count or
 CPU. A budgeted peer can still use `--max-connections` x the budget, and
-`WirePolicy::max_conn_bytes` of 0 (embedders and tests) is unlimited.
+`WirePolicy::max_conn_bytes` / `ServeLimits::max_conn_bytes` of 0 (embedders
+and tests) is unlimited; only the CLI refuses it.

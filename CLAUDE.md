@@ -172,8 +172,9 @@ transport-adjacent. The rest, imperatively:
 - **Writes are budgeted per connection (#233).** `sc serve --max-conn-bytes`
   (default `--max-pack-size` plus the max object size; must be > 0 and at least
   both) counts `PutObject` bytes (structural objects included, `blob_size` 0 or
-  not) and `PutPack` spool bytes plus the encoded size of a pack's structural
-  records; exceeding it replies `ConnectionBudgetExceeded` (`EC_BUDGET`, no
+  not) and, per `PutPack`, the larger of its spool bytes and the decoded bytes
+  held (structural records; every record on a `--store` bucket); the default
+  (~16.25 GiB) does not bound RAM, lower it with `--max-pack-size`; exceeding it replies `ConnectionBudgetExceeded` (`EC_BUDGET`, no
   version bump) and closes the connection. Reads are not budgeted. A new
   object-write verb must charge `ConnBudget` in `serve_session`.
 - **The P35 desktop app is a keyless, read-only top-level adapter.** Its

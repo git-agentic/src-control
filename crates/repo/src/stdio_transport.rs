@@ -186,7 +186,22 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
     fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
         let mut rw = self.rw.borrow_mut();
         wire::write_frame(&mut rw.1, &Request::PutPack.encode())?;
-        wire::write_pack_stream(&mut rw.1, src, wire::pack_chunk_size())?;
+        if let Err(e) = wire::write_pack_stream(&mut rw.1, src, wire::pack_chunk_size()) {
+            // A server that refused mid-stream (pack or connection budget)
+            // replies and closes; surface its typed error instead of the
+            // broken pipe. Only for a dead socket: any other write failure is
+            // local and the server would still be waiting for us.
+            let closed = matches!(&e, Error::Io(io) if matches!(io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted));
+            if closed {
+                if let Ok(frame) = wire::read_frame(&mut rw.0) {
+                    wire::parse_response(frame)?;
+                }
+            }
+            return Err(e);
+        }
         let frame = wire::read_frame(&mut rw.0)?;
         wire::decode_ids_body(&wire::parse_response(frame)?)
     }

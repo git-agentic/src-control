@@ -877,6 +877,13 @@ fn is_loopback_host(host: &str) -> bool {
     }
 }
 
+/// Does the `host:port` listen address bind loopback only? (Used by the CLI's
+/// default-budget startup warning, #233.)
+pub fn addr_is_loopback(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    is_loopback_host(host.trim_start_matches('[').trim_end_matches(']'))
+}
+
 /// The fail-closed bind decision (P29, tightened by P32/ADR-0042): a
 /// non-loopback `addr` is allowed only if justified by `--read-only`,
 /// `--allow-public`, or — once TLS is available — `--tls` plus ≥1 configured
