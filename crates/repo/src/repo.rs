@@ -4609,6 +4609,44 @@ mod tests {
     }
 
     #[test]
+    fn cacheless_platform_commits_correctly_without_a_key_file() {
+        // #214: where `.sc/local-key` cannot be restricted, no key or cache
+        // file is created and protected files re-seal on each commit (never
+        // incorrectly): the sealed blobs still decrypt to the plaintext.
+        crate::cache::force_cacheless_for_test(true);
+        let root = tmp_root("p33-cacheless");
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", std::slice::from_ref(&alice_pk), None)
+            .unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), b"top secret").unwrap();
+        let c1 = repo.commit("alice", "one").unwrap();
+        std::fs::write(root.join("readme.md"), b"hello").unwrap();
+        let c2 = repo.commit("alice", "two").unwrap();
+        for c in [&c1, &c2] {
+            let id = p33_entry_id(&repo, c, "secret/x");
+            let bytes = p33_blob_bytes(&repo, &id);
+            let snap = repo.snapshot(c).unwrap();
+            let got = crate::protect::decrypt_with(
+                &bytes,
+                &id,
+                &[&snap.protection],
+                &alice_sk,
+                "secret/x",
+            )
+            .unwrap();
+            assert_eq!(&got[..], b"top secret");
+        }
+        assert!(!repo.layout().local_key_path().exists());
+        assert!(!repo.layout().protected_cache_path().exists());
+
+        crate::cache::force_cacheless_for_test(false);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn protect_grant_and_revoke_append_oplog_records() {
         let root = tmp_root("oplog-protect");
         let repo = Repo::init(&root).unwrap();

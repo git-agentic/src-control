@@ -795,10 +795,11 @@ scale-&-reach horizon):
   `sc resolve --theirs` protected path keeps their ciphertext instead of
   re-sealing; their wrap list must be in the unioned protection, and a lookup
   gap on a partial clone just seals.
-- **Non-unix local-key fallback (P33 final-review follow-on).** `.sc/local-key`
-  is minted 0600-from-first-byte via a unix-only `OpenOptions::mode` call;
-  there is no non-unix fallback today, so the key file is left world-readable
-  on a non-unix target. A non-unix permission-hardening path is deferred.
+- **Non-unix local-key fallback — shipped (#214).** Where `.sc/local-key` cannot
+  be restricted to its owner (non-unix) no key file is created and the protected
+  cache runs cacheless with a one-time warning (spurious re-seals, never
+  incorrect). Still deferred: a real Windows ACL path that would keep the cache
+  on; the cacheless branch is unverified on a Windows host.
 - **fd secret injection — shipped (ADR-0052).** `sc run --secrets-fd N` hands the
   secrets to the command on a descriptor (NUL-terminated `NAME=VALUE` records)
   instead of its environment. Not built: the same mode for `sc ws run` and

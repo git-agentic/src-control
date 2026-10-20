@@ -101,7 +101,8 @@ file changed. Detection is a per-checkout stat cache (`crates/repo/src/cache.rs`
 - `.sc/local-key`: 32 random bytes, mode **0600 from first byte** (via
   `OpenOptions::create_new` + `mode(0o600)`, so the file is never briefly
   world-readable between creation and permission-setting), created lazily,
-  **never committed, never transferred**. The per-checkout cache file itself
+  **never committed, never transferred**. Off unix (#214) no key file is made
+  and the cache runs cacheless with a one-time warning. The per-checkout cache file itself
   (below) is written via `atomic_write_durable`.
 - Per-checkout cache files: `.sc/protected-cache` for the main working tree;
   `.sc/ws/cache-<i>` per ws workspace (see below). Each entry is

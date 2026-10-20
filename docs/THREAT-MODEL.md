@@ -81,6 +81,16 @@ too, not just the src-control-side metadata.
   protected blob under a fresh key (ADR-0051), whereas a plain `sc rewrap` only
   replaces wrap lists and leaves the key a revoked holder already has. History
   keeps the old wraps and ciphertext regardless.
+- **Local cache key is unix-only (P33, #214):** the unchanged-detection cache is
+  keyed by `.sc/local-key`, created `0600` from its first byte. Leaking that key
+  lets a local reader test guesses against cached plaintext tags. Only unix can
+  restrict the file this way; on a non-unix target `sc` creates no key file,
+  ignores any existing one, reads and writes no `.sc/protected-cache` or
+  `.sc/ws/cache-<i>`, and prints a one-time stderr warning. It runs cacheless:
+  unchanged protected files re-seal on each commit (new random ciphertext ids)
+  and `status` may list them as modified, but results are never incorrect. The
+  non-unix branch is compiled but unverified on a real Windows host; there is no
+  ACL hardening.
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 

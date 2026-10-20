@@ -7,6 +7,9 @@
 //! The tag is `blake3::keyed_hash(local_key, plaintext)` under a random
 //! per-repo key (`.sc/local-key`, 0600), so the cache file alone leaks
 //! nothing — it does not reintroduce the equality oracle this phase closes.
+//! Where the key file's permissions cannot be restricted (non-unix; #214) no
+//! key file is created and no cache is read or written: see
+//! [`can_restrict_permissions`].
 //! A lost/stale/corrupt cache degrades to spurious re-seals, never
 //! incorrectness and never a hard error.
 //!
@@ -31,9 +34,52 @@ use scl_core::ObjectId;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 
+/// Whether `.sc/local-key` can be created readable by its owner only. Only
+/// unix can (`mode(0o600)` from the first byte); there is no Windows ACL path
+/// (#214), so elsewhere the cache runs cacheless rather than leave the key
+/// world-readable. Tests force `false` via `FORCE_CACHELESS` to exercise it.
+fn can_restrict_permissions() -> bool {
+    #[cfg(test)]
+    if FORCE_CACHELESS.with(|f| f.get()) {
+        return false;
+    }
+    cfg!(unix)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_CACHELESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam: make this thread behave like a non-unix target.
+#[cfg(test)]
+pub(crate) fn force_cacheless_for_test(on: bool) {
+    FORCE_CACHELESS.with(|f| f.set(on));
+}
+
+/// Print the cacheless warning the first time `flag` is unset; `true` iff it
+/// printed. The flag is a parameter so a test can use a private one.
+fn warn_cacheless_once(flag: &std::sync::atomic::AtomicBool) -> bool {
+    if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    eprintln!(
+        "warning: this platform cannot restrict .sc/local-key to its owner; the \
+         protected-file cache is disabled (unchanged protected files will be \
+         re-sealed on each commit and may show as modified)"
+    );
+    true
+}
+
 /// Load (minting if absent) the per-repo random cache key. The key file is
 /// the only hard-error surface here: if it can't be created/read, the cache
 /// cannot be safely keyed, so surface it rather than running unkeyed.
+///
+/// When permissions cannot be restricted (see [`can_restrict_permissions`])
+/// this touches no file: it warns once and returns a fresh in-memory key, and
+/// [`ProtectedCache::open`] then drops its path so nothing keyed by that
+/// throwaway key is read or persisted. A pre-existing `.sc/local-key` is
+/// ignored in that mode.
 ///
 /// Mirrors the serve-TLS key discipline (`crates/tlsio/src/identity.rs`):
 /// the file is created 0600 from its first byte via `create_new`, so there
@@ -41,6 +87,11 @@ use crate::layout::Layout;
 /// concurrent minter losing the `create_new` race falls through to reading
 /// the winner's file rather than erroring or clobbering it.
 pub(crate) fn local_key(layout: &Layout) -> Result<[u8; 32]> {
+    if !can_restrict_permissions() {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        warn_cacheless_once(&WARNED);
+        return Ok(*blake3::hash(scl_crypto::random_hex(32).as_bytes()).as_bytes());
+    }
     let path = layout.local_key_path();
     let hex_str = match std::fs::read_to_string(&path) {
         Ok(s) => s.trim().to_string(),
@@ -65,26 +116,25 @@ pub(crate) fn local_key(layout: &Layout) -> Result<[u8; 32]> {
         .map_err(|_| Error::InvalidArgument("malformed .sc/local-key".into()))
 }
 
-#[cfg(unix)]
+/// Create the key file owner-only from its first byte. Unreachable off unix:
+/// `local_key` goes cacheless first.
 fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)
-}
-
-#[cfg(not(unix))]
-fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    f.write_all(bytes)
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, bytes);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -151,6 +201,9 @@ fn is_plain_file(root: &Path, rel: &str) -> bool {
 
 impl ProtectedCache {
     pub(crate) fn open(key: [u8; 32], root: PathBuf, path: Option<PathBuf>) -> ProtectedCache {
+        // Cacheless platform: `key` is a throwaway, so a persisted file could
+        // never be matched or reused; keep the cache in memory only.
+        let path = path.filter(|_| can_restrict_permissions());
         let mut entries = BTreeMap::new();
         if let Some(p) = &path {
             if let Ok(text) = std::fs::read_to_string(p) {
@@ -320,6 +373,54 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "key file must be 0600");
         }
         cleanup(&layout);
+    }
+
+    #[test]
+    fn cacheless_mints_no_key_and_persists_nothing() {
+        FORCE_CACHELESS.with(|f| f.set(true));
+        let layout = tmp("cacheless");
+        let key = local_key(&layout).unwrap();
+        assert_ne!(key, local_key(&layout).unwrap(), "throwaway key per call");
+        assert!(!layout.local_key_path().exists(), "no key file");
+
+        let abs = layout.root.join("secret.txt");
+        std::fs::write(&abs, b"v1").unwrap();
+        let id = ObjectId::of(b"cipher-of-v1");
+        let mut c = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
+        c.record("secret.txt", b"v1", id);
+        assert_eq!(c.unchanged("secret.txt", b"v1"), Some(id), "in-process hit");
+        c.save().unwrap();
+        assert!(!layout.protected_cache_path().exists(), "nothing persisted");
+
+        // A cache file left by a unix run is not consulted.
+        FORCE_CACHELESS.with(|f| f.set(false));
+        let mut c = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
+        c.record("secret.txt", b"v1", id);
+        c.save().unwrap();
+        FORCE_CACHELESS.with(|f| f.set(true));
+        let c = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
+        assert_eq!(c.unchanged("secret.txt", b"v1"), None);
+        FORCE_CACHELESS.with(|f| f.set(false));
+        cleanup(&layout);
+    }
+
+    #[test]
+    fn cacheless_warning_prints_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(warn_cacheless_once(&flag));
+        assert!(!warn_cacheless_once(&flag));
     }
 
     #[test]

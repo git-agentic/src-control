@@ -199,7 +199,8 @@ transport-adjacent. The rest, imperatively:
 - **`.sc/local-key` and the per-checkout protected caches
   (`.sc/protected-cache`, `.sc/ws/cache-<i>`) are never committed and never
   transferred.** Cache saves are best-effort and ordered after ref moves; a
-  cache failure may cause a spurious re-seal but never incorrectness.
+  cache failure may cause a spurious re-seal but never incorrectness. On
+  non-unix targets no key is created and the cache is off (#214).
 - **Revoke is standing-only.** A revoked recipient keeps decrypting ciphertext
   sealed before the revoke (they hold the old wraps); cryptographic cutover is
   `sc rewrap --rotate` at the tip (fresh key per protected blob; a plain
