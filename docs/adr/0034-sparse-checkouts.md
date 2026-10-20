@@ -231,9 +231,12 @@ every claim below is checked against the shipped code, not the plan.
    ref); the repo lock is held by the CLI as for any mutation.
 6. **Completion carries from the decided root, not the parents (#238).**
    A stopped merge, cherry-pick or rebase on a public branch records a
-   decided root (`MERGE`/`PICK`/`REBASE_DECIDED_ROOT`); a merge into a
-   private branch writes none and completes through `commit_private`, which
-   this refinement does not cover. `snapshot_files` carries an absent
+   decided root (`MERGE`/`PICK`/`REBASE_DECIDED_ROOT`). A merge into a
+   private branch records none, because an inner tree must not sit in
+   unsealed `.sc/` state; `commit_private` re-derives the merge outcome
+   instead and carries from that (#240, ADR-0044 "Merge-in
+   under a sparse spec"), and its stop lays out only in-view files and
+   refuses an out-of-view conflict before any write. `snapshot_files` carries an absent
    out-of-view or still-protected path from the decided root. Earlier builds
    also read the tip and merge head, so a path the other side had cleanly
    deleted (an out-of-view file, or a protected file) came back from the tip

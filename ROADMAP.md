@@ -542,7 +542,8 @@ across every phase.
   manifest while snapshots, trees, paths, messages, and blobs introduced on the
   branch remain individually sealed under a branch KEK. Grant is O(1), revoke
   rotates the KEK, and publish atomically replays scanner-gated public history.
-  (ADR-0044.)
+  A conflicted merge of a public branch into a private one under a sparse spec honors the view and decides
+  out-of-view paths by the merge, not the prior tip (#240). (ADR-0044.)
 - **Phase 35 — Native desktop browser.** A bundled Tauri v2 application opens
   `.sc` repositories through the Rust crates and renders local/remote refs, the
   all-parent snapshot DAG, provenance, public files, and first-parent diffs.
