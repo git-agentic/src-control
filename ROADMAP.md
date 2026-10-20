@@ -889,6 +889,12 @@ scale-&-reach horizon):
   rewrap/grant/revoke surface — sealed once, to the recipient set at
   attach time, permanently. Extending P17's rewrap and P16's
   grant/revoke machinery to transcripts is deferred.
+- **Bucket leaf sidecar (#229 follow-on).** Bucket `get_pack` finds signatures,
+  transcripts and tombstones by decoding every on-chain pack (cached per pack
+  hash within one transport). A per-pack sidecar object listing those leaves,
+  written at push time and ignored by older readers, would remove the decode;
+  deferred until fetch egress or CPU on a real bucket shows the scan (up to a
+  second download of each pack per fetch) is too costly.
 - **Sender-side `--no-transcripts` for fetch/clone (P30).** The #211
   opt-out is client-side: `fetch`/`clone` still receive transcripts and
   discard them, so only `push` saves bandwidth. Having the server skip

@@ -29,6 +29,7 @@ it as the revocation checklist. Written as OSTIF-audit follow-up T-14 (G-012).
 | `GITHUB_TOKEN` — `ci.yml` | `contents: read` | Ephemeral per-run. |
 | `GITHUB_TOKEN` — `codeql.yml` | `contents: read` top-level; analyze job adds `security-events: write`, `actions: read` | Ephemeral per-run. |
 | `GITHUB_TOKEN` — `audit.yml` | `contents: read`, `checks: write`, `issues: write` (job-scoped as of audit T-20) | Files RustSec findings as public issues. |
+| `GITHUB_TOKEN` — `fuzz.yml`, `sbom.yml`, `vendor-provenance.yml` | `contents: read` | Ephemeral per-run. Nightly `wire_decode` fuzz, weekly CycloneDX SBOMs, and the vendored-glib provenance check; none holds a write scope. |
 | `GITHUB_TOKEN` — `scorecard_analysis.yml` | `read-all` top-level; job adds `security-events: write`, `id-token: write` | Publishes Scorecard results. |
 | AI agents (Claude Code et al.) | `gh` CLI under the maintainer's auth: issue/PR create, comment, label, close; local commit + push | Operate the public triage pipeline (`issue-tracker.md`). **Excluded** from draft security advisories and private reports; security fixes need distinct human review (see vulnerability-response.md). Compromise playbook: incident-response class 2. |
 | Dependabot | Version + security update PRs (cargo, npm, github-actions) | PRs merge only through the standing required checks. |
