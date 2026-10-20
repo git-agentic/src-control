@@ -509,24 +509,6 @@ pub(crate) fn tree_file_ids_sparse(
     Ok(out)
 }
 
-/// Like [`tree_file_ids_sparse`], but skips a subtree the store lacks instead
-/// of failing. For `materialize`'s old-root removal walk on a partial clone:
-/// the old root was laid out under a preflighted view, so an absent subtree
-/// lay outside that view and has nothing on disk to remove. A fetch can leave
-/// a tree absent that is inside the promisor filter but outside the view
-/// (ADR-0048).
-fn tree_file_ids_sparse_present(
-    store: &mut Store,
-    root: ObjectId,
-    sparse: &Sparse,
-) -> Result<BTreeMap<String, ObjectId>> {
-    let mut out = BTreeMap::new();
-    if store.contains(&root) {
-        walk_tree_sparse(store, root, String::new(), sparse, &mut out, true)?;
-    }
-    Ok(out)
-}
-
 fn walk_tree_sparse(
     store: &mut Store,
     tree_id: ObjectId,
@@ -828,6 +810,38 @@ pub(crate) fn added_view_files(
     Ok((plain, protected))
 }
 
+/// Whether `full` is a regular file whose bytes are exactly the blob `blob_id`:
+/// the one test for "this file is still what the tree says, so it is ours to
+/// delete or overwrite". A symlink, a directory, an unreadable file or any
+/// other bytes read as no. One chunked read of the disk file and no store
+/// access, so memory stays flat for a big file and it works when the blob is
+/// not held (a partial clone gap).
+pub(crate) fn disk_is_blob(full: &Path, blob_id: &ObjectId) -> bool {
+    disk_blob_id(full).as_ref() == Some(blob_id)
+}
+
+/// The blob id of the regular file at `full`, hashed in chunks (a big file is
+/// never held in memory); `None` for a symlink, a directory, a missing or
+/// unreadable file.
+fn disk_blob_id(full: &Path) -> Option<ObjectId> {
+    if !full.symlink_metadata().ok()?.is_file() {
+        return None;
+    }
+    Object::blob_id_of_reader(std::fs::File::open(full).ok()?).ok()
+}
+
+/// What [`materialize_restore`] did besides the writes.
+#[derive(Debug, Default)]
+pub(crate) struct Materialized {
+    /// Protected paths left absent: no key for them.
+    pub skipped: Vec<String>,
+    /// In-view paths left as the user has them: a file the tree being replaced
+    /// tracked but whose bytes (or type) changed since, so it was not removed;
+    /// or, on a restore, a file standing where the restored tree needs one
+    /// that the replaced tree did not track, so it was not overwritten.
+    pub kept: Vec<String>,
+}
+
 /// Of `paths`, those that exist in the tree at `root` as plain files and whose
 /// file on disk has exactly the blob's bytes: what an interrupted widen wrote
 /// and nobody changed since. A file that merely has the same bytes but was
@@ -848,13 +862,7 @@ pub(crate) fn recorded_paths_laid(
         if perms & PROTECTED != 0 {
             continue;
         }
-        let Ok(Object::Blob(bytes)) = store.get(&blob_id) else {
-            continue;
-        };
-        let full = safe_join(&layout.root, path)?;
-        // A symlink is never ours, and a read error reads as "not laid".
-        let is_file = full.symlink_metadata().is_ok_and(|m| m.is_file());
-        if is_file && std::fs::read(&full).is_ok_and(|disk| disk[..] == bytes[..]) {
+        if disk_is_blob(&safe_join(&layout.root, path)?, &blob_id) {
             laid.insert(path.clone());
         }
     }
@@ -908,6 +916,80 @@ pub(crate) fn lay_out_added_view(
         apply_file_mode(&full, mode)?;
     }
     Ok(protected)
+}
+
+/// Whether a parent directory of the tracked path `rel` under `root` is a
+/// symlink: a file reached through it lies outside the working tree, so it is
+/// never ours to delete. Reads only.
+pub(crate) fn under_symlink(root: &Path, rel: &str) -> bool {
+    let mut end = 0;
+    while let Some(i) = rel[end..].find('/') {
+        end += i;
+        if root
+            .join(&rel[..end])
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_symlink())
+        {
+            return true;
+        }
+        end += 1;
+    }
+    false
+}
+
+/// `symlink_metadata` that reads "nothing there" (also when a parent is a
+/// file) as `None`, and surfaces any other failure: not knowing what stands
+/// at a path must stop the caller before it clears state.
+pub(crate) fn lstat(full: &Path) -> Result<Option<std::fs::Metadata>> {
+    match full.symlink_metadata() {
+        Ok(m) => Ok(Some(m)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Refuse, before anything is written, a target path (`paths`) with a file or
+/// symlink standing where one of its parent directories must be, unless
+/// `removable` names it (the removal pass is about to delete it). Writing
+/// through it would fail halfway (a file) or land outside the working tree
+/// (a symlink to a directory). Reads only; each directory is looked at once.
+pub(crate) fn refuse_blocked_parents<'a>(
+    root: &Path,
+    paths: impl Iterator<Item = &'a String>,
+    removable: &dyn Fn(&str) -> bool,
+) -> Result<()> {
+    let mut checked: BTreeSet<&str> = BTreeSet::new();
+    for path in paths {
+        let mut end = 0;
+        while let Some(i) = path[end..].find('/') {
+            end += i;
+            let parent = &path[..end];
+            end += 1;
+            if checked.contains(parent) {
+                continue;
+            }
+            let blocked = root
+                .join(parent)
+                .symlink_metadata()
+                .is_ok_and(|m| !m.is_dir())
+                && !removable(parent);
+            if blocked {
+                return Err(Error::InvalidArgument(format!(
+                    "cannot write {path}: {parent} is a file or symlink of yours where a \
+                     directory must be; move it away, then retry"
+                )));
+            }
+            checked.insert(parent);
+        }
+    }
+    Ok(())
 }
 
 /// Make room for a file at `full` (tracked path `path`) where a directory
@@ -1028,8 +1110,78 @@ pub(crate) fn materialize_with_old_view(
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
     old_view: Option<&Sparse>,
-    mut cache: Option<&mut ProtectedCache>,
+    cache: Option<&mut ProtectedCache>,
 ) -> Result<Vec<String>> {
+    Ok(materialize_impl(
+        layout,
+        store,
+        target_root,
+        old_root,
+        protection,
+        identity,
+        sparse,
+        old_view,
+        None,
+        cache,
+    )?
+    .skipped)
+}
+
+/// [`materialize`] for an abort, which restores a tip over a stopped
+/// operation's result (`old_root`, the tree the working tree reflects). The
+/// stop's own files go and the rest stay: `owned` is what the stop recorded
+/// writing in plaintext (`CONFLICT_PLAINTEXT`) plus its conflicted paths,
+/// which cannot or need not be compared with a tree, so a protected path is
+/// removed only if it is there and an owned file is overwritten whatever its
+/// bytes. Any other in-view file is written only if it is still the replaced
+/// tree's bytes (or absent): a file the user changed since stays. What it
+/// left is in [`Materialized::kept`] (#255).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_restore(
+    layout: &Layout,
+    store: &mut Store,
+    target_root: ObjectId,
+    old_root: Option<ObjectId>,
+    protection: &Protection,
+    sparse: &Sparse,
+    owned: &BTreeSet<String>,
+) -> Result<Materialized> {
+    materialize_impl(
+        layout,
+        store,
+        target_root,
+        old_root,
+        protection,
+        None,
+        sparse,
+        None,
+        Some(owned),
+        None,
+    )
+}
+
+/// The one implementation behind [`materialize`], [`materialize_with_old_view`]
+/// and [`materialize_restore`] (`restore_owned` is `Some` for the last).
+///
+/// A file the old tree tracks is removed only if the disk copy is still
+/// exactly the tracked bytes (so an edit, a replacement or a symlink the user
+/// put there survives). A protected path's plaintext cannot be compared
+/// without a key: it goes only as a regular file and, on a restore, only if the
+/// stop recorded it. A path outside the view is never reported: nothing is
+/// laid there, so a copy is the user's own (#256).
+#[allow(clippy::too_many_arguments)]
+fn materialize_impl(
+    layout: &Layout,
+    store: &mut Store,
+    target_root: ObjectId,
+    old_root: Option<ObjectId>,
+    protection: &Protection,
+    identity: Option<&scl_crypto::SecretKey>,
+    sparse: &Sparse,
+    old_view: Option<&Sparse>,
+    restore_owned: Option<&BTreeSet<String>>,
+    mut cache: Option<&mut ProtectedCache>,
+) -> Result<Materialized> {
     // Fail before the first write if the view's closure is not all present
     // (partial clones only; ADR-0048). The check lives here so every caller
     // is covered and none can forget it.
@@ -1050,6 +1202,10 @@ pub(crate) fn materialize_with_old_view(
     // Set when an interrupted `sparse set`'s marker widened the removal bound;
     // cleared once this call has finished laying the tree out under `sparse`.
     let mut prev_marker_used = false;
+    let mut kept = Vec::new();
+    // Paths the replaced tree tracks (within the removal walk's bound), with
+    // their blob ids.
+    let mut old_tracked: BTreeMap<String, ObjectId> = BTreeMap::new();
     if let Some(old) = old_root {
         // The old-root removal walk: bounded by the spec the old root was
         // laid out under (`old_view`, or `sparse` itself when the spec is
@@ -1076,11 +1232,41 @@ pub(crate) fn materialize_with_old_view(
             None => (Sparse::default(), false),
         };
         let old_files = if partial {
-            tree_file_ids_sparse_present(store, old, &old_walk_bound)?
+            tree_file_entries_with_perms_sparse_present(store, old, &old_walk_bound)?
         } else {
-            tree_file_ids_sparse(store, old, &old_walk_bound)?
+            tree_file_entries_with_perms_sparse(store, old, &old_walk_bound)?
         };
         let gone = |p: &str| !target.contains_key(p) || !sparse.matches(p);
+        // Decide every removal before the first one: which gone files are
+        // still the tree's own bytes, and so ours to delete.
+        let mut removals: BTreeSet<&str> = BTreeSet::new();
+        for (p, (blob_id, _, perms)) in old_files.iter().filter(|(p, _)| gone(p)) {
+            let full = safe_join(&layout.root, p)?;
+            if lstat(&full)?.is_none() {
+                continue;
+            }
+            let ours = !under_symlink(&layout.root, p)
+                && if perms & PROTECTED != 0 {
+                    // Plaintext cannot be compared without a key, and leftover
+                    // plaintext of a protected file must not linger: a forward op
+                    // removes it, a restore only if the stop recorded it. Only a
+                    // file is ever unlinked.
+                    full.symlink_metadata().is_ok_and(|m| m.is_file())
+                        && restore_owned.is_none_or(|owned| owned.contains(p))
+                } else {
+                    // Still the tree's bytes, or a path the stop owns (recorded
+                    // plaintext, a live conflict) where an edit is the resolution
+                    // a restore discards. Only a regular file either way.
+                    disk_is_blob(&full, blob_id)
+                        || (restore_owned.is_some_and(|owned| owned.contains(p))
+                            && full.symlink_metadata().is_ok_and(|m| m.is_file()))
+                };
+            if ours {
+                removals.insert(p);
+            } else if sparse.matches(p) {
+                kept.push(p.clone());
+            }
+        }
         // Before the first removal: a directory a target file must replace
         // may hold only directories and files this pass is about to delete.
         // Anything else is the user's, and refusing now (rather than at the
@@ -1088,7 +1274,7 @@ pub(crate) fn materialize_with_old_view(
         for path in target.keys().filter(|p| sparse.matches(p)) {
             let full = safe_join(&layout.root, path)?;
             if full.symlink_metadata().is_ok_and(|m| m.is_dir())
-                && !dir_clearable(&full, path, &|c| old_files.contains_key(c) && gone(c))
+                && !dir_clearable(&full, path, &|c| removals.contains(c))
             {
                 return Err(Error::InvalidArgument(format!(
                     "cannot write {path}: a directory with untracked or ignored content stands \
@@ -1096,12 +1282,22 @@ pub(crate) fn materialize_with_old_view(
                 )));
             }
         }
-        for p in old_files.keys() {
-            if gone(p) {
-                let full = safe_join(&layout.root, p)?;
-                let _ = std::fs::remove_file(full);
+        refuse_blocked_parents(
+            &layout.root,
+            target.keys().filter(|p| sparse.matches(p)),
+            &|c| removals.contains(c),
+        )?;
+        for p in removals {
+            match std::fs::remove_file(safe_join(&layout.root, p)?) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
         }
+        old_tracked = old_files
+            .into_iter()
+            .map(|(p, (blob, ..))| (p, blob))
+            .collect();
     }
     let mut skipped = Vec::new();
     for (path, (blob_id, mode, perms)) in &target {
@@ -1109,6 +1305,29 @@ pub(crate) fn materialize_with_old_view(
             continue;
         }
         let full = safe_join(&layout.root, path)?;
+        // A restore overwrites a file only if it is still the replaced tree's
+        // (or already the restored one), or the stop recorded it or marked it
+        // conflicted, where an edit is the resolution abort discards. A
+        // plaintext protected file never equals a blob, so it needs the
+        // record. A directory is for `clear` to judge.
+        // A symlink is never the stop's (it writes regular files) and writing
+        // would follow it, out of the working tree.
+        if restore_owned.is_some() && full.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+            kept.push(path.clone());
+            continue;
+        }
+        if let Some(owned) = restore_owned.filter(|_| old_root.is_some()) {
+            if !owned.contains(path) && full.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+                let disk = disk_blob_id(&full);
+                let is_stopped = old_tracked
+                    .get(path)
+                    .is_some_and(|old| disk.as_ref() == Some(old));
+                if disk.as_ref() != Some(blob_id) && !is_stopped {
+                    kept.push(path.clone());
+                    continue;
+                }
+            }
+        }
         let bytes = match store.get(blob_id)? {
             Object::Blob(b) => b,
             _ => continue,
@@ -1179,7 +1398,8 @@ pub(crate) fn materialize_with_old_view(
     if prev_marker_used {
         crate::sparse::clear_prev(layout)?;
     }
-    Ok(skipped)
+    kept.sort();
+    Ok(Materialized { skipped, kept })
 }
 
 #[cfg(test)]
@@ -1195,6 +1415,28 @@ mod tests {
         std::fs::create_dir_all(layout.objects_dir()).unwrap();
         let store = Store::open_persistent(layout.objects_dir(), 1 << 20).unwrap();
         (layout, store)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lstat_reads_a_file_parent_as_absent_and_under_symlink_stays_below_the_root() {
+        let root = std::env::temp_dir().join(format!("scl-repo-lstat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("file"), b"f").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        assert!(lstat(&root.join("file/child")).unwrap().is_none());
+        assert!(lstat(&root.join("missing")).unwrap().is_none());
+        assert!(lstat(&root.join("file")).unwrap().is_some());
+        assert!(under_symlink(&root, "link/a.txt"));
+        assert!(!under_symlink(&root, "real/a.txt"));
+        // The root itself being reached through a link does not count.
+        let alias = root.with_extension("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(!under_symlink(&alias, "real/a.txt"));
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]

@@ -619,11 +619,12 @@ impl Repo {
     /// moved, so abort is its own inverse; nothing to undo. Errors
     /// [`Error::InvalidArgument`] if no cherry-pick is in progress.
     ///
-    /// Returns the protected paths that could not be restored (P21): no
-    /// identity is available at abort time, so protected files in the
-    /// restored tree are skipped (left absent) rather than decrypted —
-    /// mirrors [`crate::repo::Repo::merge_abort`]'s contract exactly.
-    pub fn cherry_pick_abort(&self) -> Result<Vec<String>> {
+    /// Returns an [`crate::repo::AbortReport`] (P21, #255): the protected
+    /// paths that could not be restored (no identity is available at abort
+    /// time, so they are skipped rather than decrypted) and the paths left in
+    /// place because the user changed them since the stop — mirrors
+    /// [`crate::repo::Repo::merge_abort`]'s contract exactly.
+    pub fn cherry_pick_abort(&self) -> Result<crate::repo::AbortReport> {
         if !crate::pick_state::in_progress(&self.layout) {
             return Err(Error::InvalidArgument(
                 "no cherry-pick in progress — nothing to abort".into(),
@@ -631,7 +632,7 @@ impl Repo {
         }
         let decided = crate::pick_state::read_decided_root(&self.layout)?;
         let ours_tip = self.head_tip()?;
-        let mut skipped = Vec::new();
+        let mut report = crate::repo::AbortReport::default();
         let mut sidecar_roots: Vec<ObjectId> = Vec::new();
         if let Some(tip) = ours_tip {
             let snap = self.snapshot(&tip)?;
@@ -643,29 +644,15 @@ impl Repo {
             // before anything is removed: a view gap must leave the stopped
             // pick intact and retryable (ADR-0049 decision 10).
             self.ensure_view(snap.root, &self.sparse_spec()?)?;
-            let store_arc = self.vfs().store();
-            let mut store = store_arc.lock().unwrap();
-            // No identity at abort time: nothing is decrypted, so `materialize`
-            // records nothing — pass `None`, no cache to open or save
-            // (P33 Task 7 item 7).
-            skipped = worktree::materialize(
-                &self.layout,
-                &mut store,
-                snap.root,
-                decided,
-                &snap.protection,
-                None,
-                &self.sparse_spec()?,
-                None,
-            )?;
+            report = self.restore_over_stop(snap.root, &snap.protection, decided)?;
         }
         if let Some(root) = sidecar_roots.first() {
-            self.remove_conflict_plaintext(*root)?;
+            report.keep_all(self.remove_conflict_plaintext(*root)?);
         }
         self.remove_conflict_sidecars(&sidecar_roots)?;
         self.remove_widen_residue(decided)?;
         crate::pick_state::clear(&self.layout)?;
-        Ok(skipped)
+        Ok(report)
     }
 
     /// Replay the current branch's commits onto `target`'s tip (rebase).
@@ -1267,11 +1254,12 @@ impl Repo {
     /// ref ever moved. Errors [`Error::InvalidArgument`] if no rebase is in
     /// progress.
     ///
-    /// Returns the protected paths that could not be restored (P21): no
-    /// identity is available at abort time, so protected files in the
-    /// restored tree are skipped (left absent) rather than decrypted —
-    /// mirrors [`crate::repo::Repo::merge_abort`]'s contract exactly.
-    pub fn rebase_abort(&self) -> Result<Vec<String>> {
+    /// Returns an [`crate::repo::AbortReport`] (P21, #255): the protected
+    /// paths that could not be restored (no identity is available at abort
+    /// time, so they are skipped rather than decrypted) and the paths left in
+    /// place because the user changed them since the stop — mirrors
+    /// [`crate::repo::Repo::merge_abort`]'s contract exactly.
+    pub fn rebase_abort(&self) -> Result<crate::repo::AbortReport> {
         let Some(st) = crate::rebase_state::read(&self.layout)? else {
             return Err(Error::InvalidArgument(
                 "no rebase in progress — nothing to abort".into(),
@@ -1282,8 +1270,7 @@ impl Repo {
         // disk as the tree the working tree currently, actually reflects —
         // pass it as `old_root` so the deletion pass drops files the stop
         // pulled in from the target side (e.g. a target-only new file) that
-        // `original_tip` never had (P19 review fix, mirrors `merge_abort`'s
-        // `theirs_root`-as-`old_root` pattern in `crates/repo/src/repo.rs`).
+        // `original_tip` never had (P19 review fix, mirrors `merge_abort`).
         // Falls back to `None` (full clean materialize) only for residue
         // where the decided root is unexpectedly absent.
         let decided = crate::rebase_state::read_decided_root(&self.layout)?;
@@ -1292,28 +1279,12 @@ impl Repo {
         // anything is removed: a view gap must leave the stopped rebase
         // intact and retryable (ADR-0049 decision 10).
         self.ensure_view(snap.root, &self.sparse_spec()?)?;
-        let skipped = {
-            let store_arc = self.vfs().store();
-            let mut store = store_arc.lock().unwrap();
-            // No identity at abort time: nothing is decrypted, so `materialize`
-            // records nothing — pass `None`, no cache to open or save
-            // (P33 Task 7 item 7).
-            worktree::materialize(
-                &self.layout,
-                &mut store,
-                snap.root,
-                decided,
-                &snap.protection,
-                None,
-                &self.sparse_spec()?,
-                None,
-            )?
-        };
-        self.remove_conflict_plaintext(snap.root)?;
+        let mut report = self.restore_over_stop(snap.root, &snap.protection, decided)?;
+        report.keep_all(self.remove_conflict_plaintext(snap.root)?);
         self.remove_conflict_sidecars(&[snap.root])?;
         self.remove_widen_residue(decided)?;
         crate::rebase_state::clear(&self.layout)?;
-        Ok(skipped)
+        Ok(report)
     }
 }
 
@@ -1717,7 +1688,6 @@ mod tests {
         assert_eq!(repo.head_tip().unwrap(), Some(main_tip));
 
         let before_x = std::fs::read(root.join("x.txt")).unwrap();
-        let before_stable = std::fs::read(root.join("stable.txt")).unwrap();
         let ops_before = repo.oplog().unwrap().len();
 
         let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
@@ -1731,7 +1701,10 @@ mod tests {
         std::fs::write(root.join("x.txt"), b"garbage\n").unwrap();
         std::fs::write(root.join("stable.txt"), b"also garbage\n").unwrap();
 
-        repo.cherry_pick_abort().unwrap();
+        let report = repo.cherry_pick_abort().unwrap();
+        // The pick never touched stable.txt, so the later edit is the user's
+        // (#255): kept and reported, where x.txt (conflicted) is restored.
+        assert_eq!(report.kept, vec!["stable.txt".to_string()]);
 
         assert!(!repo.pick_in_progress(), "state cleared");
         assert_eq!(repo.pick_head().unwrap(), None);
@@ -1753,8 +1726,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(root.join("stable.txt")).unwrap(),
-            before_stable,
-            "stable.txt byte-identical"
+            b"also garbage\n",
+            "an edit of an untouched file survives"
         );
         assert!(
             !root.join("new.txt").exists(),
@@ -3569,8 +3542,8 @@ mod tests {
         remove_root(&root);
     }
 
-    /// A record naming another stop's decided root is stale: nothing is
-    /// removed on its account.
+    /// A record naming another stop's decided root is stale: it is ignored and
+    /// cleared with the stop.
     #[test]
     fn a_stale_widen_record_is_ignored() {
         let (root, repo) = merge_stopped_with_an_ours_only_file("sparse-widen-stale");
@@ -3583,7 +3556,11 @@ mod tests {
         let stale = record.replacen(&decided.to_hex(), &ObjectId::of(b"other").to_hex(), 1);
         std::fs::write(repo.layout().sparse_widen_path(), stale).unwrap();
         repo.merge_abort().unwrap();
-        assert!(root.join("docs/mine.md").exists(), "not ours to remove");
+        // The record is ignored, but the file is an unchanged copy of a path
+        // the stop's decided tree tracks, so the byte rule removes it as it
+        // would any tracked out-of-view copy (#255). An edited one stays.
+        assert!(!root.join("docs/mine.md").exists());
+        assert!(!repo.layout().sparse_widen_path().exists());
         drop(repo);
         remove_root(&root);
     }
@@ -6321,7 +6298,7 @@ mod tests {
         let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
         assert!(matches!(err, Error::PickConflicts(_)), "got {err:?}");
 
-        let skipped = repo.cherry_pick_abort().unwrap();
+        let skipped = repo.cherry_pick_abort().unwrap().skipped;
         assert_eq!(
             skipped,
             vec!["secret/a.txt".to_string()],
@@ -6357,7 +6334,7 @@ mod tests {
         let outcome = repo.rebase("main", "me", None).unwrap();
         assert!(matches!(outcome, RebaseResult::Stopped { .. }));
 
-        let skipped = repo.rebase_abort().unwrap();
+        let skipped = repo.rebase_abort().unwrap().skipped;
         assert_eq!(
             skipped,
             vec!["secret/a.txt".to_string()],
@@ -6390,7 +6367,6 @@ mod tests {
         let original_tip = repo.head_tip().unwrap().unwrap();
 
         let before_x = std::fs::read(root.join("x.txt")).unwrap();
-        let before_stable = std::fs::read(root.join("stable.txt")).unwrap();
         let ops_before = repo.oplog().unwrap().len();
 
         let outcome = repo.rebase("main", "me", None).unwrap();
@@ -6401,7 +6377,9 @@ mod tests {
         std::fs::write(root.join("x.txt"), b"garbage\n").unwrap();
         std::fs::write(root.join("stable.txt"), b"also garbage\n").unwrap();
 
-        repo.rebase_abort().unwrap();
+        // stable.txt is untouched by the rebase: the later edit is the user's.
+        let report = repo.rebase_abort().unwrap();
+        assert_eq!(report.kept, vec!["stable.txt".to_string()]);
 
         assert!(!repo.rebase_in_progress(), "state cleared");
         assert!(repo.rebase_progress().unwrap().is_none());
@@ -6417,8 +6395,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(root.join("stable.txt")).unwrap(),
-            before_stable,
-            "stable.txt byte-identical"
+            b"also garbage\n",
+            "an edit of an untouched file survives"
         );
         assert_eq!(
             repo.oplog().unwrap().len(),

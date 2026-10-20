@@ -417,9 +417,11 @@ sidecar into the tree and left it on disk. Now:
   gets `PrivateNoAccess` before any write and the stop stays for someone who
   can finish it. It then restores the private tip through the same checkout
   path as `switch` (decrypting protected files the identity can read, skipping
-  the rest), removes every in-view path theirs' tree holds that the tip does not (as
-  the public abort does with theirs' root, so an untracked user file at such a
-  path goes too), removes the recorded sidecars unless the tip tracks that name, and clears the merge
+  the rest), removes the in-view paths theirs' tree holds that the tip does not and
+  that are the stop's own (a conflicted path, a recorded plaintext path, or a
+  file whose bytes still equal theirs' blob); any other file there is the
+  user's, is left, and is returned in `AbortReport::kept` (#255, ADR-0034
+  refinement 8), removes the recorded sidecars unless the tip tracks that name, and clears the merge
   state. The ref never moved and nothing was stored outside the sealed
   manifest, so there is nothing to undo at rest. It does not re-derive the
   three-way (that can fail for a recipient who cannot read a protected path
@@ -437,6 +439,16 @@ sidecar into the tree and left it on disk. Now:
 - **The stop refuses** a sidecar whose path either side tracks or that already
   exists on disk, before any write, since abort and completion would otherwise
   delete a file the user owns.
+
+A failed removal of such a file is an error, not ignored (#255). Limits: the
+private stop keeps no decided root and no record of the bytes it laid, so a
+conflicted path cannot be compared by content and counts as the stop's, and the
+restore writes the tip over every path the tip tracks: a post-stop edit of one
+(or a user file at a tip path the stop removed) is lost, unlike the public
+abort. Closing that needs the stop to record what it laid without putting
+content ids in unsealed state. The stop's removal of a prior-tip path the
+merge deleted now runs before any conflict output and surfaces its error. Out-of-view paths are never removed by
+`materialize_private` (#256).
 
 Pinned by `private_abort.rs` and `crates/cli/tests/merge_exit.rs`.
 

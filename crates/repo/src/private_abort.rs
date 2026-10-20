@@ -157,6 +157,24 @@ fn abort_after_a_text_conflict_restores_the_private_tip() {
 }
 
 #[test]
+fn abort_keeps_a_file_of_theirs_the_user_changed_after_the_stop() {
+    // `m.txt` is theirs' add, laid by the stop. The user's edit of it is not
+    // the stop's file any more, and abort says it left it (#255).
+    let f = fixture("kept", true, false, false);
+    assert!(matches!(
+        f.repo.merge_into_private("main", "alice", f.id()),
+        Err(Error::MergeConflicts(1))
+    ));
+    put(&f.root, "m.txt", b"mine\n");
+    let report = f.repo.merge_abort_with_identity(f.id()).unwrap();
+    f.assert_no_state();
+    assert_eq!(report.kept, vec!["m.txt".to_string()]);
+    assert_eq!(read(&f.root, "m.txt"), "mine\n");
+    assert_eq!(read(&f.root, "a.txt"), "private edit\n");
+    f.finish();
+}
+
+#[test]
 fn abort_after_a_binary_conflict_removes_the_sidecar() {
     let f = fixture("bin", false, true, false);
     let before = f.tip();

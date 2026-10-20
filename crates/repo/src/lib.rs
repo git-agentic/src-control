@@ -60,6 +60,8 @@ pub mod textdiff;
 pub mod tls_pins;
 pub mod transcripts;
 pub mod transport;
+#[cfg(test)]
+mod user_file_safety;
 pub mod walfmt;
 pub mod wire;
 pub mod workspace;
@@ -79,7 +81,7 @@ pub use promisor::{PackFilter, Promisor, Scope};
 pub use protect_ops::PrefixRecipient;
 pub use remote::{RemoteConfig, RemoteKind};
 pub use replay::{PickResult, RebaseResult};
-pub use repo::{Repo, Status};
+pub use repo::{AbortReport, Repo, Status};
 pub use rewrap::RewrapReport;
 pub use scanner::ScanReport;
 pub use secrets::SecretInfo;

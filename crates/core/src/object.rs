@@ -315,6 +315,26 @@ impl Object {
         Object::Blob(Arc::from(bytes.into().into_boxed_slice()))
     }
 
+    /// The id a blob with the bytes read from `reader` would have, computed
+    /// in fixed-size chunks so a big file is never held in memory. Equal to
+    /// `Object::blob(bytes).id()` (pinned by a test).
+    pub fn blob_id_of_reader(mut reader: impl std::io::Read) -> std::io::Result<ObjectId> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&[TAG_BLOB]);
+        let mut buf = [0_u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    hasher.update(&buf[..n]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(ObjectId::from_bytes(*hasher.finalize().as_bytes()))
+    }
+
     /// Bytes counted against the store's blob budget (0 for small resident
     /// kinds). Sealed payloads are blob-sized ciphertext and get the same
     /// budget/eviction treatment as plaintext blobs.
@@ -797,6 +817,14 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_id_of_reader_matches_the_blob_id() {
+        for bytes in [vec![], b"hello".to_vec(), vec![7_u8; 200_000]] {
+            let streamed = Object::blob_id_of_reader(&bytes[..]).unwrap();
+            assert_eq!(streamed, Object::blob(bytes).id());
+        }
+    }
 
     #[test]
     fn blob_roundtrip_and_dedup() {
