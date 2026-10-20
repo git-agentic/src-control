@@ -2999,7 +2999,7 @@ mod tests {
 
     /// With a file-exact view (`src/a.bin`) the sidecar `src/a.bin.theirs`
     /// does not match the spec, yet it sits beside an in-view conflict: the
-    /// stop must write it, and abort must remove it.
+    /// stop must write it, and abort and completion must remove it.
     #[test]
     fn a_binary_conflict_in_a_file_exact_view_writes_and_removes_its_sidecar() {
         let root = tmp_root("sparse-file-exact");
@@ -3025,6 +3025,18 @@ mod tests {
         assert!(root.join("src/a.bin.theirs").exists(), "sidecar written");
         repo.merge_abort().unwrap();
         assert!(!root.join("src/a.bin.theirs").exists(), "sidecar removed");
+        assert!(!root.join(".sc/CONFLICT_SIDECARS").exists());
+
+        // Completion: resolve, commit; the sidecar is in neither the tree nor
+        // the working tree.
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(1)
+        ));
+        std::fs::write(root.join("src/a.bin"), b"\xff\xferesolved\n").unwrap();
+        repo.commit("me", "merge").unwrap();
+        assert!(!repo.tracked_paths().unwrap().contains("src/a.bin.theirs"));
+        assert!(!root.join("src/a.bin.theirs").exists(), "scratch removed");
         assert!(!root.join(".sc/CONFLICT_SIDECARS").exists());
         drop(repo);
         remove_root(&root);

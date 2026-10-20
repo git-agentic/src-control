@@ -1789,9 +1789,11 @@ impl Repo {
     /// on tree ids inside `three_way`/replay and lands via the ordinary
     /// materialize skip-write path (P24 Task 3), no markers involved. The one
     /// clean change that does arrive is plaintext that must be sealed at
-    /// completion (`to_encrypt`) or a sidecar: both are written to disk, so
-    /// either one outside the view is refused up front too (#210), on full and
-    /// partial clones alike.
+    /// completion (`to_encrypt`) or a sidecar: both are written to disk.
+    /// A `to_encrypt` path outside the view is refused up front too (#210), on
+    /// every clone. A sidecar is refused only on a partial clone: on a full one
+    /// it sits beside an in-view conflicted path and is removed on completion
+    /// and abort, even when a file-exact spec does not match its name.
     pub(crate) fn materialize_conflict_state(
         &self,
         op: &str,
@@ -1835,7 +1837,7 @@ impl Repo {
         if let Some((path, ..)) = to_encrypt.iter().find(|(p, ..)| !sparse.matches(p)) {
             return Err(Error::InvalidArgument(format!(
                 "{op} has conflicts, and {path} (outside your sparse checkout) needs sealing at completion; \
-                 {widen} (on a partial clone `sc backfill --all` also works)"
+                 {widen}"
             )));
         }
         // A sidecar is `<conflicted path>.theirs`, and the conflicted path
