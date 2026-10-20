@@ -100,7 +100,8 @@ the `Authorization` header. `wire::serve` stays a thin wrapper delegating to
   the file when unset, so no-expiry stays the default and files written before this field
   existed load unchanged.
 - `sc serve token add --expires <duration|date>` takes `30m`/`12h`/`7d`/`2w` (relative to
-  now) or `YYYY-MM-DD` (00:00 UTC that day), and must be in the future.
+  now) or `YYYY-MM-DD` (00:00 UTC that day, so the token is not valid at any point during that date),
+  and must be in the future.
 - `verify` takes `now` as a parameter (tests inject it, nothing sleeps). A token is expired
   at `now >= expires_at`, and then behaves exactly like an unknown token: the same `401`,
   decided in the same constant-time loop.
@@ -112,3 +113,5 @@ the `Authorization` header. `wire::serve` stays a thin wrapper delegating to
   scope and the **absolute** `expires_at`, and prints the new value once. The old secret
   stops verifying immediately. Rotating an already-expired token is refused (it would mint
   a dead token); `remove` + `add --expires` is how to reset an expiry.
+- Expiry is checked once, when a connection opens. A transfer already in flight can outlive
+  its token until it finishes or hits `--timeout`.

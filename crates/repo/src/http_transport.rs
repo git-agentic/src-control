@@ -2055,6 +2055,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An expired token is the same 401 as an unknown one, on a token-justified
+    /// public bind and on the loopback default alike (the entry still counts as
+    /// a configured token, so auth stays on).
+    #[test]
+    fn expired_token_is_401_on_both_policies() {
+        let root = tmp_repo("expired-token");
+        let layout = crate::layout::Layout::at(&root);
+        let raw = crate::serve_tokens::add_expiring(
+            &layout,
+            "dead",
+            crate::serve_tokens::Scope::Rw,
+            Some(1),
+        )
+        .unwrap();
+        for mandatory in [true, false] {
+            let port = spawn_real_http_server_policy_auth(root.clone(), false, mandatory);
+            assert_eq!(
+                connect_raw_status(port, Some(&raw)),
+                401,
+                "mandatory={mandatory}"
+            );
+            assert_eq!(connect_raw_status(port, None), 401, "mandatory={mandatory}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A mandatory-auth listener (tokens are the sole justification for its
     /// public bind) answers 401 to everyone when its root holds no repo, not
     /// 404: an unauthenticated probe must not learn whether a repo is served.

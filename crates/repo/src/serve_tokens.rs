@@ -212,6 +212,10 @@ pub fn parse_expiry(spec: &str, now: u64) -> Result<u64> {
             "--expires '{spec}' is not in the future"
         )));
     }
+    // TOML integers are signed 64-bit; a larger value would write an unreadable file.
+    if i64::try_from(at).is_err() {
+        return Err(bad());
+    }
     Ok(at)
 }
 
@@ -407,6 +411,8 @@ mod tests {
             "2025-13-01",
             "2025-1-1",
             "99999999999999999999d",
+            "10000000000000000000s",
+            "9223372036854775808s",
         ] {
             assert!(parse_expiry(bad, 0).is_err(), "{bad}");
         }
