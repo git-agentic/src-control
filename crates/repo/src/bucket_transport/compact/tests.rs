@@ -1,4 +1,4 @@
-//! Compaction tests (#216, ADR-0055). Most run on an in-memory bucket (fast,
+//! Compaction tests (#216, ADR-0057). Most run on an in-memory bucket (fast,
 //! and lets a test fork a bucket or fake object ages); the full-run and the
 //! concurrency tests use `DirBucket`, the real backend behind `sc+wal://`.
 

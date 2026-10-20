@@ -107,7 +107,7 @@ confidentiality perimeter for public content, not the sc protocol.
 - The log grows unboundedly with no compaction yet — every open reader walks
   the full parent chain back from `head_seq`. Checkpoint folding (P36b) and
   bucket GC/compaction are deferred (see `ROADMAP.md`). *(Both are built:
-  P36b below, compaction and gc in ADR-0055.)*
+  P36b below, compaction and gc in ADR-0057.)*
 - `sc serve` still cannot host a bucket as its backing store (P36c) — a
   bucket remote today is written to directly by every `sc push`/`sc fetch`
   client, not brokered through a server process.
@@ -225,7 +225,7 @@ skip are unchanged. Rationale and cost in ADR-0038's #229 addendum.
 packs behind one manifest CAS, then deletes log entries, checkpoints and
 unreferenced packs that no reader or writer can still need. The design, the
 pruning cutoff, the reader and writer protocols and the residual limit live in
-ADR-0055. Effects on this ADR's contracts:
+ADR-0057. Effects on this ADR's contracts:
 
 - **No format change.** The manifest, log entry and checkpoint encodings and
   `PROTOCOL_VERSION` are untouched. Compaction writes a log entry with

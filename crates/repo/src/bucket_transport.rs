@@ -18,7 +18,7 @@ mod compact;
 pub use compact::{CompactOptions, CompactReport};
 
 /// How many times a read restarts from a fresh manifest after an object the
-/// view names has vanished (ADR-0055). Each restart needs the manifest to have
+/// view names has vanished (ADR-0057). Each restart needs the manifest to have
 /// moved, so a handful is plenty: one per compaction that lands mid-read.
 const MAX_RESTARTS: u32 = 8;
 
@@ -80,7 +80,7 @@ pub struct BucketTransport {
     /// pack body on each `get_pack`.
     leaf_cache: RefCell<BTreeMap<String, Vec<Leaf>>>,
     /// Set whenever a read finds an object the manifest chain names absent
-    /// (ADR-0055): the signal for `refresh`/`restarting` to re-read the
+    /// (ADR-0057): the signal for `refresh`/`restarting` to re-read the
     /// manifest and tell a compaction that moved on (restart) from a corrupt
     /// bucket (fail closed).
     saw_absent: Cell<bool>,
@@ -247,7 +247,7 @@ impl BucketTransport {
     /// replayed from `0` — then folding the tail entries on top (seq numbers
     /// are claims; the chain is the truth — off-chain entries are garbage).
     ///
-    /// A compaction (ADR-0055) can delete log entries, checkpoints or packs
+    /// A compaction (ADR-0057) can delete log entries, checkpoints or packs
     /// between reading the manifest and reading what it names. When that
     /// happens the manifest has necessarily moved on, so the read restarts from
     /// the new one; if the same manifest fails twice with a key absent, the
@@ -563,7 +563,7 @@ impl BucketTransport {
 
     /// Fail if a pack this push is about to commit has vanished from the bucket
     /// (a compaction swept it as an unreferenced orphan after an unusually long
-    /// gap, ADR-0055). Committing a log entry that names a deleted pack would
+    /// gap, ADR-0057). Committing a log entry that names a deleted pack would
     /// corrupt the remote; failing lets the caller retry the push, which
     /// re-uploads. Two HEADs per pending pack (read rights only: pushers need
     /// no list or delete rights).
@@ -630,7 +630,7 @@ impl BucketTransport {
             // best-effort by design (see the doc above) — and let every
             // reader keep doing the slower but correct full-tail walk back
             // to the last checkpoint that DID fit. Durable relief is
-            // `compact` (ADR-0055), which merges small packs so the pack
+            // `compact` (ADR-0057), which merges small packs so the pack
             // axis fits again. The ref axis is live state and is not relieved.
             return Ok(());
         }
@@ -713,7 +713,7 @@ impl Transport for BucketTransport {
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
-        filter: Option<&[String]>,
+        filter: Option<&crate::promisor::PackFilter>,
         out: &mut dyn Write,
     ) -> Result<()> {
         if filter.is_some() {
@@ -802,7 +802,7 @@ impl Transport for BucketTransport {
         // this function — success, failure, or the loop below — simply lets
         // `pending` go out of scope; the packs themselves stay uploaded in
         // the bucket regardless (content-addressed, inert orphan garbage if
-        // never referenced — correct per spec; `compact` sweeps it later, ADR-0055).
+        // never referenced — correct per spec; `compact` sweeps it later, ADR-0057).
         let pending: Vec<String> = std::mem::take(&mut *self.pending_packs.borrow_mut());
         const MAX_CAS_RETRIES: u32 = 16;
         for _ in 0..MAX_CAS_RETRIES {
@@ -1030,7 +1030,22 @@ mod tests {
         // filter is refused loudly, not ignored
         let filt = vec!["src/".to_string()];
         assert!(t
-            .get_pack(&[tip], &[], Some(&filt), &mut Vec::new())
+            .get_pack(
+                &[tip],
+                &[],
+                crate::promisor::PackFilter::new(&filt, None).as_ref(),
+                &mut Vec::new()
+            )
+            .is_err());
+        // ... and so is a size-only filter (ADR-0055): "filter active" is
+        // `prefixes || blob_limit`, not "prefixes non-empty".
+        assert!(t
+            .get_pack(
+                &[tip],
+                &[],
+                crate::promisor::PackFilter::new(&[], Some(1024)).as_ref(),
+                &mut Vec::new()
+            )
             .is_err());
         drop(t);
         std::fs::remove_dir_all(&broot).unwrap();

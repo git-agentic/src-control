@@ -94,12 +94,22 @@ impl TreeMergeDone {
     }
 }
 
+/// An object a pass could not read: where the traversal found it and whether
+/// it is a directory (so a gap error does not blame a blob-size limit for a
+/// missing tree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Need {
+    pub(crate) id: ObjectId,
+    pub(crate) path: String,
+    pub(crate) tree: bool,
+}
+
 /// The outcome of one [`merge_trees`] pass.
 #[derive(Debug)]
 pub(crate) enum TreeMerge {
     /// The pass needs these objects (subtrees or blobs the store lacks), each
     /// with the path at which the traversal found it. Fill them and call again.
-    Needs(Vec<(ObjectId, String)>),
+    Needs(Vec<Need>),
     Done(TreeMergeDone),
 }
 
@@ -110,14 +120,18 @@ struct Walk<'a> {
     acc: MergeAcc,
     carried: Vec<(String, TreeEntry)>,
     carried_root: Option<ObjectId>,
-    needs: Vec<(ObjectId, String)>,
+    needs: Vec<Need>,
     needs_seen: BTreeSet<ObjectId>,
 }
 
 impl Walk<'_> {
-    fn need(&mut self, id: ObjectId, path: &str) {
+    fn need(&mut self, id: ObjectId, path: &str, tree: bool) {
         if self.needs_seen.insert(id) {
-            self.needs.push((id, path.to_string()));
+            self.needs.push(Need {
+                id,
+                path: path.to_string(),
+                tree,
+            });
         }
     }
 
@@ -260,7 +274,7 @@ impl crate::repo::Repo {
 /// store whose index disagrees with itself.
 fn fill_loop(
     mut pass: impl FnMut() -> Result<TreeMerge>,
-    mut fill: impl FnMut(&[(ObjectId, String)]) -> Result<FillStats>,
+    mut fill: impl FnMut(&[Need]) -> Result<FillStats>,
 ) -> Result<(TreeMergeDone, FillStats)> {
     let mut stats = FillStats::default();
     let mut asked: BTreeSet<ObjectId> = BTreeSet::new();
@@ -269,13 +283,13 @@ fn fill_loop(
             TreeMerge::Done(done) => return Ok((done, stats)),
             TreeMerge::Needs(needs) => needs,
         };
-        if let Some((id, path)) = needs.iter().find(|(id, _)| asked.contains(id)) {
+        if let Some(Need { id, path, .. }) = needs.iter().find(|n| asked.contains(&n.id)) {
             return Err(Error::Protocol(format!(
                 "merge asked again for object {id} (at {path:?}) after it was fetched; \
                  the object store and its index disagree"
             )));
         }
-        asked.extend(needs.iter().map(|(id, _)| *id));
+        asked.extend(needs.iter().map(|n| n.id));
         let round = fill(&needs)?;
         stats.requests += round.requests;
         stats.objects += round.objects;
@@ -300,7 +314,7 @@ fn visit(store: &mut Store, w: &mut Walk, path: &str, ents: [Option<TreeEntry>; 
             Ok(()) => Ok(()),
             // A blob the leaf must read is absent: ask for it.
             Err(Error::Core(scl_core::Error::NotFound(id))) => {
-                w.need(id, path);
+                w.need(id, path, false);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -352,7 +366,7 @@ fn tree_node(
     let mut missing = false;
     for e in ents.iter().flatten() {
         if !store.contains(&e.id) {
-            w.need(e.id, path);
+            w.need(e.id, path, e.kind == EntryKind::Tree);
             missing = true;
         }
     }
@@ -411,7 +425,7 @@ fn enumerate_mixed(
         let [b, o, t] = [&maps[0], &maps[1], &maps[2]].map(|m| m.get(&p).copied());
         match merge_path(store, p.clone(), b, o, t, &w.prots, w.identity, &mut w.acc) {
             Ok(()) => {}
-            Err(Error::Core(scl_core::Error::NotFound(id))) => w.need(id, &p),
+            Err(Error::Core(scl_core::Error::NotFound(id))) => w.need(id, &p, false),
             Err(e) => return Err(e),
         }
     }
@@ -429,7 +443,7 @@ fn flatten_present(
     let mut stack = vec![(root, prefix.to_string())];
     while let Some((id, p)) = stack.pop() {
         if !store.contains(&id) {
-            w.need(id, &p);
+            w.need(id, &p, true);
             continue;
         }
         let tree = store.get_tree(&id)?;
@@ -903,7 +917,7 @@ mod tests {
                                 cov.needed_fill += 1;
                             }
                             assert!(!list.is_empty());
-                            for (id, path) in list {
+                            for Need { id, path, .. } in list {
                                 assert!(
                                     allowed.contains(&id),
                                     "seed {seed}: asked for {id} under a carried subtree"
@@ -1120,7 +1134,14 @@ mod tests {
         let d_ours = tree_at(&mut s, ours, "d").unwrap();
         s.delete(&d_ours).unwrap();
         match merge_trees(&mut s, Some((base, &p)), (ours, &p), (theirs, &p), None).unwrap() {
-            TreeMerge::Needs(n) => assert_eq!(n, vec![(d_ours, "d".to_string())]),
+            TreeMerge::Needs(n) => assert_eq!(
+                n,
+                vec![Need {
+                    id: d_ours,
+                    path: "d".to_string(),
+                    tree: true
+                }]
+            ),
             other => panic!("expected Needs, got {other:?}"),
         }
     }
@@ -1152,13 +1173,21 @@ mod tests {
         })
     }
 
+    fn blob_need(id: ObjectId, path: &str) -> Need {
+        Need {
+            id,
+            path: path.into(),
+            tree: false,
+        }
+    }
+
     #[test]
     fn fill_loop_fills_then_finishes_and_sums_the_cost() {
         let a = scl_core::Object::blob(b"a".to_vec()).id();
         let b = scl_core::Object::blob(b"b".to_vec()).id();
         let mut passes = vec![
-            TreeMerge::Needs(vec![(a, "x".into())]),
-            TreeMerge::Needs(vec![(b, "x/y".into())]),
+            TreeMerge::Needs(vec![blob_need(a, "x")]),
+            TreeMerge::Needs(vec![blob_need(b, "x/y")]),
             empty_done(),
         ]
         .into_iter();
@@ -1166,7 +1195,7 @@ mod tests {
         let (_, stats) = fill_loop(
             || Ok(passes.next().unwrap()),
             |needs| {
-                filled.extend(needs.iter().map(|(id, _)| *id));
+                filled.extend(needs.iter().map(|n| n.id));
                 Ok(FillStats {
                     requests: 1,
                     objects: needs.len(),
@@ -1191,7 +1220,7 @@ mod tests {
         let a = scl_core::Object::blob(b"a".to_vec()).id();
         let mut rounds = 0;
         let err = fill_loop(
-            || Ok(TreeMerge::Needs(vec![(a, "x".into())])),
+            || Ok(TreeMerge::Needs(vec![blob_need(a, "x")])),
             |_| {
                 rounds += 1;
                 Ok(FillStats::default())

@@ -1,6 +1,6 @@
 # ADR-0037: Partial clone (promisor store + prefix-scoped fetch)
 
-- **Status:** Accepted; the merge, replay and session refusals are lifted by [ADR-0049](0049-merge-on-partial-clones.md) and [ADR-0050](0050-sessions-on-partial-clones.md), and the filter-based walks replaced by [ADR-0048](0048-presence-based-partial-clones.md)
+- **Status:** Accepted; the merge, replay and session refusals are lifted by [ADR-0049](0049-merge-on-partial-clones.md) and [ADR-0050](0050-sessions-on-partial-clones.md), and the filter-based walks replaced by [ADR-0048](0048-presence-based-partial-clones.md); the blob-size axis it deferred is [ADR-0055](0055-blob-size-clone-filter.md)
 - **Date:** 2026-07-09
 - **Phase:** 27
 - **Builds on:** ADR-0034 (sparse checkout — the materialize half), ADR-0035 (streaming pack transfer), ADR-0015 (packfiles + reachability gc), ADR-0022/0036 (transports)
@@ -73,7 +73,10 @@ independent filters).
   (sparse-view into un-fetched gaps with no "one slice" mental model).
 - **Blob-size / object-count filters** (git's `--filter=blob:limit`):
   prefix-only matches sparse and the path-boundary machinery already
-  built; size filters are a separate axis, deferred.
+  built; size filters are a separate axis, deferred. *Since built:* the size
+  filter is [ADR-0055](0055-blob-size-clone-filter.md) (`--filter
+  blob:limit=<size>`, server-evaluated, `PROTOCOL_VERSION` 6); the object-count
+  limit stays deferred.
 
 ## Refinements discovered during the build
 

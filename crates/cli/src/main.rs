@@ -310,8 +310,13 @@ enum Cmd {
         git: bool,
         /// Partial clone (P27): only fetch objects under this path prefix
         /// (repeatable). Writes `.sc/promisor` + `.sc/sparse`; missing
-        /// objects can later be pulled in with `sc backfill`. Not supported
-        /// over a git-bridge remote.
+        /// objects can later be pulled in with `sc backfill`. Also accepts
+        /// `blob:limit=<size>` (bytes, or a KiB/MiB/GiB suffix; ADR-0055),
+        /// once: blobs of at least that size are left out unless a ref tip
+        /// reaches them, so old versions of large files stay on the server.
+        /// `blob:` is reserved (a prefix cannot start with it); `blob:limit=0`
+        /// leaves out every blob no tip reaches. Not supported over a
+        /// git-bridge remote.
         #[arg(long)]
         filter: Vec<String>,
         /// Mark the partial clone lazy (P37): `sc cat` may fetch the trees
@@ -830,7 +835,7 @@ enum RemoteOp {
     List,
     /// Compact a bucket remote (`sc+wal://`, `sc+s3://`): merge small packs,
     /// then delete log entries, checkpoints and packs no reader or writer can
-    /// still need (ADR-0055). Needs bucket list and delete rights.
+    /// still need (ADR-0057). Needs bucket list and delete rights.
     Compact {
         name: String,
         /// Plan and report; write and delete nothing.
@@ -3026,10 +3031,7 @@ fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
     // EXPECTED to be absent on a partial clone, never missing/corrupt — print
     // a count instead of treating them as a verify failure.
     if let Some(gaps) = repo.partial_gap_count(&[tip])? {
-        let prefixes = repo
-            .promisor()?
-            .map(|p| p.prefixes().join(", "))
-            .unwrap_or_default();
+        let prefixes = repo.promisor()?.map(|p| p.describe()).unwrap_or_default();
         print_line(&format!(
             "partial: {gaps} object(s) outside filter [{prefixes}]"
         ));
@@ -3786,19 +3788,20 @@ fn run_clone(
         return run_clone_git(&src, &dst);
     }
     let src = absolute_local_source(src);
-    let filter_opt = (!filter.is_empty()).then_some(filter.as_slice());
-    let repo = scl_repo::Repo::clone_url_opts(&src, &dst, filter_opt, no_transcripts)?;
+    let (prefixes, blob_limit) = scl_repo::promisor::parse_clone_filters(&filter)?;
+    let repo =
+        scl_repo::Repo::clone_url_limited(&src, &dst, &prefixes, blob_limit, no_transcripts)?;
     if lazy {
         scl_repo::promisor::set_lazy(repo.layout(), true)?;
     }
     let n = repo.branches()?.len();
-    if filter_opt.is_some() {
+    if let Some(promisor) = repo.promisor()? {
         println!(
             "cloned {} into {} ({} branch(es), partial: {})",
             src,
             dst.display(),
             n,
-            filter.join(", ")
+            promisor.describe()
         );
     } else {
         println!("cloned {} into {} ({} branch(es))", src, dst.display(), n);

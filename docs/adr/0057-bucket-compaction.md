@@ -1,4 +1,4 @@
-# ADR-0055: Bucket remote compaction and gc
+# ADR-0057: Bucket remote compaction and gc
 
 - **Status:** Accepted
 - **Date:** 2026-10-20

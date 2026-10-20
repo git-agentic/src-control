@@ -47,16 +47,19 @@ pub trait Transport {
     /// `filter`, when `Some`, narrows the sender's `wants`-side walk to the
     /// given path prefixes (P27 Task 3) — the wire form of a partial clone's
     /// `.sc/promisor` prefix list, matched with the same `/`-boundary
-    /// discipline as `Promisor::matches`/`should_descend`. The `haves`-side
-    /// walk is always unfiltered (the receiver's full closure is excluded
-    /// regardless of filter, since a filter only narrows what's sent, never
-    /// widens what's assumed already held). `filter = None` reproduces the
-    /// pre-P27 full-transfer behavior byte-for-byte.
+    /// discipline as `Promisor::matches`/`should_descend` — and/or leaves out
+    /// blobs of at least `blob_limit` bytes that no want's own root tree
+    /// reaches (ADR-0055; no prefixes means every path). A `PackFilter` exists
+    /// only when it is active, so `Some` always means a partial transfer. The
+    /// `haves`-side walk is always unfiltered (the receiver's full closure is
+    /// excluded regardless of filter, since a filter only narrows what's sent,
+    /// never widens what's assumed already held). `filter = None` reproduces
+    /// the pre-P27 full-transfer behavior byte-for-byte.
     fn get_pack(
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
-        filter: Option<&[String]>,
+        filter: Option<&crate::promisor::PackFilter>,
         out: &mut dyn Write,
     ) -> Result<()>;
 
@@ -250,14 +253,13 @@ impl LocalTransport {
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
-        filter: Option<&[String]>,
+        filter: Option<&crate::promisor::PackFilter>,
     ) -> Result<TempPackGuard> {
         use std::collections::BTreeSet;
         let mut store = self.store.borrow_mut();
         // Reachable-from-wants minus reachable-from-haves, computed on this
         // (the remote) store. `haves` the remote doesn't have are skipped.
-        let promisor_filter =
-            filter.map(|prefixes| crate::promisor::Promisor::new(String::new(), prefixes.to_vec()));
+        let promisor_filter = filter.map(|f| f.scope());
         // Filtered transfers exclude private branches entirely (ADR-0044):
         // a want that resolves to a branch manifest is dropped before the
         // walk. Serves both transports — the wire server's GetPack delegates
@@ -266,10 +268,11 @@ impl LocalTransport {
             crate::reachable::filter_manifest_wants(&mut *store, wants, promisor_filter.is_some())?;
         let mut want_set = match &promisor_filter {
             Some(pf) => {
-                crate::reachable::reachable_objects_filtered(
+                crate::reachable::reachable_objects_limited(
                     &mut *store,
                     &wants,
                     Some(pf as &dyn crate::reachable::PrefixFilter),
+                    filter.and_then(|f| f.blob_limit()),
                 )?
                 .included
             }
@@ -748,7 +751,7 @@ impl Transport for LocalTransport {
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
-        filter: Option<&[String]>,
+        filter: Option<&crate::promisor::PackFilter>,
         out: &mut dyn Write,
     ) -> Result<()> {
         let guard = self.build_pack_tempfile(wants, haves, filter)?;
@@ -1138,8 +1141,13 @@ mod tests {
             other => panic!("expected snapshot, got {other:?}"),
         };
         let mut pack = Vec::new();
-        t.get_pack(&[tip], &[], Some(&["src/".to_string()]), &mut pack)
-            .unwrap();
+        t.get_pack(
+            &[tip],
+            &[],
+            crate::promisor::PackFilter::new(&["src/".to_string()], None).as_ref(),
+            &mut pack,
+        )
+        .unwrap();
 
         let _ = crate::repo::Repo::init(&dst_root).unwrap();
         let t2 = LocalTransport::open(&dst_root).unwrap();

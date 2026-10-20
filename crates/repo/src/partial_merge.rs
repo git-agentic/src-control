@@ -859,7 +859,14 @@ fn an_interrupted_fill_changes_nothing_and_the_retry_succeeds() {
     // Round one by hand: fetch the docs trees of both sides, then lose the origin
     // before the blobs arrive.
     let docs = [&b1, &b2].map(|tip| dir_id(&fx.origin, tip, "docs"));
-    let needs: Vec<(ObjectId, String)> = docs.iter().map(|id| (*id, "docs".to_string())).collect();
+    let needs: Vec<crate::merge_tree::Need> = docs
+        .iter()
+        .map(|id| crate::merge_tree::Need {
+            id: *id,
+            path: "docs".to_string(),
+            tree: true,
+        })
+        .collect();
     clone.needs_filler().unwrap().fill(&needs).unwrap();
     assert!(docs.iter().all(|id| has(&clone, id)), "trees arrived");
     let gone = fx.origin_root.with_extension("gone");

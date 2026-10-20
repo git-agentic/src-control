@@ -1,4 +1,4 @@
-//! Bucket remote compaction and gc (#216, ADR-0055).
+//! Bucket remote compaction and gc (#216, ADR-0057).
 //!
 //! Two phases, each safe on its own. `consolidate` merges small live packs and
 //! commits the result with one manifest CAS (a no-op log entry plus a
@@ -121,7 +121,7 @@ fn plan_groups(
 }
 
 impl BucketTransport {
-    /// Compact this bucket remote (ADR-0055): merge small packs, then delete
+    /// Compact this bucket remote (ADR-0057): merge small packs, then delete
     /// log entries, checkpoints and packs no reader or writer can still need.
     /// Safe to run while others push and fetch; run one at a time (concurrent
     /// runs stay correct but waste work). Needs bucket list and delete rights.

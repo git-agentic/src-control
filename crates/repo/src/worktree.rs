@@ -734,21 +734,32 @@ pub(crate) fn preflight_view(
     let Some(promisor) = crate::promisor::load(layout)? else {
         return Ok(());
     };
-    let gap = |path: &str| {
-        let prefix = promisor
-            .prefixes()
-            .iter()
-            .find(|p| {
-                let bare = p.trim_end_matches('/');
-                path == bare || path.starts_with(&format!("{bare}/"))
-            })
-            .cloned()
-            // Outside the filter (a view widened past it): name the path
-            // itself, which `sc backfill` accepts as a prefix. For the root
-            // tree there is no path, so fall back to the first filter prefix.
-            .or_else(|| (!path.is_empty()).then(|| path.to_string()))
-            .or_else(|| promisor.prefixes().first().cloned())
-            .unwrap_or_default();
+    let gap = |path: &str, is_blob: bool| {
+        // With a blob limit `sc backfill` repairs a gap by its own path rather
+        // than a covering prefix (ADR-0055). The limit is named as a cause only
+        // for a missing file in the clone's scope: a missing directory, or a path
+        // outside the scope, was left out by a fetch or by the filter.
+        let sized = promisor
+            .blob_limit()
+            .filter(|_| is_blob && promisor.matches(path));
+        let prefix = if promisor.blob_limit().is_some() && !path.is_empty() {
+            path.to_string()
+        } else {
+            promisor
+                .prefixes()
+                .iter()
+                .find(|p| {
+                    let bare = p.trim_end_matches('/');
+                    path == bare || path.starts_with(&format!("{bare}/"))
+                })
+                .cloned()
+                // Outside the filter (a view widened past it): name the path
+                // itself, which `sc backfill` accepts as a prefix. For the root
+                // tree there is no path, so fall back to the first filter prefix.
+                .or_else(|| (!path.is_empty()).then(|| path.to_string()))
+                .or_else(|| promisor.prefixes().first().cloned())
+                .unwrap_or_default()
+        };
         Error::GapInView {
             path: if path.is_empty() {
                 "(root tree)".to_string()
@@ -756,10 +767,11 @@ pub(crate) fn preflight_view(
                 path.to_string()
             },
             prefix,
+            blob_limit: sized,
         }
     };
     if !store.contains(&root) {
-        return Err(gap(""));
+        return Err(gap("", false));
     }
     let mut stack = vec![(root, String::new())];
     while let Some((tree_id, path)) = stack.pop() {
@@ -773,13 +785,13 @@ pub(crate) fn preflight_view(
             match e.kind {
                 EntryKind::Blob => {
                     if sparse.matches(&child) && !store.contains(&e.id) {
-                        return Err(gap(&child));
+                        return Err(gap(&child, true));
                     }
                 }
                 EntryKind::Tree => {
                     if sparse.should_descend(&child) {
                         if !store.contains(&e.id) {
-                            return Err(gap(&child));
+                            return Err(gap(&child, false));
                         }
                         stack.push((e.id, child));
                     }

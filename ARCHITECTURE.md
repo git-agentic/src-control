@@ -338,7 +338,8 @@ phases but the shape is stable:
   `transcript-drops` — the derived set of dropped transcripts (`sc transcript
   drop`), rebuilt from the store on clone.
 - `sparse` — the local, uncommitted sparse-checkout prefix spec (P24);
-  `promisor` — a partial clone's fetch-filter + origin (P27).
+  `promisor` — a partial clone's fetch-filter + origin (P27);
+  `promisor-blob-limit` — its blob-size limit and whole-tree-or-prefix scope (ADR-0055).
 - `serve-tokens.toml` — bearer-token access control for `sc serve --http` (P29);
   tokens may carry an expiry and be rotated in place (`sc serve token add
   --expires` / `rotate`). `serve-tls/` — the auto-minted `sc+https://` server
@@ -1191,7 +1192,7 @@ the checkpoint and walks only the tail. P36c adds `sc serve --store <url>`: an
 identity and scratch space while all served content lives in the bucket, so
 instances are disposable. Public content sits in the bucket as plaintext at
 rest (the bucket ACL is the perimeter; sealed content stays ciphertext), and
-`sc clone --filter` is refused against a bucket remote. `sc remote compact` (ADR-0055, #216) merges small packs behind one manifest
+`sc clone --filter` is refused against a bucket remote. `sc remote compact` (ADR-0057, #216) merges small packs behind one manifest
 CAS, then deletes log entries, checkpoints and unreferenced packs behind a cutoff
 that has aged past `--prune-expire`; readers that find a named object gone
 re-read the manifest and restart, and there is no format change. A bucket keeps no signature or transcript
@@ -1235,6 +1236,24 @@ by id (`ensure_view`) before switch, fast-forward, undo and `sparse set`;
 `min(--max-pack-size, 2 GiB)` (the 2 GiB ceiling is twice the largest settable
 object cap; the client reads at most 4 GiB) and split when refused. `sc export` and `sparse
 disable` stay refused on a partial clone. See ADR-0048.
+
+## Phase 27 follow-on — blob-size clone filter (built)
+
+`sc clone --filter blob:limit=<size>` (alone or with prefixes) leaves out blobs
+of at least `<size>` bytes that no ref tip's root tree reaches. Only the server
+knows a blob's size before sending it (tree entries carry none), so
+`GetPack` gained a trailing optional `blob_limit` and `PROTOCOL_VERSION` is 6.
+The sender's walk, `reachable_objects_limited`, walks every want's own tree
+first (every ref tip stays complete, so the initial checkout is whole), then
+moves over-limit blobs reached only through history from `included` to `gaps`,
+measuring each distinct blob once with `Store::blob_size`. The client side adds
+nothing to the gap model: absence is the gap (37b). `.sc/promisor-blob-limit`
+records the limit and an explicit `AllPaths`/`Prefixes` scope (a size-only clone
+is `AllPaths`, with a full sparse view); `PackFilter` is the single definition of
+a filtered transfer (a prefix or a limit). A lazy size-only clone fills a gapped
+revision by id even though its view is full; otherwise the gap error names the
+file and `sc backfill <path>` repairs it. `sc fetch` is unfiltered, and the
+object-count limit is deferred. See ADR-0055.
 
 ## Phase 37c — merge, cherry-pick and rebase on a partial clone (built)
 

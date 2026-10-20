@@ -28,8 +28,13 @@ use crate::error::{Error, Result};
 /// Bumped 4 -> 5 in P37 (ADR-0047): the additive `GetObjects` verb (batched
 /// by-id object fetch) — a v4 server would answer its opcode with an
 /// "unknown opcode" protocol error mid-session, so the mismatch is refused at
-/// the handshake instead.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// the handshake instead. Bumped 5 -> 6 in ADR-0055: `Request::GetPack` gains a
+/// trailing optional `blob_limit` (the `--filter blob:limit=<size>` clone
+/// filter, evaluated by the server because only it knows a blob's size). A v5
+/// peer would reject the longer frame as trailing bytes, or worse, a v6 limit
+/// riding in the prefix list would read as a path, so the mismatch is refused
+/// at the handshake in both directions instead.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 // Request opcodes (one per Transport verb, plus session control).
 const OP_HELLO: u8 = 0x01;
@@ -133,12 +138,16 @@ pub enum Request {
         id: ObjectId,
         expected_old: Option<ObjectId>,
     },
-    /// `filter`: partial-clone prefix list (P27 Task 3), empty = no filter
-    /// (full transfer, matching pre-P27 behavior byte-for-byte).
+    /// `filter`: partial-clone prefix list (P27 Task 3), empty = no prefix
+    /// filter. `blob_limit` (ADR-0055): leave out blobs of at least that many
+    /// bytes that no want's own root tree reaches. The transfer is filtered
+    /// when `filter` is non-empty or `blob_limit` is set; with neither it is a
+    /// full transfer, matching pre-P27 behavior byte-for-byte.
     GetPack {
         wants: Vec<ObjectId>,
         haves: Vec<ObjectId>,
         filter: Vec<String>,
+        blob_limit: Option<u64>,
     },
     /// Marker only (P25) — the pack body is no longer embedded in this
     /// request's frame. Immediately after this request frame, the sender
@@ -217,6 +226,9 @@ impl<'a> Cur<'a> {
     }
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn id(&mut self) -> Result<ObjectId> {
         Ok(ObjectId::from_bytes(self.take(32)?.try_into().unwrap()))
@@ -319,11 +331,19 @@ impl Request {
                 wants,
                 haves,
                 filter,
+                blob_limit,
             } => {
                 out.push(OP_GET_PACK);
                 put_ids(&mut out, wants);
                 put_ids(&mut out, haves);
                 put_strs(&mut out, filter);
+                match blob_limit {
+                    Some(limit) => {
+                        out.push(1);
+                        out.extend_from_slice(&limit.to_be_bytes());
+                    }
+                    None => out.push(0),
+                }
             }
             Request::PutPack => out.push(OP_PUT_PACK),
             Request::GetObjects { ids } => {
@@ -366,6 +386,11 @@ impl Request {
                 wants: c.ids()?,
                 haves: c.ids()?,
                 filter: c.strs()?,
+                blob_limit: match c.u8()? {
+                    0 => None,
+                    1 => Some(c.u64()?),
+                    t => return Err(Error::Protocol(format!("bad blob_limit tag {t}"))),
+                },
             },
             OP_PUT_PACK => Request::PutPack,
             OP_GET_OBJECTS => Request::GetObjects {
@@ -1012,7 +1037,7 @@ fn bucket_get_pack_tempfile(
     tmp_dir: &std::path::Path,
     wants: &[ObjectId],
     haves: &[ObjectId],
-    filter: Option<&[String]>,
+    filter: Option<&crate::promisor::PackFilter>,
 ) -> Result<TempPackGuard> {
     let guard = TempPackGuard::new_in(tmp_dir)?;
     let mut f = std::fs::File::create(guard.path())?;
@@ -1211,16 +1236,15 @@ fn serve_session(
                 wants,
                 haves,
                 filter,
+                blob_limit,
             } => {
-                let filter_opt = if filter.is_empty() {
-                    None
-                } else {
-                    Some(filter.as_slice())
-                };
+                let filter_opt = crate::promisor::PackFilter::new(&filter, blob_limit);
                 let result = match &transport {
-                    ServeTransport::Local(t) => t.build_pack_tempfile(&wants, &haves, filter_opt),
+                    ServeTransport::Local(t) => {
+                        t.build_pack_tempfile(&wants, &haves, filter_opt.as_ref())
+                    }
                     ServeTransport::Bucket { transport: bt, tmp } => {
-                        bucket_get_pack_tempfile(bt, &tmp.0, &wants, &haves, filter_opt)
+                        bucket_get_pack_tempfile(bt, &tmp.0, &wants, &haves, filter_opt.as_ref())
                     }
                 };
                 match result {
@@ -1529,16 +1553,37 @@ mod tests {
                 wants: vec![some_id(7)],
                 haves: vec![some_id(8), some_id(9)],
                 filter: vec![],
+                blob_limit: None,
             },
             Request::GetPack {
                 wants: vec![some_id(7)],
                 haves: vec![],
                 filter: vec!["src/".to_string(), "docs/".to_string()],
+                blob_limit: None,
             },
             Request::GetPack {
                 wants: vec![],
                 haves: vec![],
                 filter: vec![],
+                blob_limit: None,
+            },
+            Request::GetPack {
+                wants: vec![some_id(7)],
+                haves: vec![],
+                filter: vec!["src/".to_string()],
+                blob_limit: Some(1 << 20),
+            },
+            Request::GetPack {
+                wants: vec![some_id(7)],
+                haves: vec![],
+                filter: vec![],
+                blob_limit: Some(0),
+            },
+            Request::GetPack {
+                wants: vec![],
+                haves: vec![],
+                filter: vec![],
+                blob_limit: Some(u64::MAX),
             },
             Request::PutPack,
             Request::GetObjects { ids: vec![] },
@@ -1849,6 +1894,93 @@ mod tests {
         assert!(matches!(no_hello[0], Err(Error::Protocol(_))));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// ADR-0055: a v5 client (no `blob_limit` field) is refused at the
+    /// handshake with a message naming both versions, so it never sends a
+    /// `GetPack` the v6 decoder would misparse.
+    #[test]
+    fn serve_rejects_a_v5_client_naming_both_versions() {
+        let root = tmp_repo("v5client");
+        let r = run_session(&root, &[Request::Hello { version: 5 }]);
+        match &r[0] {
+            Err(Error::Protocol(m)) => assert_eq!(
+                m, "unsupported protocol version 5 (server speaks 6)",
+                "got {m}"
+            ),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// ADR-0055, the other direction: a v6 client against a v5 server sees the
+    /// v5 server's own refusal (its `handshake_hello` text with its version),
+    /// and no `GetPack` is ever sent.
+    #[test]
+    fn a_v6_client_reports_a_v5_servers_refusal() {
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server = std::thread::spawn(move || {
+            let f = read_frame(&mut server_read).unwrap();
+            assert!(matches!(
+                Request::decode(&f).unwrap(),
+                Request::Hello { version: 6 }
+            ));
+            write_err(
+                &mut server_write,
+                EC_PROTOCOL,
+                "unsupported protocol version 6 (server speaks 5)",
+            )
+            .unwrap();
+        });
+        let Err(err) = crate::stdio_transport::WireClient::handshake(client_read, client_write)
+        else {
+            panic!("the handshake must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "wire protocol error: unsupported protocol version 6 (server speaks 5)"
+        );
+        server.join().unwrap();
+    }
+
+    /// The trailing `blob_limit` tag is strict: an unknown tag or a truncated
+    /// limit is a protocol error, not a silently unfiltered pack.
+    #[test]
+    fn get_pack_decode_rejects_a_bad_blob_limit_tag() {
+        let mut ok = Request::GetPack {
+            wants: vec![],
+            haves: vec![],
+            filter: vec![],
+            blob_limit: Some(7),
+        }
+        .encode();
+        assert!(Request::decode(&ok).is_ok());
+        let tag_at = ok.len() - 9;
+        ok[tag_at] = 9;
+        assert!(matches!(Request::decode(&ok), Err(Error::Protocol(_))));
+        let mut truncated = Request::GetPack {
+            wants: vec![],
+            haves: vec![],
+            filter: vec![],
+            blob_limit: Some(7),
+        }
+        .encode();
+        truncated.pop();
+        assert!(matches!(
+            Request::decode(&truncated),
+            Err(Error::Protocol(_))
+        ));
+        // A v5 frame (no trailing field) no longer decodes.
+        let mut v5 = Request::GetPack {
+            wants: vec![],
+            haves: vec![],
+            filter: vec![],
+            blob_limit: None,
+        }
+        .encode();
+        v5.pop();
+        assert!(matches!(Request::decode(&v5), Err(Error::Protocol(_))));
     }
 
     #[test]
@@ -2953,6 +3085,22 @@ mod tests {
         assert!(!out.is_empty());
         let got = scl_core::pack::parse_pack(&out).unwrap();
         assert_eq!(got.len(), objects.len());
+
+        // A served `--store` bucket refuses a partial transfer of either kind
+        // (ADR-0046, ADR-0055 B2): a size-only request is "filtered" too.
+        for filter in [
+            crate::promisor::PackFilter::new(&["src/".to_string()], None),
+            crate::promisor::PackFilter::new(&[], Some(1024)),
+        ] {
+            let err = client
+                .get_pack(&[tip], &[], filter.as_ref(), &mut Vec::new())
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("partial clone from bucket remotes"),
+                "{err}"
+            );
+        }
 
         // PutPack + UpdateRef land a second commit through the same session.
         let (tip2, objects2) = tiny_history_for_bucket("seed2", b"second commit");

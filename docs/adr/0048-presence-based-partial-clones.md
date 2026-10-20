@@ -1,6 +1,6 @@
 # ADR-0048: Presence-based walks for partial clones (P37b)
 
-- **Status:** Accepted (built)
+- **Status:** Accepted (built); [ADR-0055](0055-blob-size-clone-filter.md) adds a second kind of gap (a blob left out by size) that these presence-based walks cover unchanged
 - **Date:** 2026-10-16
 - **Phase:** 37b
 - **Builds on:** ADR-0047 (want-by-id fetch, 37a), ADR-0037 (partial clone), ADR-0034 (sparse), ADR-0035 (streaming transfer), ADR-0039/0041 (size limits)
@@ -332,6 +332,19 @@ review established, as constraints on that work:
   through the export walk at the first absent object. 37b-i adds the same
   up-front refusal that `sc export` has.
 
+## Addendum: a blob left out by size (ADR-0055)
+
+`sc clone --filter blob:limit=<size>` leaves out blobs by size rather than by
+path, and the model above covers it without a new record: the gap is an absent
+blob a present tree references, the promise P is unchanged, and push, verify and
+gc already ask the store. What changes: the filter now has a second dimension,
+`.sc/promisor-blob-limit` records it and an explicit `Scope` (a size-only clone
+is `AllPaths`, which an empty prefix list could not say), "filter active" means
+`prefixes || blob_limit` everywhere, and a full sparse view must still fill on a
+lazy `AllPaths` clone (`ensure_view`). Every ref tip is complete at clone time;
+a later fetch can bring a tip that points at a gapped blob, which is the
+`GapInView` case above with the limit named in its message.
+
 ## Phasing
 
 - **37b-i, engine (built).** `reachable_objects_partial`; gc, push and verify on it;
@@ -410,6 +423,7 @@ review established, as constraints on that work:
   the fetch and the record, and nothing it proves that the push-time check does
   not.
 - **Make `reachable_objects_filtered` presence-aware for everyone.** The origin
-  uses it to cut transfers.
+  uses it to cut transfers. (ADR-0055 extends that same walk with a blob-size
+  rule and every-tip exemption, `reachable_objects_limited`, still server-side.)
 - **A tree-recursive merge by id in this ADR.** Withdrawn; see decision 6.
 - **Server-side merge and history operations.** Still deferred (ROADMAP).

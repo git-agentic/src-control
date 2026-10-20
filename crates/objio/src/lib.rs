@@ -34,7 +34,7 @@ pub enum Fetched {
     New { bytes: Vec<u8>, tag: String },
 }
 
-/// A listed key with the metadata compaction needs (ADR-0055).
+/// A listed key with the metadata compaction needs (ADR-0057).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
     pub key: String,
@@ -45,7 +45,7 @@ pub struct ObjectMeta {
 
 /// A flat key/value object store with the three primitives the WAL needs:
 /// conditional read, create-if-absent, and compare-and-swap overwrite; plus
-/// the metadata listing and delete that compaction (ADR-0055) adds.
+/// the metadata listing and delete that compaction (ADR-0057) adds.
 pub trait Bucket: Send {
     /// Conditional read. `cached_tag` matching the current value returns
     /// [`Fetched::Unchanged`] without transferring bytes.
