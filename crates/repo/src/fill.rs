@@ -157,8 +157,11 @@ impl Repo {
         offline: bool,
     ) -> Result<FillStats> {
         // An empty spec is a full checkout: never fill the whole tree on a
-        // partial clone's behalf (the preflight reports the gap instead).
-        if sparse.is_full() {
+        // partial clone's behalf (the preflight reports the gap instead). A
+        // size-only clone (ADR-0055) is the exception: its view is always full
+        // and what is missing under one root is exactly the large old blobs
+        // the operation needs, so the fill is bounded by that one revision.
+        if sparse.is_full() && !self.promisor()?.is_some_and(|p| p.is_all_paths()) {
             return Ok(FillStats::default());
         }
         let mut filler = Filler::new(self, offline)?;
@@ -345,10 +348,9 @@ impl<'a> Filler<'a> {
             return Ok(());
         }
         let Some(origin) = self.origin.clone() else {
-            return Err(if self.repo.promisor()?.is_some() {
-                crate::promisor::partial_gap_hint(path)
-            } else {
-                Error::Core(scl_core::Error::NotFound(*id))
+            return Err(match self.repo.promisor()? {
+                Some(p) => crate::promisor::gap_error(Some(&p), path),
+                None => Error::Core(scl_core::Error::NotFound(*id)),
             });
         };
         if self.transport.is_none() {
@@ -377,10 +379,9 @@ impl<'a> Filler<'a> {
             return Ok(());
         };
         let Some(origin) = self.origin.clone() else {
-            return Err(if self.repo.promisor()?.is_some() {
-                crate::promisor::partial_gap_hint(path)
-            } else {
-                Error::Core(scl_core::Error::NotFound(*first))
+            return Err(match self.repo.promisor()? {
+                Some(p) => crate::promisor::gap_error(Some(&p), path),
+                None => Error::Core(scl_core::Error::NotFound(*first)),
             });
         };
         if self.transport.is_none() {
@@ -759,7 +760,7 @@ mod tests {
             &self,
             _: &[ObjectId],
             _: &[ObjectId],
-            _: Option<&[String]>,
+            _: Option<&crate::promisor::PackFilter>,
             _: &mut dyn Write,
         ) -> Result<()> {
             unimplemented!()
@@ -866,7 +867,7 @@ mod tests {
             &self,
             w: &[ObjectId],
             h: &[ObjectId],
-            f: Option<&[String]>,
+            f: Option<&crate::promisor::PackFilter>,
             out: &mut dyn Write,
         ) -> Result<()> {
             self.inner.get_pack(w, h, f, out)
@@ -951,7 +952,7 @@ mod tests {
             &self,
             _: &[ObjectId],
             _: &[ObjectId],
-            _: Option<&[String]>,
+            _: Option<&crate::promisor::PackFilter>,
             _: &mut dyn Write,
         ) -> Result<()> {
             unimplemented!()

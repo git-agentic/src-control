@@ -608,7 +608,7 @@ impl Transport for BucketTransport {
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
-        filter: Option<&[String]>,
+        filter: Option<&crate::promisor::PackFilter>,
         out: &mut dyn Write,
     ) -> Result<()> {
         if filter.is_some() {
@@ -922,7 +922,22 @@ mod tests {
         // filter is refused loudly, not ignored
         let filt = vec!["src/".to_string()];
         assert!(t
-            .get_pack(&[tip], &[], Some(&filt), &mut Vec::new())
+            .get_pack(
+                &[tip],
+                &[],
+                crate::promisor::PackFilter::new(&filt, None).as_ref(),
+                &mut Vec::new()
+            )
+            .is_err());
+        // ... and so is a size-only filter (ADR-0055): "filter active" is
+        // `prefixes || blob_limit`, not "prefixes non-empty".
+        assert!(t
+            .get_pack(
+                &[tip],
+                &[],
+                crate::promisor::PackFilter::new(&[], Some(1024)).as_ref(),
+                &mut Vec::new()
+            )
             .is_err());
         drop(t);
         std::fs::remove_dir_all(&broot).unwrap();

@@ -735,20 +735,26 @@ pub(crate) fn preflight_view(
         return Ok(());
     };
     let gap = |path: &str| {
-        let prefix = promisor
-            .prefixes()
-            .iter()
-            .find(|p| {
-                let bare = p.trim_end_matches('/');
-                path == bare || path.starts_with(&format!("{bare}/"))
-            })
-            .cloned()
-            // Outside the filter (a view widened past it): name the path
-            // itself, which `sc backfill` accepts as a prefix. For the root
-            // tree there is no path, so fall back to the first filter prefix.
-            .or_else(|| (!path.is_empty()).then(|| path.to_string()))
-            .or_else(|| promisor.prefixes().first().cloned())
-            .unwrap_or_default();
+        // With a blob limit the missing object is a file, and `sc backfill`
+        // repairs it by its own path rather than a covering prefix (ADR-0055).
+        let prefix = if promisor.blob_limit().is_some() && !path.is_empty() {
+            path.to_string()
+        } else {
+            promisor
+                .prefixes()
+                .iter()
+                .find(|p| {
+                    let bare = p.trim_end_matches('/');
+                    path == bare || path.starts_with(&format!("{bare}/"))
+                })
+                .cloned()
+                // Outside the filter (a view widened past it): name the path
+                // itself, which `sc backfill` accepts as a prefix. For the root
+                // tree there is no path, so fall back to the first filter prefix.
+                .or_else(|| (!path.is_empty()).then(|| path.to_string()))
+                .or_else(|| promisor.prefixes().first().cloned())
+                .unwrap_or_default()
+        };
         Error::GapInView {
             path: if path.is_empty() {
                 "(root tree)".to_string()
@@ -756,6 +762,7 @@ pub(crate) fn preflight_view(
                 path.to_string()
             },
             prefix,
+            blob_limit: promisor.blob_limit(),
         }
     };
     if !store.contains(&root) {

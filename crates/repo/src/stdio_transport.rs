@@ -160,7 +160,7 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
-        filter: Option<&[String]>,
+        filter: Option<&crate::promisor::PackFilter>,
         out: &mut dyn Write,
     ) -> Result<()> {
         let mut rw = self.rw.borrow_mut();
@@ -169,7 +169,8 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
             &Request::GetPack {
                 wants: wants.to_vec(),
                 haves: haves.to_vec(),
-                filter: filter.map(|f| f.to_vec()).unwrap_or_default(),
+                filter: filter.map(|f| f.prefixes().to_vec()).unwrap_or_default(),
+                blob_limit: filter.and_then(|f| f.blob_limit()),
             }
             .encode(),
         )?;
@@ -346,7 +347,7 @@ impl Transport for StdioTransport {
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
-        filter: Option<&[String]>,
+        filter: Option<&crate::promisor::PackFilter>,
         out: &mut dyn Write,
     ) -> Result<()> {
         self.client.get_pack(wants, haves, filter, out)
@@ -655,7 +656,12 @@ mod tests {
 
         let mut pack = Vec::new();
         client
-            .get_pack(&[tip], &[], Some(&["src/".to_string()]), &mut pack)
+            .get_pack(
+                &[tip],
+                &[],
+                crate::promisor::PackFilter::new(&["src/".to_string()], None).as_ref(),
+                &mut pack,
+            )
             .unwrap();
         let ids: Vec<_> = scl_core::pack::parse_pack(&pack)
             .unwrap()
@@ -693,21 +699,28 @@ mod tests {
     }
 
     #[test]
-    fn handshake_rejects_v4_peer() {
-        // P37 bumped PROTOCOL_VERSION 4 -> 5 for the additive `GetObjects`
-        // verb: a v4 server cannot decode it, so refuse at the handshake.
+    fn handshake_rejects_v5_peer() {
+        // ADR-0055 bumped PROTOCOL_VERSION 5 -> 6: `GetPack` gained the
+        // trailing `blob_limit`, so a v5 server cannot decode it. Refuse at
+        // the handshake and name both versions.
         let (client_read, mut server_write) = std::io::pipe().unwrap();
         let (mut server_read, client_write) = std::io::pipe().unwrap();
         let server = std::thread::spawn(move || {
             let f = wire::read_frame(&mut server_read).unwrap();
             assert!(matches!(
                 wire::Request::decode(&f).unwrap(),
-                wire::Request::Hello { version: 5 }
+                wire::Request::Hello { version: 6 }
             ));
-            wire::write_ok(&mut server_write, &wire::u32_body(4)).unwrap();
+            wire::write_ok(&mut server_write, &wire::u32_body(5)).unwrap();
         });
         let err = WireClient::handshake(client_read, client_write).unwrap_err();
-        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+        match &err {
+            Error::Protocol(m) => assert_eq!(
+                m, "server speaks protocol 5, this client speaks 6",
+                "got {m}"
+            ),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
         server.join().unwrap();
     }
 
@@ -1002,6 +1015,7 @@ mod tests {
                 wants: vec![tip],
                 haves: vec![],
                 filter: vec![],
+                blob_limit: None,
             }
             .encode(),
         )

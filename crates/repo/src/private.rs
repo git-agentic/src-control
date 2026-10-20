@@ -2545,6 +2545,44 @@ mod tests {
         std::fs::remove_dir_all(&part_dst).unwrap();
     }
 
+    /// ADR-0055 B2: "filter active" is `prefixes || blob_limit`, so a clone
+    /// whose only filter is a size limit also leaves the private ref out.
+    #[test]
+    fn size_only_clone_excludes_private_branches() {
+        let (root, repo, (alice_sk, _), _bob) = setup("clonesize");
+        repo.branch_private("fix", &alice_sk, &[], &[]).unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        write(&root, "src/private.rs", "sealed\n");
+        repo.commit_private("alice", "c1", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        drop(repo);
+
+        let part_dst = tmp_root("clonesize-part");
+        let part = Repo::clone_url_limited(
+            &root.display().to_string(),
+            &part_dst,
+            &[],
+            Some(1024),
+            false,
+        )
+        .unwrap();
+        let names: Vec<String> = part
+            .branches()
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            !names.contains(&"fix".to_string()),
+            "a size-only clone must exclude private refs: {names:?}"
+        );
+        assert!(names.contains(&"main".to_string()));
+        drop(part);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&part_dst).unwrap();
+    }
+
     #[test]
     fn wire_pack_for_a_private_branch_carries_ciphertext_only() {
         let (root, repo, (alice_sk, _), _bob) = setup("wire");

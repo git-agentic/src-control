@@ -2,7 +2,7 @@
 //! snapshot tips. Parameterized by an `ObjectSource` so it walks either the
 //! local `Store` (push) or a remote `Transport` (clone/fetch). Reused by P8 gc.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use scl_core::{EntryKind, Object, ObjectId, Store};
 
@@ -12,11 +12,27 @@ use crate::transport::Transport;
 /// Minimal read access the walk needs: fetch a decoded object by id.
 pub trait ObjectSource {
     fn get(&mut self, id: &ObjectId) -> Result<Object>;
+
+    /// Byte length of the blob `id`. The default loads the object; a source
+    /// that can measure without admitting the blob to a cache overrides it.
+    fn blob_size(&mut self, id: &ObjectId) -> Result<u64> {
+        Ok(match self.get(id)? {
+            Object::Blob(b) => b.len() as u64,
+            _ => return Err(Error::Core(scl_core::Error::WrongKind(*id, "blob"))),
+        })
+    }
 }
 
 impl ObjectSource for Store {
     fn get(&mut self, id: &ObjectId) -> Result<Object> {
         Ok(Store::get(self, id)?)
+    }
+
+    /// Streams the payload through a fixed buffer and checks its hash, so
+    /// measuring a large blob neither fills the object cache nor trusts
+    /// unverified bytes (ADR-0055).
+    fn blob_size(&mut self, id: &ObjectId) -> Result<u64> {
+        Ok(Store::blob_size(self, id)? as u64)
     }
 }
 
@@ -122,7 +138,34 @@ pub fn reachable_objects_filtered(
     tips: &[ObjectId],
     filter: Option<&dyn PrefixFilter>,
 ) -> Result<Reachable> {
+    reachable_objects_limited(src, tips, filter, None)
+}
+
+/// [`reachable_objects_filtered`] plus the blob-size limit (ADR-0055). With
+/// `blob_limit = Some(n)`, a blob of at least `n` bytes goes to `gaps` instead
+/// of `included`, unless it is reachable from the root tree of one of `tips`
+/// (the wants): every tip is complete, so the limit only prunes blobs that are
+/// reachable through parent snapshots alone. `blob_limit` needs a `filter` to
+/// say which paths are in scope (use an all-paths one for a size-only walk).
+/// With `None` this is `reachable_objects_filtered` exactly.
+///
+/// Ordering: `walk_snapshots` queues every tip before any parent, so a tip's
+/// exempt walk always runs before a non-tip snapshot's limited one, even when
+/// one tip is an ancestor of another. The `(id, path)` expansion gate then only
+/// ever lets a limited walk skip work an exempt walk already did (a superset),
+/// never the reverse; and a tip root tree that equals an older subtree is still
+/// expanded at its own `(root, "")` key.
+pub fn reachable_objects_limited(
+    src: &mut impl ObjectSource,
+    tips: &[ObjectId],
+    filter: Option<&dyn PrefixFilter>,
+    blob_limit: Option<u64>,
+) -> Result<Reachable> {
     let mut gaps = BTreeSet::new();
+    let tip_set: HashSet<ObjectId> = tips.iter().copied().collect();
+    // Size verdicts by blob id: a blob shared by many paths or versions is
+    // measured once per request (ADR-0055).
+    let mut sizes: HashMap<ObjectId, bool> = HashMap::new();
     // (id, path) pairs already pushed for expansion, under a filter only.
     // Hoisted to span EVERY snapshot's walk in this call (not just one), so
     // a later snapshot whose ROOT tree dedups to an already-expanded
@@ -131,8 +174,21 @@ pub fn reachable_objects_filtered(
     // comment for why a bare-id gate on the root is wrong under a filter
     // (C1, P27 final review).
     let mut expanded: HashSet<(ObjectId, String)> = HashSet::new();
-    let mut included = walk_snapshots(src, tips, |src, _snapshot, root, included| {
-        walk_tree_filtered(src, root, included, &mut gaps, filter, &mut expanded)
+    let mut included = walk_snapshots(src, tips, |src, snapshot, root, included| {
+        let mut gate = blob_limit.map(|limit| SizeGate {
+            limit,
+            exempt: tip_set.contains(&snapshot),
+            verdicts: &mut sizes,
+        });
+        walk_tree_sized(
+            src,
+            root,
+            included,
+            &mut gaps,
+            filter,
+            &mut expanded,
+            gate.as_mut(),
+        )
     })?;
     // A byte-identical subtree can be gapped at one path and included at
     // another (same id, different filter verdict per path) — included
@@ -364,6 +420,41 @@ fn walk_tree_filtered(
     filter: Option<&dyn PrefixFilter>,
     expanded: &mut HashSet<(ObjectId, String)>,
 ) -> Result<()> {
+    walk_tree_sized(src, root, included, gaps, filter, expanded, None)
+}
+
+/// The blob-size rule for one snapshot's tree walk (ADR-0055): `exempt` is true
+/// for a want's own walk, where every in-scope blob is kept; otherwise a blob
+/// of `limit` bytes or more is a gap. `verdicts` caches "keep?" by blob id.
+struct SizeGate<'a> {
+    limit: u64,
+    exempt: bool,
+    verdicts: &'a mut HashMap<ObjectId, bool>,
+}
+
+impl SizeGate<'_> {
+    fn keeps(&mut self, src: &mut impl ObjectSource, id: &ObjectId) -> Result<bool> {
+        if self.exempt {
+            return Ok(true);
+        }
+        if let Some(keep) = self.verdicts.get(id) {
+            return Ok(*keep);
+        }
+        let keep = src.blob_size(id)? < self.limit;
+        self.verdicts.insert(*id, keep);
+        Ok(keep)
+    }
+}
+
+fn walk_tree_sized(
+    src: &mut impl ObjectSource,
+    root: ObjectId,
+    included: &mut BTreeSet<ObjectId>,
+    gaps: &mut BTreeSet<ObjectId>,
+    filter: Option<&dyn PrefixFilter>,
+    expanded: &mut HashSet<(ObjectId, String)>,
+    mut size: Option<&mut SizeGate<'_>>,
+) -> Result<()> {
     let mut stack: Vec<(ObjectId, String)> = Vec::new();
     match filter {
         None => {
@@ -395,7 +486,15 @@ fn walk_tree_filtered(
                         included.insert(e.id);
                     }
                     Some(f) => {
-                        if f.matches(&child_path) {
+                        let keep = f.matches(&child_path)
+                            && match size.as_deref_mut() {
+                                // Already kept via an exempt walk: no need to measure.
+                                Some(gate) if !included.contains(&e.id) => {
+                                    gate.keeps(src, &e.id)?
+                                }
+                                _ => true,
+                            };
+                        if keep {
                             included.insert(e.id);
                         } else {
                             gaps.insert(e.id);

@@ -97,11 +97,27 @@ impl Repo {
         filter: Option<&[String]>,
         no_transcripts: bool,
     ) -> Result<Repo> {
+        Self::clone_url_limited(src_url, dst, filter.unwrap_or(&[]), None, no_transcripts)
+    }
+
+    /// [`Repo::clone_url_opts`] with the blob-size limit (ADR-0055): the
+    /// clone is partial when `prefixes` is non-empty or `blob_limit` is set.
+    /// With a limit and no prefix every path is in scope (`Scope::AllPaths`)
+    /// and the sparse view stays full. The server leaves out blobs of at least
+    /// `blob_limit` bytes that no ref tip's root tree reaches, so the initial
+    /// checkout is always complete.
+    pub fn clone_url_limited(
+        src_url: &str,
+        dst: impl AsRef<Path>,
+        prefixes: &[String],
+        blob_limit: Option<u64>,
+        no_transcripts: bool,
+    ) -> Result<Repo> {
         // Before the network or the destination directory: a blank prefix
         // would be persisted as a sparse line that reloads as a full view.
-        if let Some(f) = filter {
-            crate::sparse::validate_prefixes(f)?;
-        }
+        crate::sparse::validate_prefixes(prefixes)?;
+        let pack_filter = crate::promisor::PackFilter::new(prefixes, blob_limit);
+        let filter = pack_filter.as_ref();
         let transport = open_transport(src_url)?;
         let remote_refs = transport.list_refs()?;
         let head_branch = transport.head_branch()?;
@@ -177,9 +193,17 @@ impl Repo {
         // doesn't transfer a pre-existing `.sc/sparse` from the source (out
         // of P24 scope, sparse config is local like `.scignore`).
         let sparse_spec = match filter {
-            Some(prefixes) => {
-                let promisor = crate::promisor::Promisor::new(src_url, prefixes.to_vec());
+            Some(_) => {
+                let promisor = match blob_limit {
+                    Some(limit) => crate::promisor::Promisor::with_blob_limit(
+                        src_url,
+                        prefixes.to_vec(),
+                        limit,
+                    ),
+                    None => crate::promisor::Promisor::new(src_url, prefixes.to_vec()),
+                };
                 crate::promisor::store(&dst_repo.layout, &promisor)?;
+                // A size-only clone has no prefixes: the view stays full.
                 let sparse = crate::sparse::Sparse::new(prefixes.to_vec());
                 crate::sparse::store(&dst_repo.layout, &sparse)?;
                 sparse
@@ -284,7 +308,9 @@ impl Repo {
                 &mut store,
                 &tips,
                 &[],
-                Some(prefixes),
+                // Backfill never applies the clone's blob limit: it fetches
+                // every version of the named paths (ADR-0055).
+                crate::promisor::PackFilter::new(prefixes, None).as_ref(),
             )?;
         }
 
@@ -611,7 +637,7 @@ fn transfer_objects(
     store: &mut Store,
     tips: &[ObjectId],
     haves: &[ObjectId],
-    filter: Option<&[String]>,
+    filter: Option<&crate::promisor::PackFilter>,
 ) -> Result<()> {
     transfer_objects_opts(layout, transport, store, tips, haves, filter, false)
 }
@@ -625,7 +651,7 @@ fn transfer_objects_opts(
     store: &mut Store,
     tips: &[ObjectId],
     haves: &[ObjectId],
-    filter: Option<&[String]>,
+    filter: Option<&crate::promisor::PackFilter>,
     no_transcripts: bool,
 ) -> Result<()> {
     let guard = crate::transport::TempPackGuard::new(layout)?;

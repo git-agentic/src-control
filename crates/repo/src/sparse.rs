@@ -343,7 +343,7 @@ impl Repo {
                     "cannot set an empty sparse spec (a full checkout) on a partial clone: \
                      only [{}] was fetched; run `sc backfill --all` to convert to a full \
                      clone first, or name a prefix within it",
-                    promisor.prefixes().join(", ")
+                    promisor.describe()
                 )));
             }
             // A lazy clone may widen the view past its fetch filter: the
@@ -747,7 +747,7 @@ impl Repo {
                 "cannot disable sparse checkout (full materialization) on a partial clone: \
                  only [{}] was fetched; run `sc backfill --all` to convert to a full clone \
                  first, or `sc sparse set` to a prefix within it",
-                promisor.prefixes().join(", ")
+                promisor.describe()
             )));
         }
         let dirty = self.status()?;
