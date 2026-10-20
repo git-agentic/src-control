@@ -69,20 +69,29 @@ pub struct BucketTransport {
 }
 
 /// Untrusted-length guard (P28 parity): refuse any WAL metadata value —
-/// manifest, log entry, idx — larger than `MAX_OBJECT_SIZE` before decoding.
-/// Pack bodies are exempt from this particular guard (they may legitimately
-/// exceed it), but are not unguarded: `object_bytes` reads a pack body via
+/// manifest, log entry, idx — larger than the default 256 MiB before
+/// decoding. Fixed at the default, not the operator's object cap: this is
+/// metadata, not an object, and a lowered cap would make a bucket with a
+/// large pack index unreadable (idx entries are 48 bytes each). The check runs
+/// after the bucket GET has buffered the value, so unlike the frame and pack
+/// guards it bounds decode work, not the download. Pack bodies are exempt
+/// from this particular guard (they may legitimately exceed it), but are not
+/// unguarded: `object_bytes` reads a pack body via
 /// `scl_core::pack::read_object_at_bounded` (not the unbounded
 /// `read_object_at` — that path is reserved for `Store`'s own
 /// already-verified on-disk packs per ADR-0039's explicit trust split),
 /// which caps both the compressed record length and the decompressed output
-/// at `MAX_OBJECT_SIZE`, mirroring `parse_pack_reader`'s bounded decode. A
+/// at the live object cap, mirroring `parse_pack_reader`'s bounded decode. A
 /// hostile bucket pack therefore cannot mount a decompression-bomb DoS
 /// against `get_object`/`get_pack`.
 fn capped(what: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
-    if bytes.len() > scl_core::MAX_OBJECT_SIZE {
+    capped_to(what, bytes, scl_core::DEFAULT_MAX_OBJECT_SIZE)
+}
+
+fn capped_to(what: &str, bytes: Vec<u8>, max: usize) -> Result<Vec<u8>> {
+    if bytes.len() > max {
         return Err(Error::Wal(format!(
-            "{what} exceeds MAX_OBJECT_SIZE (256 MiB)"
+            "{what} exceeds the {max}-byte metadata limit"
         )));
     }
     Ok(bytes)
@@ -322,7 +331,7 @@ impl BucketTransport {
             *cache = Some((hash.clone(), bytes));
         }
         let (_, pack) = cache.as_ref().unwrap();
-        Ok(read_object_at_bounded(pack, offset, id, scl_core::MAX_OBJECT_SIZE)?.encode())
+        Ok(read_object_at_bounded(pack, offset, id, scl_core::max_object_size())?.encode())
     }
 
     /// Upload one pack (+ its idx) content-addressed by BLAKE3 of the pack
@@ -663,6 +672,25 @@ impl Transport for BucketTransport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capped_metadata_guard_is_the_fixed_default_not_the_live_cap() {
+        // calloc'd zeros: no resident memory for the oversized value.
+        let at = vec![0u8; scl_core::DEFAULT_MAX_OBJECT_SIZE];
+        assert!(capped("idx", at).is_ok());
+        let over = vec![0u8; scl_core::DEFAULT_MAX_OBJECT_SIZE + 1];
+        let err = capped("idx", over).unwrap_err();
+        assert!(format!("{err}").contains("metadata limit"), "got {err}");
+    }
+
+    #[test]
+    fn capped_to_rejects_above_a_lowered_cap_and_accepts_at_a_raised_one() {
+        let v = vec![0u8; scl_core::MIN_MAX_OBJECT_SIZE + 1];
+        let err = capped_to("manifest", v.clone(), scl_core::MIN_MAX_OBJECT_SIZE).unwrap_err();
+        assert!(format!("{err}").contains("metadata limit"), "got {err}");
+        assert!(capped_to("manifest", v.clone(), scl_core::MIN_MAX_OBJECT_SIZE + 1).is_ok());
+        assert!(capped_to("manifest", v, scl_core::MAX_MAX_OBJECT_SIZE).is_ok());
+    }
+
     use super::*;
     use crate::transport::Transport;
     use crate::walfmt::{

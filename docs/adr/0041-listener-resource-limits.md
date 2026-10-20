@@ -6,7 +6,7 @@
 - **Builds on:** ADR-0036 (P26 sc-native HTTP transport — names three of the
   four gaps closed here), ADR-0040 (P29 access control — the seam where a
   busy/error status is already written before the wire handshake), ADR-0039
-  (P28 DoS hardening — `MAX_OBJECT_SIZE`, composed with, not replaced by,
+  (P28 DoS hardening — the max object size, composed with, not replaced by,
   this phase's spool cap)
 - **Research:** `docs/research/bounded-server-patterns.md` (ticket #27,
   std-only bounded-server survey pinned to file:line). Decided at the
@@ -56,11 +56,11 @@ scoped to the listener (`--stdio` is unaffected except where noted):
    stall trips it, not a slow-but-moving transfer. The opening keeps its
    existing, unchanged 30s.
 
-3. **`--max-pack-size <bytes>` (default 16 GiB, 0 = unlimited, floor 256 MiB
-   = `MAX_OBJECT_SIZE`).** Applies to **both** `--http` and `--stdio` — it
+3. **`--max-pack-size <bytes>` (default 16 GiB, 0 = unlimited, floor = the max
+   object size, 256 MiB by default).** Applies to **both** `--http` and `--stdio` — it
    lives in `WirePolicy` (`crates/repo/src/wire.rs`), the shared layer both
    transports call into, not in `ServeLimits` (the `--http`-only listener
-   config). A configured non-zero value below `MAX_OBJECT_SIZE` is rejected
+   config). A configured non-zero value below the max object size (`scl_core::max_object_size()`, configurable since #213, ADR-0039 addendum) is rejected
    as invalid config at startup. Enforcement is a counted mid-stream abort in
    the pack-stream readers (mirroring git's `receive.maxInputSize`): once the
    running total crosses the cap, the reader stops, a best-effort

@@ -68,11 +68,13 @@ immutable packs plus one compare-and-swapped manifest**:
   format has no per-prefix negotiation yet; a filtered clone needs a served
   remote (ADR-0037) until that lands.
 - **Untrusted-length guard on reads.** Manifest, log entries, and idx
-  metadata are capped at `MAX_OBJECT_SIZE` (256 MiB, ADR-0039) before
+  metadata are capped at a fixed 256 MiB (the default object cap; since #213
+  deliberately not the operator's cap, see the ADR-0039 addendum) before
   decoding — a hostile or corrupted bucket cannot force an unbounded
   allocation. Pack bodies are read through
   `scl_core::pack::read_object_at_bounded`, which caps both the compressed
-  record length and the decompressed output at `MAX_OBJECT_SIZE`, mirroring
+  record length and the decompressed output at the live object cap (default
+  256 MiB, configurable from 2 MiB to 1 GiB since #213), mirroring
   `parse_pack_reader`'s bounded decode — this is the same zstd-bomb guard
   P28 put on every other untrusted transfer path. **This is deliberately a
   different code path from `Store`'s own on-disk reads:** the trusted local
@@ -144,7 +146,7 @@ confidentiality perimeter for public content, not the sc protocol.
 into `open_transport` for `sc+wal://` and `sc+s3://`, validated eagerly at
 `sc remote add`. 12 tests in `bucket_transport.rs` covering the base
 round-trip, racing/fleet pushes, crash-mid-push recovery, and the
-`MAX_OBJECT_SIZE` cap. CLI plumbing (remote-add validation, push, clone,
+object-size cap. CLI plumbing (remote-add validation, push, clone,
 fetch through the real binary) proven in
 `crates/cli/tests/bucket_remote.rs`.
 

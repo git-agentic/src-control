@@ -1018,7 +1018,7 @@ pub fn serve_http(
     tls: TlsMode,
     store: Option<&str>,
 ) -> Result<()> {
-    crate::wire::validate_max_pack_size(limits.max_pack_size)?;
+    crate::wire::validate_max_pack_size(limits.max_pack_size, scl_core::max_object_size())?;
     let tls_config = resolve_tls(root, &tls)?;
     if !bind_is_allowed(addr, root, read_only, allow_public, tls_config.is_some())? {
         return Err(Error::InvalidArgument(format!(
