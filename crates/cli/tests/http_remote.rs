@@ -178,6 +178,61 @@ fn serve_token_add_list_remove_round_trips() {
     );
 }
 
+/// `--expires` shows in `list`, `rotate` prints a new value and keeps the
+/// label and expiry, and a bad `--expires` is rejected.
+#[test]
+fn serve_token_expires_and_rotate() {
+    let root = tmp("token-expiry");
+    assert!(sc(&root, &["init"]).status.success());
+    let add = sc(
+        &root,
+        &[
+            "serve",
+            "token",
+            "add",
+            "--label",
+            "t",
+            "--scope",
+            "rw",
+            "--expires",
+            "7d",
+        ],
+    );
+    assert!(add.status.success(), "{:?}", add);
+    let old = String::from_utf8_lossy(&add.stdout).trim().to_string();
+
+    let rot = sc(&root, &["serve", "token", "rotate", "t"]);
+    assert!(rot.status.success(), "{:?}", rot);
+    let new = String::from_utf8_lossy(&rot.stdout).trim().to_string();
+    assert!(new.starts_with("sct-") && new != old);
+
+    let list = sc(&root, &["serve", "token", "list"]);
+    let out = String::from_utf8_lossy(&list.stdout);
+    assert!(out.contains("t  rw  expires "), "{out}");
+    assert!(!out.contains("EXPIRED"), "{out}");
+
+    for bad in ["bogus", "2001-01-01"] {
+        let out = sc(
+            &root,
+            &[
+                "serve",
+                "token",
+                "add",
+                "--label",
+                "u",
+                "--scope",
+                "ro",
+                "--expires",
+                bad,
+            ],
+        );
+        assert!(!out.status.success(), "{bad} should be rejected");
+    }
+    assert!(!sc(&root, &["serve", "token", "rotate", "missing"])
+        .status
+        .success());
+}
+
 /// An invalid `--scope` is rejected with a clear message rather than
 /// silently defaulting.
 #[test]

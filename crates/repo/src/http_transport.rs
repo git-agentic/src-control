@@ -1275,7 +1275,7 @@ fn handle_http_connection(
         match opening
             .bearer
             .as_deref()
-            .and_then(|t| crate::serve_tokens::verify(&tokens, t))
+            .and_then(|t| crate::serve_tokens::verify(&tokens, t, crate::serve_tokens::now()))
         {
             Some(crate::serve_tokens::Scope::Ro) => true,
             Some(crate::serve_tokens::Scope::Rw) => false,
