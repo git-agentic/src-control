@@ -595,10 +595,16 @@ enum TranscriptOp {
     /// list`. Records a tombstone that travels with fetch/push, so a peer
     /// that still has the transcript cannot bring it back; `sc gc` reclaims
     /// the body after its grace window. Not erasure: peers that never
-    /// receive the tombstone keep the sealed body.
+    /// receive the tombstone keep the sealed body. Without `--identity` the
+    /// drop is local-only: peers honor a tombstone only when it is signed by
+    /// a key in their `[signers] trusted` list.
     Drop {
         /// Transcript id as shown by `sc transcript list` (hex prefix).
         id: String,
+        /// Sign the tombstone with this v2 identity so trusting peers honor
+        /// it (default: unsigned, local-only).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
     /// Sign every transcript attached to a ref's tip snapshot.
     Sign {
@@ -3012,9 +3018,13 @@ fn run_transcript(op: TranscriptOp) -> Result<()> {
             }
             Ok(())
         }
-        TranscriptOp::Drop { id } => {
-            let tid = repo.drop_transcript(&id)?;
+        TranscriptOp::Drop { id, identity } => {
+            let signer = identity.map(|p| load_identity_full(Some(p))).transpose()?;
+            let tid = repo.drop_transcript(&id, signer.as_ref())?;
             println!("dropped transcript {}", tid.short());
+            if signer.is_none() {
+                eprintln!("note: unsigned drop is local-only; pass --identity to let trusting peers honor it");
+            }
             Ok(())
         }
         TranscriptOp::Sign { r#ref, identity } => {

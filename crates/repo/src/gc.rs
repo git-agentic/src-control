@@ -801,7 +801,8 @@ mod tests {
             .attach_transcript(base, "a", "gone", b"gone", &[identity.enc.public()])
             .unwrap();
         repo.sign_transcript(gone, &identity).unwrap();
-        repo.drop_transcript(&gone.to_hex()).unwrap();
+        repo.drop_transcript(&gone.to_hex(), Some(&identity))
+            .unwrap();
 
         repo.gc(Duration::from_secs(0)).unwrap();
 
@@ -821,6 +822,11 @@ mod tests {
         assert!(s.contains(&tomb), "tombstone is rooted");
         drop(s);
         assert!(repo.signatures_for(&gone).unwrap().is_empty());
+        assert_eq!(
+            repo.signatures_for(&tomb).unwrap().len(),
+            1,
+            "the tombstone's signature is kept with it"
+        );
         assert_eq!(transcripts::load(repo.layout()).unwrap().len(), 1);
 
         drop(repo);

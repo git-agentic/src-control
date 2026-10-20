@@ -890,7 +890,8 @@ mod tests {
         drop(a);
 
         // B drops it; origin A still carries it. Fetching must not restore it.
-        b.drop_transcript(&tid.to_hex()).unwrap();
+        crate::transcripts::tests::trust_signer(&b, &identity);
+        b.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
         b.fetch("origin").unwrap();
         assert!(b.transcripts_for(&snap).unwrap().is_empty());
         drop(b);
@@ -898,13 +899,20 @@ mod tests {
         // A fetching from B learns the drop and hides its own copy.
         let a = Repo::open(&a_root).unwrap();
         assert_eq!(a.transcripts_for(&snap).unwrap().len(), 1);
+        // The origin only honors tombstones from a signer it trusts.
         a.remote_add("b", b_root.to_str().unwrap()).unwrap();
+        a.fetch("b").unwrap();
+        assert_eq!(
+            a.transcripts_for(&snap).unwrap().len(),
+            1,
+            "an untrusted signer's tombstone is ignored"
+        );
+        crate::transcripts::tests::trust_signer(&a, &identity);
         a.fetch("b").unwrap();
         assert!(a.transcripts_for(&snap).unwrap().is_empty());
         drop(a);
 
-        // A fresh clone of A (which still holds the body object) gets the
-        // tombstone via reindex and shows nothing.
+        // A fresh clone of A never receives the dropped body at all.
         let c_root = std::env::temp_dir().join(format!("scl-transdrop-c-{pid}"));
         let _ = std::fs::remove_dir_all(&c_root);
         let c = Repo::clone_to(&a_root, &c_root).unwrap();

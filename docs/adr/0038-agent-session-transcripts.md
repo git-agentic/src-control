@@ -194,11 +194,14 @@ over-send, whatever order the lines landed in.
   live entry. A crash between steps leaves the drop line present, so the
   transcript is still hidden (fail-closed).
 - **fetch/clone/push receive:** `index_incoming` records an incoming
-  tombstone as a drop and never indexes a transcript whose id is already
-  dropped, so a pack from a peer that still has the transcript cannot
-  restore it, in either arrival order.
-- **sender:** the over-send for a transfer set includes the tombstones of its
-  snapshots, so fetching from the dropper (or a push that moves the ref)
+  tombstone as a drop only after the checks in "Who may drop" pass, and never
+  indexes a transcript whose id is already dropped, so a pack from a peer
+  that still has the transcript cannot restore it, in either arrival order.
+  A tombstone that fails the checks stays an inert object and is simply
+  re-evaluated whenever it is sent again (for example after the operator
+  adds the signer to the trust list and fetches).
+- **sender:** the over-send for a transfer set includes the tombstones (and
+  their signatures) of its snapshots, so fetching from the dropper (or a push that moves the ref)
   propagates the drop. A peer that still holds the transcript object hides
   it as soon as it ingests the tombstone. `push` still skips all I/O when
   the remote tip already equals the local tip, so a drop alone does not push,
@@ -206,6 +209,41 @@ over-send, whatever order the lines landed in.
 - **merge, cherry-pick, rebase:** transcripts are not part of snapshots, so
   history operations neither carry nor restore them; only transfer can
   reintroduce one, and that path is covered above.
+
+### Who may drop
+
+P16 does not authenticate its tombstones: a revoke is a commit on a branch,
+and the operator decides to merge that branch, so the merge is the trust
+boundary. A drop tombstone has no such gate, because it arrives with a plain
+fetch or push. Honoring it blindly would let any peer that can write to a
+remote hide, and let gc reclaim, any transcript. The P16 trust model
+therefore does not carry over, and drops are authenticated with the P22
+machinery instead.
+
+- **Local drop:** always honored by the store that ran it.
+- **Signed drop:** `sc transcript drop <id> --identity <key>` also signs the
+  tombstone id with the transcript domain (`sign_transcript`), stored in the
+  shared `.sc/signatures` index and sent with the tombstone. No new crypto.
+- **Receiving a tombstone** (`index_incoming`, clone `reindex`) honors it
+  only if all of these hold: the tombstone's snapshot exists locally; if the
+  dropped transcript is held locally it is a real transcript on that same
+  snapshot; and a valid signature over the tombstone id comes from a key
+  under `[signers] trusted` in the receiver's `.sc/recipients.toml` (the set
+  `sc verify` already uses). Missing or malformed trust config trusts nobody.
+  If the dropped transcript is not held yet, the snapshot check is the only
+  structural one, so a trusted signer can drop an id ahead of its arrival.
+- **Unsigned or untrusted tombstones are inert:** never recorded, so they
+  cannot hide a transcript and gc never reclaims a body because of them.
+
+Trade-offs. Trust is local configuration, not repository content, so a fresh
+clone ignores tombstones until its operator trusts the signer and fetches
+again (a clone of a store that already honored the drop never receives the
+body in the first place). Trust is checked at ingest, not retroactively, so removing a signer
+later does not undo drops already recorded. "Trusted signer" is the same
+project-level authority that can sign commits; it is deliberately not
+narrowed to the transcript's recipients or its own signer, because
+transcripts are usually unsigned and recipient ids (X25519) do not map to
+signing keys. An unsigned local drop does not propagate.
 
 ### gc
 
@@ -227,9 +265,6 @@ reported anywhere (it is pruned by gc, hidden before that).
 
 ### Limits
 
-- **Drop is not authenticated.** Anyone who can write to a store can drop any
-  transcript, the same trust level as attaching one. Signed drops are a
-  follow-on.
 - **Drop is not erasure.** Peers that never receive the tombstone keep the
   sealed body, and a recipient who already decrypted it keeps the plaintext.
   Rotation is not erasure here either.

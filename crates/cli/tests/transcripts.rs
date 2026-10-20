@@ -320,7 +320,16 @@ fn drop_removes_transcript_from_list_and_show() {
         .unwrap()
         .to_string();
 
-    let drop = sc(&repo, &["transcript", "drop", &tid[..12]]);
+    let drop = sc(
+        &repo,
+        &[
+            "transcript",
+            "drop",
+            &tid[..12],
+            "--identity",
+            id.to_str().unwrap(),
+        ],
+    );
     assert!(
         drop.status.success(),
         "{}",
