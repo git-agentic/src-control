@@ -1787,7 +1787,13 @@ impl Repo {
     /// CAS — no out-of-sparse marker is ever written, not even transiently.
     /// A CLEAN out-of-sparse change never reaches here at all: it resolves
     /// on tree ids inside `three_way`/replay and lands via the ordinary
-    /// materialize skip-write path (P24 Task 3), no markers involved.
+    /// materialize skip-write path (P24 Task 3), no markers involved. The one
+    /// clean change that does arrive is plaintext that must be sealed at
+    /// completion (`to_encrypt`) or a sidecar: both are written to disk.
+    /// A `to_encrypt` path outside the view is refused up front too (#210), on
+    /// every clone. A sidecar is refused only on a partial clone: on a full one
+    /// it sits beside an in-view conflicted path and is removed on completion
+    /// and abort, even when a file-exact spec does not match its name.
     pub(crate) fn materialize_conflict_state(
         &self,
         op: &str,
@@ -1801,6 +1807,13 @@ impl Repo {
         conflicted_paths: &[String],
     ) -> Result<ObjectId> {
         let sparse = self.sparse_spec()?;
+        // `sc sparse set` is refused while a rebase is stopped, so a refusal
+        // reached from `rebase --continue` cannot be fixed by widening in place.
+        let widen = if crate::rebase_state::in_progress(&self.layout) {
+            "abort the rebase (`sc rebase --abort`), widen with `sc sparse set`, then rerun the rebase"
+        } else {
+            "run `sc sparse set` to include it, then retry"
+        };
         let needs_widen: Vec<&String> = conflicted_paths
             .iter()
             .filter(|p| !sparse.matches(p))
@@ -1812,29 +1825,33 @@ impl Repo {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(Error::InvalidArgument(format!(
-                "conflict in {names} is outside your sparse checkout; run `sc sparse set` to include it, then retry"
+                "conflict in {names} is outside your sparse checkout; {widen}"
             )));
         }
-        // A partial clone completes from its view alone, so plaintext that
-        // must be sealed at completion has to sit inside the view (ADR-0049
-        // decision 8). A full clone writes it wherever it lies and reads it
-        // back; here it would be left behind and dropped.
-        if self.promisor()?.is_some() {
-            if let Some((path, ..)) = to_encrypt.iter().find(|(p, ..)| !sparse.matches(p)) {
-                return Err(Error::InvalidArgument(format!(
-                    "{op} has conflicts, and {path} (outside your sparse checkout) needs sealing at completion; \
-                     run `sc sparse set` to include it, or `sc backfill --all`, then retry"
-                )));
-            }
+        // `to_encrypt` plaintext is written straight to the working tree and
+        // sealed again at completion, which reads it back from disk (a
+        // partial clone has nothing else to read it from: ADR-0049 decision
+        // 8). Outside the view that write would widen the checkout, and
+        // completion's `commit` never sweeps it, so refuse like an
+        // out-of-view conflict instead (ADR-0034, #210).
+        if let Some((path, ..)) = to_encrypt.iter().find(|(p, ..)| !sparse.matches(p)) {
+            return Err(Error::InvalidArgument(format!(
+                "{op} has conflicts, and {path} (outside your sparse checkout) needs sealing at completion; \
+                 {widen}"
+            )));
         }
-        // A sidecar is plaintext written beside a conflicted file. Outside the
-        // view it would sit where completion neither expects nor protects it,
-        // and a later commit would read it back as a plain file.
+        // A sidecar is `<conflicted path>.theirs`, and the conflicted path
+        // passed the gate above, so on a full clone it is beside an in-view
+        // file (a file-exact spec such as `src/a.bin` does not match
+        // `src/a.bin.theirs`, yet that sidecar is in view) and `abort` and
+        // completion remove it. A partial clone keeps the stricter ADR-0049
+        // refusal: outside the view its sidecar would sit where completion
+        // neither expects nor protects it.
         if self.promisor()?.is_some() {
             if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !sparse.matches(r)) {
                 return Err(Error::InvalidArgument(format!(
                     "{op} has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
-                     run `sc sparse set` to include it, or `sc backfill --all`, then retry"
+                     {widen}"
                 )));
             }
         }
@@ -1881,13 +1898,12 @@ impl Repo {
                 .map(|(p, ..)| p.as_str())
                 .chain(sidecars.iter().map(|(r, _)| r.as_str()));
             for rel in targets {
-                // A path the sparse view never materialized holds no tracked
-                // file on disk, even if the tree tracks it: whatever is there
-                // is the user's own. A failed lookup counts as untracked.
+                // Every target is in the view (gated above; a sidecar is
+                // never tracked, checked above). A failed lookup counts as
+                // untracked.
                 let mut tracked = |p: &str| {
-                    sparse.matches(p)
-                        && worktree::tree_entry_at(&mut store, old_root, p, partial)
-                            .is_ok_and(|e| e.is_some())
+                    worktree::tree_entry_at(&mut store, old_root, p, partial)
+                        .is_ok_and(|e| e.is_some())
                 };
                 match stop_write_blocker(&self.layout.root, rel, &mut tracked)? {
                     None => {}
@@ -5400,6 +5416,102 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn merge_conflict_with_out_of_sparse_protected_change_refuses_then_lands_after_widening() {
+        // #210: an in-sparse conflict co-occurring with a clean content merge
+        // of an out-of-sparse protected path would write that path's
+        // plaintext outside the view (and `commit` never sweeps it). The stop
+        // refuses up front instead, writing nothing; widening the view lets
+        // the same merge stop, complete and land the protected merge sealed.
+        let root = tmp_root("sparse-conflict-protected-outside");
+        let repo = Repo::init(&root).unwrap();
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("secret/s.txt"), b"s1\ns2\ns3\ns4\ns5\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+
+        std::fs::write(root.join("src/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("secret/s.txt"), b"OURS\ns2\ns3\ns4\ns5\n").unwrap();
+        repo.commit("me", "ours").unwrap();
+        repo.switch_with_identity("feature", Some(&sk)).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("secret/s.txt"), b"s1\ns2\ns3\ns4\nTHEIRS\n").unwrap();
+        repo.commit("me", "theirs").unwrap();
+        repo.switch_with_identity("main", Some(&sk)).unwrap();
+
+        repo.set_sparse(&["src/".into()], Some(&sk)).unwrap();
+        assert!(!root.join("secret/s.txt").exists());
+        let before = repo.head_tip().unwrap();
+
+        let err = repo
+            .merge_with_identity("feature", "me", Some(&sk))
+            .unwrap_err();
+        match err {
+            Error::InvalidArgument(msg) => {
+                assert!(msg.contains("secret/s.txt"), "names the path: {msg}");
+                assert!(msg.contains("sc sparse set"), "suggests widening: {msg}");
+            }
+            other => panic!("expected InvalidArgument widen hint, got {other:?}"),
+        }
+        assert!(
+            !root.join("secret/s.txt").exists(),
+            "nothing out of view on disk"
+        );
+        assert!(!root.join(".sc/CONFLICT_PLAINTEXT").exists());
+        assert!(!root.join(".sc/CONFLICT_SIDECARS").exists());
+        assert!(!repo.merge_in_progress());
+        assert_eq!(repo.head_tip().unwrap(), before, "HEAD unchanged");
+        assert_eq!(
+            std::fs::read(root.join("src/a.txt")).unwrap(),
+            b"OURS\nl2\nl3\n",
+            "the in-view file is untouched"
+        );
+
+        // Widen and retry: stops on the in-view conflict only.
+        repo.set_sparse(&["src/".into(), "secret/".into()], Some(&sk))
+            .unwrap();
+        let err = repo
+            .merge_with_identity("feature", "me", Some(&sk))
+            .unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+        std::fs::write(root.join("src/a.txt"), b"RESOLVED\nl2\nl3\n").unwrap();
+        let id = repo.commit("me", "resolve").unwrap();
+        let snap = repo.snapshot(&id).unwrap();
+        let (blob_id, perms) = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut s, snap.root).unwrap();
+            let (bid, _, perms) = entries["secret/s.txt"];
+            (bid, perms)
+        };
+        assert_ne!(perms & scl_core::PROTECTED, 0);
+        let bytes = {
+            let store_arc = repo.vfs_handle().store();
+            let mut s = store_arc.lock().unwrap();
+            match s.get(&blob_id).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("expected Blob"),
+            }
+        };
+        let pt = crate::protect::decrypt_with(
+            &bytes,
+            &blob_id,
+            &[&snap.protection],
+            &sk,
+            "secret/s.txt",
+        )
+        .unwrap();
+        assert_eq!(&pt[..], b"OURS\ns2\ns3\ns4\nTHEIRS\n");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test repository must leave no residue");
     }
 
     #[test]

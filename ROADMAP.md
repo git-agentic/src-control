@@ -732,16 +732,6 @@ scale-&-reach horizon):
   merge, cherry-pick or rebase is stopped there (`MergeInProgress` & co.), so
   the completing commit cannot silently drop a pushed commit. Other branches
   are unaffected.
-- **Sparse-gate the conflict helper's non-marker writes (P24 boundary).**
-  `Repo::materialize_conflict_state` gates conflict *markers* against the
-  sparse spec but not its `to_encrypt`/sidecar write loops — so an
-  in-sparse conflict co-occurring with an out-of-sparse protected/I2 clean
-  change transiently writes that out-of-sparse plaintext to disk outside
-  the view, and it PERSISTS after completion until a later re-lay (only
-  abort cleans it). Not data loss (completion re-lands it in the CAS) and
-  not a disclosure (an authorized identity produced it), documented in
-  ADR-0034 — but the sparse view is briefly wider than advertised. Extend
-  the gate to those write loops.
 - **Sparse ergonomics (P24 final-review Minors) — shipped.** `sc sparse set`
   warns for each prefix that matches no tracked path at HEAD (the tree is still
   laid out, empty, and `sc sparse disable` is named as the way back); a bare
