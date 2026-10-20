@@ -377,12 +377,23 @@ impl Repo {
         old_paths: &BTreeSet<String>,
         protection: &Protection,
         identity: &SecretKey,
+        restores: bool,
     ) -> Result<Vec<String>> {
         let sparse = self.sparse_spec()?;
         let target = self.inner_tree_files(store, ctx, target_root)?;
         // Before the first removal or write: nothing of the user's may be
         // replaced (see `refuse_untracked_paths`).
         self.refuse_untracked_paths(op, old_paths, target.keys())?;
+        // A restore (abort) re-lays the tree the stop started from: nothing is
+        // added, and `old_paths` is only what the stop wrote, in view.
+        if !restores {
+            self.refuse_untracked_out_of_view_paths(
+                op,
+                &sparse,
+                old_paths,
+                &target.keys().cloned().collect(),
+            )?;
+        }
         for p in old_paths {
             if !target.contains_key(p) || !sparse.matches(p) {
                 let full = worktree::safe_join(&self.layout.root, p)?;
@@ -459,6 +470,7 @@ impl Repo {
                 old_paths,
                 &tip_snap.protection,
                 sk,
+                false,
             )?
         };
         refs::write_head(&self.layout, name)?;
@@ -896,6 +908,7 @@ impl Repo {
             &written,
             &ours.protection,
             sk,
+            true,
         )?;
         drop(store);
         // After the restore, so a failed restore leaves the sidecars to retry.
@@ -1350,6 +1363,7 @@ impl Repo {
                 &old_paths,
                 &theirs_snap.protection,
                 sk,
+                false,
             )?;
             drop(store);
             refs::write_branch_tip(&self.layout, &head, &new_mid)?;
@@ -1412,6 +1426,10 @@ impl Repo {
             // value (`commit_private`, #240). It reads MERGE_HEAD.
             let prior_entries = self.inner_tree_files(&mut store, &ctx, ours_snap.root)?;
             let prior_paths: BTreeSet<String> = prior_entries.keys().cloned().collect();
+            // Completion reads the working tree, where a file wins over the
+            // merge's addition: refuse one in the way outside the view (#248).
+            let merged_paths: BTreeSet<String> = fm.files.iter().map(|f| f.path.clone()).collect();
+            self.refuse_untracked_out_of_view_paths("merge", &sparse, &prior_paths, &merged_paths)?;
             // Carried protected ciphertext: decrypt for the resolver to see
             // (completion re-seals it as needed). One this recipient cannot
             // read has its old plaintext dropped, so completion carries the
@@ -1619,6 +1637,7 @@ impl Repo {
             &old_paths,
             &merged_prot,
             sk,
+            false,
         )?;
         drop(store);
         refs::write_branch_tip(&self.layout, &head, &new_mid)?;
