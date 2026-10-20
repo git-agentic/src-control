@@ -833,6 +833,16 @@ pub fn validate_max_conn_bytes(budget: u64, max_pack_size: u64, object_cap: usiz
     Ok(())
 }
 
+/// Admit a `PutObject` body of `len` bytes under object cap `cap`: `Err` is a
+/// budget refusal (close the connection), `Ok(Some(e))` an over-cap reply that
+/// keeps the session open, `Ok(None)` admitted. The bytes are charged first,
+/// so a frame that passes the frame limit but not the cap (it may exceed the
+/// cap by `FRAME_OVERHEAD - 37`) still uses up the budget.
+fn gate_put_object(budget: &mut ConnBudget, len: usize, cap: usize) -> Result<Option<Error>> {
+    budget.charge(len as u64)?;
+    Ok(check_object_len(len, cap).err())
+}
+
 /// Running count of bytes a connection has made the server write (#233).
 struct ConnBudget {
     limit: u64,
@@ -1339,17 +1349,20 @@ fn serve_session(
             Request::PutObject { id, bytes } => {
                 // Distinct structural objects report `blob_size` 0, so the
                 // budget counts the encoded length every time (#233).
-                if let Err(e) = check_object_len(bytes.len(), scl_core::max_object_size()) {
-                    let (code, msg) = err_to_wire(&e);
-                    write_err(w, code, &msg)?;
-                    continue;
-                }
-                if let Err(e) = budget.charge(bytes.len() as u64) {
-                    // Refuse before the store write, then close: a peer that
-                    // exhausted its budget gets no further requests served.
-                    let (code, msg) = err_to_wire(&e);
-                    let _ = write_err(w, code, &msg);
-                    return Ok(());
+                match gate_put_object(&mut budget, bytes.len(), scl_core::max_object_size()) {
+                    Err(e) => {
+                        // Refuse before the store write, then close: a peer
+                        // that exhausted its budget gets no further requests.
+                        let (code, msg) = err_to_wire(&e);
+                        let _ = write_err(w, code, &msg);
+                        return Ok(());
+                    }
+                    Ok(Some(e)) => {
+                        let (code, msg) = err_to_wire(&e);
+                        write_err(w, code, &msg)?;
+                        continue;
+                    }
+                    Ok(None) => {}
                 }
                 match transport.as_transport().put_object(&id, &bytes) {
                     Ok(()) => write_ok(w, &[])?,
@@ -2595,6 +2608,36 @@ mod tests {
         assert!(!root.exists());
     }
 
+    /// An over-cap `PutObject` body (the frame limit leaves it room) is
+    /// answered with a protocol error and the session stays open, but its bytes
+    /// are charged, so repeating it cannot run for free.
+    #[test]
+    fn oversized_put_object_attempts_are_charged() {
+        let mut budget = ConnBudget {
+            limit: 100,
+            used: 0,
+        };
+        for _ in 0..9 {
+            let e = gate_put_object(&mut budget, 11, 10).unwrap();
+            assert!(matches!(e, Some(Error::Protocol(_))));
+        }
+        assert_eq!(budget.used, 99);
+        assert!(matches!(
+            gate_put_object(&mut budget, 11, 10),
+            Err(Error::ConnectionBudgetExceeded(_))
+        ));
+        assert!(gate_put_object(
+            &mut ConnBudget {
+                limit: 100,
+                used: 0
+            },
+            10,
+            10
+        )
+        .unwrap()
+        .is_none());
+    }
+
     /// The spool half of the max charge: an incompressible blob pack has no
     /// structural bytes, so only its spooled size can use up the budget for
     /// the request that follows (charging the tally alone would pass this).
@@ -2978,7 +3021,8 @@ mod tests {
         assert!(matches!(err, Error::ConnectionBudgetExceeded(_)), "{err:?}");
         drop(client);
         srv.join().unwrap().unwrap();
-        std::fs::remove_dir_all(&broot).ok();
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
         std::fs::remove_dir_all(&home).unwrap();
         assert!(!home.exists());
     }

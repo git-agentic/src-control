@@ -3814,6 +3814,13 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Does the listener run on the default connection budget with no explicit
+/// bound on either knob? A nonzero `--max-pack-size` already lowers the default
+/// budget with it; `0` (unlimited) still falls back to the 16 GiB default.
+fn runs_default_budget(conn_bytes_given: bool, max_pack_size: Option<u64>) -> bool {
+    !conn_bytes_given && matches!(max_pack_size, None | Some(0))
+}
+
 /// Serve a repo over the wire protocol: either on stdin/stdout (invoked as
 /// the remote-side command by `ssh` for `ssh://` remotes), or over TCP for
 /// `sc+http://` clients (P26, `--http <addr>`; blocks until the listener is
@@ -3843,8 +3850,7 @@ fn run_serve(
     path: PathBuf,
 ) -> Result<()> {
     let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
-    // An explicit --max-pack-size already lowers the default budget with it.
-    let default_budget = max_conn_bytes.is_none() && max_pack_size.is_none();
+    let default_budget = runs_default_budget(max_conn_bytes.is_some(), max_pack_size);
     let conn_bytes = match max_conn_bytes {
         Some(raw) => {
             scl_core::parse_byte_size(&raw).map_err(|e| anyhow::anyhow!("--max-conn-bytes: {e}"))?
@@ -4648,6 +4654,17 @@ fn run_rewrap(identity: Option<PathBuf>, dry_run: bool, rotate: bool) -> Result<
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn default_budget_warning_logic() {
+        assert!(runs_default_budget(false, None));
+        assert!(
+            runs_default_budget(false, Some(0)),
+            "0 = unlimited pack cap"
+        );
+        assert!(!runs_default_budget(false, Some(1 << 30)));
+        assert!(!runs_default_budget(true, None));
+    }
 
     #[test]
     fn parses_suffixed_durations() {
