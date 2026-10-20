@@ -249,3 +249,27 @@ every claim below is checked against the shipped code, not the plan.
    (merge, pick, rebase: deletion kept, clean add and modify land, ours-side
    out-of-view changes kept, equal to the run without sparse; file to
    directory; an out-of-view exec bit; a protected deletion).
+7. **An untracked file where the result adds an out-of-view path is refused
+   (#248).** Nothing is written outside the view, but a later commit reads the
+   working tree, and a file on disk wins over the decided root (refinement 6),
+   so a user's untracked or ignored file at a path the other side adds there
+   was committed in place of the addition, silently, on the public stop and on
+   the private merge-in stop. `refuse_untracked_overwrite` now also runs
+   `refuse_untracked_out_of_view`: for every file the result holds outside the
+   view that the tree the working tree reflects does not, it reuses
+   `stop_write_blocker` (a file, directory or symlink on the path, or a file
+   where a parent directory must be) and refuses before any write, naming the
+   path and telling the user to move it away and retry. It covers the
+   conflict stop of merge, cherry-pick and rebase, and the operations that
+   never stop (clean merge, fast-forward, clean pick and rebase, undo, switch,
+   and the private `materialize_private`), because their result is exact but
+   the next ordinary commit would take the user's file instead. A path the old
+   tree already tracks is not an addition and is not checked here (a user's
+   copy of it is read as an edit; a stop's `materialize` can still delete it),
+   nor is anything in the view (the existing guard). Completion still reads a file
+   the user creates after a stop at such a path; that is their resolution, as
+   for an edited tracked file (refinement 5). On a partial clone the guard sees
+   only the subtrees the store holds, so an addition inside a carried, absent
+   subtree is not checked; it is not silent, because the commit then fails with
+   `GappedPathContent` naming the path (move the file away and retry). Refusing up front would mean fetching or guessing the absent subtree's paths (a disk probe under a changed absent directory would refuse unrelated files), so the limit stays. Pinned by `sparse_completion.rs`
+   and `private_sparse.rs`.

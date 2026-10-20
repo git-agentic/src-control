@@ -160,3 +160,78 @@ fn replay_onto_a_private_branch_stays_refused_under_sparse() {
     std::fs::remove_dir_all(&f.root).unwrap();
     assert!(!f.root.exists(), "test dir left behind");
 }
+
+#[test]
+fn an_untracked_file_where_the_public_side_adds_one_out_of_view_is_refused() {
+    let f = fixture("collide", true, false);
+    let mine = f.root.join("docs/new.txt");
+    std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+    std::fs::write(&mine, "MINE\n").unwrap();
+    let (_, before, _) = f.repo.head_private().unwrap().unwrap();
+    let err = f
+        .repo
+        .merge_into_private("main", "alice", Some(&f.sk))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("docs/new.txt"), "{err}");
+    assert!(err.contains("move it away"), "{err}");
+    assert!(!crate::merge_state::in_progress(f.repo.layout()));
+    assert_eq!(f.repo.head_private().unwrap().unwrap().1, before);
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "MINE\n");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
+        "private\n",
+        "refusal wrote nothing"
+    );
+    // Moved away, the same run lands the public addition.
+    std::fs::remove_file(&mine).unwrap();
+    let got = run(&f, true);
+    assert_eq!(got["new.txt"], "new-public\n");
+    std::fs::remove_dir_all(&f.root).unwrap();
+    assert!(!f.root.exists(), "test dir left behind");
+}
+
+#[test]
+fn leaving_a_private_branch_refuses_an_untracked_file_where_main_has_one_out_of_view() {
+    let f = fixture("leave", true, false);
+    let mine = f.root.join("docs/new.txt");
+    std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+    std::fs::write(&mine, "MINE\n").unwrap();
+    let err = f
+        .repo
+        .switch_with_identity("main", Some(&f.sk))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("docs/new.txt") && err.contains("move it away"),
+        "{err}"
+    );
+    assert!(
+        f.repo.head_private().unwrap().is_some(),
+        "still on the private branch"
+    );
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "MINE\n");
+    std::fs::remove_file(&mine).unwrap();
+    f.repo.switch_with_identity("main", Some(&f.sk)).unwrap();
+    std::fs::remove_dir_all(&f.root).unwrap();
+    assert!(!f.root.exists(), "test dir left behind");
+}
+
+#[test]
+fn aborting_a_private_stop_ignores_a_file_at_an_out_of_view_tracked_path() {
+    let f = fixture("abort", true, false);
+    let sk = Some(&f.sk);
+    assert!(matches!(
+        f.repo.merge_into_private("main", "alice", sk),
+        Err(Error::MergeConflicts(1))
+    ));
+    // `docs/ours.txt` is tracked by the private tip, outside the view.
+    put(&f.root, "docs/ours.txt", "MINE\n");
+    f.repo.merge_abort_with_identity(sk).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("docs/ours.txt")).unwrap(),
+        "MINE\n"
+    );
+    std::fs::remove_dir_all(&f.root).unwrap();
+    assert!(!f.root.exists(), "test dir left behind");
+}
