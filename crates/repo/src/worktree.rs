@@ -509,24 +509,6 @@ pub(crate) fn tree_file_ids_sparse(
     Ok(out)
 }
 
-/// Like [`tree_file_ids_sparse`], but skips a subtree the store lacks instead
-/// of failing. For `materialize`'s old-root removal walk on a partial clone:
-/// the old root was laid out under a preflighted view, so an absent subtree
-/// lay outside that view and has nothing on disk to remove. A fetch can leave
-/// a tree absent that is inside the promisor filter but outside the view
-/// (ADR-0048).
-fn tree_file_ids_sparse_present(
-    store: &mut Store,
-    root: ObjectId,
-    sparse: &Sparse,
-) -> Result<BTreeMap<String, ObjectId>> {
-    let mut out = BTreeMap::new();
-    if store.contains(&root) {
-        walk_tree_sparse(store, root, String::new(), sparse, &mut out, true)?;
-    }
-    Ok(out)
-}
-
 fn walk_tree_sparse(
     store: &mut Store,
     tree_id: ObjectId,
@@ -816,6 +798,29 @@ pub(crate) fn added_view_files(
     Ok((plain, protected))
 }
 
+/// Whether `full` is a regular file whose bytes are exactly the blob `blob_id`:
+/// the one test for "this file is still what the tree says, so it is ours to
+/// delete or overwrite". A symlink, a directory, an unreadable file or any
+/// other bytes read as no. One read of the disk file and no store access, so
+/// it is cheap for a big file and works when the blob is not held (a partial
+/// clone gap).
+pub(crate) fn disk_is_blob(full: &Path, blob_id: &ObjectId) -> bool {
+    full.symlink_metadata().is_ok_and(|m| m.is_file())
+        && std::fs::read(full).is_ok_and(|disk| Object::blob(disk).id() == *blob_id)
+}
+
+/// What [`materialize_restore`] did besides the writes.
+#[derive(Debug, Default)]
+pub(crate) struct Materialized {
+    /// Protected paths left absent: no key for them.
+    pub skipped: Vec<String>,
+    /// In-view paths left as the user has them: a file the tree being replaced
+    /// tracked but whose bytes (or type) changed since, so it was not removed;
+    /// or, on a restore, a file standing where the restored tree needs one
+    /// that the replaced tree did not track, so it was not overwritten.
+    pub kept: Vec<String>,
+}
+
 /// Of `paths`, those that exist in the tree at `root` as plain files and whose
 /// file on disk has exactly the blob's bytes: what an interrupted widen wrote
 /// and nobody changed since. A file that merely has the same bytes but was
@@ -836,13 +841,7 @@ pub(crate) fn recorded_paths_laid(
         if perms & PROTECTED != 0 {
             continue;
         }
-        let Ok(Object::Blob(bytes)) = store.get(&blob_id) else {
-            continue;
-        };
-        let full = safe_join(&layout.root, path)?;
-        // A symlink is never ours, and a read error reads as "not laid".
-        let is_file = full.symlink_metadata().is_ok_and(|m| m.is_file());
-        if is_file && std::fs::read(&full).is_ok_and(|disk| disk[..] == bytes[..]) {
+        if disk_is_blob(&safe_join(&layout.root, path)?, &blob_id) {
             laid.insert(path.clone());
         }
     }
@@ -1016,8 +1015,74 @@ pub(crate) fn materialize_with_old_view(
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
     old_view: Option<&Sparse>,
-    mut cache: Option<&mut ProtectedCache>,
+    cache: Option<&mut ProtectedCache>,
 ) -> Result<Vec<String>> {
+    Ok(materialize_impl(
+        layout,
+        store,
+        target_root,
+        old_root,
+        protection,
+        identity,
+        sparse,
+        old_view,
+        None,
+        cache,
+    )?
+    .skipped)
+}
+
+/// [`materialize`] for an abort, which restores a tip over a stopped
+/// operation's result (`old_root`, the tree the working tree reflects). The
+/// stop's own files go and the rest stay: `owned` is what the stop recorded
+/// writing in plaintext (`CONFLICT_PLAINTEXT`), which cannot be compared with
+/// a tree, so a protected path is removed only if it is there. An in-view
+/// path the restored tree needs but the replaced tree did not track is
+/// written only if nothing of the user's stands there. What it left is in
+/// [`Materialized::kept`] (#255).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_restore(
+    layout: &Layout,
+    store: &mut Store,
+    target_root: ObjectId,
+    old_root: Option<ObjectId>,
+    protection: &Protection,
+    sparse: &Sparse,
+    owned: &BTreeSet<String>,
+) -> Result<Materialized> {
+    materialize_impl(
+        layout,
+        store,
+        target_root,
+        old_root,
+        protection,
+        None,
+        sparse,
+        None,
+        Some(owned),
+        None,
+    )
+}
+
+// The rule for removing a file the old tree tracks: it goes only if the
+/// disk copy is still exactly the tracked bytes (so an edit, a replacement or
+/// a symlink the user put there survives), or, for a protected path (whose
+/// plaintext cannot be compared without a key), if the caller is not
+/// restoring or the stop recorded it. A path outside the view is never
+/// reported: nothing is laid there, so a copy is the user's own (#256).
+#[allow(clippy::too_many_arguments)]
+fn materialize_impl(
+    layout: &Layout,
+    store: &mut Store,
+    target_root: ObjectId,
+    old_root: Option<ObjectId>,
+    protection: &Protection,
+    identity: Option<&scl_crypto::SecretKey>,
+    sparse: &Sparse,
+    old_view: Option<&Sparse>,
+    restore_owned: Option<&BTreeSet<String>>,
+    mut cache: Option<&mut ProtectedCache>,
+) -> Result<Materialized> {
     // Fail before the first write if the view's closure is not all present
     // (partial clones only; ADR-0048). The check lives here so every caller
     // is covered and none can forget it.
@@ -1038,6 +1103,9 @@ pub(crate) fn materialize_with_old_view(
     // Set when an interrupted `sparse set`'s marker widened the removal bound;
     // cleared once this call has finished laying the tree out under `sparse`.
     let mut prev_marker_used = false;
+    let mut kept = Vec::new();
+    // Paths the replaced tree tracks (within the removal walk's bound).
+    let mut old_tracked: BTreeSet<String> = BTreeSet::new();
     if let Some(old) = old_root {
         // The old-root removal walk: bounded by the spec the old root was
         // laid out under (`old_view`, or `sparse` itself when the spec is
@@ -1064,11 +1132,30 @@ pub(crate) fn materialize_with_old_view(
             None => (Sparse::default(), false),
         };
         let old_files = if partial {
-            tree_file_ids_sparse_present(store, old, &old_walk_bound)?
+            tree_file_entries_with_perms_sparse_present(store, old, &old_walk_bound)?
         } else {
-            tree_file_ids_sparse(store, old, &old_walk_bound)?
+            tree_file_entries_with_perms_sparse(store, old, &old_walk_bound)?
         };
         let gone = |p: &str| !target.contains_key(p) || !sparse.matches(p);
+        // Decide every removal before the first one: which gone files are
+        // still the tree's own bytes, and so ours to delete.
+        let mut removals: BTreeSet<&str> = BTreeSet::new();
+        for (p, (blob_id, _, perms)) in old_files.iter().filter(|(p, _)| gone(p)) {
+            let full = safe_join(&layout.root, p)?;
+            if full.symlink_metadata().is_err() {
+                continue;
+            }
+            let ours = if perms & PROTECTED != 0 {
+                restore_owned.is_none_or(|owned| owned.contains(p))
+            } else {
+                disk_is_blob(&full, blob_id)
+            };
+            if ours {
+                removals.insert(p);
+            } else if sparse.matches(p) {
+                kept.push(p.clone());
+            }
+        }
         // Before the first removal: a directory a target file must replace
         // may hold only directories and files this pass is about to delete.
         // Anything else is the user's, and refusing now (rather than at the
@@ -1076,7 +1163,7 @@ pub(crate) fn materialize_with_old_view(
         for path in target.keys().filter(|p| sparse.matches(p)) {
             let full = safe_join(&layout.root, path)?;
             if full.symlink_metadata().is_ok_and(|m| m.is_dir())
-                && !dir_clearable(&full, path, &|c| old_files.contains_key(c) && gone(c))
+                && !dir_clearable(&full, path, &|c| removals.contains(c))
             {
                 return Err(Error::InvalidArgument(format!(
                     "cannot write {path}: a directory with untracked or ignored content stands \
@@ -1084,12 +1171,14 @@ pub(crate) fn materialize_with_old_view(
                 )));
             }
         }
-        for p in old_files.keys() {
-            if gone(p) {
-                let full = safe_join(&layout.root, p)?;
-                let _ = std::fs::remove_file(full);
+        for p in removals {
+            match std::fs::remove_file(safe_join(&layout.root, p)?) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
         }
+        old_tracked = old_files.into_keys().collect();
     }
     let mut skipped = Vec::new();
     for (path, (blob_id, mode, perms)) in &target {
@@ -1097,6 +1186,21 @@ pub(crate) fn materialize_with_old_view(
             continue;
         }
         let full = safe_join(&layout.root, path)?;
+        // A restore overwrites what the replaced tree tracked (the stop's
+        // markers, or a file the user edited, are discarded by design) and
+        // what the stop recorded, never a file or symlink of the user's at a
+        // path neither covers. A directory is for `clear` to judge.
+        if let Some(owned) = restore_owned {
+            if perms & PROTECTED == 0
+                && !old_tracked.contains(path)
+                && !owned.contains(path)
+                && full.symlink_metadata().is_ok_and(|m| !m.is_dir())
+                && !disk_is_blob(&full, blob_id)
+            {
+                kept.push(path.clone());
+                continue;
+            }
+        }
         let bytes = match store.get(blob_id)? {
             Object::Blob(b) => b,
             _ => continue,
@@ -1167,7 +1271,8 @@ pub(crate) fn materialize_with_old_view(
     if prev_marker_used {
         crate::sparse::clear_prev(layout)?;
     }
-    Ok(skipped)
+    kept.sort();
+    Ok(Materialized { skipped, kept })
 }
 
 #[cfg(test)]

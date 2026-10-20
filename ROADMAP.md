@@ -759,13 +759,14 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   later; both are documented limits, not regressions.
 - **Sparse untracked-file guard edge cases.** #241: on a case-insensitive
   filesystem the untracked-file guard can alias an old-view path with a newly
-  in-view one. #248: an untracked file at an out-of-view path that the other side adds wins
-  over the merge result at completion.
-- **Abort and private-merge stop bugs.** #246: `--abort` of a merge stopped on a
-  private branch fails with `WrongKind`, and a binary conflict's `.theirs`
-  sidecar is committed into the sealed tree. #247: `--abort` of a stopped
-  merge, pick or rebase fails with `IsADirectory` when the decided root replaced
-  a file with a directory.
+  in-view one.
+- **User-file safety limits (ADR-0034 refinement 8, ADR-0044).** A file whose
+  bytes equal the tracked or laid ones cannot be told from the stop's own
+  write, so it is removed. `merge --abort` of a private-branch merge, which
+  keeps no decided root, still overwrites a user file at a path the stop
+  removed from the tip, and treats a conflicted path as the stop's whatever
+  its bytes. Private forward operations (switch, fast-forward, clean merge)
+  remove in-view paths on the dirty check alone, without a byte comparison.
 - **Network-Git same-remote edge cases** (ADR-0018's re-synthesis
   limitation across different Git repos).
 - **Richer signer trust models** beyond trusted-key lists (delegation, expiry)

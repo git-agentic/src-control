@@ -287,6 +287,19 @@ transport-adjacent. The rest, imperatively:
   `.sc/sparse-widen` (local-only like the rest, removed with the spec write or
   the op); abort and completion delete what an interrupted widen laid outside
   the view.
+- **`materialize` deletes or overwrites a path only if it is the stop's own
+  file (ADR-0034 refinement 8, #255, #256).** A file the replaced tree tracks goes
+  only when the disk copy is a regular file with exactly the tracked bytes (an
+  edit, a replacement or a symlink survives); a path outside the sparse view is
+  never reported, since nothing is laid there and a copy is the user's. An
+  abort (`merge_abort`, `cherry_pick_abort`, `rebase_abort`; they return an
+  `AbortReport`) finishes anyway: it removes what the stop laid, leaves the
+  rest and lists it in `kept` (`sc` prints `left in place (changed since the
+  stop)`), and does not overwrite a user file at a tip path the stop's tree
+  lacked. Recorded plaintext (`CONFLICT_PLAINTEXT`, which now includes the
+  carried protected files a stop decrypted) and sidecars are removed whatever
+  their bytes, since an edit of them is the discarded resolution. Merge abort
+  compares against the decided root, not theirs' tree.
 - **A merge, switch, cherry-pick, rebase, undo or sparse-spec change refuses, before any write, to lay a file or
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
   away and retry. A directory holding only tracked files is not such a case: a file/directory change at one path crosses switch, undo, abort and `--continue`, and the emptied directories are cleared (#247). `materialize` checks every such directory before its first removal, so a refusal changes nothing and an abort stays retryable; a forward op also refuses a user's empty directory there (it cannot tell it from a husk), while `materialize` itself prunes empty ones. (On a case-insensitive checkout, replacing `foo/a` with a file `Foo` is refused: the check does not follow the case alias. Fail-closed.) On a sparse checkout the same holds for a path the result adds
@@ -307,7 +320,7 @@ truth — do not re-list items here); entries that name an issue mirror the open
 GitHub issues. Standing entries: named/concurrent `sc ws` sessions (#215),
 blob-size clone filters (#217), bucket compaction and gc (#216), the non-unix
 `.sc/local-key` ACL (#214), transcript-drop delivery gaps (#230), and the open
-sparse, private-branch and abort edge cases (#241, #246, #247, #248).
+sparse guard and user-file safety limits (#241, ADR-0034 refinement 8).
 
 ## Agent skills
 

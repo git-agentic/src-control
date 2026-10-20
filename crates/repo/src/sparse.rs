@@ -623,8 +623,8 @@ impl Repo {
     /// On completion this is what keeps the files out of the commit's input.
     /// On abort it only covers what the abort's own walk cannot see (an
     /// ours-only file, or a subtree never fetched for theirs): that walk
-    /// removes any out-of-view path theirs tracks regardless of bytes, by
-    /// design (abort restores ours). Returns whether a valid record existed.
+    /// follows the decided tree and applies the same byte rule (ADR-0034
+    /// refinement 8). Returns whether a valid record existed.
     pub(crate) fn remove_widen_residue(&self, decided: Option<scl_core::ObjectId>) -> Result<bool> {
         Ok(self.remove_widen_residue_keeping(decided)?.is_some())
     }

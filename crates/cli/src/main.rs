@@ -2173,6 +2173,17 @@ fn run_status(json: bool, identity: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Say what an abort did not restore: protected paths it has no key for, and
+/// files it left because they are no longer what the stop laid (#255).
+fn print_abort_report(report: &scl_repo::AbortReport) {
+    for path in &report.skipped {
+        eprintln!("skipped (no key): {path}");
+    }
+    for path in &report.kept {
+        eprintln!("left in place (changed since the stop): {path}");
+    }
+}
+
 fn run_merge(
     branch: Option<String>,
     abort: bool,
@@ -2187,11 +2198,9 @@ fn run_merge(
         } else {
             None
         };
-        let skipped = repo.merge_abort_with_identity(sk.as_ref())?;
+        let report = repo.merge_abort_with_identity(sk.as_ref())?;
         println!("merge aborted; working tree restored");
-        for path in &skipped {
-            eprintln!("skipped (no key): {path}");
-        }
+        print_abort_report(&report);
         return Ok(());
     }
     let branch = branch.ok_or_else(|| anyhow::anyhow!("merge: provide a branch or --abort"))?;
@@ -2232,11 +2241,9 @@ fn run_cherry_pick(
 ) -> Result<()> {
     let repo = open_repo()?;
     if abort {
-        let skipped = repo.cherry_pick_abort()?;
+        let report = repo.cherry_pick_abort()?;
         println!("cherry-pick aborted; working tree restored");
-        for path in &skipped {
-            eprintln!("skipped (no key): {path}");
-        }
+        print_abort_report(&report);
         return Ok(());
     }
     let refname = refname.ok_or_else(|| anyhow::anyhow!("cherry-pick needs a ref or --abort"))?;
@@ -2276,11 +2283,9 @@ fn run_rebase(
 ) -> Result<()> {
     let repo = open_repo()?;
     if abort {
-        let skipped = repo.rebase_abort()?;
+        let report = repo.rebase_abort()?;
         println!("rebase aborted; working tree restored");
-        for path in &skipped {
-            eprintln!("skipped (no key): {path}");
-        }
+        print_abort_report(&report);
         return Ok(());
     }
     // Soft-resolve like `run_merge`/`run_cherry_pick`: a missing identity file
