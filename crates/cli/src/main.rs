@@ -363,8 +363,9 @@ enum Cmd {
         /// Largest single object accepted from a peer: bytes, or a number
         /// with a KiB/MiB/GiB suffix. Default 256MiB, range 2MiB to 1GiB;
         /// out-of-range values are refused at startup, never clamped. Clients
-        /// set the same limit with `SC_MAX_OBJECT_SIZE`; both ends must
-        /// agree, since a larger object fails at the receiver. (#213)
+        /// set it with `SC_MAX_OBJECT_SIZE`. Each receiver applies its own
+        /// cap, so a larger object fails at whichever side is receiving it.
+        /// (#213)
         #[arg(long, value_name = "SIZE")]
         max_object_size: Option<String>,
         /// Serve TLS (`sc+https://`): auto-mints a self-signed identity into

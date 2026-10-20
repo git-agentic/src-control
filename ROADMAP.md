@@ -796,7 +796,7 @@ scale-&-reach horizon):
 - **`--max-object-size` operator knob — shipped (#213, ADR-0039 addendum).**
   `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE` set the per-object cap
   (default 256 MiB, range 2 MiB to 1 GiB, out of range aborts startup). No wire
-  negotiation: both ends must agree.
+  negotiation: each receiver applies its own cap.
 - **P28 review follow-ons — shipped.** `refs::write_head`/`delete_branch` run
   `validate_branch_name`; `SC_PACK_CHUNK` is clamped to the object cap minus one (a chunk frame carries a tag byte too; an
   oversized value used to make every transfer fail with a confusing receiver

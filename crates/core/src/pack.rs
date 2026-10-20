@@ -281,8 +281,9 @@ fn decompress_and_decode(payload: &[u8], id: &ObjectId, max: Option<usize>) -> R
         Some(max) => {
             let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(payload))
                 .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-            let canonical = crate::read_limited(&mut decoder, max + 1, payload.len() * 4)
-                .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+            let canonical =
+                crate::read_limited(&mut decoder, max + 1, payload.len().saturating_mul(4))
+                    .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
             if canonical.len() > max {
                 return Err(Error::PackCorrupt(format!(
                     "decompressed object exceeds the {max}-byte object size limit ({})",
@@ -427,10 +428,15 @@ pub fn parse_pack_reader_max<R: Read>(
         // still decompress to an enormous plaintext (a "zstd bomb"). Read at
         // most max + 1 bytes so we can detect and reject an
         // over-cap output without ever materializing it in full.
-        let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(&payload))
-            .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-        let canonical = crate::read_limited(&mut decoder, max + 1, payload.len() * 4)
-            .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+        let canonical = {
+            let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(&payload))
+                .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
+            crate::read_limited(&mut decoder, max + 1, payload.len().saturating_mul(4))
+                .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?
+        };
+        // Release the compressed copy before decoding, so peak per record is
+        // decompressed + decoded (about 2 x cap), not three copies.
+        drop(payload);
         if canonical.len() > max {
             return Err(Error::PackCorrupt(format!(
                 "decompressed object exceeds the {max}-byte object size limit ({})",
@@ -444,6 +450,7 @@ pub fn parse_pack_reader_max<R: Read>(
             )));
         }
         let obj = Object::decode(&canonical)?;
+        drop(canonical);
         f(actual_id, obj)?;
     }
 }

@@ -147,11 +147,12 @@ default of 256 MiB. Decisions:
    env. An empty `SC_MAX_OBJECT_SIZE` counts as unset. The setting is fixed
    by whichever comes first, the startup `set_max_object_size` or the first
    `max_object_size()` read; a later, different value is an error. There is no handshake field and no
-   `PROTOCOL_VERSION` bump: matching the two ends is an operator
-   responsibility, because an object larger than the receiver's cap fails at
-   the receiver. The failure is loud and typed, never silent truncation, and
+   `PROTOCOL_VERSION` bump: the operator must make each receiver's cap
+   admit the objects it will receive, because an object larger than the
+   receiver's cap fails at the receiver (only the receiving side's cap applies
+   to incoming frames and records). The failure is loud and typed, never silent truncation, and
    the frame and pack-record errors name `SC_MAX_OBJECT_SIZE` /
-   `--max-object-size` as the thing to align.
+   `--max-object-size` as the thing to raise on the refusing side.
 3. **Every guard reads the accessor.** Frame length (`wire::read_frame_max`);
    pack record compressed length and decompressed output
    (`pack::parse_pack_reader_max`, `read_object_at_bounded`); bucket pack
@@ -185,15 +186,22 @@ default of 256 MiB. Decisions:
 
 The resident-blob budget of a repo or transport store was a fixed 512 MiB; a
 raised cap would have admitted frames the store then refused with
-`BudgetExceeded`. It is now `max(512 MiB, 2 x cap)` (`repo::default_budget`),
-unchanged at the default. The env var therefore also changes that budget for
-every local command, not just transfers. Raising the cap raises the memory a
-peer can make a receiver hold per connection, in two parts: transient pack
-decode memory (the record is held compressed, then decompressed, then decoded
-into an object, up to about 3 x cap) plus that connection's own store budget
-(each served connection opens its own store, `max(512 MiB, 2 x cap)`). At
-the default that is about 0.75 GiB + 0.5 GiB; at the 1 GiB ceiling about
-3 GiB + 2 GiB, per connection, times `--max-connections` (THREAT-MODEL.md).
+`BudgetExceeded`. The default is now `max(512 MiB, 2 x cap)`
+(`repo::default_budget`), unchanged at the default cap. It applies to
+`Repo::open`/`init` and to `LocalTransport` (so also to a served connection).
+The env var therefore changes the default budget of every local command that
+opens a repo, not just transfers. An explicit budget (`sc work --budget-mb`,
+`Repo::open_with_budget`) overrides the default and can be smaller than an
+object.
+
+Raising the cap raises the memory a peer can make a receiver hold per
+connection, in two parts: transient pack decode memory (compressed +
+decompressed while decompressing, then decompressed + decoded while decoding,
+the compressed copy being released in between: peak about 2 x cap) plus that
+connection's own store budget (each served connection opens its own store,
+`max(512 MiB, 2 x cap)`). At the default that is about 0.5 GiB + 0.5 GiB; at
+the 1 GiB ceiling about 2 GiB + 2 GiB, per connection, times
+`--max-connections` (THREAT-MODEL.md).
 
 For `ssh://` remotes the client builds the remote `sc serve --stdio` command
 itself and ssh does not forward the environment, so the server end of an ssh

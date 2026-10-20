@@ -273,23 +273,23 @@ protocol error, because the stream is no longer in sync.
 
 ### 5. Reply size limits
 
-37a left a mismatch: the client reads at most 1 GiB per by-id reply while the
-server default `--max-pack-size` is larger, and the server sums canonical
+37a left a mismatch: the client read at most 1 GiB per by-id reply (4 GiB since
+#213) while the server default `--max-pack-size` is larger, and the server sums canonical
 object sizes while the client counts pack bytes (36-byte record headers plus
 zstd framing). Decisions:
 
 - The server caps a `GetObjects` reply, measured in canonical size, at
-  `min(--max-pack-size, 512 MiB)` where a `--max-pack-size` of 0 means
-  unlimited. Headroom to the client's 1 GiB read cap covers framing and
-  incompressible data. (#213 later made both constants independent of the
-  object cap: reply ceiling 2 GiB, client read cap 4 GiB. See ADR-0039.)
+  `min(--max-pack-size, 2 GiB)` where a `--max-pack-size` of 0 means
+  unlimited. Headroom to the client's 4 GiB read cap covers framing and
+  incompressible data. (Originally 512 MiB and 1 GiB; #213 made both
+  constants independent of the object cap, see the ADR-0039 addendum.)
 - The cap applies to `LocalTransport::get_objects` as well, which today builds
   with no limit (`build_objects_tempfile(ids, 0)`). A lazy clone whose promisor
   is a local path would otherwise spool up to 1024 large blobs in one request.
 - The over-cap refusal happens before any pack byte is written, so the
   connection stays in sync. The client splits the batch in half and retries.
   A batch of one that is still refused is final and is returned as an error;
-  splitting never loops. (An object above `MAX_OBJECT_SIZE`, or above a small
+  splitting never loops. (An object above the max object size, or above a small
   `--max-pack-size`, can exist on an origin.)
 - The 37a handling for a stream abandoned mid-reply (kill the ssh child, drop
   the connection) stays as the backstop.

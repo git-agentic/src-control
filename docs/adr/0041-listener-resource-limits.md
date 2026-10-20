@@ -56,11 +56,11 @@ scoped to the listener (`--stdio` is unaffected except where noted):
    stall trips it, not a slow-but-moving transfer. The opening keeps its
    existing, unchanged 30s.
 
-3. **`--max-pack-size <bytes>` (default 16 GiB, 0 = unlimited, floor 256 MiB
-   = `MAX_OBJECT_SIZE`).** Applies to **both** `--http` and `--stdio` — it
+3. **`--max-pack-size <bytes>` (default 16 GiB, 0 = unlimited, floor = the max
+   object size, 256 MiB by default).** Applies to **both** `--http` and `--stdio` — it
    lives in `WirePolicy` (`crates/repo/src/wire.rs`), the shared layer both
    transports call into, not in `ServeLimits` (the `--http`-only listener
-   config). A configured non-zero value below `MAX_OBJECT_SIZE` is rejected
+   config). A configured non-zero value below the max object size (`scl_core::max_object_size()`, configurable since #213, ADR-0039 addendum) is rejected
    as invalid config at startup. Enforcement is a counted mid-stream abort in
    the pack-stream readers (mirroring git's `receive.maxInputSize`): once the
    running total crosses the cap, the reader stops, a best-effort

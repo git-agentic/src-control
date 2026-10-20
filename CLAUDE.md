@@ -167,8 +167,8 @@ transport-adjacent. The rest, imperatively:
   `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE` set it, range 2 MiB to
   1 GiB, out of range aborts startup, ADR-0039 addendum) guards the
   transfer path only — a larger blob commits locally but fails every
-  subsequent push/fetch/clone at the receiver. There is no negotiation: both
-  ends must agree. Never inline a size in a new length guard; read the accessor.
+  subsequent push/fetch/clone at the receiver. There is no negotiation: each
+  receiver applies its own cap, so it must admit the objects it receives. Never inline a size in a new length guard; read the accessor.
 - **The P35 desktop app is a keyless, read-only top-level adapter.** Its
   renderer has five typed repository commands, no general filesystem/shell
   capability, and no DTO field capable of carrying protected ciphertext or

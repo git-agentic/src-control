@@ -433,20 +433,29 @@ too, not just the src-control-side metadata.
   **Accepted boundaries:**
   - The cap is a *transfer-path* guard. A locally-committed blob above it
     commits fine but cannot be transferred.
-  - **Both ends must agree.** There is no negotiation and no protocol bump. An
-    object above the receiver's cap is refused there, loudly. A server raised
+  - **The receiver's cap must admit the object.** There is no negotiation and
+    no protocol bump, and only the receiving side's cap applies to incoming
+    frames and records (a default server serves a 3 MiB object to a client
+    capped at 4 MiB). An object above the receiver's cap is refused there,
+    loudly, with an error naming `SC_MAX_OBJECT_SIZE`. A server raised
     to 1 GiB accepts a peer's gigabyte claim only if that peer sends the bytes,
     but then holds that object in memory. Raising the cap raises
-    per-connection memory in two parts. Transient pack-decode memory: a
-    record is held compressed, then decompressed, then decoded, up to about
-    3 x cap. Plus the connection's own store budget, `max(512 MiB, 2 x cap)`,
-    because each served connection opens its own store. That is about
-    0.75 GiB + 0.5 GiB per connection at the default and about 3 GiB + 2 GiB
-    at the 1 GiB ceiling, times `--max-connections` (default 32); size
-    `--max-connections` down when raising the cap. Lowering the cap below a
-    repository's largest object makes that repository unpushable until it is
-    restored. `SC_MAX_OBJECT_SIZE` also sets the store budget of every local
-    command, not only transfers.
+    per-connection memory in two parts. Transient pack-decode memory: a record
+    holds its compressed payload plus the decompressed output (each up to the
+    cap) while decompressing, then the decompressed output plus the decoded
+    object while decoding (the compressed copy is released first), so the peak
+    is about 2 x cap. Plus the connection's own store budget,
+    `max(512 MiB, 2 x cap)`, because each served connection opens its own
+    store. That is about 0.5 GiB + 0.5 GiB per connection at the default and
+    about 2 GiB + 2 GiB at the 1 GiB ceiling, and it multiplies by
+    `--max-connections` (default 32); size `--max-connections` down when
+    raising the cap. Lowering the cap below a repository's largest object
+    makes that repository unpushable until it is restored. `SC_MAX_OBJECT_SIZE`
+    also sets the default store budget of every local command that opens a
+    repo or serves one (`Repo::open`, `LocalTransport`), not only transfers.
+    An explicit budget overrides it: `sc work --budget-mb` and
+    `Repo::open_with_budget` use exactly the size given, and one smaller than
+    an object fails with `BudgetExceeded`.
   - **One length is checked after allocation:** bucket WAL metadata (manifest,
     log entry, idx) is capped at a fixed 256 MiB after the bucket GET has
     buffered it, so it bounds decode work, not the download. It is not tied to

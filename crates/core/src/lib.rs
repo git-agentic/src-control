@@ -24,9 +24,9 @@ pub const DEFAULT_MAX_OBJECT_SIZE: usize = 256 * 1024 * 1024;
 /// 1 MiB cap would refuse, so anything lower cannot talk to a default peer.
 pub const MIN_MAX_OBJECT_SIZE: usize = 2 * 1024 * 1024;
 
-/// What to tell an operator whose peer refused (or was refused by) the cap:
-/// there is no negotiation, so both ends must use the same value.
-pub const OBJECT_SIZE_HINT: &str = "peer mismatch? both ends must use the same max object size: set SC_MAX_OBJECT_SIZE (or `sc serve --max-object-size`) to the same value";
+/// What to tell an operator whose receiver refused an object: there is no
+/// negotiation, and each receiver applies its own cap to what it accepts.
+pub const OBJECT_SIZE_HINT: &str = "only the receiving side's cap applies: raise SC_MAX_OBJECT_SIZE (or `sc serve --max-object-size` on a server) on the side that is refusing";
 
 /// Hard ceiling for the operator-set object cap (1 GiB). Compile-time, so no
 /// flag or env value can make a hostile peer's allocation claim unbounded.
