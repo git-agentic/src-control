@@ -196,6 +196,13 @@ fn permanent(e: &Error) -> bool {
     )
 }
 
+/// Whether a pre-#257 index is waiting to be imported. Anything that judges
+/// tombstones against the index must not run meanwhile: it would see no
+/// signatures and record the trust as judged.
+pub(crate) fn migration_pending(layout: &Layout) -> bool {
+    layout.signatures_legacy_path().exists() && !layout.signatures_path().exists()
+}
+
 /// Import a pre-#257 `.sc/signatures` (no signer column) into the v2 index,
 /// once. The signer comes from the signature object, and each entry goes
 /// through [`acceptable`] again: an index written before #230 may hold
@@ -1193,6 +1200,14 @@ mod tests {
         std::fs::remove_file(layout.signatures_path()).unwrap();
         std::fs::write(layout.signatures_legacy_path(), legacy).unwrap();
         crate::transcripts::tests::trust_signer(&repo, &owner);
+        // While the import is pending (e.g. it failed), a trust pass must
+        // neither honor nor record the trust as judged.
+        {
+            let arc = repo.store_arc();
+            let mut store = arc.lock().unwrap();
+            crate::transcripts::reevaluate_if_trust_changed(&layout, &mut store).unwrap();
+        }
+        assert!(crate::transcripts::trust_changed(&layout));
         drop(repo);
 
         let repo = Repo::open(&root).unwrap();

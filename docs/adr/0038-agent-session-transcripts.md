@@ -633,7 +633,9 @@ scan in `tombstone_honored` never reached it. Now:
 - **Failed migration.** `Repo::open` and `LocalTransport::open` ignore a
   failed import (for example a read-only `.sc/`), and until it succeeds the
   index reads as empty: signatures read `Unsigned` and a served repo forwards
-  none. Every writer and gc retry the import and fail rather than proceed.
+  none. The trust re-evaluation does not run while an import is pending, so it
+  cannot record the trust as judged against an empty index. Every writer and
+  gc retry the import and fail rather than proceed.
   An object that is gone or will not decode is dropped from the import like
   any entry that does not verify, so one bad object does not block it; only a
   transient I/O error fails it.

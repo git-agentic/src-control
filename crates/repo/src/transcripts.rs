@@ -288,7 +288,7 @@ pub(crate) fn reevaluate_if_trust_changed(
 ) -> Result<usize> {
     let trusted = trusted_signers(layout);
     let fp = fp_of(&trusted);
-    if !needs_judging(layout, &fp) {
+    if !needs_judging(layout, &fp) || crate::signatures::migration_pending(layout) {
         return Ok(0);
     }
     // The pass rewrites the pending list, so it runs under the index lock.
