@@ -153,7 +153,10 @@ default of 256 MiB. Decisions:
    to incoming frames and records). The failure is loud and typed, never silent truncation, and
    the frame and pack-record errors name `SC_MAX_OBJECT_SIZE` /
    `--max-object-size` as the thing to raise on the refusing side.
-3. **Every guard reads the accessor.** Frame length (`wire::read_frame_max`);
+3. **Every guard reads the accessor.** Frame length (`wire::read_frame_max`,
+   limit `cap + FRAME_OVERHEAD`, 64 bytes, so an object of exactly the cap fits
+   inside its `PutObject`/`GetObject` envelope; `wire::check_object_len` then
+   checks the object body against the cap exactly);
    pack record compressed length and decompressed output
    (`pack::parse_pack_reader_max`, `read_object_at_bounded`); bucket pack
    bodies (`bucket_transport::object_bytes`); server-side servable-size check
@@ -199,7 +202,9 @@ object.
 Raising the cap raises the memory a peer can make a receiver hold per
 connection, in two parts: transient pack decode memory (compressed +
 decompressed while decompressing, then decompressed + decoded while decoding,
-the compressed copy being released in between: peak about 2 x cap) plus that
+the compressed copy being released in between: peak about 2 x cap; a
+single-object `PutObject` or `GetObject` is also about 2 x cap, the request
+frame being moved into the object body rather than copied) plus that
 connection's own store budget (each served connection opens its own store,
 `max(512 MiB, 2 x cap)`). At the default that is about 0.5 GiB + 0.5 GiB; at
 the 1 GiB ceiling about 2 GiB + 2 GiB, per connection, times
