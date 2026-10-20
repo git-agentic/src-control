@@ -86,6 +86,78 @@ fn bucket_clone_push_fetch_round_trip_and_url_validation() {
     }
 }
 
+/// #216: `sc remote compact` merges and sweeps a bucket remote, `--dry-run`
+/// writes nothing, a default grace window deletes nothing young, and a
+/// non-bucket remote is refused. A clone and a fetch still work afterwards.
+#[test]
+fn remote_compact_merges_and_sweeps_a_bucket_and_clones_still_work() {
+    let a = tmp("compact-a");
+    let bucket = tmp("compact-bucket");
+    let local = tmp("compact-local");
+    let url = format!("sc+wal://{}", bucket.display());
+    assert!(sc(&a, &["init"]).status.success());
+    assert!(sc(&a, &["remote", "add", "origin", &url]).status.success());
+    assert!(sc(&a, &["remote", "add", "plain", local.to_str().unwrap()])
+        .status
+        .success());
+    for i in 0..3 {
+        std::fs::write(a.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
+        assert!(sc(&a, &["commit", "-m", &format!("c{i}")]).status.success());
+        assert!(sc(&a, &["push", "origin"]).status.success());
+    }
+    let count = |sub: &str| std::fs::read_dir(bucket.join(sub)).unwrap().count();
+    let (logs, packs) = (count("log"), count("packs"));
+    assert_eq!((logs, packs), (3, 6), "3 pushes: 3 entries, 3 packs + idx");
+
+    // dry run: reports the plan, changes nothing
+    let out = sc(&a, &["remote", "compact", "origin", "--dry-run"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("[dry run]") && text.contains("would merge 3 pack(s) into 1"),
+        "{text}"
+    );
+    assert_eq!((count("log"), count("packs")), (logs, packs));
+
+    // default 24h grace: merges, but deletes nothing young
+    let out = sc(&a, &["remote", "compact", "origin"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("merged 3 pack(s) into 1") && text.contains("kept 3 unreferenced"),
+        "{text}"
+    );
+    assert_eq!(
+        count("packs"),
+        8,
+        "3 old packs kept for the grace window + the merged one"
+    );
+
+    // zero grace: sweeps the old packs and the log
+    let out = sc(&a, &["remote", "compact", "origin", "--prune-expire", "0s"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!((count("log"), count("packs")), (0, 2));
+
+    // refuses a non-bucket remote and an unknown one
+    assert!(!sc(&a, &["remote", "compact", "plain"]).status.success());
+    assert!(!sc(&a, &["remote", "compact", "nope"]).status.success());
+
+    // the compacted bucket still clones and fetches
+    let parent = tmp("compact-parent");
+    let b = parent.join("b");
+    let out = sc(&parent, &["clone", &url, b.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(std::fs::read(b.join("f2.txt")).unwrap(), b"content 2");
+    std::fs::write(b.join("g.txt"), b"after compact").unwrap();
+    assert!(sc(&b, &["commit", "-m", "c3"]).status.success());
+    assert!(sc(&b, &["push", "origin"]).status.success());
+    assert!(sc(&a, &["fetch", "origin"]).status.success());
+
+    for d in [&a, &bucket, &local, &parent] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// #229: a signed snapshot pushed to a bucket keeps its signature on a fresh
 /// clone, so `sc verify --require` passes there once the signer is trusted
 /// (trust is local config, written into the clone).

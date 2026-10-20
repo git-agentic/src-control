@@ -160,7 +160,13 @@ impl Bucket for DirBucket {
         }
         validate_key(prefix.trim_end_matches('/'))?;
         let mut out = Vec::new();
-        walk(&self.root, &self.root, &mut out)?;
+        // Keys live under their directory, so start the walk at the prefix's
+        // directory part instead of scanning the whole bucket.
+        let start = match prefix.rsplit_once('/') {
+            Some((dir, _)) => self.root.join(dir),
+            None => self.root.clone(),
+        };
+        walk(&start, &self.root, &mut out)?;
         out.retain(|m| m.key.starts_with(prefix));
         out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
