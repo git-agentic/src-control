@@ -1851,7 +1851,7 @@ impl Repo {
             if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !sparse.matches(r)) {
                 return Err(Error::InvalidArgument(format!(
                     "{op} has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
-                     {widen}, or run `sc backfill --all`"
+                     {widen}"
                 )));
             }
         }
@@ -5511,6 +5511,7 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test repository must leave no residue");
     }
 
     #[test]
