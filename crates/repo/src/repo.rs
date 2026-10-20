@@ -2247,6 +2247,9 @@ impl Repo {
     ) -> Result<()> {
         // `rel` is not in `old`, and a tree holds no file at an ancestor of
         // another of its paths, so nothing on the way is a tracked file.
+        // Relies on `stop_write_blocker` treating whatever stands at `rel` (any
+        // directory included) as the user's: nothing outside the view is laid
+        // out, so no tracked file can be on disk there.
         let mut is_tracked = |_: &str| false;
         for rel in target
             .iter()

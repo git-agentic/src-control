@@ -291,7 +291,7 @@ transport-adjacent. The rest, imperatively:
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
   away and retry. On a sparse checkout the same holds for a path the result adds
   outside the view (a later commit would take the user's file instead, #248).
-  Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded (except that a private stop refuses a `.theirs` sidecar that would land on an existing file, and an out-of-view addition under a file on disk, #248).
+  Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded (except that a private stop refuses a `.theirs` sidecar that would land on an existing file).
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first. A push into a repo with a stopped op is

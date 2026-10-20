@@ -271,5 +271,5 @@ every claim below is checked against the shipped code, not the plan.
    for an edited tracked file (refinement 5). On a partial clone the guard sees
    only the subtrees the store holds, so an addition inside a carried, absent
    subtree is not checked; it is not silent, because the commit then fails with
-   `GappedPathContent` naming the path (move the file away and retry). Pinned by `sparse_completion.rs`
+   `GappedPathContent` naming the path (move the file away and retry). Refusing up front would mean fetching or guessing the absent subtree's paths (a disk probe under a changed absent directory would refuse unrelated files), so the limit stays. Pinned by `sparse_completion.rs`
    and `private_sparse.rs`.
