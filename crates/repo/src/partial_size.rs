@@ -38,6 +38,16 @@ fn text(edits: &[(usize, &str)]) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Remove fixture directories and assert they are gone.
+fn remove_all(dirs: &[&std::path::Path]) {
+    for d in dirs {
+        if d.exists() {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+        assert!(!d.exists(), "fixture {} must be removed", d.display());
+    }
+}
+
 fn huge(tag: u8) -> Vec<u8> {
     vec![tag; 8192]
 }
@@ -200,9 +210,7 @@ fn boundary_is_inclusive_and_zero_keeps_only_tip_blobs() {
     );
     drop(zero);
     drop(origin);
-    for r in [&origin_root, &clone_root, &zero_root] {
-        std::fs::remove_dir_all(r).unwrap();
-    }
+    remove_all(&[&origin_root, &clone_root, &zero_root]);
 }
 
 /// A clone that combines a prefix with a limit: the prefix decides scope, the
@@ -312,7 +320,7 @@ fn scope_and_limit_round_trip_through_the_markers() {
     crate::promisor::store(&layout, &crate::Promisor::new("o", vec![])).unwrap();
     std::fs::write(layout.promisor_blob_limit_path(), "limit nope\n").unwrap();
     assert!(crate::promisor::load(&layout).is_err());
-    std::fs::remove_dir_all(&root).unwrap();
+    remove_all(&[&root]);
 }
 
 /// Widening an all-paths scope is a no-op, and widening a prefix scope keeps
@@ -399,9 +407,7 @@ fn gc_verify_and_push_work_on_a_size_limited_clone() {
     assert_eq!(origin.head_tip().unwrap(), Some(tip));
     assert!(origin.snapshot(&tip).is_ok());
     drop(origin);
-    for r in [&origin_root, &clone_root] {
-        std::fs::remove_dir_all(r).unwrap();
-    }
+    remove_all(&[&origin_root, &clone_root]);
 }
 
 /// A destination that is not a mirror lacks the gapped history, so the push is
@@ -427,7 +433,7 @@ fn push_to_a_non_mirror_refuses_on_a_size_gap() {
         other => panic!("expected PushGap, got {other:?}"),
     }
     drop(clone);
-    std::fs::remove_dir_all(&other_root).unwrap();
+    remove_all(&[&other_root]);
     sz.cleanup();
 }
 
@@ -494,9 +500,7 @@ fn a_tip_root_equal_to_an_older_subtree_is_still_expanded() {
     );
     drop(clone);
     drop(origin);
-    for r in [&origin_root, &clone_root] {
-        std::fs::remove_dir_all(r).unwrap();
-    }
+    remove_all(&[&origin_root, &clone_root]);
 }
 
 /// The walk itself: limit semantics at the `reachable` level, both orderings of

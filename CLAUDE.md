@@ -185,7 +185,7 @@ transport-adjacent. The rest, imperatively:
   renderer has five typed repository commands, no general filesystem/shell
   capability, and no DTO field capable of carrying protected ciphertext or
   identity material.
-- **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (both allowed on a size-only `AllPaths` clone, ADR-0055; and, on a non-lazy clone, one outside the filter), `sc rewrap`,
+- **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (and `sparse disable`; both are allowed on a size-only `AllPaths` clone, ADR-0055), on a non-lazy clone a `sparse set` outside the filter, `sc rewrap`,
   `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view (a `.theirs` sidecar sits beside its conflicted path, so it is in view whenever that path is; ADR-0049) (no ref, state or working-tree change; on every clone, a conflict stop that needs sealing outside the view is refused the same way), `sc push` to a git remote, and
   `sc fetch` from any native remote but the promisor origin.** `sc merge`, `sc cherry-pick` and `sc rebase` work, including conflicts inside the view (P37c). `sc ws` and `sc work` work too (ADR-0050): workspaces and agents see the clone's view only, and harvest lands through the same merge. `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what

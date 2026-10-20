@@ -25,6 +25,16 @@ fn tmp(tag: &str) -> PathBuf {
     d
 }
 
+/// Remove fixture directories and assert they are gone.
+fn remove_all(dirs: &[&Path]) {
+    for d in dirs {
+        if d.exists() {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+        assert!(!d.exists(), "fixture {} must be removed", d.display());
+    }
+}
+
 const OLD: &[u8] = &[b'o'; 4096];
 const NEW: &[u8] = &[b'n'; 4096];
 
@@ -76,8 +86,7 @@ fn size_limited_clone_checks_out_complete_and_reports_the_gap() {
     );
     assert!(sc(&dst, &["gc"]).status.success());
     assert!(sc(&dst, &["status"]).status.success());
-    std::fs::remove_dir_all(&src).unwrap();
-    std::fs::remove_dir_all(&dst).unwrap();
+    remove_all(&[&src, &dst]);
 }
 
 #[test]
@@ -129,9 +138,7 @@ fn lazy_and_backfill_repair_a_size_gap() {
     assert!(all.status.success(), "{}", stderr(&all));
     assert!(!dst2.join(".sc/promisor").exists());
     assert!(!dst2.join(".sc/promisor-blob-limit").exists());
-    for d in [&src, &dst, &dst2] {
-        std::fs::remove_dir_all(d).unwrap();
-    }
+    remove_all(&[&src, &dst, &dst2]);
 }
 
 #[test]
@@ -162,7 +169,7 @@ fn filter_grammar_errors_are_actionable() {
         "{}",
         stdout(&help)
     );
-    std::fs::remove_dir_all(&src).unwrap();
+    remove_all(&[&src]);
 }
 
 #[test]
@@ -190,7 +197,5 @@ fn a_bucket_remote_refuses_a_size_only_clone() {
         "{}",
         stderr(&out)
     );
-    for d in [&src, &bucket, &dst] {
-        let _ = std::fs::remove_dir_all(d);
-    }
+    remove_all(&[&src, &bucket, &dst]);
 }
