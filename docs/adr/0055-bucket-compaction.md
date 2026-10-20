@@ -115,9 +115,10 @@ Readers never take a lock and never need compaction to be quiet. The rule:
 
 This is sound because deletion only follows a manifest CAS that moved the
 tag: the sweep deletes only objects unreferenced by the manifest it read, and
-manifest tags never repeat (`head_seq` is strictly increasing and a fold
-raises `checkpoint_seq`, so the content hash cannot return to an earlier
-value; S3 ETags are content hashes). A reader that lost an object therefore
+manifest tags never repeat (every successful CAS strictly increases
+`(head_seq, checkpoint_seq)`, so the content cannot return to an earlier value,
+and an S3 ETag changes with the content, whether it is an MD5 or an opaque
+SSE value). A reader that lost an object therefore
 always finds a newer manifest on re-read. Object ids stay valid across the
 restart because consolidation preserves every object, only moving it to a new
 pack, so `get_pack`'s id lists computed before a restart remain valid.
@@ -137,9 +138,10 @@ store offers no atomic "delete if the manifest is unchanged". Two defenses:
 1. **Age.** The sweep removes an unreferenced pack only if its last-modified
    time is at least `grace` old (default 24 h). A writer's gap between upload
    and CAS is milliseconds to minutes.
-2. **Verify before commit.** `update_ref` checks (`list_meta("packs/<hash>.")`)
-   that each pending pack and idx still exist immediately before every
-   manifest CAS (after the log slot is claimed), and fails with a clear
+2. **Verify before commit.** `update_ref` checks (`exists`, a HEAD) that each
+   pending pack and idx still exist immediately before every manifest CAS
+   (after the log slot is claimed), so pushers need no list rights;
+   consolidation does the same for the packs it created, and fails with a clear
    retry-the-push error if not, instead of committing an entry that names a
    deleted pack. The window left is one bucket round trip.
 
@@ -176,7 +178,9 @@ it.
 ### Command surface
 
 `sc remote compact <name> [--dry-run] [--prune-expire <dur>]` (default
-`24h`, same flag and default as `sc gc`). It is the smallest surface: it needs
+`24h`, same flag and default as `sc gc`; a value under 1h is refused unless
+`--allow-short-grace` is given, because a short grace turns the residual limit
+below into an ordinary race). It is the smallest surface: it needs
 only the configured remote's URL, adds no wire verb, and is not reachable
 through `sc serve`, so a served bucket's clients can never trigger a delete.
 `--dry-run` plans phase 1 and phase 2 against the live bucket and prints what
@@ -195,7 +199,10 @@ The `Bucket` trait gains two methods, implemented by `DirBucket` and
 
 - `list_meta(prefix)`: keys with size and last-modified time, raw string
   prefix, sorted. S3 uses `ListObjectsV2`.
-- `delete(key)`: idempotent; an absent key is success.
+- `exists(key)`: a HEAD, read rights only. Used by the writer-side check.
+- `delete(key)`: idempotent; an absent key is success. On a versioned S3 bucket
+  a delete only adds a delete marker, so space comes back only with a
+  lifecycle rule that expires noncurrent versions.
 
 ## Consequences
 

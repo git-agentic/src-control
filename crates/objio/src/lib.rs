@@ -68,6 +68,8 @@ pub trait Bucket: Send {
     /// scope, so `packs/ab12.` matches `packs/ab12.pack`), with size and
     /// last-modified time, sorted by key.
     fn list_meta(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
+    /// Whether `key` exists (a HEAD: needs read rights only, no listing).
+    fn exists(&self, key: &str) -> Result<bool>;
     /// Remove `key`. Idempotent: an absent key is success.
     fn delete(&self, key: &str) -> Result<()>;
 }
@@ -149,6 +151,8 @@ pub fn contract_suite(b: &dyn Bucket) {
     assert!(age < std::time::Duration::from_secs(3600));
     assert_eq!(b.list_meta("packs/").unwrap().len(), 3);
     assert!(b.list_meta("nothing/").unwrap().is_empty());
+    assert!(b.exists("packs/ab12.pack").unwrap());
+    assert!(!b.exists("packs/zz.pack").unwrap());
     // delete: removes, is idempotent, touches only its key
     b.delete("packs/ab12.pack").unwrap();
     b.delete("packs/ab12.pack").unwrap();

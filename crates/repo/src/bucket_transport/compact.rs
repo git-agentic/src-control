@@ -10,7 +10,7 @@
 //! cold start reads.
 
 use super::{capped, BucketTransport};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::walfmt::{checkpoint_key, log_key, pack_key, Checkpoint, LogEntry, Manifest, MAX_LIST};
 use scl_core::pack::parse_pack_reader;
 use scl_core::ObjectId;
@@ -138,6 +138,8 @@ impl BucketTransport {
 
     /// Phase 1: merge small live packs and commit with one manifest CAS.
     fn consolidate(&self, opts: &CompactOptions, rep: &mut CompactReport) -> Result<()> {
+        // Manifest tag of an attempt that found a planned member pack missing.
+        let mut missing_on: Option<String> = None;
         'attempt: for _ in 0..MAX_ATTEMPTS {
             self.refresh()?;
             let (live, nrefs) = {
@@ -178,9 +180,9 @@ impl BucketTransport {
                 ));
                 return Ok(());
             }
-            rep.packs_merged = replaced.len();
-            rep.packs_created = groups.len();
             if opts.dry_run {
+                rep.packs_merged = replaced.len();
+                rep.packs_created = groups.len();
                 return Ok(());
             }
             let mut created = Vec::new();
@@ -188,7 +190,16 @@ impl BucketTransport {
                 let mut objects: BTreeMap<ObjectId, Vec<u8>> = BTreeMap::new();
                 for hash in group {
                     let Fetched::New { bytes, .. } = self.bucket.get(&pack_key(hash), None)? else {
-                        // Another compactor swept it: the plan is stale.
+                        // Either another compactor retired it (the manifest has
+                        // moved: replan) or the bucket is damaged (same manifest
+                        // twice: say so instead of retrying).
+                        let tag = self.view.borrow().as_ref().map(|v| v.tag.clone());
+                        if tag == missing_on {
+                            return Err(Error::Wal(format!(
+                                "pack {hash} on chain but body absent"
+                            )));
+                        }
+                        missing_on = tag;
                         continue 'attempt;
                     };
                     parse_pack_reader(std::io::Cursor::new(&bytes[..]), |id, obj| {
@@ -216,6 +227,7 @@ impl BucketTransport {
                     v.packs.clone(),
                 )
             };
+            let packs_now: BTreeSet<String> = packs.iter().cloned().collect();
             let mut seen = BTreeSet::new();
             let mut kept: Vec<String> = packs
                 .into_iter()
@@ -235,6 +247,11 @@ impl BucketTransport {
                         .into(),
                 );
                 return Ok(());
+            }
+            // Another compactor may have retired some of the packs we merged
+            // already: replan rather than publish a second copy of the same data.
+            if !replaced.is_subset(&packs_now) {
+                continue 'attempt;
             }
             let mut try_seq = head_seq + 1;
             let entry = LogEntry {
@@ -267,12 +284,17 @@ impl BucketTransport {
                 checkpoint_seq: seq,
                 head_branch,
             };
+            // A sweep by another compactor may have removed a merged pack that
+            // was a content-identical leftover; never commit a name that is gone.
+            self.ensure_packs_present(&created)?;
             if self
                 .bucket
                 .put_if_tag("manifest", &manifest.encode(), Some(&tag))?
                 .is_some()
             {
                 self.refresh()?;
+                rep.packs_merged = replaced.len();
+                rep.packs_created = created.len();
                 rep.checkpoint_seq = seq;
                 return Ok(());
             }

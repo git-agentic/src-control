@@ -815,6 +815,10 @@ enum RemoteOp {
         /// (e.g. 24h, 7d). Keep it well above any push's duration.
         #[arg(long, default_value = "24h")]
         prune_expire: String,
+        /// Allow a --prune-expire under 1h. Only safe while nothing pushes to
+        /// or fetches from the bucket: a push in flight can lose its pack.
+        #[arg(long)]
+        allow_short_grace: bool,
     },
 }
 
@@ -4126,8 +4130,15 @@ fn run_remote(op: RemoteOp) -> Result<()> {
             name,
             dry_run,
             prune_expire,
+            allow_short_grace,
         } => {
             let grace = parse_duration(&prune_expire)?;
+            if grace < std::time::Duration::from_secs(3600) && !allow_short_grace {
+                anyhow::bail!(
+                    "--prune-expire under 1h can delete a pack an in-flight push has uploaded but \
+                     not committed; pass --allow-short-grace only if nothing is pushing or fetching"
+                );
+            }
             let url = repo
                 .remotes()?
                 .into_iter()

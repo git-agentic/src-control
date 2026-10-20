@@ -120,7 +120,12 @@ impl Bucket for DirBucket {
     }
 
     fn list_meta(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
-        fn walk(dir: &Path, root: &Path, out: &mut Vec<ObjectMeta>) -> std::io::Result<()> {
+        fn walk(
+            dir: &Path,
+            root: &Path,
+            prefix: &str,
+            out: &mut Vec<ObjectMeta>,
+        ) -> std::io::Result<()> {
             let rd = match std::fs::read_dir(dir) {
                 Ok(rd) => rd,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -135,6 +140,15 @@ impl Bucket for DirBucket {
                 }) {
                     continue;
                 }
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                // Skip files outside the prefix before paying for a stat.
+                if entry.file_type()?.is_file() && !rel.starts_with(prefix) {
+                    continue;
+                }
                 // A concurrent delete/rename can remove the entry between the
                 // readdir and the stat; a key that is gone is just not listed.
                 let md = match std::fs::metadata(&p) {
@@ -143,14 +157,10 @@ impl Bucket for DirBucket {
                     Err(e) => return Err(e),
                 };
                 if md.is_dir() {
-                    walk(&p, root, out)?;
+                    walk(&p, root, prefix, out)?;
                 } else {
                     out.push(ObjectMeta {
-                        key: p
-                            .strip_prefix(root)
-                            .unwrap()
-                            .to_string_lossy()
-                            .replace('\\', "/"),
+                        key: rel,
                         size: md.len(),
                         modified: md.modified()?,
                     });
@@ -166,10 +176,14 @@ impl Bucket for DirBucket {
             Some((dir, _)) => self.root.join(dir),
             None => self.root.clone(),
         };
-        walk(&start, &self.root, &mut out)?;
+        walk(&start, &self.root, prefix, &mut out)?;
         out.retain(|m| m.key.starts_with(prefix));
         out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        Ok(self.key_path(key)?.is_file())
     }
 
     fn delete(&self, key: &str) -> Result<()> {

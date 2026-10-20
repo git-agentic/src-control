@@ -223,6 +223,21 @@ impl Bucket for S3Bucket {
         Ok(out)
     }
 
+    fn exists(&self, key: &str) -> Result<bool> {
+        let k = self.full_key(key)?;
+        match self.rt.block_on(
+            self.client
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&k)
+                .send(),
+        ) {
+            Ok(_) => Ok(true),
+            Err(e) if http_status(&e) == Some(404) => Ok(false),
+            Err(e) => Err(Error::Backend(format!("s3 head {k}: {e}"))),
+        }
+    }
+
     fn delete(&self, key: &str) -> Result<()> {
         let k = self.full_key(key)?;
         // S3 DeleteObject succeeds on an absent key, which is the contract.

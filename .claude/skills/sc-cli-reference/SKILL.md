@@ -365,7 +365,9 @@ cargo run --bin sc -- remote compact <name> [--dry-run] [--prune-expire 24h]
                                               # as `sc gc`; keep it well above any push's duration).
                                               # Needs bucket list + delete rights. --dry-run prints
                                               # the plan and writes nothing. Safe beside live
-                                              # pushes/fetches; run one at a time. Relieves the
+                                              # pushes/fetches; run one at a time. A --prune-expire under 1h is refused
+                                              # unless --allow-short-grace (only with no pushes
+                                              # or fetches running). Relieves the
                                               # 65536-pack checkpoint cap (not the ref cap)
 cargo run --bin sc -- serve --http <addr> <home> --store sc+wal://<dir>|sc+s3://<bucket>/<prefix>
                                               # serve a bucket remote over sc+http(s):// (P36c):

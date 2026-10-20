@@ -134,7 +134,22 @@ fn remote_compact_merges_and_sweeps_a_bucket_and_clones_still_work() {
     );
 
     // zero grace: sweeps the old packs and the log
-    let out = sc(&a, &["remote", "compact", "origin", "--prune-expire", "0s"]);
+    let refused = sc(&a, &["remote", "compact", "origin", "--prune-expire", "0s"]);
+    assert!(
+        !refused.status.success(),
+        "a zero grace needs an explicit opt-in"
+    );
+    let out = sc(
+        &a,
+        &[
+            "remote",
+            "compact",
+            "origin",
+            "--prune-expire",
+            "0s",
+            "--allow-short-grace",
+        ],
+    );
     assert!(out.status.success(), "{out:?}");
     assert_eq!((count("log"), count("packs")), (0, 2));
 

@@ -86,6 +86,9 @@ impl Bucket for Shared {
             })
             .collect())
     }
+    fn exists(&self, key: &str) -> scl_objio::Result<bool> {
+        Ok(self.0.map.lock().unwrap().contains_key(key))
+    }
     fn delete(&self, key: &str) -> scl_objio::Result<()> {
         self.0.map.lock().unwrap().remove(key);
         Ok(())
@@ -443,6 +446,10 @@ impl Bucket for FailAfter {
         self.tick()?;
         self.inner.list_meta(prefix)
     }
+    fn exists(&self, key: &str) -> scl_objio::Result<bool> {
+        self.tick()?;
+        self.inner.exists(key)
+    }
     fn delete(&self, key: &str) -> scl_objio::Result<()> {
         self.tick()?;
         self.inner.delete(key)
@@ -555,22 +562,32 @@ fn readers_and_writers_stay_consistent_while_compaction_runs() {
                 })
             })
             .collect();
-        let compactor = s.spawn(|| {
-            let t = open(&root);
-            let mut runs = 0u32;
-            while !done.load(Ordering::SeqCst) {
-                let rep = t
-                    .compact(&opts)
-                    .unwrap_or_else(|e| panic!("compactor: {e}"));
-                deleted.fetch_add(
-                    rep.logs_deleted + rep.checkpoints_deleted + rep.packs_deleted,
-                    Ordering::SeqCst,
-                );
-                runs += 1;
-                std::thread::sleep(Duration::from_millis(40));
-            }
-            runs
-        });
+        // Two compactors at once: the ADR promises that is safe (just wasteful).
+        let compactors: Vec<_> = (0..2)
+            .map(|_| {
+                s.spawn(|| {
+                    let t = open(&root);
+                    let mut runs = 0u32;
+                    while !done.load(Ordering::SeqCst) {
+                        match t.compact(&opts) {
+                            Ok(rep) => {
+                                deleted.fetch_add(
+                                    rep.logs_deleted + rep.checkpoints_deleted + rep.packs_deleted,
+                                    Ordering::SeqCst,
+                                );
+                            }
+                            // A rival's sweep took a pack this run was about to
+                            // name; the guard fails the run instead of committing.
+                            Err(Error::Remote(m)) if m.contains("removed from the bucket") => {}
+                            Err(e) => panic!("compactor: {e}"),
+                        }
+                        runs += 1;
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                    runs
+                })
+            })
+            .collect();
         for w in writers {
             w.join().unwrap();
         }
@@ -581,7 +598,9 @@ fn readers_and_writers_stay_consistent_while_compaction_runs() {
         for r in readers {
             r.join().unwrap();
         }
-        assert!(compactor.join().unwrap() > 2, "compactor barely ran");
+        for c in compactors {
+            assert!(c.join().unwrap() > 2, "compactor barely ran");
+        }
     });
     assert!(
         deleted.load(Ordering::SeqCst) > 0,
@@ -593,7 +612,13 @@ fn readers_and_writers_stay_consistent_while_compaction_runs() {
     open(&root).compact(&eager()).unwrap();
     assert_readable(&root, &expect);
     assert_eq!(keys(&root, "packs/").len(), 2, "all packs merged into one");
-    assert!(keys(&root, "log/").is_empty());
+    // Nothing at or below the head survives. A slot above it can: a rival
+    // compactor's lost CAS leaves its claimed entry as debris, swept once a
+    // checkpoint passes it.
+    let head = manifest(&root).head_seq;
+    assert!(keys(&root, "log/")
+        .iter()
+        .all(|k| seq_of(k).unwrap() > head));
     std::fs::remove_dir_all(&root).unwrap();
     assert!(!root.exists());
 }
@@ -619,7 +644,8 @@ fn a_reader_whose_view_was_swept_restarts_and_a_corrupt_bucket_still_fails() {
         .find(|k| k.ends_with(".pack"))
         .unwrap();
     mem.bucket().delete(&pack).unwrap();
-    assert!(open(&mem).object_bytes(&tip).is_err());
+    let err = open(&mem).object_bytes(&tip).unwrap_err();
+    assert!(format!("{err}").contains("body absent"), "{err}");
 }
 
 #[test]
@@ -661,6 +687,9 @@ fn a_cold_start_straddling_a_sweep_restarts_instead_of_failing() {
         }
         fn list_meta(&self, p: &str) -> scl_objio::Result<Vec<ObjectMeta>> {
             self.inner.list_meta(p)
+        }
+        fn exists(&self, k: &str) -> scl_objio::Result<bool> {
+            self.inner.exists(k)
         }
         fn delete(&self, k: &str) -> scl_objio::Result<()> {
             self.inner.delete(k)

@@ -390,6 +390,11 @@ impl BucketTransport {
                         index.insert(id, (hash.clone(), offset, length));
                     }
                 }
+                // Packs a compaction retired will never be asked about again.
+                {
+                    let live: std::collections::HashSet<&String> = packs.iter().collect();
+                    self.leaf_cache.borrow_mut().retain(|h, _| live.contains(h));
+                }
                 *self.view.borrow_mut() = Some(WalView {
                     tag,
                     manifest,
@@ -560,13 +565,12 @@ impl BucketTransport {
     /// (a compaction swept it as an unreferenced orphan after an unusually long
     /// gap, ADR-0055). Committing a log entry that names a deleted pack would
     /// corrupt the remote; failing lets the caller retry the push, which
-    /// re-uploads. One prefix listing per pending pack, matching both objects.
+    /// re-uploads. Two HEADs per pending pack (read rights only: pushers need
+    /// no list or delete rights).
     /// Called right before the manifest CAS.
     fn ensure_packs_present(&self, hashes: &[String]) -> Result<()> {
         for hash in hashes {
-            let have = self.bucket.list_meta(&format!("packs/{hash}."))?;
-            let has = |key: String| have.iter().any(|m| m.key == key);
-            if !(has(pack_key(hash)) && has(idx_key(hash))) {
+            if !(self.bucket.exists(&pack_key(hash))? && self.bucket.exists(&idx_key(hash))?) {
                 return Err(Error::Remote(format!(
                     "pack {hash} was removed from the bucket before this push committed \
                      (bucket compaction swept it); retry the push"
@@ -1843,6 +1847,9 @@ mod tests {
         }
         fn list_meta(&self, prefix: &str) -> scl_objio::Result<Vec<scl_objio::ObjectMeta>> {
             self.0.list_meta(prefix)
+        }
+        fn exists(&self, key: &str) -> scl_objio::Result<bool> {
+            self.0.exists(key)
         }
         fn delete(&self, key: &str) -> scl_objio::Result<()> {
             self.0.delete(key)
