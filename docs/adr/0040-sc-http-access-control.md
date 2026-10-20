@@ -57,7 +57,7 @@ the `Authorization` header. `wire::serve` stays a thin wrapper delegating to
 - `--allow-public` alone remains a sanctioned foot-gun: a fully open public read-write
   server, entered explicitly by the operator.
 - `sc serve token add/remove/list` join `sc keygen`/`sc secret` as local-config commands;
-  rotation is add-new + remove-old (no expiry metadata in the MVP).
+  rotation was add-new + remove-old in the MVP (expiry and `rotate` followed, below).
 - The build closed one review-found fail-open: a non-loopback bind justified only by
   configured tokens now fails closed (`401` on every connection, not an open server) if its
   last token is removed while the server is still running.
@@ -93,3 +93,25 @@ the `Authorization` header. `wire::serve` stays a thin wrapper delegating to
   remains. A token store that cannot be read or parsed is a `401` there too, not a dropped connection. The two answers are status-indistinguishable, not timing-identical. A client
   holding a valid token sees the `401` authentication error rather than `NotARepo` if the
   repo is removed while the server runs.
+
+## Addendum: token expiry and rotation (#209)
+
+- A `TokenEntry` carries an optional `expires_at` (Unix seconds, UTC). It is omitted from
+  the file when unset, so no-expiry stays the default and files written before this field
+  existed load unchanged.
+- `sc serve token add --expires <duration|date>` takes `30m`/`12h`/`7d`/`2w` (relative to
+  now) or `YYYY-MM-DD` (00:00 UTC that day, so the token is not valid at any point during that date),
+  and must be in the future.
+- `verify` takes `now` as a parameter (tests inject it, nothing sleeps). A token is expired
+  at `now >= expires_at`, and then behaves exactly like an unknown token: the same `401`,
+  decided in the same constant-time loop.
+- **Expired entries are kept, not dropped or tombstoned.** They still count as configured
+  tokens, so a server whose tokens have all expired keeps refusing everyone (mandatory
+  auth from #207 holds) instead of reverting to open. Nothing rewrites the file on read;
+  `sc serve token list` flags them `EXPIRED` and `remove` clears them.
+- `sc serve token rotate <label>` replaces the hash with a fresh secret, keeping label,
+  scope and the **absolute** `expires_at`, and prints the new value once. The old secret
+  stops verifying immediately. Rotating an already-expired token is refused (it would mint
+  a dead token); `remove` + `add --expires` is how to reset an expiry.
+- Expiry is checked once, when a connection opens. A transfer already in flight can outlive
+  its token until it finishes or hits `--timeout`.
