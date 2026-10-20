@@ -368,6 +368,22 @@ cargo run --bin sc -- remote add <name> sc+s3://<bucket>/<prefix>   # same, on a
                                               # content stays ciphertext); `clone --filter` is
                                               # refused; signatures, transcripts and drop
                                               # tombstones travel like on any native remote (#229)
+cargo run --bin sc -- remote compact <name> [--dry-run] [--prune-expire 24h] [--allow-short-grace]
+                                              # bucket remotes only (#216, ADR-0057): merge small
+                                              # packs behind one manifest CAS, then delete log
+                                              # entries, checkpoints and packs nothing names that
+                                              # are older than --prune-expire (same flag and default
+                                              # as `sc gc`; keep it well above any push's duration).
+                                              # Needs bucket list + delete rights. --dry-run prints
+                                              # the plan and writes nothing. Safe beside live
+                                              # pushes/fetches within --prune-expire (a writer
+                                              # stalled longer than that between uploading a pack
+                                              # and committing it can lose the pack); run one at a time. A --prune-expire under 1h is refused
+                                              # unless --allow-short-grace (only with no pushes
+                                              # or fetches running). On a versioned S3
+                                              # bucket deletes only add delete markers (add a
+                                              # noncurrent-version lifecycle rule). Relieves the
+                                              # 65536-pack checkpoint cap (not the ref cap)
 cargo run --bin sc -- serve --http <addr> <home> --store sc+wal://<dir>|sc+s3://<bucket>/<prefix>
                                               # serve a bucket remote over sc+http(s):// (P36c):
                                               # all content lives in the bucket (instance is

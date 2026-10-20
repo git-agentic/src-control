@@ -66,7 +66,9 @@ pub mod workspace;
 pub mod worktree;
 pub(crate) mod ws;
 
-pub use bucket_transport::{BucketScheme, BucketTransport, BucketUrl};
+pub use bucket_transport::{
+    BucketScheme, BucketTransport, BucketUrl, CompactOptions, CompactReport,
+};
 pub use conflicts::{ActiveOp, ConflictKind, ConflictVersions, ResolveSide, Side};
 pub use error::{Error, Result};
 pub use gc::GcStats;

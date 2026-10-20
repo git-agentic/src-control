@@ -151,7 +151,7 @@ the code, those win.
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
 | P34 | Private branches: ref points at a sealed-branch manifest; every commit/tree/blob individually sealed (copy-on-write) under a per-branch KEK wrapped per recipient + escrow; `sc branch --private/grant/revoke/publish`; opaque to non-recipients (content, paths, messages); grant O(1), revoke rotates the KEK; publish replays to public with a scanner gate; git bridge + private→public integration refused; `PROTOCOL_VERSION` 4 | [0044](docs/adr/0044-per-branch-access-control.md) |
 | P35 | Native Tauri desktop browser: opens `.sc` repositories through `scl-repo`, shows local/remote refs, all-parent snapshot DAG + provenance, public trees and first-parent diffs; protected content is locked and private branches remain opaque; no mutation or identity surface | [0045](docs/adr/0045-native-desktop-read-model.md) |
-| P36 | Bucket WAL remotes (sc+wal://, sc+s3://): immutable packs + CAS'd manifest, checkpoints + log-tail cold start, bucket-backed `sc serve --store` with disposable instances; `get_pack` serves signatures, transcripts and signed drop tombstones by decoding the on-chain packs (#229, no format change) | [0046](docs/adr/0046-wal-bucket-remotes.md) |
+| P36 | Bucket WAL remotes (sc+wal://, sc+s3://): immutable packs + CAS'd manifest, checkpoints + log-tail cold start, bucket-backed `sc serve --store` with disposable instances; `get_pack` serves signatures, transcripts and signed drop tombstones by decoding the on-chain packs (#229, no format change); `sc remote compact <name> [--dry-run] [--prune-expire 24h]` (#216) merges small packs behind one manifest CAS, then deletes log entries, checkpoints and unreferenced packs behind an aged-checkpoint cutoff, readers restart on a moved manifest, no format or wire change | [0046](docs/adr/0046-wal-bucket-remotes.md), [0057](docs/adr/0057-bucket-compaction.md) |
 | P37a | Want-by-id fetch: batched `GetObjects` verb (wire v5), opt-in `.sc/promisor-lazy`, `sc cat <ref>:<path>` fills only the absent trees and blob on its path; `Store::get` stays network-free; sealed objects refused by kind; sparse widen and the lifted P27 refusals are P37b | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
 | P37b-i | Presence-based partial clones: push, verify and gc walk what the store holds (`reachable_objects_partial`), not the fetch filter; push checks every gap id against the destination before sending; a view gap fails with `GapInView` before any write (preflight at the top of `materialize`, plus `undo` and `sparse set`); a partial clone fetches from its origin only. 37b-ii: on a lazy, online clone `ensure_view` fills the view closure by id before switch, fast-forward, undo and `sparse set`, `sparse set` may widen past the filter, a by-id reply is capped at `min(--max-pack-size, 2 GiB)` (a constant since #213, independent of the object cap) and a refused batch is split. | [0048](docs/adr/0048-presence-based-partial-clones.md) |
 | P37c | Merge, cherry-pick and rebase on a partial clone: a tree-recursive engine (`merge_trees`) carries a subtree by id when the sides agree and no protection rule applies, reads only where they differ or a rule intersects, and on a lazy, online clone fills what it asks for by id outside the store lock (a non-lazy clone gets the gap error with `sc backfill <path>`); a carried protected subtree keeps the complete input wrap union; a conflict inside the view is marked and resolved like on a full clone (`sc conflicts`/`sc resolve`/`merge --abort`/`sc commit`; the out-of-view part is grafted from the decided root), while a conflict outside the view, or a result that must be sealed outside it, is refused before any ref, merge-state or working-tree change (fetched objects stay). A subtree identical on all three sides is carried even under a protection rule. Cherry-pick and rebase use the same engine (`replay_commit`): the fold's accumulator may hold absent subtrees, the view is filled before the final write, and a stopped pick or rebase keeps its carried subtrees in the decided root. Mode-only edits now merge and a file/directory collision fails before any write, on full clones too. | [0049](docs/adr/0049-merge-on-partial-clones.md) |
@@ -206,6 +206,12 @@ transport-adjacent. The rest, imperatively:
 - **Bucket remotes hold public content plaintext at rest** — bucket ACL is
   the perimeter (sealed content stays ciphertext, unchanged); partial-clone
   `filter` against bucket remotes is refused.
+- **`sc remote compact` deletes bucket objects** (ADR-0057): it needs bucket
+  list and delete rights, which pushers and `sc serve --store` instances should
+  not hold. It advances the manifest only through the normal CAS (one no-op
+  entry plus a checkpoint) and never deletes what the current chain names. Keep `--prune-expire` well above any push's duration (default
+  24h): a writer stalled longer than that between uploading a pack and its
+  commit can still lose the pack (the leases follow-on closes it).
 - **`sc serve --store` still requires a local serve home with `.sc/`** —
   tokens, TLS identity, and pack spills live there; the bucket holds all
   served content.
@@ -323,7 +329,7 @@ transport-adjacent. The rest, imperatively:
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here); entries that name an issue mirror the open
 GitHub issues. Standing entries: `sc ws` workspace refresh (#215),
-a limit-aware `sc fetch` and an object-count clone limit (#217 remainder), bucket compaction and gc (#216), the non-unix
+a limit-aware `sc fetch` and an object-count clone limit (#217 remainder), the non-unix
 `.sc/local-key` ACL (#214), and the open
 sparse, private-branch and abort edge cases (#241, #246, #247, #248).
 

@@ -833,6 +833,23 @@ enum RemoteOp {
     },
     /// List configured remotes.
     List,
+    /// Compact a bucket remote (`sc+wal://`, `sc+s3://`): merge small packs,
+    /// then delete log entries, checkpoints and packs no reader or writer can
+    /// still need (ADR-0057). Needs bucket list and delete rights.
+    Compact {
+        name: String,
+        /// Plan and report; write and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete only what has been unreferenced for at least this long
+        /// (e.g. 24h, 7d). Keep it well above any push's duration.
+        #[arg(long, default_value = "24h")]
+        prune_expire: String,
+        /// Allow a --prune-expire under 1h. Only safe while nothing pushes to
+        /// or fetches from the bucket: a push in flight can lose its pack.
+        #[arg(long)]
+        allow_short_grace: bool,
+    },
 }
 
 /// Top-level `sc serve` subcommand namespace, distinct from the plain
@@ -4159,6 +4176,36 @@ fn run_remote(op: RemoteOp) -> Result<()> {
                 println!("added remote {name} -> {url}");
             }
         }
+        RemoteOp::Compact {
+            name,
+            dry_run,
+            prune_expire,
+            allow_short_grace,
+        } => {
+            let grace = parse_duration(&prune_expire)?;
+            if grace < std::time::Duration::from_secs(3600) && !allow_short_grace {
+                anyhow::bail!(
+                    "--prune-expire under 1h can delete a pack an in-flight push has uploaded but \
+                     not committed; pass --allow-short-grace only if nothing is pushing or fetching"
+                );
+            }
+            let url = repo
+                .remotes()?
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, u)| u)
+                .ok_or_else(|| anyhow::anyhow!("no such remote: {name}"))?;
+            if !(url.starts_with("sc+wal://") || url.starts_with("sc+s3://")) {
+                anyhow::bail!("remote '{name}' is not a bucket remote ({url}); nothing to compact");
+            }
+            let transport = scl_repo::BucketTransport::open(&url)?;
+            let rep = transport.compact(&scl_repo::CompactOptions {
+                prune_expire: grace,
+                dry_run,
+                ..Default::default()
+            })?;
+            print_compact_report(&name, &url, &rep);
+        }
         RemoteOp::List => {
             let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
             for (name, url) in repo.remotes()? {
@@ -4171,6 +4218,41 @@ fn run_remote(op: RemoteOp) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Human-readable summary of a bucket compaction (`dry_run` reads "would").
+fn print_compact_report(name: &str, url: &str, rep: &scl_repo::CompactReport) {
+    let (merge, delete) = if rep.dry_run {
+        ("would merge", "would delete")
+    } else {
+        ("merged", "deleted")
+    };
+    println!(
+        "compact {name} ({url}){}",
+        if rep.dry_run { " [dry run]" } else { "" }
+    );
+    println!(
+        "  {merge} {} pack(s) into {}",
+        rep.packs_merged, rep.packs_created
+    );
+    println!(
+        "  {delete} {} log entr{}, {} checkpoint(s), {} pack(s) ({} bytes), cutoff checkpoint {}",
+        rep.logs_deleted,
+        if rep.logs_deleted == 1 { "y" } else { "ies" },
+        rep.checkpoints_deleted,
+        rep.packs_deleted,
+        rep.bytes_deleted,
+        rep.cutoff
+    );
+    if rep.packs_held_back > 0 {
+        println!(
+            "  kept {} unreferenced pack(s) younger than the grace window",
+            rep.packs_held_back
+        );
+    }
+    for note in &rep.notes {
+        println!("  note: {note}");
+    }
 }
 
 /// Fetch from `remote`, dispatching on its configured kind: a `git`-kind

@@ -1192,8 +1192,10 @@ the checkpoint and walks only the tail. P36c adds `sc serve --store <url>`: an
 identity and scratch space while all served content lives in the bucket, so
 instances are disposable. Public content sits in the bucket as plaintext at
 rest (the bucket ACL is the perimeter; sealed content stays ciphertext), and
-`sc clone --filter` is refused against a bucket remote. Bucket compaction and gc
-are not built (open issue #216). A bucket keeps no signature or transcript
+`sc clone --filter` is refused against a bucket remote. `sc remote compact` (ADR-0057, #216) merges small packs behind one manifest
+CAS, then deletes log entries, checkpoints and unreferenced packs behind a cutoff
+that has aged past `--prune-expire`; readers that find a named object gone
+re-read the manifest and restart, and there is no format change. A bucket keeps no signature or transcript
 index, so its `get_pack` rebuilds the over-send from the packs the manifest
 chain names; signatures, transcripts and signed drop tombstones therefore
 travel through a bucket like any other remote, but each fresh fetch or clone

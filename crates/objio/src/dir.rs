@@ -1,6 +1,6 @@
 //! Local-directory `Bucket` — the test/demo backend behind `sc+wal://`.
 
-use crate::{validate_key, Bucket, Error, Fetched, Result};
+use crate::{validate_key, Bucket, Error, Fetched, ObjectMeta, Result};
 use std::path::{Path, PathBuf};
 
 /// A local filesystem bucket implementation using a directory as the backing
@@ -116,7 +116,16 @@ impl Bucket for DirBucket {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+        Ok(self.list_meta(prefix)?.into_iter().map(|m| m.key).collect())
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        fn walk(
+            dir: &Path,
+            root: &Path,
+            prefix: &str,
+            out: &mut Vec<ObjectMeta>,
+        ) -> std::io::Result<()> {
             let rd = match std::fs::read_dir(dir) {
                 Ok(rd) => rd,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -131,24 +140,61 @@ impl Bucket for DirBucket {
                 }) {
                     continue;
                 }
-                if p.is_dir() {
-                    walk(&p, root, out)?;
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                // Skip files outside the prefix before paying for a stat.
+                if entry.file_type()?.is_file() && !rel.starts_with(prefix) {
+                    continue;
+                }
+                // A concurrent delete/rename can remove the entry between the
+                // readdir and the stat; a key that is gone is just not listed.
+                let md = match std::fs::metadata(&p) {
+                    Ok(md) => md,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                if md.is_dir() {
+                    walk(&p, root, prefix, out)?;
                 } else {
-                    out.push(
-                        p.strip_prefix(root)
-                            .unwrap()
-                            .to_string_lossy()
-                            .replace('\\', "/"),
-                    );
+                    out.push(ObjectMeta {
+                        key: rel,
+                        size: md.len(),
+                        modified: md.modified()?,
+                    });
                 }
             }
             Ok(())
         }
         validate_key(prefix.trim_end_matches('/'))?;
         let mut out = Vec::new();
-        walk(&self.root, &self.root, &mut out)?;
-        out.retain(|k| k.starts_with(prefix));
-        out.sort();
+        // Keys live under their directory, so start the walk at the prefix's
+        // directory part instead of scanning the whole bucket.
+        let start = match prefix.rsplit_once('/') {
+            Some((dir, _)) => self.root.join(dir),
+            None => self.root.clone(),
+        };
+        walk(&start, &self.root, prefix, &mut out)?;
+        out.retain(|m| m.key.starts_with(prefix));
+        out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        match std::fs::metadata(self.key_path(key)?) {
+            Ok(md) => Ok(md.is_file()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        match std::fs::remove_file(self.key_path(key)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }

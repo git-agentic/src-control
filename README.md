@@ -33,7 +33,7 @@ back to Git commits, and reaches hosted Git (e.g. GitHub) through a spawned
 system-git mirror bridge.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design,
-[docs/adr/](docs/adr/) for the architecture decision records (0001-0054) behind
+[docs/adr/](docs/adr/) for the architecture decision records (0001-0057) behind
 every phase, and [CLAUDE.md](CLAUDE.md) for project conventions and the
 per-phase capability map. [CONTRIBUTING.md](CONTRIBUTING.md) covers the
 development workflow.
@@ -170,7 +170,7 @@ and Git (including hosted GitHub) network transports, plus private branches
 sealed to a recipient set until publish and a read-only Tauri desktop
 browser. All 36 phases and P37a-37d are implemented and tested; `demo/` holds
 28 independent end-to-end proofs, one per major capability. Remaining
-follow-ons (transcript drop delivery gaps, bucket compaction and gc, `sc ws`
+follow-ons (transcript drop delivery gaps, `sc ws`
 workspace refresh, a limit-aware fetch and an object-count clone limit, and similar hardening
 items) are tracked in [ROADMAP.md](ROADMAP.md)'s Deferred section and as open
 GitHub issues rather than being open MVP scope.
