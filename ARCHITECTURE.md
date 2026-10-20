@@ -984,9 +984,12 @@ a receiving peer honors it only if the signature comes from a key in its `[signe
 trusted` list; an unsigned drop is local-only, and an untrusted tombstone stays
 inert. Drop is not erasure: a peer that never receives an honored tombstone
 keeps the sealed body, and a remote that received a tombstone before trusting
-its signer keeps it inert (#230). `sc clone|fetch|push --no-transcripts` leaves
-transcript objects out of one transfer (per command, not remembered; no effect
-on git remotes). See ADR-0038 and its addendum.
+its signer keeps it inert (#230). `sc push --no-transcripts` leaves transcripts and their signatures out of the
+pack (saving bandwidth); `sc clone|fetch --no-transcripts` cannot, because the
+server still sends the full pack, so the receiver hash-checks every record and
+then discards transcripts and their signatures, writing and indexing none
+(saving disk and exposure, not bandwidth). It is per command, not remembered,
+and has no effect on git remotes, which carry none. See ADR-0038 and its addendum.
 
 ## Phase 31 — listener resource limits (built)
 
