@@ -173,6 +173,29 @@ pub(crate) fn clear_prev(layout: &Layout) -> Result<()> {
     remove_if_exists(&layout.sparse_prev_path())
 }
 
+/// The paths an in-flight stopped-op widen recorded writing (empty if none).
+pub(crate) fn load_widen(layout: &Layout) -> Result<std::collections::BTreeSet<String>> {
+    match std::fs::read_to_string(layout.sparse_widen_path()) {
+        Ok(text) => Ok(text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Record `paths` as the files a widen is about to write.
+pub(crate) fn store_widen(
+    layout: &Layout,
+    paths: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let text: String = paths.iter().map(|p| format!("{p}\n")).collect();
+    scl_core::fsutil::atomic_write_durable(&layout.sparse_widen_path(), text.as_bytes())?;
+    Ok(())
+}
+
 impl Sparse {
     /// A spec that matches whatever either input matches. A full (empty) spec
     /// is full in the union.
@@ -453,15 +476,33 @@ impl Repo {
             let mut s = store_arc.lock().unwrap();
             crate::worktree::preflight_view(self.layout(), &mut s, root, new)?;
         }
-        // Files an interrupted run of this same widen already wrote (same
-        // bytes as the decided root): a retry may rewrite them, not refuse.
+        // Files an interrupted run of this same widen already wrote (recorded
+        // in `.sc/sparse-widen`, bytes equal to the decided root's): a retry
+        // may rewrite them. Anything else at those paths is the user's.
+        let recorded = load_widen(self.layout())?;
         let already_laid = {
             let mut s = store_arc.lock().unwrap();
-            crate::worktree::added_view_already_laid(self.layout(), &mut s, decided, old, new)?
+            crate::worktree::added_view_already_laid(
+                self.layout(),
+                &mut s,
+                decided,
+                old,
+                new,
+                &recorded,
+            )?
         };
         for root in roots {
             self.refuse_untracked_for_view_change("sparse set", root, old, new, &already_laid)?;
         }
+        // Every guard passed, so each path below is the widen's to write:
+        // record them (keeping an earlier interrupted run's) before the first.
+        let mut written = recorded;
+        {
+            let mut s = store_arc.lock().unwrap();
+            let (plain, _) = crate::worktree::added_view_files(&mut s, decided, old, new)?;
+            written.extend(plain.into_iter().map(|(p, _)| p));
+        }
+        store_widen(self.layout(), &written)?;
         // A partial clone's abort removes only what its removal walk can see,
         // which is the spec's view plus this marker. The files are laid before
         // the spec is stored, so record the new view first; a crash then
@@ -478,6 +519,7 @@ impl Repo {
             crate::worktree::lay_out_added_view(self.layout(), &mut s, decided, old, new)?
         };
         store(self.layout(), new)?;
+        remove_if_exists(&self.layout().sparse_widen_path())?;
         if partial {
             match prev {
                 Some(p) => store_prev(self.layout(), &p)?,

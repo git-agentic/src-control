@@ -3070,8 +3070,10 @@ mod tests {
         let (root, repo) = rebase_refused_at_an_out_of_view_conflict("sparse-rebase-widen-abort");
         repo.set_sparse(&["src/".into(), "docs/".into()], None)
             .unwrap();
+        crate::sparse::store_widen(repo.layout(), &["docs/y.txt".to_string()].into()).unwrap();
         repo.rebase_abort().unwrap();
         assert!(!repo.rebase_in_progress());
+        assert!(!repo.layout().sparse_widen_path().exists());
         for (path, want) in [
             ("src/a.txt", &b"THEIRS\nl2\nl3\n"[..]),
             ("docs/x.txt", b"THEIRS\nx2\nx3\n"),
@@ -3323,12 +3325,18 @@ mod tests {
         assert!(root.join("docs/y.txt").exists(), "laid, spec not stored");
         assert_eq!(repo.sparse_spec().unwrap(), old);
 
-        // A file the user changed since is still theirs and still refused.
+        // Without the widen's record these byte-equal files are the user's.
+        assert!(repo.set_sparse(new.prefixes(), None).is_err());
+        let paths: std::collections::BTreeSet<String> =
+            ["docs/x.txt".to_string(), "docs/y.txt".to_string()].into();
+        crate::sparse::store_widen(repo.layout(), &paths).unwrap();
+        // A recorded file the user changed since is still refused.
         std::fs::write(root.join("docs/y.txt"), b"MINE\n").unwrap();
         assert!(repo.set_sparse(new.prefixes(), None).is_err());
         std::fs::write(root.join("docs/y.txt"), b"Y-work\n").unwrap();
 
         repo.set_sparse(new.prefixes(), None).unwrap();
+        assert!(!repo.layout().sparse_widen_path().exists());
         // The same spec again is a quiet no-op.
         assert!(repo.set_sparse(new.prefixes(), None).unwrap().is_empty());
         assert!(matches!(

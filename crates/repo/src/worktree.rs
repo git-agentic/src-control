@@ -774,19 +774,47 @@ pub(crate) fn preflight_view(
     Ok(())
 }
 
-/// The paths a widened view (`new`, which covers `old`) brings in from `root`
-/// that are already on disk with exactly the bytes [`lay_out_added_view`]
-/// would write: what an interrupted run of the same widen left behind.
+/// `(plain files with their blob ids, protected paths)` a widened view adds.
+type AddedViewFiles = (Vec<(String, ObjectId)>, Vec<String>);
+
+/// The plain (unprotected) files a widened view (`new`, which covers `old`)
+/// brings in from `root`, with their blob ids: what [`lay_out_added_view`]
+/// writes. Protected entries are returned apart, as `(plain, protected)`.
+pub(crate) fn added_view_files(
+    store: &mut Store,
+    root: ObjectId,
+    old: &Sparse,
+    new: &Sparse,
+) -> Result<AddedViewFiles> {
+    let (mut plain, mut protected) = (Vec::new(), Vec::new());
+    for (path, (blob_id, _mode, perms)) in tree_file_entries_with_perms_sparse(store, root, new)? {
+        if old.matches(&path) {
+            continue;
+        }
+        if perms & PROTECTED != 0 {
+            protected.push(path);
+        } else {
+            plain.push((path, blob_id));
+        }
+    }
+    Ok((plain, protected))
+}
+
+/// Of the paths an interrupted widen recorded in `.sc/sparse-widen`
+/// (`recorded`), those whose file on disk has exactly the bytes
+/// [`lay_out_added_view`] would write: the widen's own earlier writes. A file
+/// that merely has the same bytes but was never recorded is the user's.
 pub(crate) fn added_view_already_laid(
     layout: &Layout,
     store: &mut Store,
     root: ObjectId,
     old: &Sparse,
     new: &Sparse,
+    recorded: &std::collections::BTreeSet<String>,
 ) -> Result<std::collections::BTreeSet<String>> {
     let mut laid = std::collections::BTreeSet::new();
-    for (path, (blob_id, _mode, perms)) in tree_file_entries_with_perms_sparse(store, root, new)? {
-        if old.matches(&path) || perms & PROTECTED != 0 {
+    for (path, blob_id) in added_view_files(store, root, old, new)?.0 {
+        if !recorded.contains(&path) {
             continue;
         }
         let Object::Blob(bytes) = store.get(&blob_id)? else {
@@ -806,7 +834,8 @@ pub(crate) fn added_view_already_laid(
 /// in from `root`, and nothing else: no removal pass, and no rewrite of a path
 /// `old` already laid out (it may hold conflict markers or the user's
 /// resolution). A protected entry is not decrypted: it is left absent and
-/// returned, since the caller has no wrap map for `root`.
+/// returned, since the caller has no wrap map for `root`. Each file is written
+/// atomically, so an interruption never leaves a half-written one.
 pub(crate) fn lay_out_added_view(
     layout: &Layout,
     store: &mut Store,
@@ -814,15 +843,8 @@ pub(crate) fn lay_out_added_view(
     old: &Sparse,
     new: &Sparse,
 ) -> Result<Vec<String>> {
-    let mut skipped = Vec::new();
-    for (path, (blob_id, _mode, perms)) in tree_file_entries_with_perms_sparse(store, root, new)? {
-        if old.matches(&path) {
-            continue;
-        }
-        if perms & PROTECTED != 0 {
-            skipped.push(path);
-            continue;
-        }
+    let (plain, protected) = added_view_files(store, root, old, new)?;
+    for (path, blob_id) in plain {
         let Object::Blob(bytes) = store.get(&blob_id)? else {
             continue;
         };
@@ -830,9 +852,9 @@ pub(crate) fn lay_out_added_view(
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&full, &bytes[..])?;
+        scl_core::fsutil::atomic_write_durable(&full, &bytes[..])?;
     }
-    Ok(skipped)
+    Ok(protected)
 }
 
 /// Materialize a snapshot's file tree into the working dir.

@@ -48,8 +48,10 @@ pub(crate) fn read(layout: &Layout) -> Result<BTreeSet<String>> {
     }
 }
 
-/// Drop both records.
+/// Drop both records, and the stopped-op widen's (`.sc/sparse-widen`): all of
+/// them end with the stopped merge, pick or rebase.
 pub(crate) fn clear(layout: &Layout) -> Result<()> {
+    remove_if_present(&layout.sparse_widen_path())?;
     remove_if_present(&path(layout))?;
     remove_if_present(&sidecar_path(layout))
 }

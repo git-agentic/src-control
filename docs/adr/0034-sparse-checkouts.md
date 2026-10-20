@@ -180,9 +180,13 @@ every claim below is checked against the shipped code, not the plan.
    view and runs `refuse_untracked_for_view_change`, then writes
    only the files `old` did not match (`worktree::lay_out_added_view`) and
    stores the spec last, so a crash leaves extra out-of-view files, never a
-   view with files missing. A retry treats a file already on disk with the
-   decided root's bytes as its own earlier write (modes are not compared:
-   `lay_out_added_view` writes none, #237) and a changed one still refuses. On a
+   view with files missing. The paths are recorded in `.sc/sparse-widen` before
+   the first write (each file is written atomically) and the record is
+   removed with the spec write or with the stopped op. A retry treats a
+   recorded file already on disk with the decided root's bytes as its own
+   earlier write; an unrecorded file, even with equal bytes, or a changed one
+   still refuses (modes are not compared: `lay_out_added_view` writes none,
+   #237). On a
    partial clone the new view is recorded in `.sc/sparse_prev` before the
    writes, so the abort's removal walk covers files an interrupted widen
    laid; the marker is restored to its prior state once the spec is stored.

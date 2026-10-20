@@ -124,6 +124,13 @@ impl Layout {
     pub fn sparse_prev_path(&self) -> PathBuf {
         self.dot_sc.join("sparse-prev")
     }
+    /// `.sc/sparse-widen` — the paths a `sparse set` widen during a stopped
+    /// merge, pick or rebase is writing, recorded before the writes. It is the
+    /// evidence that a file found at one of them on a retry is the widen's own
+    /// earlier write and not the user's; removed once the spec is stored.
+    pub fn sparse_widen_path(&self) -> PathBuf {
+        self.dot_sc.join("sparse-widen")
+    }
     /// `.sc/serve-tokens.toml` — server access-control tokens (P29): each entry is
     /// `{label, hash = BLAKE3(raw token), scope}`. Presence of ≥1 entry turns on
     /// bearer auth for `sc serve --http`. Distinct from `recipients.toml`

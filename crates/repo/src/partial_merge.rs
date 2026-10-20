@@ -414,13 +414,13 @@ fn aborting_a_widened_partial_merge_leaves_no_residue() {
                 .unwrap();
         } else {
             clone.set_sparse(wide.prefixes(), None).unwrap();
-            assert!(!fx.clone_root.join(".sc/sparse_prev").exists());
+            assert!(!clone.layout().sparse_prev_path().exists());
         }
         assert!(fx.clone_root.join("docs/new.md").exists(), "laid");
 
         clone.merge_abort().unwrap();
         assert!(!fx.clone_root.join("docs/new.md").exists(), "no residue");
-        assert!(!fx.clone_root.join(".sc/sparse_prev").exists());
+        assert!(!clone.layout().sparse_prev_path().exists());
         assert_eq!(
             std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
             b"uno\ntwo\nthree\n"
