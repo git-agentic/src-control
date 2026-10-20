@@ -209,8 +209,13 @@ pub fn record(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<()> 
         .append(true)
         .open(file)
         .map_err(|e| Error::InvalidArgument(format!("open pin file {}: {e}", file.display())))?;
-    writeln!(f, "{host}:{port} {}", scl_tlsio::fingerprint_hex(pin))
-        .map_err(|e| Error::InvalidArgument(format!("write pin file {}: {e}", file.display())))?;
+    writeln!(
+        f,
+        "{} {}",
+        host_port(host, port),
+        scl_tlsio::fingerprint_hex(pin)
+    )
+    .map_err(|e| Error::InvalidArgument(format!("write pin file {}: {e}", file.display())))?;
     Ok(())
 }
 
@@ -265,6 +270,22 @@ fn resolve_pin_path(file: &Path) -> PathBuf {
     }
 }
 
+/// `host` as it appears in a URL authority or `Host:` header: an IPv6 literal
+/// gets its brackets back.
+pub(crate) fn bracket_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+/// `host:port` with an IPv6 literal bracketed (`[::1]:7777`); the pin file's
+/// key format and the display form.
+pub fn host_port(host: &str, port: u16) -> String {
+    format!("{}:{port}", bracket_host(host))
+}
+
 /// One pin as stored: the `host:port` it was recorded for and its SPKI hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinEntry {
@@ -282,13 +303,18 @@ pub fn fingerprint(pin: &[u8; 32]) -> String {
 /// [`crate::http_transport::DEFAULT_PORT`]), the same split an `sc+https://`
 /// URL's authority gets, so a pin names exactly what a connection looks up.
 pub fn parse_host_port(s: &str) -> Result<(String, u16)> {
-    let (host, port) = match s.split_once(':') {
-        Some((h, p)) => (
+    let (host, port) = match crate::http_transport::split_authority(s) {
+        Some((h, Some(p))) => (
             h,
             p.parse::<u16>()
                 .map_err(|_| Error::InvalidArgument(format!("bad port in {s:?}")))?,
         ),
-        None => (s, crate::http_transport::DEFAULT_PORT),
+        Some((h, None)) => (h, crate::http_transport::DEFAULT_PORT),
+        None => {
+            return Err(Error::InvalidArgument(format!(
+                "bad bracketed host in {s:?}"
+            )))
+        }
     };
     if host.is_empty() {
         return Err(Error::InvalidArgument(format!("empty host in {s:?}")));
@@ -313,8 +339,12 @@ fn parse_line(line: &str) -> Option<PinEntry> {
         return None;
     }
     let (key, value) = line.split_once(' ')?;
-    let (host, port) = key.split_once(':')?;
+    let (host, port) = key.rsplit_once(':')?;
     let port = port.parse::<u16>().ok()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     Some(PinEntry {
         host: host.to_string(),
         port,
@@ -371,7 +401,8 @@ pub fn set_pin(file: &Path, host: &str, port: u16, pin: &[u8; 32]) -> Result<boo
         kept.push('\n');
     }
     kept.push_str(&format!(
-        "{host}:{port} {}\n",
+        "{} {}\n",
+        host_port(host, port),
         scl_tlsio::fingerprint_hex(pin)
     ));
     write_pin_file(file, &kept)?;
@@ -426,6 +457,24 @@ mod tests {
         assert_eq!(lookup(&file, "example.com", 8730).unwrap(), Some(pin));
         // Same host, different port = a different pin slot.
         assert_eq!(lookup(&file, "example.com", 9000).unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn ipv6_literal_pins_round_trip_bracketed() {
+        let dir = tmp("v6");
+        let file = dir.join("known_hosts");
+        let pin = [0x22u8; 32];
+        record(&file, "::1", 7777, &pin).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text, format!("[::1]:7777 sha256:{}\n", "22".repeat(32)));
+        assert_eq!(lookup(&file, "::1", 7777).unwrap(), Some(pin));
+        assert_eq!(parse_host_port("[::1]:7777").unwrap(), ("::1".into(), 7777));
+        assert_eq!(parse_host_port("[::1]").unwrap(), ("::1".into(), 8730));
+        assert!(parse_host_port("[::1").is_err());
+        assert_eq!(forget(&file, "::1", 7777).unwrap(), 1);
+        assert_eq!(lookup(&file, "::1", 7777).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
     }

@@ -1133,9 +1133,8 @@ fn run_tls(op: TlsOp) -> Result<()> {
             } else {
                 for e in &entries {
                     print_line(&format!(
-                        "{}:{} {}",
-                        e.host,
-                        e.port,
+                        "{} {}",
+                        tls_pins::host_port(&e.host, e.port),
                         tls_pins::fingerprint(&e.pin)
                     ));
                 }
@@ -1149,11 +1148,16 @@ fn run_tls(op: TlsOp) -> Result<()> {
             let (host, port) = tls_pins::parse_host_port(&target)?;
             let n = tls_pins::forget(&file, &host, port)?;
             if n == 0 {
-                anyhow::bail!("no pin for {host}:{port} in {}", file.display());
+                anyhow::bail!(
+                    "no pin for {} in {}",
+                    tls_pins::host_port(&host, port),
+                    file.display()
+                );
             }
             println!(
-                "forgot {n} pin(s) for {host}:{port}; a later connection pins what it sees \
-                 unless SC_HTTPS_STRICT=1 or SC_HTTPS_FINGERPRINT is set (then use `sc tls pin`)"
+                "forgot {n} pin(s) for {}; a later connection pins what it sees \
+                 unless SC_HTTPS_STRICT=1 or SC_HTTPS_FINGERPRINT is set (then use `sc tls pin`)",
+                tls_pins::host_port(&host, port)
             );
             Ok(())
         }
@@ -1165,8 +1169,9 @@ fn run_tls(op: TlsOp) -> Result<()> {
             let pin = tls_pins::parse_fingerprint(&fingerprint)?;
             let replaced = tls_pins::set_pin(&file, &host, port, &pin)?;
             println!(
-                "{} {host}:{port} -> {}",
+                "{} {} -> {}",
                 if replaced { "re-pinned" } else { "pinned" },
+                tls_pins::host_port(&host, port),
                 tls_pins::fingerprint(&pin)
             );
             Ok(())
