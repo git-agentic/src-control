@@ -14,7 +14,7 @@ currently live in two root files — treat them as the glossary/context source:
   pointer to it. The full per-phase narrative log is archived at
   `docs/archive/claude-md-phase-log-2026-07.md`.
 - **`ARCHITECTURE.md`** at the repo root — the full design and rationale.
-- **`docs/adr/`** — 43+ ADRs (0001…) recording every significant decision;
+- **`docs/adr/`** — 54 ADRs (0001…0054) recording every significant decision;
   read the ADRs that touch the area you're about to work in. This is a
   single-context repo, so there are no per-crate `crates/<name>/docs/adr/`
   dirs — all decisions live in the one root `docs/adr/`.
@@ -33,11 +33,12 @@ Single-context repo:
 /
 ├── CLAUDE.md        ← working guide + capability map (AGENTS.md points here)
 ├── ARCHITECTURE.md  ← full design + rationale
-├── docs/adr/        ← 0001…0043+ architectural decisions (one root collection)
-└── crates/          ← core, vfs, gitio, crypto, tlsio, repo, cli (one cohesive VCS domain)
+├── docs/adr/        ← 0001…0054 architectural decisions (one root collection)
+├── crates/          ← core, vfs, gitio, crypto, tlsio, objio, repo, cli (one cohesive VCS domain)
+└── apps/desktop/    ← Tauri v2 read-only browser (a top-level adapter over repo)
 ```
 
-(This is a seven-crate Rust workspace but **one** domain — a next-gen VCS — so a
+(This is an eight-crate Rust workspace plus a desktop app but **one** domain — a next-gen VCS — so a
 single context, not a multi-context `CONTEXT-MAP.md` layout.)
 
 ## Use the project's vocabulary
