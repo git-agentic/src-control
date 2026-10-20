@@ -175,6 +175,17 @@ skipped re-uploading an object could reference a dropped pack; it also needs a
 reachability walk of the whole bucket. A pack is "live" here if the chain names
 it.
 
+### Signatures, transcripts and tombstones (#229, #254)
+
+The bucket's sender seam finds signatures, transcripts and signed drop
+tombstones by decoding every on-chain pack (`pack_leaves`). Compaction keeps
+that sound three ways: an on-chain pack is never dropped, only merged;
+consolidation decodes and re-encodes every object of a merged pack, whatever its
+kind, so the merged pack holds the same leaves; and `pack_leaves` runs against
+the post-compaction pack list (the leaf cache is keyed by pack hash and trimmed
+to live packs on refresh). `a_clone_after_compaction_still_gets_signatures_transcripts_and_tombstones`
+covers a clone and a fetch across two compactions with a signed drop in between.
+
 ### Command surface
 
 `sc remote compact <name> [--dry-run] [--prune-expire <dur>]` (default

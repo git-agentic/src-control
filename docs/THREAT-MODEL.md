@@ -423,7 +423,7 @@ too, not just the src-control-side metadata.
   compact` reclaims what is unreferenced (below).
 - **Compaction deletes data, so it is a privileged operation (#216,
   ADR-0055).** `sc remote compact` needs bucket **list and delete** rights in
-  addition to the get/put/head a pusher holds (pushes themselves need no list
+  addition to the get/put/head permissions a pusher holds (pushes themselves need no list
   or delete rights). Grant them to a dedicated operator or
   scheduled-job identity, not to ordinary pushers, read-only clients or the
   `sc serve --store` instances (they never need them: compaction is not a wire

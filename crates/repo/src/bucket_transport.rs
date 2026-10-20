@@ -2035,6 +2035,68 @@ mod tests {
         assert!(!base.exists());
     }
 
+    /// #216 x #229: compaction merges the packs the sender seam scans for
+    /// signatures, transcripts and tombstones, so a clone after it must still
+    /// be served all three.
+    #[test]
+    fn a_clone_after_compaction_still_gets_signatures_transcripts_and_tombstones() {
+        let (a, url, snap, tid, identity, base) = signed_bucket_origin("compact");
+        for (i, f) in ["f2", "f3"].iter().enumerate() {
+            std::fs::write(base.join("a").join(f), format!("more {i}")).unwrap();
+            a.commit("t", &format!("c{}", i + 2)).unwrap();
+            a.push("origin").unwrap();
+        }
+        let compact = || {
+            BucketTransport::open(&url)
+                .unwrap()
+                .compact(&crate::bucket_transport::CompactOptions {
+                    prune_expire: std::time::Duration::ZERO,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let rep = compact();
+        assert!(rep.packs_merged >= 3 && rep.packs_deleted >= 3, "{rep:?}");
+        let bucket = base.join("bucket");
+        let count = |sub: &str| std::fs::read_dir(bucket.join(sub)).unwrap().count();
+        assert_eq!(count("packs"), 2, "merged into one pack + idx");
+
+        let b = crate::repo::Repo::clone_url(&url, base.join("b")).unwrap();
+        assert_eq!(
+            b.sig_status(&snap, &trust_map(&identity)).unwrap(),
+            crate::signatures::SigStatus::Trusted("alice".to_string())
+        );
+        assert!(b
+            .transcripts_for(&snap)
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t == tid));
+        assert_eq!(b.signatures_for(&tid).unwrap().len(), 1);
+
+        // A signed drop pushed on top of the compacted bucket, then compacted again.
+        crate::transcripts::tests::trust_signer(&a, &identity);
+        a.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        std::fs::write(base.join("a/f4"), b"four").unwrap();
+        a.commit("t", "c5").unwrap();
+        a.push("origin").unwrap();
+        compact();
+        let tomb = ObjectId::of(
+            &Object::Transcript(scl_core::Transcript::drop_tombstone(snap, &tid)).encode(),
+        );
+        let c = crate::repo::Repo::clone_url(&url, base.join("c")).unwrap();
+        assert!(
+            c.store_arc().lock().unwrap().contains(&tomb),
+            "the tombstone survives compaction and is served"
+        );
+        crate::transcripts::tests::trust_signer(&b, &identity);
+        b.fetch("origin").unwrap();
+        assert!(b.transcripts_for(&snap).unwrap().is_empty());
+
+        drop((a, b, c));
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!base.exists());
+    }
+
     #[test]
     fn fetch_from_a_bucket_delivers_a_later_transcript_and_signature() {
         let (a, url, snap, tid, identity, base) = signed_bucket_origin("fetch");

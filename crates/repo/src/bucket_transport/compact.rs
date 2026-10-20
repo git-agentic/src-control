@@ -134,6 +134,11 @@ impl BucketTransport {
             rep.notes
                 .push("bucket has no manifest: only aged orphan packs are swept".into());
         } else {
+            rep.checkpoint_seq = self
+                .view
+                .borrow()
+                .as_ref()
+                .map_or(0, |v| v.manifest.checkpoint_seq);
             self.consolidate(opts, &mut rep)?;
         }
         // Read the clock after phase 1 so a zero grace sees its own checkpoint.

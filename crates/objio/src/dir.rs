@@ -183,7 +183,11 @@ impl Bucket for DirBucket {
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
-        Ok(self.key_path(key)?.is_file())
+        match std::fs::metadata(self.key_path(key)?) {
+            Ok(md) => Ok(md.is_file()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn delete(&self, key: &str) -> Result<()> {
