@@ -776,10 +776,18 @@ enum ServeTokenOp {
         /// Access scope: `ro` (read-only) or `rw` (read-write).
         #[arg(long)]
         scope: String,
+        /// Expire the token after a duration (`30m`, `12h`, `7d`, `2w`) or at
+        /// 00:00 UTC on a date (`2030-01-31`). Default: never expires.
+        #[arg(long)]
+        expires: Option<String>,
     },
     /// Remove a token by label.
     Remove { label: String },
-    /// List token labels + scopes (never the token value itself).
+    /// Replace a token's secret in one step, keeping its label, scope and
+    /// expiry date; prints the new value ONCE. The old secret stops working
+    /// immediately. An expired token must be removed and re-added instead.
+    Rotate { label: String },
+    /// List token labels, scopes and expiry (never the token value itself).
     List {
         #[arg(long)]
         json: bool,
@@ -3831,13 +3839,20 @@ fn run_serve_token(op: ServeTokenOp) -> Result<()> {
     let repo = open_repo()?;
     let layout = repo.layout();
     match op {
-        ServeTokenOp::Add { label, scope } => {
+        ServeTokenOp::Add {
+            label,
+            scope,
+            expires,
+        } => {
             let scope = match scope.as_str() {
                 "ro" => scl_repo::serve_tokens::Scope::Ro,
                 "rw" => scl_repo::serve_tokens::Scope::Rw,
                 other => anyhow::bail!("scope must be 'ro' or 'rw', got {other}"),
             };
-            let raw = scl_repo::serve_tokens::add(layout, &label, scope)?;
+            let expires_at = expires
+                .map(|e| scl_repo::serve_tokens::parse_expiry(&e, scl_repo::serve_tokens::now()))
+                .transpose()?;
+            let raw = scl_repo::serve_tokens::add_expiring(layout, &label, scope, expires_at)?;
             println!("{raw}");
             eprintln!(
                 "token '{label}' ({scope:?}) added — store this value now; it is not recoverable"
@@ -3849,8 +3864,18 @@ fn run_serve_token(op: ServeTokenOp) -> Result<()> {
             eprintln!("removed serve token '{label}'");
             Ok(())
         }
+        ServeTokenOp::Rotate { label } => {
+            let raw =
+                scl_repo::serve_tokens::rotate(layout, &label, scl_repo::serve_tokens::now())?;
+            println!("{raw}");
+            eprintln!(
+                "token '{label}' rotated — store this value now; the old one no longer works"
+            );
+            Ok(())
+        }
         ServeTokenOp::List { json } => {
             let tokens = scl_repo::serve_tokens::load(layout)?;
+            let now = scl_repo::serve_tokens::now();
             if json {
                 let v: Vec<_> = tokens
                     .iter()
@@ -3858,13 +3883,27 @@ fn run_serve_token(op: ServeTokenOp) -> Result<()> {
                         serde_json::json!({
                             "label": t.label,
                             "scope": format!("{:?}", t.scope).to_lowercase(),
+                            "expires_at": t.expires_at,
+                            "expired": t.is_expired(now),
                         })
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 for t in tokens {
-                    println!("{}  {}", t.label, format!("{:?}", t.scope).to_lowercase());
+                    let expiry = match t.expires_at {
+                        None => String::new(),
+                        Some(e) => format!(
+                            "  expires {}{}",
+                            scl_repo::serve_tokens::format_time(e),
+                            if t.is_expired(now) { "  EXPIRED" } else { "" }
+                        ),
+                    };
+                    println!(
+                        "{}  {}{expiry}",
+                        t.label,
+                        format!("{:?}", t.scope).to_lowercase()
+                    );
                 }
             }
             Ok(())

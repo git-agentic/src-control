@@ -1308,7 +1308,7 @@ fn handle_http_connection(
         match opening
             .bearer
             .as_deref()
-            .and_then(|t| crate::serve_tokens::verify(&tokens, t))
+            .and_then(|t| crate::serve_tokens::verify(&tokens, t, crate::serve_tokens::now()))
         {
             Some(crate::serve_tokens::Scope::Ro) => true,
             Some(crate::serve_tokens::Scope::Rw) => false,
@@ -2141,6 +2141,32 @@ mod tests {
         assert_eq!(connect_raw_status(port, None), 401);
         assert_eq!(connect_raw_status(port, Some("sct-not-a-real-token")), 401);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An expired token is the same 401 as an unknown one, on a token-justified
+    /// public bind and on the loopback default alike (the entry still counts as
+    /// a configured token, so auth stays on).
+    #[test]
+    fn expired_token_is_401_on_both_policies() {
+        let root = tmp_repo("expired-token");
+        let layout = crate::layout::Layout::at(&root);
+        let raw = crate::serve_tokens::add_expiring(
+            &layout,
+            "dead",
+            crate::serve_tokens::Scope::Rw,
+            Some(1),
+        )
+        .unwrap();
+        for mandatory in [true, false] {
+            let port = spawn_real_http_server_policy_auth(root.clone(), false, mandatory);
+            assert_eq!(
+                connect_raw_status(port, Some(&raw)),
+                401,
+                "mandatory={mandatory}"
+            );
+            assert_eq!(connect_raw_status(port, None), 401, "mandatory={mandatory}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
