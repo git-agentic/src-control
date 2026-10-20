@@ -209,7 +209,7 @@ fn completion_leaves_the_sidecar_out_of_the_sealed_tree_and_removes_it() {
 }
 
 #[test]
-fn a_tracked_theirs_file_survives_completion_and_abort() {
+fn a_tracked_theirs_file_refuses_the_stop() {
     // `bin.dat.theirs` is the user's own tracked file on both sides' history:
     // the stop must refuse to overwrite it rather than record it as scratch.
     let root = std::env::temp_dir().join(format!("scl-priv-abort-own-{}", std::process::id()));

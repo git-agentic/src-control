@@ -417,8 +417,9 @@ sidecar into the tree and left it on disk. Now:
   gets `PrivateNoAccess` before any write and the stop stays for someone who
   can finish it. It then restores the private tip through the same checkout
   path as `switch` (decrypting protected files the identity can read, skipping
-  the rest), removes the files the stop laid from theirs (in view only), removes
-  the recorded sidecars unless the tip tracks that name, and clears the merge
+  the rest), removes every in-view path theirs' tree holds that the tip does not (as
+  the public abort does with theirs' root, so an untracked user file at such a
+  path goes too), removes the recorded sidecars unless the tip tracks that name, and clears the merge
   state. The ref never moved and nothing was stored outside the sealed
   manifest, so there is nothing to undo at rest. It does not re-derive the
   three-way (that can fail for a recipient who cannot read a protected path
