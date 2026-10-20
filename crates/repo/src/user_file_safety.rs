@@ -429,3 +429,20 @@ fn abort_keeps_a_user_file_at_a_protected_path_the_stop_removed() {
     assert_eq!(report.kept, vec!["secret/old.txt".to_string()]);
     finish(&root, repo);
 }
+
+#[cfg(unix)]
+#[test]
+fn abort_never_writes_through_a_symlink_at_a_conflicted_path() {
+    for op in OPS {
+        let (root, repo) = stopped("conflict-symlink", op, false);
+        let victim = root.with_extension("victim");
+        std::fs::write(&victim, b"precious\n").unwrap();
+        std::fs::remove_file(root.join("x.txt")).unwrap();
+        std::os::unix::fs::symlink(&victim, root.join("x.txt")).unwrap();
+        let report = abort(&repo, op);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious\n", "{op:?}");
+        assert_eq!(report.kept, vec!["x.txt".to_string()], "{op:?}");
+        std::fs::remove_file(&victim).unwrap();
+        finish(&root, repo);
+    }
+}

@@ -1255,6 +1255,12 @@ fn materialize_impl(
         // conflicted, where an edit is the resolution abort discards. A
         // plaintext protected file never equals a blob, so it needs the
         // record. A directory is for `clear` to judge.
+        // A symlink is never the stop's (it writes regular files) and writing
+        // would follow it, out of the working tree.
+        if restore_owned.is_some() && full.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+            kept.push(path.clone());
+            continue;
+        }
         if let Some(owned) = restore_owned.filter(|_| old_root.is_some()) {
             if !owned.contains(path) && full.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
                 let disk = disk_blob_id(&full);
