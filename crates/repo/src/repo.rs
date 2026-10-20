@@ -1918,7 +1918,22 @@ impl Repo {
                 .iter()
                 .map(|(p, ..)| p.as_str())
                 .chain(sidecars.iter().map(|(r, _)| r.as_str()));
+            let sidecar_rels: std::collections::BTreeSet<&str> =
+                sidecars.iter().map(|(r, _)| r.as_str()).collect();
             for rel in targets {
+                // Only a plaintext target clears a tracked directory husk; a
+                // sidecar is written with a plain write, so any directory at
+                // its path blocks.
+                if sidecar_rels.contains(rel)
+                    && worktree::safe_join(&self.layout.root, rel)?
+                        .symlink_metadata()
+                        .is_ok_and(|m| m.is_dir())
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "{op} has conflicts, and its sidecar {rel} would land on a directory; \
+                         move it away, then retry"
+                    )));
+                }
                 // Every target is in the view (gated above; a sidecar is
                 // never tracked, checked above). A failed lookup counts as
                 // untracked.
@@ -1987,6 +2002,7 @@ impl Repo {
         )?;
         for (path, bytes, mode, _recipients) in to_encrypt {
             let full = worktree::safe_join(&self.layout.root, path)?;
+            worktree::clear_dir_obstruction(&full, path)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -2250,9 +2266,9 @@ impl Repo {
     ) -> Result<()> {
         // `rel` is not in `old`, and a tree holds no file at an ancestor of
         // another of its paths, so nothing on the way is a tracked file.
-        // Relies on `stop_write_blocker` treating whatever stands at `rel` (any
-        // directory included) as the user's: nothing outside the view is laid
-        // out, so no tracked file can be on disk there.
+        // Nothing outside the view is laid out, so no tracked file can be on
+        // disk there and any directory at `rel` is the user's. `stop_write_blocker`
+        // accepts a directory of tracked files (#247), so refuse one here first.
         // Only a case alias of a path `old` laid out, so inside the view (a
         // case-only rename on a case-insensitive filesystem), is the tracked
         // file; an out-of-view old path was never on disk.
@@ -2267,7 +2283,10 @@ impl Repo {
             .iter()
             .filter(|p| !sparse.matches(p) && !old.contains(*p))
         {
-            if stop_write_blocker(&self.layout.root, rel, &mut is_tracked)?.is_some() {
+            let is_dir = worktree::safe_join(&self.layout.root, rel)?
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_dir());
+            if is_dir || stop_write_blocker(&self.layout.root, rel, &mut is_tracked)?.is_some() {
                 return Err(Error::InvalidArgument(format!(
                     "{op} would add {rel} (outside your sparse checkout), where an untracked or \
                      ignored file or directory already stands; a later commit would take that \
@@ -2832,6 +2851,40 @@ fn is_tracked_case_alias(
     false
 }
 
+/// True when the directory `full` (path `rel`) holds at least one tracked file
+/// and nothing else of substance: no symlink, and no file `tracked` does not
+/// name. An empty directory has no tracked file to show it is the old tree's,
+/// and a read failure counts as not tracked.
+fn dir_holds_only_tracked(
+    full: &std::path::Path,
+    rel: &str,
+    tracked: &mut impl FnMut(&str) -> bool,
+) -> bool {
+    // `Some(n)`: only tracked files, `n` of them.
+    fn count(
+        full: &std::path::Path,
+        rel: &str,
+        tracked: &mut impl FnMut(&str) -> bool,
+    ) -> Option<usize> {
+        let mut n = 0;
+        for e in std::fs::read_dir(full).ok()? {
+            let e = e.ok()?;
+            // A name that is not UTF-8 cannot be a tracked path.
+            let child = format!("{rel}/{}", e.file_name().to_str()?);
+            let t = e.file_type().ok()?;
+            if t.is_dir() {
+                n += count(&e.path(), &child, tracked)?;
+            } else if t.is_file() && tracked(&child) {
+                n += 1;
+            } else {
+                return None;
+            }
+        }
+        Some(n)
+    }
+    count(full, rel, tracked).is_some_and(|n| n > 0)
+}
+
 /// What stands in the way of a conflict stop's direct write to `rel`.
 #[derive(Debug, PartialEq, Eq)]
 enum StopBlocker {
@@ -2848,7 +2901,8 @@ enum StopBlocker {
 /// tracks `path` as a file that is on disk. A tracked file standing where a
 /// parent directory must be is fine: the stop's materialize removes it before
 /// the write, as a merge that replaces a file with a directory does. A
-/// directory at `rel` is never fine, tracked or not: the write would fail.
+/// directory at `rel` is fine only when everything under it is tracked (the
+/// reverse replacement, #247); any other content in it is the user's.
 fn stop_write_blocker(
     root: &std::path::Path,
     rel: &str,
@@ -2870,7 +2924,13 @@ fn stop_write_blocker(
     let full = worktree::safe_join(root, rel)?;
     match full.symlink_metadata() {
         Err(_) => Ok(None),
-        Ok(m) if m.is_dir() => Ok(Some(StopBlocker::Occupied)),
+        // A directory is fine when it holds only tracked files: the write
+        // removes them first and `worktree::clear_dir_obstruction` the husk.
+        Ok(m) if m.is_dir() => Ok(if dir_holds_only_tracked(&full, rel, tracked) {
+            None
+        } else {
+            Some(StopBlocker::Occupied)
+        }),
         // A symlink is never the tracked file: a write would follow it to
         // whatever it points at, outside the repository.
         Ok(m) if m.file_type().is_symlink() => Ok(Some(StopBlocker::Occupied)),
@@ -7162,13 +7222,22 @@ mod stop_blocker_tests {
     }
 
     #[test]
-    fn a_directory_at_the_target_blocks_even_when_tracked() {
+    fn a_directory_at_the_target_blocks_unless_everything_in_it_is_tracked() {
         let root = tmp("dir-at-target");
         std::fs::create_dir_all(root.join("x/y")).unwrap();
-        let tracked = |_: &str| true;
+        std::fs::write(root.join("x/y/a"), b"a\n").unwrap();
+        // Only `x/y/a` is tracked: the directory holds nothing else.
+        let tracked = |p: &str| p == "x/y/a";
         assert_eq!(
             stop_write_blocker(&root, "x/y", &mut { tracked }).unwrap(),
-            Some(StopBlocker::Occupied)
+            None,
+            "the stop removes the tracked files, then the empty directories"
+        );
+        std::fs::write(root.join("x/y/mine"), b"mine\n").unwrap();
+        assert_eq!(
+            stop_write_blocker(&root, "x/y", &mut { tracked }).unwrap(),
+            Some(StopBlocker::Occupied),
+            "an untracked file in it is the user's"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

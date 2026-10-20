@@ -409,6 +409,30 @@ fn a_stop_refuses_an_untracked_file_where_the_other_side_adds_one_out_of_view() 
     }
 }
 
+/// Any directory where the other side adds an out-of-view file is the user's,
+/// empty or not: `stop_write_blocker` accepts a directory of tracked files
+/// (#247), but nothing out of view is laid out, so none is tracked here.
+#[test]
+fn a_stop_refuses_any_directory_where_the_other_side_adds_a_file_out_of_view() {
+    for op in ops() {
+        for with_file in [false, true] {
+            let (root, repo) = collision_setup(&tag(op, &format!("dir-{with_file}")), op);
+            let dir = root.join("docs/new.txt");
+            std::fs::create_dir_all(&dir).unwrap();
+            if with_file {
+                std::fs::write(dir.join("mine"), b"MINE\n").unwrap();
+            }
+            let err = start(&repo, op).unwrap_err().to_string();
+            assert!(err.contains("docs/new.txt"), "{op:?}: {err}");
+            assert!(!in_progress(&repo), "{op:?}: refusal left state behind");
+            assert!(dir.is_dir(), "{op:?}: the directory is untouched");
+            drop(repo);
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(!root.exists(), "temp repo must be removed");
+        }
+    }
+}
+
 /// A file standing where the other side needs a parent directory out of view.
 #[test]
 fn a_stop_refuses_an_untracked_file_where_an_out_of_view_directory_must_be() {
