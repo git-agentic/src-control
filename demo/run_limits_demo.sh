@@ -2,7 +2,7 @@
 # P31 listener-limits demo: `sc serve --http`'s three new operator knobs —
 # `--max-connections` (503-style busy shed at the limit), `--timeout`
 # (session idle read+write timeout), and `--max-pack-size` (floor:
-# MAX_OBJECT_SIZE, 256 MiB) — layered on P26/P29's `sc serve --http`.
+# the max object size, 256 MiB) — layered on P26/P29's `sc serve --http`.
 #
 # Honesty note on scope: a connection that never sends its opening is
 # reaped by the FIXED 30s opening timeout, not by `--timeout` (which
@@ -20,6 +20,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# The --max-pack-size values below assume the default 256 MiB object cap; a
+# caller's exported SC_MAX_OBJECT_SIZE must not change what the demo proves.
+unset SC_MAX_OBJECT_SIZE
 cargo build --quiet --bin sc
 SC="$PWD/target/debug/sc"
 
@@ -164,7 +167,7 @@ echo "clone through a floor-capped server: succeeds ✔"
 # The cap gates the PutPack spool (the server's receive path) — a clone's
 # GetPack never consults it. Exercise the actually-gated path: a small
 # commit pushed THROUGH the capped server must land (its pack is far under
-# the 256 MiB floor cap). If the cap's enforcement broke open-endedly or
+# the 256 MiB --max-pack-size floor, which is the default max object size). If the cap's enforcement broke open-endedly or
 # regressed to rejecting everything, this push is the step that notices.
 cd "$W/c-floor"
 printf 'v2 via capped push\n' > pushed.txt
@@ -183,7 +186,7 @@ SERVER_PID=""
 ! nc -z 127.0.0.1 "$PORT2" 2>/dev/null || fail "second server still accepting connections after kill"
 
 if "$SC" serve --http "127.0.0.1:$PORT2" --max-pack-size 1024 "$A" 2>"$W/err-cap.txt"; then
-  fail "server should have refused to start with --max-pack-size below MAX_OBJECT_SIZE"
+  fail "server should have refused to start with --max-pack-size below the max object size"
 fi
 grep -qi "max-pack-size" "$W/err-cap.txt" \
   || fail "expected a --max-pack-size floor error, got: $(cat "$W/err-cap.txt")"

@@ -81,17 +81,19 @@ pub fn pack_chunk_size() -> usize {
 
 /// The `SC_PACK_CHUNK` decision, pure so it can be tested without touching the
 /// process environment: an unset, unparsable or zero value is the default, and
-/// anything larger than a frame can carry is clamped. A chunk frame is the
-/// `ST_PACK_CHUNK` tag byte plus the data, and the receiver refuses a frame
-/// above `MAX_OBJECT_SIZE`, so the data is capped one byte below it; an
-/// oversized setting would otherwise fail every large transfer with a
-/// confusing error.
+/// anything larger than the smallest valid receiver accepts is clamped. Caps
+/// are receiver-local and unnegotiated, and the smallest a receiver can be set
+/// to is [`scl_core::MIN_MAX_OBJECT_SIZE`], so the data is capped one byte
+/// below that (the `ST_PACK_CHUNK` tag byte makes the frame exactly that size).
+/// Every chunk frame therefore fits any valid receiver, and receivers built
+/// before the frame limit gained [`FRAME_OVERHEAD`]; an oversized setting would
+/// otherwise fail every large transfer with a confusing error.
 fn chunk_from(value: Option<&str>) -> usize {
     value
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(CHUNK_SIZE)
-        .min(scl_core::MAX_OBJECT_SIZE - 1)
+        .min(scl_core::MIN_MAX_OBJECT_SIZE - 1)
 }
 
 // Wire error codes. Typed errors that sync logic relies on get their own code;
@@ -370,6 +372,23 @@ impl Request {
         c.done()?;
         Ok(req)
     }
+
+    /// [`Request::decode`] for a frame the caller owns. A `PutObject` object
+    /// body is moved out of the frame (the header is shifted off in place)
+    /// instead of copied, so a near-cap request holds one copy of the object,
+    /// not two. Anything malformed falls through to `decode` for its error.
+    pub fn decode_owned(mut frame: Vec<u8>) -> Result<Request> {
+        const HEADER: usize = 1 + 32 + 4;
+        if frame.len() >= HEADER && frame[0] == OP_PUT_OBJECT {
+            let n = u32::from_be_bytes(frame[33..HEADER].try_into().unwrap()) as usize;
+            if frame.len() - HEADER == n {
+                let id = ObjectId::from_bytes(frame[1..33].try_into().unwrap());
+                frame.drain(..HEADER);
+                return Ok(Request::PutObject { id, bytes: frame });
+            }
+        }
+        Request::decode(&frame)
+    }
 }
 
 // --- frame IO ---
@@ -398,6 +417,32 @@ pub fn read_frame_opt(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
 }
 
 fn read_frame_inner(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
+    read_frame_max(r, scl_core::max_object_size())
+}
+
+/// Room a frame has beyond the object it carries: the longest header is a
+/// `PutObject` request (opcode + 32-byte id + 4-byte length = 37 bytes); a
+/// response adds a status byte and a pack chunk a tag byte. Frames may be
+/// `cap + FRAME_OVERHEAD` long so an object of exactly `cap` bytes still
+/// fits; the object itself is checked against `cap` by [`check_object_len`].
+pub const FRAME_OVERHEAD: usize = 64;
+
+/// Reject an object body above the cap `max`. Frames carry [`FRAME_OVERHEAD`]
+/// extra bytes, so a single-object payload gets this separate exact check.
+pub(crate) fn check_object_len(len: usize, max: usize) -> Result<()> {
+    if len > max {
+        return Err(Error::Protocol(format!(
+            "object of {len} bytes exceeds the {max}-byte object size limit ({})",
+            scl_core::OBJECT_SIZE_HINT
+        )));
+    }
+    Ok(())
+}
+
+/// [`read_frame_opt`] with an explicit object cap `max` (the live
+/// [`scl_core::max_object_size`] in production); the frame limit is
+/// `max + FRAME_OVERHEAD`.
+fn read_frame_max(r: &mut impl Read, max: usize) -> Result<Option<Vec<u8>>> {
     let mut len_bytes = [0u8; 4];
     let mut filled = 0;
     while filled < 4 {
@@ -411,13 +456,15 @@ fn read_frame_inner(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
         filled += n;
     }
     let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > scl_core::MAX_OBJECT_SIZE {
+    if len > max + FRAME_OVERHEAD {
         return Err(Error::Protocol(format!(
-            "frame length {len} exceeds MAX_OBJECT_SIZE"
+            "frame length {len} exceeds the {max}-byte object size limit plus framing ({})",
+            scl_core::OBJECT_SIZE_HINT
         )));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).map_err(|e| match e.kind() {
+    // The length is the peer's claim: grow with the bytes that actually
+    // arrive instead of allocating `len` up front.
+    let buf = scl_core::read_exact_vec(r, len).map_err(|e| match e.kind() {
         // A read timeout is the peer going quiet, not a malformed frame.
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Error::Io(e),
         _ => Error::Protocol(format!("read inside {len}-byte frame body failed: {e}")),
@@ -530,14 +577,18 @@ pub fn write_err(w: &mut impl Write, code: u8, msg: &str) -> Result<()> {
 }
 
 /// Split a response frame into its OK body, or reconstruct the typed error.
-pub fn parse_response(frame: Vec<u8>) -> Result<Vec<u8>> {
-    let (&status, rest) = frame
-        .split_first()
+pub fn parse_response(mut frame: Vec<u8>) -> Result<Vec<u8>> {
+    let status = *frame
+        .first()
         .ok_or_else(|| Error::Protocol("empty response frame".into()))?;
     match status {
-        ST_OK => Ok(rest.to_vec()),
+        ST_OK => {
+            // Strip the status byte in place: no second copy of a large body.
+            frame.remove(0);
+            Ok(frame)
+        }
         ST_ERR => {
-            let mut c = Cur::new(rest);
+            let mut c = Cur::new(&frame[1..]);
             let code = c.u8()?;
             let msg = c.str()?;
             c.done()?;
@@ -729,14 +780,14 @@ impl Default for WirePolicy {
 }
 
 /// Validate an operator-supplied `--max-pack-size` value. `0` (unlimited) is
-/// always fine; a nonzero cap below [`scl_core::MAX_OBJECT_SIZE`] can never
-/// fit even one object and is rejected as a misconfiguration rather than
-/// silently failing every push at runtime.
-pub fn validate_max_pack_size(max: u64) -> Result<()> {
-    if max != 0 && max < scl_core::MAX_OBJECT_SIZE as u64 {
+/// always fine; a nonzero cap below `object_cap` (the live
+/// [`scl_core::max_object_size`]) can never fit even one object and is
+/// rejected as a misconfiguration rather than silently failing every push at
+/// runtime.
+pub fn validate_max_pack_size(max: u64, object_cap: usize) -> Result<()> {
+    if max != 0 && max < object_cap as u64 {
         return Err(Error::InvalidArgument(format!(
-            "--max-pack-size {max} is below MAX_OBJECT_SIZE ({}); a cap that cannot fit one object is a misconfiguration",
-            scl_core::MAX_OBJECT_SIZE
+            "--max-pack-size {max} is below the max object size ({object_cap}); a cap that cannot fit one object is a misconfiguration"
         )));
     }
     Ok(())
@@ -987,7 +1038,7 @@ fn serve_session(
             Some(f) => f,
             None => return Ok(()), // peer hung up between requests
         };
-        let req = match Request::decode(&frame) {
+        let req = match Request::decode_owned(frame) {
             Ok(req) => req,
             Err(e) => {
                 let (code, msg) = err_to_wire(&e);
@@ -1129,20 +1180,17 @@ fn serve_session(
                         // `guard` drops here — temp pack file removed,
                         // whether ingestion succeeded or failed.
                     }
-                    Err(e @ Error::PackTooLarge(_)) => {
-                        // Over the cap: the stream is desynced (we stopped
-                        // reading mid-pack, so any bytes still on the wire
-                        // are neither read nor a subsequent request), so a
-                        // best-effort reply is the most we can do — then
-                        // close the connection rather than try to serve
-                        // further requests off a desynced stream.
+                    Err(e) => {
+                        // Any spill failure (over the cap, a malformed or
+                        // over-cap frame, I/O): we stopped reading mid-pack,
+                        // so any bytes still on the wire are neither read
+                        // nor a subsequent request. A best-effort reply is
+                        // the most we can do; then close the connection
+                        // rather than serve further requests off a
+                        // desynced stream.
                         let (code, msg) = err_to_wire(&e);
                         let _ = write_err(w, code, &msg);
                         return Ok(());
-                    }
-                    Err(e) => {
-                        let (code, msg) = err_to_wire(&e);
-                        write_err(w, code, &msg)?;
                     }
                 }
             }
@@ -1162,10 +1210,14 @@ fn serve_session(
                         transport.as_transport().has_object(&id).map(bool_body)
                     }
                     Request::GetObject(id) => transport.as_transport().get_object(&id),
-                    Request::PutObject { id, bytes } => transport
-                        .as_transport()
-                        .put_object(&id, &bytes)
-                        .map(|()| Vec::new()),
+                    Request::PutObject { id, bytes } => {
+                        check_object_len(bytes.len(), scl_core::max_object_size()).and_then(|()| {
+                            transport
+                                .as_transport()
+                                .put_object(&id, &bytes)
+                                .map(|()| Vec::new())
+                        })
+                    }
                     Request::UpdateRef {
                         branch,
                         id,
@@ -1387,16 +1439,113 @@ mod tests {
 
     #[test]
     fn frame_over_cap_rejected() {
-        // A frame header alone (no body) claiming a length past
-        // MAX_OBJECT_SIZE must be rejected before any allocation of the
-        // (fictitious) body — feeding only the 4-byte header proves this:
-        // if the implementation tried to `vec![0u8; len]` and then
-        // `read_exact`, it would hang/OOM here rather than erroring.
-        let over = (scl_core::MAX_OBJECT_SIZE + 1) as u32;
+        // A frame header alone (no body) claiming a length past the cap plus
+        // framing must be rejected before the (fictitious) body is read or
+        // allocated: feeding only the 4-byte header proves this, since
+        // reading first would hit EOF and report a different error.
+        let cap = scl_core::MIN_MAX_OBJECT_SIZE;
+        let over = (cap + FRAME_OVERHEAD + 1) as u32;
         let mut r = std::io::Cursor::new(over.to_be_bytes().to_vec());
-        let err = read_frame_opt(&mut r).unwrap_err();
+        let err = read_frame_max(&mut r, cap).unwrap_err();
         assert!(
-            matches!(err, crate::error::Error::Protocol(_)),
+            matches!(&err, crate::error::Error::Protocol(m) if m.contains("exceeds")),
+            "got {err:?}"
+        );
+        // The production entry point is the same guard at the live cap.
+        let over = (scl_core::max_object_size() + FRAME_OVERHEAD + 1) as u32;
+        let mut r = std::io::Cursor::new(over.to_be_bytes().to_vec());
+        assert!(matches!(
+            read_frame_opt(&mut r),
+            Err(crate::error::Error::Protocol(m)) if m.contains("exceeds")
+        ));
+    }
+
+    #[test]
+    fn frame_cap_lowered_rejects_and_raised_accepts_the_same_frame() {
+        let low = scl_core::MIN_MAX_OBJECT_SIZE;
+        let body = vec![7u8; low + FRAME_OVERHEAD + 1];
+        let mut framed = Vec::new();
+        write_frame(&mut framed, &body).unwrap();
+        assert!(read_frame_max(&mut &framed[..], low).is_err());
+        assert_eq!(
+            read_frame_max(&mut &framed[..], low + 1).unwrap().unwrap(),
+            body
+        );
+        assert_eq!(
+            read_frame_max(&mut &framed[..], low * 4).unwrap().unwrap(),
+            body
+        );
+    }
+
+    /// An object of exactly the cap travels in `PutObject` (37 header bytes)
+    /// and `GetObject` (1 status byte) frames; one byte more is refused by
+    /// the exact object check even though the frame itself still fits.
+    #[test]
+    fn object_boundary_exactly_cap_accepted_cap_plus_one_rejected() {
+        let cap = scl_core::MIN_MAX_OBJECT_SIZE;
+        let id = some_id(7);
+        for (len, ok) in [(cap, true), (cap + 1, false)] {
+            let bytes = vec![5u8; len];
+            // PutObject request.
+            let mut framed = Vec::new();
+            write_frame(
+                &mut framed,
+                &Request::PutObject {
+                    id,
+                    bytes: bytes.clone(),
+                }
+                .encode(),
+            )
+            .unwrap();
+            let frame = read_frame_max(&mut &framed[..], cap).unwrap().unwrap();
+            let Request::PutObject { bytes: got, .. } = Request::decode_owned(frame).unwrap()
+            else {
+                panic!("not a PutObject");
+            };
+            assert_eq!(got, bytes);
+            assert_eq!(check_object_len(got.len(), cap).is_ok(), ok, "put {len}");
+            // GetObject response.
+            let mut framed = Vec::new();
+            write_ok(&mut framed, &bytes).unwrap();
+            let frame = read_frame_max(&mut &framed[..], cap).unwrap().unwrap();
+            let body = parse_response(frame).unwrap();
+            assert_eq!(body, bytes);
+            assert_eq!(check_object_len(body.len(), cap).is_ok(), ok, "get {len}");
+        }
+    }
+
+    #[test]
+    fn decode_owned_matches_decode_and_handles_malformed_put_object() {
+        let id = some_id(3);
+        let enc = Request::PutObject {
+            id,
+            bytes: b"hello".to_vec(),
+        }
+        .encode();
+        assert_eq!(
+            Request::decode_owned(enc.clone()).unwrap(),
+            Request::decode(&enc).unwrap()
+        );
+        // Declared length disagrees with the frame: same error as decode.
+        let mut bad = enc.clone();
+        bad.push(0);
+        assert!(Request::decode_owned(bad).is_err());
+        let mut short = enc;
+        short.truncate(10);
+        assert!(Request::decode_owned(short).is_err());
+    }
+
+    #[test]
+    fn frame_claiming_the_ceiling_without_a_body_is_a_short_read_error() {
+        // At the ceiling, a 4-byte header can claim 1 GiB and passes the
+        // length guard; with no body behind it the read fails as a short
+        // frame. (That no cap-sized buffer is allocated is pinned by
+        // `read_limited_never_over_allocates_by_more_than_one_step`.)
+        let cap = scl_core::MAX_MAX_OBJECT_SIZE;
+        let mut r = std::io::Cursor::new((cap as u32).to_be_bytes().to_vec());
+        let err = read_frame_max(&mut r, cap).unwrap_err();
+        assert!(
+            matches!(&err, crate::error::Error::Protocol(m) if m.contains("frame body")),
             "got {err:?}"
         );
     }
@@ -1875,32 +2024,39 @@ mod tests {
     }
 
     #[test]
-    fn chunk_from_defaults_and_clamps_to_the_object_cap() {
+    fn chunk_from_defaults_and_clamps_to_the_smallest_valid_receiver_cap() {
+        let min = scl_core::MIN_MAX_OBJECT_SIZE;
         assert_eq!(chunk_from(None), CHUNK_SIZE);
         assert_eq!(chunk_from(Some("")), CHUNK_SIZE);
         assert_eq!(chunk_from(Some("0")), CHUNK_SIZE);
         assert_eq!(chunk_from(Some("junk")), CHUNK_SIZE);
         assert_eq!(chunk_from(Some("4096")), 4096);
-        // A chunk frame carries a tag byte too: data at the cap would make a
-        // frame one byte over what the receiver accepts.
-        let cap = scl_core::MAX_OBJECT_SIZE - 1;
-        assert_eq!(
-            chunk_from(Some(&(scl_core::MAX_OBJECT_SIZE * 8).to_string())),
-            cap,
-            "an oversized setting is clamped, not passed through"
-        );
-        assert_eq!(
-            chunk_from(Some(&scl_core::MAX_OBJECT_SIZE.to_string())),
-            cap
-        );
-        assert_eq!(chunk_from(Some(&cap.to_string())), cap);
+        // Independent of this process's own cap: a sender raised to 1 GiB
+        // must still produce frames the smallest valid receiver accepts.
+        for v in [min, min * 8, scl_core::MAX_MAX_OBJECT_SIZE, usize::MAX] {
+            assert_eq!(chunk_from(Some(&v.to_string())), min - 1, "{v}");
+        }
+        // The resulting frame (tag byte + data) is exactly the minimum cap and
+        // is accepted by a receiver at that cap, even with no overhead slack.
+        let mut frame = vec![ST_PACK_CHUNK];
+        frame.extend(vec![0u8; min - 1]);
+        let mut framed = Vec::new();
+        write_frame(&mut framed, &frame).unwrap();
+        assert!(read_frame_max(&mut &framed[..], min).unwrap().is_some());
+        assert!(CHUNK_SIZE < min, "the default chunk fits every receiver");
     }
 
     #[test]
     fn validate_max_pack_size_floor() {
-        assert!(validate_max_pack_size(0).is_ok());
-        assert!(validate_max_pack_size(scl_core::MAX_OBJECT_SIZE as u64).is_ok());
-        assert!(validate_max_pack_size(1024).is_err());
+        let max = scl_core::DEFAULT_MAX_OBJECT_SIZE;
+        assert!(validate_max_pack_size(0, max).is_ok());
+        assert!(validate_max_pack_size(max as u64, max).is_ok());
+        assert!(validate_max_pack_size(1024, max).is_err());
+        // The floor tracks the object cap: lowered admits what a default
+        // cap refuses, raised refuses what a default cap admits.
+        let low = scl_core::MIN_MAX_OBJECT_SIZE;
+        assert!(validate_max_pack_size(low as u64, low).is_ok());
+        assert!(validate_max_pack_size(max as u64, scl_core::MAX_MAX_OBJECT_SIZE).is_err());
     }
 
     /// An oversized push on a read-only connection drains at most ro_drain_cap
@@ -1943,6 +2099,39 @@ mod tests {
         ));
         let tmp = root.join(".sc").join("tmp");
         assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A malformed frame inside a pack stream desyncs the connection: the
+    /// server replies once and closes instead of answering what follows.
+    #[test]
+    fn put_pack_protocol_error_closes_the_connection() {
+        let root = tmp_repo("putpack-proto");
+        let mut input = Vec::new();
+        for req in [
+            Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+            Request::PutPack,
+        ] {
+            write_frame(&mut input, &req.encode()).unwrap();
+        }
+        write_frame(&mut input, &[0x7f]).unwrap(); // not a pack chunk or end
+        write_frame(&mut input, &Request::HeadBranch.encode()).unwrap(); // must never be answered
+
+        let mut output = Vec::new();
+        serve(&root, &mut std::io::Cursor::new(input), &mut output).unwrap();
+
+        let mut frames = Vec::new();
+        let mut r = std::io::Cursor::new(output);
+        while let Some(f) = read_frame_opt(&mut r).unwrap() {
+            frames.push(parse_response(f));
+        }
+        assert_eq!(frames.len(), 2, "hello ok, one error, then closed");
+        assert!(matches!(
+            frames[1].as_ref().unwrap_err(),
+            Error::Protocol(_)
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 

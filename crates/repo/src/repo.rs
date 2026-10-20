@@ -13,7 +13,19 @@ use crate::refs;
 use crate::worktree::{self, Diff};
 
 const DEFAULT_BRANCH: &str = "main";
-pub(crate) const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
+const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
+
+/// Resident-blob budget for a repo or transport store: 512 MiB, or twice the
+/// object cap if that is larger, so one maximum-size object always fits (a
+/// blob bigger than the whole budget would fail with `BudgetExceeded`). Equal
+/// to the old fixed 512 MiB at the default 256 MiB cap.
+pub(crate) fn default_budget() -> usize {
+    budget_for(scl_core::max_object_size())
+}
+
+fn budget_for(object_cap: usize) -> usize {
+    DEFAULT_BUDGET.max(2 * object_cap)
+}
 
 /// A working-tree file headed for encryption at commit time:
 /// `(path, plaintext bytes, file mode, recipient pubkeys)`.
@@ -44,17 +56,17 @@ impl Repo {
         std::fs::create_dir_all(layout.objects_dir())?;
         std::fs::create_dir_all(layout.refs_heads_dir())?;
         refs::write_head(&layout, DEFAULT_BRANCH)?;
-        Self::open_layout(layout, DEFAULT_BUDGET)
+        Self::open_layout(layout, default_budget())
     }
 
     /// Open an existing repo by discovering `.sc/` at or above `start`.
     pub fn open(start: impl AsRef<Path>) -> Result<Repo> {
         let layout = Layout::discover(start)?;
-        Self::open_layout(layout, DEFAULT_BUDGET)
+        Self::open_layout(layout, default_budget())
     }
 
     /// Open an existing repo with an explicit memory budget for the shared
-    /// object cache (bytes). `open` uses `DEFAULT_BUDGET`; workspace sessions
+    /// object cache (bytes). `open` uses `default_budget()`; workspace sessions
     /// (`sc work --budget-mb`) size the cache to the fleet they fork.
     pub fn open_with_budget(start: impl AsRef<Path>, budget_bytes: usize) -> Result<Repo> {
         let layout = Layout::discover(start)?;
@@ -2519,10 +2531,21 @@ impl Repo {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread clock override for tests that need two commits to share a
+    /// timestamp without racing a wall-clock second boundary.
+    pub(crate) static TEST_NOW: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Current unix time in seconds, for snapshot timestamps. Snapshot ids
 /// legitimately depend on commit time (as in Git); nothing in the system
 /// requires two separate commits of identical content to share an id.
 pub(crate) fn unix_now() -> i64 {
+    #[cfg(test)]
+    if let Some(t) = TEST_NOW.with(std::cell::Cell::get) {
+        return t;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2697,6 +2720,20 @@ fn stop_write_blocker(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn store_budget_always_fits_one_maximum_size_object() {
+        // Unchanged at the default cap; grows with a raised cap.
+        assert_eq!(budget_for(scl_core::DEFAULT_MAX_OBJECT_SIZE), 512 << 20);
+        assert_eq!(budget_for(scl_core::MIN_MAX_OBJECT_SIZE), 512 << 20);
+        for cap in [
+            scl_core::DEFAULT_MAX_OBJECT_SIZE,
+            scl_core::MAX_MAX_OBJECT_SIZE,
+        ] {
+            assert!(budget_for(cap) >= cap);
+        }
+        assert_eq!(budget_for(scl_core::MAX_MAX_OBJECT_SIZE), 2 << 30);
+    }
+
     use super::*;
 
     fn tmp_root(tag: &str) -> std::path::PathBuf {
