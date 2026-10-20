@@ -199,3 +199,89 @@ fn a_bucket_remote_refuses_a_size_only_clone() {
     );
     remove_all(&[&src, &bucket, &dst]);
 }
+
+/// Add a commit to `src` that introduces `extra.bin`, then replaces it, so the
+/// first version is history only.
+fn grow(src: &Path) {
+    std::fs::write(src.join("extra.bin"), [b'x'; 4096]).unwrap();
+    assert!(sc(src, &["commit", "-m", "c3"]).status.success());
+    std::fs::write(src.join("extra.bin"), [b'y'; 4096]).unwrap();
+    assert!(sc(src, &["commit", "-m", "c4"]).status.success());
+}
+
+fn clone_limited(src: &Path, dst: &Path) {
+    let out = sc(
+        src,
+        &[
+            "clone",
+            src.to_str().unwrap(),
+            dst.to_str().unwrap(),
+            "--filter",
+            "blob:limit=1KiB",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn fetch_keeps_the_limit_and_no_blob_limit_opts_out() {
+    let src = origin("fetch");
+    let dst = tmp("fetch-dst");
+    clone_limited(&src, &dst);
+    let dst2 = tmp("fetch-dst2");
+    clone_limited(&src, &dst2);
+    grow(&src);
+
+    let f = sc(&dst, &["fetch"]);
+    assert!(f.status.success(), "{}", stderr(&f));
+    let m = sc(&dst, &["merge", "origin/main"]);
+    assert!(m.status.success(), "{}", stderr(&m));
+    assert_eq!(std::fs::read(dst.join("extra.bin")).unwrap(), [b'y'; 4096]);
+    let v = stdout(&sc(&dst, &["verify"]));
+    // The clone-time old big.bin and the history-only extra.bin v1.
+    assert!(
+        v.contains("partial: 2 object(s) outside filter [blob:limit=1024]"),
+        "fetch must leave the history-only extra.bin out: {v}"
+    );
+
+    // The opt-out fetches in full for one command and keeps the marker.
+    let f = sc(&dst2, &["fetch", "--no-blob-limit"]);
+    assert!(f.status.success(), "{}", stderr(&f));
+    assert!(sc(&dst2, &["merge", "origin/main"]).status.success());
+    let v = stdout(&sc(&dst2, &["verify"]));
+    assert!(
+        v.contains("partial: 1 object(s) outside filter [blob:limit=1024]"),
+        "only the clone-time gap remains: {v}"
+    );
+    assert!(dst2.join(".sc/promisor-blob-limit").exists());
+    let help = stdout(&sc(&src, &["fetch", "--help"]));
+    assert!(help.contains("--no-blob-limit"), "{help}");
+    remove_all(&[&src, &dst, &dst2]);
+}
+
+#[test]
+fn a_bucket_origin_refuses_a_limit_bearing_fetch() {
+    let src = origin("bucket-fetch");
+    let bucket = tmp("bucket-fetch-wal");
+    std::fs::create_dir_all(&bucket).unwrap();
+    let url = format!("sc+wal://{}", bucket.display());
+    assert!(sc(&src, &["remote", "add", "bk", &url]).status.success());
+    assert!(sc(&src, &["push", "bk"]).status.success());
+    let dst = tmp("bucket-fetch-dst");
+    clone_limited(&src, &dst);
+    // Point the promisor at the bucket, as if the clone had come from it.
+    let promisor = dst.join(".sc/promisor");
+    std::fs::write(&promisor, format!("origin {url}\n")).unwrap();
+    assert!(sc(&dst, &["remote", "add", "bk", &url]).status.success());
+    let out = sc(&dst, &["fetch", "bk"]);
+    assert!(!out.status.success(), "a bucket remote must refuse");
+    assert!(
+        stderr(&out).contains("partial clone from bucket remotes"),
+        "{}",
+        stderr(&out)
+    );
+    // Without the limit the same fetch is an ordinary one.
+    let ok = sc(&dst, &["fetch", "bk", "--no-blob-limit"]);
+    assert!(ok.status.success(), "{}", stderr(&ok));
+    remove_all(&[&src, &bucket, &dst]);
+}

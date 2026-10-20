@@ -142,7 +142,7 @@ the code, those win.
 | P24 | Sparse checkouts: `.sc/sparse` local prefix spec; checkout-only (CAS keeps everything) | [0034](docs/adr/0034-sparse-checkouts.md) |
 | P25 | Streaming pack transfer: bounded RAM on both sides, `ST_PACK_CHUNK` frames (`SC_PACK_CHUNK` tunes), two-pass atomic-after-verify ingest | [0035](docs/adr/0035-streaming-transfer.md) |
 | P26 | `sc+http://` transport: `sc serve --http`, thread-per-connection, status-line-before-handshake opening | [0036](docs/adr/0036-http-transport.md) |
-| P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3. Blob-size filter (#217): `--filter blob:limit=<size>` (combinable with prefixes; `blob:` is reserved) leaves out blobs of at least that size unless a ref tip reaches them, evaluated by the server (`GetPack.blob_limit`, wire v6); the gap is absence as in ADR-0048, `sc backfill <path>` or a lazy fill repairs it, `.sc/promisor-blob-limit` records limit and scope | [0037](docs/adr/0037-partial-clone.md), [0055](docs/adr/0055-blob-size-clone-filter.md) |
+| P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3. Blob-size filter (#217): `--filter blob:limit=<size>` (combinable with prefixes; `blob:` is reserved) leaves out blobs of at least that size unless a ref tip reaches them, evaluated by the server (`GetPack.blob_limit`, wire v6); the gap is absence as in ADR-0048, `sc backfill <path>` or a lazy fill repairs it, `.sc/promisor-blob-limit` records limit and scope; `sc fetch` from the promisor origin sends the recorded limit again (`--no-blob-limit` opts out for one fetch); no object-count limit (rejected) | [0037](docs/adr/0037-partial-clone.md), [0055](docs/adr/0055-blob-size-clone-filter.md) |
 | P28 | Security hardening: a max object size (default 256 MiB; `--max-object-size` / `SC_MAX_OBJECT_SIZE`, 2 MiB to 1 GiB) caps every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | P29 | `sc serve --http` access control: bearer tokens (`sc serve token add [--expires]`/`rotate`/`remove`/`list`; an expired token gets the same 401 as an unknown one), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
 | P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex; retained signed tombstones ride a transfer when their snapshot is in it or was collected by the sender, only verifying signatures are indexed, and held-but-untrusted tombstones are re-judged from `.sc/transcript-pending` when the trusted-signer set changes (#230); the signature index (`.sc/signatures.v2`) holds one slot per (target, signer) so attacker-made keys cannot crowd out a drop (#257), and serve-path index updates take a short `.sc/index.lock` distinct from the repo lock (#260) | [0038](docs/adr/0038-agent-session-transcripts.md) |
@@ -202,7 +202,13 @@ transport-adjacent. The rest, imperatively:
   with a limit the gap errors name the file's own path (`GapBySize`, or
   `GapInView` with the limit as a cause). A size-only clone has an `AllPaths`
   scope and a full sparse view, and a lazy one still fills on switch, undo, merge
-  and replay. `sc fetch` is not limit-aware, and the object-count limit is deferred.
+  and replay. `sc fetch` from the promisor origin sends the recorded limit (only
+  the limit, never the prefixes), so later growth stays bounded and every fetched
+  tip stays complete (except a blob the clone already gapped, which a reverting
+  tip names without it: `GapInView`); `sc fetch --no-blob-limit` sends none for that command. A
+  limited fetch records no remote-tracking ref for a private branch, as clone
+  does; `--no-blob-limit` receives them. There is no
+  object-count limit (ADR-0055 decision 10).
 - **Bucket remotes hold public content plaintext at rest** — bucket ACL is
   the perimeter (sealed content stays ciphertext, unchanged); partial-clone
   `filter` against bucket remotes is refused.
@@ -315,6 +321,19 @@ transport-adjacent. The rest, imperatively:
   `.sc/sparse-widen` (local-only like the rest, removed with the spec write or
   the op); abort and completion delete what an interrupted widen laid outside
   the view.
+- **`materialize` deletes or overwrites a path only if it is the stop's own
+  file (ADR-0034 refinement 8, #255, #256).** A file the replaced tree tracks goes
+  only when the disk copy is a regular file with exactly the tracked bytes (an
+  edit, a replacement or a symlink survives); a path outside the sparse view is
+  never reported, since nothing is laid there and a copy is the user's. An
+  abort (`merge_abort`, `cherry_pick_abort`, `rebase_abort`; they return an
+  `AbortReport`) finishes anyway: it removes what the stop laid, leaves the
+  rest and lists it in `kept` (`sc` prints `left in place (changed since the
+  stop)`), and overwrites a file only if it is still the stopped tree's bytes or
+  the stop owns it (recorded plaintext, a conflicted path). Recorded plaintext (`CONFLICT_PLAINTEXT`, which now includes the
+  carried protected files a stop decrypted) and sidecars are removed whatever
+  their bytes, since an edit of them is the discarded resolution. Merge abort
+  compares against the decided root, not theirs' tree.
 - **A merge, switch, cherry-pick, rebase, undo or sparse-spec change refuses, before any write, to lay a file or
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
   away and retry. A directory holding only tracked files is not such a case: a file/directory change at one path crosses switch, undo, abort and `--continue`, and the emptied directories are cleared (#247). `materialize` checks every such directory before its first removal, so a refusal changes nothing and an abort stays retryable; a forward op also refuses a user's empty directory there (it cannot tell it from a husk), while `materialize` itself prunes empty ones. (On a case-insensitive checkout, replacing `foo/a` with a file `Foo` is refused: the check does not follow the case alias. Fail-closed.) On a sparse checkout the same holds for a path the result adds
@@ -333,9 +352,9 @@ transport-adjacent. The rest, imperatively:
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here); entries that name an issue mirror the open
 GitHub issues. Standing entries: `sc ws` workspace refresh (#215),
-a limit-aware `sc fetch` and an object-count clone limit (#217 remainder), the non-unix
+the non-unix
 `.sc/local-key` ACL (#214), and the open
-sparse, private-branch and abort edge cases (#241, #246, #247, #248).
+sparse guard and user-file safety limits (#241, ADR-0034 refinement 8).
 
 ## Agent skills
 

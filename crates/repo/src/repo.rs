@@ -34,6 +34,29 @@ type ProtectedFile = crate::protect::SealInput;
 /// Working-tree status against HEAD.
 pub type Status = Diff;
 
+impl AbortReport {
+    /// Add paths left in place, keeping the list sorted and free of repeats.
+    pub(crate) fn keep_all(&mut self, paths: Vec<String>) {
+        self.kept.extend(paths);
+        self.kept.sort();
+        self.kept.dedup();
+    }
+}
+
+/// What an abort did not restore. The abort itself completes either way and
+/// its state is cleared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AbortReport {
+    /// Protected paths left absent: no identity at abort time (or this
+    /// identity cannot read them).
+    pub skipped: Vec<String>,
+    /// Paths left as the user has them, because they are not the stop's file
+    /// any more: a file the stop laid that was changed or replaced since (not
+    /// removed), or a file the user put where the restored tip has one (not
+    /// overwritten). The user decides what to do with each (#255).
+    pub kept: Vec<String>,
+}
+
 /// A handle to an open persistent repo. Holds the single-writer lock for its
 /// lifetime.
 pub struct Repo {
@@ -1969,6 +1992,7 @@ impl Repo {
         // the store lock.
         self.ensure_view(conflict_root, &sparse)?;
         self.refuse_untracked_overwrite(op, Some(old_root), conflict_root)?;
+        let decrypted: Vec<String>;
         {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
@@ -1978,7 +2002,7 @@ impl Repo {
             // skipped content, so nothing is lost by not surfacing the list
             // here (the `Err`/`Stopped` return can't carry it).
             let mut cache = self.open_protected_cache()?;
-            let _skipped = worktree::materialize(
+            let skipped = worktree::materialize(
                 &self.layout,
                 &mut store,
                 conflict_root,
@@ -1991,14 +2015,30 @@ impl Repo {
             // Conflict materialization moves no branch ref; best-effort save
             // so cache trouble never aborts the conflict write-out (P33 Task 7).
             cache.save_best_effort();
+            // A carried protected file the identity could read is now on disk
+            // in plaintext, though no tree records that: abort may delete it
+            // only because it is recorded (#255), like the private stop.
+            let skipped: std::collections::HashSet<&String> = skipped.iter().collect();
+            decrypted = worktree::tree_file_entries_with_perms_sparse(
+                &mut store,
+                conflict_root,
+                &self.sparse_spec()?,
+            )?
+            .into_iter()
+            .filter(|(p, (_, _, perms))| perms & scl_core::PROTECTED != 0 && !skipped.contains(p))
+            .map(|(p, _)| p)
+            .collect();
         }
-        // Record what is about to be written in plaintext, before writing it:
-        // completion and abort need the list (see `conflict_plaintext`).
+        // Record the plaintext on disk: what is about to be written
+        // (`to_encrypt`, before writing it) and what `materialize` just
+        // decrypted. Completion and abort need the list (see
+        // `conflict_plaintext`).
         crate::conflict_plaintext::write(
             &self.layout,
             &to_encrypt
                 .iter()
                 .map(|(p, ..)| p.clone())
+                .chain(decrypted)
                 .collect::<Vec<_>>(),
         )?;
         crate::conflict_plaintext::write_sidecars(
@@ -2027,11 +2067,14 @@ impl Repo {
     /// protected content (`conflict_plaintext`), except a path the restored
     /// tree tracks as a plain file: that one is the user's own. Call it after
     /// the restore. A lookup that fails keeps the file: it would be a path the
-    /// restored tree may track.
-    pub(crate) fn remove_conflict_plaintext(&self, restored_root: ObjectId) -> Result<()> {
+    /// restored tree may track. Returns the recorded paths it left because
+    /// the user's symlink (or a symlinked parent)
+    /// stands there; a directory is reported by the restore itself.
+    pub(crate) fn remove_conflict_plaintext(&self, restored_root: ObjectId) -> Result<Vec<String>> {
         let paths = crate::conflict_plaintext::read(&self.layout)?;
+        let mut retained = Vec::new();
         if paths.is_empty() {
-            return Ok(());
+            return Ok(retained);
         }
         let partial = self.promisor()?.is_some();
         let store_arc = self.vfs.store();
@@ -2042,7 +2085,20 @@ impl Repo {
                 Ok(Some((_, _, perms))) => perms & scl_core::PROTECTED != 0,
                 Err(_) => false,
             };
-            if remove {
+            // A regular file only: the stop wrote one, so a symlink there is
+            // the user's, and so is anything behind a symlinked parent.
+            let full = worktree::safe_join(&self.layout.root, &path)?;
+            // Not knowing what stands there must stop the abort before its
+            // state is cleared, like a failed removal.
+            let meta = worktree::lstat(&full)?;
+            let behind_link = worktree::under_symlink(&self.layout.root, &path);
+            let is_file = !behind_link && meta.as_ref().is_some_and(|m| m.is_file());
+            if remove && meta.as_ref().is_some_and(|m| m.is_symlink() || behind_link) {
+                // The user's link where the stop wrote plaintext: left, and
+                // told to the caller.
+                retained.push(path.clone());
+            }
+            if remove && is_file {
                 // Only an already-absent file is fine: any other failure must
                 // stop the abort before its state is cleared, or the decrypted
                 // text stays on disk with nothing left to retry.
@@ -2053,7 +2109,7 @@ impl Repo {
                 }
             }
         }
-        Ok(())
+        Ok(retained)
     }
 
     /// [`Repo::refuse_untracked_overwrite_vs`] against the tree `old_root`
@@ -2417,13 +2473,14 @@ impl Repo {
     /// Abandon an in-progress merge: restore the working tree to the current tip
     /// and clear merge state. Errors if no merge is in progress.
     ///
-    /// Returns the protected paths that could not be restored. No identity is
-    /// available at abort time, so protected files are skipped (left absent)
+    /// The report lists the protected paths that could not be restored. No
+    /// identity is available at abort time, so protected files are skipped (left absent)
     /// rather than decrypted — that's expected; re-supply an identity via a
-    /// `switch_with_identity` back to the branch to materialize them. A merge
-    /// into a private branch cannot be aborted this way: it needs
-    /// [`Repo::merge_abort_with_identity`].
-    pub fn merge_abort(&self) -> Result<Vec<String>> {
+    /// `switch_with_identity` back to the branch to materialize them. It also
+    /// lists any path left in place because the user changed it since the stop
+    /// ([`AbortReport::kept`]). A merge into a private branch cannot be aborted
+    /// this way: it needs [`Repo::merge_abort_with_identity`].
+    pub fn merge_abort(&self) -> Result<AbortReport> {
         self.merge_abort_with_identity(None)
     }
 
@@ -2434,7 +2491,7 @@ impl Repo {
     pub fn merge_abort_with_identity(
         &self,
         identity: Option<&scl_crypto::SecretKey>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<AbortReport> {
         if !crate::merge_state::in_progress(&self.layout) {
             return Err(Error::InvalidArgument("no merge in progress".into()));
         }
@@ -2451,45 +2508,69 @@ impl Repo {
             let ours_root = self.snapshot(&ours_id)?.root;
             self.ensure_view(ours_root, &self.sparse_spec()?)?;
         }
-        // Restore working tree to ours tip. Pass theirs' root as `old_root` so
-        // the deletion pass drops files the conflicted merge pulled in from
-        // theirs; materializing against ours==old would delete nothing.
-        let mut skipped = Vec::new();
+        // Restore the working tree to ours tip. The tree the stop laid out is
+        // its decided root: the deletion pass must drop what it pulled in from
+        // theirs, and only that (theirs' own tree also holds paths the result
+        // deleted, which the stop never wrote). A stop without a decided root
+        // falls back to theirs' tree.
+        let mut report = AbortReport::default();
         let mut sidecar_roots: Vec<ObjectId> = Vec::new();
         let ours_tip = self.head_tip()?;
         if let Some(ours_id) = ours_tip {
-            let store_arc = self.vfs.store();
-            let mut store = store_arc.lock().unwrap();
-            let ours_snap = store.get_snapshot(&ours_id)?;
-            let ours_root = ours_snap.root;
-            let ours_protection = ours_snap.protection;
-            let theirs_root = store.get_snapshot(&theirs_id)?.root;
-            sidecar_roots = vec![ours_root];
-            // No identity at abort time: protected files in ours are skipped
-            // (not decrypted). With nothing decrypted, `materialize` records
-            // nothing into a cache, so pass `None` — no cache to open or save
-            // (P33 Task 7 item 7).
+            let ours_snap = self.snapshot(&ours_id)?;
+            sidecar_roots = vec![ours_snap.root];
+            let decided = match crate::merge_state::read_decided_root(&self.layout)? {
+                Some(d) => d,
+                None => self.snapshot(&theirs_id)?.root,
+            };
             // ensure_view ran above, before the lock and before any removal.
-            skipped = worktree::materialize(
-                &self.layout,
-                &mut store,
-                ours_root,
-                Some(theirs_root),
-                &ours_protection,
-                None,
-                &self.sparse_spec()?,
-                None,
-            )?;
+            report =
+                self.restore_over_stop(ours_snap.root, &ours_snap.protection, Some(decided))?;
         }
         if let Some(root) = sidecar_roots.first() {
-            self.remove_conflict_plaintext(*root)?;
+            report.keep_all(self.remove_conflict_plaintext(*root)?);
         }
         self.remove_conflict_sidecars(&sidecar_roots)?;
         // What an interrupted stopped-op widen laid, which the walk above
-        // (over theirs' tree) cannot see.
+        // (over the decided tree) cannot see.
         self.remove_widen_residue(crate::merge_state::read_decided_root(&self.layout)?)?;
         crate::merge_state::clear(&self.layout)?;
-        Ok(skipped)
+        Ok(report)
+    }
+
+    /// Re-lay `tip_root` over the tree a stopped merge, pick or rebase left on
+    /// disk (`stopped`), for its abort: no identity, so nothing is decrypted
+    /// and no cache is touched (P33 Task 7 item 7). Deletes only what the
+    /// stop laid and nobody changed, and leaves the rest in the report (#255,
+    /// `worktree::materialize_restore`). The caller has already filled the
+    /// view (`ensure_view`).
+    pub(crate) fn restore_over_stop(
+        &self,
+        tip_root: ObjectId,
+        protection: &scl_core::Protection,
+        stopped: Option<ObjectId>,
+    ) -> Result<AbortReport> {
+        // What the stop owns outright: the plaintext it recorded and the
+        // paths it left conflicted. A user's edit of either is the resolution
+        // abort discards; an edit of any other file is theirs to keep.
+        let mut owned = crate::conflict_plaintext::read(&self.layout)?;
+        owned.extend(self.active_conflicts()?);
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        // ensure-view-exempt: every caller filled the view before the first removal.
+        let m = worktree::materialize_restore(
+            &self.layout,
+            &mut store,
+            tip_root,
+            stopped,
+            protection,
+            &self.sparse_spec()?,
+            &owned,
+        )?;
+        Ok(AbortReport {
+            skipped: m.skipped,
+            kept: m.kept,
+        })
     }
 
     /// Snapshots from the current tip back through parents (newest first).
@@ -2659,10 +2740,16 @@ impl Repo {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
             let target_paths = worktree::tree_file_entries_with_perms(&mut store, target_root)?;
+            let sparse = self.sparse_spec()?;
             for p in &old_paths {
-                if !target_paths.contains_key(p) {
+                // Out of the view nothing was laid: a copy is the user's (#256).
+                if !target_paths.contains_key(p) && sparse.matches(p) {
                     let full = worktree::safe_join(&self.layout.root, p)?;
-                    let _ = std::fs::remove_file(full);
+                    match std::fs::remove_file(full) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             }
         }

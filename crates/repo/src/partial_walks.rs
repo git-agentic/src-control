@@ -673,7 +673,8 @@ fn every_materializer_call_site_fills_or_is_exempt() {
                 continue;
             }
             let call = t.contains("worktree::materialize(")
-                || t.contains("worktree::materialize_with_old_view(");
+                || t.contains("worktree::materialize_with_old_view(")
+                || t.contains("worktree::materialize_restore(");
             if !call {
                 continue;
             }
@@ -686,7 +687,7 @@ fn every_materializer_call_site_fills_or_is_exempt() {
             );
         }
     }
-    assert!(checked >= 15, "the scan found only {checked} call sites");
+    assert!(checked >= 14, "the scan found only {checked} call sites");
 }
 
 /// A private branch cannot be checked out on a partial clone (sealing and

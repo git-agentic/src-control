@@ -196,8 +196,7 @@ every claim below is checked against the shipped code, not the plan.
    bytes, before the op's state is cleared: the abort's own walk follows the
    other side's tree and the restored view, so it cannot see an ours-only
    file or a subtree never fetched for theirs. A file the user edited since is
-   left by this cleanup; the abort's own walk still removes any out-of-view path theirs
-   tracks, whatever its bytes (abort restores ours). At completion a kept edited
+   left by this cleanup, and by the abort's own walk (refinement 8). At completion a kept edited
    file outside the view is, on a full clone, read like any tracked file and committed
    with the user's edit (intended: it is their change, and a sparse full clone reads
    tracked files wherever they sit); on a partial clone the commit is refused naming
@@ -265,7 +264,7 @@ every claim below is checked against the shipped code, not the plan.
    and the private `materialize_private`), because their result is exact but
    the next ordinary commit would take the user's file instead. A path the old
    tree already tracks is not an addition and is not checked here (a user's
-   copy of it is read as an edit; a stop's `materialize` can still delete it),
+   copy of it is read as an edit; a stop's `materialize` leaves it, refinement 8),
    nor is anything in the view (the existing guard). Completion still reads a file
    the user creates after a stop at such a path; that is their resolution, as
    for an edited tracked file (refinement 5). On a partial clone the guard sees
@@ -273,3 +272,69 @@ every claim below is checked against the shipped code, not the plan.
    subtree is not checked; it is not silent, because the commit then fails with
    `GappedPathContent` naming the path (move the file away and retry). Refusing up front would mean fetching or guessing the absent subtree's paths (a disk probe under a changed absent directory would refuse unrelated files), so the limit stays. Pinned by `sparse_completion.rs`
    and `private_sparse.rs`.
+8. **`materialize` and abort remove only what is provably the stop's (#255,
+   #256).** Two data-loss holes shared one cause: the removal pass deleted every
+   path the old tree tracked and the target did not, with no look at the disk.
+   On a sparse checkout that included every out-of-view path the old tree
+   tracks (on a full clone the walk is unbounded and the target is
+   view-filtered), so a user's local copy of one was deleted by any stop; on
+   abort it removed any in-view path theirs held that the tip did not, so a
+   file the user created there after the stop went too. One rule now: a path is
+   deleted or overwritten only if (a) the tree being replaced tracks it and the
+   disk file is a regular file with exactly those bytes (`worktree::disk_is_blob`:
+   one chunked read of the disk file, hashed with `Object::blob_id_of_reader`, so
+   memory stays flat for a big file; no store access and no size lookup, so it
+   also works on a partial clone's gap), or (b) the stop recorded it
+   (`CONFLICT_PLAINTEXT`, `CONFLICT_SIDECARS`, the `sparse-widen` journal) and it
+   still matches what was laid where that is checkable. A path that fails the
+   test is left alone: out of the view it is the user's copy and is not
+   reported (completion still reads it as an edit, refinement 5); in view,
+   `materialize_restore` lists it in `Materialized::kept`. The decision is made
+   for every candidate before the first removal, and the #247 directory
+   pre-check uses the same set, so a kept file under a directory a target file
+   must replace refuses atomically instead of failing mid-write.
+   Choice: an abort **completes and reports** rather than refusing, because it
+   must still restore the tip and drop the stop's state, and a refusal on a
+   kept resolution edit would leave the user unable to abort; `AbortReport`
+   (`skipped` for protected paths without a key, `kept` for these) is returned
+   by `merge_abort[_with_identity]`, `cherry_pick_abort` and `rebase_abort`, and
+   `sc` prints each kept path. The stop itself never refuses on this account
+   (the guards of refinement 7 and #250 still do). A restore also writes over a
+   file only if it is still the stopped tree's bytes (or already the restored
+   ones), or the stop owns it: recorded plaintext or a path left conflicted
+   (`active_conflicts`), where an edit is the resolution abort discards. So a
+   user's edit of an untouched file, or a file or symlink put at a path the
+   stopped tree lacked, is kept and reported. A conflict already resolved with
+   `sc resolve` leaves the conflict list and is reported as kept if its bytes
+   differ.
+   A kept file or symlink standing where a parent directory of a target path
+   must be (a stop laid a file `zz` over a tracked `zz/a`, and the user changed
+   it) is refused before any removal or write with a message naming it
+   (`worktree::refuse_blocked_parents`, also in `materialize_private`): writing
+   through it would fail halfway or, for a symlink to a directory, land outside
+   the working tree. A restore with no replaced tree (residue without a decided
+   root) skips the "not tracked by the stopped tree" check, which would
+   otherwise keep every differing tip path.
+   Details: `merge_abort` now takes the stop's decided root as the replaced
+   tree (theirs' tree also holds paths the result deleted, which the stop never
+   wrote), falling back to theirs only without one. A protected old path is
+   plaintext and cannot be compared without a key: forward operations (already
+   dirty-checked) still remove it, a restore only if recorded, which is why the
+   public stop now records the carried protected files it decrypted, as the
+   private stop already did. Recorded plaintext, a path left conflicted
+   (a modify/delete conflict's surviving file included) and sidecars are
+   removed without a byte check, as regular files only (a symlink or directory
+   there is kept and reported, including by `remove_conflict_plaintext`): the user's edit of them is the resolution abort
+   discards. Recording the decrypted files also changes completion: a recorded protected
+   path the user deleted during the stop is committed as deleted instead of
+   being carried back from a parent (the rule plain files already followed).
+   Only a regular file is unlinked as protected plaintext. A forward op still
+   removes a user's plaintext copy at an out-of-view protected tracked path
+   (leftover plaintext of a protected file must not linger; `sparse set` and
+   `switch` do the same), a stated limit. A stop recorded by an older
+   build lacks the decrypted entries, so aborting it keeps such a file
+   (reported as kept); delete it by hand. The private-to-public switch's own
+   removal skips out-of-view paths and surfaces unlink errors too. Limits: a user file whose bytes equal the tracked or laid ones is
+   indistinguishable from the stop's own write and goes; a failed unlink other
+   than "not found" is now an error instead of being swallowed. Pinned by
+   `user_file_safety.rs` (merge, pick, rebase) and `private_abort.rs`.

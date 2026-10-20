@@ -394,10 +394,25 @@ impl Repo {
                 &target.keys().cloned().collect(),
             )?;
         }
+        // A path outside the view is never laid out, so a copy on disk is the
+        // user's own (#256). A failed removal is an error: the file may be
+        // decrypted plaintext that must not linger.
+        worktree::refuse_blocked_parents(
+            &self.layout.root,
+            target.keys().filter(|p| sparse.matches(p)),
+            &|c| old_paths.contains(c) && !target.contains_key(c),
+        )?;
         for p in old_paths {
-            if !target.contains_key(p) || !sparse.matches(p) {
+            if !target.contains_key(p)
+                && sparse.matches(p)
+                && !worktree::under_symlink(&self.layout.root, p)
+            {
                 let full = worktree::safe_join(&self.layout.root, p)?;
-                let _ = std::fs::remove_file(full);
+                match std::fs::remove_file(full) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         let mut skipped = Vec::new();
@@ -880,7 +895,10 @@ impl Repo {
     /// only the checkout needs restoring. It needs the identity (the tip is a
     /// manifest); a caller who cannot open the branch is refused before any
     /// write, leaving the stop intact for someone who can.
-    pub(crate) fn merge_abort_private(&self, identity: Option<&SecretKey>) -> Result<Vec<String>> {
+    pub(crate) fn merge_abort_private(
+        &self,
+        identity: Option<&SecretKey>,
+    ) -> Result<crate::repo::AbortReport> {
         let (branch, mid, manifest) = self
             .head_private()?
             .ok_or_else(|| Error::NotPrivateBranch("HEAD".into()))?;
@@ -889,6 +907,10 @@ impl Repo {
         let theirs_id = crate::merge_state::read_merge_head(&self.layout)?
             .expect("in_progress is true but MERGE_HEAD is absent");
         let sparse = self.sparse_spec()?;
+        let plaintext = crate::conflict_plaintext::read(&self.layout)?;
+        let conflicted: BTreeSet<String> = crate::merge_state::read_conflicts(&self.layout)?
+            .into_iter()
+            .collect();
 
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
@@ -896,13 +918,45 @@ impl Repo {
         let ours = self.get_inner_snapshot(&mut store, &ctx, &inner_tip)?;
         let theirs = store.get_snapshot(&theirs_id)?;
         let prior = self.inner_tree_files(&mut store, &ctx, ours.root)?;
-        // The stop wrote files from ours and from theirs, in view only; theirs'
-        // adds are not in the restored tree, so the removal pass must know
-        // them (as the public abort does by passing theirs' root).
-        let mut written: BTreeSet<String> = prior.keys().cloned().collect();
-        written
-            .extend(worktree::tree_file_entries_with_perms(&mut store, theirs.root)?.into_keys());
-        written.retain(|p| sparse.matches(p));
+        // The stop wrote files from theirs, in view only; those the restored
+        // tip does not track must go, but only the stop's own: a conflicted
+        // path or recorded plaintext, or a file that is still theirs' bytes.
+        // A stop keeps no decided root for a private branch (it would be
+        // unsealed), so a conflicted path cannot be compared by content.
+        // Anything else at such a path is the user's and is reported (#255).
+        let mut written: BTreeSet<String> = prior
+            .keys()
+            .filter(|p| sparse.matches(p))
+            .cloned()
+            .collect();
+        let mut kept = Vec::new();
+        for (p, (blob_id, _, perms)) in
+            worktree::tree_file_entries_with_perms(&mut store, theirs.root)?
+        {
+            if prior.contains_key(&p) || !sparse.matches(&p) {
+                continue;
+            }
+            let full = worktree::safe_join(&self.layout.root, &p)?;
+            // Not knowing what stands there must stop the abort before it
+            // clears the stop's records (decrypted text could linger).
+            let Some(meta) = worktree::lstat(&full)? else {
+                continue;
+            };
+            let recorded = plaintext.contains(&p);
+            // The stop wrote regular files: a symlink there is the user's.
+            let ours = meta.is_file()
+                && !worktree::under_symlink(&self.layout.root, &p)
+                && if perms & PROTECTED != 0 {
+                    recorded
+                } else {
+                    recorded || conflicted.contains(&p) || worktree::disk_is_blob(&full, &blob_id)
+                };
+            if ours {
+                written.insert(p);
+            } else {
+                kept.push(p);
+            }
+        }
         let skipped = self.materialize_private(
             "merge --abort",
             &mut store,
@@ -917,7 +971,7 @@ impl Repo {
         // After the restore, so a failed restore leaves the sidecars to retry.
         self.remove_conflict_sidecars_unless(&mut |p| prior.contains_key(p))?;
         crate::merge_state::clear(&self.layout)?;
-        Ok(skipped)
+        Ok(crate::repo::AbortReport { skipped, kept })
     }
 
     /// Build inner trees + snapshot from a decided file map, seal everything
@@ -1522,6 +1576,21 @@ impl Repo {
                     }
                 }
             }
+            // Drop the prior-tip paths the merge deleted, with the removals
+            // above and before any conflict output is written: a failure here
+            // then leaves no markers without a merge state, and is never
+            // swallowed (completion would resurrect the file from disk).
+            for p in prior_paths.difference(&merged_paths) {
+                if !sparse.matches(p) {
+                    continue;
+                }
+                let full = worktree::safe_join(&self.layout.root, p)?;
+                match std::fs::remove_file(full) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
             // Record what is about to land on disk in plaintext, and the
             // sidecars, before writing it: completion and abort need both
             // (see `conflict_plaintext`). Nothing here is sealed, and it names
@@ -1562,13 +1631,6 @@ impl Repo {
             for (name, bytes) in &fm.sidecars {
                 let full = worktree::safe_join(&self.layout.root, name)?;
                 std::fs::write(&full, bytes)?;
-            }
-            for p in prior_paths.difference(&merged_paths) {
-                if !sparse.matches(p) {
-                    continue;
-                }
-                let full = worktree::safe_join(&self.layout.root, p)?;
-                let _ = std::fs::remove_file(full);
             }
             crate::merge_state::write(&self.layout, &theirs, &fm.conflicts, None)?;
             return Err(Error::MergeConflicts(fm.conflicts.len()));

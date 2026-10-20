@@ -435,6 +435,14 @@ enum Cmd {
         /// git remotes, which carry no transcripts.
         #[arg(long)]
         no_transcripts: bool,
+        /// A clone made with `--filter blob:limit=<size>` sends that limit on
+        /// every fetch from its origin, so blobs of at least that size that no fetched tip
+        /// reaches arrive as gaps (tips stay complete). This switch sends no
+        /// limit for this one fetch: history arrives in full. Per command,
+        /// not remembered; the recorded limit stays. Does nothing for a clone
+        /// without a limit.
+        #[arg(long)]
+        no_blob_limit: bool,
     },
     /// Push the current branch to a remote (fast-forward-only).
     Push {
@@ -1203,7 +1211,8 @@ fn main() -> Result<()> {
         Cmd::Fetch {
             remote,
             no_transcripts,
-        } => run_fetch(&remote, no_transcripts),
+            no_blob_limit,
+        } => run_fetch(&remote, no_transcripts, no_blob_limit),
         Cmd::Push {
             remote,
             include_encrypted,
@@ -2220,6 +2229,17 @@ fn run_status(json: bool, identity: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Say what an abort did not restore: protected paths it has no key for, and
+/// files it left because they are no longer what the stop laid (#255).
+fn print_abort_report(report: &scl_repo::AbortReport) {
+    for path in &report.skipped {
+        eprintln!("skipped (no key): {path}");
+    }
+    for path in &report.kept {
+        eprintln!("left in place (changed since the stop): {path}");
+    }
+}
+
 fn run_merge(
     branch: Option<String>,
     abort: bool,
@@ -2234,11 +2254,9 @@ fn run_merge(
         } else {
             None
         };
-        let skipped = repo.merge_abort_with_identity(sk.as_ref())?;
+        let report = repo.merge_abort_with_identity(sk.as_ref())?;
         println!("merge aborted; working tree restored");
-        for path in &skipped {
-            eprintln!("skipped (no key): {path}");
-        }
+        print_abort_report(&report);
         return Ok(());
     }
     let branch = branch.ok_or_else(|| anyhow::anyhow!("merge: provide a branch or --abort"))?;
@@ -2279,11 +2297,9 @@ fn run_cherry_pick(
 ) -> Result<()> {
     let repo = open_repo()?;
     if abort {
-        let skipped = repo.cherry_pick_abort()?;
+        let report = repo.cherry_pick_abort()?;
         println!("cherry-pick aborted; working tree restored");
-        for path in &skipped {
-            eprintln!("skipped (no key): {path}");
-        }
+        print_abort_report(&report);
         return Ok(());
     }
     let refname = refname.ok_or_else(|| anyhow::anyhow!("cherry-pick needs a ref or --abort"))?;
@@ -2323,11 +2339,9 @@ fn run_rebase(
 ) -> Result<()> {
     let repo = open_repo()?;
     if abort {
-        let skipped = repo.rebase_abort()?;
+        let report = repo.rebase_abort()?;
         println!("rebase aborted; working tree restored");
-        for path in &skipped {
-            eprintln!("skipped (no key): {path}");
-        }
+        print_abort_report(&report);
         return Ok(());
     }
     // Soft-resolve like `run_merge`/`run_cherry_pick`: a missing identity file
@@ -4259,13 +4273,13 @@ fn print_compact_report(name: &str, url: &str, rep: &scl_repo::CompactReport) {
 /// remote gets a full-history import into a remote-tracking ref (see
 /// `run_fetch_git`); an `sc`-kind remote (or unconfigured, defaulting to `sc`)
 /// uses the existing object-transport fetch.
-fn run_fetch(remote: &str, no_transcripts: bool) -> Result<()> {
+fn run_fetch(remote: &str, no_transcripts: bool, no_blob_limit: bool) -> Result<()> {
     let repo = open_repo()?;
     let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
     match cfg.kind(remote) {
         Some(scl_repo::RemoteKind::Git) => run_fetch_git(&repo, remote),
         _ => {
-            let remote_refs = repo.fetch_opts(remote, no_transcripts)?;
+            let remote_refs = repo.fetch_limited(remote, no_transcripts, no_blob_limit)?;
             println!("fetched {remote}: {} remote branch(es)", remote_refs.len());
             for (branch, tip) in remote_refs {
                 println!("  {remote}/{branch} -> {}", tip.short());

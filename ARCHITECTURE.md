@@ -1252,8 +1252,11 @@ records the limit and an explicit `AllPaths`/`Prefixes` scope (a size-only clone
 is `AllPaths`, with a full sparse view); `PackFilter` is the single definition of
 a filtered transfer (a prefix or a limit). A lazy size-only clone fills a gapped
 revision by id even though its view is full; otherwise the gap error names the
-file and `sc backfill <path>` repairs it. `sc fetch` is unfiltered, and the
-object-count limit is deferred. See ADR-0055.
+file and `sc backfill <path>` repairs it. `sc fetch` from the promisor origin
+sends the recorded limit (never the prefixes), so every fetched tip is complete
+(bar a blob the clone already gapped) and later history growth is gapped like the clone's; `--no-blob-limit` sends none
+for one fetch. There is no object-count limit: the transfer set is id-ordered, so
+"the first N objects" has no stable meaning. See ADR-0055.
 
 ## Phase 37c — merge, cherry-pick and rebase on a partial clone (built)
 
