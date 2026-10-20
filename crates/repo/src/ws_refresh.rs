@@ -957,6 +957,7 @@ mod tests {
         assert!(dirs[0].join("b.txt").exists() && !dirs[0].join("c.txt").exists());
         assert!(dirs[1].join("w2.txt").exists() && !dirs[1].join("b.txt").exists());
 
+        assert!(repo.ws_run_plan(None, 1, false, None).is_err());
         // Harvest would read the refreshed b.txt as the agent's own change, and
         // re-apply it even after the host reverts it: it refuses instead.
         let err = repo

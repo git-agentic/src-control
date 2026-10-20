@@ -604,6 +604,14 @@ impl Repo {
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<WsRunPlan> {
         let session = open_session(self.layout(), name)?;
+        // A command could delete a file the unfinished refresh wrote, a deletion
+        // its retry could not see against the old base.
+        if session.pending_refresh.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "a `sc ws refresh` did not finish; run `sc ws refresh{}` before `sc ws run`",
+                name.map(|n| format!(" --session {n}")).unwrap_or_default()
+            )));
+        }
         let entry = session
             .workspaces
             .iter()
