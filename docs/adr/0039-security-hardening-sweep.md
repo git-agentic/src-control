@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-09
 - **Phase:** 28
+- **Amended:** #213 (addendum at the end) made the object cap configurable; the `MAX_OBJECT_SIZE` constant and 256 MiB figures in the sections before the addendum are the original design.
 - **Builds on:** ADR-0021 (durability/concurrency hardening — the P21 sweep precedent), ADR-0022 (ssh wire protocol), ADR-0015 (packfiles), ADR-0014 (protected paths), ADR-0008/0009 (secrets)
 
 ## Context

@@ -6,7 +6,7 @@
 - **Builds on:** ADR-0036 (P26 sc-native HTTP transport — names three of the
   four gaps closed here), ADR-0040 (P29 access control — the seam where a
   busy/error status is already written before the wire handshake), ADR-0039
-  (P28 DoS hardening — `MAX_OBJECT_SIZE`, composed with, not replaced by,
+  (P28 DoS hardening — the max object size, composed with, not replaced by,
   this phase's spool cap)
 - **Research:** `docs/research/bounded-server-patterns.md` (ticket #27,
   std-only bounded-server survey pinned to file:line). Decided at the

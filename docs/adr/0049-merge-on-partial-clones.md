@@ -66,7 +66,7 @@ Recipient-list changes alone do not require re-wrapping a carried ciphertext: th
 
 A per-id rule ("prune what you enumerated") is unsound: a blob id seen as deleted at one path may survive under a carried subtree elsewhere, since ids alias across paths. So the rule is coarse: **if the merge carried any subtree, the merged map is the complete union of the input wraps** (ours, theirs, base, with the existing ours/theirs/base precedence and per-recipient dedup), plus fresh wraps. If it carried nothing, the existing prune applies. Union resurrecting a wrap for a recipient revoked since is the intended P16 behavior (tombstones gate future seals, not historical wraps; ADR-0026).
 
-Over-retention costs size: wraps are inline in the snapshot, and an object above `MAX_OBJECT_SIZE` fails transfer. Nothing prunes dead entries today (`sc rewrap` refuses partial clones and only removes ids it upgrades, `rewrap.rs:164`, `:308`). So the growth is real and bounded by the repo's protected blob count; it is measured before any prune is designed.
+Over-retention costs size: wraps are inline in the snapshot, and an object above the max object size (256 MiB by default, ADR-0039 addendum) fails transfer. Nothing prunes dead entries today (`sc rewrap` refuses partial clones and only removes ids it upgrades, `rewrap.rs:164`, `:308`). So the growth is real and bounded by the repo's protected blob count; it is measured before any prune is designed.
 
 ### 5. The engine is pull-based; filling happens outside the store lock
 

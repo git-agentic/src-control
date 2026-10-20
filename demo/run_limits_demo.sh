@@ -20,6 +20,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# The --max-pack-size values below assume the default 256 MiB object cap; a
+# caller's exported SC_MAX_OBJECT_SIZE must not change what the demo proves.
+unset SC_MAX_OBJECT_SIZE
 cargo build --quiet --bin sc
 SC="$PWD/target/debug/sc"
 
