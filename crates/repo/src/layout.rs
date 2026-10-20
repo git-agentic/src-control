@@ -84,6 +84,12 @@ impl Layout {
     pub fn transcripts_path(&self) -> PathBuf {
         self.dot_sc.join("transcripts")
     }
+    /// `.sc/transcript-drops` — the transcript drop-tombstone index (ADR-0038
+    /// addendum): one `<snapshot-hex> <tombstone-hex> <dropped-hex>` line per
+    /// dropped transcript. Never pruned by gc.
+    pub fn transcript_drops_path(&self) -> PathBuf {
+        self.dot_sc.join("transcript-drops")
+    }
     /// `.sc/tmp` — scratch space for transient files (P25 streaming pack
     /// transfer: spilled sender/receiver pack bodies). Never durable state —
     /// safe to delete at any time; callers that write here are responsible
