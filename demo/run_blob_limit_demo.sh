@@ -4,7 +4,8 @@
 # transfer while every ref tip stays complete (the checkout is whole), that
 # `sc verify` / `sc gc` / `sc push` work on such a clone, that `sc backfill
 # <path>` repairs the gap, that `--lazy` is accepted with only a size filter,
-# and that a prefix filter combines with a size limit.
+# that a prefix filter combines with a size limit, and that a later `sc fetch`
+# keeps the limit (tips stay complete) unless `--no-blob-limit` is given.
 #
 # Self-checking: every claim is an assertion; any failure exits non-zero
 # before the RESULT line.
@@ -90,4 +91,24 @@ echo "=== 7: backfill by the file's own path, then --all ==="
 echo "backfill assets.bin closed the gap; --all made it a full clone ✔"
 
 echo
-echo "RESULT: blob-size clone filter proven (limit, tips complete, verify/gc/push, lazy marker, combo, repair)"
+echo "=== 8: sc fetch keeps the limit; --no-blob-limit opts out for one fetch ==="
+KEEP="$W/keep"; FULLF="$W/fullf"
+"$SC" clone --filter blob:limit=16KiB "$ORIGIN" "$KEEP" >/dev/null
+"$SC" clone --filter blob:limit=16KiB "$ORIGIN" "$FULLF" >/dev/null
+(
+  cd "$ORIGIN"
+  head -c 65536 /dev/urandom | od -An -tx1 | tr -d ' \n' > assets.bin   # v4: history only after v5
+  "$SC" commit -m "v4" --author demo >/dev/null
+  head -c 65536 /dev/urandom | od -An -tx1 | tr -d ' \n' > assets.bin   # v5: the new tip
+  "$SC" commit -m "v5" --author demo >/dev/null
+)
+(cd "$KEEP" && "$SC" fetch >/dev/null && "$SC" merge origin/main >/dev/null)
+(cd "$FULLF" && "$SC" fetch --no-blob-limit >/dev/null && "$SC" merge origin/main >/dev/null)
+cmp "$KEEP/assets.bin" "$ORIGIN/assets.bin" || fail "the fetched tip's large file must be whole"
+(cd "$KEEP" && "$SC" verify) | grep -q "partial: 2 object(s) outside filter \[blob:limit=16384\]" || fail "fetch must leave v4 out: $(cd "$KEEP" && "$SC" verify)"
+(cd "$FULLF" && "$SC" verify) | grep -q "partial: 1 object(s) outside filter \[blob:limit=16384\]" || fail "--no-blob-limit must fetch v4: $(cd "$FULLF" && "$SC" verify)"
+[ -f "$FULLF/.sc/promisor-blob-limit" ] || fail "--no-blob-limit must keep the recorded limit"
+echo "plain fetch: v4 left out, tip whole; --no-blob-limit: v4 arrived, marker kept ✔"
+
+echo
+echo "RESULT: blob-size clone filter proven (limit, tips complete, verify/gc/push, lazy marker, combo, repair, limit-aware fetch)"

@@ -343,7 +343,10 @@ is `AllPaths`, which an empty prefix list could not say), "filter active" means
 `prefixes || blob_limit` everywhere, and a full sparse view must still fill on a
 lazy `AllPaths` clone (`ensure_view`). Every ref tip is complete at clone time;
 a later fetch can bring a tip that points at a gapped blob, which is the
-`GapInView` case above with the limit named in its message.
+`GapInView` case above with the limit named in its message. A fetch from the
+origin now sends the recorded limit too (ADR-0055 decision 9), so "a fetch is
+unfiltered" holds for paths only: it carries no prefixes, and carries the limit
+unless `--no-blob-limit` is given.
 
 ## Phasing
 

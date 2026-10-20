@@ -1,6 +1,6 @@
 # ADR-0055: Blob-size clone filter (`--filter blob:limit=<size>`)
 
-- **Status:** Accepted (built). Accepted after an independent Opus plan review and a Sol review; their blockers are decisions 3, 5, 7 and 8 below. The object-count limit and a limit-aware `sc fetch` are deferred (decision 2).
+- **Status:** Accepted (built). Accepted after an independent Opus plan review and a Sol review; their blockers are decisions 3, 5, 7 and 8 below. A limit-aware `sc fetch` was added afterwards (decision 9, #217); the object-count limit is rejected (decision 10).
 - **Date:** 2026-10-20
 - **Phase:** 27 follow-on (issue #217)
 - **Builds on:** ADR-0037 (partial clone), ADR-0047 (want-by-id fetch), ADR-0048 (presence-based walks), ADR-0049/0050 (merge and sessions on partial clones), ADR-0044 (private branches), ADR-0014 (protected paths), ADR-0046 (bucket remotes)
@@ -64,14 +64,12 @@ A limit above the largest transferable object (1 GiB, `MAX_MAX_OBJECT_SIZE`)
 filters nothing and is an error. Rejected: a separate `--blob-limit` flag, which has no collision but diverges
 from the issue and from git.
 
-### 2. Deferred
+### 2. Deferred at first, both closed later
 
-- **Object-count limit.** No stable definition (finding 4), no git precedent, no
-  stated use case. `ROADMAP.md` keeps a one-line deferred entry.
-- **A limit-aware `sc fetch`.** Fetch stays unfiltered (ADR-0048 Context), so new
-  large blobs arrive in full and the limit bounds the initial transfer, not later
-  growth. A limit-aware fetch needs the paths a user backfilled to ride in the
-  request as exemptions, which is a larger design.
+- **Object-count limit.** Rejected, decision 10.
+- **A limit-aware `sc fetch`.** Built, decision 9. The first version of this ADR
+  kept fetch unfiltered and thought it needed the paths a user backfilled to ride
+  in the request as exemptions; decision 9 shows it does not.
 
 ### 3. The server evaluates the filter: wire change, `PROTOCOL_VERSION` 5 to 6
 
@@ -147,9 +145,9 @@ large ones" from the issue is therefore met for the history case: an operation
 that reaches an old gapped blob fills it by id on a lazy clone and fails with the
 gap error otherwise.
 
-**Tips are complete at clone time only (D2).** A later `sc fetch` is unfiltered
-and subtracts the closure of the local tips, so a new tip that points at an old,
-gapped blob (a revert) arrives without it. A lazy clone heals that on the
+**Tips are complete at clone time only (D2).** A later `sc fetch` is limit-aware
+(decision 9) but still subtracts the closure of the local tips, so a new tip that
+points at an old, gapped blob (a revert) arrives without it. A lazy clone heals that on the
 fast-forward or switch (decision 7); a non-lazy one gets the gap error with the
 limit clause (decision 6) and `sc backfill <file>` repairs it.
 
@@ -266,6 +264,84 @@ the file's own path), and a workspace session on a size-limited clone.
   and the listener limits remain the bounds. A size index on the server is a later
   optimization.
 
+### 9. `sc fetch` carries the recorded limit (#217)
+
+A fetch from the promisor origin sends the limit in `.sc/promisor-blob-limit`
+(`GetPack.blob_limit`, already on the wire: no version bump). Blobs of at least
+the limit that no fetched ref tip's root tree reaches arrive as gaps, so later
+growth is bounded the way the clone was, and every fetched tip is complete
+(decision 4's rule, applied to the fetch's wants).
+
+- **Only the limit, never the prefixes.** A fetch stays path-unfiltered
+  (ADR-0048), so a prefix+limit clone fetches every path's tips whole and gaps
+  history-only large blobs under every path. The sender sees `AllPaths` plus a
+  limit, the same shape as a size-only clone.
+- **No per-path exemptions.** The first version of this ADR expected a user's
+  `sc backfill <path>` to need an exemption so a later fetch would not re-gap the
+  file. It does not: backfill fills what exists now; a new version of that file
+  that lands at a tip is complete (decision 4), and one that lands only in
+  history is a gap exactly like any other history blob, which a lazy fill or
+  `sc backfill <path>` repairs again. Nothing already present is ever removed.
+- **Opt-out: `sc fetch --no-blob-limit`.** Sends no limit for that one command,
+  so the new history arrives whole; the recorded limit and scope stay, and the
+  next plain fetch is limited again. Per command, like `--no-transcripts`. It
+  does nothing on a clone without a limit and on a full clone. The alternative to
+  a flag, `sc backfill --all`, converts the clone for good; the flag covers "pull
+  this once in full" without that. Rejected: a `--blob-limit <size>` override
+  (a second size parser and a way to widen the recorded limit by accident).
+- **Unchanged.** Haves are still the local tips and the sender still subtracts
+  their full closure, so a fetch cannot re-send a blob a gapped tip names (the
+  D2 revert case stays a `GapInView`/lazy-fill case). Non-promisor remotes are
+  unaffected: the origin check runs first and refuses any other remote on a
+  partial clone, and a clone with no limit sends `None` as before. A bucket origin
+  refuses a limit-bearing fetch (decision 5), though a limited clone cannot be
+  made from one, so it takes a hand-edited `.sc/promisor`. Push, verify, gc,
+  merge and sessions are presence-based and untouched.
+- **Private branches.** A filtered fetch drops manifest wants (decision 5), so
+  fetch skips a remote ref whose tip did not arrive instead of writing a dangling
+  remote-tracking ref, as clone does. This is a change for a size-limited clone
+  that used to receive private-branch ciphertext on fetch; it matches what its
+  clone never received. `--no-blob-limit` is an unfiltered fetch, so it does
+  receive private manifests and their sealed closures (ciphertext, as any
+  unfiltered fetch always did); a later limited fetch leaves such a
+  remote-tracking ref at its old value rather than advancing it.
+- **Tips and gaps the clone already has.** "Every fetched tip is complete"
+  means every blob the fetch sends for it; a tip that names a blob the clone
+  already gapped (a revert, a restore of an old version) still arrives without
+  it, because the sender subtracts the haves' closure (decision 4, D2). A lazy
+  clone fills it on fast-forward or switch; otherwise `GapInView` names
+  `sc backfill <file>`. Because every fetch can now add history gaps, this is
+  more visible than before; filling it at fetch time (a by-id request for each
+  new tip's missing blobs) is not done here and would also contact the origin
+  from a command that already does.
+- **Server cost.** The want walk receives the haves' closure (`held`) and keeps
+  any blob in it without measuring, so a fetch measures only blobs the client
+  lacks and a no-op fetch measures nothing (`the_limited_walk_does_not_measure_blobs_the_receiver_holds`
+  counts `blob_size` calls). The haves' closure walk
+  reads trees and snapshots only. Without that, every fetch would have
+  stream-hashed all of history. Otherwise as decision 8.
+
+Tests: `fetch_sends_the_recorded_limit_and_keeps_the_new_tip_complete`,
+`no_blob_limit_fetches_history_in_full_and_keeps_the_marker`,
+`fetch_on_a_prefix_plus_limit_clone_applies_the_limit_to_every_path`,
+`fetch_without_a_recorded_limit_is_unchanged`,
+`fetch_with_a_limit_skips_private_refs_it_did_not_receive` and, through the
+binary, `fetch_keeps_the_limit_and_no_blob_limit_opts_out` and
+`a_bucket_origin_refuses_a_limit_bearing_fetch`; the demo's step 8 repeats it.
+
+### 10. No object-count limit
+
+Closed as rejected, not deferred. Git has no such filter, and no definition
+survives: the transfer set is a `BTreeSet` ordered by id, so "the first N
+objects" is an arbitrary, server-dependent set, and a client cannot tell a
+cut-off object from a missing one by any rule. The deterministic candidates
+mean something else and are other features: "the newest N commits" is a shallow
+clone (grafted parents, a history-rewrite hazard for merge, push and gc, and a
+different ADR), and "the N smallest or largest blobs" is the size filter with a
+worse interface. The need behind the issue, bounding a clone, is met by
+`blob:limit` and by path prefixes. Reopen only with a concrete use case that
+those cannot serve.
+
 ## Consequences
 
 - A clone can skip the old revisions of large files, with a complete checkout and
@@ -273,10 +349,9 @@ the file's own path), and a workspace session on a size-limited clone.
 - Wire version 6; servers and clients upgrade together.
 - A new marker file, one new scope case in `Promisor`, one new error variant
   (`GapBySize`) and a field on `GapInView`.
-- `sc fetch` is not limit-aware (decision 2).
+- `sc fetch` sends the recorded limit; `--no-blob-limit` opts out for one fetch (decision 9). No object-count limit (decision 10).
 
 ## Open questions
 
-1. A limit-aware `sc fetch` with per-path exemptions for backfilled files.
-2. An object-count or `tree:<depth>`-style filter, if a use case appears.
-3. A server-side size index so a limited request need not stream-measure.
+1. A `tree:<depth>`-style filter, if a use case appears.
+2. A server-side size index so a limited request need not stream-measure.
