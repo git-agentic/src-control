@@ -2434,7 +2434,12 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "unbounded: {err:?}"
         );
-        assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
+        // The message pins the failure to the opening write: a later status
+        // read timing out is also `ConnectionLost`, with a different message.
+        assert!(
+            matches!(&err, Error::ConnectionLost(m) if m == "timed out writing the HTTP opening"),
+            "got {err:?}"
+        );
         tx.send(()).unwrap();
         holder.join().unwrap();
     }
