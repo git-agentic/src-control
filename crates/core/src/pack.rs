@@ -204,7 +204,7 @@ pub fn parse_index(idx: &[u8]) -> Result<Vec<IndexEntry>> {
 /// untouched"). `Store::read_pack_object` is this function's one caller
 /// (`crates/core/src/store.rs`), reading packs `sc gc`'s own repack wrote to
 /// this process's `.sc/objects/`: `write_pack` performs no size validation,
-/// so a locally-committed blob legitimately larger than `MAX_OBJECT_SIZE`
+/// so a locally-committed blob legitimately larger than the object cap
 /// ("committable but not transferable", per ADR-0039's final-review
 /// addendum) must still round-trip through a repack, or `sc gc` would
 /// silently make that blob permanently unreadable. Do **not** add a length
@@ -251,7 +251,7 @@ fn record_bounds(pack: &[u8], offset: u64, max: Option<usize>) -> Result<(usize,
     if let Some(max) = max {
         if len > max {
             return Err(Error::PackCorrupt(format!(
-                "record compressed length {len} exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit"
+                "record compressed length {len} exceeds the {max}-byte object size limit"
             )));
         }
     }
@@ -287,9 +287,9 @@ fn decompress_and_decode(payload: &[u8], id: &ObjectId, max: Option<usize>) -> R
                 .read_to_end(&mut canonical)
                 .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
             if canonical.len() > max {
-                return Err(Error::PackCorrupt(
-                    "decompressed object exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit".into(),
-                ));
+                return Err(Error::PackCorrupt(format!(
+                    "decompressed object exceeds the {max}-byte object size limit"
+                )));
             }
             canonical
         }
@@ -306,7 +306,7 @@ fn decompress_and_decode(payload: &[u8], id: &ObjectId, max: Option<usize>) -> R
 /// every record. Test-convenience whole-pack helper only — its
 /// `zstd::decode_all` is UNBOUNDED, and every caller in this codebase is
 /// `#[cfg(test)]`. Untrusted or transport-received input MUST go through
-/// [`parse_pack_reader`] instead, which enforces the `MAX_OBJECT_SIZE` cap
+/// [`parse_pack_reader`] instead, which enforces the [`crate::max_object_size`] cap
 /// on both compressed length and decompressed output.
 pub fn parse_pack(pack: &[u8]) -> Result<Vec<(ObjectId, Object)>> {
     if pack.len() < 8 || &pack[..4] != PACK_MAGIC {
@@ -376,7 +376,17 @@ fn read_up_to<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
 /// pack.len()`, generalized to a reader that has no total length to check
 /// against.
 pub fn parse_pack_reader<R: Read>(
+    r: R,
+    f: impl FnMut(ObjectId, Object) -> Result<()>,
+) -> Result<()> {
+    parse_pack_reader_max(r, crate::max_object_size(), f)
+}
+
+/// [`parse_pack_reader`] with an explicit per-object cap `max` (the live
+/// [`crate::max_object_size`] in production).
+pub fn parse_pack_reader_max<R: Read>(
     mut r: R,
+    max: usize,
     mut f: impl FnMut(ObjectId, Object) -> Result<()>,
 ) -> Result<()> {
     let mut header = [0u8; 8];
@@ -405,32 +415,31 @@ pub fn parse_pack_reader<R: Read>(
         r.read_exact(&mut len_bytes)
             .map_err(|e| Error::PackCorrupt(format!("truncated record length: {e}")))?;
         let len = u32::from_le_bytes(len_bytes) as usize;
-        if len > crate::MAX_OBJECT_SIZE {
+        if len > max {
             return Err(Error::PackCorrupt(format!(
-                "record compressed length {len} exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit"
+                "record compressed length {len} exceeds the {max}-byte object size limit"
             )));
         }
 
-        let mut payload = vec![0u8; len];
-        r.read_exact(&mut payload)
+        let payload = crate::read_exact_vec(&mut r, len)
             .map_err(|e| Error::PackCorrupt(format!("truncated record payload: {e}")))?;
 
         // Bound the decompressed output too: a small compressed payload can
         // still decompress to an enormous plaintext (a "zstd bomb"). Read at
-        // most MAX_OBJECT_SIZE + 1 bytes so we can detect and reject an
+        // most max + 1 bytes so we can detect and reject an
         // over-cap output without ever materializing it in full.
         let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(&payload))
             .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
         let mut canonical = Vec::new();
         decoder
             .by_ref()
-            .take(crate::MAX_OBJECT_SIZE as u64 + 1)
+            .take(max as u64 + 1)
             .read_to_end(&mut canonical)
             .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-        if canonical.len() > crate::MAX_OBJECT_SIZE {
-            return Err(Error::PackCorrupt(
-                "decompressed object exceeds MAX_OBJECT_SIZE (256 MiB) transfer limit".into(),
-            ));
+        if canonical.len() > max {
+            return Err(Error::PackCorrupt(format!(
+                "decompressed object exceeds the {max}-byte object size limit"
+            )));
         }
         let actual_id = ObjectId::of(&canonical);
         if actual_id != expected_id {
@@ -577,30 +586,64 @@ mod tests {
     #[test]
     fn pack_record_over_cap_rejected() {
         // A well-formed header, then one record whose id is arbitrary and
-        // whose compressed_len claims MAX_OBJECT_SIZE + 1 — parse_pack_reader
-        // must reject this before `vec![0u8; len]` allocates a 256+ MiB
-        // buffer for a length that was never actually sent.
+        // whose compressed_len claims cap + 1 — parse_pack_reader must
+        // reject this before allocating a buffer for a length that was never
+        // actually sent.
         let mut buf = Vec::new();
         buf.extend_from_slice(PACK_MAGIC);
         buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         buf.extend_from_slice(&[0u8; 32]); // arbitrary id
-        let over = (crate::MAX_OBJECT_SIZE + 1) as u32;
+        let cap = crate::MIN_MAX_OBJECT_SIZE;
+        let over = (cap + 1) as u32;
         buf.extend_from_slice(&over.to_le_bytes());
         // No payload bytes follow — if the implementation allocated first it
         // would then fail on read_exact anyway, but we want the cap check to
         // fire first (see zstd_bomb_rejected for the case where a payload
         // IS present but must still be rejected on the length check alone).
-        let err = parse_pack_reader(&buf[..], |_id, _obj| Ok(())).unwrap_err();
+        let err = parse_pack_reader_max(&buf[..], cap, |_id, _obj| Ok(())).unwrap_err();
         assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
+        // The same claim is not a length-cap error at a raised cap: it only
+        // fails later, on the (absent) payload bytes.
+        let err = parse_pack_reader_max(&buf[..], cap * 2, |_id, _obj| Ok(())).unwrap_err();
+        assert!(
+            format!("{err}").contains("truncated record payload"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_legitimate_object_is_rejected_below_its_size_and_accepted_at_a_raised_cap() {
+        // Incompressible so the compressed record is also > 1 MiB.
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let payload: Vec<u8> = (0..crate::MIN_MAX_OBJECT_SIZE + 4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let obj = Object::blob(payload);
+        let (pack, _idx) = build_pack(&[enc(&obj)]).unwrap();
+        let low = crate::MIN_MAX_OBJECT_SIZE;
+        assert!(parse_pack_reader_max(&pack[..], low, |_, _| Ok(())).is_err());
+        let mut n = 0;
+        parse_pack_reader_max(&pack[..], low * 4, |_, _| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
     fn zstd_bomb_rejected() {
         // A small compressed payload that decompresses to well beyond
-        // MAX_OBJECT_SIZE. parse_pack_reader must bound the zstd output
+        // the cap. parse_pack_reader must bound the zstd output
         // (decode-with-limit), not decode_all-then-check, or this test
         // would itself OOM the test process.
-        let bomb_plain = vec![0u8; crate::MAX_OBJECT_SIZE + 1024];
+        let cap = crate::MIN_MAX_OBJECT_SIZE;
+        let bomb_plain = vec![0u8; cap + 1024];
         let compressed =
             zstd::encode_all(std::io::Cursor::new(&bomb_plain[..]), COMPRESSION_LEVEL).unwrap();
         assert!(
@@ -615,8 +658,15 @@ mod tests {
         buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         buf.extend_from_slice(&compressed);
 
-        let err = parse_pack_reader(&buf[..], |_id, _obj| Ok(())).unwrap_err();
-        assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
+        let err = parse_pack_reader_max(&buf[..], cap, |_id, _obj| Ok(())).unwrap_err();
+        assert!(
+            format!("{err}").contains("decompressed object exceeds"),
+            "got {err:?}"
+        );
+        // A raised cap lets the same record through the size guard (the
+        // all-zero payload then fails id verification, not the cap).
+        let err = parse_pack_reader_max(&buf[..], cap * 2, |_id, _obj| Ok(())).unwrap_err();
+        assert!(format!("{err}").contains("hash mismatch"), "got {err:?}");
     }
 
     #[test]
@@ -628,10 +678,11 @@ mod tests {
         // untrusted input, unlike `read_object_at`'s one caller (`Store`'s
         // own self-written packs, ADR-0039's explicit unbounded carve-out).
         let id = ObjectId::of(b"whatever");
-        let over = (crate::MAX_OBJECT_SIZE + 1) as u32;
+        let cap = crate::MIN_MAX_OBJECT_SIZE;
+        let over = (cap + 1) as u32;
         let mut pack = Vec::new();
         pack.extend_from_slice(&over.to_le_bytes()); // the length prefix read at offset 0
-        let err = read_object_at_bounded(&pack, 0, &id, crate::MAX_OBJECT_SIZE).unwrap_err();
+        let err = read_object_at_bounded(&pack, 0, &id, cap).unwrap_err();
         assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
     }
 
@@ -644,7 +695,8 @@ mod tests {
         // trusted, unbounded path) deliberately does NOT get this guard —
         // see `read_object_at_reads_a_legitimately_oversized_local_record`
         // below for the regression that pins the other side of that split.
-        let bomb_plain = vec![0u8; crate::MAX_OBJECT_SIZE + 1024];
+        let cap = crate::MIN_MAX_OBJECT_SIZE;
+        let bomb_plain = vec![0u8; cap + 1024];
         let compressed =
             zstd::encode_all(std::io::Cursor::new(&bomb_plain[..]), COMPRESSION_LEVEL).unwrap();
         assert!(
@@ -659,8 +711,11 @@ mod tests {
         pack.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         pack.extend_from_slice(&compressed);
 
-        let err = read_object_at_bounded(&pack, 0, &id, crate::MAX_OBJECT_SIZE).unwrap_err();
-        assert!(matches!(err, Error::PackCorrupt(_)), "got {err:?}");
+        let err = read_object_at_bounded(&pack, 0, &id, cap).unwrap_err();
+        assert!(
+            format!("{err}").contains("decompressed object exceeds"),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -668,7 +723,7 @@ mod tests {
         // ADR-0039's explicit scope: "the cap is transfer-path only, not a
         // local-commit limit... read_object_at's local already-verified
         // on-disk pack is untouched" — a locally-committed blob legitimately
-        // larger than MAX_OBJECT_SIZE ("committable but not transferable")
+        // larger than the object cap ("committable but not transferable")
         // must still round-trip through `sc gc`'s repack, since `write_pack`
         // performs no size validation and a cap here would surface as
         // silent, permanent unreadability on the next read. This is the
@@ -676,7 +731,7 @@ mod tests {
         // briefly did in an earlier, incorrect fix for the zstd-bomb
         // finding), this test catches it directly, without relying only on
         // the doc-comment contract.
-        let big = Object::blob(vec![7u8; crate::MAX_OBJECT_SIZE + 4096]);
+        let big = Object::blob(vec![7u8; crate::DEFAULT_MAX_OBJECT_SIZE + 4096]);
         let (id, bytes) = enc(&big);
         let (pack, idx) = build_pack(&[(id, bytes.clone())]).unwrap();
         let e = parse_index(&idx).unwrap().pop().unwrap();

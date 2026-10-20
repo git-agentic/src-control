@@ -142,7 +142,7 @@ the code, those win.
 | P25 | Streaming pack transfer: bounded RAM on both sides, `ST_PACK_CHUNK` frames (`SC_PACK_CHUNK` tunes), two-pass atomic-after-verify ingest | [0035](docs/adr/0035-streaming-transfer.md) |
 | P26 | `sc+http://` transport: `sc serve --http`, thread-per-connection, status-line-before-handshake opening | [0036](docs/adr/0036-http-transport.md) |
 | P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3 | [0037](docs/adr/0037-partial-clone.md) |
-| P28 | Security hardening: `MAX_OBJECT_SIZE` (256 MiB) caps on every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
+| P28 | Security hardening: a max object size (default 256 MiB; `--max-object-size` / `SC_MAX_OBJECT_SIZE`, 1 MiB to 1 GiB) caps every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | P29 | `sc serve --http` access control: bearer tokens (`sc serve token`), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
 | P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign`, always-encrypted body, gc-coupled index | [0038](docs/adr/0038-agent-session-transcripts.md) |
 | P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff | [0041](docs/adr/0041-listener-resource-limits.md) |
@@ -163,9 +163,12 @@ Cross-cutting current facts that bite. Security boundaries are consolidated in
 transport-adjacent. The rest, imperatively:
 
 - **Wire protocol is version 5** (bumped from 4 in P37 for the additive
-  `GetObjects` verb; 3 to 4 in P34 for the sealed-branch object kinds). `MAX_OBJECT_SIZE` (256 MiB) guards the
+  `GetObjects` verb; 3 to 4 in P34 for the sealed-branch object kinds). The max object size (`scl_core::max_object_size()`, default 256 MiB;
+  `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE` set it, range 1 MiB to
+  1 GiB, out of range aborts startup, ADR-0039 addendum) guards the
   transfer path only — a larger blob commits locally but fails every
-  subsequent push/fetch/clone at the receiver.
+  subsequent push/fetch/clone at the receiver. There is no negotiation: both
+  ends must agree. Never inline a size in a new length guard; read the accessor.
 - **The P35 desktop app is a keyless, read-only top-level adapter.** Its
   renderer has five typed repository commands, no general filesystem/shell
   capability, and no DTO field capable of carrying protected ciphertext or

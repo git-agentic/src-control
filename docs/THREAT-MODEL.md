@@ -305,7 +305,7 @@ too, not just the src-control-side metadata.
     it. The incoming-pack spool used no aggregate size bound — only ADR-0039's
     per-frame/per-record caps applied — so a single oversized or endless pack
     could exhaust server disk on **either** transport. `--max-pack-size`
-    (default 16 GiB, 0 = unlimited, floor 256 MiB = `MAX_OBJECT_SIZE`) now
+    (default 16 GiB, 0 = unlimited, floor = the max object size, 256 MiB by default) now
     counts the running total and aborts mid-stream past the cap. This includes
     the **read-only drain path**: the pre-`EC_READONLY` drain that keeps a
     connection in sync when a read-only-scoped client streams a pack the server
@@ -349,7 +349,7 @@ too, not just the src-control-side metadata.
   (`walfmt.rs`): unknown versions, bad magic, and any length that would
   overrun the buffer are refused outright rather than best-effort parsed.
   Untrusted-length caps apply throughout: manifest/log/idx bytes are capped
-  at `MAX_OBJECT_SIZE` before decode, and pack bodies are read through
+  at the max object size before decode, and pack bodies are read through
   `scl_core::pack::read_object_at_bounded` (not the unbounded
   `read_object_at` the trusted local `Store` uses for its own already-
   verified on-disk packs, per ADR-0039's explicit trust split) — capping
@@ -409,20 +409,34 @@ too, not just the src-control-side metadata.
   read is capped at 1 GiB.
 - **Server cost is bounded per request:** 1024 ids (checked while decoding,
   before any id is read), the server's `--max-pack-size` over the summed
-  encoded size, and `MAX_OBJECT_SIZE` per object.
+  encoded size, and the max object size per object.
 - **Laziness is a local opt-in.** `.sc/promisor-lazy` is never committed or
   transferred; without it a partial clone never dials the remote after clone,
   and `SC_OFFLINE=1` forces that per process.
 
 ## Untrusted-input hardening (DoS) — ADR-0039
 
-- A single `MAX_OBJECT_SIZE` (256 MiB) caps every untrusted length: wire frames,
+- A single max object size caps every untrusted length: wire frames,
   pack-record compressed length, the zstd *decompressed* output (decompression-bomb
-  guard), and object-decode collection counts. **Accepted boundary:** the cap is a
-  *transfer-path* guard — a locally-committed blob larger than 256 MiB commits fine
-  but cannot then be transferred; and the wire frame-length header can still
-  allocate up to the cap before a chunk boundary is enforced (a deferred
-  hostile-peer hardening item).
+  guard), bucket WAL metadata, by-id reply objects, the `SC_PACK_CHUNK` clamp,
+  and object-decode collection counts. The default is 256 MiB. An operator can
+  lower or raise it with `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE`
+  (#213), within a compile-time range of 1 MiB to 1 GiB; a value outside that
+  range aborts startup rather than being clamped. A guard checks the claimed
+  length before allocating, and frame bodies and pack records are then read
+  incrementally, so a hostile header cannot buy a cap-sized allocation without
+  sending the bytes. **Accepted boundaries:**
+  - The cap is a *transfer-path* guard. A locally-committed blob above it
+    commits fine but cannot be transferred.
+  - **Both ends must agree.** There is no negotiation and no protocol bump. An
+    object above the receiver's cap is refused there, loudly. A server raised
+    to 1 GiB accepts a peer's gigabyte claim only if that peer sends the bytes,
+    but then holds that object in memory: raising the cap raises per-connection
+    memory by up to the new cap (times `--max-connections`). Lowering it below
+    a repository's largest object makes that repository unpushable until the
+    cap is restored.
+  - The ceiling (1 GiB) is compile-time, so no configuration can make a length
+    claim unbounded.
 
 ## Reporting
 

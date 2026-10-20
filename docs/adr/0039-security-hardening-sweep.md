@@ -128,3 +128,54 @@ same-user processes, crash dumps, and shell wrappers, and no amount of zeroizing
 the parent's buffer changes that. Accepted boundary: the child-env copy is
 fundamental and un-zeroizable; fd/stdin injection stays deferred. 1 pinned
 regression test.
+
+## Addendum (#213): the object cap is operator-configurable
+
+`MAX_OBJECT_SIZE` was a compile-time constant. It is now a process-wide
+setting read through one accessor, `scl_core::max_object_size()`, with a
+default of 256 MiB. Decisions:
+
+1. **Lower or raise, inside a compile-time range.** Floor 1 MiB
+   (`MIN_MAX_OBJECT_SIZE`), ceiling 1 GiB (`MAX_MAX_OBJECT_SIZE`). A value
+   outside the range, or one that does not parse, aborts startup with a clear
+   error. It is never clamped. The ceiling bounds what a hostile peer can
+   make a receiver commit to for any one object whatever the operator sets.
+2. **Server flag and client env, no negotiation.** `sc serve
+   --max-object-size <bytes|KiB|MiB|GiB>` and, for every `sc` process,
+   `SC_MAX_OBJECT_SIZE` (same parse, same bounds). The flag wins over the
+   env. The setting is fixed once at startup (`set_max_object_size`; a second,
+   different value is an error). There is no handshake field and no
+   `PROTOCOL_VERSION` bump: matching the two ends is an operator
+   responsibility, because an object larger than the receiver's cap fails at
+   the receiver. The failure is loud and typed, never silent truncation.
+3. **Every guard reads the accessor.** Frame length (`wire::read_frame_max`);
+   pack record compressed length and decompressed output
+   (`pack::parse_pack_reader_max`, `read_object_at_bounded`); bucket WAL
+   metadata and pack bodies (`bucket_transport::capped_to`,
+   `object_bytes`); server-side servable-size check
+   (`check_servable_size`); the `SC_PACK_CHUNK` clamp (`cap - 1`, a chunk
+   frame carries a tag byte); the `--max-pack-size` floor
+   (`validate_max_pack_size`). Two limits that were independent constants are
+   now derived: the by-id reply ceiling is `2 x cap` (512 MiB at the default;
+   still `min(--max-pack-size, ceiling)`) and the client's by-id reply read
+   cap is `4 x cap` (1 GiB at the default), so both keep room for one
+   maximum-size object plus framing at any setting. Each guard takes the cap
+   as a parameter below the public entry point so tests can drive a lowered
+   and a raised cap without touching the process-global.
+4. **Allocation follows bytes received.** The length check still runs before
+   any allocation, but the frame body and pack record payload are now read
+   through `scl_core::read_exact_vec`, which grows the buffer as bytes arrive
+   instead of pre-allocating the claimed length. With the ceiling at 1 GiB, a
+   four-byte header no longer buys a gigabyte-sized allocation. This closes the
+   "frame header can allocate up to the cap" item in THREAT-MODEL.md.
+
+For `ssh://` remotes the client builds the remote `sc serve --stdio` command
+itself and ssh does not forward the environment, so the server end of an ssh
+remote gets a non-default cap only from the server's own environment (a
+wrapper script, `sshd` `SetEnv`, or a forced command passing
+`--max-object-size`).
+
+Unchanged: the cap is still a transfer-path guard, not a local-commit limit,
+so lowering it can leave a repository holding committed objects it cannot
+push; `read_object_at` (the trusted on-disk path) stays uncapped. The
+desktop app does not read the env var; it does no transfers.

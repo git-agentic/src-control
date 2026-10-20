@@ -2,7 +2,7 @@
 # P31 listener-limits demo: `sc serve --http`'s three new operator knobs —
 # `--max-connections` (503-style busy shed at the limit), `--timeout`
 # (session idle read+write timeout), and `--max-pack-size` (floor:
-# MAX_OBJECT_SIZE, 256 MiB) — layered on P26/P29's `sc serve --http`.
+# the max object size, 256 MiB) — layered on P26/P29's `sc serve --http`.
 #
 # Honesty note on scope: a connection that never sends its opening is
 # reaped by the FIXED 30s opening timeout, not by `--timeout` (which
@@ -183,7 +183,7 @@ SERVER_PID=""
 ! nc -z 127.0.0.1 "$PORT2" 2>/dev/null || fail "second server still accepting connections after kill"
 
 if "$SC" serve --http "127.0.0.1:$PORT2" --max-pack-size 1024 "$A" 2>"$W/err-cap.txt"; then
-  fail "server should have refused to start with --max-pack-size below MAX_OBJECT_SIZE"
+  fail "server should have refused to start with --max-pack-size below the max object size"
 fi
 grep -qi "max-pack-size" "$W/err-cap.txt" \
   || fail "expected a --max-pack-size floor error, got: $(cat "$W/err-cap.txt")"

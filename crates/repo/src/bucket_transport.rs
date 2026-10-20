@@ -69,20 +69,24 @@ pub struct BucketTransport {
 }
 
 /// Untrusted-length guard (P28 parity): refuse any WAL metadata value —
-/// manifest, log entry, idx — larger than `MAX_OBJECT_SIZE` before decoding.
+/// manifest, log entry, idx — larger than the object cap before decoding.
 /// Pack bodies are exempt from this particular guard (they may legitimately
 /// exceed it), but are not unguarded: `object_bytes` reads a pack body via
 /// `scl_core::pack::read_object_at_bounded` (not the unbounded
 /// `read_object_at` — that path is reserved for `Store`'s own
 /// already-verified on-disk packs per ADR-0039's explicit trust split),
 /// which caps both the compressed record length and the decompressed output
-/// at `MAX_OBJECT_SIZE`, mirroring `parse_pack_reader`'s bounded decode. A
+/// at the object cap, mirroring `parse_pack_reader`'s bounded decode. A
 /// hostile bucket pack therefore cannot mount a decompression-bomb DoS
 /// against `get_object`/`get_pack`.
 fn capped(what: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
-    if bytes.len() > scl_core::MAX_OBJECT_SIZE {
+    capped_to(what, bytes, scl_core::max_object_size())
+}
+
+fn capped_to(what: &str, bytes: Vec<u8>, max: usize) -> Result<Vec<u8>> {
+    if bytes.len() > max {
         return Err(Error::Wal(format!(
-            "{what} exceeds MAX_OBJECT_SIZE (256 MiB)"
+            "{what} exceeds the {max}-byte object size limit"
         )));
     }
     Ok(bytes)
@@ -322,7 +326,7 @@ impl BucketTransport {
             *cache = Some((hash.clone(), bytes));
         }
         let (_, pack) = cache.as_ref().unwrap();
-        Ok(read_object_at_bounded(pack, offset, id, scl_core::MAX_OBJECT_SIZE)?.encode())
+        Ok(read_object_at_bounded(pack, offset, id, scl_core::max_object_size())?.encode())
     }
 
     /// Upload one pack (+ its idx) content-addressed by BLAKE3 of the pack
@@ -663,6 +667,15 @@ impl Transport for BucketTransport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capped_to_rejects_above_a_lowered_cap_and_accepts_at_a_raised_one() {
+        let v = vec![0u8; scl_core::MIN_MAX_OBJECT_SIZE + 1];
+        let err = capped_to("manifest", v.clone(), scl_core::MIN_MAX_OBJECT_SIZE).unwrap_err();
+        assert!(format!("{err}").contains("object size limit"), "got {err}");
+        assert!(capped_to("manifest", v.clone(), scl_core::MIN_MAX_OBJECT_SIZE + 1).is_ok());
+        assert!(capped_to("manifest", v, scl_core::MAX_MAX_OBJECT_SIZE).is_ok());
+    }
+
     use super::*;
     use crate::transport::Transport;
     use crate::walfmt::{

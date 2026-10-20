@@ -82,20 +82,25 @@ pub trait Transport {
     }
 }
 
-/// The most canonical object bytes one by-id reply carries (ADR-0048). It sits
-/// well under the client's 1 GiB read cap so pack record headers and zstd
-/// framing cannot push a legitimate reply past it.
-const BY_ID_REPLY_CAP: u64 = 512 << 20;
+/// The most canonical object bytes one by-id reply carries (ADR-0048): twice
+/// the per-object cap (`object_cap`, the live [`scl_core::max_object_size`];
+/// 512 MiB at the default), so a reply always has room for one maximum-size
+/// object plus pack record headers and zstd framing, and scales with an
+/// operator-set cap.
+fn by_id_reply_ceiling(object_cap: usize) -> u64 {
+    (object_cap as u64) * 2
+}
 
 /// The by-id reply limit for a server whose `--max-pack-size` is
 /// `max_pack_size` (0 means unlimited): the smaller of that and
-/// [`BY_ID_REPLY_CAP`]. Shared by the wire server and [`LocalTransport`], so a
-/// lazy clone of a local path cannot spool an unbounded reply either.
-pub(crate) fn by_id_reply_cap(max_pack_size: u64) -> u64 {
+/// [`by_id_reply_ceiling`]. Shared by the wire server and [`LocalTransport`],
+/// so a lazy clone of a local path cannot spool an unbounded reply either.
+pub(crate) fn by_id_reply_cap(max_pack_size: u64, object_cap: usize) -> u64 {
+    let ceiling = by_id_reply_ceiling(object_cap);
     if max_pack_size == 0 {
-        BY_ID_REPLY_CAP
+        ceiling
     } else {
-        max_pack_size.min(BY_ID_REPLY_CAP)
+        max_pack_size.min(ceiling)
     }
 }
 
@@ -111,11 +116,12 @@ fn encoded_len(obj: &Object) -> u64 {
 }
 
 /// Refuse an object a receiver would reject anyway: `pack::parse_pack_reader`
-/// fails any record whose canonical encoding exceeds `MAX_OBJECT_SIZE`.
-fn check_servable_size(id: &ObjectId, len: u64) -> Result<()> {
-    if len > scl_core::MAX_OBJECT_SIZE as u64 {
+/// fails any record whose canonical encoding exceeds the object cap `max`
+/// (the live [`scl_core::max_object_size`]).
+fn check_servable_size(id: &ObjectId, len: u64, max: usize) -> Result<()> {
+    if len > max as u64 {
         return Err(Error::PackTooLarge(format!(
-            "object {id} exceeds MAX_OBJECT_SIZE and cannot be transferred"
+            "object {id} exceeds the {max}-byte object size limit and cannot be transferred"
         )));
     }
     Ok(())
@@ -160,7 +166,7 @@ impl LocalTransport {
     /// shared core of [`Transport::get_objects`] and `wire::serve`'s
     /// `GetObjects` arm. Duplicate ids are served once. `max_bytes` (0 =
     /// unlimited) bounds the summed canonical encoded size, and any single
-    /// object over `MAX_OBJECT_SIZE` is refused (every receiver would reject
+    /// object over the object cap is refused (every receiver would reject
     /// it). Both fail with `PackTooLarge` before any pack byte is written.
     /// Blobs and sealed objects are measured without re-encoding them.
     pub(crate) fn build_objects_tempfile(
@@ -182,7 +188,7 @@ impl LocalTransport {
                 Ok(obj) if refused_by_id(&obj) => not_sent.push(*id),
                 Ok(obj) => {
                     let size = encoded_len(&obj);
-                    check_servable_size(id, size)?;
+                    check_servable_size(id, size, scl_core::max_object_size())?;
                     total = total.saturating_add(size);
                     if max_bytes > 0 && total > max_bytes {
                         return Err(Error::PackTooLarge(format!(
@@ -408,7 +414,7 @@ pub(crate) fn write_ids_to_temp_pack(
 /// Two defenses now compose here (updated for P28 Task 2). First,
 /// `parse_pack_reader` itself hard-rejects any record whose compressed
 /// length prefix, or whose decompressed zstd output, exceeds
-/// `MAX_OBJECT_SIZE` (256 MiB) — an absolute per-record cap enforced
+/// the object cap (`scl_core::max_object_size`, default 256 MiB) — an absolute per-record cap enforced
 /// regardless of source. Second, and independently, both passes here read
 /// the *already-fully-spilled* temp file rather than the live connection
 /// (whether it was spilled by `Transport::put_pack`'s own bounded copy from
@@ -416,7 +422,7 @@ pub(crate) fn write_ids_to_temp_pack(
 /// total bytes any record's length prefix can possibly claim is also
 /// bounded by the file's own size on disk, which was itself bounded by
 /// however many bytes the sender actually sent. So a hostile length prefix
-/// is now rejected outright by the `MAX_OBJECT_SIZE` cap, and even absent
+/// is now rejected outright by the object cap, and even absent
 /// that cap could never claim more than the attacker already transferred —
 /// both defenses hold. Every call site in this codebase (both here and
 /// `wire::serve`'s own dispatch) reads a spilled file, never the live
@@ -537,7 +543,8 @@ impl Transport for LocalTransport {
                 crate::wire::MAX_GET_OBJECTS_IDS
             )));
         }
-        let (not_sent, guard) = self.build_objects_tempfile(ids, by_id_reply_cap(0))?;
+        let (not_sent, guard) =
+            self.build_objects_tempfile(ids, by_id_reply_cap(0, scl_core::max_object_size()))?;
         let mut f = std::fs::File::open(guard.path())?;
         std::io::copy(&mut f, out)?;
         Ok(not_sent)
@@ -730,14 +737,20 @@ mod tests {
             assert_eq!(encoded_len(o), o.encode().len() as u64, "{}", o.kind_name());
         }
         let id = blob.id();
-        // The receiver rejects a canonical encoding above MAX_OBJECT_SIZE, and
-        // the encoding of a blob is its payload plus one tag byte.
-        let max = scl_core::MAX_OBJECT_SIZE as u64;
-        assert!(check_servable_size(&id, max).is_ok());
-        assert!(matches!(
-            check_servable_size(&id, max + 1),
-            Err(Error::PackTooLarge(_))
-        ));
+        // The receiver rejects a canonical encoding above the object cap, and
+        // the encoding of a blob is its payload plus one tag byte. Lowered and
+        // raised caps move the boundary.
+        for max in [
+            scl_core::MIN_MAX_OBJECT_SIZE,
+            scl_core::DEFAULT_MAX_OBJECT_SIZE,
+            scl_core::MAX_MAX_OBJECT_SIZE,
+        ] {
+            assert!(check_servable_size(&id, max as u64, max).is_ok());
+            assert!(matches!(
+                check_servable_size(&id, max as u64 + 1, max),
+                Err(Error::PackTooLarge(_))
+            ));
+        }
         assert_eq!(encoded_len(&Object::blob(vec![0u8; 10])), 11);
     }
 
@@ -1109,13 +1122,20 @@ mod tests {
     }
 
     #[test]
-    fn by_id_reply_cap_is_the_smaller_of_max_pack_size_and_512_mib() {
+    fn by_id_reply_cap_is_the_smaller_of_max_pack_size_and_twice_the_object_cap() {
         const MIB: u64 = 1 << 20;
+        let default = scl_core::DEFAULT_MAX_OBJECT_SIZE;
         // 0 means "unlimited" for --max-pack-size, but a by-id reply is still
-        // bounded so the client's read cap always covers it.
-        assert_eq!(by_id_reply_cap(0), 512 * MIB);
-        assert_eq!(by_id_reply_cap(64 * MIB), 64 * MIB);
-        assert_eq!(by_id_reply_cap(16 << 30), 512 * MIB);
+        // bounded: 2 x the object cap, 512 MiB at the default.
+        assert_eq!(by_id_reply_cap(0, default), 512 * MIB);
+        assert_eq!(by_id_reply_cap(64 * MIB, default), 64 * MIB);
+        assert_eq!(by_id_reply_cap(16 << 30, default), 512 * MIB);
+        // The ceiling follows a lowered or raised object cap.
+        assert_eq!(by_id_reply_cap(0, scl_core::MIN_MAX_OBJECT_SIZE), 2 * MIB);
+        assert_eq!(
+            by_id_reply_cap(16 << 30, scl_core::MAX_MAX_OBJECT_SIZE),
+            2048 * MIB
+        );
     }
 
     /// A repo with a stopped merge, pick or rebase is completed against its
