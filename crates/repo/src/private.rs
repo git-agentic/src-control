@@ -934,12 +934,16 @@ impl Repo {
                 continue;
             }
             let full = worktree::safe_join(&self.layout.root, &p)?;
-            if full.symlink_metadata().is_err() {
-                continue;
-            }
+            let meta = match full.symlink_metadata() {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // Not knowing what stands there must stop the abort before it
+                // clears the stop's records (decrypted text could linger).
+                Err(e) => return Err(e.into()),
+            };
             let recorded = plaintext.contains(&p);
             // The stop wrote regular files: a symlink there is the user's.
-            let ours = full.symlink_metadata().is_ok_and(|m| m.is_file())
+            let ours = meta.is_file()
                 && if perms & PROTECTED != 0 {
                     recorded
                 } else {

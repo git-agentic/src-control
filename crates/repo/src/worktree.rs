@@ -1204,7 +1204,12 @@ fn materialize_impl(
                 full.symlink_metadata().is_ok_and(|m| m.is_file())
                     && restore_owned.is_none_or(|owned| owned.contains(p))
             } else {
+                // Still the tree's bytes, or a path the stop owns (recorded
+                // plaintext, a live conflict) where an edit is the resolution
+                // a restore discards. Only a regular file either way.
                 disk_is_blob(&full, blob_id)
+                    || (restore_owned.is_some_and(|owned| owned.contains(p))
+                        && full.symlink_metadata().is_ok_and(|m| m.is_file()))
             };
             if ours {
                 removals.insert(p);

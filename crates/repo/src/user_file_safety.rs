@@ -446,3 +446,30 @@ fn abort_never_writes_through_a_symlink_at_a_conflicted_path() {
         finish(&root, repo);
     }
 }
+
+#[test]
+fn abort_discards_the_resolution_of_a_modify_delete_conflict() {
+    // Ours deleted `y.txt`, theirs changed it: the stop leaves theirs' file as
+    // the conflict. The user's edit of it is the resolution abort discards.
+    for op in [Op::Merge, Op::Pick] {
+        let root = root_for("modify-delete", op);
+        let repo = Repo::init(&root).unwrap();
+        put(&root, "y.txt", b"y\n");
+        put(&root, "x.txt", b"keep\n");
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        std::fs::remove_file(root.join("y.txt")).unwrap();
+        repo.commit("me", "main deletes y").unwrap();
+        repo.switch("feature").unwrap();
+        put(&root, "y.txt", b"y changed\n");
+        repo.commit("me", "feature edits y").unwrap();
+        repo.switch("main").unwrap();
+        stop(&repo, op);
+        assert!(root.join("y.txt").exists(), "{op:?}: setup");
+        put(&root, "y.txt", b"my resolution\n");
+        let report = abort(&repo, op);
+        assert!(!root.join("y.txt").exists(), "{op:?}");
+        assert!(report.kept.is_empty(), "{op:?}: {report:?}");
+        finish(&root, repo);
+    }
+}

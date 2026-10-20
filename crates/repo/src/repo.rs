@@ -34,6 +34,15 @@ type ProtectedFile = crate::protect::SealInput;
 /// Working-tree status against HEAD.
 pub type Status = Diff;
 
+impl AbortReport {
+    /// Add paths left in place, keeping the list sorted and free of repeats.
+    pub(crate) fn keep_all(&mut self, paths: Vec<String>) {
+        self.kept.extend(paths);
+        self.kept.sort();
+        self.kept.dedup();
+    }
+}
+
 /// What an abort did not restore. The abort itself completes either way and
 /// its state is cleared.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2053,11 +2062,14 @@ impl Repo {
     /// protected content (`conflict_plaintext`), except a path the restored
     /// tree tracks as a plain file: that one is the user's own. Call it after
     /// the restore. A lookup that fails keeps the file: it would be a path the
-    /// restored tree may track.
-    pub(crate) fn remove_conflict_plaintext(&self, restored_root: ObjectId) -> Result<()> {
+    /// restored tree may track. Returns the recorded paths it left because
+    /// something other than a regular file (the user's symlink or directory)
+    /// stands there.
+    pub(crate) fn remove_conflict_plaintext(&self, restored_root: ObjectId) -> Result<Vec<String>> {
         let paths = crate::conflict_plaintext::read(&self.layout)?;
+        let mut retained = Vec::new();
         if paths.is_empty() {
-            return Ok(());
+            return Ok(retained);
         }
         let partial = self.promisor()?.is_some();
         let store_arc = self.vfs.store();
@@ -2077,6 +2089,16 @@ impl Repo {
                 // its state is cleared, like a failed removal.
                 Err(e) => return Err(e.into()),
             };
+            if remove && !is_file {
+                // Not the stop's regular file (a symlink or directory the user
+                // put there): left, and told to the caller.
+                if worktree::safe_join(&self.layout.root, &path)?
+                    .symlink_metadata()
+                    .is_ok()
+                {
+                    retained.push(path.clone());
+                }
+            }
             if remove && is_file {
                 // Only an already-absent file is fine: any other failure must
                 // stop the abort before its state is cleared, or the decrypted
@@ -2088,7 +2110,7 @@ impl Repo {
                 }
             }
         }
-        Ok(())
+        Ok(retained)
     }
 
     /// [`Repo::refuse_untracked_overwrite_vs`] against the tree `old_root`
@@ -2507,7 +2529,7 @@ impl Repo {
                 self.restore_over_stop(ours_snap.root, &ours_snap.protection, Some(decided))?;
         }
         if let Some(root) = sidecar_roots.first() {
-            self.remove_conflict_plaintext(*root)?;
+            report.keep_all(self.remove_conflict_plaintext(*root)?);
         }
         self.remove_conflict_sidecars(&sidecar_roots)?;
         // What an interrupted stopped-op widen laid, which the walk above

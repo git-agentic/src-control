@@ -647,7 +647,7 @@ impl Repo {
             report = self.restore_over_stop(snap.root, &snap.protection, decided)?;
         }
         if let Some(root) = sidecar_roots.first() {
-            self.remove_conflict_plaintext(*root)?;
+            report.keep_all(self.remove_conflict_plaintext(*root)?);
         }
         self.remove_conflict_sidecars(&sidecar_roots)?;
         self.remove_widen_residue(decided)?;
@@ -1279,8 +1279,8 @@ impl Repo {
         // anything is removed: a view gap must leave the stopped rebase
         // intact and retryable (ADR-0049 decision 10).
         self.ensure_view(snap.root, &self.sparse_spec()?)?;
-        let report = self.restore_over_stop(snap.root, &snap.protection, decided)?;
-        self.remove_conflict_plaintext(snap.root)?;
+        let mut report = self.restore_over_stop(snap.root, &snap.protection, decided)?;
+        report.keep_all(self.remove_conflict_plaintext(snap.root)?);
         self.remove_conflict_sidecars(&[snap.root])?;
         self.remove_widen_residue(decided)?;
         crate::rebase_state::clear(&self.layout)?;

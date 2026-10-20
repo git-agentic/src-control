@@ -321,8 +321,10 @@ every claim below is checked against the shipped code, not the plan.
    plaintext and cannot be compared without a key: forward operations (already
    dirty-checked) still remove it, a restore only if recorded, which is why the
    public stop now records the carried protected files it decrypted, as the
-   private stop already did. Recorded plaintext and sidecars are removed
-   without a byte check: the user's edit of them is the resolution abort
+   private stop already did. Recorded plaintext, a path left conflicted
+   (a modify/delete conflict's surviving file included) and sidecars are
+   removed without a byte check, as regular files only (a symlink or directory
+   there is kept and reported, including by `remove_conflict_plaintext`): the user's edit of them is the resolution abort
    discards. Recording the decrypted files also changes completion: a recorded protected
    path the user deleted during the stop is committed as deleted instead of
    being carried back from a parent (the rule plain files already followed).
