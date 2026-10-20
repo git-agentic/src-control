@@ -60,10 +60,16 @@ pub struct WsRefresh {
     pub workspaces: Vec<WsRefreshEntry>,
 }
 
-/// The writes one workspace needs, decided before anything is touched.
+/// A write the plan decided on: path, new blob, mode and perms, and the
+/// candidate's entry at the path (`None` when the checkout does not track it).
+type PlannedWrite = (String, ObjectId, FileMode, u8, Option<(ObjectId, u8)>);
+
+/// The writes one workspace needs, decided before anything is touched. Each
+/// carries what the candidate recorded at its path, so apply can check again,
+/// right before touching the file, that it is still that.
 struct Plan {
-    removals: Vec<String>,
-    writes: Vec<(String, ObjectId, FileMode, u8)>,
+    removals: Vec<(String, ObjectId, u8)>,
+    writes: Vec<PlannedWrite>,
     skipped: Vec<String>,
 }
 
@@ -81,6 +87,10 @@ struct Job {
 thread_local! {
     /// Test seam: fail the Nth file operation of the apply phase (0 = the first).
     static FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Test seam: runs once the plan is final and the pending marker is written,
+    /// right before the first file is touched (a stand-in for an editor).
+    static BEFORE_APPLY: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Test seam for a crash in the middle of the apply phase; a no-op outside tests.
@@ -97,10 +107,74 @@ fn injected_failure() -> Result<()> {
     Ok(())
 }
 
+fn before_apply_hook() {
+    #[cfg(test)]
+    BEFORE_APPLY.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
+}
+
 fn changed_since_read(p: &str) -> Error {
     Error::InvalidArgument(format!(
         "{p} changed in the workspace while it was being read; run `sc ws refresh` again"
     ))
+}
+
+/// Whether the file at `full` is still exactly what the candidate recorded at
+/// `p` (`prior` = blob and perms). A plain file is compared by bytes. A
+/// protected file's plaintext is proved the same way commit proves it: a
+/// randomized one by the workspace cache, a convergent one by re-encrypting.
+/// Anything that is not a regular file reads as changed.
+fn still_read(
+    full: &std::path::Path,
+    p: &str,
+    prior: (ObjectId, u8),
+    cache: &ProtectedCache,
+) -> bool {
+    let (blob, perms) = prior;
+    if perms & PROTECTED == 0 {
+        return disk_is_blob(full, &blob);
+    }
+    if !full.symlink_metadata().is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(full).map(scl_crypto::Zeroizing::new) else {
+        return false;
+    };
+    if perms & RANDOMIZED != 0 {
+        cache.unchanged(p, &bytes) == Some(blob)
+    } else {
+        Object::blob(scl_crypto::encrypt_path(&bytes).0).id() == blob
+    }
+}
+
+/// The disk state of path `p` against the candidate's record of it: fine to
+/// replace or remove (`Ok(())`), or changed since it was read. A tracked plain
+/// file that is gone was deleted after the read; a protected one may never have
+/// been laid out (no key at fork), which is not a change.
+fn check_prior(
+    full: &std::path::Path,
+    p: &str,
+    prior: Option<(ObjectId, u8)>,
+    target: Option<ObjectId>,
+    cache: &ProtectedCache,
+) -> Result<()> {
+    let meta = lstat(full)?;
+    match (meta, prior) {
+        (None, Some((_, perms))) if perms & PROTECTED == 0 => Err(changed_since_read(p)),
+        (None, _) => Ok(()),
+        (Some(m), _) if m.is_dir() => Ok(()), // judged by the directory rules
+        (Some(_), Some(prior)) if still_read(full, p, prior, cache) => Ok(()),
+        // Already the target bytes (a plain file): nothing of the user's to lose.
+        (Some(_), _) if target.is_some_and(|t| disk_is_blob(full, &t)) => Ok(()),
+        (Some(_), Some(_)) => Err(changed_since_read(p)),
+        (Some(_), None) => Err(Error::InvalidArgument(format!(
+            "cannot write {p}: a file of yours (untracked or ignored) stands there; move it \
+             away, then retry"
+        ))),
+    }
 }
 
 /// Decide, without writing, how to turn the checkout (laid out from `old_root`)
@@ -114,6 +188,7 @@ fn plan_checkout(
     protection: &Protection,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
+    cache: &ProtectedCache,
 ) -> Result<Plan> {
     // Bounded by the view on both sides: a partial clone does not hold the rest.
     let old = tree_file_entries_with_perms_sparse(store, old_root, sparse)?;
@@ -121,22 +196,13 @@ fn plan_checkout(
     let (mut removals, mut writes, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     for (p, (blob, _, perms)) in old.iter().filter(|(p, _)| !new.contains_key(*p)) {
         let full = safe_join(root, p)?;
-        let Some(meta) = lstat(&full)? else { continue };
-        if under_symlink(root, p) {
+        if lstat(&full)?.is_none() || under_symlink(root, p) {
             continue;
         }
-        // A protected file's plaintext cannot be compared without its key.
-        let ours = if perms & PROTECTED != 0 {
-            meta.is_file()
-        } else {
-            disk_is_blob(&full, blob)
-        };
-        if !ours {
-            return Err(changed_since_read(p));
-        }
-        removals.push(p.clone());
+        check_prior(&full, p, Some((*blob, *perms)), None, cache)?;
+        removals.push((p.clone(), *blob, *perms));
     }
-    let removable: BTreeSet<&str> = removals.iter().map(String::as_str).collect();
+    let removable: BTreeSet<&str> = removals.iter().map(|r| r.0.as_str()).collect();
     for (p, (blob, mode, perms)) in &new {
         let prior = old.get(p);
         if prior.is_some_and(|(b, m, _)| b == blob && m == mode) {
@@ -161,35 +227,18 @@ fn plan_checkout(
                 continue;
             }
         }
-        match &meta {
-            None => {}
-            Some(m) if m.is_dir() => {
-                if !dir_clearable(&full, p, &|c| removable.contains(c)) {
-                    return Err(Error::InvalidArgument(format!(
-                        "cannot write {p}: a directory with untracked or ignored content \
-                         stands there; move it away, then retry"
-                    )));
-                }
+        let prior = prior.map(|(b, _, op)| (*b, *op));
+        if meta.as_ref().is_some_and(|m| m.is_dir()) {
+            if !dir_clearable(&full, p, &|c| removable.contains(c)) {
+                return Err(Error::InvalidArgument(format!(
+                    "cannot write {p}: a directory with untracked or ignored content \
+                     stands there; move it away, then retry"
+                )));
             }
-            Some(m) => {
-                let was_ours = match prior {
-                    Some((_, _, op)) if op & PROTECTED != 0 => m.is_file(),
-                    Some((b, ..)) => disk_is_blob(&full, b),
-                    None => false,
-                };
-                if !was_ours && !(!protected && disk_is_blob(&full, blob)) {
-                    return Err(if prior.is_some() {
-                        changed_since_read(p)
-                    } else {
-                        Error::InvalidArgument(format!(
-                            "cannot write {p}: a file of yours (untracked or ignored) stands \
-                             there; move it away, then retry"
-                        ))
-                    });
-                }
-            }
+        } else {
+            check_prior(&full, p, prior, (!protected).then_some(*blob), cache)?;
         }
-        writes.push((p.clone(), *blob, *mode, *perms));
+        writes.push((p.clone(), *blob, *mode, *perms, prior));
     }
     refuse_blocked_parents(root, writes.iter().map(|w| &w.0), &|c| {
         removable.contains(c)
@@ -202,31 +251,40 @@ fn plan_checkout(
 }
 
 /// Carry out one workspace's plan. Each file is replaced atomically, so an
-/// interruption never leaves a half-written one.
+/// interruption never leaves a half-written one, and is checked once more right
+/// before it is touched: the plan was made earlier, and anything can edit a
+/// checkout meanwhile. `done` counts the file operations completed, across
+/// workspaces. A removal that empties a directory takes the directory too.
 fn apply_plan(
     store: &mut Store,
     job: &mut Job,
     identity: Option<&scl_crypto::SecretKey>,
+    done: &mut usize,
 ) -> Result<()> {
-    for p in &job.plan.removals {
+    for (p, blob, perms) in &job.plan.removals {
         injected_failure()?;
-        match std::fs::remove_file(safe_join(&job.dir, p)?) {
+        let full = safe_join(&job.dir, p)?;
+        check_prior(&full, p, Some((*blob, *perms)), None, &job.cache)?;
+        match std::fs::remove_file(&full) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        *done += 1;
     }
-    for (p, blob, mode, perms) in &job.plan.writes {
+    for (p, blob, mode, perms, prior) in &job.plan.writes {
         injected_failure()?;
         let full = safe_join(&job.dir, p)?;
         let Object::Blob(bytes) = store.get(blob)? else {
             continue;
         };
+        let protected = perms & PROTECTED != 0;
+        check_prior(&full, p, *prior, (!protected).then_some(*blob), &job.cache)?;
         clear_dir_obstruction(&full, p)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if perms & PROTECTED != 0 {
+        if protected {
             let pt =
                 decrypt_protected(&bytes, blob, &job.protection, identity).ok_or_else(|| {
                     Error::InvalidArgument(format!("{p}: the key stopped opening it mid-refresh"))
@@ -240,6 +298,12 @@ fn apply_plan(
             scl_core::fsutil::atomic_write_durable(&full, &bytes[..])?;
             apply_file_mode(&full, *mode)?;
         }
+        *done += 1;
+    }
+    // Only directories a removal emptied: `remove_dir` fails on anything else.
+    for (p, ..) in &job.plan.removals {
+        let mut dir = safe_join(&job.dir, p)?;
+        while dir.pop() && dir != job.dir && std::fs::remove_dir(&dir).is_ok() {}
     }
     Ok(())
 }
@@ -260,12 +324,12 @@ impl Repo {
     /// (in or out of the view), needs a protected path decrypted without
     /// `identity`, has a file or directory of the user's where the new tip puts
     /// one, or the view of the new tip cannot be filled (the gap error,
-    /// ADR-0050). The write order is each checkout, then the manifest with the
-    /// new base. A crash in between leaves a manifest that still names the old
-    /// base and checkouts whose every file is either its old state or its merged
-    /// one; a harvest then lands them (the merge sees the new tip's changes on
-    /// both sides) or, where the two sides edited the same lines, falls back to a
-    /// branch. Nothing is lost, and `sc ws refresh` can be run again.
+    /// ADR-0050). The write order is a `pending_refresh` marker in the manifest,
+    /// each checkout, then the manifest with the new base and no marker. A crash
+    /// in between leaves checkouts holding a mix of old and merged files and a
+    /// marker that makes harvest refuse until `sc ws refresh` is run again
+    /// (abandon still works). Nothing is lost: every file is replaced
+    /// atomically, only over the bytes the candidate read.
     pub fn ws_refresh(
         &self,
         name: Option<&str>,
@@ -282,7 +346,7 @@ impl Repo {
         if crate::rebase_state::in_progress(&self.layout) {
             return Err(Error::RebaseInProgress);
         }
-        let mut session = open_session(self.layout(), name)?;
+        let session = open_session(self.layout(), name)?;
         let branch = match onto {
             Some(b) => b.to_string(),
             None => refs::current_branch(self.layout())?,
@@ -294,8 +358,28 @@ impl Repo {
         if self.manifest_at(&to)?.is_some() {
             return Err(Error::PrivateUnsupported("sc ws refresh".into()));
         }
+        // An unfinished refresh left files at the state of its own target. Finish
+        // it onto that exact tip first: replayed onto a tip the branch has since
+        // moved to, those files would read as the agent's own changes (and would
+        // survive a host revert).
+        if let Some(pending) = session.pending_refresh.filter(|p| *p != to) {
+            self.refresh_onto(name, &session.base_branch, pending, identity)?;
+        }
+        self.refresh_onto(name, &branch, to, identity)
+    }
+
+    /// [`Self::ws_refresh`] onto the snapshot `to`, labelled as `branch`.
+    fn refresh_onto(
+        &self,
+        name: Option<&str>,
+        branch: &str,
+        to: ObjectId,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<WsRefresh> {
+        let branch = branch.to_string();
+        let mut session = open_session(self.layout(), name)?;
         let from = session.base_snapshot;
-        if to == from && branch == session.base_branch {
+        if to == from && branch == session.base_branch && session.pending_refresh.is_none() {
             return Ok(WsRefresh {
                 branch,
                 from,
@@ -390,6 +474,7 @@ impl Repo {
                     &protection,
                     identity,
                     &sparse,
+                    &cache,
                 );
                 match planned {
                     Ok(plan) => plan,
@@ -415,21 +500,38 @@ impl Repo {
             )));
         }
 
+        // From here the checkouts may hold a mix of old and refreshed files, and
+        // harvest would read the refreshed ones as the agent's own: mark the
+        // session, durably, before the first write (cleared with the new base).
+        session.pending_refresh = Some(to);
+        write_manifest(self.layout(), &session)?;
+        before_apply_hook();
         let mut report = Vec::with_capacity(jobs.len());
-        {
+        let mut done = 0;
+        let applied = {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
-            for job in &mut jobs {
-                apply_plan(&mut store, job, identity)?;
+            jobs.iter_mut().try_for_each(|job| {
+                apply_plan(&mut store, job, identity, &mut done)?;
                 report.push(WsRefreshEntry {
                     index: job.index,
                     written: job.plan.writes.len(),
                     removed: job.plan.removals.len(),
                     skipped: job.plan.skipped.clone(),
                 });
+                Ok(())
+            })
+        };
+        if let Err(e) = applied {
+            if done == 0 {
+                // Refused at the first file: nothing was written, nothing is pending.
+                session.pending_refresh = None;
+                write_manifest(self.layout(), &session)?;
             }
+            return Err(e);
         }
         // The new base last: until it lands, the old one is still the truth.
+        session.pending_refresh = None;
         session.base_snapshot = to;
         session.base_branch = branch.clone();
         write_manifest(self.layout(), &session)?;
@@ -507,6 +609,14 @@ mod tests {
         drop(repo);
         std::fs::remove_dir_all(root).unwrap();
         assert!(!root.exists());
+    }
+
+    /// Clears the before-apply hook however the test ends.
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            BEFORE_APPLY.with(|h| *h.borrow_mut() = None);
+        }
     }
 
     /// Resets the failure seam however the test ends.
@@ -780,8 +890,8 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_refresh_leaves_a_workspace_that_still_harvests() {
-        let (repo, root, dirs, old, tip) = crash_fixture("crash-harvest");
+    fn an_interrupted_refresh_blocks_harvest_until_it_is_finished() {
+        let (repo, root, dirs, old, _tip) = crash_fixture("crash-harvest");
         {
             // One file into the first workspace, then the apply phase dies.
             let _g = FailGuard::after(1);
@@ -793,9 +903,39 @@ mod tests {
             old,
             "the manifest still names the old base"
         );
+        assert!(repo
+            .ws_session(None)
+            .unwrap()
+            .unwrap()
+            .pending_refresh
+            .is_some());
         assert!(dirs[0].join("b.txt").exists() && !dirs[0].join("c.txt").exists());
         assert!(dirs[1].join("w2.txt").exists() && !dirs[1].join("b.txt").exists());
 
+        // Harvest would read the refreshed b.txt as the agent's own change, and
+        // re-apply it even after the host reverts it: it refuses instead.
+        let err = repo
+            .ws_harvest(None, None, "t", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("did not finish") && err.contains("sc ws refresh"),
+            "{err}"
+        );
+        let tip2 = host_commit(&repo, &root, &[("b.txt", None)]);
+
+        let r = repo.ws_refresh(None, None, None).unwrap();
+        assert_eq!(r.to, tip2);
+        assert!(repo
+            .ws_session(None)
+            .unwrap()
+            .unwrap()
+            .pending_refresh
+            .is_none());
+        assert!(
+            !dirs[0].join("b.txt").exists(),
+            "the host's revert is honoured"
+        );
         let out = repo.ws_harvest(None, None, "t", None).unwrap();
         assert!(
             out.iter()
@@ -803,14 +943,135 @@ mod tests {
             "{out:?}"
         );
         let head = repo.head_tip().unwrap().unwrap();
-        assert_ne!(head, tip);
         assert_eq!(
             tree_has(&repo, head, "a.txt").unwrap(),
             b"ONE\ntwo\nthree\nfour\nfive\n"
         );
-        for p in ["b.txt", "c.txt", "w2.txt"] {
+        assert!(tree_has(&repo, head, "b.txt").is_none(), "not re-applied");
+        for p in ["c.txt", "w2.txt"] {
             assert!(tree_has(&repo, head, p).is_some(), "{p} must survive");
         }
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn an_interrupted_refresh_can_be_abandoned() {
+        let (repo, root, _dirs, ..) = crash_fixture("crash-abandon");
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        assert_eq!(repo.ws_abandon(None, None).unwrap(), 0);
+        assert!(repo.ws_session(None).unwrap().is_none());
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_refusal_before_the_first_write_leaves_nothing_pending() {
+        let (repo, root) = init("noop-pending");
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        host_commit(&repo, &root, &[("a.txt", Some("host\n"))]);
+        // An editor changes the file after the plan is made, before the first write.
+        let d = dir.clone();
+        BEFORE_APPLY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(d.join("a.txt"), "edited late\n").unwrap();
+            }))
+        });
+        let _reset = HookGuard;
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("a.txt changed in the workspace"), "{err}");
+        assert_eq!(
+            read(&dir, "a.txt"),
+            "edited late\n",
+            "the edit is not overwritten"
+        );
+        let session = repo.ws_session(None).unwrap().unwrap();
+        assert!(session.pending_refresh.is_none() && session.base_snapshot == s.base_snapshot);
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_protected_file_edited_after_the_plan_is_not_overwritten() {
+        let (repo, root) = init("late-protected");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "secret x\n").unwrap();
+        repo.commit("t", "protected").unwrap();
+        let s = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        host_commit(&repo, &root, &[("secret/x", Some("secret x v2\n"))]);
+        let d = dir.clone();
+        BEFORE_APPLY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(d.join("secret/x"), "agent edit\n").unwrap();
+            }))
+        });
+        let _reset = HookGuard;
+        let err = repo
+            .ws_refresh(None, None, Some(&sk))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret/x changed in the workspace"), "{err}");
+        assert_eq!(read(&dir, "secret/x"), "agent edit\n");
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_crash_after_a_protected_rewrite_needs_the_key_to_finish() {
+        let (repo, root) = init("crash-protected");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "secret x\n").unwrap();
+        repo.commit("t", "protected").unwrap();
+        let s = repo.ws_fork(None, 2, "t", Some(&sk)).unwrap();
+        let (d1, d2) = (s.workspaces[0].dir.clone(), s.workspaces[1].dir.clone());
+        host_commit(&repo, &root, &[("secret/x", Some("secret x v2\n"))]);
+        {
+            // Workspace 1 is rewritten, workspace 2 is not reached.
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, Some(&sk)).unwrap_err();
+        }
+        assert_eq!(read(&d1, "secret/x"), "secret x v2\n");
+        assert_eq!(read(&d2, "secret/x"), "secret x\n");
+        // The rewritten file no longer matches the old base, so finishing needs
+        // the key to merge it; without one it refuses and changes nothing.
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("nothing was changed"), "{err}");
+        repo.ws_refresh(None, None, Some(&sk)).unwrap();
+        for d in [&d1, &d2] {
+            assert_eq!(read(d, "secret/x"), "secret x v2\n");
+        }
+        assert!(repo
+            .ws_session(None)
+            .unwrap()
+            .unwrap()
+            .pending_refresh
+            .is_none());
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn directories_a_removal_emptied_go_and_others_stay() {
+        let root = tmp_root("prune");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("gone/deep")).unwrap();
+        std::fs::create_dir_all(root.join("kept")).unwrap();
+        std::fs::write(root.join("gone/deep/f"), "f\n").unwrap();
+        std::fs::write(root.join("kept/g"), "g\n").unwrap();
+        std::fs::write(root.join("kept/h"), "h\n").unwrap();
+        repo.commit("t", "base").unwrap();
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        std::fs::create_dir_all(dir.join("empty-of-mine")).unwrap();
+        host_commit(&repo, &root, &[("gone/deep/f", None), ("kept/g", None)]);
+        repo.ws_refresh(None, None, None).unwrap();
+        assert!(!dir.join("gone").exists(), "emptied by the removal");
+        assert!(dir.join("kept/h").exists());
+        assert!(dir.join("empty-of-mine").exists(), "not ours to remove");
         cleanup(repo, &root);
     }
 

@@ -187,7 +187,9 @@ cargo run --bin sc -- ws refresh [--session <n>] [--onto <branch>] [--identity <
                                               # (lists workspace + paths), a running `ws run`, a
                                               # scanner hit, a view gap, a user file in the way,
                                               # or a protected path it needs --identity to
-                                              # decrypt. Whole session only (no per-index form)
+                                              # decrypt. Whole session only (no per-index form).
+                                              # An interrupted refresh leaves a marker: harvest
+                                              # refuses until `ws refresh` is run again to finish it
 cargo run --bin sc -- ws abandon [--session <n>] [<i>]  # drop one workspace or the whole session
 bash demo/run_ws_demo.sh                      # multi-invocation session + auto-merge + refresh proof (P20)
 cargo run --bin sc -- cherry-pick <ref> [--identity <key>]   # replay one commit onto the

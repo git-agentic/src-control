@@ -74,6 +74,11 @@ pub struct WsSession {
     /// manifest (no `sparse` key) parse as empty/full, matching that
     /// manifest's actual behavior (sparse checkouts didn't exist yet).
     pub sparse: Vec<String>,
+    /// Set while a `sc ws refresh` is writing its checkouts, cleared when it
+    /// completes: the tip it is moving to. A set marker means the checkouts may
+    /// hold a mix of old and refreshed files, so harvest refuses until refresh
+    /// is run again (ADR-0056). Absent from older manifests.
+    pub pending_refresh: Option<ObjectId>,
     pub workspaces: Vec<WsEntry>,
 }
 
@@ -160,6 +165,8 @@ struct SessionToml {
     #[serde(default)]
     sparse: Vec<String>,
     #[serde(default)]
+    pending_refresh: Option<String>,
+    #[serde(default)]
     workspace: Vec<EntryToml>,
 }
 
@@ -170,6 +177,7 @@ impl From<&WsSession> for SessionToml {
             base_branch: s.base_branch.clone(),
             author: s.author.clone(),
             sparse: s.sparse.clone(),
+            pending_refresh: s.pending_refresh.map(|t| t.to_hex()),
             workspace: s
                 .workspaces
                 .iter()
@@ -206,12 +214,17 @@ impl SessionToml {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let pending_refresh = raw
+            .pending_refresh
+            .map(|t| ObjectId::from_str(&t).map_err(|_| bad(format!("bad pending_refresh: {t}"))))
+            .transpose()?;
         Ok(WsSession {
             name: name.map(str::to_string),
             base_snapshot,
             base_branch: raw.base_branch,
             author: raw.author,
             sparse: raw.sparse,
+            pending_refresh,
             workspaces,
         })
     }
@@ -394,6 +407,7 @@ impl Repo {
             base_branch: branch,
             author: author.to_string(),
             sparse: sparse.prefixes().to_vec(),
+            pending_refresh: None,
             workspaces,
         };
         write_manifest(self.layout(), &session)?;
@@ -817,6 +831,13 @@ impl Repo {
             return Err(Error::RebaseInProgress);
         }
         let mut session = open_session(self.layout(), name)?;
+        if session.pending_refresh.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "a `sc ws refresh` did not finish and the checkouts may hold a mix of old and \
+                 refreshed files; run `sc ws refresh{}` to finish it (or abandon the session)",
+                name.map(|n| format!(" --session {n}")).unwrap_or_default()
+            )));
+        }
 
         let landing = into.unwrap_or(&session.base_branch).to_string();
         let current = refs::current_branch(self.layout())?;
@@ -2257,6 +2278,7 @@ mod tests {
             base_branch: session.base_branch.clone(),
             author: session.author.clone(),
             sparse: session.sparse.clone(),
+            pending_refresh: None,
             workspaces: vec![WsEntry {
                 index: 1,
                 dir: dir.clone(),

@@ -3512,6 +3512,16 @@ fn run_ws(op: WsOp) -> Result<()> {
                     Some(n) => print!("session {n} base:"),
                 }
                 println!(" branch {} @ {}", s.base_branch, s.base_snapshot.short());
+                if let Some(t) = s.pending_refresh {
+                    println!(
+                        "refresh to {} did not finish: run `sc ws refresh{}` to complete it",
+                        t.short(),
+                        s.name
+                            .as_deref()
+                            .map(|n| format!(" --session {n}"))
+                            .unwrap_or_default()
+                    );
+                }
                 println!("index  status                       dir");
                 for entry in &s.workspaces {
                     let status = repo.ws_status_label(s, entry)?;

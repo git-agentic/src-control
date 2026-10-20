@@ -803,10 +803,12 @@ tree nor a ref. A planner then compares the candidate's tree with the replayed
 one under the session's recorded view and decides every removal and write for
 every workspace; any conflict, running command, scanner hit, view gap, protected
 path it cannot decrypt, or user file in the way refuses the whole refresh before
-a write. Applying touches only differing paths, each written atomically and only
-over the bytes the candidate was read from; the manifest, which carries the new
-base, is written last, so a crash leaves the old base and a checkout that a
-harvest still lands without loss. Session-wide only.
+a write. Applying touches only differing paths, each written atomically and
+re-checked against what the candidate read right before it is touched; a
+`pending_refresh` marker is written to the manifest before the first file, and
+the manifest with the new base and no marker last. A crash leaves the marker:
+harvest refuses and `sc ws refresh` finishes onto the marked tip first.
+Session-wide only.
 
 ## Phase 21 — hardening & consolidation sweep (built)
 
