@@ -737,7 +737,10 @@ pub(crate) fn preflight_view(
     let gap = |path: &str| {
         // With a blob limit the missing object is a file, and `sc backfill`
         // repairs it by its own path rather than a covering prefix (ADR-0055).
-        let prefix = if promisor.blob_limit().is_some() && !path.is_empty() {
+        // The limit is the cause only for a path in the clone's scope; a path
+        // outside it (a view widened past the filter) was left out by the filter.
+        let sized = promisor.blob_limit().filter(|_| promisor.matches(path));
+        let prefix = if sized.is_some() && !path.is_empty() {
             path.to_string()
         } else {
             promisor
@@ -762,7 +765,7 @@ pub(crate) fn preflight_view(
                 path.to_string()
             },
             prefix,
-            blob_limit: promisor.blob_limit(),
+            blob_limit: sized,
         }
     };
     if !store.contains(&root) {

@@ -437,6 +437,13 @@ impl SizeGate<'_> {
         if self.exempt {
             return Ok(true);
         }
+        // Decided by the limit alone: nothing to measure.
+        if self.limit == 0 {
+            return Ok(false);
+        }
+        if self.limit == u64::MAX {
+            return Ok(true);
+        }
         if let Some(keep) = self.verdicts.get(id) {
             return Ok(*keep);
         }

@@ -533,10 +533,11 @@ fn limited_walk_orders_and_none_match_the_unlimited_walk() {
     sz.cleanup();
 }
 
-/// B3: a lazy size-only clone has a full view, and switch/undo to a revision
-/// with a gap must still fill (the `is_full()` guard used to skip it).
+/// B3: a lazy size-only clone has a full view, and a switch to a revision with
+/// a gap must still fill (the `is_full()` guard used to skip it). Undo has its
+/// own test below.
 #[test]
-fn lazy_full_view_switch_and_undo_fill_the_gapped_revision() {
+fn lazy_full_view_switch_fills_the_gapped_revision() {
     let sz = Sz::new("b3");
     let clone = sz.clone(&[], LIMIT, false);
     refs::write_branch_tip(clone.layout(), "old", &sz.c1).unwrap();
@@ -555,12 +556,9 @@ fn lazy_full_view_switch_and_undo_fill_the_gapped_revision() {
     );
     assert!(has(&clone, &blob_id(&huge(1))), "filled by id");
 
-    // Undo back to main (already complete) and then forward again is a no-op
-    // for gaps; undo to the gapped tip on a non-lazy clone fails first.
+    // gc keeps the filled blobs (reachable from `old`).
     clone.switch("main").unwrap();
-    crate::promisor::set_lazy(clone.layout(), false).unwrap();
     clone.gc(Duration::from_secs(0)).unwrap();
-    // gc kept the filled blobs (reachable from `old`), so nothing is missing.
     assert!(has(&clone, &blob_id(&huge(1))));
     drop(clone);
     sz.cleanup();
@@ -820,15 +818,6 @@ fn partial_refusals_are_unchanged_on_a_size_limited_clone() {
     let clone = sz.clone(&[], LIMIT, false);
     let (sk, pk) = scl_crypto::generate_keypair();
     let rid = pk.recipient_id();
-    let err = clone.set_sparse(&[], None).unwrap_err();
-    assert!(
-        matches!(err, Error::InvalidArgument(ref m) if m.contains("empty sparse spec")),
-        "got {err:?}"
-    );
-    assert!(
-        err.to_string().contains(&format!("blob:limit={LIMIT}")),
-        "{err}"
-    );
     assert!(matches!(
         clone.rewrap(&sk, &[], &[], false),
         Err(Error::PartialCloneUnsupported(_))
@@ -841,10 +830,51 @@ fn partial_refusals_are_unchanged_on_a_size_limited_clone() {
         clone.revoke("src/", &rid),
         Err(Error::PartialCloneUnsupported(_))
     ));
+    drop(clone);
+    sz.cleanup();
+
+    // A prefix + limit clone keeps the sparse refusals and names both filters.
+    let sz = Sz::new("refuse-prefix");
+    let clone = sz.clone(&["src/"], LIMIT, false);
+    let err = clone.set_sparse(&[], None).unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidArgument(ref m) if m.contains("empty sparse spec")),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains(&format!("src/, blob:limit={LIMIT}")),
+        "{err}"
+    );
     assert!(
         clone.disable_sparse(None).is_err(),
         "sparse disable stays refused"
     );
+    drop(clone);
+    sz.cleanup();
+}
+
+/// A size-only clone can narrow its view and return to the full one it started
+/// with: `sparse set` with no prefixes and `sparse disable` are allowed on an
+/// `AllPaths` scope (the closure is filled when lazy, `GapInView` otherwise).
+#[test]
+fn a_size_only_clone_can_narrow_and_restore_its_full_view() {
+    let sz = Sz::new("restore");
+    let clone = sz.clone(&[], LIMIT, false);
+    clone.set_sparse(&["src/".to_string()], None).unwrap();
+    assert!(!sz.clone_root.join("big.txt").exists(), "narrowed");
+    clone.set_sparse(&[], None).unwrap();
+    assert!(clone.sparse_spec().unwrap().is_full());
+    assert_eq!(
+        std::fs::read(sz.clone_root.join("big.txt")).unwrap(),
+        text(&[(0, "ours")]),
+        "restored"
+    );
+    clone.set_sparse(&["src/".to_string()], None).unwrap();
+    clone.disable_sparse(None).unwrap();
+    assert!(clone.sparse_spec().unwrap().is_full());
+    assert!(sz.clone_root.join("big.txt").exists());
+    assert!(clone.promisor().unwrap().unwrap().is_all_paths());
     drop(clone);
     sz.cleanup();
 }

@@ -236,16 +236,22 @@ the file's own path), and a workspace session on a size-limited clone.
 - **Sealed objects, signatures, transcripts.** Not path-reached blobs; never
   subject to the limit.
 - **Sparse and prefix filters.** The prefix decides scope first, the limit prunes
-  inside it. A size-only clone leaves `.sc/sparse` empty (a full view).
+  inside it. A size-only clone leaves `.sc/sparse` empty (a full view). It may
+  narrow that view with `sc sparse set` and return to it with `sc sparse set`
+  (no prefixes) or `sc sparse disable`: a full view is its starting state, so
+  those two refusals apply to prefix scopes only, and the closure is filled
+  (lazy) or refused with `GapInView` before anything changes.
 - **Push, verify, gc.** Presence-based (ADR-0048).
 - **Merge, pick, rebase, ws, work** (ADR-0049/0050). No new engine code; a size
   gap is "asked for" like any other (decision 7).
 - **Server cost and limits (D5).** The walk measures a blob with `Store::blob_size`
   (streamed through a fixed buffer, hash-verified, never admitted to the object
   cache) and caches each verdict by blob id, so a distinct blob is measured at
-  most once per request. The work is bounded by the stored bytes of the distinct
-  candidate blobs, which an unfiltered `GetPack` reads anyway to build its pack;
-  the filter changes bandwidth, not read cost. Reads are unbudgeted (#233 budgets
+  most once per request (a limit of 0 or `u64::MAX` measures nothing). The work
+  is bounded by the stored bytes of the distinct candidate blobs; a kept blob is
+  read twice (measure, then pack), so the read cost is at most twice that of an
+  unfiltered `GetPack`, which already reads every blob into its pack. The filter
+  changes bandwidth, not the order of magnitude of the work. Reads are unbudgeted (#233 budgets
   writes), and the filter does not change that: `--max-connections`, `--timeout`
   and the listener limits remain the bounds. A size index on the server is a later
   optimization.

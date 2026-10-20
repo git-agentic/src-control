@@ -532,8 +532,10 @@ too, not just the src-control-side metadata.
   ciphertext size, which anyone who can fetch the object already sees; the
   filter reveals nothing new. A limited `GetPack` makes the server stream-measure
   each distinct candidate blob once (`Store::blob_size`, fixed buffer, hash
-  checked, cached by id), bounded by the stored bytes of those blobs, which an
-  unfiltered `GetPack` reads anyway. Reads are not budgeted (#233 budgets writes)
+  checked, cached by id; a limit of 0 or `u64::MAX` measures nothing), bounded by
+  the stored bytes of those blobs. A blob that is kept is read twice, once to
+  measure and once to write the pack, so the read cost is at most twice an
+  unfiltered `GetPack`'s, which already reads every blob into its pack. Reads are not budgeted (#233 budgets writes)
   and the filter does not change that; the listener limits are the bound. Every
   active filter, a limit alone included, still excludes private branches and is
   refused by bucket remotes. The wire bump (version 6) makes a mixed-version pair

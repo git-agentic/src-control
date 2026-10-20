@@ -681,6 +681,55 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// ADR-0055: the client's `blob_limit` reaches the server and is applied
+    /// there. A tip blob over the limit is kept, an old one over it is not, an
+    /// old small one is kept.
+    #[test]
+    fn blob_limit_get_pack_over_wire() {
+        let root = tmp_repo("blob-limit");
+        let repo = crate::repo::Repo::open(&root).unwrap();
+        let old_big = vec![b'o'; 4096];
+        let new_big = vec![b'n'; 4096];
+        std::fs::write(root.join("big"), &old_big).unwrap();
+        std::fs::write(root.join("small"), b"s1").unwrap();
+        repo.commit("t", "c1").unwrap();
+        std::fs::write(root.join("big"), &new_big).unwrap();
+        std::fs::write(root.join("small"), b"s2").unwrap();
+        let tip = repo.commit("t", "c2").unwrap();
+        drop(repo);
+        let id = |b: &[u8]| Object::blob(b.to_vec()).id();
+
+        let (client, server) = connect(root.clone());
+        for (limit, old_big_sent, small_old_sent) in [
+            (1024u64, false, true),
+            (0, false, false),
+            (1 << 20, true, true),
+        ] {
+            let mut pack = Vec::new();
+            client
+                .get_pack(
+                    &[tip],
+                    &[],
+                    crate::promisor::PackFilter::new(&[], Some(limit)).as_ref(),
+                    &mut pack,
+                )
+                .unwrap();
+            let ids: Vec<_> = scl_core::pack::parse_pack(&pack)
+                .unwrap()
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect();
+            assert!(ids.contains(&id(&new_big)), "limit {limit}: tip blob");
+            assert!(ids.contains(&id(b"s2")), "limit {limit}: tip small blob");
+            assert_eq!(ids.contains(&id(&old_big)), old_big_sent, "limit {limit}");
+            assert_eq!(ids.contains(&id(b"s1")), small_old_sent, "limit {limit}");
+        }
+        client.bye().unwrap();
+        drop(client);
+        server.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn handshake_surfaces_not_a_repo_as_typed_error() {
         let root = std::env::temp_dir().join(format!("scl-stdio-norepo-{}", std::process::id()));
