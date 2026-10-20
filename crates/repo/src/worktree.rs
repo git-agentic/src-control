@@ -943,7 +943,12 @@ pub(crate) fn clear_dir_obstruction(full: &Path, path: &str) -> Result<()> {
     // check above makes a directory non-empty and the removal fail, not vanish.
     fn prune(dir: &Path) -> std::io::Result<()> {
         for e in std::fs::read_dir(dir)? {
-            prune(&e?.path())?;
+            let e = e?;
+            // A child swapped for a symlink since the check is never followed.
+            if !e.file_type()?.is_dir() {
+                return Err(std::io::ErrorKind::DirectoryNotEmpty.into());
+            }
+            prune(&e.path())?;
         }
         std::fs::remove_dir(dir)
     }

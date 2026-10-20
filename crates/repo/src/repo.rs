@@ -2727,7 +2727,8 @@ fn dir_holds_only_tracked(
         let mut n = 0;
         for e in std::fs::read_dir(full).ok()? {
             let e = e.ok()?;
-            let child = format!("{rel}/{}", e.file_name().to_string_lossy());
+            // A name that is not UTF-8 cannot be a tracked path.
+            let child = format!("{rel}/{}", e.file_name().to_str()?);
             let t = e.file_type().ok()?;
             if t.is_dir() {
                 n += count(&e.path(), &child, tracked)?;
