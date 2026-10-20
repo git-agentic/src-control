@@ -26,6 +26,56 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Lay `mode`'s executable bit onto the file at `path`, the one place every
+/// checkout-style write sets modes so the filesystem round-trips EXEC/FILE.
+/// EXEC adds an execute bit wherever the file already has a read bit (the
+/// umask-respecting default stays, read bits never widen); FILE clears execute
+/// bits. setuid/setgid/sticky are always cleared, as git does by recreating the
+/// file. A no-op off unix. A filesystem that refuses the chmod (no mode bits,
+/// or not our file) is not an error, but warns once per process because status
+/// ignores modes and the next commit would record EXEC as FILE.
+pub fn apply_file_mode(path: &Path, mode: FileMode) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let cur = std::fs::metadata(path)?.permissions().mode();
+        let mut want = if mode.0 & 0o111 != 0 {
+            cur | ((cur & 0o444) >> 2)
+        } else {
+            cur & !0o111
+        };
+        want &= !0o7000;
+        if want != cur {
+            match std::fs::set_permissions(path, std::fs::Permissions::from_mode(want)) {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::Unsupported
+                        || e.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    warn_chmod_swallowed(path, &e);
+                }
+                Err(e) => return Err(e),
+                Ok(()) => {}
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn warn_chmod_swallowed(path: &Path, err: &std::io::Error) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "warning: could not set the file mode on {} ({err}); executable bits may not be \
+             preserved, and the next commit may record an executable file as non-executable \
+             (this warning is shown once)",
+            path.display()
+        );
+    }
+}
+
 /// A shared object store plus the operations that fork worktrees from it.
 #[derive(Clone)]
 pub struct Repo {
@@ -400,12 +450,7 @@ impl Worktree {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&full, &bytes[..])?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = self.mode_of(&path);
-                std::fs::set_permissions(&full, std::fs::Permissions::from_mode(mode.0))?;
-            }
+            apply_file_mode(&full, self.mode_of(&path))?;
             count += 1;
         }
         Ok(count)
