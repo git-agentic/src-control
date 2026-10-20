@@ -118,7 +118,7 @@ the code, those win.
 |---|---|---|
 | P1 | In-RAM copy-on-write virtual worktrees; bounded blob budget + LRU eviction, optional spill; zero disk residue | [0005](docs/adr/0005-in-ram-vfs-over-fuse.md), [0006](docs/adr/0006-memory-budget-and-eviction.md) |
 | P2 | Committed secrets: per-secret DEK (XChaCha20-Poly1305) wrapped per X25519 recipient; secrets are env vars, never files — `checkout` never materializes them; `sc run` injects into a child env, or onto a descriptor with `--secrets-fd N` (unix) | [0008](docs/adr/0008-committed-secrets-envelope-encryption.md), [0009](docs/adr/0009-key-management-and-authorization.md), [0010](docs/adr/0010-secret-registry-and-opaque-wrapped-dek.md), [0052](docs/adr/0052-secret-injection-by-fd.md) |
-| P3 | Persistent `.sc/` repo: loose objects, branches, symbolic HEAD, single-writer lock, working tree; write-out paths restore the recorded executable bit (unix; #242; `sc resolve` after a deleted conflicted file still drops it, #243) | [0011](docs/adr/0011-persistent-store-and-working-tree.md) |
+| P3 | Persistent `.sc/` repo: loose objects, branches, symbolic HEAD, single-writer lock, working tree; write-out paths restore the recorded executable bit (unix; #242; special bits are always cleared, `sc resolve` restores the chosen side's mode, and a swallowed chmod warns once; #243) | [0011](docs/adr/0011-persistent-store-and-working-tree.md) |
 | P4 | Snapshot-DAG three-way merge; ff when possible; conflict markers + `.theirs` sidecars | [0012](docs/adr/0012-three-way-merge.md) |
 | P5 | Commit-time secret scanner (pattern + entropy) hard-rejects plaintext secrets; `sc scan` preview; hash-scoped allowlist | [0017](docs/adr/0017-secret-scanner.md) |
 | P6 | Local-path remotes: `clone`/`fetch`/`push`, remote-tracking refs, `Transport` trait | [0013](docs/adr/0013-remote-sync-model.md) |
@@ -305,7 +305,7 @@ truth — do not re-list items here); entries that name an issue mirror the open
 GitHub issues. Standing entries: named/concurrent `sc ws` sessions (#215),
 blob-size clone filters (#217), bucket compaction and gc (#216), the non-unix
 `.sc/local-key` ACL (#214), transcript-drop delivery gaps (#230), and the open
-sparse, private-branch and abort edge cases (#241, #246, #247, #248, #243).
+sparse, private-branch and abort edge cases (#241, #246, #247, #248).
 
 ## Agent skills
 
