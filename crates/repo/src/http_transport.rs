@@ -229,14 +229,19 @@ impl ScHttpUrl {
         };
         let slash = rest.find('/').unwrap_or(rest.len());
         let (authority, path) = rest.split_at(slash);
-        let (host, port) = match authority.split_once(':') {
-            Some((h, p)) => {
+        let (host, port) = match split_authority(authority) {
+            Some((h, Some(p))) => {
                 let port = p.parse::<u16>().map_err(|_| {
                     Error::InvalidArgument(format!("bad port in sc+http url: {url}"))
                 })?;
                 (h, port)
             }
-            None => (authority, DEFAULT_PORT),
+            Some((h, None)) => (h, DEFAULT_PORT),
+            None => {
+                return Err(Error::InvalidArgument(format!(
+                    "malformed bracketed host in sc+http url: {url}"
+                )))
+            }
         };
         if host.is_empty() {
             return Err(Error::InvalidArgument(format!(
@@ -261,16 +266,39 @@ impl ScHttpUrl {
             )));
         }
         Ok(ScHttpUrl {
-            host: host.to_string(),
+            host,
             port,
             path,
             tls,
         })
     }
 
-    /// `host:port`, for `TcpStream::connect`.
+    /// `host:port`, for `TcpStream::connect`; an IPv6 literal is re-bracketed
+    /// (`[::1]:7777`). `host` itself stays bare, which is what TLS name
+    /// checks and the pin file key on.
     pub fn authority(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        crate::tls_pins::host_port(&self.host, self.port)
+    }
+}
+
+/// Split a URL authority into host and optional port text. A bracketed IPv6
+/// literal (`[::1]:7777`) yields the address in its canonical text form, so
+/// `[::1]` and `[0:0:0:0:0:0:0:1]` share one pin key; `None` means the brackets
+/// are malformed or do not hold an IPv6 address. An unbracketed authority
+/// splits on its first `:`, so a bare IPv6 literal falls out as an empty host
+/// or a bad port for the caller to reject.
+pub(crate) fn split_authority(authority: &str) -> Option<(String, Option<&str>)> {
+    let Some(rest) = authority.strip_prefix('[') else {
+        return Some(match authority.split_once(':') {
+            Some((h, p)) => (h.to_string(), Some(p)),
+            None => (authority.to_string(), None),
+        });
+    };
+    let (host, tail) = rest.split_once(']')?;
+    let host = host.parse::<std::net::Ipv6Addr>().ok()?.to_string();
+    match tail {
+        "" => Some((host, None)),
+        t => Some((host, Some(t.strip_prefix(':')?))),
     }
 }
 
@@ -546,7 +574,12 @@ impl HttpTransport {
             }
         };
 
-        write_client_opening(&mut w, &url.host, &url.path, token)?;
+        write_client_opening(
+            &mut w,
+            &crate::tls_pins::bracket_host(&url.host),
+            &url.path,
+            token,
+        )?;
         w.flush()
             .map_err(|e| Error::ConnectionLost(format!("sc+http opening flush: {e}")))?;
 
@@ -635,7 +668,7 @@ impl Transport for HttpTransport {
 /// Applied only around the opening read — the opening timeout is REPLACED
 /// (not cleared) by `limits.timeout_secs`'s session read+write timeouts
 /// after the 200 status is written, before handing off to `wire::serve` —
-/// see [`handle_http_connection`] for the timeout sequencing.
+/// see `handle_http_connection` for the timeout sequencing.
 const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the client allows the connect, TLS handshake, opening and wire
@@ -798,7 +831,7 @@ pub struct ServeLimits {
     pub max_connections: u32,
     /// Per-connection idle/session timeout in seconds, applied to both the
     /// read and write halves once the session begins (see
-    /// [`handle_http_connection`]). `0` = disabled.
+    /// `handle_http_connection`). `0` = disabled.
     pub timeout_secs: u64,
     /// Forwarded to [`crate::wire::WirePolicy::max_pack_size`]. `0` =
     /// unlimited.
@@ -974,7 +1007,7 @@ pub fn serve_tls_fingerprint(root: &std::path::Path) -> Result<String> {
 ///
 /// Fail-closed bind gate (P29): a non-loopback `addr` is refused up front
 /// unless justified by `read_only`, `allow_public`, or ≥1 configured serve
-/// token (see [`bind_is_allowed`]) — an unauthenticated server must not
+/// token (see `bind_is_allowed`) — an unauthenticated server must not
 /// silently listen on a public interface.
 pub fn serve_http(
     addr: &str,
@@ -1051,7 +1084,7 @@ pub fn serve_http(
 /// P31 additions: a live-connection counter enforces `limits.max_connections`
 /// (shedding with `503` BEFORE spawning a thread or reading an opening, so a
 /// shed connection costs no fd beyond the accept itself); a per-`accept()`
-/// error is paced by [`AcceptBackoff`] instead of busy-looping.
+/// error is paced by `AcceptBackoff` instead of busy-looping.
 pub fn serve_http_listener(
     listener: TcpListener,
     root: &std::path::Path,
@@ -1355,6 +1388,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_bracketed_ipv6_literal() {
+        let u = ScHttpUrl::parse("sc+http://[::1]:7777/repo").unwrap();
+        assert_eq!(
+            (u.host.as_str(), u.port, u.path.as_str()),
+            ("::1", 7777, "/repo")
+        );
+        assert!(!u.tls);
+        assert_eq!(u.authority(), "[::1]:7777");
+        // Spellings of one address share a host, hence one pin key.
+        let long = ScHttpUrl::parse("sc+http://[0:0:0:0:0:0:0:1]:7777/repo").unwrap();
+        assert_eq!(long.host, "::1");
+
+        let u = ScHttpUrl::parse("sc+https://[2001:db8::1]/r").unwrap();
+        assert_eq!((u.host.as_str(), u.port), ("2001:db8::1", DEFAULT_PORT));
+        assert!(u.tls);
+        assert_eq!(u.authority(), format!("[2001:db8::1]:{DEFAULT_PORT}"));
+    }
+
+    #[test]
+    fn parse_rejects_malformed_bracketed_hosts() {
+        for bad in [
+            "sc+http://[::1/repo",
+            "sc+http://[::1]x/repo",
+            "sc+http://[::1]:notaport/repo",
+            "sc+http://[]/repo",
+            "sc+http://[host]/repo",
+            "sc+http://::1:7777/repo",
+        ] {
+            assert!(ScHttpUrl::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn parse_rejects_other_schemes() {
         assert!(ScHttpUrl::parse("http://h/r").is_err());
         assert!(ScHttpUrl::parse("ssh://h/r").is_err());
@@ -1594,6 +1660,29 @@ mod tests {
 
         server.join().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A bracketed IPv6 literal URL dials the bare address: the 404 mapping is
+    /// only reachable once TCP connect and the opening both worked.
+    #[test]
+    fn connect_dials_a_bracketed_ipv6_literal() {
+        // Hosts without IPv6 loopback cannot run this.
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("skipping: no IPv6 loopback on this host");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut sock = sock;
+            read_client_opening(&mut reader).unwrap();
+            write_status(&mut sock, 404).unwrap();
+        });
+        let url = ScHttpUrl::parse(&format!("sc+http://[::1]:{port}/nope")).unwrap();
+        let err = HttpTransport::connect(&url).unwrap_err();
+        assert!(matches!(err, Error::NotARepo), "got {err:?}");
+        server.join().unwrap();
     }
 
     // SC_PACK_CHUNK env mutation races other tests that also transfer packs

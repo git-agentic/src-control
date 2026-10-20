@@ -595,7 +595,7 @@ impl Transport for LocalTransport {
     }
 
     /// Bounded sender (P25): builds the transfer set into a temp pack file
-    /// via [`LocalTransport::build_pack_tempfile`] (peak RAM one object),
+    /// via `LocalTransport::build_pack_tempfile` (peak RAM one object),
     /// then copies that file's raw bytes into `out` with a small fixed
     /// buffer (`std::io::copy`) — `out` still receives exactly the raw
     /// `.pack` bytes `build_pack` used to hand back directly, so every
@@ -621,7 +621,7 @@ impl Transport for LocalTransport {
     /// Bounded receiver (P25): spills `src` to a temp pack file with a small
     /// fixed buffer (`std::io::copy` — bounded RAM, and writes exactly what
     /// `src` produced, satisfying Task 1 carry-in #2's exact-EOF framing
-    /// requirement), then ingests it via [`ingest_pack_file`]'s two-pass
+    /// requirement), then ingests it via `ingest_pack_file`'s two-pass
     /// atomic-after-verify contract (see that function's doc comment for the
     /// full correctness argument, including Task 1 carry-in #1). The temp
     /// file is removed on drop regardless of outcome.
