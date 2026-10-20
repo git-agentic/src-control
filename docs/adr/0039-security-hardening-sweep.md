@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-09
 - **Phase:** 28
-- **Amended:** #213 (addendum at the end) made the object cap configurable; the `MAX_OBJECT_SIZE` constant and 256 MiB figures in the sections before the addendum are the original design.
+- **Amended:** #213 (first addendum) made the object cap configurable; the `MAX_OBJECT_SIZE` constant and 256 MiB figures in the sections before the addendum are the original design. #233 (second addendum, at the end) added a per-connection write budget and closes the "known gap" paragraph in the #213 addendum.
 - **Builds on:** ADR-0021 (durability/concurrency hardening — the P21 sweep precedent), ADR-0022 (ssh wire protocol), ADR-0015 (packfiles), ADR-0014 (protected paths), ADR-0008/0009 (secrets)
 
 ## Context
@@ -213,13 +213,10 @@ connection's own store budget (each served connection opens its own store,
 the 1 GiB ceiling about 2 GiB + 2 GiB, per connection, times
 `--max-connections` (THREAT-MODEL.md).
 
-Known gaps, not addressed here. `Object::blob_size` is 0 for structural
-objects (trees, snapshots, secrets, transcripts), so a writable listener has no
-per-connection aggregate byte bound on repeated `PutObject` of distinct
-structural objects; each is capped, the sum is bounded only by
-`--max-connections` x connection lifetime. This predates #213 and a raised cap
-amplifies it: prefer read-only or token-gated listeners, keep the cap low.
-Tracked in #233. A local-path remote loads and encodes an object before the
+Known gap, since closed by #233 (second addendum): `Object::blob_size` is 0 for
+structural objects (trees, snapshots, secrets, transcripts), so a writable
+listener had no per-connection aggregate byte bound on repeated `PutObject` of
+distinct structural objects. A local-path remote loads and encodes an object before the
 receiver's cap refuses it (`TransportSource::get`), bounded by the store
 budget.
 
@@ -233,3 +230,76 @@ Unchanged: the cap is still a transfer-path guard, not a local-commit limit,
 so lowering it can leave a repository holding committed objects it cannot
 push; `read_object_at` (the trusted on-disk path) stays uncapped. The
 desktop app does not read the env var; it does no transfers.
+
+## Addendum (#233): per-connection write budget
+
+**Problem.** `Object::blob_size` is 0 for trees, snapshots, secrets and
+transcripts, so the store budget never sees them. A writable `sc serve`
+connection could `PutObject` distinct structural objects, each under the
+object cap, with no bound on the sum except `--max-connections` x
+connection lifetime (`--timeout` is an inactivity bound, not a total).
+Repeated `PutPack` frames had the same shape: `--max-pack-size` caps one
+pack, not the connection.
+
+**Decision.** `serve_session` keeps a running byte counter per connection
+(`ConnBudget`), set by `sc serve --max-conn-bytes <size>` (`--http` and
+`--stdio`; same parser and `KiB`/`MiB`/`GiB` suffixes as `--max-object-size`,
+`scl_core::parse_byte_size`). It counts, per request:
+
+- `PutObject`: the frame's decoded length, every time, structural or not.
+  A repeated or already-present object still counts (the server cannot
+  know cheaply, and a replaying peer costs nothing to refuse).
+- `PutPack`: the exact spooled bytes (`spill_pack_stream` now returns the
+  count), plus the encoded size of the pack's structural records.
+
+Reads (`GetObject`, `GetObjects`, `GetPack`, ref listing) are not budgeted.
+
+**Why a pack's structural records are counted.** Reading `ingest_pack_file_impl`:
+a pack is spooled to disk, verified in pass 1, then every record is
+`Store::put` in pass 2. The store keeps trees, snapshots, secrets and
+transcripts resident (CLAUDE.md: "small, not evicted") and only blobs and
+sealed payloads are budgeted, so structural records of a pack are retained
+exactly like `PutObject` ones. The spool size alone understates them by the
+zstd ratio (a 3 MB tree with one long name packs to a few KB), so a
+`--max-pack-size` pack could carry far more resident structure than its
+byte count. Pass 1 therefore sums `Object::encode().len()` for every record
+whose `blob_size` is 0 (`StructuralTally`) and refuses before pass 2 if the
+remaining budget is exceeded. Blobs are not added again: they are bounded
+by the store budget and already counted via the spool. A bucket-backed
+`--store` keeps the pack as an immutable object and holds no resident
+structure, so only the spool bytes count there.
+
+**Enforcement and state.** A `PutObject` that would exceed the budget is
+refused before the store write; a `PutPack` is cut off mid-stream at the
+smaller of `--max-pack-size` and what is left of the budget (the existing
+counted abort, reported as the budget error when the budget was the
+binding cap) and a pack whose structural bytes do not fit is refused
+before pass 2. Either way the server replies and closes the connection,
+the same path as the `PutPack` Protocol-error arm: the spool guard drops,
+no later request is served, and a retry on a fresh connection starts at
+zero. Bytes of the refused request are counted (the counter is not
+rolled back), which is moot because the connection ends. The comparison is
+`used > limit`, so a total exactly equal to the budget is accepted.
+
+**Wire.** New error code `EC_BUDGET = 7` mapped to
+`Error::ConnectionBudgetExceeded(String)` (payload is the server's own
+text, like `PackTooLarge`). `PROTOCOL_VERSION` is unchanged: an older client
+degrades an unknown code to `Error::Remote(msg)`, which still carries the
+message.
+
+**Bounds and default.** The flag must be greater than zero (there is no
+unlimited setting from the CLI), at least the max object size (a smaller
+budget could not admit one object) and at least a nonzero
+`--max-pack-size` (a smaller one would silently lower the pack cap);
+violations abort startup, never clamped. Default: `--max-pack-size`
+(16 GiB when unlimited) plus the max object size, so a legitimate push that
+fills the pack cap and adds one more object still fits one connection. That
+default bounds the sum at about 16 GiB, not tightly: an operator who wants
+a small budget lowers `--max-pack-size` and `--max-conn-bytes` together.
+The single-connection push path (one `PutPack` within `--max-pack-size`)
+is unaffected by the default; a workload that pushes more than the budget
+over one connection must raise the flag or push over several.
+
+**Not covered.** The budget bounds bytes accepted, not request count or
+CPU. A budgeted peer can still use `--max-connections` x the budget, and
+`WirePolicy::max_conn_bytes` of 0 (embedders and tests) is unlimited.

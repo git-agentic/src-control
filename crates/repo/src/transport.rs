@@ -325,6 +325,37 @@ impl LocalTransport {
         let mut store = self.store.borrow_mut();
         ingest_pack_file(&self.layout, &mut store, path)
     }
+
+    /// [`Self::ingest_from`] for a budgeted serve connection (#233): pass 1
+    /// sums the encoded size of the pack's structural records into `tally`
+    /// and refuses with [`Error::ConnectionBudgetExceeded`] before any write
+    /// when that exceeds `tally.limit`.
+    pub(crate) fn ingest_from_tallied(
+        &self,
+        path: &std::path::Path,
+        tally: &mut StructuralTally,
+    ) -> Result<Vec<ObjectId>> {
+        let mut store = self.store.borrow_mut();
+        ingest_pack_file_impl(
+            &self.layout,
+            &mut store,
+            path,
+            None,
+            |_| Ok(()),
+            false,
+            Some(tally),
+        )
+    }
+}
+
+/// Structural bytes a pack ingest would keep resident (#233): trees,
+/// snapshots, secrets and transcripts report `blob_size` 0, so the store
+/// budget never sees them, and a pack's compressed size can understate them by
+/// the zstd ratio. `limit` of `None` is unlimited.
+#[derive(Default)]
+pub(crate) struct StructuralTally {
+    pub(crate) limit: Option<u64>,
+    pub(crate) seen: u64,
 }
 
 /// RAII guard for a per-transfer temporary pack file under `.sc/tmp/`
@@ -461,7 +492,7 @@ pub(crate) fn ingest_pack_file_checked(
     max_records: Option<usize>,
     check: impl FnOnce(&std::collections::BTreeSet<ObjectId>) -> Result<()>,
 ) -> Result<Vec<ObjectId>> {
-    ingest_pack_file_impl(layout, store, path, max_records, check, false)
+    ingest_pack_file_impl(layout, store, path, max_records, check, false, None)
 }
 
 /// [`ingest_pack_file`] for a `--no-transcripts` receiver (ADR-0038 addendum,
@@ -476,7 +507,7 @@ pub(crate) fn ingest_pack_file_without_transcripts(
     store: &mut Store,
     path: &std::path::Path,
 ) -> Result<Vec<ObjectId>> {
-    ingest_pack_file_impl(layout, store, path, None, |_| Ok(()), true)
+    ingest_pack_file_impl(layout, store, path, None, |_| Ok(()), true, None)
 }
 
 fn ingest_pack_file_impl(
@@ -486,6 +517,7 @@ fn ingest_pack_file_impl(
     max_records: Option<usize>,
     check: impl FnOnce(&std::collections::BTreeSet<ObjectId>) -> Result<()>,
     skip_transcripts: bool,
+    mut tally: Option<&mut StructuralTally>,
 ) -> Result<Vec<ObjectId>> {
     // Transcript ids seen in pass 1; pass 2 uses them to also drop their signatures.
     let mut dropped = std::collections::BTreeSet::new();
@@ -494,8 +526,18 @@ fn ingest_pack_file_impl(
         let f = std::fs::File::open(path)?;
         let mut seen = std::collections::BTreeSet::new();
         let mut records = 0usize;
-        scl_core::pack::parse_pack_reader(f, |id, obj| {
+        let mut over_budget = false;
+        let parsed = scl_core::pack::parse_pack_reader(f, |id, obj| {
             records += 1;
+            if let Some(t) = tally.as_deref_mut() {
+                if obj.blob_size() == 0 {
+                    t.seen = t.seen.saturating_add(obj.encode().len() as u64);
+                    if t.limit.is_some_and(|l| t.seen > l) {
+                        over_budget = true;
+                        return Err(scl_core::Error::PackCorrupt("connection budget".into()));
+                    }
+                }
+            }
             if max_records.is_some_and(|max| records > max) {
                 return Err(scl_core::Error::PackCorrupt(format!(
                     "pack holds more than the {} record(s) requested",
@@ -507,7 +549,12 @@ fn ingest_pack_file_impl(
             }
             seen.insert(id);
             Ok(())
-        })?;
+        });
+        if over_budget {
+            // The wire layer swaps in its own limit text.
+            return Err(Error::ConnectionBudgetExceeded(String::new()));
+        }
+        parsed?;
         check(&seen)?;
     }
     // Pass 2: every record verified in pass 1 — now write each into the store.

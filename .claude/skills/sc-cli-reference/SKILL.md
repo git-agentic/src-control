@@ -290,6 +290,16 @@ cargo run --bin sc -- serve --http <addr> <path> [--read-only] [--allow-public]
                                               # cap, both --http and --stdio, default 16 GiB,
                                               # 0=unlimited, floor = the max object size;
                                               # counted mid-stream abort -> EC_TOO_LARGE (P31)
+                                              # --max-conn-bytes <bytes|KiB|MiB|GiB>: per-connection
+                                              # write budget, both --http and --stdio: every
+                                              # PutObject's bytes + PutPack spool bytes + the
+                                              # encoded size of a pack's structural records;
+                                              # over it -> typed "connection write budget
+                                              # exceeded" error, then the connection closes.
+                                              # Default = --max-pack-size (16 GiB if 0) + the
+                                              # max object size; must be > 0, >= the max object
+                                              # size and >= a nonzero --max-pack-size, else
+                                              # startup aborts. Reads unbudgeted (#233)
                                               # --max-object-size <bytes|KiB|MiB|GiB>: largest
                                               # single object accepted from a peer, default
                                               # 256MiB, range 2MiB..1GiB, out of range aborts

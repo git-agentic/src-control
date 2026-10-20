@@ -367,6 +367,17 @@ enum Cmd {
         /// size (default 256 MiB) when non-zero. (P31)
         #[arg(long)]
         max_pack_size: Option<u64>,
+        /// Per-connection budget over everything a peer makes the server
+        /// write (every PutObject, structural objects included, plus
+        /// PutPack spool bytes and the structural records inside a pack):
+        /// bytes, or a number with a KiB/MiB/GiB suffix (both --http and
+        /// --stdio). Exceeding it replies an error and closes the
+        /// connection; reads are not budgeted. Default: --max-pack-size (16
+        /// GiB if unlimited) plus the max object size. Must be greater than
+        /// zero, at least the max object size, and at least --max-pack-size
+        /// (a nonzero one). (#233)
+        #[arg(long, value_name = "SIZE")]
+        max_conn_bytes: Option<String>,
         /// Largest single object accepted from a peer: bytes, or a number
         /// with a KiB/MiB/GiB suffix. Default 256MiB, range 2MiB to 1GiB;
         /// out-of-range values are refused at startup, never clamped. Clients
@@ -1099,6 +1110,7 @@ fn main() -> Result<()> {
             max_connections,
             timeout,
             max_pack_size,
+            max_conn_bytes,
             max_object_size: _,
             tls,
             tls_cert,
@@ -1129,6 +1141,7 @@ fn main() -> Result<()> {
                     max_connections,
                     timeout,
                     max_pack_size,
+                    max_conn_bytes,
                     tls,
                     tls_cert,
                     tls_key,
@@ -3808,7 +3821,8 @@ fn run_clone_git(url: &str, dst: &std::path::Path) -> Result<()> {
 /// `--read-only`/`--allow-public` are `--http`-only (P29): `--stdio`
 /// delegates auth/access entirely to ssh, so combining them is refused
 /// rather than silently ignored. `--max-connections`/`--timeout` are also
-/// `--http`-only (P31). `--max-pack-size` applies to both (P31). `--store`
+/// `--http`-only (P31). `--max-pack-size` and `--max-conn-bytes` apply
+/// to both (P31, #233). `--store`
 /// (P36c) redirects served content to a bucket WAL remote; `path` remains
 /// the serve home (tokens/TLS identity/scratch) either way. A malformed
 /// `--store` URL is validated up front, before any bind — same fail-fast
@@ -3821,12 +3835,21 @@ fn run_serve(
     max_connections: Option<u32>,
     timeout: Option<u64>,
     max_pack_size: Option<u64>,
+    max_conn_bytes: Option<String>,
     tls: bool,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     store: Option<String>,
     path: PathBuf,
 ) -> Result<()> {
+    let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
+    let conn_bytes = match max_conn_bytes {
+        Some(raw) => {
+            scl_core::parse_byte_size(&raw).map_err(|e| anyhow::anyhow!("--max-conn-bytes: {e}"))?
+        }
+        None => scl_repo::wire::default_max_conn_bytes(max_pack),
+    };
+    scl_repo::wire::validate_max_conn_bytes(conn_bytes, max_pack, scl_core::max_object_size())?;
     if let Some(url) = &store {
         scl_repo::BucketUrl::parse(url)?; // fail fast on malformed URLs, before any bind
     }
@@ -3863,12 +3886,12 @@ fn run_serve(
                     path.display()
                 );
             }
-            let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
             scl_repo::wire::validate_max_pack_size(max_pack, scl_core::max_object_size())?;
             let policy = scl_repo::wire::WirePolicy {
                 read_only: false,
                 max_pack_size: max_pack,
                 ro_drain_cap: scl_repo::wire::RO_DRAIN_CAP,
+                max_conn_bytes: conn_bytes,
             };
             let mut stdin = std::io::stdin().lock();
             let mut stdout = std::io::stdout().lock();
@@ -3895,6 +3918,7 @@ fn run_serve(
             if let Some(m) = max_pack_size {
                 limits.max_pack_size = m;
             }
+            limits.max_conn_bytes = conn_bytes;
             let tls_mode = match (tls, tls_cert, tls_key) {
                 (false, None, None) => scl_repo::http_transport::TlsMode::Off,
                 (false, _, _) => anyhow::bail!("--tls-cert/--tls-key require --tls"),

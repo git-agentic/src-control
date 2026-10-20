@@ -836,6 +836,10 @@ pub struct ServeLimits {
     /// Forwarded to [`crate::wire::WirePolicy::max_pack_size`]. `0` =
     /// unlimited.
     pub max_pack_size: u64,
+    /// Forwarded to [`crate::wire::WirePolicy::max_conn_bytes`] (#233).
+    /// The CLI refuses `0`. The default is
+    /// [`crate::wire::default_max_conn_bytes`] of the default pack cap.
+    pub max_conn_bytes: u64,
 }
 impl Default for ServeLimits {
     fn default() -> Self {
@@ -843,6 +847,7 @@ impl Default for ServeLimits {
             max_connections: 32,
             timeout_secs: 300,
             max_pack_size: crate::wire::DEFAULT_MAX_PACK_SIZE,
+            max_conn_bytes: crate::wire::default_max_conn_bytes(crate::wire::DEFAULT_MAX_PACK_SIZE),
         }
     }
 }
@@ -1019,6 +1024,11 @@ pub fn serve_http(
     store: Option<&str>,
 ) -> Result<()> {
     crate::wire::validate_max_pack_size(limits.max_pack_size, scl_core::max_object_size())?;
+    crate::wire::validate_max_conn_bytes(
+        limits.max_conn_bytes,
+        limits.max_pack_size,
+        scl_core::max_object_size(),
+    )?;
     let tls_config = resolve_tls(root, &tls)?;
     if !bind_is_allowed(addr, root, read_only, allow_public, tls_config.is_some())? {
         return Err(Error::InvalidArgument(format!(
@@ -1350,6 +1360,7 @@ fn handle_http_connection(
         read_only,
         max_pack_size: limits.max_pack_size,
         ro_drain_cap: crate::wire::RO_DRAIN_CAP,
+        max_conn_bytes: limits.max_conn_bytes,
     };
     match store {
         Some(url) => {

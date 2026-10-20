@@ -70,14 +70,14 @@ fn check_object_size_bounds(n: usize) -> std::result::Result<(), String> {
     }
 }
 
-/// Parse an object-size setting: plain bytes, or a number with a `KiB`,
-/// `MiB` or `GiB` suffix (case-insensitive). Applies the same hard bounds as
-/// [`set_max_object_size`]; an out-of-range value is an error, not clamped.
-pub fn parse_object_size(s: &str) -> std::result::Result<usize, String> {
+/// Parse a byte-size setting: plain bytes, or a number with a `KiB`, `MiB` or
+/// `GiB` suffix (case-insensitive). No range check; callers apply their own
+/// bounds (see [`parse_object_size`]).
+pub fn parse_byte_size(s: &str) -> std::result::Result<u64, String> {
     let t = s.trim();
     let lower = t.to_ascii_lowercase();
     let (digits, mult) = if let Some(d) = lower.strip_suffix("kib") {
-        (d, 1usize << 10)
+        (d, 1u64 << 10)
     } else if let Some(d) = lower.strip_suffix("mib") {
         (d, 1 << 20)
     } else if let Some(d) = lower.strip_suffix("gib") {
@@ -85,14 +85,22 @@ pub fn parse_object_size(s: &str) -> std::result::Result<usize, String> {
     } else {
         (lower.as_str(), 1)
     };
-    let n = digits
+    digits
         .trim()
-        .parse::<usize>()
+        .parse::<u64>()
         .ok()
         .and_then(|n| n.checked_mul(mult))
         .ok_or_else(|| {
-            format!("invalid object size {s:?}: expected bytes or a KiB/MiB/GiB suffix, e.g. 64MiB")
-        })?;
+            format!("invalid size {s:?}: expected bytes or a KiB/MiB/GiB suffix, e.g. 64MiB")
+        })
+}
+
+/// Parse an object-size setting: [`parse_byte_size`] plus the same hard
+/// bounds as [`set_max_object_size`]; an out-of-range value is an error, not
+/// clamped.
+pub fn parse_object_size(s: &str) -> std::result::Result<usize, String> {
+    let n = usize::try_from(parse_byte_size(s)?)
+        .map_err(|_| format!("invalid object size {s:?}: too large"))?;
     check_object_size_bounds(n)?;
     Ok(n)
 }
@@ -206,6 +214,17 @@ mod tests {
         assert!(parse_object_size("2GiB")
             .unwrap_err()
             .contains("allowed range"));
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_suffixes_without_bounds() {
+        assert_eq!(parse_byte_size("0"), Ok(0));
+        assert_eq!(parse_byte_size(" 3kib "), Ok(3 << 10));
+        assert_eq!(parse_byte_size("16GiB"), Ok(16 << 30));
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("-1").is_err());
+        assert!(parse_byte_size("1.5MiB").is_err());
+        assert!(parse_byte_size("99999999999999999999GiB").is_err());
     }
 
     #[test]
