@@ -109,7 +109,7 @@ not have. The rules for `GetObjects`:
   confidentiality rests on encryption, not on withholding.
 - Caps: 1024 ids per request (`MAX_GET_OBJECTS_IDS`, checked while decoding),
   the server's `--max-pack-size` over the summed canonical encoded size of a reply and
-  the max object size per object (both `PackTooLarge`, before any pack byte is
+  1 GiB (the largest configurable object cap, ADR-0039 addendum) per object (both `PackTooLarge`, before any pack byte is
   written), and a 4 GiB cap on the stream a client will read back (originally
   1 GiB; a constant independent of the object cap since #213, see ADR-0048 and
   the ADR-0039 addendum). A client

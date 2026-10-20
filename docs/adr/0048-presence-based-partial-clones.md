@@ -289,7 +289,7 @@ zstd framing). Decisions:
 - The over-cap refusal happens before any pack byte is written, so the
   connection stays in sync. The client splits the batch in half and retries.
   A batch of one that is still refused is final and is returned as an error;
-  splitting never loops. (An object above the max object size, or above a small
+  splitting never loops. (An object above 1 GiB, the largest configurable object cap, or above a small
   `--max-pack-size`, can exist on an origin.)
 - The 37a handling for a stream abandoned mid-reply (kill the ssh child, drop
   the connection) stays as the backstop.

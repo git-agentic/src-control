@@ -157,7 +157,9 @@ default of 256 MiB. Decisions:
    pack record compressed length and decompressed output
    (`pack::parse_pack_reader_max`, `read_object_at_bounded`); bucket pack
    bodies (`bucket_transport::object_bytes`); server-side servable-size check
-   (`check_servable_size`); the `SC_PACK_CHUNK` clamp (`cap - 1`, a chunk
+   (`check_servable_size`, against the largest configurable cap, not the
+   server's own: the cap is receiver-only, so a server with a lower cap still
+   serves a larger local object by id, as `GetPack` does); the `SC_PACK_CHUNK` clamp (`cap - 1`, a chunk
    frame carries a tag byte); the `--max-pack-size` floor
    (`validate_max_pack_size`). Two exceptions are deliberately fixed, not derived from the cap. Bucket
    WAL metadata (manifest, log entry, idx) stays capped at the default

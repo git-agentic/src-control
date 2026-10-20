@@ -86,8 +86,9 @@ pub trait Transport {
 /// the largest object cap an operator can set, so a reply has room for a
 /// maximum-size object plus framing at any setting. A constant, not derived
 /// from the local object cap: it bounds a disk spool, not RAM, and ends with
-/// different caps must not disagree about whether a by-id batch fits. An
-/// object over a server's own cap is still refused individually.
+/// different caps must not disagree about whether a by-id batch fits. A single
+/// object over the largest configurable cap is still refused individually; the
+/// serving process's own cap is not applied (it is receiver-only).
 pub(crate) const BY_ID_REPLY_CEILING: u64 = 2 * scl_core::MAX_MAX_OBJECT_SIZE as u64;
 
 /// The by-id reply limit for a server whose `--max-pack-size` is
@@ -113,9 +114,12 @@ fn encoded_len(obj: &Object) -> u64 {
     }
 }
 
-/// Refuse an object a receiver would reject anyway: `pack::parse_pack_reader`
-/// fails any record whose canonical encoding exceeds the object cap `max`
-/// (the live [`scl_core::max_object_size`]).
+/// Refuse an object no receiver could accept: `pack::parse_pack_reader` fails
+/// any record whose canonical encoding exceeds the receiver's cap, and no cap
+/// exceeds `max` (callers pass [`scl_core::MAX_MAX_OBJECT_SIZE`]). The
+/// serving process's own cap is deliberately not applied: the cap is
+/// receiver-only, as it is for `GetPack`, so a server with a lower cap still
+/// serves a locally committed larger object to a client whose cap admits it.
 fn check_servable_size(id: &ObjectId, len: u64, max: usize) -> Result<()> {
     if len > max as u64 {
         return Err(Error::PackTooLarge(format!(
@@ -164,8 +168,8 @@ impl LocalTransport {
     /// shared core of [`Transport::get_objects`] and `wire::serve`'s
     /// `GetObjects` arm. Duplicate ids are served once. `max_bytes` (0 =
     /// unlimited) bounds the summed canonical encoded size, and any single
-    /// object over the object cap is refused (every receiver would reject
-    /// it). Both fail with `PackTooLarge` before any pack byte is written.
+    /// object over the largest configurable cap is refused (no receiver
+    /// could accept it; the server's own cap is not applied). Both fail with `PackTooLarge` before any pack byte is written.
     /// Blobs and sealed objects are measured without re-encoding them.
     pub(crate) fn build_objects_tempfile(
         &self,
@@ -186,7 +190,7 @@ impl LocalTransport {
                 Ok(obj) if refused_by_id(&obj) => not_sent.push(*id),
                 Ok(obj) => {
                     let size = encoded_len(&obj);
-                    check_servable_size(id, size, scl_core::max_object_size())?;
+                    check_servable_size(id, size, scl_core::MAX_MAX_OBJECT_SIZE)?;
                     total = total.saturating_add(size);
                     if max_bytes > 0 && total > max_bytes {
                         return Err(Error::PackTooLarge(format!(
@@ -734,9 +738,8 @@ mod tests {
             assert_eq!(encoded_len(o), o.encode().len() as u64, "{}", o.kind_name());
         }
         let id = blob.id();
-        // The receiver rejects a canonical encoding above the object cap, and
-        // the encoding of a blob is its payload plus one tag byte. Lowered and
-        // raised caps move the boundary.
+        // `max` is the boundary passed in; production passes the largest
+        // configurable cap (the serving process's own cap is receiver-only).
         for max in [
             scl_core::MIN_MAX_OBJECT_SIZE,
             scl_core::DEFAULT_MAX_OBJECT_SIZE,

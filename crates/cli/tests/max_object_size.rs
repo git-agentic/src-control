@@ -171,9 +171,22 @@ fn a_lowered_cap_refuses_a_transfer_a_raised_one_allows() {
     std::fs::remove_dir_all(&parent).unwrap();
 }
 
-fn spawn_http_server(root: &Path) -> (Child, String) {
+/// Kills the server when dropped, so a failing assertion cannot leave it
+/// holding the test's stderr open.
+struct Server(Child);
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_http_server(root: &Path, extra: &[&str]) -> (Server, String) {
+    let mut args = vec!["serve", "--http", "127.0.0.1:0"];
+    args.extend_from_slice(extra);
+    args.push(root.to_str().unwrap());
     let mut child = Command::new(env!("CARGO_BIN_EXE_sc"))
-        .args(["serve", "--http", "127.0.0.1:0", root.to_str().unwrap()])
+        .args(&args)
         .env_remove("SC_MAX_OBJECT_SIZE")
         .stdout(Stdio::piped())
         .spawn()
@@ -188,7 +201,7 @@ fn spawn_http_server(root: &Path) -> (Child, String) {
         .to_string();
     // Keep draining so the server never blocks on a full stdout pipe.
     std::thread::spawn(move || for _ in reader.lines() {});
-    (child, addr)
+    (Server(child), addr)
 }
 
 #[test]
@@ -196,7 +209,7 @@ fn a_client_with_a_lower_cap_than_the_server_fails_with_the_mismatch_hint() {
     let src = tmp("mismatch-src");
     let big = repo_with_big_file(&src, 3 * 1024 * 1024);
     // The server runs at the default cap and serves the 3 MiB blob happily.
-    let (mut server, addr) = spawn_http_server(&src);
+    let (_server, addr) = spawn_http_server(&src, &[]);
     let url = format!("sc+http://{addr}");
 
     let parent = tmp("mismatch-dst");
@@ -220,8 +233,55 @@ fn a_client_with_a_lower_cap_than_the_server_fails_with_the_mismatch_hint() {
     assert!(o.status.success(), "an adequate cap passes: {}", stderr(&o));
     assert_eq!(std::fs::read(ok.join("big.bin")).unwrap(), big);
 
-    let _ = server.kill();
-    let _ = server.wait();
+    std::fs::remove_dir_all(&src).unwrap();
+    std::fs::remove_dir_all(&parent).unwrap();
+}
+
+#[test]
+fn a_lower_cap_server_still_serves_a_by_id_fetch_to_a_higher_cap_client() {
+    // The cap is receiver-only: a server capped at 2 MiB that holds a
+    // locally committed 3 MiB blob serves it by id to a 4 MiB lazy client,
+    // as GetPack would.
+    let src = tmp("byid-src");
+    assert!(sc(&src, &[], &["init"]).status.success());
+    std::fs::create_dir_all(src.join("src")).unwrap();
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::write(src.join("src/a.txt"), "small\n").unwrap();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let big: Vec<u8> = (0..3 * 1024 * 1024)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    std::fs::write(src.join("docs/big.bin"), &big).unwrap();
+    let o = sc(&src, &[("SC_AUTHOR", "t")], &["commit", "-m", "c"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+
+    let (_server, addr) = spawn_http_server(&src, &["--max-object-size", "2MiB"]);
+    let url = format!("sc+http://{addr}");
+    let parent = tmp("byid-dst");
+    let dst = parent.join("lazy");
+    let envs = [("SC_MAX_OBJECT_SIZE", "4MiB")];
+    let o = sc(
+        &parent,
+        &envs,
+        &[
+            "clone",
+            &url,
+            dst.to_str().unwrap(),
+            "--filter",
+            "src/",
+            "--lazy",
+        ],
+    );
+    assert!(o.status.success(), "filtered clone: {}", stderr(&o));
+    let o = sc(&dst, &envs, &["cat", "main:docs/big.bin"]);
+    assert!(o.status.success(), "by-id fill: {}", stderr(&o));
+    assert_eq!(o.stdout, big);
+
     std::fs::remove_dir_all(&src).unwrap();
     std::fs::remove_dir_all(&parent).unwrap();
 }

@@ -410,8 +410,11 @@ too, not just the src-control-side metadata.
   bounds a disk spool, not RAM).
 - **Server cost is bounded per request:** 1024 ids (checked while decoding,
   before any id is read), the server's `--max-pack-size` over the summed
-  encoded size, and the max object size per object. The server's reply ceiling is a constant
-  2 GiB, independent of the object cap.
+  encoded size, and 1 GiB (the largest configurable object cap) per object. The
+  server's own object cap is not applied to replies, since the cap is
+  receiver-only: a lower-cap server serves a larger local object to a client
+  whose cap admits it, as `GetPack` does. The reply ceiling is a constant
+  2 GiB.
 - **Laziness is a local opt-in.** `.sc/promisor-lazy` is never committed or
   transferred; without it a partial clone never dials the remote after clone,
   and `SC_OFFLINE=1` forces that per process.
