@@ -169,6 +169,14 @@ default of 256 MiB. Decisions:
    four-byte header no longer buys a gigabyte-sized allocation. This closes the
    "frame header can allocate up to the cap" item in THREAT-MODEL.md.
 
+The resident-blob budget of a repo or transport store was a fixed 512 MiB; a
+raised cap would have admitted frames the store then refused with
+`BudgetExceeded`. It is now `max(512 MiB, 2 x cap)` (`repo::default_budget`),
+unchanged at the default. Raising the cap also raises the memory a peer can
+make a receiver hold per connection: a pack record is held compressed, then
+decompressed, then decoded, so plan for roughly 3x the cap times
+`--max-connections` (THREAT-MODEL.md).
+
 For `ssh://` remotes the client builds the remote `sc serve --stdio` command
 itself and ssh does not forward the environment, so the server end of an ssh
 remote gets a non-default cap only from the server's own environment (a

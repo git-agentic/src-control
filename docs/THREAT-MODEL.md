@@ -406,7 +406,8 @@ too, not just the src-control-side metadata.
   nothing both sent and refused, nothing omitted) before any object is
   written. A hostile remote can at worst answer "not sent"; it cannot plant an
   object under another id or smuggle in extras. The reply stream a client will
-  read is capped at 1 GiB.
+  read is capped at four times the max object size (1 GiB at the default,
+  up to 4 GiB with the cap raised to its 1 GiB ceiling).
 - **Server cost is bounded per request:** 1024 ids (checked while decoding,
   before any id is read), the server's `--max-pack-size` over the summed
   encoded size, and the max object size per object.
@@ -431,8 +432,13 @@ too, not just the src-control-side metadata.
   - **Both ends must agree.** There is no negotiation and no protocol bump. An
     object above the receiver's cap is refused there, loudly. A server raised
     to 1 GiB accepts a peer's gigabyte claim only if that peer sends the bytes,
-    but then holds that object in memory: raising the cap raises per-connection
-    memory by up to the new cap (times `--max-connections`). Lowering it below
+    but then holds that object in memory. Raising the cap raises per-connection
+    memory: a pack record is buffered compressed and then decompressed, and the
+    decoded object is a further copy, so budget a small multiple of the cap
+    (roughly 3x) per connection, times `--max-connections` (default 32). Size
+    `--max-connections` down when raising the cap. The repository's resident
+    blob budget rises with the cap (to twice the cap, never below 512 MiB) so one
+    maximum-size object can still be admitted. Lowering it below
     a repository's largest object makes that repository unpushable until the
     cap is restored.
   - The ceiling (1 GiB) is compile-time, so no configuration can make a length

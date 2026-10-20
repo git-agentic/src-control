@@ -154,7 +154,7 @@ impl LocalTransport {
         }
         // Match the repo's store budget so a single large object never fails to resolve
         // (a blob bigger than the whole budget would BudgetExceed).
-        let store = Store::open_persistent(layout.objects_dir(), crate::repo::DEFAULT_BUDGET)?;
+        let store = Store::open_persistent(layout.objects_dir(), crate::repo::default_budget())?;
         Ok(LocalTransport {
             layout,
             store: RefCell::new(store),
@@ -897,9 +897,11 @@ mod tests {
         let id = blob.id();
         let expected = blob.encode();
         {
-            let mut s =
-                scl_core::Store::open_persistent(layout.objects_dir(), crate::repo::DEFAULT_BUDGET)
-                    .unwrap();
+            let mut s = scl_core::Store::open_persistent(
+                layout.objects_dir(),
+                crate::repo::default_budget(),
+            )
+            .unwrap();
             s.put(Object::blob(vec![0xAB; (1 << 20) + 4096])).unwrap();
         }
         let t = LocalTransport::open(&layout.root).unwrap();
