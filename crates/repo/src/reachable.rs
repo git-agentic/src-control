@@ -138,7 +138,7 @@ pub fn reachable_objects_filtered(
     tips: &[ObjectId],
     filter: Option<&dyn PrefixFilter>,
 ) -> Result<Reachable> {
-    reachable_objects_limited(src, tips, filter, None)
+    reachable_objects_limited(src, tips, filter, None, &BTreeSet::new())
 }
 
 /// [`reachable_objects_filtered`] plus the blob-size limit (ADR-0055). With
@@ -148,6 +148,11 @@ pub fn reachable_objects_filtered(
 /// reachable through parent snapshots alone. `blob_limit` needs a `filter` to
 /// say which paths are in scope (use an all-paths one for a size-only walk).
 /// With `None` this is `reachable_objects_filtered` exactly.
+///
+/// `held` is what the receiver already has (the closure of the request's
+/// haves, which the caller subtracts afterwards): the limit keeps a blob in it
+/// without measuring, so a fetch measures only objects the receiver lacks and a
+/// no-op fetch measures nothing. Pass an empty set for a clone.
 ///
 /// Ordering: `walk_snapshots` queues every tip before any parent, so a tip's
 /// exempt walk always runs before a non-tip snapshot's limited one, even when
@@ -160,6 +165,7 @@ pub fn reachable_objects_limited(
     tips: &[ObjectId],
     filter: Option<&dyn PrefixFilter>,
     blob_limit: Option<u64>,
+    held: &BTreeSet<ObjectId>,
 ) -> Result<Reachable> {
     // A limit needs a scope to apply to (an all-paths filter for a size-only
     // walk). Failing here is safer than silently sending everything.
@@ -185,6 +191,7 @@ pub fn reachable_objects_limited(
         let mut gate = blob_limit.map(|limit| SizeGate {
             limit,
             exempt: tip_set.contains(&snapshot),
+            held,
             verdicts: &mut sizes,
         });
         walk_tree_sized(
@@ -436,12 +443,13 @@ fn walk_tree_filtered(
 struct SizeGate<'a> {
     limit: u64,
     exempt: bool,
+    held: &'a BTreeSet<ObjectId>,
     verdicts: &'a mut HashMap<ObjectId, bool>,
 }
 
 impl SizeGate<'_> {
     fn keeps(&mut self, src: &mut impl ObjectSource, id: &ObjectId) -> Result<bool> {
-        if self.exempt {
+        if self.exempt || self.held.contains(id) {
             return Ok(true);
         }
         // Decided by the limit alone: nothing to measure.

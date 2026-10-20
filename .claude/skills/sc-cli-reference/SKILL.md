@@ -409,7 +409,10 @@ cargo run --bin sc -- clone --filter blob:limit=<size> [--filter <prefix…>] [-
                                               # limit above 1 GiB is an error.
                                               # Server-evaluated: wire v6, upgrade both sides.
                                               # Repair: `sc backfill <file>`, a lazy fill, or
-                                              # `backfill --all`; fetch is not limit-aware
+                                              # `backfill --all`. A later `sc fetch` from the
+                                              # origin sends the recorded limit (tips stay
+                                              # complete); `sc fetch --no-blob-limit` sends none
+                                              # for that one fetch. No object-count limit.
 cargo run --bin sc -- backfill <prefix…>      # widen a partial clone: fetch objects under
                                               # these prefixes from the promisor origin and
                                               # widen .sc/promisor; errors if this repo isn't

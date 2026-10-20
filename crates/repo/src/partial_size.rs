@@ -414,8 +414,14 @@ fn limited_walk_without_a_filter_is_refused() {
     let sz = Sz::new("nofilter");
     let arc = sz.origin.vfs().store();
     let mut store = arc.lock().unwrap();
-    let err = crate::reachable::reachable_objects_limited(&mut *store, &[sz.c2], None, Some(1))
-        .unwrap_err();
+    let err = crate::reachable::reachable_objects_limited(
+        &mut *store,
+        &[sz.c2],
+        None,
+        Some(1),
+        &Default::default(),
+    )
+    .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
     drop(store);
     drop(arc);
@@ -635,15 +641,26 @@ fn limited_walk_orders_and_none_match_the_unlimited_walk() {
     let f: &dyn crate::reachable::PrefixFilter = &all;
     let full = crate::reachable::reachable_objects(&mut *store, &[sz.c2]).unwrap();
 
-    let none =
-        crate::reachable::reachable_objects_limited(&mut *store, &[sz.c2], Some(f), None).unwrap();
+    let none = crate::reachable::reachable_objects_limited(
+        &mut *store,
+        &[sz.c2],
+        Some(f),
+        None,
+        &Default::default(),
+    )
+    .unwrap();
     assert_eq!(none.included, full, "no limit keeps everything");
     assert!(none.gaps.is_empty());
 
     for tips in [vec![sz.c2], vec![sz.c2, sz.c1], vec![sz.c1, sz.c2]] {
-        let r =
-            crate::reachable::reachable_objects_limited(&mut *store, &tips, Some(f), Some(LIMIT))
-                .unwrap();
+        let r = crate::reachable::reachable_objects_limited(
+            &mut *store,
+            &tips,
+            Some(f),
+            Some(LIMIT),
+            &Default::default(),
+        )
+        .unwrap();
         let old_in_tips = tips.contains(&sz.c1);
         assert_eq!(
             r.included.contains(&blob_id(&huge(1))),
@@ -1094,5 +1111,250 @@ fn named_sessions_on_a_size_limited_clone() {
         "both sessions ended"
     );
     drop(clone);
+    sz.cleanup();
+}
+
+impl Sz {
+    /// Two more origin commits on top of `c2`: `c3` adds `extra.bin` (over the
+    /// limit), `c4` (the new tip) replaces it. `extra.bin` v1 is history only;
+    /// v2 is the tip's.
+    fn grow(&self) -> ObjectId {
+        std::fs::write(self.origin_root.join("extra.bin"), huge(3)).unwrap();
+        self.origin.commit("t", "c3").unwrap();
+        std::fs::write(self.origin_root.join("extra.bin"), huge(4)).unwrap();
+        self.origin.commit("t", "c4").unwrap()
+    }
+}
+
+/// ADR-0055 addendum (#217): a fetch from the promisor origin sends the
+/// recorded limit, so a history-only large blob that arrives later is a gap
+/// while the new tip stays complete.
+#[test]
+fn fetch_sends_the_recorded_limit_and_keeps_the_new_tip_complete() {
+    let sz = Sz::new("fetch");
+    let clone = sz.clone(&[], LIMIT, false);
+    let c4 = sz.grow();
+
+    let refs = clone.fetch("origin").unwrap();
+    assert_eq!(refs, vec![("main".to_string(), c4)]);
+    assert_eq!(
+        refs::read_remote_tip(clone.layout(), "origin", "main").unwrap(),
+        Some(c4)
+    );
+    assert!(
+        has(&clone, &blob_id(&huge(4))),
+        "the new tip's blob is whole"
+    );
+    assert!(
+        !has(&clone, &blob_id(&huge(3))),
+        "history-only blob is a gap"
+    );
+    assert_eq!(
+        clone.partial_gap_count(&[c4]).unwrap(),
+        Some(3),
+        "the two earlier gaps plus the new one"
+    );
+    // The tip is complete: fast-forwarding to it lays out the large file.
+    clone.merge("origin/main", "t").unwrap();
+    assert_eq!(
+        std::fs::read(sz.clone_root.join("extra.bin")).unwrap(),
+        huge(4)
+    );
+    drop(clone);
+    sz.cleanup();
+}
+
+/// `fetch_limited(.., true)` (`sc fetch --no-blob-limit`) sends no limit for
+/// that fetch and leaves the recorded limit alone.
+#[test]
+fn no_blob_limit_fetches_history_in_full_and_keeps_the_marker() {
+    let sz = Sz::new("nolimit");
+    let clone = sz.clone(&[], LIMIT, false);
+    let c4 = sz.grow();
+
+    clone.fetch_limited("origin", false, true).unwrap();
+    assert!(has(&clone, &blob_id(&huge(3))), "full history arrived");
+    assert!(has(&clone, &blob_id(&huge(4))));
+    assert!(
+        !has(&clone, &blob_id(&huge(1))),
+        "older gaps stay gaps: subtraction trusts what the clone already has"
+    );
+    assert_eq!(
+        clone.promisor().unwrap().unwrap().blob_limit(),
+        Some(LIMIT),
+        "the recorded limit is untouched"
+    );
+    assert_eq!(
+        refs::read_remote_tip(clone.layout(), "origin", "main").unwrap(),
+        Some(c4)
+    );
+    drop(clone);
+    sz.cleanup();
+}
+
+/// A prefix+limit clone sends only its limit on fetch (a fetch is
+/// path-unfiltered, ADR-0048), so out-of-prefix tip blobs arrive whole and
+/// history-only large blobs anywhere are gaps.
+#[test]
+fn fetch_on_a_prefix_plus_limit_clone_applies_the_limit_to_every_path() {
+    let sz = Sz::new("fetch-prefix");
+    let clone = sz.clone(&["src/"], LIMIT, false);
+    let c4 = sz.grow();
+
+    clone.fetch("origin").unwrap();
+    assert!(
+        has(&clone, &blob_id(&huge(4))),
+        "an out-of-prefix tip blob arrives (fetch is not path-filtered)"
+    );
+    assert!(!has(&clone, &blob_id(&huge(3))), "the limit still applies");
+    assert_eq!(
+        refs::read_remote_tip(clone.layout(), "origin", "main").unwrap(),
+        Some(c4)
+    );
+    let p = clone.promisor().unwrap().unwrap();
+    assert_eq!(p.prefixes(), &["src/".to_string()], "scope unchanged");
+    drop(clone);
+    sz.cleanup();
+}
+
+/// Clones without a limit are unaffected: a prefix-only clone and a full clone
+/// still fetch history in full, and `--no-blob-limit` is a no-op for them.
+#[test]
+fn fetch_without_a_recorded_limit_is_unchanged() {
+    let sz = Sz::new("fetch-plain");
+    let full_root =
+        std::env::temp_dir().join(format!("scl-p27sz-plain-full-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&full_root);
+    let full = Repo::clone_to(&sz.origin_root, &full_root).unwrap();
+    let prefix_root =
+        std::env::temp_dir().join(format!("scl-p27sz-plain-prefix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&prefix_root);
+    let prefix = Repo::clone_url_filtered(
+        sz.origin_root.to_str().unwrap(),
+        &prefix_root,
+        Some(&["src/".to_string()]),
+    )
+    .unwrap();
+    sz.grow();
+    let (sk, pk) = scl_crypto::generate_keypair();
+    sz.origin
+        .branch_private("embargo", &sk, std::slice::from_ref(&pk), &[])
+        .unwrap();
+    sz.origin.switch_with_identity("main", Some(&sk)).unwrap();
+
+    // A plain fetch on the full clone and the opt-out on the prefix clone: both
+    // are the old unfiltered fetch.
+    full.fetch("origin").unwrap();
+    prefix.fetch_limited("origin", false, true).unwrap();
+    for repo in [&full, &prefix] {
+        assert!(
+            repo.layout().remote_ref_path("origin", "embargo").exists(),
+            "an unfiltered fetch still records the private remote ref"
+        );
+    }
+    for repo in [&full, &prefix] {
+        assert!(has(repo, &blob_id(&huge(3))), "history arrives whole");
+        assert!(has(repo, &blob_id(&huge(4))));
+    }
+    drop((full, prefix));
+    remove_all(&[&full_root, &prefix_root]);
+    sz.cleanup();
+}
+
+/// A limit-bearing fetch skips a ref whose tip did not arrive (a private
+/// branch's manifest, dropped under any active filter) instead of recording a
+/// dangling remote-tracking ref.
+#[test]
+fn fetch_with_a_limit_skips_private_refs_it_did_not_receive() {
+    let sz = Sz::new("fetch-private");
+    let clone = sz.clone(&[], LIMIT, false);
+    let (sk, pk) = scl_crypto::generate_keypair();
+    sz.origin
+        .branch_private("embargo", &sk, std::slice::from_ref(&pk), &[])
+        .unwrap();
+    // `branch_private` switches the origin to the private branch; go back.
+    sz.origin.switch_with_identity("main", Some(&sk)).unwrap();
+
+    assert!(
+        sz.origin
+            .branches()
+            .unwrap()
+            .iter()
+            .any(|(n, _)| n == "embargo"),
+        "the origin serves the private ref"
+    );
+    let refs = clone.fetch("origin").unwrap();
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    assert_eq!(refs[0].0, "main");
+    assert!(!clone.layout().remote_ref_path("origin", "embargo").exists());
+    drop(clone);
+    sz.cleanup();
+}
+
+/// Counts `blob_size` calls, to prove which blobs the limit measures.
+struct Counting<'a> {
+    store: &'a mut scl_core::Store,
+    measured: usize,
+}
+
+impl crate::reachable::ObjectSource for Counting<'_> {
+    fn get(&mut self, id: &ObjectId) -> crate::error::Result<Object> {
+        crate::reachable::ObjectSource::get(self.store, id)
+    }
+    fn blob_size(&mut self, id: &ObjectId) -> crate::error::Result<u64> {
+        self.measured += 1;
+        crate::reachable::ObjectSource::blob_size(self.store, id)
+    }
+}
+
+/// A fetch measures only blobs the receiver lacks: with the whole closure held
+/// (a no-op fetch) nothing is measured, and the result is the same as without.
+#[test]
+fn the_limited_walk_does_not_measure_blobs_the_receiver_holds() {
+    let sz = Sz::new("held");
+    let arc = sz.origin.vfs().store();
+    let mut store = arc.lock().unwrap();
+    let all = crate::promisor::Promisor::with_blob_limit("", vec![], LIMIT);
+    let f: &dyn crate::reachable::PrefixFilter = &all;
+    let held = crate::reachable::reachable_objects(&mut *store, &[sz.c2]).unwrap();
+
+    let mut cold = Counting {
+        store: &mut store,
+        measured: 0,
+    };
+    let r_cold = crate::reachable::reachable_objects_limited(
+        &mut cold,
+        &[sz.c2],
+        Some(f),
+        Some(LIMIT),
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(cold.measured > 0, "control: a clone measures history blobs");
+
+    let mut warm = Counting {
+        store: &mut store,
+        measured: 0,
+    };
+    let r_warm = crate::reachable::reachable_objects_limited(
+        &mut warm,
+        &[sz.c2],
+        Some(f),
+        Some(LIMIT),
+        &held,
+    )
+    .unwrap();
+    assert_eq!(warm.measured, 0, "a no-op fetch measures nothing");
+    // Held blobs are kept instead of gapped; subtracting `held` leaves the
+    // same pack either way.
+    let pack = |r: &crate::reachable::Reachable| -> Vec<ObjectId> {
+        r.included
+            .iter()
+            .filter(|id| !held.contains(id))
+            .copied()
+            .collect()
+    };
+    assert_eq!(pack(&r_cold), pack(&r_warm));
+    drop(store);
     sz.cleanup();
 }
