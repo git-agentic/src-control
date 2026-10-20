@@ -476,7 +476,12 @@ across every phase.
   failing closed on ciphertext while the right identity decrypts the exact
   body bytes, the `sc log` marker, and `sc gc` pruning a deleted branch's
   transcript while the still-reachable one survives — run twice, zero
-  residue. No new dependency. (ADR-0038.)
+  residue. No new dependency. Issue #212 added `sc transcript drop <id>`: a
+  grow-only drop tombstone (a bare `Transcript` object, so no wire change)
+  hides the body from `list`/`show`, travels with fetch/clone, blocks
+  resurrection in either arrival order, and is kept by gc while the dropped
+  body is swept at gc (after the grace window if loose). (ADR-0038 addendum;
+  delivery gaps tracked in #230.)
 
 - **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
   (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"
@@ -869,11 +874,6 @@ scale-&-reach horizon):
   <path>` requires an explicit path today; auto-discovering a
   conventional transcript location (e.g. an agent-runner-written temp
   file) per workspace is deferred.
-- **`sc transcript drop` + resurrection tombstone (P30).** There is no
-  command to remove an attached transcript short of gc-by-unreachability;
-  a first-class drop with a tombstone (so a later merge of a pre-drop
-  branch can't silently resurrect it, mirroring P16's revocation
-  tombstones) is deferred.
 - **Transcript access lifecycle (P30).** Transcripts have no
   rewrap/grant/revoke surface — sealed once, to the recipient set at
   attach time, permanently. Extending P17's rewrap and P16's
