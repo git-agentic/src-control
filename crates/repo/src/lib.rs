@@ -28,6 +28,8 @@ mod partial_sessions;
 mod partial_walks;
 pub mod pick_state;
 pub mod private;
+#[cfg(test)]
+mod private_sparse;
 pub mod promisor;
 pub mod protect;
 pub mod protect_ops;
