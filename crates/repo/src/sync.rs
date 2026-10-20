@@ -80,6 +80,23 @@ impl Repo {
         dst: impl AsRef<Path>,
         filter: Option<&[String]>,
     ) -> Result<Repo> {
+        Self::clone_url_opts(src_url, dst, filter, false)
+    }
+
+    /// [`Repo::clone_url_filtered`] with the `--no-transcripts` switch
+    /// (ADR-0038 addendum, #211). With `no_transcripts`, transcript objects
+    /// (and signatures over them) in the received pack are hash-checked but
+    /// not written, so this clone holds no transcript object and no index
+    /// entry. Bucket remotes never serve transcripts, so the flag does
+    /// nothing there.
+    /// Snapshots, trees and blobs transfer unchanged. Per command, not
+    /// persisted: a later plain `fetch` brings the transcripts in.
+    pub fn clone_url_opts(
+        src_url: &str,
+        dst: impl AsRef<Path>,
+        filter: Option<&[String]>,
+        no_transcripts: bool,
+    ) -> Result<Repo> {
         // Before the network or the destination directory: a blank prefix
         // would be persisted as a sparse line that reloads as a full view.
         if let Some(f) = filter {
@@ -99,13 +116,14 @@ impl Repo {
             let mut store = store_arc.lock().unwrap();
             // Fresh clone dst has no local refs yet → no haves → full transfer
             // (of whatever `filter` scopes it to).
-            transfer_objects(
+            transfer_objects_opts(
                 &dst_repo.layout,
                 transport.as_ref(),
                 &mut store,
                 &tips,
                 &[],
                 filter,
+                no_transcripts,
             )?;
             // Clone-specific belt-and-suspenders (P22 Task 3): the transfer
             // above already indexes every signature object it wrote via
@@ -351,6 +369,22 @@ impl Repo {
     /// Fetch objects + branch tips from `remote` into remote-tracking refs
     /// (`refs/remotes/<remote>/<branch>`). Local branches are left untouched.
     pub fn fetch(&self, remote: &str) -> Result<Vec<(String, ObjectId)>> {
+        self.fetch_opts(remote, false)
+    }
+
+    /// [`Repo::fetch`] with the `--no-transcripts` switch (ADR-0038
+    /// addendum, #211): received transcript objects, and signatures over
+    /// them, are hash-checked and then not written by this fetch. The
+    /// sender re-sends every indexed transcript each time (they are never
+    /// subtracted via the have-set), so a transcript you already hold is
+    /// re-sent and its new signature, if any, is dropped too; the next plain
+    /// fetch brings both in. No wire flag exists, so this saves disk and
+    /// exposure, not bandwidth.
+    pub fn fetch_opts(
+        &self,
+        remote: &str,
+        no_transcripts: bool,
+    ) -> Result<Vec<(String, ObjectId)>> {
         let cfg = RemoteConfig::load(&self.layout)?;
         let url = cfg
             .url(remote)
@@ -379,13 +413,14 @@ impl Repo {
             let mut store = store_arc.lock().unwrap();
             // Derive haves from local refs before the mutable borrow for transfer.
             let haves = local_have_tips(&self.layout, &store)?;
-            transfer_objects(
+            transfer_objects_opts(
                 &self.layout,
                 transport.as_ref(),
                 &mut store,
                 &tips,
                 &haves,
                 None,
+                no_transcripts,
             )?;
         }
         for (branch, tip) in &remote_refs {
@@ -398,6 +433,14 @@ impl Repo {
     /// branch if absent. Errors `NonFastForward` if the remote has commits not
     /// reachable from the local tip.
     pub fn push(&self, remote: &str) -> Result<ObjectId> {
+        self.push_opts(remote, false)
+    }
+
+    /// [`Repo::push`] with the `--no-transcripts` switch (ADR-0038 addendum,
+    /// #211): indexed transcripts, and signatures over them, are left out of
+    /// the pack, so the remote receives no transcript object or index entry
+    /// from this push. This is the one command that saves bandwidth.
+    pub fn push_opts(&self, remote: &str, no_transcripts: bool) -> Result<ObjectId> {
         let cfg = RemoteConfig::load(&self.layout)?;
         let url = cfg
             .url(remote)
@@ -485,8 +528,11 @@ impl Repo {
             // not the snapshot's, so it only surfaces if the transcript
             // ids are folded into the signature query too (review-caught
             // alongside the `get_pack` fix — same omission, same shape).
-            let transcript_ids =
-                crate::transcripts::indexed_transcript_ids_for(&self.layout, &snaps)?;
+            let transcript_ids = if no_transcripts {
+                Vec::new()
+            } else {
+                crate::transcripts::indexed_transcript_ids_for(&self.layout, &snaps)?
+            };
             let sig_targets: Vec<ObjectId> =
                 snaps.iter().chain(transcript_ids.iter()).copied().collect();
             let sig_ids = crate::signatures::indexed_signature_ids_for(&self.layout, &sig_targets)?;
@@ -567,12 +613,31 @@ fn transfer_objects(
     haves: &[ObjectId],
     filter: Option<&[String]>,
 ) -> Result<()> {
+    transfer_objects_opts(layout, transport, store, tips, haves, filter, false)
+}
+
+/// [`transfer_objects`] with `no_transcripts`: ingest through
+/// [`crate::transport::ingest_pack_file_without_transcripts`], which verifies
+/// but does not store transcripts.
+fn transfer_objects_opts(
+    layout: &Layout,
+    transport: &dyn Transport,
+    store: &mut Store,
+    tips: &[ObjectId],
+    haves: &[ObjectId],
+    filter: Option<&[String]>,
+    no_transcripts: bool,
+) -> Result<()> {
     let guard = crate::transport::TempPackGuard::new(layout)?;
     {
         let mut f = std::fs::File::create(guard.path())?;
         transport.get_pack(tips, haves, filter, &mut f)?;
     }
-    crate::transport::ingest_pack_file(layout, store, guard.path())?;
+    if no_transcripts {
+        crate::transport::ingest_pack_file_without_transcripts(layout, store, guard.path())?;
+    } else {
+        crate::transport::ingest_pack_file(layout, store, guard.path())?;
+    }
     Ok(())
 }
 
@@ -580,7 +645,7 @@ fn transfer_objects(
 mod tests {
     use crate::repo::Repo;
     use crate::signatures::SigStatus;
-    use crate::sync::transfer_objects;
+    use crate::sync::{transfer_objects, transfer_objects_opts};
     use scl_core::ObjectId;
 
     #[test]
@@ -869,6 +934,220 @@ mod tests {
         std::fs::remove_dir_all(&b_root).unwrap();
     }
 
+    /// `--no-transcripts` fixture (#211): an origin with a signed snapshot
+    /// carrying a signed transcript. Returns the repo, snapshot, transcript
+    /// id and the identity that sealed and signed both.
+    fn origin_with_signed_transcript(
+        root: &std::path::Path,
+    ) -> (Repo, ObjectId, ObjectId, scl_crypto::Identity) {
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root).unwrap();
+        let a = Repo::init(root).unwrap();
+        std::fs::write(root.join("f1"), b"one").unwrap();
+        let snap = a.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        a.sign_snapshot(snap, &identity).unwrap();
+        let tid = a
+            .attach_transcript(snap, "claude-code", "s1", b"body", &[identity.enc.public()])
+            .unwrap();
+        a.sign_transcript(tid, &identity).unwrap();
+        (a, snap, tid, identity)
+    }
+
+    /// Assert `r` holds no trace of transcript `tid` (object, index entry,
+    /// signature) while snapshot `snap` is fully present: its whole closure
+    /// resolves and its own signature arrived.
+    fn assert_no_transcript_but_snapshot_intact(r: &Repo, snap: ObjectId, tid: ObjectId) {
+        {
+            let arc = r.store_arc();
+            let mut store = arc.lock().unwrap();
+            assert!(
+                !store.contains(&tid),
+                "transcript object must not be stored"
+            );
+            crate::reachable::reachable_objects(&mut *store, &[snap])
+                .expect("snapshot closure transfers and verifies");
+        }
+        assert!(crate::transcripts::load(r.layout()).unwrap().is_empty());
+        assert!(r.transcripts_for(&snap).unwrap().is_empty());
+        assert!(
+            r.signatures_for(&tid).unwrap().is_empty(),
+            "no signature index entry may point at the dropped transcript"
+        );
+        assert_eq!(
+            r.signatures_for(&snap).unwrap().len(),
+            1,
+            "the snapshot's own signature still arrives"
+        );
+    }
+
+    #[test]
+    fn clone_no_transcripts_drops_transcript_keeps_snapshot() {
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-notrans-clone-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-notrans-clone-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        let (a, snap, tid, identity) = origin_with_signed_transcript(&a_root);
+
+        let b = Repo::clone_url_opts(&a_root.display().to_string(), &b_root, None, true).unwrap();
+        assert_no_transcript_but_snapshot_intact(&b, snap, tid);
+
+        // Per command, not persisted: a later plain fetch brings it in,
+        // sealed and signed.
+        b.fetch("origin").unwrap();
+        let got = b.transcripts_for(&snap).unwrap();
+        assert!(got.iter().any(|(t, _)| *t == tid));
+        assert_eq!(
+            b.open_transcript(&tid, &identity.enc).unwrap().as_slice(),
+            b"body"
+        );
+        assert_eq!(b.signatures_for(&tid).unwrap().len(), 1);
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        assert!(!a_root.exists());
+        std::fs::remove_dir_all(&b_root).unwrap();
+        assert!(!b_root.exists());
+    }
+
+    #[test]
+    fn fetch_no_transcripts_drops_transcript_keeps_snapshot() {
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-notrans-fetch-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-notrans-fetch-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        let (a, snap, tid, _identity) = origin_with_signed_transcript(&a_root);
+        // Clone opted out, then fetch opted out.
+        let b = Repo::clone_url_opts(&a_root.display().to_string(), &b_root, None, true).unwrap();
+        std::fs::write(a_root.join("f2"), b"two").unwrap();
+        let snap2 = a.commit("t", "c2").unwrap();
+        let tid2 = a
+            .attach_transcript(
+                snap2,
+                "claude-code",
+                "s2",
+                b"body2",
+                &[scl_crypto::generate_identity_v2().1.enc.public()],
+            )
+            .unwrap();
+
+        b.fetch_opts("origin", true).unwrap();
+        assert_no_transcript_but_snapshot_intact(&b, snap, tid);
+        {
+            let arc = b.store_arc();
+            let mut store = arc.lock().unwrap();
+            assert!(!store.contains(&tid2));
+            // The new snapshot arrived and its closure verifies.
+            crate::reachable::reachable_objects(&mut *store, &[snap2]).unwrap();
+        }
+        assert!(crate::transcripts::load(b.layout()).unwrap().is_empty());
+
+        // A plain fetch now brings both transcripts in.
+        b.fetch("origin").unwrap();
+        let idx = crate::transcripts::load(b.layout()).unwrap();
+        assert!(idx.contains(&(snap, tid)) && idx.contains(&(snap2, tid2)));
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        assert!(!a_root.exists());
+        std::fs::remove_dir_all(&b_root).unwrap();
+        assert!(!b_root.exists());
+    }
+
+    #[test]
+    fn push_no_transcripts_sends_snapshot_not_transcript() {
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-notrans-push-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-notrans-push-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        std::fs::create_dir_all(&a_root).unwrap();
+        let a = Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f1"), b"one").unwrap();
+        a.commit("t", "c1").unwrap();
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        // A pushed-into repo must not be held open by its owner (single-writer lock).
+        drop(a);
+
+        // B commits, signs and attaches a signed transcript, then pushes
+        // without transcripts.
+        std::fs::write(b_root.join("f2"), b"two").unwrap();
+        let snap = b.commit("t", "c2").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        b.sign_snapshot(snap, &identity).unwrap();
+        let tid = b
+            .attach_transcript(snap, "claude-code", "s1", b"body", &[identity.enc.public()])
+            .unwrap();
+        b.sign_transcript(tid, &identity).unwrap();
+        b.push_opts("origin", true).unwrap();
+        let a = Repo::open(&a_root).unwrap();
+        assert_no_transcript_but_snapshot_intact(&a, snap, tid);
+        drop(a);
+
+        // The next plain push that moves the branch carries it.
+        std::fs::write(b_root.join("f3"), b"three").unwrap();
+        b.commit("t", "c3").unwrap();
+        b.push("origin").unwrap();
+        let a = Repo::open(&a_root).unwrap();
+        assert!(a
+            .transcripts_for(&snap)
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t == tid));
+        assert_eq!(a.signatures_for(&tid).unwrap().len(), 1);
+
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        assert!(!a_root.exists());
+        std::fs::remove_dir_all(&b_root).unwrap();
+        assert!(!b_root.exists());
+    }
+
+    #[test]
+    fn no_transcripts_fetch_over_the_wire_drops_what_the_server_over_sends() {
+        // The wire server always over-sends indexed transcripts (no flag);
+        // the receiver must verify and discard them. Mirrors
+        // `signatures_ride_ssh_transport`.
+        use crate::stdio_transport::WireClient;
+        use crate::wire;
+
+        let pid = std::process::id();
+        let src_root = std::env::temp_dir().join(format!("scl-notrans-wire-src-{pid}"));
+        let dst_root = std::env::temp_dir().join(format!("scl-notrans-wire-dst-{pid}"));
+        let _ = std::fs::remove_dir_all(&dst_root);
+        let (src, snap, tid, _identity) = origin_with_signed_transcript(&src_root);
+
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let server_root = src_root.clone();
+        let server = std::thread::spawn(move || {
+            wire::serve(&server_root, &mut server_read, &mut server_write)
+        });
+        let client = WireClient::handshake(client_read, client_write).unwrap();
+
+        let dst = Repo::init(&dst_root).unwrap();
+        {
+            let store_arc = dst.vfs().store();
+            let mut store = store_arc.lock().unwrap();
+            transfer_objects_opts(&dst.layout, &client, &mut store, &[snap], &[], None, true)
+                .unwrap();
+        }
+        client.bye().unwrap();
+        drop(client);
+        server.join().unwrap().unwrap();
+
+        assert_no_transcript_but_snapshot_intact(&dst, snap, tid);
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        assert!(!src_root.exists());
+        std::fs::remove_dir_all(&dst_root).unwrap();
+        assert!(!dst_root.exists());
+    }
+
     #[test]
     fn dropped_transcript_is_not_resurrected_by_fetch_and_the_drop_propagates() {
         let pid = std::process::id();
@@ -922,6 +1201,47 @@ mod tests {
         std::fs::remove_dir_all(&a_root).unwrap();
         std::fs::remove_dir_all(&b_root).unwrap();
         std::fs::remove_dir_all(&c_root).unwrap();
+    }
+
+    #[test]
+    fn no_transcripts_fetch_drops_a_drop_tombstone_like_any_transcript() {
+        // #226 x #211 (ADR-0038 addendum): a drop tombstone is a `Transcript`
+        // object, so a `--no-transcripts` receive does not write it (nor its
+        // signature). A receiver that still holds the transcript keeps
+        // showing it until a plain fetch brings the tombstone in.
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-notrans-tomb-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-notrans-tomb-b-{pid}"));
+        let c_root = std::env::temp_dir().join(format!("scl-notrans-tomb-c-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        let _ = std::fs::remove_dir_all(&c_root);
+        let (a, snap, tid, identity) = origin_with_signed_transcript(&a_root);
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        assert_eq!(b.transcripts_for(&snap).unwrap().len(), 1);
+        crate::transcripts::tests::trust_signer(&b, &identity);
+        a.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        drop(a);
+
+        b.fetch_opts("origin", true).unwrap();
+        assert_eq!(
+            b.transcripts_for(&snap).unwrap().len(),
+            1,
+            "the tombstone was dropped with the transcripts, so the held one stays visible"
+        );
+        b.fetch("origin").unwrap();
+        assert!(b.transcripts_for(&snap).unwrap().is_empty());
+
+        // A clone made with the flag holds neither the transcript nor a drop.
+        let c = Repo::clone_url_opts(&a_root.display().to_string(), &c_root, None, true).unwrap();
+        assert!(c.transcripts_for(&snap).unwrap().is_empty());
+        assert!(crate::transcripts::load(c.layout()).unwrap().is_empty());
+
+        drop(b);
+        drop(c);
+        for root in [&a_root, &b_root, &c_root] {
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
+        }
     }
 
     #[test]

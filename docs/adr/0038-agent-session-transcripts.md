@@ -99,9 +99,8 @@ pipe-safety discipline).
   with a wider audience is an explicit grant/rewrap act, not a
   repo-visibility accident.
 - New store growth axis: transcripts are KB–MB, not signature-sized.
-  Over-send-on-transfer is correct but potentially heavy; a
-  `--no-transcripts` fetch knob is anticipated as a fast-follow if
-  measurement warrants (logged, never silent).
+  Over-send-on-transfer is correct but potentially heavy; the
+  `--no-transcripts` opt-out (see the addendum below) is that knob.
 - Wraps living inside the object mean recipient cutover (P17 `sc rewrap`)
   cannot re-wrap in place — it must mint replacement transcript objects
   and re-point the index. Acceptable for the MVP (transcripts are
@@ -148,6 +147,65 @@ pipe-safety discipline).
   Also does not defend: secrets echoed into a transcript remaining readable to
   *authorized* transcript recipients (scan-and-warn mitigates, rotation
   remedies); content quality or truthfulness of the recorded session.
+
+## Addendum: `--no-transcripts` on fetch, clone and push (2026-10, #211)
+
+`sc fetch`, `sc clone` and `sc push` accept `--no-transcripts`. Decisions:
+
+1. **Client-side only, no `PROTOCOL_VERSION` bump.** `GetPack` has no field a
+   receiver could use to say "no transcripts", and the sender over-sends
+   indexed transcripts unconditionally. So the opt-out lives where the
+   client already has control:
+   - `push`: the client builds the outgoing set, so it leaves out indexed
+     transcripts and the signatures keyed by them. This saves bandwidth.
+   - `fetch` / `clone`: the server still sends them. The receiver
+     hash-checks every record in pass 1 of `ingest_pack_file` as usual (a
+     hash check, not signature verification), then pass 2 does not write
+     `Transcript` objects, nor a signature whose target is a transcript
+     dropped from the same pack. This transfer therefore writes and indexes
+     no transcript. It saves disk and exposure (no ciphertext, no index
+     entry), **not** bandwidth. A server-side skip would need a new
+     `GetPack` field and a version bump; it is a deferred follow-on in
+     `ROADMAP.md`.
+2. **Per command, not persisted.** A clone made with `--no-transcripts`
+   records nothing; a later plain `sc fetch` brings every indexed transcript
+   in (the sender re-sends all of them each time, because they are never
+   subtracted via the have-set). The same re-send means a `--no-transcripts`
+   fetch also drops a new signature over a transcript the receiver already
+   holds; the next plain fetch brings it in. A plain `sc push` after a
+   `--no-transcripts` push carries them only once the branch moves again,
+   because `push` returns early when the remote tip already equals the local
+   tip (the same limit a retroactive attach has).
+3. **Sealing and integrity unchanged.** Bodies stay sealed whether or not they
+   travel. Snapshots, trees, blobs and the snapshot's own signatures transfer
+   and are hash-checked exactly as before. Index entries are left out with the
+   objects, so no `.sc/transcripts` or `.sc/signatures` entry created by this
+   transfer points at a transcript the repo does not hold.
+4. **Remotes where the flag does nothing.** Git remotes never carry
+   transcripts. Bucket remotes (`sc+wal://`, `sc+s3://`) never serve them:
+   `BucketTransport::get_pack` walks reachability only, so a fetch or clone
+   from a bucket delivers no transcripts or transcript signatures whether or
+   not the flag is given, and a plain fetch does not change that. For `push`
+   the flag still works: a normal bucket push uploads and stores the
+   transcripts (they are simply never served back), and `--no-transcripts`
+   skips that upload. The serving gap is tracked in #229.
+5. **Interaction with transcript-drop tombstones (second addendum below,
+   #212).** A drop tombstone is a `Transcript` object with an empty envelope,
+   so `--no-transcripts` treats it like any other transcript: the pack is
+   hash-checked, then the tombstone and its drop-digest signature are not
+   written, and `index_incoming` never sees them, so no `.sc/transcript-drops`
+   line is recorded by that transfer. This breaks none of the drop
+   invariants: nothing is indexed that is not held, gc only roots what is
+   stored, and a transcript that was already dropped is never sent by the
+   dropper in the first place. The consequence is the same as for any
+   transcript: a receiver that still holds a transcript keeps showing it
+   after a `--no-transcripts` fetch, even though the sender dropped it, until
+   a plain fetch brings the tombstone in and the receiver's trust list
+   honors it. A clone made with the flag from a store that dropped the
+   transcript holds neither. On `push`, the flag likewise leaves tombstones
+   (and their signatures) out, because `indexed_transcript_ids_for` returns
+   them with the transcripts; a drop pushed with `--no-transcripts` does not
+   reach the remote.
 
 ## Addendum: `sc transcript drop` and the drop tombstone (issue #212)
 
