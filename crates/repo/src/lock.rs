@@ -64,7 +64,7 @@ thread_local! {
 /// Tests get a long wait: their threads queue behind durable (fsynced) writes
 /// on a loaded machine; the timeout path is tested with `with_index_lock_for`.
 const INDEX_LOCK_WAIT: std::time::Duration =
-    std::time::Duration::from_secs(if cfg!(test) { 300 } else { 10 });
+    std::time::Duration::from_secs(if cfg!(test) { 300 } else { 30 });
 
 /// Run `f` holding the short-lived index lock (`.sc/index.lock`, ADR-0038
 /// "Index lock", #260). It serializes the read-modify-write of the derived

@@ -190,6 +190,8 @@ fn permanent(e: &Error) -> bool {
                 scl_core::Error::NotFound(_)
                     | scl_core::Error::Malformed(_)
                     | scl_core::Error::WrongKind(..)
+                    | scl_core::Error::PackCorrupt(_)
+                    | scl_core::Error::BadPackIndex(_)
             )
     )
 }
@@ -299,11 +301,29 @@ pub(crate) fn gc_prune(layout: &Layout, reachable: &mut BTreeSet<ObjectId>) -> R
 /// so it now propagates like any other store error. Callers with a looser
 /// contract (ids that may or may not resolve) should filter before calling,
 /// not rely on this function to do it silently.
+///
+/// Production ingest calls [`verify_incoming`] and [`append_accepted`]
+/// separately (see `transport::ingest_pack_file_impl`); this is the two in
+/// one for tests.
+#[cfg(test)]
 pub(crate) fn index_incoming(
     layout: &Layout,
     store: &mut scl_core::Store,
     ids: &[ObjectId],
 ) -> Result<usize> {
+    let accepted = verify_incoming(store, ids)?;
+    append_entries(layout, store, &accepted)?;
+    Ok(accepted.len())
+}
+
+/// The verifying half of [`index_incoming`], with no lock and no index write,
+/// so a caller can hold the index lock only around the file updates
+/// ([`append_accepted`]) and not around one Ed25519 check per signature in a
+/// pack a writer chose.
+pub(crate) fn verify_incoming(
+    store: &mut scl_core::Store,
+    ids: &[ObjectId],
+) -> Result<Vec<(ObjectId, ObjectId, [u8; 32])>> {
     let mut accepted = Vec::new();
     for id in ids {
         if let Object::Signature(sig) = store.get(id)? {
@@ -315,8 +335,16 @@ pub(crate) fn index_incoming(
             }
         }
     }
-    append_entries(layout, store, &accepted)?;
-    Ok(accepted.len())
+    Ok(accepted)
+}
+
+/// Index what [`verify_incoming`] accepted.
+pub(crate) fn append_accepted(
+    layout: &Layout,
+    store: &mut scl_core::Store,
+    accepted: &[(ObjectId, ObjectId, [u8; 32])],
+) -> Result<()> {
+    append_entries(layout, store, accepted)
 }
 
 /// Whether `sig` may enter the index: its target is held, and the signature

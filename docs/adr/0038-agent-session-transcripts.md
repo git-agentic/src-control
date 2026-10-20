@@ -672,7 +672,7 @@ Design:
   OS releases it when the holder dies, so there is no stale-lock breaking.
   Threads of one process conflict too (separate open files). Reentrant per
   thread, so a nested critical section reuses the held lock.
-- **Bounded wait**: polls up to 10 seconds, then `Error::IndexBusy` (a distinct
+- **Bounded wait**: polls up to 30 seconds, then `Error::IndexBusy` (a distinct
   error: its message must not tell anyone to delete the lock file, which would
   let two holders lock different inodes). The sections it guards are single file updates, not command
   lifetimes.
@@ -683,7 +683,8 @@ Design:
   cannot deadlock; tests drive `put_pack`-path ingests and `update_ref` from
   threads together.
 - **Atomic groups**: an ingest takes the lock once around its signature and
-  transcript indexing, and gc once around its transcript and signature prunes
+  transcript index updates (its Ed25519 checks run before the lock, so a large
+  pack does not lengthen the hold), and gc once around its transcript and signature prunes
   (the signature prune relies on the transcript prune having rooted the
   transcript ids), so neither can interleave with the other's half.
 - **Covered**: every read-modify-write or rewrite of `.sc/signatures.v2`,
@@ -695,7 +696,7 @@ Design:
 - **Unchanged**: `RepoLock` and its `Locked` behavior for local commands. A
   local command never fails because an ingest holds the index lock, nor the
   reverse.
-- A failure to get the lock (a holder busy for more than 10 seconds) fails
+- A failure to get the lock (a holder busy for more than 30 seconds) fails
   that ingest after its objects are stored. The client sees an error, but a
   retried push sends only objects the remote lacks, so the objects of that
   ingest stay unindexed on that remote until a reindex (`sc clone` of it). This

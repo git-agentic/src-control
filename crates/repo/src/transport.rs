@@ -634,8 +634,11 @@ fn ingest_pack_file_impl(
     // written" contract holds. Both passes run under one index lock: gc prunes
     // the transcript and signature indexes together, and between two separate
     // locks it would drop a signature whose transcript was not yet indexed.
+    // The Ed25519 checks run before the lock is taken; it covers the file
+    // updates and the (bounded) tombstone judging only.
+    let accepted = crate::signatures::verify_incoming(store, &ids)?;
     crate::lock::with_index_lock(layout, || {
-        crate::signatures::index_incoming(layout, store, &ids)?;
+        crate::signatures::append_accepted(layout, store, &accepted)?;
         crate::transcripts::index_incoming(layout, store, &ids)
     })?;
     Ok(ids)
