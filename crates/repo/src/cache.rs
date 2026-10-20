@@ -79,7 +79,7 @@ fn warn_cacheless_once(flag: &std::sync::atomic::AtomicBool) -> bool {
 /// this touches no file: it warns once and returns a fresh in-memory key, and
 /// [`ProtectedCache::open`] then drops its path so nothing keyed by that
 /// throwaway key is read or persisted. A pre-existing `.sc/local-key` is
-/// ignored in that mode.
+/// deleted in that mode.
 ///
 /// Mirrors the serve-TLS key discipline (`crates/tlsio/src/identity.rs`):
 /// the file is created 0600 from its first byte via `create_new`, so there
@@ -90,6 +90,9 @@ pub(crate) fn local_key(layout: &Layout) -> Result<[u8; 32]> {
     if !can_restrict_permissions() {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         warn_cacheless_once(&WARNED);
+        // An earlier build may have left a world-readable key; the cache is
+        // off, so drop it rather than leave it guessable-against.
+        let _ = std::fs::remove_file(layout.local_key_path());
         return Ok(*blake3::hash(scl_crypto::random_hex(32).as_bytes()).as_bytes());
     }
     let path = layout.local_key_path();
@@ -379,9 +382,10 @@ mod tests {
     fn cacheless_mints_no_key_and_persists_nothing() {
         FORCE_CACHELESS.with(|f| f.set(true));
         let layout = tmp("cacheless");
+        std::fs::write(layout.local_key_path(), "legacy").unwrap();
         let key = local_key(&layout).unwrap();
         assert_ne!(key, local_key(&layout).unwrap(), "throwaway key per call");
-        assert!(!layout.local_key_path().exists(), "no key file");
+        assert!(!layout.local_key_path().exists(), "legacy key removed");
 
         let abs = layout.root.join("secret.txt");
         std::fs::write(&abs, b"v1").unwrap();

@@ -85,12 +85,16 @@ too, not just the src-control-side metadata.
   keyed by `.sc/local-key`, created `0600` from its first byte. Leaking that key
   lets a local reader test guesses against cached plaintext tags. Only unix can
   restrict the file this way; on a non-unix target `sc` creates no key file,
-  ignores any existing one, reads and writes no `.sc/protected-cache` or
+  deletes any existing one (it may have been created world-readable by an earlier
+  build), reads and writes no `.sc/protected-cache` or
   `.sc/ws/cache-<i>`, and prints a one-time stderr warning. It runs cacheless:
   unchanged protected files re-seal on each commit (new random ciphertext ids)
-  and `status` may list them as modified, but results are never incorrect. The
-  non-unix branch is compiled but unverified on a real Windows host; there is no
-  ACL hardening.
+  and `status` lists every authorized randomized protected file as modified, so
+  the clean-tree gates (switch, merge, ...) refuse while one is checked out. No
+  wrong data is committed, but this is a known usability gap on those targets. The
+  non-unix branch has not been compiled or run on a Windows host; there is no
+  ACL hardening. A unix filesystem that ignores mode bits (vfat, exFAT, some
+  network mounts) is not detected.
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 
