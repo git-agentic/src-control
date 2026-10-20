@@ -2421,8 +2421,12 @@ mod tests {
             path: "/repo".to_string(),
             tls: false,
         };
-        // Far larger than any loopback send + receive buffer.
-        let huge = "t".repeat(64 * 1024 * 1024);
+        // Above the send + receive buffers loopback autotunes to (4 MiB each
+        // on macOS, 4 and 6 MiB on Linux), so the write must block. Not
+        // larger: the elapsed bound below also counts a per-MiB cost of the
+        // blocked write (64 MiB took ~4 s on an idle Mac, #266), which a slow
+        // CI host stretched past the bound.
+        let huge = "t".repeat(16 * 1024 * 1024);
         let started = std::time::Instant::now();
         let err =
             HttpTransport::connect_bounded(&url, Some(&huge), None, SHORT, SHORT).unwrap_err();
@@ -2430,7 +2434,12 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "unbounded: {err:?}"
         );
-        assert!(matches!(err, Error::ConnectionLost(_)), "got {err:?}");
+        // The message pins the failure to the opening write: a later status
+        // read timing out is also `ConnectionLost`, with a different message.
+        assert!(
+            matches!(&err, Error::ConnectionLost(m) if m == "timed out writing the HTTP opening"),
+            "got {err:?}"
+        );
         tx.send(()).unwrap();
         holder.join().unwrap();
     }
