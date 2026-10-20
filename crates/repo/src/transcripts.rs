@@ -134,10 +134,14 @@ const MAX_SIG_VERIFIES: usize = 8;
 /// Distinct signature targets `index_incoming` looks up per batch.
 const MAX_SIG_LOOKUPS: usize = 1024;
 
-fn read_pending(layout: &Layout) -> Vec<ObjectId> {
-    std::fs::read_to_string(layout.transcript_pending_path())
-        .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
-        .unwrap_or_default()
+/// A missing file is empty; any other read failure is an error, so gc never
+/// treats an unreadable pending list as empty and sweeps what it roots.
+fn read_pending(layout: &Layout) -> Result<Vec<ObjectId>> {
+    match std::fs::read_to_string(layout.transcript_pending_path()) {
+        Ok(s) => Ok(s.lines().filter_map(|l| l.trim().parse().ok()).collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(Error::Io(e)),
+    }
 }
 
 fn write_pending(layout: &Layout, ids: &[ObjectId]) -> Result<()> {
@@ -156,9 +160,12 @@ fn write_pending(layout: &Layout, ids: &[ObjectId]) -> Result<()> {
 /// Remember `new` tombstones for re-evaluation, deduped, newest last, capped
 /// at [`MAX_PENDING`]. Writes only when the set changes.
 fn note_pending(layout: &Layout, new: &[ObjectId]) -> Result<()> {
-    // Only the newest MAX_PENDING of a (peer-sized) batch can survive.
+    // Dedupe the batch (order kept), then only its newest MAX_PENDING can
+    // survive.
+    let mut once = BTreeSet::new();
+    let new: Vec<ObjectId> = new.iter().copied().filter(|i| once.insert(*i)).collect();
     let new = &new[new.len().saturating_sub(MAX_PENDING)..];
-    let mut all = read_pending(layout);
+    let mut all = read_pending(layout)?;
     let mut seen: BTreeSet<ObjectId> = all.iter().copied().collect();
     let mut added = false;
     for id in new {
@@ -324,7 +331,7 @@ pub(crate) fn gc_prune(layout: &Layout, reachable: &mut BTreeSet<ObjectId>) -> R
     let drops = read_drops(layout)?;
     reachable.extend(drops.iter().map(|(_, tomb, _)| *tomb));
     // Held-but-unhonored tombstones stay until trusted or evicted (#230).
-    reachable.extend(read_pending(layout));
+    reachable.extend(read_pending(layout)?);
     let dropped: BTreeSet<ObjectId> = drops.iter().map(|(_, _, d)| *d).collect();
     let entries = read_raw(layout)?;
     let mut kept = Vec::with_capacity(entries.len());
@@ -365,19 +372,30 @@ pub(crate) fn index_incoming(
     let trusted = trusted_signers(layout);
     let sigs = crate::signatures::index_by_target(layout)?;
     let mut held = Vec::new();
+    // Tombstones already recorded as drops need nothing: every fetch re-sends
+    // them all, so skipping them keeps a resend O(new) rather than O(drops^2).
+    let mut recorded: BTreeSet<ObjectId> = read_drops(layout)?
+        .into_iter()
+        .map(|(_, tomb, _)| tomb)
+        .collect();
     // Honor a tombstone, or remember a signed one that is held but inert: a
     // push-only remote is never sent it again (#230).
     let mut consider = |store: &mut scl_core::Store, id: ObjectId, t: &Transcript, d: ObjectId| {
+        if recorded.contains(&id) {
+            return Ok::<_, Error>(());
+        }
         if tombstone_honored(store, &trusted, &sigs, id, t, d)? {
             append_drop(layout, (t.snapshot, id, d))?;
+            recorded.insert(id);
         } else if sigs.contains_key(&id) {
             held.push(id);
         }
-        Ok::<_, Error>(())
+        Ok(())
     };
     // Each tombstone is considered once per batch, and the signature-driven
     // lookups (one object read per distinct target) are capped.
     let mut considered = BTreeSet::new();
+    let mut looked_up = BTreeSet::new();
     let mut lookups = 0;
     for id in ids {
         match store.get(id)? {
@@ -397,6 +415,7 @@ pub(crate) fn index_incoming(
             Object::Signature(s)
                 if lookups < MAX_SIG_LOOKUPS
                     && !considered.contains(&s.snapshot)
+                    && looked_up.insert(s.snapshot)
                     && store.contains(&s.snapshot) =>
             {
                 lookups += 1;
@@ -421,14 +440,13 @@ pub(crate) fn index_incoming(
 /// object is gone, or that no longer decodes as a tombstone, is forgotten.
 /// Returns how many drops were honored.
 pub(crate) fn reevaluate_pending(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
-    let pending = read_pending(layout);
+    let pending = read_pending(layout)?;
     if pending.is_empty() {
         return Ok(0);
     }
     let trusted = trusted_signers(layout);
-    let mut sigs = crate::signatures::index_by_target(layout)?;
     let wanted: BTreeSet<ObjectId> = pending.iter().copied().collect();
-    sigs.retain(|target, _| wanted.contains(target));
+    let sigs = crate::signatures::index_for_targets(layout, &wanted, MAX_SIG_READS)?;
     let (mut keep, mut honored) = (Vec::new(), 0);
     for id in &pending {
         if !store.contains(id) {
@@ -888,7 +906,7 @@ pub(crate) mod tests {
 
     /// Number of tombstones `repo` is remembering for re-evaluation.
     pub(crate) fn pending_count(repo: &Repo) -> usize {
-        read_pending(repo.layout()).len()
+        read_pending(repo.layout()).unwrap().len()
     }
 
     #[test]
@@ -1212,12 +1230,12 @@ pub(crate) mod tests {
         let unsigned = put_tomb(None);
         let mut store = arc.lock().unwrap();
         index_incoming(repo.layout(), &mut store, &[unsigned]).unwrap();
-        assert!(read_pending(repo.layout()).is_empty());
+        assert!(read_pending(repo.layout()).unwrap().is_empty());
         drop(store);
         let signed = put_tomb(Some(&owner));
         let mut store = arc.lock().unwrap();
         index_incoming(repo.layout(), &mut store, &[signed]).unwrap();
-        assert_eq!(read_pending(repo.layout()), vec![signed]);
+        assert_eq!(read_pending(repo.layout()).unwrap(), vec![signed]);
         assert_eq!(reevaluate_pending(repo.layout(), &mut store).unwrap(), 0);
         assert!(read_drops(repo.layout()).unwrap().is_empty());
         drop(store);
@@ -1271,7 +1289,10 @@ pub(crate) mod tests {
         let arc = repo.store_arc();
         let mut store = arc.lock().unwrap();
         index_incoming(repo.layout(), &mut store, &[tomb]).unwrap();
-        assert!(read_pending(repo.layout()).is_empty(), "unsigned: not kept");
+        assert!(
+            read_pending(repo.layout()).unwrap().is_empty(),
+            "unsigned: not kept"
+        );
         drop(store);
 
         // The signature arrives in a later transfer, without the tombstone.
@@ -1280,7 +1301,7 @@ pub(crate) mod tests {
         let sig = crate::signatures::index_by_target(repo.layout()).unwrap()[&tomb][0];
         let mut store = arc.lock().unwrap();
         index_incoming(repo.layout(), &mut store, &[sig]).unwrap();
-        assert_eq!(read_pending(repo.layout()), vec![tomb]);
+        assert_eq!(read_pending(repo.layout()).unwrap(), vec![tomb]);
         drop(store);
 
         trust_signer(&repo, &owner);
@@ -1390,8 +1411,42 @@ pub(crate) mod tests {
         let mut store = arc.lock().unwrap();
         index_incoming(repo.layout(), &mut store, &ids).unwrap();
         drop(store);
-        assert!(read_pending(repo.layout()).is_empty());
+        assert!(read_pending(repo.layout()).unwrap().is_empty());
         assert!(read_drops(repo.layout()).unwrap().is_empty());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_recorded_drop_is_not_requeued_and_a_batch_is_deduped_before_the_cap() {
+        let root = tmp_root("recorded");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let body = repo
+            .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+            .unwrap();
+        repo.drop_transcript(&body.to_hex(), Some(&owner)).unwrap();
+        let tomb = read_drops(repo.layout()).unwrap()[0].1;
+
+        // Signer no longer trusted, tombstone re-sent: already recorded, so
+        // it is not queued again.
+        let arc = repo.store_arc();
+        let mut store = arc.lock().unwrap();
+        index_incoming(repo.layout(), &mut store, &[tomb]).unwrap();
+        drop(store);
+        assert!(read_pending(repo.layout()).unwrap().is_empty());
+
+        // The same id repeated fills no more than one slot.
+        let a = ObjectId::of(b"a");
+        let b = ObjectId::of(b"b");
+        let mut batch = vec![a];
+        batch.extend(std::iter::repeat_n(b, MAX_PENDING + 10));
+        note_pending(repo.layout(), &batch).unwrap();
+        assert_eq!(read_pending(repo.layout()).unwrap(), vec![a, b]);
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -1407,7 +1462,7 @@ pub(crate) mod tests {
             .collect();
         note_pending(repo.layout(), &ids).unwrap();
         note_pending(repo.layout(), &ids[10..13]).unwrap(); // dedup, no growth
-        let held = read_pending(repo.layout());
+        let held = read_pending(repo.layout()).unwrap();
         assert_eq!(held.len(), MAX_PENDING);
         assert_eq!(held[0], ids[5], "oldest evicted");
         assert_eq!(held[MAX_PENDING - 1], ids[MAX_PENDING + 4]);

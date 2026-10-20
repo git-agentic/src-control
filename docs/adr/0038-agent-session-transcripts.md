@@ -500,6 +500,20 @@ re-runs. Fix: a small local index plus re-evaluation.
 - Trust is still checked at evaluation time and still not retroactive:
   removing a signer later does not undo a recorded drop.
 
+### Review notes (accepted limits)
+
+- A receiver skips a tombstone it has already recorded as a drop, so the
+  all-drops resend costs the recorded set one read per ingest, not a check and
+  a file rewrite per tombstone, and a recorded drop is never queued as pending.
+- Re-evaluation scans `.sc/signatures` once per trigger (time proportional to
+  the file, memory proportional to the pending targets, at most 256 ids each).
+- Index files are written without a lock on the serve ingest path, as
+  `.sc/signatures` and `.sc/transcript-drops` already are; two concurrent
+  pushes can lose one pending entry. A fetching peer is re-sent the tombstone
+  and recovers; a push-only remote needs the signer trusted before the push.
+- A bucket serves every signed tombstone-shaped object it holds, and its
+  contents are whatever writers uploaded; receivers still judge each one.
+
 ### Not changed
 
 A tombstone a repo already held when it upgraded to this build has no pending

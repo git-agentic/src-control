@@ -195,6 +195,26 @@ pub(crate) fn index_by_target(
     Ok(out)
 }
 
+/// [`index_by_target`] restricted to `targets`, keeping at most `per_target`
+/// signature ids each (index order). Only the wanted entries are retained, so
+/// a large index costs a scan, not memory.
+pub(crate) fn index_for_targets(
+    layout: &Layout,
+    targets: &BTreeSet<ObjectId>,
+    per_target: usize,
+) -> Result<std::collections::HashMap<ObjectId, Vec<ObjectId>>> {
+    let mut out: std::collections::HashMap<ObjectId, Vec<ObjectId>> = Default::default();
+    for (target, sig_id) in read_index(layout)? {
+        if targets.contains(&target) {
+            let v = out.entry(target).or_default();
+            if v.len() < per_target {
+                v.push(sig_id);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Sender-side seam (Task 3): the indexed signature object ids covering any
 /// of `snapshots`, deduped and sorted — the set a push/export needs to
 /// carry alongside the snapshots themselves so the receiving repo's index
