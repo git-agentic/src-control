@@ -75,7 +75,10 @@ impl Repo {
 
     fn open_layout(layout: Layout, budget_bytes: usize) -> Result<Repo> {
         let lock = RepoLock::acquire(&layout)?;
-        let store = Store::open_persistent(layout.objects_dir(), budget_bytes)?;
+        let mut store = Store::open_persistent(layout.objects_dir(), budget_bytes)?;
+        // Honor held tombstones whose signer was trusted since (#230). Best
+        // effort: a failure must not stop an open, and the next open retries.
+        let _ = crate::transcripts::reevaluate_pending(&layout, &mut store);
         Ok(Repo {
             layout,
             vfs: VfsRepo::new(store),

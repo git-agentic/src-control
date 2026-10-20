@@ -145,7 +145,7 @@ the code, those win.
 | P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3 | [0037](docs/adr/0037-partial-clone.md) |
 | P28 | Security hardening: a max object size (default 256 MiB; `--max-object-size` / `SC_MAX_OBJECT_SIZE`, 2 MiB to 1 GiB) caps every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | P29 | `sc serve --http` access control: bearer tokens (`sc serve token add [--expires]`/`rotate`/`remove`/`list`; an expired token gets the same 401 as an unknown one), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
-| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex | [0038](docs/adr/0038-agent-session-transcripts.md) |
+| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex; every retained signed tombstone rides every transfer, and held-but-untrusted ones are re-evaluated from `.sc/transcript-pending` on open/ingest (#230) | [0038](docs/adr/0038-agent-session-transcripts.md) |
 | P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff; later `--max-conn-bytes` per-connection write budget (#233) | [0041](docs/adr/0041-listener-resource-limits.md) |
 | P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning (`sc tls list/forget/pin/path` manages the pin file); `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system` validate against a CA instead; client connect/handshake bounded; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md), [0053](docs/adr/0053-tls-pin-management.md), [0054](docs/adr/0054-tls-ca-validation.md) |
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
@@ -299,7 +299,7 @@ Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here); entries that name an issue mirror the open
 GitHub issues. Standing entries: named/concurrent `sc ws` sessions (#215),
 blob-size clone filters (#217), bucket compaction and gc (#216), the non-unix
-`.sc/local-key` ACL (#214), transcript-drop delivery gaps (#230), and the open
+`.sc/local-key` ACL (#214), and the open
 sparse, private-branch and abort edge cases (#241, #246, #247, #248, #243).
 
 ## Agent skills

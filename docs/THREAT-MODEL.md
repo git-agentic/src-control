@@ -207,9 +207,13 @@ too, not just the src-control-side metadata.
   transcripts on every peer that trusts it and make those peers' gc reclaim the
   bodies. Drop is not erasure: peers without the tombstone keep the body,
   `GetObjects` serves it until gc sweeps it, and a peer that still holds it can
-  re-send it. A tombstone ignored on arrival stays ignored on a push-only or
-  served remote, so configure `[signers] trusted` there before the first drop
-  push. Trust is checked at ingest and is not retroactive.
+  re-send it. A tombstone held while its signer is untrusted is remembered
+  (`.sc/transcript-pending`, capped at 1024, FIFO) and re-evaluated on open and
+  after each ingest, so trusting the signer later is enough on a push-only or
+  served remote. Every retained signed tombstone is sent on every transfer, so
+  a peer is told even after gc collected the snapshot; a peer that pushes junk
+  can only evict pending entries, not get one honored. Trust is checked at
+  evaluation and is not retroactive.
 
 ## Network transport (`sc serve --http` / `sc+http(s)://` / `ssh://`) — ADR-0022/0036/0040/0041/0042
 

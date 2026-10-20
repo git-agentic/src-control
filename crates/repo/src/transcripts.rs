@@ -116,6 +116,49 @@ fn append_drop(layout: &Layout, entry: DropEntry) -> Result<()> {
     Ok(())
 }
 
+/// Most held-but-unhonored tombstones remembered (#230). A peer can push
+/// arbitrarily many, so the set is a FIFO ring: the newest win, and an evicted
+/// one is only lost to a push-only remote (a fetching peer is re-sent every
+/// retained tombstone on each fetch).
+const MAX_PENDING: usize = 1024;
+
+fn read_pending(layout: &Layout) -> Vec<ObjectId> {
+    std::fs::read_to_string(layout.transcript_pending_path())
+        .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+fn write_pending(layout: &Layout, ids: &[ObjectId]) -> Result<()> {
+    let path = layout.transcript_pending_path();
+    if ids.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::Io(e)),
+            _ => Ok(()),
+        };
+    }
+    let out: String = ids.iter().map(|i| format!("{}\n", i.to_hex())).collect();
+    scl_core::fsutil::atomic_write_durable(&path, out.as_bytes())?;
+    Ok(())
+}
+
+/// Remember `new` tombstones for re-evaluation, deduped, newest last, capped
+/// at [`MAX_PENDING`]. Writes only when the set changes.
+fn note_pending(layout: &Layout, new: &[ObjectId]) -> Result<()> {
+    let mut all = read_pending(layout);
+    let before = all.len();
+    for id in new {
+        if !all.contains(id) {
+            all.push(*id);
+        }
+    }
+    if all.len() == before {
+        return Ok(());
+    }
+    let excess = all.len().saturating_sub(MAX_PENDING);
+    all.drain(..excess);
+    write_pending(layout, &all)
+}
+
 /// Rewrite the whole index file atomically (temp file + rename), so a
 /// concurrent reader never observes a half-written index.
 fn write_index(layout: &Layout, entries: &[(ObjectId, ObjectId)]) -> Result<()> {
@@ -252,6 +295,8 @@ pub(crate) fn gc_prune(layout: &Layout, reachable: &mut BTreeSet<ObjectId>) -> R
     // itself is never rooted, so it is swept after the grace window.
     let drops = read_drops(layout)?;
     reachable.extend(drops.iter().map(|(_, tomb, _)| *tomb));
+    // Held-but-unhonored tombstones stay until trusted or evicted (#230).
+    reachable.extend(read_pending(layout));
     let dropped: BTreeSet<ObjectId> = drops.iter().map(|(_, _, d)| *d).collect();
     let entries = read_raw(layout)?;
     let mut kept = Vec::with_capacity(entries.len());
@@ -291,11 +336,17 @@ pub(crate) fn index_incoming(
     let mut count = 0;
     let trusted = trusted_signers(layout);
     let sigs = crate::signatures::index_by_target(layout)?;
+    let mut held = Vec::new();
     for id in ids {
         if let Object::Transcript(t) = store.get(id)? {
             match t.dropped_id() {
                 Some(dropped) => {
                     if !tombstone_honored(store, &trusted, &sigs, *id, &t, dropped)? {
+                        // Held but inert. Remember a signed one: a push-only
+                        // remote is never sent it again (#230).
+                        if sigs.contains_key(id) {
+                            held.push(*id);
+                        }
                         continue;
                     }
                     append_drop(layout, (t.snapshot, *id, dropped))?
@@ -305,7 +356,45 @@ pub(crate) fn index_incoming(
             count += 1;
         }
     }
+    note_pending(layout, &held)?;
     Ok(count)
+}
+
+/// Re-run the honoring checks on every remembered tombstone (#230): a signer
+/// trusted since, or a snapshot or signature that arrived since, now lets the
+/// drop take effect without the sender re-sending it. Idempotent; cost is
+/// bounded by [`MAX_PENDING`] and zero when nothing is pending. An entry whose
+/// object is gone, or that no longer decodes as a tombstone, is forgotten.
+/// Returns how many drops were honored.
+pub(crate) fn reevaluate_pending(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
+    let pending = read_pending(layout);
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let trusted = trusted_signers(layout);
+    let sigs = crate::signatures::index_by_target(layout)?;
+    let (mut keep, mut honored) = (Vec::new(), 0);
+    for id in &pending {
+        if !store.contains(id) {
+            continue;
+        }
+        let Ok(Object::Transcript(t)) = store.get(id) else {
+            continue;
+        };
+        let Some(dropped) = t.dropped_id() else {
+            continue;
+        };
+        if tombstone_honored(store, &trusted, &sigs, *id, &t, dropped)? {
+            append_drop(layout, (t.snapshot, *id, dropped))?;
+            honored += 1;
+        } else {
+            keep.push(*id);
+        }
+    }
+    if keep.len() != pending.len() {
+        write_pending(layout, &keep)?;
+    }
+    Ok(honored)
 }
 
 /// Full-store rebuild of the transcript index (clone path): scan every
@@ -361,17 +450,22 @@ pub(crate) fn indexed_transcript_ids_for(
             out.insert(tid);
         }
     }
-    // Signed tombstones travel with their snapshot so a drop propagates. An
-    // unsigned (local-only) drop is never sent: peers would ignore it, and an
-    // older peer would index it as a live transcript.
+    // Every retained signed tombstone travels on every transfer, not only
+    // those of `snapshots`: gc keeps a tombstone after it collects its
+    // snapshot, and a stale peer that still lists the body must still be told
+    // (#230). Cost: one tombstone plus one signature per drop, which receivers
+    // dedupe and ignore when they cannot use it. An unsigned (local-only) drop
+    // is never sent: peers would ignore it, and an older peer would index it
+    // as a live transcript.
     let drops = read_drops(layout)?;
     if !drops.is_empty() {
         let sigs = crate::signatures::index_by_target(layout)?;
-        for (snap, tomb, _) in drops {
-            if wanted.contains(&snap) && sigs.contains_key(&tomb) {
-                out.insert(tomb);
-            }
-        }
+        out.extend(
+            drops
+                .into_iter()
+                .filter(|(_, tomb, _)| sigs.contains_key(tomb))
+                .map(|(_, tomb, _)| tomb),
+        );
     }
     Ok(out.into_iter().collect())
 }
@@ -728,6 +822,11 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    /// Number of tombstones `repo` is remembering for re-evaluation.
+    pub(crate) fn pending_count(repo: &Repo) -> usize {
+        read_pending(repo.layout()).len()
+    }
+
     #[test]
     fn drop_hides_transcript_and_blocks_resurrection() {
         let root = tmp_root("drop");
@@ -991,6 +1090,122 @@ pub(crate) mod tests {
             vec![keep],
             "signed drop honored, unsigned drop is not"
         );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sender_offers_every_retained_signed_tombstone_whatever_the_transfer_set() {
+        let root = tmp_root("send-all");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let signed = repo
+            .attach_transcript(snap, "a", "s", b"signed", &[owner.enc.public()])
+            .unwrap();
+        let unsigned = repo
+            .attach_transcript(snap, "a", "u", b"unsigned", &[owner.enc.public()])
+            .unwrap();
+        repo.drop_transcript(&signed.to_hex(), Some(&owner))
+            .unwrap();
+        repo.drop_transcript(&unsigned.to_hex(), None).unwrap();
+        let drops = read_drops(repo.layout()).unwrap();
+        let tomb = drops.iter().find(|d| d.2 == signed).unwrap().1;
+
+        // `snap` is not in the transfer set (gc may have collected it).
+        let sent = indexed_transcript_ids_for(repo.layout(), &[]).unwrap();
+        assert_eq!(sent, vec![tomb], "the signed tombstone only");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn held_tombstone_is_honored_after_the_signer_is_trusted_and_never_before() {
+        let root = tmp_root("pending");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let (_s, stranger) = scl_crypto::generate_identity_v2();
+        let body = repo
+            .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+            .unwrap();
+        let arc = repo.store_arc();
+        let put_tomb = |signer: Option<&scl_crypto::Identity>| {
+            let tomb = Transcript::drop_tombstone(snap, &body);
+            let id = arc.lock().unwrap().put(Object::Transcript(tomb)).unwrap();
+            if let Some(who) = signer {
+                repo.sign_drop(id, who.signing.as_ref().unwrap()).unwrap();
+            }
+            id
+        };
+
+        // Unsigned: inert and not remembered. Signed by nobody trusted: held.
+        let unsigned = put_tomb(None);
+        let mut store = arc.lock().unwrap();
+        index_incoming(repo.layout(), &mut store, &[unsigned]).unwrap();
+        assert!(read_pending(repo.layout()).is_empty());
+        drop(store);
+        let signed = put_tomb(Some(&owner));
+        let mut store = arc.lock().unwrap();
+        index_incoming(repo.layout(), &mut store, &[signed]).unwrap();
+        assert_eq!(read_pending(repo.layout()), vec![signed]);
+        assert_eq!(reevaluate_pending(repo.layout(), &mut store).unwrap(), 0);
+        assert!(read_drops(repo.layout()).unwrap().is_empty());
+        drop(store);
+
+        // A trusted stranger does not make the owner's tombstone count.
+        trust_signer(&repo, &stranger);
+        let mut store = arc.lock().unwrap();
+        assert_eq!(reevaluate_pending(repo.layout(), &mut store).unwrap(), 0);
+        drop(store);
+        assert_eq!(load(repo.layout()).unwrap().len(), 1, "still visible");
+
+        // Gc keeps a held tombstone and its signature.
+        let mut reachable = BTreeSet::new();
+        gc_prune(repo.layout(), &mut reachable).unwrap();
+        assert!(reachable.contains(&signed));
+
+        trust_signer(&repo, &owner);
+        let mut store = arc.lock().unwrap();
+        assert_eq!(reevaluate_pending(repo.layout(), &mut store).unwrap(), 1);
+        assert_eq!(
+            reevaluate_pending(repo.layout(), &mut store).unwrap(),
+            0,
+            "idempotent: nothing is pending any more"
+        );
+        drop(store);
+        assert!(load(repo.layout()).unwrap().is_empty(), "now hidden");
+        assert!(!repo.layout().transcript_pending_path().exists());
+        assert_eq!(read_drops(repo.layout()).unwrap().len(), 1);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pending_set_is_a_bounded_fifo_and_forgets_missing_objects() {
+        let root = tmp_root("pending-cap");
+        let repo = Repo::init(&root).unwrap();
+        let ids: Vec<ObjectId> = (0..MAX_PENDING + 5)
+            .map(|i| ObjectId::of(format!("t{i}").as_bytes()))
+            .collect();
+        note_pending(repo.layout(), &ids).unwrap();
+        note_pending(repo.layout(), &ids[10..13]).unwrap(); // dedup, no growth
+        let held = read_pending(repo.layout());
+        assert_eq!(held.len(), MAX_PENDING);
+        assert_eq!(held[0], ids[5], "oldest evicted");
+        assert_eq!(held[MAX_PENDING - 1], ids[MAX_PENDING + 4]);
+
+        // None of these objects exist: a re-evaluation forgets them all.
+        let arc = repo.store_arc();
+        let mut store = arc.lock().unwrap();
+        assert_eq!(reevaluate_pending(repo.layout(), &mut store).unwrap(), 0);
+        drop(store);
+        assert!(!repo.layout().transcript_pending_path().exists());
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();

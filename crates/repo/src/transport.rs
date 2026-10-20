@@ -609,6 +609,12 @@ fn ingest_pack_file_impl(
     // Receiver seam (P30 Task 4): same "ids just written" contract, for
     // Transcript objects.
     crate::transcripts::index_incoming(layout, store, &ids)?;
+    // Tombstones held from earlier transfers whose signer is trusted by now
+    // (#230). A `--no-transcripts` transfer indexes no transcript state. Best
+    // effort: the pack is already stored, so a failure here must not fail it.
+    if !skip_transcripts {
+        let _ = crate::transcripts::reevaluate_pending(layout, store);
+    }
     Ok(ids)
 }
 

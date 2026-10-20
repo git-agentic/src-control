@@ -259,10 +259,11 @@ over-send, whatever order the lines landed in.
   adds the signer to the trust list and fetches). `push` never re-sends an
   object the remote already holds, so a remote that received the tombstone by
   push before trusting the signer keeps it inert.
-- **sender:** the over-send for a transfer set includes the tombstones of its
-  snapshots that have an indexed signature, with those signatures. An
-  unsigned (local-only) drop is never sent. Fetching from the dropper (or a
-  push that moves the ref) propagates the drop. A peer that still holds the
+- **sender:** the over-send of every transfer includes each retained
+  tombstone that has an indexed signature, with its signatures (selection
+  widened by #230, see the delivery addendum below; it was the tombstones of
+  the transfer set's snapshots). An unsigned (local-only) drop is never sent.
+  Fetching from the dropper (or a push that moves the ref) propagates the drop. A peer that still holds the
   transcript object hides it once it ingests an honored tombstone. `push`
   still skips all I/O when the remote tip already equals the local tip, so a
   drop alone does not push, the same pre-existing behavior as a retroactive
@@ -303,12 +304,9 @@ machinery instead.
   cannot hide a transcript and gc never reclaims a body because of them.
 
 Operational consequences. A tombstone that arrives while its signer is
-untrusted is ignored and not recorded. A fetching peer retries it on its next
-fetch. A push-only or served remote has no retry: it already holds the object,
-so a later push does not send it again and nothing re-runs the check, and the
-drop stays inert there even after the signer is trusted (tracked in #230).
-Configure
-`[signers] trusted` on a remote before the first drop is pushed to it. Any key under `[signers] trusted` can hide transcripts on every peer that
+untrusted is not recorded as a drop. A fetching peer retries it on its next
+fetch. A push-only or served remote re-evaluates what it holds (delivery
+addendum below, #230), so trusting the signer later is enough. Any key under `[signers] trusted` can hide transcripts on every peer that
 trusts it, and make that peer's gc reclaim the bodies. `GetObjects` still
 serves a dropped body until gc sweeps it, and a peer that still holds the
 body re-sends it on a later transfer, which restarts its grace window. All of
@@ -338,14 +336,8 @@ dead**, as P16 keeps revocation tombstones forever. They are load-bearing
 against a later fetch of the same history from a stale peer, and cost about
 100 bytes each. This is the one place the drop index outlives its snapshot;
 no transcript content does.
-Retention is local protection only. The sender selects tombstones through the
-snapshots of the transfer set, and a snapshot gc has removed is never in it,
-so a stale peer that still lists the body is not told about a drop whose
-snapshot the dropper has since collected. Sending every retained tombstone on
-every transfer would close that, at the cost of one object per drop per fetch
-for receivers that cannot use it; deferred to #230, together with the
-push-only remote limit above (a tombstone rejected on arrival is never
-re-evaluated there).
+Retention alone protects only the dropper. Delivery of a tombstone whose
+snapshot gc has collected is the #230 addendum below.
 
 ### `sc verify`
 
@@ -415,3 +407,81 @@ failed. (Confirmed by test before the fix; the issue left this open.)
   would avoid the decode; deferred in `ROADMAP.md`.
 - `sc serve --store` uses the same `get_pack`, so served-bucket fetch and
   clone get the same behavior.
+
+## Addendum: tombstone delivery after gc and late trust (issue #230)
+
+Two gaps in the drop addendum above, closed with no `PROTOCOL_VERSION` bump,
+no new object kind and no change to the trust gate. A tombstone is still
+honored only when a drop-digest signature verifies under a key in the
+receiver's `[signers] trusted`; unsigned drops still never leave the dropper.
+
+### 1. Send every retained signed tombstone
+
+`indexed_transcript_ids_for` (used by `LocalTransport::build_pack_tempfile`
+for fetch/clone/serve and by `push_opts`) no longer selects tombstones
+through the transfer set's snapshots. It returns every line of
+`.sc/transcript-drops` that has an indexed signature, plus (as before) the
+signatures over them. The bucket sender (`leaf_ids_for`) does the same. Why
+not match against the advertised haves: the stale peer's snapshot is exactly
+what the dropper's gc removed, so the dropper cannot resolve a have to it,
+and an id-only match would need the dropper to keep the snapshot id forever.
+
+Cost and limits:
+
+- One tombstone (about 100 bytes) plus one signature per retained drop, per
+  transfer, regardless of branch. Nothing is capped: capping would silently
+  withhold a drop from a peer, and the set only grows by explicit drops (the
+  dropper's own and ones it honored from trusted signers). It is never
+  subtracted via the have set, like transcripts and signatures.
+- A receiver that has the drop recorded dedups (`append_drop` writes only a
+  new line); one that cannot use it (snapshot unknown, signer untrusted)
+  stores the small object and ignores it.
+- A push sends only tombstones the remote lacks (`has_object`), so repeat
+  pushes cost one existence check per drop. `--no-transcripts` still leaves
+  tombstones and their signatures out of both directions (#228).
+- A fresh clone made after the dropper's gc receives retained tombstones
+  whose snapshots it never has. They stay inert and are remembered as
+  pending (below, capped), so they occupy ring slots without ever being
+  honored.
+
+### 2. Remember and re-evaluate held, unhonored tombstones
+
+A push-only or served remote holds the tombstone object from an earlier
+push, so `push` (has-object) never re-sends it and `index_incoming` never
+re-runs. Fix: a small local index plus re-evaluation.
+
+- `.sc/transcript-pending`: one tombstone object id per line, newest last.
+  `index_incoming` appends a tombstone that is held, **has an indexed
+  signature**, and failed `tombstone_honored`. Unsigned tombstones are never
+  remembered. A derived cache like `.sc/transcript-drops`: losing it only
+  loses the retry.
+- `reevaluate_pending` re-runs the unchanged `tombstone_honored` on each
+  entry with the current `[signers] trusted` and signature index, records the
+  ones that now pass as drops and removes them from the file, forgets entries
+  whose object is gone or no longer a tombstone, and leaves the rest. It is
+  idempotent and does nothing (one failed file read) when no pending file
+  exists. It runs at `Repo::open` (holding the repo lock `open` takes) and at
+  the end of every ingest except a `--no-transcripts` one. Both are best
+  effort: a failure never fails an open or a transfer, and the next trigger
+  retries. The open trigger covers `sc serve` (per connection), `sc gc`,
+  `sc transcript list`, and every other command, so an operator who edits
+  `recipients.toml` needs no extra step; the ingest trigger covers a
+  long-lived server process.
+- **Bounded.** The file is a FIFO ring of 1024 ids. A peer that pushes many
+  signed junk tombstones evicts older entries, so the work per trigger is at
+  most 1024 object reads and signature checks, and the file stays under
+  about 70 KiB. An evicted legitimate entry is lost only for a push-only
+  remote; a fetching peer is re-sent every retained tombstone (part 1). A
+  writer with push access can still push out a genuine pending entry; it
+  cannot make one honored.
+- **gc** roots pending tombstones like drop lines, so they survive the
+  loose-object sweep and the signature index keeps their signatures
+  (`transcripts::gc_prune` runs before `signatures::gc_prune`).
+- Trust is still checked at evaluation time and still not retroactive:
+  removing a signer later does not undo a recorded drop.
+
+### Not changed
+
+`push` still returns early when the remote tip equals the local tip, so a
+drop alone does not push (unchanged). Clone `reindex` is unchanged: it
+rebuilds drops from the store and does not touch the pending file.
