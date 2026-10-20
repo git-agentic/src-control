@@ -411,6 +411,27 @@ impl Repo {
         remote: &str,
         no_transcripts: bool,
     ) -> Result<Vec<(String, ObjectId)>> {
+        self.fetch_limited(remote, no_transcripts, false)
+    }
+
+    /// [`Repo::fetch_opts`] with the blob-limit switch (ADR-0055 addendum,
+    /// #217). A clone made with `blob:limit=N` records the limit, and a fetch
+    /// from its promisor origin sends it again: blobs of at least `N` bytes
+    /// that no fetched ref tip's root tree reaches arrive as gaps, so later
+    /// growth stays as bounded as the clone was and every tip stays complete.
+    /// Only the limit rides along, never the clone's path prefixes (a fetch
+    /// stays path-unfiltered, ADR-0048). `no_blob_limit` sends no limit for
+    /// this one fetch, so history arrives in full; the recorded limit stays.
+    /// It changes nothing for a clone without a limit. "Every tip complete"
+    /// does not cover a blob the clone already gapped: the sender subtracts
+    /// the closure of the local tips, so a tip that names such a blob (a
+    /// revert) arrives without it (`GapInView`, ADR-0055 decision 4).
+    pub fn fetch_limited(
+        &self,
+        remote: &str,
+        no_transcripts: bool,
+        no_blob_limit: bool,
+    ) -> Result<Vec<(String, ObjectId)>> {
         let cfg = RemoteConfig::load(&self.layout)?;
         let url = cfg
             .url(remote)
@@ -420,7 +441,8 @@ impl Repo {
         // lacks is held by the origin. Another remote subtracts the closure
         // of a have it holds, and the origin may not hold that object, so a
         // fetch from it could leave a gap nobody can fill.
-        if let Some(p) = self.promisor()? {
+        let promisor = self.promisor()?;
+        if let Some(p) = &promisor {
             if !same_remote_url(url, &p.origin) {
                 return Err(Error::InvalidArgument(format!(
                     "refusing to fetch from {remote}: this is a partial clone and only its \
@@ -430,6 +452,14 @@ impl Repo {
                 )));
             }
         }
+        // The origin check above is the only way a limit reaches the wire, so
+        // a non-promisor remote never sees one.
+        let blob_limit = match &promisor {
+            Some(p) if !no_blob_limit => p.blob_limit(),
+            _ => None,
+        };
+        let pack_filter = crate::promisor::PackFilter::new(&[], blob_limit);
+        let filter = pack_filter.as_ref();
         let transport = open_transport(url)?;
         let remote_refs = transport.list_refs()?;
 
@@ -445,14 +475,22 @@ impl Repo {
                 &mut store,
                 &tips,
                 &haves,
-                None,
+                filter,
                 no_transcripts,
             )?;
         }
-        for (branch, tip) in &remote_refs {
-            refs::write_remote_tip(&self.layout, remote, branch, tip)?;
+        let mut landed = Vec::with_capacity(remote_refs.len());
+        for (branch, tip) in remote_refs {
+            // A filtered transfer drops private-branch manifests (ADR-0044,
+            // ADR-0055): skip the ref rather than record a dangling one, as
+            // clone does.
+            if filter.is_some() && !self.vfs.store().lock().unwrap().contains(&tip) {
+                continue;
+            }
+            refs::write_remote_tip(&self.layout, remote, &branch, &tip)?;
+            landed.push((branch, tip));
         }
-        Ok(remote_refs)
+        Ok(landed)
     }
 
     /// Push the current branch to `remote`, fast-forward-only. Creates the remote

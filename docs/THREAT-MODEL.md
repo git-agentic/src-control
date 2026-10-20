@@ -577,7 +577,11 @@ too, not just the src-control-side metadata.
   and the filter does not change that; the listener limits are the bound. Every
   active filter, a limit alone included, still excludes private branches and is
   refused by bucket remotes. The wire bump (version 6) makes a mixed-version pair
-  fail closed at the handshake in both directions.
+  fail closed at the handshake in both directions. `sc fetch` sends the recorded
+  limit to the promisor origin only (the origin check precedes it), so the
+  same request scope and server cost apply per fetch; `--no-blob-limit` removes
+  the scope and adds no plaintext access (it is an unfiltered fetch, which also
+  receives private-branch ciphertext).
 - **Operations that need a complete closure refuse on a partial clone, fail
   closed:** `sc export`, `sc rewrap`, `sc grant`/`revoke`, private branches, and
   `sc push` to a git remote. They refuse rather than run on partial data.
