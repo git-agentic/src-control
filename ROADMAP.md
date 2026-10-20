@@ -743,6 +743,17 @@ scale-&-reach horizon):
   `sc sparse set` on a full clone is refused with a pointer to `sc sparse
   disable` (a partial clone keeps its `sc backfill` refusal); and `.sc/sparse`
   parsing ignores blank lines.
+- **Sparse follow-ups from #210 — shipped (#224).** A partial clone treats a
+  binary conflict's `.theirs` sidecar as in view when its conflicted path is, so
+  a file-exact spec no longer refuses it. `sc sparse set` may widen (never
+  narrow) while a merge, cherry-pick or rebase is stopped: the files coming into
+  view are laid out from the stop's decided root, so `rebase --continue`'s
+  out-of-view refusal no longer needs an abort. Protected files that come into
+  view mid-stop are not decrypted: they stay absent from disk and completion
+  carries them. A rebase's final fold re-lays the tree and decrypts them with
+  `--identity`; a merge or cherry-pick finished with `sc commit` writes no
+  working tree, so they stay absent until the next operation that does (a
+  `switch`, or `sparse set` again).
 - **Transparent lazy-fetch for partial clones (P27).** `sc backfill` is
   explicit-only by design (ADR-0037's "no network in read paths" choice);
   the identical filtered-walk/gap infra could instead dial the promisor

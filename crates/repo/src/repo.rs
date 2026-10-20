@@ -938,6 +938,11 @@ impl Repo {
         // in the pick arm avoids double-managing (and clobbering) the cache
         // `assemble_completion_snapshot` already saved.
         let mut cache: Option<crate::cache::ProtectedCache> = None;
+        // Files an interrupted widen laid outside the view go before the
+        // working tree is read, or they would be read as completion input.
+        if merging || picking {
+            self.finish_widen_at_completion(decided_root)?;
+        }
         let id = match (tip, merge_head, pick_head) {
             (Some(t), None, Some(ph)) => self.assemble_completion_snapshot(
                 t,
@@ -1817,10 +1822,12 @@ impl Repo {
         conflicted_paths: &[String],
     ) -> Result<ObjectId> {
         let sparse = self.sparse_spec()?;
-        // `sc sparse set` is refused while a rebase is stopped, so a refusal
-        // reached from `rebase --continue` cannot be fixed by widening in place.
+        // A stopped op can be widened in place (`sc sparse set`, additive
+        // only; ADR-0034), so the stopped-op refusal from `--continue` names
+        // that instead of an abort.
         let widen = if crate::rebase_state::in_progress(&self.layout) {
-            "abort the rebase (`sc rebase --abort`), widen with `sc sparse set`, then rerun the rebase"
+            "add it to the current prefixes with `sc sparse set` (it may only widen the view \
+             while the rebase is stopped), then rerun `sc rebase --continue`"
         } else {
             "run `sc sparse set` to include it, then retry"
         };
@@ -1851,14 +1858,15 @@ impl Repo {
             )));
         }
         // A sidecar is `<conflicted path>.theirs`, and the conflicted path
-        // passed the gate above, so on a full clone it is beside an in-view
-        // file (a file-exact spec such as `src/a.bin` does not match
+        // passed the gate above, so it is beside an in-view file (a
+        // file-exact spec such as `src/a.bin` does not match
         // `src/a.bin.theirs`, yet that sidecar is in view) and `abort` and
-        // completion remove it. A partial clone keeps the stricter ADR-0049
-        // refusal: outside the view its sidecar would sit where completion
-        // neither expects nor protects it.
+        // completion remove it. A partial clone still checks it, by its base
+        // path: outside the view it would sit where completion neither
+        // expects nor protects it (ADR-0049).
         if self.promisor()?.is_some() {
-            if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !sparse.matches(r)) {
+            let in_view = |r: &str| sparse.matches(r.strip_suffix(".theirs").unwrap_or(r));
+            if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !in_view(r)) {
                 return Err(Error::InvalidArgument(format!(
                     "{op} has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
                      {widen}"
@@ -2085,9 +2093,14 @@ impl Repo {
     }
 
     /// Refuse a sparse-spec change (`op`) that would lay a tracked file onto an
-    /// untracked or ignored one: a path newly in view (`new_view`) that the
-    /// tree `root` tracks, with something already standing there and the old
-    /// view (`old_view`) not having laid it out. Same rules as
+    /// untracked or ignored one: a path newly in view (`new_view` and not
+    /// `old_view`) that the tree `root` tracks, with something already standing
+    /// there. Paths the old view matched are not checked: they are not written
+    /// (a stopped op may have turned one into a directory, say). `already_laid`
+    /// names paths that count as tracked because an earlier, interrupted run of
+    /// the same change wrote them. `alias_ok` lets a case alias of a laid-out
+    /// path count as tracked; a stopped-op widen passes false, because writing
+    /// a newly visible `SRC/a.txt` would overwrite the user's `src/a.txt`. Same rules as
     /// [`Repo::refuse_untracked_overwrite_vs`].
     pub(crate) fn refuse_untracked_for_view_change(
         &self,
@@ -2095,9 +2108,11 @@ impl Repo {
         root: ObjectId,
         old_view: &crate::Sparse,
         new_view: &crate::Sparse,
+        already_laid: &std::collections::BTreeSet<String>,
+        alias_ok: bool,
     ) -> Result<()> {
         let partial = self.promisor()?.is_some();
-        let (laid_out, target) = {
+        let (mut laid_out, target) = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
             let mut files = |view: &crate::Sparse| -> Result<std::collections::BTreeSet<String>> {
@@ -2111,7 +2126,14 @@ impl Repo {
             };
             (files(old_view)?, files(new_view)?)
         };
-        self.refuse_untracked_paths_in(op, &laid_out, target.iter(), new_view)
+        laid_out.extend(already_laid.iter().cloned());
+        self.refuse_untracked_paths_in(
+            op,
+            &laid_out,
+            target.iter().filter(|p| !old_view.matches(p)),
+            new_view,
+            alias_ok,
+        )
     }
 
     /// The path-list core of [`Repo::refuse_untracked_overwrite_vs`], for a
@@ -2123,7 +2145,7 @@ impl Repo {
         tracked: &std::collections::BTreeSet<String>,
         target: impl Iterator<Item = &'a String>,
     ) -> Result<()> {
-        self.refuse_untracked_paths_in(op, tracked, target, &self.sparse_spec()?)
+        self.refuse_untracked_paths_in(op, tracked, target, &self.sparse_spec()?, true)
     }
 
     /// [`Repo::refuse_untracked_paths`] for the view the write will happen
@@ -2135,6 +2157,7 @@ impl Repo {
         tracked: &std::collections::BTreeSet<String>,
         target: impl Iterator<Item = &'a String>,
         sparse: &crate::Sparse,
+        alias_ok: bool,
     ) -> Result<()> {
         // A path outside the view was never laid out: whatever is on disk
         // there is the user's, even if the tree tracks it. On a
@@ -2143,7 +2166,8 @@ impl Repo {
         // provably the same file.
         let root = &self.layout.root;
         let mut is_tracked = |p: &str| {
-            sparse.matches(p) && (tracked.contains(p) || is_tracked_case_alias(root, tracked, p))
+            sparse.matches(p)
+                && (tracked.contains(p) || (alias_ok && is_tracked_case_alias(root, tracked, p)))
         };
         for rel in target.filter(|p| sparse.matches(p)) {
             match stop_write_blocker(&self.layout.root, rel, &mut is_tracked)? {
@@ -2318,6 +2342,9 @@ impl Repo {
             self.remove_conflict_plaintext(*root)?;
         }
         self.remove_conflict_sidecars(&sidecar_roots)?;
+        // What an interrupted stopped-op widen laid, which the walk above
+        // (over theirs' tree) cannot see.
+        self.remove_widen_residue(crate::merge_state::read_decided_root(&self.layout)?)?;
         crate::merge_state::clear(&self.layout)?;
         Ok(skipped)
     }
@@ -2736,6 +2763,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// On a case-insensitive filesystem `SRC/a.txt` is the tracked `src/a.txt`.
+    /// A normal checkout counts that alias as tracked, but a stopped-op widen
+    /// would write the decided `SRC/a.txt` over the user's `src/a.txt`, so it
+    /// must not (`alias_ok = false`). Skipped where the filesystem is
+    /// case-sensitive and no alias exists.
+    #[cfg(unix)]
+    #[test]
+    fn a_widen_does_not_treat_a_case_alias_as_its_own_file() {
+        let root = tmp_root("widen-case-alias");
+        let repo = Repo::init(&root).unwrap();
+        if root.join(".SC").symlink_metadata().is_err() {
+            drop(repo);
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"my resolution\n").unwrap();
+        let tracked: std::collections::BTreeSet<String> = ["src/a.txt".to_string()].into();
+        let target = ["SRC/a.txt".to_string()];
+        let sparse = crate::Sparse::new(vec!["src/".into(), "SRC/".into()]);
+        repo.refuse_untracked_paths_in("t", &tracked, target.iter(), &sparse, true)
+            .unwrap();
+        let err = repo
+            .refuse_untracked_paths_in("t", &tracked, target.iter(), &sparse, false)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

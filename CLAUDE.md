@@ -182,7 +182,7 @@ transport-adjacent. The rest, imperatively:
   capability, and no DTO field capable of carrying protected ciphertext or
   identity material.
 - **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (and, on a non-lazy clone, one outside the filter), `sc rewrap`,
-  `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view or whose `.theirs` sidecar would lie outside the view (partial clones only: on a full clone the sidecar is exempt as it sits beside an in-view file) (no ref, state or working-tree change; on every clone, a conflict stop that needs sealing outside the view is refused the same way), `sc push` to a git remote, and
+  `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view (a `.theirs` sidecar sits beside its conflicted path, so it is in view whenever that path is; ADR-0049) (no ref, state or working-tree change; on every clone, a conflict stop that needs sealing outside the view is refused the same way), `sc push` to a git remote, and
   `sc fetch` from any native remote but the promisor origin.** `sc merge`, `sc cherry-pick` and `sc rebase` work, including conflicts inside the view (P37c). `sc ws` and `sc work` work too (ADR-0050): workspaces and agents see the clone's view only, and harvest lands through the same merge. `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what
   a clone *asked for*, not what is present: after a fetch an in-filter object
@@ -251,10 +251,14 @@ transport-adjacent. The rest, imperatively:
 - **Sparse is checkout-only**, and a stopped merge/pick/rebase writes no
   conflict marker or sealing-input plaintext outside the view: an out-of-sparse
   conflicted path or sealing input refuses with a `sc sparse set` hint before
-  any write (ADR-0034, #210; from `rebase --continue` the hint says to abort
-  first, since `sparse set` is refused mid-rebase). A binary conflict's
-  `<path>.theirs` sidecar sits beside its in-view file and may not match a
-  file-exact spec; completion and abort remove it.
+  any write (ADR-0034, #210). While a merge/pick/rebase is stopped, `sparse
+  set` accepts only a strict widen (new spec covers the old; narrowing,
+  sideways and `disable` still refuse): it lays out just the newly in-view
+  files from the stop's decided root and leaves protected ones absent, so a
+  `rebase --continue` refusal is fixed by widening and rerunning it (#224). A
+  binary conflict's `<path>.theirs` sidecar sits beside its in-view file and
+  may not match a file-exact spec (partial clones check it by its base path);
+  completion and abort remove it.
 - **`.sc/git-remotes/<name>/marks` carries `git_oid ↔ sc_id` identity —
   deleting it is destructive.** Deleting the sibling `mirror.git` is always
   safe (reconstructed on next use). Stale marks self-heal on push/export.
@@ -268,6 +272,10 @@ transport-adjacent. The rest, imperatively:
   sidecars it wrote are listed apart in `.sc/CONFLICT_SIDECARS`; abort, `rebase
   --continue` and `sc resolve` remove only those, never a `.theirs` file the stop
   did not write; the completing commit leaves them out of the tree and removes them.
+  A stopped-op `sparse set` widen records the files it is writing in
+  `.sc/sparse-widen` (local-only like the rest, removed with the spec write or
+  the op); abort and completion delete what an interrupted widen laid outside
+  the view.
 - **A merge, switch, cherry-pick, rebase, undo or sparse-spec change refuses, before any write, to lay a file or
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
   away and retry. Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded.

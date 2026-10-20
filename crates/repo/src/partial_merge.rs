@@ -308,6 +308,265 @@ fn a_conflict_in_the_view_completes_with_the_carried_subtree_grafted_from_the_de
     fx.cleanup();
 }
 
+/// A stopped merge on a lazy clone can be widened past its filter: the carried
+/// subtree that comes into view is filled by id, laid out from the decided
+/// root, and the completion equals the full merge (#224). A clone that cannot
+/// fetch refuses the widen with the gap error and changes nothing.
+#[test]
+fn widening_a_stopped_partial_merge_fills_and_lays_out_the_carried_subtree() {
+    let fx = Fx::origin("widen-stopped", |_| {});
+    fx.origin_branch(
+        "b1",
+        &[
+            ("src/a.txt", b"ONE\ntwo\nthree\n"),
+            ("docs/a.md", b"a changed\n"),
+        ],
+    );
+    let expect = full_merge_root(
+        &fx,
+        "b1",
+        &[("src/a.txt", b"uno\ntwo\nthree\n")],
+        &["src/a.txt"],
+    );
+    let clone = fx.clone(false);
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    let wide = ["src/".to_string(), "docs/".to_string()];
+    // Sideways and narrowing keep the old refusal; a widen past the filter on
+    // a clone that cannot fetch is the gap error, with nothing changed.
+    assert!(matches!(
+        clone.set_sparse(&["docs/".to_string()], None),
+        Err(Error::MergeInProgress)
+    ));
+    assert!(matches!(
+        clone.set_sparse(&wide, None),
+        Err(Error::GapOutsideFilter(_))
+    ));
+    assert_eq!(
+        clone.sparse_spec().unwrap().prefixes(),
+        ["src/".to_string()]
+    );
+    assert!(!fx.clone_root.join("docs").exists());
+
+    crate::promisor::set_lazy(clone.layout(), true).unwrap();
+    clone.set_sparse(&wide, None).unwrap();
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("docs/a.md")).unwrap(),
+        b"a changed\n",
+        "theirs' content, from the decided root"
+    );
+    assert!(std::fs::read_to_string(fx.clone_root.join("src/a.txt"))
+        .unwrap()
+        .contains("<<<<<<<"));
+    clone
+        .resolve_path("src/a.txt", crate::conflicts::ResolveSide::Ours, None)
+        .unwrap();
+    let merged = clone.commit("t", "merge").unwrap();
+    assert_eq!(clone.snapshot(&merged).unwrap().root, expect);
+    assert!(clone.status().unwrap().modified.is_empty());
+    drop(clone);
+    fx.cleanup();
+}
+
+/// Aborting a stopped merge after a widen removes what the widen laid out,
+/// and leaves no marker: a file only theirs added is gone, ours' files are back.
+/// A widen interrupted after its writes (simulated: files laid, spec not
+/// stored, marker as the widen records it) is cleaned by the abort too, which
+/// the spec's view alone could not see on a partial clone.
+#[test]
+fn aborting_a_widened_partial_merge_leaves_no_residue() {
+    for interrupted in [false, true] {
+        let fx = Fx::origin(
+            if interrupted {
+                "abort-widen-int"
+            } else {
+                "abort-widen"
+            },
+            |_| {},
+        );
+        fx.origin_branch(
+            "b1",
+            &[
+                ("src/a.txt", b"ONE\ntwo\nthree\n"),
+                ("docs/new.md", b"added by theirs\n"),
+            ],
+        );
+        let clone = fx.clone(true);
+        clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+        assert!(matches!(
+            clone.merge("origin/b1", "t").unwrap_err(),
+            Error::MergeConflicts(1)
+        ));
+        let old = clone.sparse_spec().unwrap();
+        let wide = crate::Sparse::new(vec!["src/".to_string(), "docs/".to_string()]);
+        if interrupted {
+            let decided = crate::merge_state::read_decided_root(clone.layout())
+                .unwrap()
+                .unwrap();
+            clone.ensure_view(decided, &wide).unwrap();
+            crate::sparse::store_prev(clone.layout(), &wide).unwrap();
+            let store = clone.vfs().store();
+            let mut s = store.lock().unwrap();
+            crate::worktree::lay_out_added_view(clone.layout(), &mut s, decided, &old, &wide)
+                .unwrap();
+        } else {
+            clone.set_sparse(wide.prefixes(), None).unwrap();
+            assert!(!clone.layout().sparse_prev_path().exists());
+        }
+        assert!(fx.clone_root.join("docs/new.md").exists(), "laid");
+
+        clone.merge_abort().unwrap();
+        assert!(!fx.clone_root.join("docs/new.md").exists(), "no residue");
+        assert!(!clone.layout().sparse_prev_path().exists());
+        assert_eq!(
+            std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
+            b"uno\ntwo\nthree\n"
+        );
+        assert!(clone.status().unwrap().modified.is_empty());
+        drop(clone);
+        fx.cleanup();
+    }
+}
+
+/// On a partial clone an interrupted widen laid a subtree only ours has (theirs'
+/// docs tree was never fetched, so the abort's walk over theirs cannot see it).
+/// The abort removes those files using the widen's record, and a fresh widen
+/// then succeeds.
+#[test]
+fn abort_after_an_interrupted_partial_widen_removes_the_subtree_it_laid() {
+    let fx = Fx::origin("abort-widen-ours-only", |_| {});
+    // Cut before main gains its own docs file, so theirs never touches docs/.
+    fx.origin_branch("b1", &[("src/a.txt", b"ONE\ntwo\nthree\n")]);
+    std::fs::write(fx.origin_root.join("docs/mine.md"), b"ours only\n").unwrap();
+    fx.origin.commit("t", "ours docs").unwrap();
+    let clone = fx.clone(true);
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    let old = clone.sparse_spec().unwrap();
+    let wide = crate::Sparse::new(vec!["src/".to_string(), "docs/".to_string()]);
+    let decided = crate::merge_state::read_decided_root(clone.layout())
+        .unwrap()
+        .unwrap();
+    clone.lay_out_widened_view(decided, &old, &wide).unwrap();
+    assert!(fx.clone_root.join("docs/mine.md").exists(), "laid");
+
+    clone.merge_abort().unwrap();
+    assert!(!fx.clone_root.join("docs/mine.md").exists(), "no residue");
+    assert!(!clone.layout().sparse_widen_path().exists());
+    assert!(!clone.layout().sparse_prev_path().exists());
+    clone.set_sparse(wide.prefixes(), None).unwrap();
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("docs/mine.md")).unwrap(),
+        b"ours only\n"
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
+/// Completing a stopped merge after an interrupted widen on a partial clone
+/// removes what the widen laid and the `sparse-prev` bound it left, so a later
+/// materialize cannot delete tracked files under that bound unchecked. A file
+/// the user edited since is kept (and the bound is still dropped).
+#[test]
+fn completing_after_an_interrupted_partial_widen_clears_the_bound() {
+    for edited in [false, true] {
+        let fx = Fx::origin(
+            if edited {
+                "complete-widen-ed"
+            } else {
+                "complete-widen"
+            },
+            |_| {},
+        );
+        fx.origin_branch(
+            "b1",
+            &[
+                ("src/a.txt", b"ONE\ntwo\nthree\n"),
+                ("docs/new.md", b"added by theirs\n"),
+            ],
+        );
+        let clone = fx.clone(true);
+        clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+        assert!(matches!(
+            clone.merge("origin/b1", "t").unwrap_err(),
+            Error::MergeConflicts(1)
+        ));
+        let old = clone.sparse_spec().unwrap();
+        let wide = crate::Sparse::new(vec!["src/".to_string(), "docs/".to_string()]);
+        let decided = crate::merge_state::read_decided_root(clone.layout())
+            .unwrap()
+            .unwrap();
+        clone.lay_out_widened_view(decided, &old, &wide).unwrap();
+        assert!(clone.layout().sparse_prev_path().exists(), "premise");
+        if edited {
+            std::fs::write(fx.clone_root.join("docs/new.md"), b"my edit\n").unwrap();
+        }
+
+        std::fs::write(fx.clone_root.join("src/a.txt"), b"MERGED\ntwo\nthree\n").unwrap();
+        if edited {
+            // Refused with the path named, nothing moved; moving it away lets
+            // the commit through.
+            let err = clone.commit("t", "merge").unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains("docs/new.md")),
+                "got {err:?}"
+            );
+            assert!(clone.merge_in_progress());
+            std::fs::remove_file(fx.clone_root.join("docs/new.md")).unwrap();
+        }
+        clone.commit("t", "merge").unwrap();
+        assert!(!clone.layout().sparse_prev_path().exists());
+        assert!(!clone.layout().sparse_widen_path().exists());
+        assert!(!fx.clone_root.join("docs/new.md").exists());
+        drop(clone);
+        fx.cleanup();
+    }
+}
+
+/// A widen whose newly included paths are all protected writes no file, so its
+/// record has only a header, yet on a partial clone it still left the wider
+/// `sparse-prev` bound. Completion treats that record as pending too.
+#[test]
+fn completing_after_an_interrupted_protected_only_widen_clears_the_bound() {
+    let (_sk, pk) = scl_crypto::generate_keypair();
+    let fx = protected_origin("complete-widen-prot", &pk);
+    fx.origin_branch("b1", &[("src/a.txt", b"ONE\ntwo\nthree\n")]);
+    let clone = fx.clone(true);
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    let old = clone.sparse_spec().unwrap();
+    let wide = crate::Sparse::new(vec!["src/".to_string(), "vault/".to_string()]);
+    let decided = crate::merge_state::read_decided_root(clone.layout())
+        .unwrap()
+        .unwrap();
+    let (skipped, _) = clone.lay_out_widened_view(decided, &old, &wide).unwrap();
+    assert_eq!(skipped, vec!["vault/s.txt".to_string()], "protected only");
+    assert_eq!(
+        crate::sparse::load_widen(clone.layout(), decided).unwrap(),
+        Some(Default::default()),
+        "a header-only record"
+    );
+    assert!(clone.layout().sparse_prev_path().exists(), "premise");
+
+    clone
+        .resolve_path("src/a.txt", crate::conflicts::ResolveSide::Theirs, None)
+        .unwrap();
+    clone.commit("t", "merge").unwrap();
+    assert!(!clone.layout().sparse_prev_path().exists());
+    assert!(!clone.layout().sparse_widen_path().exists());
+    drop(clone);
+    fx.cleanup();
+}
+
 /// Aborting restores ours and removes the markers; the carried subtree was
 /// never on disk and the ref never moved.
 #[test]
@@ -852,31 +1111,35 @@ fn a_protected_conflict_in_the_view_seals_at_completion() {
 }
 
 /// A binary conflict writes `<path>.theirs` beside the file. When the view is
-/// the file itself the sidecar falls outside it, so the merge is refused before
-/// any write instead of leaving plaintext where completion does not look.
+/// the file itself the sidecar does not match the spec, yet it sits beside an
+/// in-view conflict: the stop writes it, abort removes it, and completion
+/// leaves it out of the tree (#224).
 #[test]
-fn a_sidecar_outside_the_view_is_refused_before_any_write() {
-    let fx = Fx::origin("sidecar-out", |_| {});
+fn a_sidecar_beside_an_in_view_conflict_is_written_and_removed_under_a_file_exact_view() {
+    let fx = Fx::origin("sidecar-exact", |_| {});
     fx.origin_branch("b1", &[("src/a.txt", b"\xff\xfeTHEIRS\n")]);
     let clone = fx.clone(false);
     clone.set_sparse(&["src/a.txt".to_string()], None).unwrap();
     clone_edit_src(&fx, &clone, b"\xff\xfeOURS\n");
-    let before = refs::read_branch_tip(clone.layout(), "main").unwrap();
+    let sidecar = fx.clone_root.join("src/a.txt.theirs");
+
     let err = clone.merge("origin/b1", "t").unwrap_err();
-    assert!(
-        matches!(&err, Error::InvalidArgument(m) if m.contains("sidecar")),
-        "got {err:?}"
-    );
-    assert!(!clone.merge_in_progress());
-    assert!(!fx.clone_root.join("src/a.txt.theirs").exists());
-    assert_eq!(
-        refs::read_branch_tip(clone.layout(), "main").unwrap(),
-        before
-    );
-    assert_eq!(
-        std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
-        b"\xff\xfeOURS\n"
-    );
+    assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"\xff\xfeTHEIRS\n");
+    assert!(!fx.clone_root.join("docs").exists());
+    clone.merge_abort().unwrap();
+    assert!(!sidecar.exists(), "abort removes the sidecar");
+    assert!(!fx.clone_root.join(".sc/CONFLICT_SIDECARS").exists());
+
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    std::fs::write(fx.clone_root.join("src/a.txt"), b"\xff\xferesolved\n").unwrap();
+    let merged = clone.commit("t", "merge").unwrap();
+    assert!(!sidecar.exists(), "completion removes the sidecar");
+    assert!(!clone.tracked_paths().unwrap().contains("src/a.txt.theirs"));
+    assert_eq!(clone.snapshot(&merged).unwrap().parents.len(), 2);
     drop(clone);
     fx.cleanup();
 }
