@@ -91,6 +91,14 @@ fn hash_of(key: &str) -> Option<&str> {
         .or_else(|| name.strip_suffix(".idx"))
 }
 
+/// Bytes of the `.pack` and `.idx` objects behind these packs.
+fn pack_bytes(packs: &[(&String, &Vec<ObjectMeta>)]) -> u64 {
+    packs
+        .iter()
+        .flat_map(|(_, ms)| ms.iter().map(|m| m.size))
+        .sum()
+}
+
 /// Greedy size-tiered grouping: smallest candidates first, a group closes when
 /// the next pack would push it past `group_bytes`. Groups of one are dropped
 /// (there is nothing to merge).
@@ -194,15 +202,14 @@ impl BucketTransport {
                 ));
                 return Ok(());
             }
-            if opts.dry_run {
-                rep.packs_merged = replaced.len();
-                rep.packs_created = groups.len();
-                return Ok(());
-            }
             let mut created = Vec::new();
+            // The packs actually folded: a source that fills a part alone is
+            // left where it is (#263), so this can be a subset of `replaced`.
+            let mut merged: BTreeSet<String> = BTreeSet::new();
             for group in &groups {
                 let mut objects: BTreeMap<ObjectId, Vec<u8>> = BTreeMap::new();
                 let mut decoded = 0u64;
+                let mut part: Vec<&String> = Vec::new();
                 for hash in group {
                     let Fetched::New { bytes, .. } = self.bucket.get(&pack_key(hash), None)? else {
                         // Either another compactor retired it (the manifest has
@@ -223,19 +230,36 @@ impl BucketTransport {
                         objects.insert(id, enc);
                         Ok(())
                     })?;
+                    part.push(hash);
                     // Compressed sizes bound the group, not the decoded bytes held
                     // here; spill to a pack of its own before RAM balloons.
                     if decoded > opts.group_bytes.saturating_mul(DECODED_FACTOR) {
-                        let part: Vec<(ObjectId, Vec<u8>)> =
-                            std::mem::take(&mut objects).into_iter().collect();
-                        created.push(self.upload_pack(&part)?.0);
+                        self.flush_part(&mut objects, &mut part, &mut created, &mut merged, opts)?;
                         decoded = 0;
                     }
                 }
-                if !objects.is_empty() {
-                    let objects: Vec<(ObjectId, Vec<u8>)> = objects.into_iter().collect();
-                    created.push(self.upload_pack(&objects)?.0);
+                self.flush_part(&mut objects, &mut part, &mut created, &mut merged, opts)?;
+            }
+            if created.is_empty() {
+                rep.notes.push(
+                    "no merge would reduce the pack count: every candidate is large once decoded, \
+                     nothing merged"
+                        .into(),
+                );
+                return Ok(());
+            }
+            if opts.dry_run {
+                // Split parts can outnumber the planned groups: size the
+                // checkpoint the real run would build, as it does.
+                if super::fold_would_overflow(nrefs, live.len() - merged.len() + created.len()) {
+                    rep.notes.push(format!(
+                        "the merged checkpoint would exceed the cap of {MAX_LIST}: nothing merged"
+                    ));
+                    return Ok(());
                 }
+                rep.packs_merged = merged.len();
+                rep.packs_created = created.len();
+                return Ok(());
             }
             // Fence + fold in one CAS: the manifest tag we read is the state
             // the checkpoint describes, so a lost CAS just replans.
@@ -258,7 +282,7 @@ impl BucketTransport {
             let mut seen = BTreeSet::new();
             let mut kept: Vec<String> = packs
                 .into_iter()
-                .filter(|h| !replaced.contains(h) && seen.insert(h.clone()))
+                .filter(|h| !merged.contains(h) && seen.insert(h.clone()))
                 .collect();
             for h in &created {
                 if seen.insert(h.clone()) {
@@ -277,7 +301,7 @@ impl BucketTransport {
             }
             // Another compactor may have retired some of the packs we merged
             // already: replan rather than publish a second copy of the same data.
-            if !replaced.is_subset(&packs_now) {
+            if !merged.is_subset(&packs_now) {
                 continue 'attempt;
             }
             let mut try_seq = head_seq + 1;
@@ -320,7 +344,7 @@ impl BucketTransport {
                 .is_some()
             {
                 self.refresh()?;
-                rep.packs_merged = replaced.len();
+                rep.packs_merged = merged.len();
                 rep.packs_created = created.len();
                 rep.checkpoint_seq = seq;
                 return Ok(());
@@ -330,6 +354,35 @@ impl BucketTransport {
             "manifest kept moving or a concurrent compaction raced ({MAX_ATTEMPTS} attempts): \
              nothing merged, rerun"
         ));
+        Ok(())
+    }
+
+    /// Upload the objects of the source packs in `part` as one pack and mark
+    /// them merged, leaving `objects` and `part` empty. A part of fewer than two
+    /// sources is dropped: rewriting one pack into one gains nothing, and a
+    /// source whose decoded bytes alone pass the spill limit would otherwise
+    /// cost an upload per source (#263).
+    fn flush_part(
+        &self,
+        objects: &mut BTreeMap<ObjectId, Vec<u8>>,
+        part: &mut Vec<&String>,
+        created: &mut Vec<String>,
+        merged: &mut BTreeSet<String>,
+        opts: &CompactOptions,
+    ) -> Result<()> {
+        let objects: Vec<(ObjectId, Vec<u8>)> = std::mem::take(objects).into_iter().collect();
+        let sources = std::mem::take(part);
+        if sources.len() < 2 {
+            return Ok(());
+        }
+        // A dry run reads and splits the same way but uploads nothing, so its
+        // counts match what a real run would do.
+        created.push(if opts.dry_run {
+            String::new()
+        } else {
+            self.upload_pack(&objects)?.0
+        });
+        merged.extend(sources.into_iter().cloned());
         Ok(())
     }
 
@@ -434,10 +487,7 @@ impl BucketTransport {
                 }
             }
             rep.packs_deleted += del_packs.len();
-            rep.bytes_deleted += del_packs
-                .iter()
-                .flat_map(|(_, ms)| ms.iter().map(|m| m.size))
-                .sum::<u64>();
+            rep.bytes_deleted += pack_bytes(&del_packs);
             if opts.dry_run {
                 if rep.packs_created > 0 {
                     rep.notes.push(
@@ -458,10 +508,7 @@ impl BucketTransport {
             );
             if !unmoved {
                 rep.packs_deleted -= del_packs.len();
-                rep.bytes_deleted -= del_packs
-                    .iter()
-                    .flat_map(|(_, ms)| ms.iter().map(|m| m.size))
-                    .sum::<u64>();
+                rep.bytes_deleted -= pack_bytes(&del_packs);
                 continue;
             }
             // The delete loop can run long (one request per object), so look at
@@ -476,6 +523,7 @@ impl BucketTransport {
                 {
                     let left = del_packs.len() - i * PACK_DELETE_BATCH;
                     rep.packs_deleted -= left;
+                    rep.bytes_deleted -= pack_bytes(&del_packs[i * PACK_DELETE_BATCH..]);
                     rep.notes.push(format!(
                         "the manifest moved during pack deletion: {left} unreferenced pack(s) \
                          kept, rerun"

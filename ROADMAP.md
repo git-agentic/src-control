@@ -499,7 +499,9 @@ across every phase.
   a stale peer is told), only verifying signatures enter the signature index,
   and a remote that held a tombstone before trusting the signer re-judges it
   from a capped `.sc/transcript-pending` index when the trusted-signer set
-  changes. Crowding by valid signatures from attacker keys is tracked in #257.
+  changes. Valid signatures from attacker keys cannot crowd out a drop (#257: the
+  signature index holds one slot per (target, signer)), and serve-path index
+  updates take a short index lock (#260).
 
 - **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
   (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"
@@ -608,8 +610,12 @@ across every phase.
   6; client and server upgrade together). The gap is absence (ADR-0048), recorded
   by `.sc/promisor-blob-limit` with an explicit `AllPaths`/`Prefixes` scope; a lazy
   clone fills by id (a full view included), and otherwise the gap error names the
-  file and `sc backfill <path>` repairs it. Proven by `demo/run_blob_limit_demo.sh`.
-  (ADR-0055.)
+  file and `sc backfill <path>` repairs it. `sc fetch` from the promisor origin
+  sends the recorded limit again (`--no-blob-limit` opts out for one fetch), so
+  later growth is bounded too; every fetched tip stays complete (bar a blob the
+  clone already gapped). The object-count
+  limit is rejected, not deferred (ADR-0055 decision 10). Proven by
+  `demo/run_blob_limit_demo.sh`. (ADR-0055.)
 - **Phase 37d — Agent sessions on a partial clone.** `sc ws` and `sc work` work
   on a partial clone: a workspace sees the host's sparse view, and harvest lands
   through the ADR-0049 merge. (ADR-0050.)
@@ -683,7 +689,7 @@ under Deferred below.
 | **P37a — Want-by-id fetch (`sc cat`)** | Read outside a partial clone's filter without backfilling everything | `sc clone --filter src/ --lazy`; `sc cat main:docs/api/guide.bin` fetches exactly the absent trees and the blob by object id (`GetObjects`, wire v5), sibling untouched; `SC_OFFLINE=1` and non-lazy clones keep the gap error; proven by `demo/run_lazy_fetch_demo.sh` | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
 | **P37b — Presence-based partial clones** | Make push, verify, gc and the view agree on what a partial clone holds | `reachable_objects_partial` walks the store, not the filter; `GapInView` before any write; on a lazy, online clone the view closure is filled by id before switch, fast-forward, undo and `sparse set` (which may widen past the filter) | [0048](docs/adr/0048-presence-based-partial-clones.md) |
 | **P37c — Merge on partial clones** | `sc merge`, `sc cherry-pick` and `sc rebase` without a full clone | tree-recursive engine carries subtrees by id; conflicts in the view are marked and resolved with `sc conflicts`/`sc resolve`; conflicts outside the view are refused before any write | [0049](docs/adr/0049-merge-on-partial-clones.md) |
-| **P27 follow-on — Blob-size clone filter (#217)** | Clone a repo with large binary history without fetching old revisions | `sc clone --filter blob:limit=1MiB <src> <dst>` (with or without prefixes) leaves out old large blobs, the tip checkout is whole; verify/gc/push work; `--lazy` fills by id, `sc backfill <path>` repairs; wire v6; proven by `demo/run_blob_limit_demo.sh` | [0055](docs/adr/0055-blob-size-clone-filter.md) |
+| **P27 follow-on — Blob-size clone filter (#217)** | Clone a repo with large binary history without fetching old revisions | `sc clone --filter blob:limit=1MiB <src> <dst>` (with or without prefixes) leaves out old large blobs, the tip checkout is whole; verify/gc/push work; `--lazy` fills by id, `sc backfill <path>` repairs; `sc fetch` keeps the limit (`--no-blob-limit` opts out); wire v6; proven by `demo/run_blob_limit_demo.sh` | [0055](docs/adr/0055-blob-size-clone-filter.md) |
 | **P37d — Sessions on partial clones** | Agent workspaces on a partial clone | `sc ws fork/run/harvest/abandon` and `sc work` see the clone's sparse view; harvest lands through the ADR-0049 merge, conflicts fall back to `work-<i>` | [0050](docs/adr/0050-sessions-on-partial-clones.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
@@ -781,9 +787,6 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
-- **Sparse untracked-file guard edge cases.** #241: on a case-insensitive
-  filesystem the untracked-file guard can alias an old-view path with a newly
-  in-view one.
 - **User-file safety limits (ADR-0034 refinement 8, ADR-0044).** A file whose
   bytes equal the tracked or laid ones cannot be told from the stop's own
   write, so it is removed. `merge --abort` of a private-branch merge, which
@@ -804,11 +807,6 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   everything else reports a gap with the `sc backfill` repair. Dialing the promisor origin
   from any read path is still deferred (offline breakage, surprise latency,
   fetch-during-gc).
-- **Remainder of #217 (P27): a limit-aware `sc fetch` and an object-count clone
-  limit.** The blob-size filter shipped (ADR-0055); `sc fetch` stays unfiltered,
-  so the limit bounds the initial transfer, not later growth, and a limit-aware
-  fetch needs per-path exemptions for backfilled files. An object-count limit has
-  no stable definition (the transfer set is id-ordered) and no git precedent.
 - **`sc rewrap` on partial clones — refused (P37).** `Repo::rewrap` calls
   `refuse_on_partial`; a paths-only/streaming rebuild that would lift the
   refusal remains a possible follow-on.

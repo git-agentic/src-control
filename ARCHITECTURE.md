@@ -142,7 +142,7 @@ a retired pre-P16 snapshot encoding, refused with a clear error):
   other object, so it flows through fork/checkout/clone untouched and stays
   ciphertext until an authorized context decrypts it.
 - **Signature** (P22) — a bytes-only object over a domain-separated snapshot id
-  (`Ed25519`), indexed on the side (`.sc/signatures`); the crypto stays
+  (`Ed25519`), indexed on the side (`.sc/signatures.v2`); the crypto stays
   quarantined in `crates/crypto`, so `core` sees only opaque bytes.
 - **Transcript** (P30) — a sealed agent-session record attached to the snapshot
   it motivated: the same envelope shape as a `Secret` (fresh DEK wrapped per
@@ -291,7 +291,7 @@ recipient/escrow set. See ADR-0019/0027.
 HKDF-derived into *both* an X25519 encryption key and an Ed25519 signing key,
 written as a single `scl-id-<hex>` file (a pre-P22 v1 `scl-sk-` identity still
 parses and encrypts but cannot sign). Signatures are bytes-only CAS objects over
-a domain-separated snapshot id, indexed in `.sc/signatures`; `sc verify` walks
+a domain-separated snapshot id, indexed in `.sc/signatures.v2`; `sc verify` walks
 history and reports a four-state status (trusted ✓ / untrusted ? / invalid ✗ /
 unsigned). Session transcripts (P30) reuse the same signing machinery under a
 distinct domain. Signing binds identity to a *snapshot id*, detecting history
@@ -831,7 +831,7 @@ generic `"abandoned"` a manual `ws abandon` still shows. See ADR-0031.
 
 Signatures are ordinary CAS objects (`TAG_SIGNATURE`, bytes-only in
 `crates/core` — no crypto crosses the quarantine) over the domain-separated
-snapshot id; a local `.sc/signatures` index maps snapshot → signature ids,
+snapshot id; a local `.sc/signatures.v2` index maps (snapshot, signer) → signature id,
 gc-rooted and pruned alongside dead snapshots. `sc keygen` now emits a **v2
 identity**: one random seed, HKDF-derived into *both* an X25519 encryption
 key and an Ed25519 signing key in a single `scl-id-<hex>` file (a v1
@@ -998,7 +998,7 @@ a keyless clone gets ciphertext only. A one-to-many `.sc/transcripts` index
 (snapshot → transcript ids) means history-editing ops start each fresh
 snapshot with none attached, so there is no stale-provenance carry-forward
 to reason about. Signing is opt-in and reuses P22's machinery outright —
-same `SignatureObj` type, same `.sc/signatures` index, no second index —
+same `SignatureObj` type, same `.sc/signatures.v2` index, no second index —
 under a distinct signature domain string.
 
 Because transcripts are ordinary content-addressed CAS objects, transfer
@@ -1267,8 +1267,11 @@ records the limit and an explicit `AllPaths`/`Prefixes` scope (a size-only clone
 is `AllPaths`, with a full sparse view); `PackFilter` is the single definition of
 a filtered transfer (a prefix or a limit). A lazy size-only clone fills a gapped
 revision by id even though its view is full; otherwise the gap error names the
-file and `sc backfill <path>` repairs it. `sc fetch` is unfiltered, and the
-object-count limit is deferred. See ADR-0055.
+file and `sc backfill <path>` repairs it. `sc fetch` from the promisor origin
+sends the recorded limit (never the prefixes), so every fetched tip is complete
+(bar a blob the clone already gapped) and later history growth is gapped like the clone's; `--no-blob-limit` sends none
+for one fetch. There is no object-count limit: the transfer set is id-ordered, so
+"the first N objects" has no stable meaning. See ADR-0055.
 
 ## Phase 37c — merge, cherry-pick and rebase on a partial clone (built)
 

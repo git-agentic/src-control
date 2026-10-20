@@ -209,10 +209,15 @@ every claim below is checked against the shipped code, not the plan.
    laid; the marker is restored to its prior state once the spec is stored.
    The untracked-file guard checks only paths the old view did not match
    (those it laid out are not written, and a stopped op may have turned one
-   into a directory). Widening to the same spec is a quiet no-op. The guard does not count a case
-   alias of a laid-out path as tracked (`alias_ok = false`): on a case-insensitive
-   filesystem a decided `SRC/a.txt` would otherwise be written over the user's
-   resolution of `src/a.txt`. A crash between an atomic write's temp file
+   into a directory). Widening to the same spec is a quiet no-op. The guard never counts a case
+   alias of a laid-out path as tracked, for a stopped-op widen and for a plain
+   `sparse set`/`disable` alike (#241): both spellings come from one tree, so on a
+   case-insensitive filesystem a newly visible `SRC/a.txt` is the laid-out
+   `src/a.txt` itself, and writing it would replace that file's bytes (for a stopped
+   op, the user's resolution). The alias exemption stays for switch and the other
+   ops, where the old and new trees differ and a case-only rename is real; there it
+   needs a case-insensitive filesystem (probed with `.SC`, only when a case-variant
+   tracked path exists) and the same device and inode. A crash between an atomic write's temp file
    (`<name>.<pid>.<n>.tmp`) and its rename leaves that temp file beside the target;
    it is not recorded, delete it. The
    decided root is the right source: it is what completion carries an

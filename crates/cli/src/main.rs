@@ -435,6 +435,14 @@ enum Cmd {
         /// git remotes, which carry no transcripts.
         #[arg(long)]
         no_transcripts: bool,
+        /// A clone made with `--filter blob:limit=<size>` sends that limit on
+        /// every fetch from its origin, so blobs of at least that size that no fetched tip
+        /// reaches arrive as gaps (tips stay complete). This switch sends no
+        /// limit for this one fetch: history arrives in full. Per command,
+        /// not remembered; the recorded limit stays. Does nothing for a clone
+        /// without a limit.
+        #[arg(long)]
+        no_blob_limit: bool,
     },
     /// Push the current branch to a remote (fast-forward-only).
     Push {
@@ -1221,7 +1229,8 @@ fn main() -> Result<()> {
         Cmd::Fetch {
             remote,
             no_transcripts,
-        } => run_fetch(&remote, no_transcripts),
+            no_blob_limit,
+        } => run_fetch(&remote, no_transcripts, no_blob_limit),
         Cmd::Push {
             remote,
             include_encrypted,
@@ -4320,13 +4329,13 @@ fn print_compact_report(name: &str, url: &str, rep: &scl_repo::CompactReport) {
 /// remote gets a full-history import into a remote-tracking ref (see
 /// `run_fetch_git`); an `sc`-kind remote (or unconfigured, defaulting to `sc`)
 /// uses the existing object-transport fetch.
-fn run_fetch(remote: &str, no_transcripts: bool) -> Result<()> {
+fn run_fetch(remote: &str, no_transcripts: bool, no_blob_limit: bool) -> Result<()> {
     let repo = open_repo()?;
     let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
     match cfg.kind(remote) {
         Some(scl_repo::RemoteKind::Git) => run_fetch_git(&repo, remote),
         _ => {
-            let remote_refs = repo.fetch_opts(remote, no_transcripts)?;
+            let remote_refs = repo.fetch_limited(remote, no_transcripts, no_blob_limit)?;
             println!("fetched {remote}: {} remote branch(es)", remote_refs.len());
             for (branch, tip) in remote_refs {
                 println!("  {remote}/{branch} -> {}", tip.short());

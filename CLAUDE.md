@@ -142,10 +142,10 @@ the code, those win.
 | P24 | Sparse checkouts: `.sc/sparse` local prefix spec; checkout-only (CAS keeps everything) | [0034](docs/adr/0034-sparse-checkouts.md) |
 | P25 | Streaming pack transfer: bounded RAM on both sides, `ST_PACK_CHUNK` frames (`SC_PACK_CHUNK` tunes), two-pass atomic-after-verify ingest | [0035](docs/adr/0035-streaming-transfer.md) |
 | P26 | `sc+http://` transport: `sc serve --http`, thread-per-connection, status-line-before-handshake opening | [0036](docs/adr/0036-http-transport.md) |
-| P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3. Blob-size filter (#217): `--filter blob:limit=<size>` (combinable with prefixes; `blob:` is reserved) leaves out blobs of at least that size unless a ref tip reaches them, evaluated by the server (`GetPack.blob_limit`, wire v6); the gap is absence as in ADR-0048, `sc backfill <path>` or a lazy fill repairs it, `.sc/promisor-blob-limit` records limit and scope | [0037](docs/adr/0037-partial-clone.md), [0055](docs/adr/0055-blob-size-clone-filter.md) |
+| P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3. Blob-size filter (#217): `--filter blob:limit=<size>` (combinable with prefixes; `blob:` is reserved) leaves out blobs of at least that size unless a ref tip reaches them, evaluated by the server (`GetPack.blob_limit`, wire v6); the gap is absence as in ADR-0048, `sc backfill <path>` or a lazy fill repairs it, `.sc/promisor-blob-limit` records limit and scope; `sc fetch` from the promisor origin sends the recorded limit again (`--no-blob-limit` opts out for one fetch); no object-count limit (rejected) | [0037](docs/adr/0037-partial-clone.md), [0055](docs/adr/0055-blob-size-clone-filter.md) |
 | P28 | Security hardening: a max object size (default 256 MiB; `--max-object-size` / `SC_MAX_OBJECT_SIZE`, 2 MiB to 1 GiB) caps every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | P29 | `sc serve --http` access control: bearer tokens (`sc serve token add [--expires]`/`rotate`/`remove`/`list`; an expired token gets the same 401 as an unknown one), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
-| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex; retained signed tombstones ride a transfer when their snapshot is in it or was collected by the sender, only verifying signatures are indexed, and held-but-untrusted tombstones are re-judged from `.sc/transcript-pending` when the trusted-signer set changes (#230) | [0038](docs/adr/0038-agent-session-transcripts.md) |
+| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex; retained signed tombstones ride a transfer when their snapshot is in it or was collected by the sender, only verifying signatures are indexed, and held-but-untrusted tombstones are re-judged from `.sc/transcript-pending` when the trusted-signer set changes (#230); the signature index (`.sc/signatures.v2`) holds one slot per (target, signer) so attacker-made keys cannot crowd out a drop (#257), and serve-path index updates take a short `.sc/index.lock` distinct from the repo lock (#260) | [0038](docs/adr/0038-agent-session-transcripts.md) |
 | P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff; later `--max-conn-bytes` per-connection write budget (#233) | [0041](docs/adr/0041-listener-resource-limits.md) |
 | P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning (`sc tls list/forget/pin/path` manages the pin file); `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system` validate against a CA instead; client connect/handshake bounded; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md), [0053](docs/adr/0053-tls-pin-management.md), [0054](docs/adr/0054-tls-ca-validation.md) |
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
@@ -202,7 +202,13 @@ transport-adjacent. The rest, imperatively:
   with a limit the gap errors name the file's own path (`GapBySize`, or
   `GapInView` with the limit as a cause). A size-only clone has an `AllPaths`
   scope and a full sparse view, and a lazy one still fills on switch, undo, merge
-  and replay. `sc fetch` is not limit-aware, and the object-count limit is deferred.
+  and replay. `sc fetch` from the promisor origin sends the recorded limit (only
+  the limit, never the prefixes), so later growth stays bounded and every fetched
+  tip stays complete (except a blob the clone already gapped, which a reverting
+  tip names without it: `GapInView`); `sc fetch --no-blob-limit` sends none for that command. A
+  limited fetch records no remote-tracking ref for a private branch, as clone
+  does; `--no-blob-limit` receives them. There is no
+  object-count limit (ADR-0055 decision 10).
 - **Bucket remotes hold public content plaintext at rest** — bucket ACL is
   the perimeter (sealed content stays ciphertext, unchanged); partial-clone
   `filter` against bucket remotes is refused.
@@ -237,6 +243,10 @@ transport-adjacent. The rest, imperatively:
   `sc rewrap --rotate` at the tip (fresh key per protected blob; a plain
   `sc rewrap` only replaces wrap lists) plus rotating the underlying credential.
   History keeps the old ciphertext (rotation is not erasure).
+- **The signature index is `.sc/signatures.v2` (#257).** `.sc/signatures` is the
+  pre-#257 file, kept only for the one-time import. Do not run an older binary's
+  `sc gc` on a repo this build has signed in or ingested into: it roots only the
+  legacy file and sweeps the signatures v2 lists (ADR-0038).
 - **The oplog is local-only** (like a reflog) — it never travels over
   fetch/push/clone. `sc undo` twice = redo; undoing the initial commit is
   refused.
@@ -341,9 +351,9 @@ transport-adjacent. The rest, imperatively:
 
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here); entries that name an issue mirror the open
-GitHub issues. Standing entries: a limit-aware `sc fetch` and an object-count clone limit (#217 remainder), the non-unix
+GitHub issues. Standing entries: the non-unix
 `.sc/local-key` ACL (#214), and the open
-sparse guard and user-file safety limits (#241, ADR-0034 refinement 8).
+user-file safety limits of the sparse guard (ADR-0034 refinement 8).
 
 ## Agent skills
 
