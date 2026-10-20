@@ -1,6 +1,6 @@
 # ADR-0044: Per-branch access control (private branches)
 
-- **Status:** Accepted
+- **Status:** Accepted; merge-in under a sparse spec added in the "Merge-in under a sparse spec (#240)" section
 - **Date:** 2026-07-11
 - **Phase:** 34
 - **Builds on:** ADR-0043 (P33 randomized sealing — the seal primitive private

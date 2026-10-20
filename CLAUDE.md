@@ -300,7 +300,7 @@ truth — do not re-list items here); entries that name an issue mirror the open
 GitHub issues. Standing entries: named/concurrent `sc ws` sessions (#215),
 blob-size clone filters (#217), bucket compaction and gc (#216), the non-unix
 `.sc/local-key` ACL (#214), transcript-drop delivery gaps (#230), and the open
-sparse, private-branch and abort edge cases (#240, #241, #246, #247, #248, #243).
+sparse, private-branch and abort edge cases (#241, #246, #247, #248, #243).
 
 ## Agent skills
 

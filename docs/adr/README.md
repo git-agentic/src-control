@@ -44,7 +44,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0031](0031-hardening-consolidation.md) | Hardening & consolidation sweep — closing the P16–P20 review tail | Accepted | 21 |
 | [0032](0032-signed-commits-provenance.md) | Signed commits & provenance | Accepted | 22 |
 | [0033](0033-merge-ergonomics.md) | Merge ergonomics — conflict UX beyond markers | Accepted | 23 |
-| [0034](0034-sparse-checkouts.md) | Sparse checkouts / sub-tree sharing | Accepted | 24 |
+| [0034](0034-sparse-checkouts.md) | Sparse checkouts / sub-tree sharing | Accepted; private merge-in under sparse in 0044 | 24 |
 | [0035](0035-streaming-transfer.md) | Streaming pack transfer (bounded-RAM, >4 GiB) | Accepted | 25 |
 | [0036](0036-http-transport.md) | sc-native HTTP transport (`sc+http://`) | Accepted; gaps closed by 0040, 0041, 0042 | 26 |
 | [0037](0037-partial-clone.md) | Partial clone (promisor store + prefix-scoped fetch) | Accepted; refusals lifted by 0048, 0049, 0050 | 27 |
@@ -54,7 +54,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0041](0041-listener-resource-limits.md) | Listener resource limits (connection cap, session timeout, spool cap, accept backoff) | Accepted | 31 |
 | [0042](0042-in-binary-tls-sc-https.md) | In-binary TLS — `sc+https://` via rustls | Accepted; CA validation 0054, pin management 0053 | 32 |
 | [0043](0043-randomized-protected-encryption.md) | Randomized protected-path encryption (dual-read, randomized-write) | Accepted; rotate-for-paths built as 0051 | 33 |
-| [0044](0044-per-branch-access-control.md) | Per-branch access control with opaque private branches | Accepted | 34 |
+| [0044](0044-per-branch-access-control.md) | Per-branch access control with opaque private branches | Accepted; sparse merge-in section (#240) | 34 |
 | [0045](0045-native-desktop-read-model.md) | Native desktop adapter and keyless read model | Accepted | 35 |
 | [0046](0046-wal-bucket-remotes.md) | Bucket remotes via an immutable-pack WAL + one CAS'd manifest | Accepted | 36 |
 | [0047](0047-want-by-id-fetch-and-gap-fill.md) | Want-by-id fetch and explicit gap fill for partial clones | Accepted (built) | 37 |

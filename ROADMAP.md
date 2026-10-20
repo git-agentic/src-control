@@ -755,11 +755,9 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   not sent after the dropper's gc removed its snapshot, and a tombstone a
   push-only remote received before trusting the signer is not re-evaluated
   later; both are documented limits, not regressions.
-- **Sparse + private-branch and untracked-file edge cases.** #240: a conflicted
-  merge-in on a private branch under a sparse spec resurrects a file the public
-  side deleted outside the view. #241: on a case-insensitive filesystem the
-  untracked-file guard can alias an old-view path with a newly in-view one.
-  #248: an untracked file at an out-of-view path that the other side adds wins
+- **Sparse untracked-file guard edge cases.** #241: on a case-insensitive
+  filesystem the untracked-file guard can alias an old-view path with a newly
+  in-view one. #248: an untracked file at an out-of-view path that the other side adds wins
   over the merge result at completion.
 - **Abort and private-merge stop bugs.** #246: `--abort` of a merge stopped on a
   private branch fails with `WrongKind`, and a binary conflict's `.theirs`
