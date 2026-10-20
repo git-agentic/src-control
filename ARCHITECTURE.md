@@ -370,10 +370,11 @@ branch ref. `switch` materializes the target branch tip into the working tree,
 removing tracked files that are absent from the target, and refuses the
 operation if tracked files are modified or deleted (to prevent data loss). New,
 untracked files are left in place. `status` diffs the working tree against HEAD.
-Every write-out path (switch, merge, rebase, `sparse set`, clone, `ws fork`,
-private and conflict write-outs) applies the recorded file mode through one
+The write-out paths (switch, merge, rebase, `sparse set`, clone, `ws fork`,
+private and conflict write-outs) apply the recorded file mode through one
 helper, so an executable file stays executable on unix and a stale execute bit
-is cleared on a plain file (#242).
+is cleared on a plain file (#242). `sc resolve` after the user deleted a
+conflicted file does not use it yet (#243).
 
 ### Mode-scoped disk invariant
 
@@ -1016,7 +1017,7 @@ Later additions to the same policy: `--max-object-size` (operator-configurable
 per-object cap, #213) and `--max-conn-bytes`, a per-connection write budget on
 both transports that counts every `PutObject` and each `PutPack`'s larger of
 spool and decoded bytes, replies `ConnectionBudgetExceeded` and closes (#233,
-no `PROTOCOL_VERSION` change; see the ADR-0039 addenda).
+no `PROTOCOL_VERSION` change; see the ADR-0039 additions).
 
 The read-only pre-drain is capped at 8 MiB (`RO_DRAIN_CAP`), and the accept
 loop gained a hardcoded Go-`net/http`-shaped exponential backoff around fd

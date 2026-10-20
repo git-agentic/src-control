@@ -492,13 +492,14 @@ too, not just the src-control-side metadata.
   filler only ever dials the origin. A hostile or pruned origin can make a gap
   permanent (it can answer "not sent", or prune history a clone still
   points at); it cannot plant an object under another id, and a gap surfaces
-  as `GapInView` or a fill error before any write, never as silently missing
-  content.
+  as `GapInView` or a fill error before any ref, operation-state or
+  working-tree change, never as silently missing content. Objects a fill had
+  already fetched by id stay in the store.
 - **`--filter` is request scope, not access control.** The filter says what a
   clone asked for. Any client that can read the served repository can still
-  fetch anything by id (`sc backfill`, `GetObjects`); a filter hides nothing
-  from the user running the clone, and sealed or protected content is governed
-  by its keys, not by the filter.
+  fetch the rest (`sc backfill`, or by id where By-id object reads allows it);
+  a filter hides nothing from the user running the clone, and sealed or
+  protected content is governed by its keys, not by the filter.
 - **Merge carries subtrees by id without reading them (ADR-0049), so the
   protection check happens before the carry.** A subtree is carried only when
   the sides agree and no protection rule of either side covers it or lies
@@ -518,7 +519,7 @@ too, not just the src-control-side metadata.
   clone does not hold, and a workspace commit grafts the out-of-view subtrees
   from the base by id. This bounds what an agent touches by default; it is not a
   confidentiality boundary against the user, who can widen the view with
-  `sc sparse set` or `sc backfill`.
+  `sc sparse set`.
 - **Operations that need a complete closure refuse on a partial clone, fail
   closed:** `sc export`, `sc rewrap`, `sc grant`/`revoke`, private branches, and
   `sc push` to a git remote. They refuse rather than run on partial data.

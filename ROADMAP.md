@@ -573,7 +573,8 @@ across every phase.
   widen past the filter. (ADR-0048.)
 - **Phase 37c — Merge, cherry-pick and rebase on a partial clone.** A
   tree-recursive three-way engine carries a subtree by id where the sides agree
-  and no protection rule applies; conflicts inside the view are marked and
+  and no protection rule applies (a subtree identical on all three sides is
+  carried even under a rule); conflicts inside the view are marked and
   resolved as on a full clone, conflicts outside it are refused before any
   write. (ADR-0049.)
 - **Phase 37d — Agent sessions on a partial clone.** `sc ws` and `sc work` work
@@ -599,7 +600,8 @@ across every phase.
     path, and `sc sparse set` may widen while a merge, pick or rebase is stopped
     (#224, #236); a stopped completion no longer resurrects out-of-view
     deletions (#239).
-  - Checkout restores the executable bit on every write-out path (#242).
+  - Checkout restores the executable bit on the write-out paths (#242); `sc resolve`
+    after the user deleted a conflicted file still drops it (#243).
   - A warning when the protected-cache key cannot be permission-restricted on a
     non-unix target (#225; the owner-only ACL is #214).
 
@@ -635,7 +637,7 @@ under Deferred below.
 | **P24 — Sparse checkouts / sub-tree sharing** | Materialize one subtree of a large repo, leave the rest on the CAS | `sc sparse set <prefix…>`/`show`/`disable`; `commit`'s absent-path carry widens to out-of-sparse paths (byte-identical carried subtrees); `materialize` filters both its write and removal loops; proven by `demo/run_sparse_demo.sh` (narrow, edit, commit, then disable/clone restore byte-identical) | [0034](docs/adr/0034-sparse-checkouts.md) |
 | **P25 — Streaming pack transfer (bounded-RAM, >4 GiB)** | `push`/`fetch`/`clone` over ssh:// don't hold a whole pack in RAM anywhere — server, wire, or client | `PackWriter`/`parse_pack_reader` (bounded-RAM pack build/parse); `ST_PACK_CHUNK`/`ST_PACK_END` chunk framing (`SC_PACK_CHUNK`-tunable); `PROTOCOL_VERSION` 2, v1 dropped; two-pass atomic-after-verify ingest + `TempPackGuard`; the ssh client's own `sync.rs` fetch/push call sites route through the same `ingest_pack_file`/`write_ids_to_temp_pack` machinery (final-review fix); proven by `demo/run_streaming_demo.sh` (forced 4 KiB chunks, byte-for-byte clone, signature rides the stream, zero temp residue) | [0035](docs/adr/0035-streaming-transfer.md) |
 | **P26 — sc-native HTTP transport** | Reach a repo over plain TCP with no ssh account | `sc serve --http <addr> <path>`; `sc clone sc+http://host[:port]/repo`; thread-per-connection server, opening-status mapped before the wire handshake, P25 chunk stream + P22 signatures ride the raw socket with no HTTP framing; proven by `demo/run_http_remote_demo.sh` (real loopback TCP, no shim; clone/push/fetch byte-for-byte, signed commit verifies clean, zero `.sc/tmp` residue) | [0036](docs/adr/0036-http-transport.md) |
-| **P27 — Partial clone** | Bound network transfer to a subset of paths, not the whole repo | `sc clone --filter <prefix…> <src> <dst>` fetches only in-filter objects (`.sc/promisor` + filtered reachability walk); `sc backfill <prefix…>` widens on demand; `sc gc`/`sc verify` are gap-tolerant; merge/rebase/`ws harvest`/`sc work`/`sc export` refused on a partial clone (the merge, replay and session refusals were lifted by P37c/P37d; `export` still refuses); proven by `demo/run_partial_clone_demo.sh` (fewer objects fetched, push composes after a partial-clone commit, backfill shrinks the gap count, gc preserves everything, run twice) | [0037](docs/adr/0037-partial-clone.md) |
+| **P27 — Partial clone** | Bound network transfer to a subset of paths, not the whole repo | `sc clone --filter <prefix…> <src> <dst>` fetches only in-filter objects (`.sc/promisor` + filtered reachability walk); `sc backfill <prefix…>` widens on demand; `sc gc`/`sc verify` are gap-tolerant; merge/rebase/`ws harvest`/`sc work`/`sc export` refused on a partial clone at the time (P37c and P37d later lifted the merge, replay and session refusals; `sc export` still refuses); proven by `demo/run_partial_clone_demo.sh` (fewer objects fetched, push composes after a partial-clone commit, backfill shrinks the gap count, gc preserves everything, run twice) | [0037](docs/adr/0037-partial-clone.md) |
 | **P28 — Security hardening sweep** | Close the audit's concrete-bug Highs + surface the accepted Mediums | strict ref-name validation at the write/read boundary (hostile wire `UpdateRef` + git-remote branch names rejected); `MAX_OBJECT_SIZE` caps every untrusted frame/pack-record/zstd-output length; `sc protect` nudges low-entropy secret filenames toward `sc secret`; secret env-var boundary documented as authorized-local-process-context + plaintext stays `Zeroizing`; every prior demo green + new pinned regression tests, no new dependency | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | **P29 — sc+http access control** | Close the audit's remaining unauthenticated-server High | fail-closed non-loopback bind; `sc serve token add/remove/list` + `SC_HTTP_TOKEN` bearer auth at the HTTP opening (constant-time `BLAKE3` compare, `401` before the wire handoff); `--read-only`/`ro`-scope tokens reject mutating verbs before any store write via `EC_READONLY`; proven by `demo/run_http_auth_demo.sh` | [0040](docs/adr/0040-sc-http-access-control.md) |
 | **P30 — Agent session transcripts** | Attach a sealed, provenance-checked agent-session record to a commit | `sc transcript attach <ref> <file> --agent claude --sign`; a keyless clone gets ciphertext only, the recipient's identity decrypts byte-exact; `sc log` shows a non-decrypting presence marker; `sc gc` prunes a transcript once its only snapshot is unreachable; proven by `demo/run_transcript_demo.sh` | [0038](docs/adr/0038-agent-session-transcripts.md) |
@@ -771,8 +773,9 @@ items live under Done above, not here.
   shipped.)
 - **Transparent lazy-fetch in read paths (P27, narrowed by P37).** `Store::get`
   stays network-free by design (ADR-0037, ADR-0047). What shipped is opt-in: a
-  lazy clone's `sc cat` and view-filling operations fetch by id, and everything
-  else reports a gap with the `sc backfill` repair. Dialing the promisor origin
+  lazy, online clone's `sc cat`, view-filling operations (switch, fast-forward,
+  undo, `sparse set`) and merge, cherry-pick and rebase fetch by id, and
+  everything else reports a gap with the `sc backfill` repair. Dialing the promisor origin
   from any read path is still deferred (offline breakage, surprise latency,
   fetch-during-gc).
 - **Blob-size and object-count clone filters (#217, P27).** `sc clone --filter`

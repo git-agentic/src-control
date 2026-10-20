@@ -347,8 +347,9 @@ review established, as constraints on that work:
   site with the ordering tests, reply-cap alignment with batch splitting,
   `sparse set` outside the filter. Demo: widen, commit, push, a second clone
   sees it; gc and verify after; undo after a widen while offline.
-- **37b-iii onward.** Merge design record after a spike, then replay, then a
-  decision on sessions.
+- **37b-iii onward (since built).** Merge design record after a spike, then replay,
+  then a decision on sessions: merge and replay are ADR-0049 (P37c), sessions
+  are ADR-0050 (P37d).
 
 ## Consequences
 

@@ -19,7 +19,7 @@ cargo run --bin sc -- demo --agents 4 --checkout   # also materialize each workt
                                              # temp dir (the one disk-writing path), then clean up
 cargo run --bin sc -- import --repo <path>   # import a Git repo's HEAD
 bash demo/run_demo.sh                         # independent zero-residue proof
-cargo run --bin sc -- keygen [--out <file>]  # (default ~/.sc/identity, 0600) v2 identity: one seed derives BOTH an X25519
+cargo run --bin sc -- keygen [--out <file>]  # (default ~/.sc/identity; 0600 on unix only) v2 identity: one seed derives BOTH an X25519
                                              # encryption key and an Ed25519 signing key (P22);
                                              # a pre-P22 v1 (scl-sk-) identity still parses and
                                              # still encrypts, but cannot sign
@@ -345,8 +345,8 @@ cargo run --bin sc -- clone sc+http://host[:port]/repo <dst>   # clone over sc+h
                                               # port defaults to 8730); sc remote add/fetch/push
                                               # accept the same sc+http:// URL form
 cargo run --bin sc -- remote add <name> sc+wal://<dir>          # bucket WAL remote on a local
-                                              # directory (P36, ADR-0046); `clone`/`fetch`/`push`
-                                              # take the same URL form
+                                              # directory (P36, ADR-0046); `clone` takes the URL
+                                              # directly, `fetch`/`push` use the remote's name
 cargo run --bin sc -- remote add <name> sc+s3://<bucket>/<prefix>   # same, on an S3-compatible
                                               # store; a malformed URL (e.g. no bucket) is rejected
                                               # at `remote add` time. Public content is plaintext at
@@ -405,8 +405,9 @@ bash demo/run_partial_clone_demo.sh           # partial clone proof (P27): sc cl
                                               # docs/ shrinks the gap count; sc gc succeeds and
                                               # preserves everything; run twice
 bash demo/run_limits_demo.sh                  # listener-limits proof (P31): --max-connections
-                                              # busy shed and slot reuse, --timeout and
-                                              # --max-pack-size parse and take effect
+                                              # busy shed and slot reuse; --timeout and
+                                              # --max-pack-size are accepted (timeout expiry
+                                              # itself is unit-tested, not shown here)
 bash demo/run_http_auth_demo.sh               # sc+http access-control proof (P29): a no-token
                                               # clone is rejected with an authentication error,
                                               # an ro-token clone reads but its push is rejected

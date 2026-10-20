@@ -25,7 +25,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0012](0012-three-way-merge.md) | Three-way merge with a snapshot common ancestor | Accepted | 4 |
 | [0017](0017-secret-scanner.md) | Accidental-plaintext secret scanner at commit time | Accepted | 5 |
 | [0013](0013-remote-sync-model.md) | Remote sync via object + ref transfer over a pluggable transport | Accepted | 6 |
-| [0014](0014-per-file-permissions-encrypted-paths.md) | Per-file permissions as encrypted paths (convergent encryption) | Accepted; new content superseded by 0043 | 7 |
+| [0014](0014-per-file-permissions-encrypted-paths.md) | Per-file permissions as encrypted paths (convergent encryption) | Accepted; new content superseded by 0043, rotation added by 0051 | 7 |
 | [0015](0015-packfiles-and-gc.md) | Packfiles and reachability-based garbage collection | Accepted | 8 |
 | [0016](0016-git-export.md) | Git export for round-trip interop | Accepted | 9 |
 | [0018](0018-git-as-a-remote.md) | Git as a remote (bidirectional sync) | Accepted | 10 |
@@ -74,7 +74,7 @@ ahead of 0015–0016.
 
 - **Proposed** — under discussion, not yet built.
 - **Accepted** — decided and implemented. `Accepted (built)` marks a multi-step
-  ADR whose steps (such as 37b-i to 37c-iv) have all landed.
+  ADR whose steps (such as 37b-i and 37b-ii in ADR-0048) have all landed.
 - **Accepted; … by ADR-NNNN** — still the record of its decision, but a later ADR
   changed a current fact (a refusal lifted, a deferred item built, a default
   narrowed). The body is left as written; read the pointer for today's behavior.
