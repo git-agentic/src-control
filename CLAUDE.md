@@ -169,6 +169,14 @@ transport-adjacent. The rest, imperatively:
   transfer path only — a larger blob commits locally but fails every
   subsequent push/fetch/clone at the receiver. There is no negotiation: each
   receiver applies its own cap, so it must admit the objects it receives. Never inline a size in a new length guard; read the accessor.
+- **Writes are budgeted per connection (#233).** `sc serve --max-conn-bytes`
+  (default `--max-pack-size` plus the max object size; must be > 0 and at least
+  both) counts `PutObject` bytes (structural objects included, `blob_size` 0 or
+  not) and, per `PutPack`, the larger of its spool bytes and the decoded bytes
+  held (structural records; every record on a `--store` bucket); the default
+  (~16.25 GiB) does not bound RAM, lower it with `--max-pack-size`; exceeding it replies `ConnectionBudgetExceeded` (`EC_BUDGET`, no
+  version bump) and closes the connection. Reads are not budgeted. A new
+  object-write verb must charge `ConnBudget` in `serve_session`.
 - **The P35 desktop app is a keyless, read-only top-level adapter.** Its
   renderer has five typed repository commands, no general filesystem/shell
   capability, and no DTO field capable of carrying protected ciphertext or

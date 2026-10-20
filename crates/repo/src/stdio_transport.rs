@@ -186,7 +186,23 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
     fn put_pack(&self, src: &mut dyn Read) -> Result<Vec<ObjectId>> {
         let mut rw = self.rw.borrow_mut();
         wire::write_frame(&mut rw.1, &Request::PutPack.encode())?;
-        wire::write_pack_stream(&mut rw.1, src, wire::pack_chunk_size())?;
+        let mut sock = SocketWrites {
+            inner: &mut rw.1,
+            dead: false,
+        };
+        if let Err(e) = wire::write_pack_stream(&mut sock, src, wire::pack_chunk_size()) {
+            // A server that refused mid-stream (pack or connection budget)
+            // replies and closes; surface its typed error instead of the
+            // broken pipe. Only when the *socket write* failed on a dead
+            // connection: an error reading `src` is local and the server is
+            // still waiting for us, so a reply read could block.
+            if sock.dead {
+                if let Ok(frame) = wire::read_frame(&mut rw.0) {
+                    wire::parse_response(frame)?;
+                }
+            }
+            return Err(e);
+        }
         let frame = wire::read_frame(&mut rw.0)?;
         wire::decode_ids_body(&wire::parse_response(frame)?)
     }
@@ -197,6 +213,29 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
     /// cannot make a by-id fetch spool without bound.
     fn get_objects(&self, ids: &[ObjectId], out: &mut dyn Write) -> Result<Vec<ObjectId>> {
         self.get_objects_flagged(ids, out, &mut false)
+    }
+}
+
+/// Write adapter that records whether a write to the peer failed because the
+/// connection is gone (not a timeout), to tell it from a local `src` error.
+struct SocketWrites<'a, W: Write> {
+    inner: &'a mut W,
+    dead: bool,
+}
+
+impl<W: Write> Write for SocketWrites<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf).inspect_err(|e| self.note(e))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush().inspect_err(|e| self.note(e))
+    }
+}
+
+impl<W: Write> SocketWrites<'_, W> {
+    fn note(&mut self, e: &std::io::Error) {
+        use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+        self.dead |= matches!(e.kind(), BrokenPipe | ConnectionReset | ConnectionAborted);
     }
 }
 
