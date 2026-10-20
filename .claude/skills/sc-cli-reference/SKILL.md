@@ -288,8 +288,16 @@ cargo run --bin sc -- serve --http <addr> <path> [--read-only] [--allow-public]
                                               # trip; opening keeps its own 30s (P31)
                                               # --max-pack-size <bytes>: incoming-pack aggregate
                                               # cap, both --http and --stdio, default 16 GiB,
-                                              # 0=unlimited, floor 256 MiB (MAX_OBJECT_SIZE);
+                                              # 0=unlimited, floor = the max object size;
                                               # counted mid-stream abort -> EC_TOO_LARGE (P31)
+                                              # --max-object-size <bytes|KiB|MiB|GiB>: largest
+                                              # single object accepted from a peer, default
+                                              # 256MiB, range 2MiB..1GiB, out of range aborts
+                                              # startup (never clamped). Clients use env
+                                              # SC_MAX_OBJECT_SIZE (same parse, any command; empty = unset);
+                                              # flag beats env. No negotiation: each receiver
+                                              # applies its own cap; a larger object fails at
+                                              # whichever side receives it (#213)
 cargo run --bin sc -- serve token add --label <name> --scope ro|rw [--expires <30m|12h|7d|2w|YYYY-MM-DD>]
                                               # mint an sct-<hex> bearer token in
                                               # .sc/serve-tokens.toml; raw value prints once on

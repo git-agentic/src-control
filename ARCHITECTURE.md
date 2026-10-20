@@ -139,7 +139,7 @@ a retired pre-P16 snapshot encoding, refused with a clear error):
 
 Objects are serialized canonically (length-prefixed, sorted tree entries) so the
 hash is stable across machines. Every decode length prefix is bounded by a
-`MAX_OBJECT_SIZE` / remaining-bytes guard (P28) so a hostile object can't drive
+max-object-size / remaining-bytes guard (P28) so a hostile object can't drive
 an unbounded allocation.
 
 ## In-memory VFS layer
@@ -888,7 +888,7 @@ coarsening rather than per-case gap tolerance. See ADR-0037.
 ## Phase 28 — security hardening sweep (built)
 
 A dedicated security pass closing exposure introduced by opening the store
-to untrusted network peers (P26/P27). One `MAX_OBJECT_SIZE` cap bounds any
+to untrusted network peers (P26/P27). One max-object-size cap (`scl_core::max_object_size()`, ADR-0039 addendum) bounds any
 single object's decompressed/decoded size at every read/write boundary that
 takes attacker-controlled bytes, closing a decompression-bomb / unbounded-
 allocation class that P25's `read_frame_inner` had already named as a known
@@ -945,8 +945,8 @@ limit a new connection gets an immediate busy status at the pre-handshake
 opening seam and closes — no queuing), `--timeout` (default 300s; read+write
 timeouts now persist for the whole session instead of being cleared after the
 opening, connection-fatal on trip since a mid-stream abort desyncs the frame
-stream), and `--max-pack-size` (default 16 GiB, floor 256 MiB =
-`MAX_OBJECT_SIZE`; lives in the shared `WirePolicy`, so it applies to both
+stream), and `--max-pack-size` (default 16 GiB, floor = the max object
+size, 256 MiB by default; lives in the shared `WirePolicy`, so it applies to both
 `--http` and `--stdio`; a counted mid-stream abort replies `EC_TOO_LARGE`).
 
 The read-only pre-drain is capped at 8 MiB (`RO_DRAIN_CAP`), and the accept

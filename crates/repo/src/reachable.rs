@@ -28,6 +28,10 @@ pub struct TransportSource<'a> {
 impl ObjectSource for TransportSource<'_> {
     fn get(&mut self, id: &ObjectId) -> Result<Object> {
         let bytes = self.transport.get_object(id)?;
+        // The receiver's cap, before decoding. (A local-path source has
+        // already loaded and encoded the object by now; wire sources refuse
+        // earlier, in `WireClient::get_object`.)
+        crate::wire::check_object_len(bytes.len(), scl_core::max_object_size())?;
         let obj = Object::decode(&bytes).map_err(Error::from)?;
         if obj.id() != *id {
             return Err(Error::CorruptObject(*id));

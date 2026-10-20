@@ -363,10 +363,18 @@ enum Cmd {
         #[arg(long)]
         timeout: Option<u64>,
         /// Maximum incoming pack size in bytes (both --http and --stdio);
-        /// 0 = unlimited. Default 16 GiB. Must be ≥ 256 MiB (MAX_OBJECT_SIZE)
-        /// when non-zero. (P31)
+        /// 0 = unlimited. Default 16 GiB. Must be at least the max object
+        /// size (default 256 MiB) when non-zero. (P31)
         #[arg(long)]
         max_pack_size: Option<u64>,
+        /// Largest single object accepted from a peer: bytes, or a number
+        /// with a KiB/MiB/GiB suffix. Default 256MiB, range 2MiB to 1GiB;
+        /// out-of-range values are refused at startup, never clamped. Clients
+        /// set it with `SC_MAX_OBJECT_SIZE`. Each receiver applies its own
+        /// cap, so a larger object fails at whichever side is receiving it.
+        /// (#213)
+        #[arg(long, value_name = "SIZE")]
+        max_object_size: Option<String>,
         /// Serve TLS (`sc+https://`): auto-mints a self-signed identity into
         /// `.sc/serve-tls/` unless --tls-cert/--tls-key supply a PEM pair.
         /// `--http` only. (P32)
@@ -971,8 +979,31 @@ struct DemoArgs {
     checkout: bool,
 }
 
+/// Fix the process-wide object cap before any command runs: `sc serve
+/// --max-object-size` wins over `SC_MAX_OBJECT_SIZE` (empty = unset), which wins over the
+/// default. An out-of-range or unparsable value aborts startup (#213).
+fn init_max_object_size(flag: Option<&str>) -> Result<()> {
+    let (src, raw) = match (flag, std::env::var("SC_MAX_OBJECT_SIZE")) {
+        (Some(f), _) => ("--max-object-size", f.to_string()),
+        // An empty variable (`SC_MAX_OBJECT_SIZE=`) means unset, so exporting
+        // it blank in a profile does not abort every command.
+        (None, Ok(e)) if e.trim().is_empty() => return Ok(()),
+        (None, Ok(e)) => ("SC_MAX_OBJECT_SIZE", e),
+        (None, Err(std::env::VarError::NotPresent)) => return Ok(()),
+        (None, Err(e)) => anyhow::bail!("SC_MAX_OBJECT_SIZE: {e}"),
+    };
+    let n = scl_core::parse_object_size(&raw).map_err(|e| anyhow::anyhow!("{src}: {e}"))?;
+    scl_core::set_max_object_size(n).map_err(|e| anyhow::anyhow!("{src}: {e}"))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_max_object_size(match &cli.cmd {
+        Cmd::Serve {
+            max_object_size, ..
+        } => max_object_size.as_deref(),
+        _ => None,
+    })?;
     match cli.cmd {
         Cmd::Demo(args) => run_demo(args),
         Cmd::Import { repo } => run_import(repo),
@@ -1068,6 +1099,7 @@ fn main() -> Result<()> {
             max_connections,
             timeout,
             max_pack_size,
+            max_object_size: _,
             tls,
             tls_cert,
             tls_key,
@@ -3832,7 +3864,7 @@ fn run_serve(
                 );
             }
             let max_pack = max_pack_size.unwrap_or(scl_repo::wire::DEFAULT_MAX_PACK_SIZE);
-            scl_repo::wire::validate_max_pack_size(max_pack)?;
+            scl_repo::wire::validate_max_pack_size(max_pack, scl_core::max_object_size())?;
             let policy = scl_repo::wire::WirePolicy {
                 read_only: false,
                 max_pack_size: max_pack,

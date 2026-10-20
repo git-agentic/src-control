@@ -102,7 +102,10 @@ impl<R: Read, W: Write> WireClient<R, W> {
         // is already part-way through the stream, so report it as a protocol
         // violation that callers must not answer by splitting the batch.
         wire::read_pack_stream(&mut rw.0, out, GET_OBJECTS_RESPONSE_CAP).map_err(|e| match e {
-            Error::PackTooLarge(m) => Error::Protocol(format!("by-id reply too large: {m}")),
+            Error::PackTooLarge(_) => Error::Protocol(format!(
+                "by-id reply exceeded this client's {}-byte spool limit",
+                GET_OBJECTS_RESPONSE_CAP
+            )),
             other => other,
         })?;
         Ok(not_sent)
@@ -120,7 +123,9 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
         wire::decode_bool_body(&self.call(Request::HasObject(*id))?)
     }
     fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        self.call(Request::GetObject(*id))
+        let body = self.call(Request::GetObject(*id))?;
+        wire::check_object_len(body.len(), scl_core::max_object_size())?;
+        Ok(body)
     }
     fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
         self.call(Request::PutObject {
@@ -195,8 +200,12 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
     }
 }
 
-/// Most bytes a client accepts in one `GetObjects` reply stream (1 GiB).
-const GET_OBJECTS_RESPONSE_CAP: u64 = 1 << 30;
+/// Most bytes a client accepts in one `GetObjects` reply stream: twice the
+/// server's by-id reply ceiling, so pack framing never trips it on a
+/// legitimate reply. A constant, not derived from the local object cap: it
+/// bounds a disk spool, not RAM, and a cap that differed between the two ends
+/// must not make a by-id batch with no large object fail.
+const GET_OBJECTS_RESPONSE_CAP: u64 = 2 * crate::transport::BY_ID_REPLY_CEILING;
 
 /// A [`Transport`] whose far end is a child process speaking the wire protocol
 /// on its stdio — `ssh <host> sc serve --stdio <path>` for real remotes.
