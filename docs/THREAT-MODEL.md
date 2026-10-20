@@ -216,7 +216,9 @@ too, not just the src-control-side metadata.
   and signer public key of such drops to any peer the dropper transfers with,
   including one that never had the snapshot (ids are hashes, bodies stay
   sealed). Only signatures that verify for a held target are indexed, so
-  forged signatures are never stored or forwarded. A writer to a shared remote
+  forged signatures stay in the object store (until gc sweeps them) but are
+  never indexed, so a `sc serve` or local sender never forwards them and gc
+  never keeps them (a bucket forwards what it holds; receivers filter). A writer to a shared remote
   who signs with keys of their own can still crowd more than 256 valid
   signatures ahead of the real one, which keeps the drop inert on every peer
   that ingests them (a denial of the drop, never an honored one; #257). Writers
