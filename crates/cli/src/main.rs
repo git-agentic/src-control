@@ -294,7 +294,8 @@ enum Cmd {
         #[command(subcommand)]
         op: WsOp,
     },
-    /// Clone a repo (local path or `ssh://` URL) into a new directory.
+    /// Clone a repo (local path, `ssh://`, `sc+http(s)://`, `sc+wal://`/`sc+s3://`
+    /// or Git URL) into a new directory.
     Clone {
         src: String,
         dst: PathBuf,
@@ -441,12 +442,11 @@ enum Cmd {
         #[arg(long)]
         no_transcripts: bool,
     },
-    /// Protect a path prefix: files under it are convergently encrypted for the
-    /// named recipients on commit. With `--list` (or no prefix), list the rules.
-    /// Convergent encryption is equality-confirmable — an attacker who can
-    /// guess a candidate plaintext can confirm a match (see ADR-0014); for
-    /// low-entropy secrets (API keys, `.env` files, credentials), prefer
-    /// `sc secret` instead.
+    /// Protect a path prefix: files under it are encrypted for the named
+    /// recipients on commit (randomized sealing since P33, ADR-0043; ciphertext
+    /// from before P33 stays equality-confirmable, ADR-0014). With `--list` (or
+    /// no prefix), list the rules. For low-entropy secrets (API keys, `.env`
+    /// files, credentials), prefer `sc secret` instead.
     Protect {
         /// Path prefix to protect (e.g. `secret/`). Omit to list.
         prefix: Option<String>,

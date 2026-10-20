@@ -1,6 +1,6 @@
 # ADR-0048: Presence-based walks for partial clones (P37b)
 
-- **Status:** Accepted (37b-i, 37b-ii built)
+- **Status:** Accepted (built)
 - **Date:** 2026-10-16
 - **Phase:** 37b
 - **Builds on:** ADR-0047 (want-by-id fetch, 37a), ADR-0037 (partial clone), ADR-0034 (sparse), ADR-0035 (streaming transfer), ADR-0039/0041 (size limits)

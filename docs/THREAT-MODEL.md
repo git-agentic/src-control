@@ -4,7 +4,7 @@ This document consolidates, in one place, the **deliberate security boundaries**
 of src-control's cryptographic features — the things it does *not* defend against
 by design. They are drawn from the per-phase ADRs (linked below); this page
 exists so a newcomer evaluating whether to trust real data to the system does not
-have to read 44 ADRs to find the caveats.
+have to read 54 ADRs to find the caveats.
 
 > **Status: pre-1.0, not independently audited.** These are MVP implementations
 > reviewed by the project's own process only. Do not commit production secrets to
@@ -237,7 +237,22 @@ too, not just the src-control-side metadata.
   and validity periods deliberately. The TLS handshake signature is still
   verified even though names/validity are not, so a captured certificate
   replayed without its matching private key is rejected regardless of pin
-  state.
+  state. `sc tls list/forget/pin/path` (ADR-0053) manages the pin file: `forget`
+  is the deliberate recovery after a legitimate server key change (the next
+  accept-new connect re-pins, so it reopens the first-connection window for that
+  host unless `SC_HTTPS_STRICT` or `SC_HTTPS_FINGERPRINT` is set), and `pin`
+  records an out-of-band fingerprint without connecting. A mismatch is still
+  never resolved by the client on its own.
+- **Serve tokens can expire and be rotated (ADR-0040 addendum, #209).**
+  `sc serve token add --expires` stores an absolute `expires_at`; an expired
+  token behaves exactly like an unknown one (the same `401`, no oracle for
+  "was valid once"), and expired entries stay in the file and still count as
+  configured tokens, so a server whose tokens have all expired keeps refusing
+  everyone. `sc serve token rotate <label>` swaps the secret in one step, keeps
+  the absolute expiry, and kills the old secret at once. Expiry is checked when
+  a connection opens: a transfer already in flight can outlive its token. Tokens
+  remain all-or-nothing per connection (`ro`/`rw`); there are no per-path or
+  per-ref scopes.
 - **CA validation is the additive alternative (ADR-0054).** A client that sets
   `SC_HTTPS_CA_FILE=<pem>` (a CA bundle) or `SC_HTTPS_CA=system` (the platform
   roots) stops pinning and validates like a browser: the chain to a trusted
@@ -344,7 +359,9 @@ too, not just the src-control-side metadata.
     network must raise it explicitly. See ADR-0041 for the full decision,
     including rejected alternatives.
 - The ssh:// transport delegates authentication entirely to ssh (ADR-0022);
-  `--max-pack-size` is the one P31 bound that also applies to `--stdio`.
+  `--max-pack-size`, `--max-conn-bytes` and `--max-object-size` are the bounds
+  that also apply to `--stdio` (the connection, timeout and TLS knobs are
+  `--http` only).
 
 ## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046
 
@@ -379,6 +396,15 @@ too, not just the src-control-side metadata.
   both the compressed record length and the decompressed output, so a
   hostile or corrupted bucket cannot mount a decompression-bomb DoS via
   `get_object`/`get_pack`.
+- **Checkpoints are untrusted input too (P36b).** A checkpoint object is
+  strict-decoded like the rest of the WAL, and a reader refuses (`Error::Wal`)
+  a manifest that names an absent checkpoint, a checkpoint whose `seq` differs
+  from the key it was fetched at, and a log chain that steps past the
+  checkpoint without landing on it. A writer with bucket access can fold a
+  checkpoint, but it is derived data any reader can refold from the log, and a
+  lost manifest CAS drops a fold silently. Nothing is ever removed from a
+  bucket (no compaction or gc yet, #216), so a hostile writer can grow it
+  without bound; bucket quotas are the operator's bound.
 - **Sealed content stays end-to-end sealed, unchanged.** Protected-path
   ciphertext (ADR-0014/0043) and committed secrets travel through a bucket
   remote exactly as through any other transport: a bucket reader without the
@@ -453,6 +479,51 @@ too, not just the src-control-side metadata.
 - **Laziness is a local opt-in.** `.sc/promisor-lazy` is never committed or
   transferred; without it a partial clone never dials the remote after clone,
   and `SC_OFFLINE=1` forces that per process.
+
+## Partial clones (`--filter`, `--lazy`, merge and sessions on a clone) — ADR-0037/0047/0048/0049/0050
+
+- **A partial clone is a store plus one promise, and the promise is about the
+  origin (ADR-0048).** Every id referenced by an object the clone holds, that
+  the clone lacks, is held by the promisor origin. Hash verification at ingest
+  proves identity, not that a sender has a complete closure, so the client
+  cannot check the promise locally; it trusts the origin for completeness. That
+  is why a partial clone **fetches from its promisor origin only**: a fetch
+  from another remote could leave a gap the origin does not hold, and the
+  filler only ever dials the origin. A hostile or pruned origin can make a gap
+  permanent (it can answer "not sent", or prune history a clone still
+  points at); it cannot plant an object under another id, and a gap surfaces
+  as `GapInView` or a fill error before any write, never as silently missing
+  content.
+- **`--filter` is request scope, not access control.** The filter says what a
+  clone asked for. Any client that can read the served repository can still
+  fetch anything by id (`sc backfill`, `GetObjects`); a filter hides nothing
+  from the user running the clone, and sealed or protected content is governed
+  by its keys, not by the filter.
+- **Merge carries subtrees by id without reading them (ADR-0049), so the
+  protection check happens before the carry.** A subtree is carried only when
+  the sides agree and no protection rule of either side covers it or lies
+  inside it; otherwise it is read and sealed like on a full clone. One accepted
+  divergence: a subtree identical on all three sides is carried even under a
+  rule, so a merge does not force a clone to fetch every protected prefix
+  (plaintext that already sat under a rule stays as it was). The wrap map is
+  not pruned when anything was carried, since a carried subtree is never
+  enumerated; it can keep wraps for blobs the merge did not see, but never
+  drops one a carried blob needs.
+- **Conflicts and sealing stay inside the view.** A conflict outside the sparse
+  view, or a result that must be sealed outside it, is refused before any ref,
+  merge-state or working-tree change, so no conflict marker or sealing-input
+  plaintext is written outside the view (the sparse boundary of ADR-0034).
+- **A session on a partial clone sees the host's view and nothing else
+  (ADR-0050).** An agent from `sc work` or `sc ws` cannot read or change what the
+  clone does not hold, and a workspace commit grafts the out-of-view subtrees
+  from the base by id. This bounds what an agent touches by default; it is not a
+  confidentiality boundary against the user, who can widen the view with
+  `sc sparse set` or `sc backfill`.
+- **Operations that need a complete closure refuse on a partial clone, fail
+  closed:** `sc export`, `sc rewrap`, `sc grant`/`revoke`, private branches, and
+  `sc push` to a git remote. They refuse rather than run on partial data.
+- **Laziness is a local opt-in** (see By-id object reads above), and bucket
+  remotes refuse `--filter` (see Bucket remotes).
 
 ## Untrusted-input hardening (DoS) — ADR-0039
 

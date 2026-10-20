@@ -1,6 +1,6 @@
 # ADR-0040: sc+http access control
 
-- **Status:** Accepted
+- **Status:** Accepted; bind gate narrowed by [ADR-0042](0042-in-binary-tls-sc-https.md), token expiry and rotation in the addendum below
 - **Date:** 2026-07-09
 - **Phase:** 29
 - **Builds on:** ADR-0036 (P26 sc-native HTTP transport), ADR-0002 (BLAKE3),

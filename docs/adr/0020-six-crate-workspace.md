@@ -1,6 +1,6 @@
 # ADR-0020: Six-crate workspace with a strict dependency direction
 
-- **Status:** Accepted
+- **Status:** Accepted; crate set extended since by [ADR-0042](0042-in-binary-tls-sc-https.md) (`tlsio`), [ADR-0045](0045-native-desktop-read-model.md) (desktop adapter) and [ADR-0046](0046-wal-bucket-remotes.md) (`objio`)
 - **Date:** 2026-07-05
 - **Phase:** Foundation (revision)
 - **Supersedes:** ADR-0004
