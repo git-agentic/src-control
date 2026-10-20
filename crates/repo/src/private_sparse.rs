@@ -190,3 +190,29 @@ fn an_untracked_file_where_the_public_side_adds_one_out_of_view_is_refused() {
     std::fs::remove_dir_all(&f.root).unwrap();
     assert!(!f.root.exists(), "test dir left behind");
 }
+
+#[test]
+fn leaving_a_private_branch_refuses_an_untracked_file_where_main_has_one_out_of_view() {
+    let f = fixture("leave", true, false);
+    let mine = f.root.join("docs/new.txt");
+    std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+    std::fs::write(&mine, "MINE\n").unwrap();
+    let err = f
+        .repo
+        .switch_with_identity("main", Some(&f.sk))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("docs/new.txt") && err.contains("move it away"),
+        "{err}"
+    );
+    assert!(
+        f.repo.head_private().unwrap().is_some(),
+        "still on the private branch"
+    );
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "MINE\n");
+    std::fs::remove_file(&mine).unwrap();
+    f.repo.switch_with_identity("main", Some(&f.sk)).unwrap();
+    std::fs::remove_dir_all(&f.root).unwrap();
+    assert!(!f.root.exists(), "test dir left behind");
+}

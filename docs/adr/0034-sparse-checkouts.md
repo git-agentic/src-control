@@ -264,8 +264,9 @@ every claim below is checked against the shipped code, not the plan.
    never stop (clean merge, fast-forward, clean pick and rebase, undo, switch,
    and the private `materialize_private`), because their result is exact but
    the next ordinary commit would take the user's file instead. A path the old
-   tree already tracks is the user's tracked file and is not refused, nor is
-   anything in the view (the existing guard). Completion still reads a file
+   tree already tracks is not an addition and is not checked here (a user's
+   copy of it is read as an edit; a stop's `materialize` can still delete it),
+   nor is anything in the view (the existing guard). Completion still reads a file
    the user creates after a stop at such a path; that is their resolution, as
    for an edited tracked file (refinement 5). Pinned by `sparse_completion.rs`
    and `private_sparse.rs`.

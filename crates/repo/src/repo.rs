@@ -2200,7 +2200,8 @@ impl Repo {
     /// the working tree, where a file wins over the tree, and would commit the
     /// user's bytes instead of the addition, silently (#248). `old_root` is
     /// the tree the working tree reflects, `target_root` the result. A path
-    /// `old_root` already tracks is the user's tracked file, not a collision.
+    /// `old_root` already tracks is not an addition, and is left to the
+    /// ordinary tracked-file rules.
     pub(crate) fn refuse_untracked_out_of_view(
         &self,
         op: &str,
@@ -2244,9 +2245,9 @@ impl Repo {
         old: &std::collections::BTreeSet<String>,
         target: &std::collections::BTreeSet<String>,
     ) -> Result<()> {
-        // A prefix that is a file in `old` yet a directory in `target` is not
-        // the tracked file either: nothing removes it out of view.
-        let mut is_tracked = |p: &str| old.contains(p) && target.contains(p);
+        // `rel` is not in `old`, and a tree holds no file at an ancestor of
+        // another of its paths, so nothing on the way is a tracked file.
+        let mut is_tracked = |_: &str| false;
         for rel in target
             .iter()
             .filter(|p| !sparse.matches(p) && !old.contains(*p))
@@ -2563,8 +2564,25 @@ impl Repo {
         // before the first stale file is removed or written (ADR-0048).
         self.ensure_view(target_root, &self.sparse_spec()?)?;
         self.refuse_untracked_overwrite_vs("switch", &old_paths, target_root)?;
-        if let Some(old) = old_root {
-            self.refuse_untracked_out_of_view("switch", old, target_root)?;
+        match old_root {
+            Some(old) => self.refuse_untracked_out_of_view("switch", old, target_root)?,
+            // Leaving a private branch: `old_paths` is its full inner tree
+            // (partial clones refuse private branches).
+            None => {
+                let target: std::collections::BTreeSet<String> = {
+                    let store_arc = self.vfs.store();
+                    let mut store = store_arc.lock().unwrap();
+                    worktree::tree_file_entries_with_perms(&mut store, target_root)?
+                        .into_keys()
+                        .collect()
+                };
+                self.refuse_untracked_out_of_view_paths(
+                    "switch",
+                    &self.sparse_spec()?,
+                    &old_paths,
+                    &target,
+                )?;
+            }
         }
         if head_priv.is_some() {
             // Remove private-tip paths the public target doesn't track,

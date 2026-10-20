@@ -405,6 +405,7 @@ fn a_stop_refuses_an_untracked_file_where_the_other_side_adds_one_out_of_view() 
         drop(s);
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "temp repo must be removed");
     }
 }
 
@@ -422,6 +423,7 @@ fn a_stop_refuses_an_untracked_file_where_an_out_of_view_directory_must_be() {
         assert_eq!(std::fs::read(root.join("docs")).unwrap(), b"MINE\n");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "temp repo must be removed");
     }
 }
 
@@ -447,6 +449,7 @@ fn a_stop_and_abort_leave_an_unrelated_out_of_view_file() {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "temp repo must be removed");
     }
 }
 
@@ -502,5 +505,6 @@ fn a_clean_operation_refuses_an_untracked_file_where_it_adds_one_out_of_view() {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "temp repo must be removed");
     }
 }
