@@ -929,11 +929,11 @@ ADR-0039.
 
 ## Phase 29 — sc+http access control (built)
 
-`sc serve --http` gains three composed access-control gates at the
-connection opening, closing P26's stated "unauthenticated" boundary: a
-read-only mode that rejects each mutating request inside
-`wire::serve_with_policy` before any store write, a fail-closed bind check, and bearer-token authentication
-against a `.sc/serve-tokens.toml` allowlist. `--read-only` forces the
+`sc serve --http` gains three composed access-control gates, closing P26's
+stated "unauthenticated" boundary: a fail-closed bind check and bearer-token
+authentication against a `.sc/serve-tokens.toml` allowlist, both at the
+connection opening, and a read-only mode that rejects each mutating request
+inside `wire::serve_with_policy` before any store write. `--read-only` forces the
 read-only gate independent of tokens (a rejected write gets the typed
 `EC_READONLY` wire error), so a public-read mirror needs no token management at
 all. The bind and token gates
