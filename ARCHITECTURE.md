@@ -346,11 +346,11 @@ phases but the shape is stable:
 - `promisor-lazy` — empty marker: this partial clone may fill gaps by object id
   (P37a); `sparse-prev` — the previous sparse spec while a `sparse set` is in
   flight (P37b).
-- `local-key`, `protected-cache` (and `ws/cache-<i>`) — the P33 keyed stat cache
+- `local-key`, `protected-cache` (and `ws/cache-<i>`, `ws-<name>/cache-<i>`) — the P33 keyed stat cache
   for protected paths; never committed, never transferred.
 - `tmp/` — guard-cleaned scratch for streaming pack transfer (P25).
 - `ws/` — durable agent-session workspaces: `session.toml` manifest + per-agent
-  checkouts (P20). `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
+  checkouts (P20); `ws-<name>/` — the same for a named session (ADR-0056). `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
   lazily-built bare `mirror.git` for network Git (P10/P18).
 - Transient in-progress state (removed on completion/abort): `MERGE_HEAD`,
   `PICK_HEAD`, `REBASE_STATE`, and their `*_DECIDED_ROOT` records, plus
@@ -780,6 +780,19 @@ guard family as a ref-mover.
 `resolve_and_teardown` writes the manifest before removing the workspace
 directory, so a crash between the two never strands a `live = true` entry
 pointing at a directory that no longer exists. See ADR-0030.
+
+Named sessions (ADR-0056). `sc ws fork --name <n>` opens a further session in a
+sibling root, `.sc/ws-<n>/` (manifest, `<i>/` checkouts and `cache-<i>` inside),
+so the unnamed session's layout is untouched and tearing one session down never
+touches another. `list`/`run`/`harvest`/`abandon` take `--session <n>`; without
+it they mean the unnamed session and never guess a named one. Fallback branches
+and `SC_WORKSPACE` are `<n>-<i>` (`work-<i>` unnamed). The repo lock serializes
+every `sc` command, so harvests of different sessions run one at a time in
+invocation order: the first lands, a later one merges over it or falls back.
+`sc ws run` resolves its workspace and secret environment under the lock, then
+releases it before spawning the command (`WsRunPlan`), so other sessions stay
+usable while an agent runs. gc roots every open session's base snapshot.
+Workspace refresh is designed in the ADR and not built.
 
 ## Phase 21 — hardening & consolidation sweep (built)
 

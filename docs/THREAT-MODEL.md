@@ -537,7 +537,10 @@ too, not just the src-control-side metadata.
   reach: an agent is a same-user process that can read the host repository's
   store and working tree and, on a lazy clone, fetch more (`sc sparse set`,
   `sc cat`, `sc backfill`). It is not an isolation boundary (compare Secret
-  injection).
+  injection). A command run by `sc ws run`
+  no longer holds the repo lock (ADR-0056), so an `sc` it runs from inside the
+  workspace finds the host repo and can change it, as a hand-started agent always
+  could.
 - **Operations that need a complete closure refuse on a partial clone, fail
   closed:** `sc export`, `sc rewrap`, `sc grant`/`revoke`, private branches, and
   `sc push` to a git remote. They refuse rather than run on partial data.

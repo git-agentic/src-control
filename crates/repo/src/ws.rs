@@ -53,6 +53,10 @@ pub struct WsEntry {
 /// The session manifest (`.sc/ws/session.toml`). Never stores key material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsSession {
+    /// `None` for the unnamed session (`.sc/ws`), `Some(name)` for a named one
+    /// (`.sc/ws-<name>`, ADR-0056). Derived from where the manifest lives and
+    /// never stored in it, so the format is unchanged.
+    pub name: Option<String>,
     /// The snapshot every workspace was forked from.
     pub base_snapshot: ObjectId,
     /// The branch `base_snapshot` was the tip of at fork time (display only).
@@ -73,12 +77,61 @@ pub struct WsSession {
     pub workspaces: Vec<WsEntry>,
 }
 
-fn ws_dir(layout: &Layout) -> PathBuf {
-    layout.dot_sc.join("ws")
+fn ws_dir(layout: &Layout, name: Option<&str>) -> PathBuf {
+    layout.ws_root(name)
 }
 
-fn manifest_path(layout: &Layout) -> PathBuf {
-    ws_dir(layout).join("session.toml")
+fn manifest_path(layout: &Layout, name: Option<&str>) -> PathBuf {
+    ws_dir(layout, name).join("session.toml")
+}
+
+/// The prefix of a session's fallback branches and `SC_WORKSPACE` label:
+/// `work` for the unnamed session (unchanged), the session name otherwise,
+/// matching `sc work --name`.
+fn label_prefix(name: Option<&str>) -> &str {
+    name.unwrap_or("work")
+}
+
+/// `<session root>/running-<i>`: written (with the pid of the `sc` process
+/// that owns the command) while a `sc ws run` command is live in workspace `i`,
+/// so harvest and abandon, which now work while the command runs, can refuse
+/// instead of landing a half-written checkout or deleting it under the agent.
+/// Beside the checkout dir, never inside it, like the stat cache.
+fn running_path(layout: &Layout, name: Option<&str>, i: u32) -> PathBuf {
+    ws_dir(layout, name).join(format!("running-{i}"))
+}
+
+/// Refuse if a `sc ws run` command is still live in workspace `i`. The marker
+/// names the `sc` process and, once spawned, its child (an orphaned child keeps
+/// the workspace busy after `sc` is killed). It is cleared only when every
+/// recorded pid is provably dead (the repo lock's probe); an unreadable or
+/// empty marker counts as busy.
+fn ensure_idle(layout: &Layout, name: Option<&str>, i: u32) -> Result<()> {
+    let path = running_path(layout, name, i);
+    if path.exists() {
+        let pids: Vec<u32> = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        if pids.is_empty() || !pids.iter().all(|&p| crate::lock::pid_is_dead(p)) {
+            return Err(Error::InvalidArgument(format!(
+                "workspace {i} has a `sc ws run` command still running ({}); \
+                 wait for it to exit",
+                path.display()
+            )));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+/// A session name is a branch-name component (its fallback branches are
+/// `<name>-<i>`) and a directory name under `.sc/`, so it takes the branch-name
+/// grammar.
+fn validate_session_name(name: &str) -> Result<()> {
+    crate::repo::validate_branch_name(name)
+        .map_err(|_| Error::InvalidArgument(format!("invalid session name: {name:?}")))
 }
 
 fn bad(msg: impl Into<String>) -> Error {
@@ -131,9 +184,8 @@ impl From<&WsSession> for SessionToml {
     }
 }
 
-impl TryFrom<SessionToml> for WsSession {
-    type Error = Error;
-    fn try_from(raw: SessionToml) -> Result<WsSession> {
+impl SessionToml {
+    fn into_session(raw: SessionToml, name: Option<&str>) -> Result<WsSession> {
         let base_snapshot = ObjectId::from_str(&raw.base_snapshot)
             .map_err(|_| bad(format!("bad base_snapshot: {}", raw.base_snapshot)))?;
         let workspaces = raw
@@ -155,6 +207,7 @@ impl TryFrom<SessionToml> for WsSession {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(WsSession {
+            name: name.map(str::to_string),
             base_snapshot,
             base_branch: raw.base_branch,
             author: raw.author,
@@ -164,18 +217,66 @@ impl TryFrom<SessionToml> for WsSession {
     }
 }
 
-/// Read the open session's manifest, if any. `pub(crate)` so `gc.rs` can root
-/// the base snapshot without going through a `Repo`.
-pub(crate) fn read_manifest(layout: &Layout) -> Result<Option<WsSession>> {
-    match std::fs::read_to_string(manifest_path(layout)) {
+/// Read one session's manifest (`None` = the unnamed session), if open.
+pub(crate) fn read_manifest(layout: &Layout, name: Option<&str>) -> Result<Option<WsSession>> {
+    if let Some(n) = name {
+        // `--session` reaches here unchecked; a `..` must not leave `.sc/`.
+        validate_session_name(n)?;
+    }
+    match std::fs::read_to_string(manifest_path(layout, name)) {
         Ok(text) => {
             let raw: SessionToml =
                 toml::from_str(&text).map_err(|e| bad(format!("malformed: {e}")))?;
-            raw.try_into().map(Some)
+            SessionToml::into_session(raw, name).map(Some)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Every open session: the unnamed one first, then named ones by name. A
+/// `.sc/ws-*` directory with no manifest is crash residue and is skipped.
+/// `pub(crate)` so `gc.rs` can root every base snapshot without a `Repo`.
+pub(crate) fn list_sessions(layout: &Layout) -> Result<Vec<WsSession>> {
+    let mut out: Vec<WsSession> = read_manifest(layout, None)?.into_iter().collect();
+    let mut names = Vec::new();
+    for e in std::fs::read_dir(&layout.dot_sc)? {
+        let e = e?;
+        let file = e.file_name();
+        // A stray file or oddly named entry must not break gc or `ws list`.
+        if let Some(n) = file.to_str().and_then(|f| f.strip_prefix("ws-")) {
+            if e.path().is_dir() && validate_session_name(n).is_ok() {
+                names.push(n.to_string());
+            }
+        }
+    }
+    names.sort();
+    for n in names {
+        out.extend(read_manifest(layout, Some(&n))?);
+    }
+    Ok(out)
+}
+
+/// The open session called `name`, or an error naming what is open instead.
+fn open_session(layout: &Layout, name: Option<&str>) -> Result<WsSession> {
+    if let Some(s) = read_manifest(layout, name)? {
+        return Ok(s);
+    }
+    let open: Vec<String> = list_sessions(layout)?
+        .iter()
+        .map(|s| s.name.clone().unwrap_or_else(|| "(unnamed)".into()))
+        .collect();
+    Err(Error::InvalidArgument(match (name, open.is_empty()) {
+        (_, true) => "no workspace session open".into(),
+        (None, false) => format!(
+            "no unnamed workspace session open (open: {}); pass --session <name>",
+            open.join(", ")
+        ),
+        (Some(n), false) => format!(
+            "no workspace session named '{n}' open (open: {})",
+            open.join(", ")
+        ),
+    }))
 }
 
 /// Write the session manifest atomically. The parent dir must already exist
@@ -183,7 +284,8 @@ pub(crate) fn read_manifest(layout: &Layout) -> Result<Option<WsSession>> {
 fn write_manifest(layout: &Layout, session: &WsSession) -> Result<()> {
     let raw: SessionToml = session.into();
     let text = toml::to_string(&raw).map_err(|e| Error::BadConfig(e.to_string()))?;
-    scl_core::fsutil::atomic_write_durable(&manifest_path(layout), text.as_bytes())?;
+    let path = manifest_path(layout, session.name.as_deref());
+    scl_core::fsutil::atomic_write_durable(&path, text.as_bytes())?;
     Ok(())
 }
 
@@ -196,6 +298,7 @@ impl Repo {
     /// branch, or the user's working tree.
     pub fn ws_fork(
         &self,
+        name: Option<&str>,
         agents: u32,
         author: &str,
         identity: Option<&scl_crypto::SecretKey>,
@@ -204,10 +307,17 @@ impl Repo {
         if agents == 0 {
             return Err(Error::InvalidArgument("agents must be >= 1".into()));
         }
-        if let Some(existing) = read_manifest(self.layout())? {
+        if let Some(n) = name {
+            validate_session_name(n)?;
+        }
+        if let Some(existing) = read_manifest(self.layout(), name)? {
+            let (which, abandon) = match name {
+                None => (String::new(), "sc ws abandon".to_string()),
+                Some(n) => (format!(" '{n}'"), format!("sc ws abandon --session {n}")),
+            };
             return Err(Error::InvalidArgument(format!(
-                "a workspace session is already open ({} workspace(s) forked from branch {} @ {}); \
-                 run `sc ws abandon` first",
+                "a workspace session{which} is already open ({} workspace(s) forked from branch {} @ {}); \
+                 run `{abandon}` first",
                 existing.workspaces.len(),
                 existing.base_branch,
                 existing.base_snapshot.short(),
@@ -235,7 +345,7 @@ impl Repo {
             crate::worktree::preflight_view(self.layout(), &mut store, tip_root, &sparse)?;
         }
 
-        let root = ws_dir(self.layout());
+        let root = ws_dir(self.layout(), name);
         // No manifest proves any .sc/ws content is crash residue from a
         // killed fork — always safe to clear before materializing.
         let _ = std::fs::remove_dir_all(&root);
@@ -253,7 +363,7 @@ impl Repo {
             let mut cache = crate::cache::ProtectedCache::open(
                 key,
                 dir.clone(),
-                Some(self.layout().ws_cache_path(i as usize)),
+                Some(self.layout().ws_cache_path(name, i as usize)),
             );
             if let Err(e) = crate::workspace::materialize_workspace(
                 self,
@@ -279,6 +389,7 @@ impl Repo {
         }
 
         let session = WsSession {
+            name: name.map(str::to_string),
             base_snapshot: tip,
             base_branch: branch,
             author: author.to_string(),
@@ -289,9 +400,14 @@ impl Repo {
         Ok(session)
     }
 
-    /// The open session's manifest, if any.
-    pub fn ws_session(&self) -> Result<Option<WsSession>> {
-        read_manifest(self.layout())
+    /// The manifest of session `name` (`None` = the unnamed one), if open.
+    pub fn ws_session(&self, name: Option<&str>) -> Result<Option<WsSession>> {
+        read_manifest(self.layout(), name)
+    }
+
+    /// Every open session, the unnamed one first, then named ones by name.
+    pub fn ws_sessions(&self) -> Result<Vec<WsSession>> {
+        list_sessions(self.layout())
     }
 
     /// True if `entry`'s checkout has diverged from the session's base
@@ -302,9 +418,8 @@ impl Repo {
     /// re-parses the manifest on every call; callers that already hold a
     /// loaded `WsSession` (e.g. `sc ws list`'s and `ws_harvest`'s per-entry
     /// loops) should call [`Self::ws_changed_for`] instead (P21).
-    pub fn ws_changed(&self, entry: &WsEntry) -> Result<bool> {
-        let session = read_manifest(self.layout())?
-            .ok_or_else(|| Error::InvalidArgument("no workspace session open".into()))?;
+    pub fn ws_changed(&self, name: Option<&str>, entry: &WsEntry) -> Result<bool> {
+        let session = open_session(self.layout(), name)?;
         self.ws_changed_for(&session, entry)
     }
 
@@ -336,7 +451,10 @@ impl Repo {
             crate::cache::ProtectedCache::open(
                 key,
                 entry.dir.clone(),
-                Some(self.layout().ws_cache_path(entry.index as usize)),
+                Some(
+                    self.layout()
+                        .ws_cache_path(session.name.as_deref(), entry.index as usize),
+                ),
             )
         });
         let d = worktree::diff_worktree(
@@ -401,9 +519,16 @@ impl Repo {
     /// removes the checkout dir(s) and rewrites the manifest, or removes
     /// `.sc/ws/` entirely once no live workspace remains. Returns the
     /// remaining live count. No oplog record — fork never touched a ref.
-    pub fn ws_abandon(&self, index: Option<u32>) -> Result<usize> {
-        let mut session = read_manifest(self.layout())?
-            .ok_or_else(|| Error::InvalidArgument("no workspace session open".into()))?;
+    pub fn ws_abandon(&self, name: Option<&str>, index: Option<u32>) -> Result<usize> {
+        let mut session = open_session(self.layout(), name)?;
+        // Refuse before removing anything if an agent command is live.
+        for e in session
+            .workspaces
+            .iter()
+            .filter(|e| e.live && index.is_none_or(|i| i == e.index))
+        {
+            ensure_idle(self.layout(), name, e.index)?;
+        }
         match index {
             Some(i) => {
                 let entry = session
@@ -415,7 +540,9 @@ impl Repo {
                     let _ = std::fs::remove_dir_all(&entry.dir);
                     // Drop the workspace's P33 stat cache too (sibling file,
                     // not under the checkout dir) — P33 Task 7 item 3.
-                    let _ = std::fs::remove_file(self.layout().ws_cache_path(entry.index as usize));
+                    let _ = std::fs::remove_file(
+                        self.layout().ws_cache_path(name, entry.index as usize),
+                    );
                     entry.live = false;
                 }
             }
@@ -427,40 +554,50 @@ impl Repo {
         }
         let remaining = session.workspaces.iter().filter(|e| e.live).count();
         if remaining == 0 {
-            let _ = std::fs::remove_dir_all(ws_dir(self.layout()));
+            let _ = std::fs::remove_dir_all(ws_dir(self.layout(), name));
         } else {
             write_manifest(self.layout(), &session)?;
         }
         Ok(remaining)
     }
 
-    /// Run a command in one workspace checkout: spawns `cmd` in `entry.dir`
-    /// with SC_WORKSPACE and SC_WORKSPACE_DIR env vars set, optionally injecting
-    /// decrypted secrets, and returns the child's exit code. The workspace must be
-    /// live (not abandoned); the session must be open. No oplog record, no harvest,
-    /// no manifest rewrite — the workspace checkout persists for later harvest.
+    /// Run a command in one workspace checkout. Convenience over
+    /// [`Self::ws_run_plan`] + [`WsRunPlan::run`] that keeps this `Repo` (and so
+    /// the single-writer lock) alive for the child's lifetime; the CLI drops the
+    /// repo between the two so other sessions stay usable meanwhile (ADR-0056).
     pub fn ws_run(
         &self,
+        name: Option<&str>,
         index: u32,
         cmd: &[String],
         with_secrets: bool,
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<i32> {
-        let session = read_manifest(self.layout())?
-            .ok_or_else(|| Error::InvalidArgument("no workspace session open".into()))?;
+        self.ws_run_plan(name, index, with_secrets, identity)?
+            .run(cmd)
+    }
+
+    /// Resolve everything `ws_run` needs from the repo (the live workspace's
+    /// dir, its `SC_WORKSPACE` label and, with `with_secrets`, the decrypted
+    /// secret environment) so the caller can release the repo lock before
+    /// spawning the possibly long-running command. The workspace must be live
+    /// and the session open. No oplog record, no harvest, no manifest rewrite.
+    pub fn ws_run_plan(
+        &self,
+        name: Option<&str>,
+        index: u32,
+        with_secrets: bool,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<WsRunPlan> {
+        let session = open_session(self.layout(), name)?;
         let entry = session
             .workspaces
             .iter()
-            .find(|e| e.index == index)
+            .find(|e| e.index == index && e.live)
             .ok_or_else(|| Error::InvalidArgument(format!("no such workspace: {index}")))?;
-        if !entry.live {
-            return Err(Error::InvalidArgument(format!(
-                "no such workspace: {index}"
-            )));
-        }
 
         // Build secret env vars if requested (strict mode, mirroring `sc work`).
-        let secret_envs = if with_secrets {
+        let envs = if with_secrets {
             let sk = identity.ok_or_else(|| {
                 Error::InvalidArgument("--with-secrets requires an identity".into())
             })?;
@@ -468,24 +605,43 @@ impl Repo {
         } else {
             Vec::new()
         };
-
-        // Spawn the command in the workspace directory with env vars set.
-        let (exe, args) = cmd
-            .split_first()
-            .ok_or_else(|| Error::InvalidArgument("empty command".into()))?;
-        let mut command = std::process::Command::new(exe);
-        command
-            .args(args)
-            .current_dir(&entry.dir)
-            // Label matches the work-<i> branch namespace a harvest fallback would mint (P13 parity: label == branch name).
-            .env("SC_WORKSPACE", format!("work-{}", entry.index))
-            .env("SC_WORKSPACE_DIR", &entry.dir);
-        for (k, v) in &secret_envs {
-            command.env(k, v);
+        // Mark the workspace busy until the command ends (see `running_path`).
+        // The marker names this process, which outlives the repo handle: the
+        // CLI keeps running the command after dropping the lock.
+        ensure_idle(self.layout(), name, index)?;
+        let marker = running_path(self.layout(), name, index);
+        // Exclusive, so two plans for one workspace cannot both hold it.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(mut f) => {
+                if let Err(e) =
+                    std::io::Write::write_all(&mut f, std::process::id().to_string().as_bytes())
+                {
+                    // An empty marker would read as busy forever.
+                    let _ = std::fs::remove_file(&marker);
+                    return Err(e.into());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Error::InvalidArgument(format!(
+                    "workspace {index} has a `sc ws run` command still running ({}); \
+                     wait for it to exit",
+                    marker.display()
+                )))
+            }
+            Err(e) => return Err(e.into()),
         }
-
-        let status = command.status()?;
-        Ok(status.code().unwrap_or(1))
+        Ok(WsRunPlan {
+            marker,
+            dir: entry.dir.clone(),
+            // Label matches the fallback-branch namespace a harvest would mint
+            // (P13 parity: label == branch name).
+            label: format!("{}-{}", label_prefix(name), entry.index),
+            envs,
+        })
     }
 
     /// Read-only conflict probe: would merging `theirs` into `ours` land
@@ -646,6 +802,7 @@ impl Repo {
     /// accident.
     pub fn ws_harvest(
         &self,
+        name: Option<&str>,
         into: Option<&str>,
         author: &str,
         identity: Option<&scl_crypto::SecretKey>,
@@ -659,8 +816,7 @@ impl Repo {
         if crate::rebase_state::in_progress(&self.layout) {
             return Err(Error::RebaseInProgress);
         }
-        let mut session = read_manifest(self.layout())?
-            .ok_or_else(|| Error::InvalidArgument("no workspace session open".into()))?;
+        let mut session = open_session(self.layout(), name)?;
 
         let landing = into.unwrap_or(&session.base_branch).to_string();
         let current = refs::current_branch(self.layout())?;
@@ -677,6 +833,11 @@ impl Repo {
             .map(|e| e.index)
             .collect();
         live_indices.sort_unstable();
+        // A workspace whose `sc ws run` command is still live is mid-edit:
+        // refuse before reading or minting anything.
+        for &i in &live_indices {
+            ensure_idle(self.layout(), name, i)?;
+        }
 
         // Preflight: if any live workspace actually diverged, a candidate
         // branch is about to be minted for it and landed via
@@ -733,10 +894,11 @@ impl Repo {
             // Step 2: pick a fallback candidate branch name, suffixed on
             // collision (a prior harvest or a pre-existing branch of the
             // same name).
-            let mut branch = format!("work-{i}");
+            let base = format!("{}-{i}", label_prefix(name));
+            let mut branch = base.clone();
             let mut suffix = 2;
             while refs::resolve_tip(self.layout(), &branch)?.is_some() {
-                branch = format!("work-{i}-{suffix}");
+                branch = format!("{base}-{suffix}");
                 suffix += 1;
             }
 
@@ -745,7 +907,10 @@ impl Repo {
             // candidate branch. `tip` is the candidate's parent, which per
             // P13's contract is the session's base snapshot, not the
             // landing branch's current (possibly since-advanced) tip.
-            let msg = format!("ws-{i} harvest");
+            let msg = match name {
+                None => format!("ws-{i} harvest"),
+                Some(n) => format!("ws {n}-{i} harvest"),
+            };
             // The session's fork-time spec, not the host's current one (P24
             // final-review fix, Critical 1) — same reasoning as
             // `ws_changed_for` above, now threaded into the commit carry too
@@ -761,7 +926,7 @@ impl Repo {
             let mut cache = crate::cache::ProtectedCache::open(
                 key,
                 dir.clone(),
-                Some(self.layout().ws_cache_path(i as usize)),
+                Some(self.layout().ws_cache_path(name, i as usize)),
             );
             let harvested = crate::workspace::harvest_workspace(
                 self,
@@ -909,7 +1074,7 @@ impl Repo {
         }
 
         if session.workspaces.iter().all(|e| !e.live) {
-            let _ = std::fs::remove_dir_all(ws_dir(self.layout()));
+            let _ = std::fs::remove_dir_all(ws_dir(self.layout(), name));
         }
 
         Ok(outcomes)
@@ -946,8 +1111,57 @@ fn resolve_and_teardown(
     // Drop this workspace's P33 stat cache alongside its checkout dir (P33
     // Task 7 item 3): the cache file lives beside the dir, not inside it, so
     // removing the dir doesn't remove it.
-    let _ = std::fs::remove_file(layout.ws_cache_path(index as usize));
+    let _ = std::fs::remove_file(layout.ws_cache_path(session.name.as_deref(), index as usize));
     Ok(())
+}
+
+/// A resolved `sc ws run`: where to run, the `SC_WORKSPACE` label, and any
+/// injected secrets. Holds no repo handle, so running it does not hold the
+/// repo lock.
+pub struct WsRunPlan {
+    /// The `running-<i>` marker; removed when the plan is dropped.
+    marker: PathBuf,
+    dir: PathBuf,
+    label: String,
+    envs: Vec<(String, std::ffi::OsString)>,
+}
+
+impl WsRunPlan {
+    /// Spawn `cmd` in the workspace dir with `SC_WORKSPACE` and
+    /// `SC_WORKSPACE_DIR` set and return its exit code.
+    pub fn run(self, cmd: &[String]) -> Result<i32> {
+        let (exe, args) = cmd
+            .split_first()
+            .ok_or_else(|| Error::InvalidArgument("empty command".into()))?;
+        let mut command = std::process::Command::new(exe);
+        command
+            .args(args)
+            .current_dir(&self.dir)
+            .env("SC_WORKSPACE", &self.label)
+            .env("SC_WORKSPACE_DIR", &self.dir);
+        for (k, v) in &self.envs {
+            command.env(k, v);
+        }
+        let mut child = command.spawn()?;
+        // Record the child too: if `sc` is killed first, the orphan keeps the
+        // workspace busy. Best effort; the parent pid is already in the file.
+        if let Err(e) = scl_core::fsutil::atomic_write_durable(
+            &self.marker,
+            format!("{} {}", std::process::id(), child.id()).as_bytes(),
+        ) {
+            eprintln!(
+                "warning: could not record the command's pid ({e}); the workspace is \
+                 protected from harvest and abandon only while `sc` itself runs"
+            );
+        }
+        Ok(child.wait()?.code().unwrap_or(1))
+    }
+}
+
+impl Drop for WsRunPlan {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.marker);
+    }
 }
 
 /// Outcome of harvesting one live workspace.
@@ -989,7 +1203,7 @@ mod tests {
         let repo = init(&root);
         let tip = repo.head_tip().unwrap().unwrap();
 
-        let session = repo.ws_fork(2, "t", None).unwrap();
+        let session = repo.ws_fork(None, 2, "t", None).unwrap();
         assert_eq!(session.base_snapshot, tip);
         assert_eq!(session.base_branch, "main");
         assert_eq!(session.workspaces.len(), 2);
@@ -1001,7 +1215,7 @@ mod tests {
             );
         }
 
-        let err = repo.ws_fork(1, "t", None).unwrap_err();
+        let err = repo.ws_fork(None, 1, "t", None).unwrap_err();
         match err {
             Error::InvalidArgument(msg) => assert!(
                 msg.contains("workspace session is already open"),
@@ -1029,7 +1243,7 @@ mod tests {
         repo.set_sparse(&["src/".into()], None).unwrap();
         assert!(!root.join("docs/x").exists());
 
-        let session = repo.ws_fork(1, "t", None).unwrap();
+        let session = repo.ws_fork(None, 1, "t", None).unwrap();
         let entry = &session.workspaces[0];
         assert!(
             entry.dir.join("src/a.txt").exists(),
@@ -1042,7 +1256,7 @@ mod tests {
 
         // Harvest carries the untouched out-of-sparse subtree verbatim.
         std::fs::write(entry.dir.join("src/a.txt"), b"a v2").unwrap();
-        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -1093,7 +1307,7 @@ mod tests {
 
         // 1. Narrow to src/ and fork — the workspace only ever sees src/.
         repo.set_sparse(&["src/".into()], None).unwrap();
-        let session = repo.ws_fork(1, "t", None).unwrap();
+        let session = repo.ws_fork(None, 1, "t", None).unwrap();
         let entry = &session.workspaces[0];
         assert!(entry.dir.join("src/a.txt").exists());
         assert!(!entry.dir.join("docs/x.txt").exists());
@@ -1115,7 +1329,7 @@ mod tests {
         // 4. Harvest. The workspace's absent docs/x.txt must be carried
         // (never materialized, not a user deletion), not committed as a
         // deletion.
-        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -1172,19 +1386,19 @@ mod tests {
 
         // Simulate a kill -9 mid-fork: a workspace dir exists with a stray
         // file but no manifest was ever written to announce the session.
-        let ws_root = ws_dir(repo.layout());
+        let ws_root = ws_dir(repo.layout(), None);
         std::fs::create_dir_all(ws_root.join("1")).unwrap();
         std::fs::write(ws_root.join("1").join("residue.txt"), "stale\n").unwrap();
-        assert!(repo.ws_session().unwrap().is_none());
+        assert!(repo.ws_session(None).unwrap().is_none());
 
-        let session = repo.ws_fork(2, "t", None).unwrap();
+        let session = repo.ws_fork(None, 2, "t", None).unwrap();
         assert_eq!(session.base_snapshot, tip);
         assert_eq!(session.workspaces.len(), 2);
 
         // Neither freshly forked workspace shows the residue as a change.
         for entry in &session.workspaces {
             assert!(
-                !repo.ws_changed(entry).unwrap(),
+                !repo.ws_changed(None, entry).unwrap(),
                 "residue must not leak into a freshly forked workspace"
             );
         }
@@ -1201,11 +1415,11 @@ mod tests {
         // Harvesting the untouched workspaces lands nothing and leaves the
         // base branch tip unchanged.
         let base_before = repo.head_tip().unwrap().unwrap();
-        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
         assert!(outcomes
             .iter()
             .all(|o| matches!(o, WsHarvestOutcome::Unchanged { .. })));
-        assert!(repo.ws_session().unwrap().is_none());
+        assert!(repo.ws_session(None).unwrap().is_none());
         assert_eq!(repo.head_tip().unwrap().unwrap(), base_before);
 
         drop(repo);
@@ -1232,25 +1446,25 @@ mod tests {
         let root = tmp_root("boundary");
         {
             let repo = init(&root);
-            repo.ws_fork(2, "t", None).unwrap();
+            repo.ws_fork(None, 2, "t", None).unwrap();
         } // repo (and its lock) dropped: simulates the process exiting
 
         let repo = Repo::open(&root).unwrap();
         let session = repo
-            .ws_session()
+            .ws_session(None)
             .unwrap()
             .expect("manifest must survive reopen");
         assert_eq!(session.workspaces.len(), 2);
         for entry in &session.workspaces {
             assert!(
-                !repo.ws_changed(entry).unwrap(),
+                !repo.ws_changed(None, entry).unwrap(),
                 "freshly forked checkout must be unchanged"
             );
         }
 
         std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited\n").unwrap();
-        assert!(repo.ws_changed(&session.workspaces[0]).unwrap());
-        assert!(!repo.ws_changed(&session.workspaces[1]).unwrap());
+        assert!(repo.ws_changed(None, &session.workspaces[0]).unwrap());
+        assert!(!repo.ws_changed(None, &session.workspaces[1]).unwrap());
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -1260,22 +1474,22 @@ mod tests {
     fn abandon_one_and_all() {
         let root = tmp_root("abandon");
         let repo = init(&root);
-        let session = repo.ws_fork(2, "t", None).unwrap();
+        let session = repo.ws_fork(None, 2, "t", None).unwrap();
         let dir1 = session.workspaces[0].dir.clone();
         let dir2 = session.workspaces[1].dir.clone();
 
-        let remaining = repo.ws_abandon(Some(1)).unwrap();
+        let remaining = repo.ws_abandon(None, Some(1)).unwrap();
         assert_eq!(remaining, 1);
         assert!(!dir1.exists());
-        let after = repo.ws_session().unwrap().expect("session still open");
+        let after = repo.ws_session(None).unwrap().expect("session still open");
         let e1 = after.workspaces.iter().find(|e| e.index == 1).unwrap();
         assert!(!e1.live);
         assert!(dir2.exists());
 
-        let remaining = repo.ws_abandon(None).unwrap();
+        let remaining = repo.ws_abandon(None, None).unwrap();
         assert_eq!(remaining, 0);
         assert!(!dir2.exists());
-        assert!(repo.ws_session().unwrap().is_none());
+        assert!(repo.ws_session(None).unwrap().is_none());
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -1292,8 +1506,8 @@ mod tests {
         std::fs::write(root.join("a.txt"), "still base\n").unwrap();
         repo.commit("t", "protect a.txt").unwrap();
 
-        repo.ws_fork(1, "t", Some(&sk)).unwrap();
-        let text = std::fs::read_to_string(manifest_path(repo.layout())).unwrap();
+        repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
+        let text = std::fs::read_to_string(manifest_path(repo.layout(), None)).unwrap();
         assert!(
             !text.contains("scl-sk"),
             "manifest must never contain key material: {text}"
@@ -1342,14 +1556,14 @@ mod tests {
 
         // Fork two workspaces WITH identity: the protected file materializes
         // decrypted AND is recorded in each workspace's own cache at fork.
-        let session = repo.ws_fork(2, "t", Some(&sk)).unwrap();
+        let session = repo.ws_fork(None, 2, "t", Some(&sk)).unwrap();
         let dir1 = session.workspaces[0].dir.clone();
         let dir2 = session.workspaces[1].dir.clone();
         // Each workspace edits ONLY its own plain file; secret/x is untouched.
         std::fs::write(dir1.join("p1.txt"), "one edited\n").unwrap();
         std::fs::write(dir2.join("p2.txt"), "two edited\n").unwrap();
 
-        let outcomes = repo.ws_harvest(None, "t", Some(&sk)).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", Some(&sk)).unwrap();
         assert_eq!(outcomes.len(), 2);
         for o in &outcomes {
             let merged_tip = match o {
@@ -1386,9 +1600,9 @@ mod tests {
         std::fs::write(root.join("secret/gone"), "doomed\n").unwrap();
         repo.commit("t", "add protected").unwrap();
 
-        let session = repo.ws_fork(1, "t", Some(&sk)).unwrap();
+        let session = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
         let dir = session.workspaces[0].dir.clone();
-        let cache_file = repo.layout().ws_cache_path(1);
+        let cache_file = repo.layout().ws_cache_path(None, 1);
         let cached = |name: &str| {
             std::fs::read_to_string(&cache_file)
                 .unwrap()
@@ -1400,7 +1614,7 @@ mod tests {
         std::fs::remove_file(dir.join("secret/gone")).unwrap();
         // An AWS-style key id trips the P5 scanner, so the workspace stays live.
         std::fs::write(dir.join("leak.txt"), "AKIAIOSFODNN7EXAMPLE\n").unwrap();
-        let outcomes = repo.ws_harvest(None, "t", Some(&sk)).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", Some(&sk)).unwrap();
         assert!(
             matches!(outcomes[0], WsHarvestOutcome::Rejected { index: 1, .. }),
             "got {outcomes:?}"
@@ -1450,7 +1664,7 @@ mod tests {
         // Fork WITH identity so the protected file materializes decrypted
         // and is recorded in the workspace's own cache at fork time; leave
         // it completely untouched.
-        let session = repo.ws_fork(1, "t", Some(&sk)).unwrap();
+        let session = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
         assert!(
             !repo
                 .ws_changed_for(&session, &session.workspaces[0])
@@ -1491,7 +1705,7 @@ mod tests {
         // Point the branch at `tip` (bypassing `commit`/oplog) just long
         // enough for `ws_fork` to read it as HEAD, then rewind to `base`.
         crate::refs::write_branch_tip(repo.layout(), "main", &tip).unwrap();
-        repo.ws_fork(1, "t", None).unwrap();
+        repo.ws_fork(None, 1, "t", None).unwrap();
         crate::refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
 
         repo.gc(std::time::Duration::from_secs(0)).unwrap();
@@ -1503,7 +1717,7 @@ mod tests {
         );
         drop(s);
 
-        repo.ws_abandon(None).unwrap();
+        repo.ws_abandon(None, None).unwrap();
         repo.gc(std::time::Duration::from_secs(0)).unwrap();
         let arc = repo.vfs().store();
         let s = arc.lock().unwrap();
@@ -1521,12 +1735,13 @@ mod tests {
     fn ws_run_sets_env_and_cwd() {
         let root = tmp_root("ws_run_env");
         let repo = init(&root);
-        let session = repo.ws_fork(2, "t", None).unwrap();
+        let session = repo.ws_fork(None, 2, "t", None).unwrap();
         let entry = &session.workspaces[1]; // work-2
 
         // Run a command that writes SC_WORKSPACE and pwd to files.
         let exit = repo
             .ws_run(
+                None,
                 entry.index,
                 &[
                     "sh".to_string(),
@@ -1561,11 +1776,12 @@ mod tests {
         let (sk, pk) = scl_crypto::generate_keypair();
         repo.secret_add("DEMO_TOKEN", b"tok-123", &[pk]).unwrap();
 
-        let session = repo.ws_fork(1, "t", Some(&sk)).unwrap();
+        let session = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
         let entry = &session.workspaces[0];
 
         let exit = repo
             .ws_run(
+                None,
                 entry.index,
                 &[
                     "sh".to_string(),
@@ -1591,11 +1807,12 @@ mod tests {
     fn ws_run_bad_index_errors() {
         let root = tmp_root("ws_run_bad");
         let repo = init(&root);
-        let _session = repo.ws_fork(2, "t", None).unwrap();
+        let _session = repo.ws_fork(None, 2, "t", None).unwrap();
 
         // Non-existent workspace index.
         let err = repo
             .ws_run(
+                None,
                 999,
                 &["sh".to_string(), "-c".to_string(), "true".to_string()],
                 false,
@@ -1606,9 +1823,10 @@ mod tests {
         assert!(err.to_string().contains("no such workspace: 999"));
 
         // Abandon workspace 1, then try to run in it.
-        repo.ws_abandon(Some(1)).unwrap();
+        repo.ws_abandon(None, Some(1)).unwrap();
         let err = repo
             .ws_run(
+                None,
                 1,
                 &["sh".to_string(), "-c".to_string(), "true".to_string()],
                 false,
@@ -1626,12 +1844,12 @@ mod tests {
     fn harvest_lands_clean_results_cumulatively() {
         let root = tmp_root("harvest-clean");
         let repo = init(&root);
-        let session = repo.ws_fork(2, "t", None).unwrap();
+        let session = repo.ws_fork(None, 2, "t", None).unwrap();
         std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited-a\n").unwrap();
         std::fs::write(session.workspaces[1].dir.join("b.txt"), "new-b\n").unwrap();
 
         let oplog_before = repo.oplog().unwrap().len();
-        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
         assert_eq!(outcomes.len(), 2);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -1665,7 +1883,7 @@ mod tests {
             .is_none());
 
         // Session ended.
-        assert!(repo.ws_session().unwrap().is_none());
+        assert!(repo.ws_session(None).unwrap().is_none());
         assert!(!repo.layout().dot_sc.join("ws").exists());
 
         // sc undo reverts ONLY the second landing: a.txt edit still present,
@@ -1692,12 +1910,12 @@ mod tests {
         std::fs::write(root.join("keep.txt"), "k\n").unwrap();
         repo.commit("t", "base").unwrap();
 
-        let session = repo.ws_fork(2, "t", None).unwrap();
+        let session = repo.ws_fork(None, 2, "t", None).unwrap();
         std::fs::write(session.workspaces[0].dir.join("n"), "file\n").unwrap();
         std::fs::create_dir_all(session.workspaces[1].dir.join("n")).unwrap();
         std::fs::write(session.workspaces[1].dir.join("n/child"), "nested\n").unwrap();
 
-        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
         assert_eq!(outcomes.len(), 2);
         assert!(
             matches!(&outcomes[0], WsHarvestOutcome::Landed { index: 1, .. }),
@@ -1720,7 +1938,7 @@ mod tests {
         std::fs::write(root.join("x.txt"), "base-x\n").unwrap();
         repo.commit("t", "add x").unwrap();
 
-        let session = repo.ws_fork(2, "t", None).unwrap();
+        let session = repo.ws_fork(None, 2, "t", None).unwrap();
         std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited-a\n").unwrap();
         std::fs::write(session.workspaces[1].dir.join("x.txt"), "ws2-x\n").unwrap();
 
@@ -1729,7 +1947,7 @@ mod tests {
         std::fs::write(root.join("x.txt"), "main-x\n").unwrap();
         repo.commit("t", "conflict x on main").unwrap();
 
-        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
         assert_eq!(outcomes.len(), 2);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -1773,7 +1991,7 @@ mod tests {
         assert!(!crate::merge_state::in_progress(repo.layout()));
 
         // Session ended.
-        assert!(repo.ws_session().unwrap().is_none());
+        assert!(repo.ws_session(None).unwrap().is_none());
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -1784,10 +2002,10 @@ mod tests {
         let root = tmp_root("harvest-notcheckedout");
         let repo = init(&root);
         repo.branch("other").unwrap();
-        let session = repo.ws_fork(1, "t", None).unwrap();
+        let session = repo.ws_fork(None, 1, "t", None).unwrap();
         repo.switch("other").unwrap();
 
-        let err = repo.ws_harvest(None, "t", None).unwrap_err();
+        let err = repo.ws_harvest(None, None, "t", None).unwrap_err();
         match err {
             Error::InvalidArgument(msg) => {
                 assert!(
@@ -1804,7 +2022,7 @@ mod tests {
 
         // Session still open; nothing moved.
         let after = repo
-            .ws_session()
+            .ws_session(None)
             .unwrap()
             .expect("session must still be open");
         assert_eq!(after.workspaces.len(), session.workspaces.len());
@@ -1821,7 +2039,7 @@ mod tests {
         std::fs::write(root.join("x.txt"), "base-x\n").unwrap();
         repo.commit("t", "add x").unwrap();
 
-        let session = repo.ws_fork(2, "t", None).unwrap();
+        let session = repo.ws_fork(None, 2, "t", None).unwrap();
         std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited-a\n").unwrap();
         std::fs::write(session.workspaces[1].dir.join("x.txt"), "ws2-x\n").unwrap();
         std::fs::write(root.join("x.txt"), "main-x\n").unwrap();
@@ -1831,7 +2049,7 @@ mod tests {
         repo.branch("work-2").unwrap();
 
         // --into with the checked-out branch name behaves as default.
-        let outcomes = repo.ws_harvest(Some("main"), "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, Some("main"), "t", None).unwrap();
         match &outcomes[1] {
             WsHarvestOutcome::FallbackBranch { index: 2, branch } => {
                 assert_eq!(branch, "work-2-2");
@@ -1840,9 +2058,9 @@ mod tests {
         }
 
         // --into a non-checked-out branch errors.
-        let _session2 = repo.ws_fork(1, "t", None).unwrap();
+        let _session2 = repo.ws_fork(None, 1, "t", None).unwrap();
         let err = repo
-            .ws_harvest(Some("nonexistent-branch"), "t", None)
+            .ws_harvest(None, Some("nonexistent-branch"), "t", None)
             .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
 
@@ -1854,19 +2072,19 @@ mod tests {
     fn harvest_guards_and_dirty_tree() {
         let root = tmp_root("harvest-guards");
         let repo = init(&root);
-        let session = repo.ws_fork(1, "t", None).unwrap();
+        let session = repo.ws_fork(None, 1, "t", None).unwrap();
 
         // (a) merge/pick/rebase in progress -> typed errors.
         crate::merge_state::write(repo.layout(), &ObjectId::of(b"theirs"), &[], None).unwrap();
         assert!(matches!(
-            repo.ws_harvest(None, "t", None),
+            repo.ws_harvest(None, None, "t", None),
             Err(Error::MergeInProgress)
         ));
         crate::merge_state::clear(repo.layout()).unwrap();
 
         crate::pick_state::write(repo.layout(), &ObjectId::of(b"picked"), &[], None, None).unwrap();
         assert!(matches!(
-            repo.ws_harvest(None, "t", None),
+            repo.ws_harvest(None, None, "t", None),
             Err(Error::PickInProgress)
         ));
         crate::pick_state::clear(repo.layout()).unwrap();
@@ -1886,7 +2104,7 @@ mod tests {
         };
         crate::rebase_state::write(repo.layout(), &st).unwrap();
         assert!(matches!(
-            repo.ws_harvest(None, "t", None),
+            repo.ws_harvest(None, None, "t", None),
             Err(Error::RebaseInProgress)
         ));
         crate::rebase_state::clear(repo.layout()).unwrap();
@@ -1897,11 +2115,11 @@ mod tests {
         // Session intact.
         std::fs::write(session.workspaces[0].dir.join("a.txt"), "ws-edit\n").unwrap();
         std::fs::write(root.join("a.txt"), "dirty-uncommitted\n").unwrap();
-        let err = repo.ws_harvest(None, "t", None).unwrap_err();
+        let err = repo.ws_harvest(None, None, "t", None).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
 
         let after = repo
-            .ws_session()
+            .ws_session(None)
             .unwrap()
             .expect("session must still be open");
         assert!(
@@ -1926,7 +2144,7 @@ mod tests {
     fn harvest_partial_leaves_session_open() {
         let root = tmp_root("harvest-partial");
         let repo = init(&root);
-        let session = repo.ws_fork(2, "t", None).unwrap();
+        let session = repo.ws_fork(None, 2, "t", None).unwrap();
         std::fs::write(session.workspaces[0].dir.join("a.txt"), "edited-a\n").unwrap();
         // An AWS-style key id trips the P5 scanner in ws-2's checkout.
         std::fs::write(
@@ -1935,7 +2153,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
         assert_eq!(outcomes.len(), 2);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -1949,7 +2167,7 @@ mod tests {
         // ws-2 stays LIVE (rejected != resolved); session still open with
         // ws-2 only.
         let after = repo
-            .ws_session()
+            .ws_session(None)
             .unwrap()
             .expect("session must still be open");
         assert_eq!(after.workspaces.len(), 2);
@@ -1977,7 +2195,7 @@ mod tests {
             "base\n"
         );
         let after_undo = repo
-            .ws_session()
+            .ws_session(None)
             .unwrap()
             .expect("ws-2 still live keeps the session open");
         let e1_after_undo = after_undo.workspaces.iter().find(|e| e.index == 1).unwrap();
@@ -1988,13 +2206,13 @@ mod tests {
 
         // Fixing the file then re-harvesting completes and ends the session.
         std::fs::remove_file(e2.dir.join("leak.txt")).unwrap();
-        let outcomes2 = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes2 = repo.ws_harvest(None, None, "t", None).unwrap();
         assert_eq!(outcomes2.len(), 1);
         match &outcomes2[0] {
             WsHarvestOutcome::Unchanged { index: 2 } => {}
             other => panic!("expected Unchanged(2) once the leak is removed, got {other:?}"),
         }
-        assert!(repo.ws_session().unwrap().is_none());
+        assert!(repo.ws_session(None).unwrap().is_none());
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -2004,7 +2222,7 @@ mod tests {
     fn harvest_reharvest_after_crash_window_is_idempotent() {
         let root = tmp_root("harvest-reharvest");
         let repo = init(&root);
-        let session = repo.ws_fork(1, "t", None).unwrap();
+        let session = repo.ws_fork(None, 1, "t", None).unwrap();
         let dir = session.workspaces[0].dir.clone();
         std::fs::write(dir.join("a.txt"), "edited-a\n").unwrap();
 
@@ -2013,7 +2231,7 @@ mod tests {
         // the re-minted candidate id matches regardless of load.
         crate::repo::TEST_NOW.with(|c| c.set(Some(1_700_000_000)));
 
-        let outcomes = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
         let landed_tip = match &outcomes[0] {
             WsHarvestOutcome::Landed {
                 index: 1,
@@ -2022,7 +2240,7 @@ mod tests {
             other => panic!("expected Landed(1), got {other:?}"),
         };
         assert!(
-            repo.ws_session().unwrap().is_none(),
+            repo.ws_session(None).unwrap().is_none(),
             "session must have ended"
         );
 
@@ -2034,6 +2252,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "edited-a\n").unwrap();
         let crashed = WsSession {
+            name: None,
             base_snapshot: session.base_snapshot,
             base_branch: session.base_branch.clone(),
             author: session.author.clone(),
@@ -2049,7 +2268,7 @@ mod tests {
 
         // Re-harvest: no error, resolves as a no-op Landed at the existing
         // tip, and leaves no stray branch behind.
-        let outcomes2 = repo.ws_harvest(None, "t", None).unwrap();
+        let outcomes2 = repo.ws_harvest(None, None, "t", None).unwrap();
         assert_eq!(outcomes2.len(), 1);
         match &outcomes2[0] {
             WsHarvestOutcome::Landed {
@@ -2069,9 +2288,457 @@ mod tests {
                 .is_none(),
             "no stray candidate branch after the UpToDate no-op resolution"
         );
-        assert!(repo.ws_session().unwrap().is_none());
+        assert!(repo.ws_session(None).unwrap().is_none());
 
         crate::repo::TEST_NOW.with(|c| c.set(None));
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- Named and concurrent sessions (ADR-0056) -------------------------
+
+    /// Fork a one-workspace session called `name` and write `file` in it.
+    fn fork_and_edit(repo: &Repo, name: Option<&str>, file: &str, content: &str) -> WsEntry {
+        let session = repo.ws_fork(name, 1, "t", None).unwrap();
+        let entry = session.workspaces[0].clone();
+        std::fs::write(entry.dir.join(file), content).unwrap();
+        entry
+    }
+
+    #[test]
+    fn named_and_unnamed_sessions_coexist_in_separate_roots() {
+        let root = tmp_root("named-coexist");
+        let repo = init(&root);
+
+        let plain = repo.ws_fork(None, 1, "t", None).unwrap();
+        let a = repo.ws_fork(Some("a"), 2, "t", None).unwrap();
+        let b = repo.ws_fork(Some("b"), 1, "t", None).unwrap();
+
+        // The unnamed session keeps the original layout; named ones sit beside it.
+        let dot = &repo.layout().dot_sc;
+        assert_eq!(plain.workspaces[0].dir, dot.join("ws/1"));
+        assert_eq!(a.workspaces[1].dir, dot.join("ws-a/2"));
+        assert_eq!(b.workspaces[0].dir, dot.join("ws-b/1"));
+        // Each session's P33 stat cache sits in its own root, beside its checkouts.
+        assert_eq!(repo.layout().ws_cache_path(None, 1), dot.join("ws/cache-1"));
+        assert_eq!(
+            repo.layout().ws_cache_path(Some("b"), 1),
+            dot.join("ws-b/cache-1")
+        );
+        for p in ["ws/session.toml", "ws-a/session.toml", "ws-b/session.toml"] {
+            assert!(dot.join(p).is_file(), "{p}");
+        }
+
+        let all = repo.ws_sessions().unwrap();
+        let names: Vec<_> = all.iter().map(|s| s.name.as_deref()).collect();
+        assert_eq!(names, [None, Some("a"), Some("b")]);
+        assert_eq!(
+            repo.ws_session(Some("a"))
+                .unwrap()
+                .unwrap()
+                .workspaces
+                .len(),
+            2
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn session_name_collisions_and_bad_names_are_refused() {
+        let root = tmp_root("named-collide");
+        let repo = init(&root);
+        repo.ws_fork(Some("a"), 1, "t", None).unwrap();
+
+        match repo.ws_fork(Some("a"), 1, "t", None).unwrap_err() {
+            Error::InvalidArgument(m) => {
+                assert!(m.contains("session 'a' is already open"), "{m}");
+                assert!(m.contains("sc ws abandon --session a"), "{m}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        // A named session does not occupy the unnamed slot, nor vice versa.
+        repo.ws_fork(None, 1, "t", None).unwrap();
+        assert!(repo.ws_fork(None, 1, "t", None).is_err());
+        repo.ws_fork(Some("b"), 1, "t", None).unwrap();
+
+        for bad in ["", "a/b", "..", ".hidden", "has space"] {
+            assert!(
+                matches!(
+                    repo.ws_fork(Some(bad), 1, "t", None),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+        // A refused fork leaves nothing behind.
+        assert_eq!(repo.ws_sessions().unwrap().len(), 3);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn addressing_a_missing_session_names_what_is_open() {
+        let root = tmp_root("named-missing");
+        let repo = init(&root);
+        assert!(matches!(
+            repo.ws_abandon(Some("x"), None),
+            Err(Error::InvalidArgument(m)) if m == "no workspace session open"
+        ));
+        repo.ws_fork(Some("a"), 1, "t", None).unwrap();
+        // No unnamed session: the default does not silently pick a named one.
+        for err in [
+            repo.ws_harvest(None, None, "t", None).unwrap_err(),
+            repo.ws_abandon(None, None).unwrap_err(),
+            repo.ws_run(None, 1, &["true".into()], false, None)
+                .unwrap_err(),
+        ] {
+            let Error::InvalidArgument(m) = err else {
+                panic!("{err:?}")
+            };
+            assert!(m.contains("open: a") && m.contains("--session"), "{m}");
+        }
+        match repo.ws_harvest(Some("nope"), None, "t", None).unwrap_err() {
+            Error::InvalidArgument(m) => assert!(m.contains("named 'nope'"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Two sessions edit the same file from the same base. Whichever harvest
+    /// runs first lands; the second finds the landing branch moved on, cannot
+    /// merge cleanly, and falls back to its own `<name>-<i>` branch.
+    #[test]
+    fn first_harvest_wins_and_the_later_conflicting_one_falls_back() {
+        for (tag, first, second) in [("ab", "a", "b"), ("ba", "b", "a")] {
+            let root = tmp_root(&format!("order-conflict-{tag}"));
+            let repo = init(&root);
+            fork_and_edit(&repo, Some("a"), "a.txt", "from a\n");
+            fork_and_edit(&repo, Some("b"), "a.txt", "from b\n");
+            let base = repo.head_tip().unwrap().unwrap();
+
+            let out = repo.ws_harvest(Some(first), None, "t", None).unwrap();
+            assert!(matches!(
+                out[..],
+                [WsHarvestOutcome::Landed { index: 1, .. }]
+            ));
+            let out = repo.ws_harvest(Some(second), None, "t", None).unwrap();
+            match &out[..] {
+                [WsHarvestOutcome::FallbackBranch { index: 1, branch }] => {
+                    assert_eq!(*branch, format!("{second}-1"));
+                }
+                other => panic!("expected a fallback, got {other:?}"),
+            }
+
+            let want = format!("from {first}\n");
+            assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), want);
+            assert_ne!(repo.head_tip().unwrap().unwrap(), base);
+            // The loser's work is intact on its branch, parented on the base.
+            let kept = crate::refs::read_branch_tip(repo.layout(), &format!("{second}-1"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(repo.snapshot(&kept).unwrap().parents, vec![base]);
+            // Both sessions ended; nothing is left under .sc.
+            assert!(repo.ws_sessions().unwrap().is_empty());
+            assert!(!repo.layout().dot_sc.join("ws-a").exists());
+            assert!(!repo.layout().dot_sc.join("ws-b").exists());
+
+            drop(repo);
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// Disjoint edits from two sessions land in either order, to the same tree;
+    /// the second landing is a real merge over the first.
+    #[test]
+    fn disjoint_sessions_land_in_either_order_to_the_same_tree() {
+        let mut trees = Vec::new();
+        for (tag, first, second) in [("ab", "a", "b"), ("ba", "b", "a")] {
+            let root = tmp_root(&format!("order-disjoint-{tag}"));
+            let repo = init(&root);
+            fork_and_edit(&repo, Some("a"), "file-a.txt", "A\n");
+            fork_and_edit(&repo, Some("b"), "file-b.txt", "B\n");
+
+            repo.ws_harvest(Some(first), None, "t", None).unwrap();
+            let one = repo.head_tip().unwrap().unwrap();
+            // The other session is untouched by the first landing.
+            assert!(repo.ws_session(Some(second)).unwrap().unwrap().workspaces[0].live);
+
+            let out = repo.ws_harvest(Some(second), None, "t", None).unwrap();
+            let tip = match out[..] {
+                [WsHarvestOutcome::Landed { merged_tip, .. }] => merged_tip,
+                ref other => panic!("expected a landing, got {other:?}"),
+            };
+            let snap = repo.snapshot(&tip).unwrap();
+            assert_eq!(snap.parents.len(), 2, "second landing is a merge");
+            assert_eq!(snap.parents[0], one);
+            for f in ["file-a.txt", "file-b.txt"] {
+                assert!(root.join(f).exists());
+            }
+            trees.push(snap.root);
+
+            drop(repo);
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        assert_eq!(
+            trees[0], trees[1],
+            "same content whichever session lands first"
+        );
+    }
+
+    #[test]
+    fn abandoning_one_session_leaves_another_usable() {
+        let root = tmp_root("named-abandon");
+        let repo = init(&root);
+        let a = fork_and_edit(&repo, Some("a"), "file-a.txt", "A\n");
+        let b = fork_and_edit(&repo, Some("b"), "file-b.txt", "B\n");
+        let plain = fork_and_edit(&repo, None, "file-p.txt", "P\n");
+        let b_manifest = repo.layout().ws_root(Some("b")).join("session.toml");
+
+        // Abandon the whole of `a` and the unnamed session while `b` is live.
+        assert_eq!(repo.ws_abandon(Some("a"), None).unwrap(), 0);
+        assert_eq!(repo.ws_abandon(None, None).unwrap(), 0);
+        assert!(!a.dir.exists() && !plain.dir.exists());
+        assert!(!repo.layout().dot_sc.join("ws-a").exists());
+        assert!(!repo.layout().dot_sc.join("ws").exists());
+
+        // `b` still has its checkout, its edit and its manifest, and still runs.
+        assert_eq!(
+            std::fs::read_to_string(b.dir.join("file-b.txt")).unwrap(),
+            "B\n"
+        );
+        assert!(b_manifest.is_file());
+        assert_eq!(
+            repo.ws_run(Some("b"), 1, &["true".into()], false, None)
+                .unwrap(),
+            0
+        );
+        assert!(repo
+            .ws_run(Some("a"), 1, &["true".into()], false, None)
+            .is_err());
+
+        // ...and still harvests.
+        let out = repo.ws_harvest(Some("b"), None, "t", None).unwrap();
+        assert!(matches!(
+            out[..],
+            [WsHarvestOutcome::Landed { index: 1, .. }]
+        ));
+        assert!(root.join("file-b.txt").exists());
+        assert!(!root.join("file-a.txt").exists() && !root.join("file-p.txt").exists());
+        assert!(repo.ws_sessions().unwrap().is_empty());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn abandoning_one_workspace_of_a_named_session_keeps_its_siblings() {
+        let root = tmp_root("named-abandon-one");
+        let repo = init(&root);
+        let s = repo.ws_fork(Some("a"), 2, "t", None).unwrap();
+        assert_eq!(repo.ws_abandon(Some("a"), Some(1)).unwrap(), 1);
+        assert!(!s.workspaces[0].dir.exists() && s.workspaces[1].dir.exists());
+        let after = repo.ws_session(Some("a")).unwrap().unwrap();
+        assert!(!after.workspaces[0].live && after.workspaces[1].live);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_named_session_labels_its_workspaces_and_branches_with_its_name() {
+        let root = tmp_root("named-label");
+        let repo = init(&root);
+        let out_file = root.join("label.txt");
+        repo.ws_fork(Some("feat"), 1, "t", None).unwrap();
+        let script = format!("printf %s \"$SC_WORKSPACE\" > {}", out_file.display());
+        let code = repo
+            .ws_run(
+                Some("feat"),
+                1,
+                &["sh".into(), "-c".into(), script],
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read_to_string(&out_file).unwrap(), "feat-1");
+        std::fs::remove_file(&out_file).unwrap();
+
+        // A pre-existing branch of the fallback name is suffixed, not clobbered.
+        repo.ws_abandon(Some("feat"), None).unwrap();
+        let entry = fork_and_edit(&repo, Some("feat"), "a.txt", "ws\n");
+        std::fs::write(root.join("a.txt"), "host\n").unwrap();
+        repo.commit("t", "host edit").unwrap();
+        repo.branch("feat-1").unwrap();
+        let out = repo.ws_harvest(Some("feat"), None, "t", None).unwrap();
+        match &out[..] {
+            [WsHarvestOutcome::FallbackBranch { branch, .. }] => assert_eq!(branch, "feat-1-2"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!entry.dir.exists());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn gc_roots_the_base_of_every_open_session() {
+        let root = tmp_root("gc-named");
+        let repo = init(&root);
+        let base = repo.head_tip().unwrap().unwrap();
+        let standalone = |msg: &str| {
+            let arc = repo.vfs().store();
+            let mut s = arc.lock().unwrap();
+            let snap = s.get_snapshot(&base).unwrap();
+            s.put(scl_core::Object::Snapshot(scl_core::Snapshot {
+                root: snap.root,
+                parents: vec![base],
+                author: "t".into(),
+                timestamp: snap.timestamp,
+                message: msg.into(),
+                secrets: Default::default(),
+                protection: Default::default(),
+            }))
+            .unwrap()
+        };
+        // Each session's base is reachable from no ref: only its manifest keeps it.
+        let mut tips = Vec::new();
+        for name in [None, Some("a"), Some("b")] {
+            let tip = standalone(name.unwrap_or("plain"));
+            crate::refs::write_branch_tip(repo.layout(), "main", &tip).unwrap();
+            repo.ws_fork(name, 1, "t", None).unwrap();
+            tips.push((name, tip));
+        }
+        crate::refs::write_branch_tip(repo.layout(), "main", &base).unwrap();
+
+        let has = |tip: &ObjectId| repo.vfs().store().lock().unwrap().contains(tip);
+        repo.gc(std::time::Duration::from_secs(0)).unwrap();
+        assert!(
+            tips.iter().all(|(_, t)| has(t)),
+            "every open base survives gc"
+        );
+
+        repo.ws_abandon(Some("a"), None).unwrap();
+        repo.gc(std::time::Duration::from_secs(0)).unwrap();
+        for (name, tip) in &tips {
+            assert_eq!(has(tip), *name != Some("a"), "{name:?}");
+        }
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_running_command_blocks_harvest_and_abandon_of_its_workspace_only() {
+        let root = tmp_root("named-busy");
+        let repo = init(&root);
+        fork_and_edit(&repo, Some("a"), "file-a.txt", "A\n");
+        fork_and_edit(&repo, Some("b"), "file-b.txt", "B\n");
+
+        let plan = repo.ws_run_plan(Some("a"), 1, false, None).unwrap();
+        let busy = |e: Error| match e {
+            Error::InvalidArgument(m) => assert!(m.contains("still running"), "{m}"),
+            other => panic!("{other:?}"),
+        };
+        busy(repo.ws_harvest(Some("a"), None, "t", None).unwrap_err());
+        busy(repo.ws_abandon(Some("a"), None).unwrap_err());
+        busy(repo.ws_abandon(Some("a"), Some(1)).unwrap_err());
+        // A second run in the same workspace is refused too.
+        busy(repo.ws_run_plan(Some("a"), 1, false, None).err().unwrap());
+        // Nothing was touched, and the other session is unaffected.
+        assert!(repo.ws_session(Some("a")).unwrap().unwrap().workspaces[0].live);
+        let out = repo.ws_harvest(Some("b"), None, "t", None).unwrap();
+        assert!(matches!(out[..], [WsHarvestOutcome::Landed { .. }]));
+
+        // Once the command is over, the workspace harvests normally.
+        assert_eq!(plan.run(&["true".into()]).unwrap(), 0);
+        let out = repo.ws_harvest(Some("a"), None, "t", None).unwrap();
+        assert!(matches!(out[..], [WsHarvestOutcome::Landed { .. }]));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn dropping_an_unused_run_plan_releases_the_workspace() {
+        let root = tmp_root("named-busy-drop");
+        let repo = init(&root);
+        repo.ws_fork(None, 1, "t", None).unwrap();
+        drop(repo.ws_run_plan(None, 1, false, None).unwrap());
+        assert_eq!(repo.ws_abandon(None, None).unwrap(), 0);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_marker_from_a_dead_process_is_cleared() {
+        let root = tmp_root("named-busy-stale");
+        let repo = init(&root);
+        repo.ws_fork(None, 1, "t", None).unwrap();
+        // The pid of a child that has already exited.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        std::fs::write(running_path(repo.layout(), None, 1), pid.to_string()).unwrap();
+        assert_eq!(repo.ws_abandon(None, None).unwrap(), 0);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `sc` is killed but the command it started lives on: the workspace stays busy.
+    #[cfg(unix)]
+    #[test]
+    fn an_orphaned_child_keeps_its_workspace_busy() {
+        let root = tmp_root("named-busy-orphan");
+        let repo = init(&root);
+        repo.ws_fork(None, 1, "t", None).unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let mut orphan = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(
+            running_path(repo.layout(), None, 1),
+            format!("{dead_pid} {}", orphan.id()),
+        )
+        .unwrap();
+        assert!(repo.ws_abandon(None, None).is_err(), "child still runs");
+        orphan.kill().unwrap();
+        orphan.wait().unwrap();
+        assert_eq!(repo.ws_abandon(None, None).unwrap(), 0);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn session_names_from_the_command_line_cannot_leave_the_sc_dir() {
+        let root = tmp_root("named-escape");
+        let repo = init(&root);
+        repo.ws_fork(Some("a"), 1, "t", None).unwrap();
+        for bad in ["a/../../ws", "../x", ".."] {
+            assert!(matches!(
+                repo.ws_abandon(Some(bad), None),
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(repo.ws_session(Some(bad)).is_err());
+        }
+        // A stray file or oddly named entry does not hide the real sessions.
+        std::fs::write(repo.layout().dot_sc.join("ws-stray"), "x").unwrap();
+        std::fs::create_dir(repo.layout().dot_sc.join("ws-.hidden")).unwrap();
+        let names: Vec<_> = repo
+            .ws_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, [Some("a".to_string())]);
+        repo.gc(std::time::Duration::from_secs(0)).unwrap();
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
