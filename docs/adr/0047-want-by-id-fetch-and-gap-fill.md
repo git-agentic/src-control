@@ -110,7 +110,9 @@ not have. The rules for `GetObjects`:
 - Caps: 1024 ids per request (`MAX_GET_OBJECTS_IDS`, checked while decoding),
   the server's `--max-pack-size` over the summed canonical encoded size of a reply and
   `MAX_OBJECT_SIZE` per object (both `PackTooLarge`, before any pack byte is
-  written), and a 1 GiB cap on the stream a client will read back. A client
+  written), and a 1 GiB cap on the stream a client will read back (since #213 a 4 GiB
+  constant independent of the object cap; see ADR-0048 and the ADR-0039
+  addendum). A client
   also stops reading a pack as soon as it holds more records than it
   requested, so repeating one large object cannot multiply the receiver's
   decompress-and-hash work.
@@ -149,7 +151,9 @@ not have. The rules for `GetObjects`:
 3. **Merge on a partial clone** needs base, ours and theirs trees for only the
    conflicting paths. Whether tree ids alone suffice (identical ids need no
    fetch) or a server-assisted diff is needed is a 37b spike.
-4. **Reply size caps and batching.** The client reads at most 1 GiB per reply
+4. **Reply size caps and batching.** (Superseded: since #213 the client read cap
+   is a 4 GiB constant and the server reply ceiling 2 GiB; ADR-0048, ADR-0039.)
+   The client reads at most 1 GiB per reply
    while the server's default `--max-pack-size` is larger, so a batch that
    crosses 1 GiB fails mid-stream and leaves that connection out of sync. 37a
    sends one id per call so it cannot happen; 37b must split batches by size

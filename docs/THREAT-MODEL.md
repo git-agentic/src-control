@@ -426,9 +426,10 @@ too, not just the src-control-side metadata.
   (#213), within a compile-time range of 2 MiB to 1 GiB; a value outside that
   range aborts startup rather than being clamped; an empty `SC_MAX_OBJECT_SIZE`
   counts as unset. A guard checks the claimed length before allocating, and
-  frame bodies, pack records and the zstd output are then read in steps of at
-  most 8 MiB as bytes arrive (no doubling), so a hostile header or compression
-  bomb cannot buy a cap-sized allocation without sending the bytes.
+  frame bodies, pack records and the zstd output are then read in exact-size
+  growth steps as bytes arrive, so over-allocation is bounded (at most the
+  larger of 8 MiB and 12.5% of the bytes received) and a hostile header or
+  compression bomb cannot buy a cap-sized allocation without sending the bytes.
   **Accepted boundaries:**
   - The cap is a *transfer-path* guard. A locally-committed blob above it
     commits fine but cannot be transferred.

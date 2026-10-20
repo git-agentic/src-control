@@ -1139,20 +1139,17 @@ fn serve_session(
                         // `guard` drops here — temp pack file removed,
                         // whether ingestion succeeded or failed.
                     }
-                    Err(e @ (Error::PackTooLarge(_) | Error::Protocol(_))) => {
-                        // Over the cap, or a malformed/over-cap frame: the stream is desynced (we stopped
-                        // reading mid-pack, so any bytes still on the wire
-                        // are neither read nor a subsequent request), so a
-                        // best-effort reply is the most we can do — then
-                        // close the connection rather than try to serve
-                        // further requests off a desynced stream.
+                    Err(e) => {
+                        // Any spill failure (over the cap, a malformed or
+                        // over-cap frame, I/O): we stopped reading mid-pack,
+                        // so any bytes still on the wire are neither read
+                        // nor a subsequent request. A best-effort reply is
+                        // the most we can do; then close the connection
+                        // rather than serve further requests off a
+                        // desynced stream.
                         let (code, msg) = err_to_wire(&e);
                         let _ = write_err(w, code, &msg);
                         return Ok(());
-                    }
-                    Err(e) => {
-                        let (code, msg) = err_to_wire(&e);
-                        write_err(w, code, &msg)?;
                     }
                 }
             }
@@ -2018,6 +2015,39 @@ mod tests {
         ));
         let tmp = root.join(".sc").join("tmp");
         assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A malformed frame inside a pack stream desyncs the connection: the
+    /// server replies once and closes instead of answering what follows.
+    #[test]
+    fn put_pack_protocol_error_closes_the_connection() {
+        let root = tmp_repo("putpack-proto");
+        let mut input = Vec::new();
+        for req in [
+            Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+            Request::PutPack,
+        ] {
+            write_frame(&mut input, &req.encode()).unwrap();
+        }
+        write_frame(&mut input, &[0x7f]).unwrap(); // not a pack chunk or end
+        write_frame(&mut input, &Request::HeadBranch.encode()).unwrap(); // must never be answered
+
+        let mut output = Vec::new();
+        serve(&root, &mut std::io::Cursor::new(input), &mut output).unwrap();
+
+        let mut frames = Vec::new();
+        let mut r = std::io::Cursor::new(output);
+        while let Some(f) = read_frame_opt(&mut r).unwrap() {
+            frames.push(parse_response(f));
+        }
+        assert_eq!(frames.len(), 2, "hello ok, one error, then closed");
+        assert!(matches!(
+            frames[1].as_ref().unwrap_err(),
+            Error::Protocol(_)
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 

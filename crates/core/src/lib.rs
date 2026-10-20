@@ -97,17 +97,29 @@ pub fn parse_object_size(s: &str) -> std::result::Result<usize, String> {
     Ok(n)
 }
 
-/// Largest single buffer growth in the incremental readers below. Peak
-/// over-allocation past the bytes actually received is at most this.
+/// Floor of a buffer growth step in the incremental readers below. Peak
+/// over-allocation past the bytes actually received is at most
+/// `max(READ_STEP, received / 8)`.
 const READ_STEP: usize = 8 * 1024 * 1024;
 
+/// Size of the next growth step once `filled` bytes are in hand: geometric up
+/// to [`READ_STEP`] (cheap for small objects), then `max(READ_STEP, filled/8)`,
+/// so total copying stays linear even on an allocator that always copies on
+/// growth, while over-allocation stays within 12.5% (or one `READ_STEP`).
+fn next_step(filled: usize) -> usize {
+    if filled < READ_STEP {
+        filled.clamp(64 * 1024, READ_STEP)
+    } else {
+        READ_STEP.max(filled / 8)
+    }
+}
+
 /// Read from `r` until EOF or `limit` bytes, whichever is first, growing the
-/// buffer by `reserve_exact` steps as bytes arrive. `first_step` sizes the
-/// first allocation (the caller's best guess); later steps grow with the data
-/// seen so far but never past [`READ_STEP`], so nothing doubles and the
-/// capacity never exceeds the bytes read plus one step. A hostile length or
-/// decompression bomb therefore cannot buy a `limit`-sized allocation without
-/// supplying the bytes.
+/// buffer by `reserve_exact` steps (see [`next_step`]) as bytes arrive.
+/// `first_step` sizes the first allocation (the caller's best guess). The
+/// capacity never exceeds the bytes read by more than `max(8 MiB, 12.5%)`, so
+/// a hostile length or decompression bomb cannot buy a `limit`-sized
+/// allocation without supplying the bytes.
 pub fn read_limited(
     r: &mut impl std::io::Read,
     limit: usize,
@@ -120,7 +132,7 @@ pub fn read_limited(
             let want = if filled == 0 {
                 first_step.clamp(1, READ_STEP)
             } else {
-                filled.clamp(64 * 1024, READ_STEP)
+                next_step(filled)
             };
             let step = want.min(limit - filled);
             buf.reserve_exact(step);
@@ -208,16 +220,25 @@ mod tests {
     fn read_limited_never_over_allocates_by_more_than_one_step() {
         // An endless reader (a decompression bomb's shape): stops at the
         // limit, and the capacity is within one step of the bytes read.
-        let limit = 3 * READ_STEP + 12_345;
+        let slack = |n: usize| READ_STEP.max(n / 8);
+        // Past the 12.5% regime (limit / 8 > READ_STEP).
+        let limit = 12 * READ_STEP + 12_345;
         let v = read_limited(&mut std::io::repeat(0), limit, 4096).unwrap();
         assert_eq!(v.len(), limit);
-        assert!(v.capacity() <= limit + READ_STEP, "cap {}", v.capacity());
+        assert!(
+            v.capacity() <= limit + slack(limit),
+            "cap {} for {limit}",
+            v.capacity()
+        );
+        let limit = 3 * READ_STEP + 12_345;
+        let v = read_limited(&mut std::io::repeat(0), limit, 4096).unwrap();
+        assert!(v.capacity() <= limit + slack(limit), "cap {}", v.capacity());
         // A claimed length with all bytes present: also within one step
         // (in fact exact, since the last step is the remainder).
         let src = vec![9u8; 2 * READ_STEP + 7];
         let v = read_exact_vec(&mut &src[..], src.len()).unwrap();
         assert_eq!(v, src);
-        assert!(v.capacity() <= src.len() + READ_STEP);
+        assert!(v.capacity() <= src.len() + slack(src.len()));
         // A small claim allocates about the claim, not a step.
         let v = read_exact_vec(&mut &b"abcdef"[..], 4).unwrap();
         assert!(v.capacity() < 1024);

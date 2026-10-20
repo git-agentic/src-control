@@ -174,9 +174,10 @@ default of 256 MiB. Decisions:
 4. **Allocation follows bytes received.** The length check still runs before
    any allocation, but the frame body and pack record payload are now read
    through `scl_core::read_limited` / `read_exact_vec`, which grow the buffer by
-   `reserve_exact` steps of at most 8 MiB as bytes arrive instead of
-   pre-allocating the claimed length. Nothing doubles, so capacity never
-   exceeds the bytes received by more than one step; the zstd decompressed
+   `reserve_exact` steps as bytes arrive instead of pre-allocating the
+   claimed length. Steps are geometric up to 8 MiB, then `max(8 MiB, filled/8)`,
+   so capacity never exceeds the bytes received by more than the larger of
+   8 MiB and 12.5%, and total copying stays linear; the zstd decompressed
    output uses the same reader (still bounded at `cap + 1` to detect overflow).
    With the ceiling at 1 GiB, a four-byte header or a decompression bomb no
    longer buys a gigabyte-sized allocation. This closes the "frame header can

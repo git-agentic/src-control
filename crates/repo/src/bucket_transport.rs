@@ -673,6 +673,16 @@ impl Transport for BucketTransport {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn capped_metadata_guard_is_the_fixed_default_not_the_live_cap() {
+        // calloc'd zeros: no resident memory for the oversized value.
+        let at = vec![0u8; scl_core::DEFAULT_MAX_OBJECT_SIZE];
+        assert!(capped("idx", at).is_ok());
+        let over = vec![0u8; scl_core::DEFAULT_MAX_OBJECT_SIZE + 1];
+        let err = capped("idx", over).unwrap_err();
+        assert!(format!("{err}").contains("metadata limit"), "got {err}");
+    }
+
+    #[test]
     fn capped_to_rejects_above_a_lowered_cap_and_accepts_at_a_raised_one() {
         let v = vec![0u8; scl_core::MIN_MAX_OBJECT_SIZE + 1];
         let err = capped_to("manifest", v.clone(), scl_core::MIN_MAX_OBJECT_SIZE).unwrap_err();
