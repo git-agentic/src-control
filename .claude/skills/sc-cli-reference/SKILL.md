@@ -220,6 +220,16 @@ cargo run --bin sc -- transcript show <ref> [--identity <key>]   # decrypt + pri
 cargo run --bin sc -- transcript list [<ref>] [--json]   # list transcripts (never decrypts)
 cargo run --bin sc -- transcript sign <ref> [--identity <key>]   # retroactively sign a tip's
                                               # transcript(s) (P30)
+cargo run --bin sc -- clone|fetch|push --no-transcripts ...   # leave transcripts (P30) out of one
+                                              # transfer (#211): clone/fetch hash-check then discard
+                                              # received transcripts + their signatures (sender
+                                              # still sends them, so no bandwidth saved); push
+                                              # does not send them. Per command, not remembered:
+                                              # a later plain fetch brings them in; a plain push
+                                              # carries them only once the branch moves again.
+                                              # Snapshots transfer and verify as usual; no-op for
+                                              # git and bucket (sc+wal://, sc+s3://) remotes
+                                              # (push to a bucket still skips the upload)
 cargo run --bin sc -- transcript drop <id> [--identity <key>]   # drop a transcript by id/hex prefix (see `list`): writes
                                               # a tombstone that travels with fetch/clone so a peer
                                               # that still has it cannot restore it; gc reclaims the

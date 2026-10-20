@@ -461,18 +461,49 @@ pub(crate) fn ingest_pack_file_checked(
     max_records: Option<usize>,
     check: impl FnOnce(&std::collections::BTreeSet<ObjectId>) -> Result<()>,
 ) -> Result<Vec<ObjectId>> {
+    ingest_pack_file_impl(layout, store, path, max_records, check, false)
+}
+
+/// [`ingest_pack_file`] for a `--no-transcripts` receiver (ADR-0038 addendum,
+/// #211): every record is still hash-checked in pass 1 (not
+/// signature-verified), but pass 2 does not
+/// write `Transcript` objects, nor a signature whose target is a transcript
+/// dropped from this same pack (it would index against a transcript that is
+/// not here). The sender over-sends regardless of what the receiver wants (no
+/// wire flag), so this saves disk and exposure, not bandwidth.
+pub(crate) fn ingest_pack_file_without_transcripts(
+    layout: &Layout,
+    store: &mut Store,
+    path: &std::path::Path,
+) -> Result<Vec<ObjectId>> {
+    ingest_pack_file_impl(layout, store, path, None, |_| Ok(()), true)
+}
+
+fn ingest_pack_file_impl(
+    layout: &Layout,
+    store: &mut Store,
+    path: &std::path::Path,
+    max_records: Option<usize>,
+    check: impl FnOnce(&std::collections::BTreeSet<ObjectId>) -> Result<()>,
+    skip_transcripts: bool,
+) -> Result<Vec<ObjectId>> {
+    // Transcript ids seen in pass 1; pass 2 uses them to also drop their signatures.
+    let mut dropped = std::collections::BTreeSet::new();
     // Pass 1: verify every record's hash; write nothing.
     {
         let f = std::fs::File::open(path)?;
         let mut seen = std::collections::BTreeSet::new();
         let mut records = 0usize;
-        scl_core::pack::parse_pack_reader(f, |id, _obj| {
+        scl_core::pack::parse_pack_reader(f, |id, obj| {
             records += 1;
             if max_records.is_some_and(|max| records > max) {
                 return Err(scl_core::Error::PackCorrupt(format!(
                     "pack holds more than the {} record(s) requested",
                     max_records.unwrap_or(0)
                 )));
+            }
+            if skip_transcripts && matches!(obj, scl_core::Object::Transcript(_)) {
+                dropped.insert(id);
             }
             seen.insert(id);
             Ok(())
@@ -483,6 +514,11 @@ pub(crate) fn ingest_pack_file_checked(
     let f = std::fs::File::open(path)?;
     let mut ids = Vec::new();
     scl_core::pack::parse_pack_reader(f, |id, obj| {
+        if dropped.contains(&id)
+            || matches!(&obj, scl_core::Object::Signature(s) if dropped.contains(&s.snapshot))
+        {
+            return Ok(());
+        }
         let got = store.put(obj)?;
         // Defense in depth: pass 1 already verified this record's hash; this
         // guards against a future change that weakens that.

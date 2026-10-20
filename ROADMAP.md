@@ -878,9 +878,10 @@ scale-&-reach horizon):
   rewrap/grant/revoke surface — sealed once, to the recipient set at
   attach time, permanently. Extending P17's rewrap and P16's
   grant/revoke machinery to transcripts is deferred.
-- **`--no-transcripts` transfer knob (P30).** `fetch`/`clone`/`push`
-  always carry every indexed transcript covering a transferred snapshot;
-  an opt-out for bandwidth- or exposure-sensitive transfers is deferred.
+- **Sender-side `--no-transcripts` for fetch/clone (P30).** The #211
+  opt-out is client-side: `fetch`/`clone` still receive transcripts and
+  discard them, so only `push` saves bandwidth. Having the server skip
+  them needs a `GetPack` request field and a `PROTOCOL_VERSION` bump.
 - **`sc export --transcripts=entire` (P30).** Git export unconditionally
   drops transcripts (reported via `transcripts_dropped`); an opt-in mode
   that carries them as detached Git notes or a sidecar format is
