@@ -95,40 +95,103 @@ fn write_index(layout: &Layout, entries: &[Entry]) -> Result<()> {
 
 /// Index `new`, skipping any `(target, signer)` already present (the first
 /// entry keeps the slot, and Ed25519 is deterministic, so a signer has one
-/// valid signature per target anyway). One locked read-modify-write for the
-/// whole batch. Imports a pre-#257 index first, so a v2 file is never started
-/// while legacy entries are unread.
+/// valid signature per target anyway). One locked read and one appended write
+/// for the whole batch: the file is never rewritten here, so a large index
+/// (one line per distinct signer a writer made up) costs a read, not a
+/// rewrite and fsync of everything, while the lock is held. Imports a
+/// pre-#257 index first, so a v2 file is never started while legacy entries
+/// are unread.
 fn append_entries(layout: &Layout, store: &mut scl_core::Store, new: &[Entry]) -> Result<()> {
+    use std::io::Write;
     if new.is_empty() {
         return Ok(());
     }
     migrate_legacy(layout, store)?;
     with_index_lock(layout, || {
-        let mut entries = read_index(layout)?;
-        let mut slots: BTreeSet<(ObjectId, [u8; 32])> =
-            entries.iter().map(|(t, _, s)| (*t, *s)).collect();
-        let before = entries.len();
-        for e in new {
-            if slots.insert((e.0, e.2)) {
-                entries.push(*e);
+        let path = layout.signatures_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => Some(t),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(Error::Io(e)),
+        };
+        let mut slots: BTreeSet<(ObjectId, [u8; 32])> = text
+            .iter()
+            .flat_map(|t| t.lines().filter_map(parse_line))
+            .map(|(t, _, s)| (t, s))
+            .collect();
+        let mut out = String::new();
+        // A crash or ENOSPC mid-write can leave a line without its newline;
+        // start on a fresh line so this one is not merged into the torn tail.
+        if text
+            .as_ref()
+            .is_some_and(|t| !t.is_empty() && !t.ends_with('\n'))
+        {
+            out.push('\n');
+        }
+        let mut added = false;
+        for (target, sig, signer) in new {
+            if slots.insert((*target, *signer)) {
+                added = true;
+                out.push_str(&format!(
+                    "{} {} {}\n",
+                    target.to_hex(),
+                    sig.to_hex(),
+                    hex::encode(signer)
+                ));
             }
         }
-        if entries.len() == before {
+        if !added {
             return Ok(());
         }
-        write_index(layout, &entries)
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)?;
+        f.write_all(out.as_bytes())?;
+        f.sync_data()?;
+        if text.is_none() {
+            // Make the new directory entry durable too.
+            std::fs::File::open(&layout.dot_sc)?.sync_all()?;
+        }
+        Ok(())
     })
 }
 
-/// Index one signature that was just put in `store`.
+/// Index the signature `sig_id`, just put in `store`, if it is acceptable
+/// (see [`acceptable`]): the local signing paths hold the same bar as ingest,
+/// so a signature in the wrong domain for its target (a plain transcript
+/// signature over a drop tombstone) can never take its signer's slot.
 pub(crate) fn append_index(
     layout: &Layout,
     store: &mut scl_core::Store,
-    target: ObjectId,
     sig_id: ObjectId,
-    signer: [u8; 32],
 ) -> Result<()> {
-    append_entries(layout, store, &[(target, sig_id, signer)])
+    let Object::Signature(sig) = store.get(&sig_id)? else {
+        return Err(Error::InvalidArgument(format!(
+            "{sig_id} is not a signature object"
+        )));
+    };
+    if !acceptable(store, &sig)? {
+        return Err(Error::InvalidArgument(format!(
+            "signature {sig_id} does not verify for its target {} in its signing domain",
+            sig.snapshot
+        )));
+    }
+    append_entries(layout, store, &[(sig.snapshot, sig_id, sig.signer)])
+}
+
+/// A failure to read or decode one object, as opposed to an I/O problem that
+/// may pass: the object will not become readable by retrying.
+fn permanent(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::CorruptObject(_)
+            | Error::Core(
+                scl_core::Error::NotFound(_)
+                    | scl_core::Error::Malformed(_)
+                    | scl_core::Error::WrongKind(..)
+            )
+    )
 }
 
 /// Import a pre-#257 `.sc/signatures` (no signer column) into the v2 index,
@@ -162,16 +225,22 @@ pub(crate) fn migrate_legacy(layout: &Layout, store: &mut scl_core::Store) -> Re
             ) else {
                 continue;
             };
-            if !store.contains(&id) {
-                continue;
-            }
-            if let Object::Signature(sig) = store.get(&id)? {
-                if sig.snapshot == target
-                    && acceptable(store, &sig)?
-                    && slots.insert((target, sig.signer))
-                {
-                    entries.push((target, id, sig.signer));
+            // An object that is gone or will not decode is dropped like any
+            // entry that does not verify: one bad object must not stop every
+            // index write. A transient I/O error still fails the import.
+            let checked = (|| -> Result<Option<[u8; 32]>> {
+                let Object::Signature(sig) = store.get(&id)? else {
+                    return Ok(None);
+                };
+                Ok((sig.snapshot == target && acceptable(store, &sig)?).then_some(sig.signer))
+            })();
+            match checked {
+                Ok(Some(signer)) if slots.insert((target, signer)) => {
+                    entries.push((target, id, signer));
                 }
+                Ok(_) => {}
+                Err(e) if permanent(&e) => {}
+                Err(e) => return Err(e),
             }
         }
         write_index(layout, &entries)
@@ -302,8 +371,9 @@ pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<us
         }
     }
     // One slot per (target, signer): the lowest signature id keeps it, so the
-    // rebuild is deterministic.
-    entries.sort();
+    // rebuild is deterministic. (Sorted by slot first: equal slots must be
+    // adjacent for `dedup_by_key`.)
+    entries.sort_by_key(|e| (e.0, e.2, e.1));
     entries.dedup_by_key(|e| (e.0, e.2));
     let count = entries.len();
     with_index_lock(layout, || write_index(layout, &entries))?;
@@ -456,7 +526,7 @@ impl Repo {
         let arc = self.store_arc();
         let mut store = arc.lock().unwrap();
         let id = store.put(Object::Signature(sig_obj))?;
-        append_index(self.layout(), &mut store, snapshot, id, signer)?;
+        append_index(self.layout(), &mut store, id)?;
         Ok(id)
     }
 
@@ -954,9 +1024,9 @@ mod tests {
         let second = ObjectId::of(b"another signature object by the same signer");
         let arc = repo.store_arc();
         let mut store = arc.lock().unwrap();
-        append_index(repo.layout(), &mut store, snap, first, signer).unwrap();
-        append_index(repo.layout(), &mut store, snap, second, signer).unwrap();
-        append_index(repo.layout(), &mut store, snap, first, signer).unwrap();
+        append_entries(repo.layout(), &mut store, &[(snap, first, signer)]).unwrap();
+        append_entries(repo.layout(), &mut store, &[(snap, second, signer)]).unwrap();
+        append_entries(repo.layout(), &mut store, &[(snap, first, signer)]).unwrap();
         drop(store);
         assert_eq!(
             indexed_signature_ids_for(repo.layout(), &[snap]).unwrap(),
@@ -964,10 +1034,10 @@ mod tests {
             "the first entry keeps the slot"
         );
         // Another signer over the same target, and the same signer over another target.
-        let (other, other_signer) = put_sig(&repo, snap, false);
+        let (other, _) = put_sig(&repo, snap, false);
         let mut store = arc.lock().unwrap();
-        append_index(repo.layout(), &mut store, snap, other, other_signer).unwrap();
-        append_index(repo.layout(), &mut store, first, second, signer).unwrap();
+        append_index(repo.layout(), &mut store, other).unwrap();
+        append_entries(repo.layout(), &mut store, &[(first, second, signer)]).unwrap();
         drop(store);
         assert_eq!(
             std::fs::read_to_string(repo.layout().signatures_path())
@@ -978,6 +1048,7 @@ mod tests {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]
@@ -1028,6 +1099,7 @@ mod tests {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]
@@ -1053,5 +1125,55 @@ mod tests {
         assert_eq!(ids, want);
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn open_imports_the_legacy_index_before_re_judging_pending_tombstones() {
+        // The re-evaluation reads the signature index; run against an empty
+        // not-yet-imported one it would record the trust as judged and the
+        // drop would stay inert (the sender never re-sends a held tombstone).
+        let root = tmp_root("legacy-pending");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let body = repo
+            .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+            .unwrap();
+        let arc = repo.store_arc();
+        let tomb = arc
+            .lock()
+            .unwrap()
+            .put(Object::Transcript(scl_core::Transcript::drop_tombstone(
+                snap, &body,
+            )))
+            .unwrap();
+        repo.sign_drop(tomb, owner.signing.as_ref().unwrap())
+            .unwrap();
+        let mut store = arc.lock().unwrap();
+        crate::transcripts::index_incoming(repo.layout(), &mut store, &[tomb]).unwrap();
+        drop(store);
+        assert_eq!(crate::transcripts::tests::pending_count(&repo), 1);
+        // Turn the v2 index back into a legacy one, then trust the signer.
+        let layout = repo.layout().clone();
+        let v2 = std::fs::read_to_string(layout.signatures_path()).unwrap();
+        let legacy: String = v2
+            .lines()
+            .map(|l| l.split(' ').take(2).collect::<Vec<_>>().join(" ") + "\n")
+            .collect();
+        std::fs::remove_file(layout.signatures_path()).unwrap();
+        std::fs::write(layout.signatures_legacy_path(), legacy).unwrap();
+        crate::transcripts::tests::trust_signer(&repo, &owner);
+        drop(repo);
+
+        let repo = Repo::open(&root).unwrap();
+        assert!(
+            repo.transcripts_for(&snap).unwrap().is_empty(),
+            "the drop was honored on open"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 }

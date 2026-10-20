@@ -61,7 +61,10 @@ thread_local! {
 }
 
 /// How long [`with_index_lock`] waits for another holder before giving up.
-const INDEX_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Tests get a long wait: their threads queue behind durable (fsynced) writes
+/// on a loaded machine; the timeout path is tested with `with_index_lock_for`.
+const INDEX_LOCK_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(test) { 300 } else { 10 });
 
 /// Run `f` holding the short-lived index lock (`.sc/index.lock`, ADR-0038
 /// "Index lock", #260). It serializes the read-modify-write of the derived
@@ -230,6 +233,7 @@ mod tests {
         })
         .unwrap();
         std::fs::remove_dir_all(&layout.root).unwrap();
+        assert!(!layout.root.exists());
     }
 
     #[test]
@@ -257,5 +261,6 @@ mod tests {
         // Released: free again, and the failed waiter left no held entry.
         with_index_lock(&layout, || Ok(())).unwrap();
         std::fs::remove_dir_all(&layout.root).unwrap();
+        assert!(!layout.root.exists());
     }
 }

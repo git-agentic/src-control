@@ -237,6 +237,10 @@ transport-adjacent. The rest, imperatively:
   `sc rewrap --rotate` at the tip (fresh key per protected blob; a plain
   `sc rewrap` only replaces wrap lists) plus rotating the underlying credential.
   History keeps the old ciphertext (rotation is not erasure).
+- **The signature index is `.sc/signatures.v2` (#257).** `.sc/signatures` is the
+  pre-#257 file, kept only for the one-time import. Do not run an older binary's
+  `sc gc` on a repo this build has signed in or ingested into: it roots only the
+  legacy file and sweeps the signatures v2 lists (ADR-0038).
 - **The oplog is local-only** (like a reflog) — it never travels over
   fetch/push/clone. `sc undo` twice = redo; undoing the initial commit is
   refused.

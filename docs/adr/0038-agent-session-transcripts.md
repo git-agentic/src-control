@@ -592,7 +592,12 @@ scan in `tombstone_honored` never reached it. Now:
   nothing: Ed25519 is deterministic, so a signer has one valid signature per
   target, and for any target kind only one signing domain is acceptable (see
   `signatures::acceptable`), so a signature in the wrong domain is never
-  indexed and cannot occupy a slot. Entries are bounded by the distinct
+  indexed and cannot occupy a slot. The local signing paths hold the same
+  bar: `append_index` refuses a signature that is not acceptable, so a plain
+  transcript signature over a drop tombstone cannot take the owner's slot
+  ahead of the real drop signature. Appends write only the new lines
+  (`O_APPEND`, under the lock) and never rewrite the file, so a large index
+  costs a read, not a rewrite and fsync, while the lock is held. Entries are bounded by the distinct
   signers, not by the number of signature objects.
 - **Honoring.** `tombstone_honored` iterates the trusted signers, looks up the
   one signature each holds over the tombstone (`signatures::SigIndex`), reads
@@ -617,11 +622,21 @@ scan in `tombstone_honored` never reached it. Now:
   before gc prunes, which fail rather than start a v2 file, or root nothing,
   while legacy entries are unread. The old file is not deleted or rewritten.
   `reindex` rebuilds v2 from the store and ignores the legacy file.
-- **Downgrade.** An older binary keeps using `.sc/signatures`. Signatures it
-  adds after the upgrade are in the object store but not in v2 (`sc clone`
-  rebuilds the index; there is no standalone reindex command). Signatures
-  made by the new binary are not visible to the older one until it is
-  upgraded.
+- **Downgrade.** Do not run an older binary's `sc gc` on a repo this build
+  has signed in or ingested into. An older gc roots only the legacy
+  `.sc/signatures`, so it sweeps the signature objects that only
+  `.sc/signatures.v2` lists, and the v2 entries then dangle. Otherwise an older
+  binary keeps using `.sc/signatures`: signatures it adds after the upgrade are
+  in the object store but not in v2 (`sc clone` rebuilds the index; there is no
+  standalone reindex command), and signatures made by this build are not
+  visible to it.
+- **Failed migration.** `Repo::open` and `LocalTransport::open` ignore a
+  failed import (for example a read-only `.sc/`), and until it succeeds the
+  index reads as empty: signatures read `Unsigned` and a served repo forwards
+  none. Every writer and gc retry the import and fail rather than proceed.
+  An object that is gone or will not decode is dropped from the import like
+  any entry that does not verify, so one bad object does not block it; only a
+  transient I/O error fails it.
 - **Forwarding.** `indexed_signature_ids_for` (sender seam for fetch, clone,
   serve and push) returns the indexed signatures, which are now one per
   (target, signer), so a sender forwards at most one signature per signer per
@@ -675,8 +690,12 @@ Design:
 - **Unchanged**: `RepoLock` and its `Locked` behavior for local commands. A
   local command never fails because an ingest holds the index lock, nor the
   reverse.
-- A failure to get the lock fails that ingest after its objects are stored;
-  the sender's retry is idempotent (objects are content-addressed, index
-  appends dedupe).
+- A failure to get the lock (a holder busy for more than 10 seconds) fails
+  that ingest after its objects are stored. The client sees an error, but a
+  retried push sends only objects the remote lacks, so the objects of that
+  ingest stay unindexed on that remote until a reindex (`sc clone` of it). This
+  is the old loss window, now reachable only after the wait; the longest
+  holders are the one-time legacy import and the trust-change re-evaluation
+  (at most 1024 tombstones).
 - `flock` is advisory and only as good as the filesystem's support for it
   (like the `O_APPEND` note above, not guaranteed on NFS).

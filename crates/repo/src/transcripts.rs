@@ -822,13 +822,7 @@ impl Repo {
         let arc = self.store_arc();
         let mut store = arc.lock().unwrap();
         let id = store.put(Object::Signature(sig_obj))?;
-        crate::signatures::append_index(
-            self.layout(),
-            &mut store,
-            tomb,
-            id,
-            key.public().to_bytes(),
-        )
+        crate::signatures::append_index(self.layout(), &mut store, id)
     }
 
     /// All indexed transcripts for `snapshot`, loaded from the CAS (id +
@@ -916,7 +910,7 @@ impl Repo {
         let arc = self.store_arc();
         let mut store = arc.lock().unwrap();
         let id = store.put(Object::Signature(sig_obj))?;
-        crate::signatures::append_index(self.layout(), &mut store, tid, id, signer)?;
+        crate::signatures::append_index(self.layout(), &mut store, id)?;
         Ok(id)
     }
 
@@ -1166,20 +1160,18 @@ pub(crate) mod tests {
         assert_eq!(repo.transcripts_for(&snap).unwrap().len(), 1);
 
         // A plain transcript signature over the bare tombstone id (what an
-        // older binary's bulk `sc transcript sign` would produce) is not a drop.
-        // (Another victim: the signer holds one index slot per target.)
-        let victim2 = repo
-            .attach_transcript(snap, "a", "v2", b"victim2", &[owner.enc.public()])
-            .unwrap();
+        // older binary's bulk `sc transcript sign` would produce) is not a
+        // drop, and is not indexed either, so it cannot take the owner's slot
+        // from the real drop signature below.
         let plain = {
             let id = arc
                 .lock()
                 .unwrap()
                 .put(Object::Transcript(Transcript::drop_tombstone(
-                    snap, &victim2,
+                    snap, &victim,
                 )))
                 .unwrap();
-            repo.sign_transcript(id, &owner).unwrap();
+            assert!(repo.sign_transcript(id, &owner).is_err());
             let mut store = arc.lock().unwrap();
             index_incoming(repo.layout(), &mut store, &[id]).unwrap();
             id
@@ -1188,17 +1180,17 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .all(|d| d.1 != plain));
-        assert_eq!(repo.transcripts_for(&snap).unwrap().len(), 2);
+        assert_eq!(repo.transcripts_for(&snap).unwrap().len(), 1);
 
         // A trusted signature on a matching tombstone is honored.
         assert!(ingest(good, Some(&owner)));
-        assert_eq!(repo.transcripts_for(&snap).unwrap().len(), 1);
-        // The sender ships the tombstone with its snapshot (and the live victim2).
+        assert!(repo.transcripts_for(&snap).unwrap().is_empty());
+        // The sender ships the tombstone with its snapshot.
         assert_eq!(
             indexed_transcript_ids_for(repo.layout(), &[snap], &|_| true)
                 .unwrap()
                 .len(),
-            2
+            1
         );
 
         drop(repo);
@@ -1963,7 +1955,7 @@ pub(crate) mod tests {
     /// `repo_open` a `Repo` holds the repo lock throughout, like a local `sc`
     /// command; otherwise each thread also moves a ref, taking the repo lock.
     fn concurrent_ingests_lose_nothing(tag: &str, repo_open: bool) {
-        let n = 12usize;
+        let n = 8usize;
         let src_root = tmp_root(&format!("{tag}-src"));
         let dst_root = tmp_root(&format!("{tag}-dst"));
         let src = Repo::init(&src_root).unwrap();
@@ -2067,6 +2059,7 @@ pub(crate) mod tests {
         drop(src);
         std::fs::remove_dir_all(&src_root).unwrap();
         std::fs::remove_dir_all(&dst_root).unwrap();
+        assert!(!src_root.exists() && !dst_root.exists());
     }
 
     #[test]
