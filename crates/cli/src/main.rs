@@ -731,8 +731,14 @@ enum EscrowOp {
 
 #[derive(Subcommand)]
 enum WsOp {
-    /// Fork N durable workspaces from HEAD under `.sc/ws/<i>/`.
+    /// Fork N durable workspaces from HEAD under `.sc/ws/<i>/` (or, with
+    /// `--name`, a separate named session under `.sc/ws-<name>/<i>/`).
     Fork {
+        /// Name the session so several can be open at once; its fallback
+        /// branches and `SC_WORKSPACE` become `<name>-<i>`. Omit for the one
+        /// unnamed session (`work-<i>`).
+        #[arg(long)]
+        name: Option<String>,
         /// Number of workspaces to fork.
         #[arg(long, default_value_t = 2)]
         agents: u32,
@@ -746,10 +752,20 @@ enum WsOp {
         #[arg(long)]
         author: Option<String>,
     },
-    /// List the open session's workspaces (changed/unchanged vs base).
-    List,
+    /// List the open sessions' workspaces (changed/unchanged vs base), or one
+    /// session's with `--session`.
+    List {
+        /// Session to address: the name given to `sc ws fork --name`. Omit
+        /// for the unnamed session.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Run a command in one workspace checkout.
     Run {
+        /// Session to address: the name given to `sc ws fork --name`. Omit
+        /// for the unnamed session.
+        #[arg(long)]
+        session: Option<String>,
         /// Workspace index to run in.
         index: u32,
         /// Decrypt and inject registered secrets into the command's environment
@@ -765,14 +781,23 @@ enum WsOp {
     },
     /// Abandon one workspace (by index) or the whole session.
     Abandon {
+        /// Session to address: the name given to `sc ws fork --name`. Omit
+        /// for the unnamed session.
+        #[arg(long)]
+        session: Option<String>,
         /// Workspace index to abandon. Omit to abandon the whole session.
         index: Option<u32>,
     },
     /// Read-only conflict probe + cumulative auto-merge of every live
     /// workspace onto the landing branch (default: the session's base
     /// branch). Conflicted/rejected workspaces fall back to a `work-<i>`
-    /// branch for manual resolution and keep the session open.
+    /// branch (`<name>-<i>` for a named session) for manual resolution and
+    /// keep the session open.
     Harvest {
+        /// Session to address: the name given to `sc ws fork --name`. Omit
+        /// for the unnamed session.
+        #[arg(long)]
+        session: Option<String>,
         /// Landing branch; must be the currently-checked-out branch
         /// (default: the session's base branch).
         #[arg(long)]
@@ -3408,12 +3433,18 @@ fn run_ws(op: WsOp) -> Result<()> {
     let repo = open_repo()?;
     match op {
         WsOp::Fork {
+            name,
             agents,
             identity,
             author,
         } => {
             let sk = resolve_identity_opt(identity)?;
-            let session = repo.ws_fork(agents, &resolve_author(author), sk.as_ref())?;
+            let session = repo.ws_fork(
+                name.as_deref(),
+                agents,
+                &resolve_author(author),
+                sk.as_ref(),
+            )?;
             println!(
                 "forked {} workspace(s) from branch {} @ {}",
                 session.workspaces.len(),
@@ -3424,22 +3455,32 @@ fn run_ws(op: WsOp) -> Result<()> {
                 println!("  {:<3} {}", entry.index, entry.dir.display());
             }
         }
-        WsOp::List => match repo.ws_session()? {
-            None => println!("no workspace session open"),
-            Some(session) => {
-                println!(
-                    "session base: branch {} @ {}",
-                    session.base_branch,
-                    session.base_snapshot.short()
-                );
+        WsOp::List { session } => {
+            let sessions = match session {
+                None => repo.ws_sessions()?,
+                Some(n) => vec![repo
+                    .ws_session(Some(&n))?
+                    .ok_or_else(|| anyhow::anyhow!("no workspace session named '{n}' open"))?],
+            };
+            if sessions.is_empty() {
+                println!("no workspace session open");
+            }
+            for s in &sessions {
+                // The unnamed session keeps its historical header verbatim.
+                match &s.name {
+                    None => print!("session base:"),
+                    Some(n) => print!("session {n} base:"),
+                }
+                println!(" branch {} @ {}", s.base_branch, s.base_snapshot.short());
                 println!("index  status                       dir");
-                for entry in &session.workspaces {
-                    let status = repo.ws_status_label(&session, entry)?;
+                for entry in &s.workspaces {
+                    let status = repo.ws_status_label(s, entry)?;
                     println!("{:<6} {:<28} {}", entry.index, status, entry.dir.display());
                 }
             }
-        },
+        }
         WsOp::Run {
+            session,
             index,
             with_secrets,
             identity,
@@ -3452,20 +3493,22 @@ fn run_ws(op: WsOp) -> Result<()> {
             } else {
                 resolve_identity_opt(identity)?
             };
-            let code = repo.ws_run(index, &cmd, with_secrets, sk.as_ref())?;
-            // Drop the repo before process::exit to ensure the RepoLock's Drop
-            // runs and releases .sc/lock (process::exit skips destructors).
+            let plan = repo.ws_run_plan(session.as_deref(), index, with_secrets, sk.as_ref())?;
+            // Release the repo lock before the (possibly long) command runs, so
+            // other sessions can be listed, harvested or abandoned meanwhile
+            // (ADR-0056); process::exit would skip the RepoLock's Drop anyway.
             drop(repo);
-            std::process::exit(code);
+            std::process::exit(plan.run(&cmd)?);
         }
-        WsOp::Abandon { index } => {
-            let remaining = repo.ws_abandon(index)?;
+        WsOp::Abandon { session, index } => {
+            let remaining = repo.ws_abandon(session.as_deref(), index)?;
             match index {
                 Some(i) => println!("abandoned workspace {i}; {remaining} still live"),
                 None => println!("abandoned the session ({remaining} workspace(s) remain)"),
             }
         }
         WsOp::Harvest {
+            session,
             into,
             identity,
             author,
@@ -3473,8 +3516,12 @@ fn run_ws(op: WsOp) -> Result<()> {
             sign,
         } => {
             let sk = resolve_identity_opt(identity.clone())?;
-            let outcomes =
-                repo.ws_harvest(into.as_deref(), &resolve_author(author), sk.as_ref())?;
+            let outcomes = repo.ws_harvest(
+                session.as_deref(),
+                into.as_deref(),
+                &resolve_author(author),
+                sk.as_ref(),
+            )?;
 
             // ws_harvest has already moved the landing refs by this point —
             // print the per-workspace landing status FIRST, unconditionally,
@@ -3497,7 +3544,7 @@ fn run_ws(op: WsOp) -> Result<()> {
                     }
                     scl_repo::WsHarvestOutcome::Rejected { index, report } => {
                         failed = true;
-                        println!("{index:<3} REJECTED by secret scanner: {report} — fix and re-run `sc ws harvest`");
+                        println!("{index:<3} REJECTED by secret scanner: {report} — fix and re-run `sc ws harvest{}`", session.as_deref().map(|n| format!(" --session {n}")).unwrap_or_default());
                     }
                 }
             }

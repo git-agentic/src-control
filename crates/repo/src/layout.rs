@@ -170,10 +170,20 @@ impl Layout {
         self.dot_sc.join("protected-cache")
     }
 
-    /// `.sc/ws/cache-<i>` — workspace `i`'s P33 stat cache. Lives BESIDE the
-    /// checkout dir (`.sc/ws/<i>/`), never inside it, so harvest's worktree
-    /// read can't pick it up as an untracked file.
-    pub fn ws_cache_path(&self, i: usize) -> PathBuf {
-        self.dot_sc.join("ws").join(format!("cache-{i}"))
+    /// A `sc ws` session's root: `.sc/ws` for the unnamed session (the
+    /// original layout, unchanged) or `.sc/ws-<name>` for a named one (ADR-0056).
+    /// A sibling, not a child, so tearing one session down never touches another.
+    pub fn ws_root(&self, session: Option<&str>) -> PathBuf {
+        match session {
+            None => self.dot_sc.join("ws"),
+            Some(name) => self.dot_sc.join(format!("ws-{name}")),
+        }
+    }
+
+    /// `<session root>/cache-<i>` — workspace `i`'s P33 stat cache. Lives
+    /// BESIDE the checkout dir (`<session root>/<i>/`), never inside it, so
+    /// harvest's worktree read can't pick it up as an untracked file.
+    pub fn ws_cache_path(&self, session: Option<&str>, i: usize) -> PathBuf {
+        self.ws_root(session).join(format!("cache-{i}"))
     }
 }

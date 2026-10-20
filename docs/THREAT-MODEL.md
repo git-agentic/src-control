@@ -537,7 +537,10 @@ too, not just the src-control-side metadata.
   reach: an agent is a same-user process that can read the host repository's
   store and working tree and, on a lazy clone, fetch more (`sc sparse set`,
   `sc cat`, `sc backfill`). It is not an isolation boundary (compare Secret
-  injection).
+  injection). A command run by `sc ws run`
+  no longer holds the repo lock (ADR-0056), so an `sc` it runs from inside the
+  workspace finds the host repo and can change it, as a hand-started agent always
+  could.
 - **A blob-size limit (`--filter blob:limit=<size>`, ADR-0055) is request scope
   like the prefix filter, and the server evaluates it.** It hides nothing: any
   client that can read the repository can fetch the left-out blobs (`sc
