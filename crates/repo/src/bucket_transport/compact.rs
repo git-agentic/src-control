@@ -249,6 +249,14 @@ impl BucketTransport {
                 return Ok(());
             }
             if opts.dry_run {
+                // Split parts can outnumber the planned groups: size the
+                // checkpoint the real run would build, as it does.
+                if super::fold_would_overflow(nrefs, live.len() - merged.len() + created.len()) {
+                    rep.notes.push(format!(
+                        "the merged checkpoint would exceed the cap of {MAX_LIST}: nothing merged"
+                    ));
+                    return Ok(());
+                }
                 rep.packs_merged = merged.len();
                 rep.packs_created = created.len();
                 return Ok(());
