@@ -30,6 +30,10 @@ fn malformed_http_urls_are_refused_at_add_time_and_good_ones_recorded() {
         "sc+http://host:99999/repo",
         "sc+https:/host/repo", // near-miss scheme: one slash
         "sc+http:host/repo",
+        "sc+http://[::1/repo",     // unclosed bracket
+        "sc+http://[::1]x/repo",   // junk after the bracket
+        "sc+http://[host]:7777/r", // brackets hold only an IPv6 literal
+        "sc+http://::1:7777/repo", // unbracketed IPv6
     ] {
         let out = sc(&root, &["remote", "add", "origin", bad]);
         assert!(!out.status.success(), "{bad} should be refused");
@@ -43,6 +47,8 @@ fn malformed_http_urls_are_refused_at_add_time_and_good_ones_recorded() {
     for (name, good) in [
         ("plain", "sc+http://127.0.0.1:7777/repo"),
         ("secure", "sc+https://example.com/repo"),
+        ("v6", "sc+http://[::1]:7777/repo"),
+        ("v6s", "sc+https://[2001:db8::1]/repo"),
     ] {
         let out = sc(&root, &["remote", "add", name, good]);
         assert!(
@@ -54,6 +60,8 @@ fn malformed_http_urls_are_refused_at_add_time_and_good_ones_recorded() {
     let list = String::from_utf8_lossy(&sc(&root, &["remote", "list"]).stdout).into_owned();
     assert!(list.contains("sc+http://127.0.0.1:7777/repo"), "{list}");
     assert!(list.contains("sc+https://example.com/repo"), "{list}");
+    assert!(list.contains("sc+http://[::1]:7777/repo"), "{list}");
+    assert!(list.contains("sc+https://[2001:db8::1]/repo"), "{list}");
 
     std::fs::remove_dir_all(&root).unwrap();
     assert!(!root.exists(), "test must leave no residue");

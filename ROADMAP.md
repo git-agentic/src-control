@@ -732,16 +732,6 @@ scale-&-reach horizon):
   merge, cherry-pick or rebase is stopped there (`MergeInProgress` & co.), so
   the completing commit cannot silently drop a pushed commit. Other branches
   are unaffected.
-- **Sparse-gate the conflict helper's non-marker writes (P24 boundary).**
-  `Repo::materialize_conflict_state` gates conflict *markers* against the
-  sparse spec but not its `to_encrypt`/sidecar write loops — so an
-  in-sparse conflict co-occurring with an out-of-sparse protected/I2 clean
-  change transiently writes that out-of-sparse plaintext to disk outside
-  the view, and it PERSISTS after completion until a later re-lay (only
-  abort cleans it). Not data loss (completion re-lands it in the CAS) and
-  not a disclosure (an authorized identity produced it), documented in
-  ADR-0034 — but the sparse view is briefly wider than advertised. Extend
-  the gate to those write loops.
 - **Sparse ergonomics (P24 final-review Minors) — shipped.** `sc sparse set`
   warns for each prefix that matches no tracked path at HEAD (the tree is still
   laid out, empty, and `sc sparse disable` is named as the way back); a bare
@@ -817,9 +807,13 @@ scale-&-reach horizon):
 - **Per-path/per-ref ACLs (P29).** `sc serve --http` access control is
   all-or-nothing per connection (`ro`/`rw`); scoping a token to specific
   path prefixes or refs is beyond the MVP. Deferred.
-- **Token expiry/rotation metadata (P29).** `sct-` tokens have no expiry
+- ~~**Token expiry/rotation metadata (P29).** `sct-` tokens have no expiry
   field; rotation today is add-new + remove-old with no automation or
-  reminder. Deferred.
+  reminder.~~ **Done.** (#209) `sc serve token add --expires <30d|2030-01-31>`
+  stores an optional `expires_at` (Unix seconds); `verify` treats an expired
+  token like an unknown one (`401`); `list` shows and flags expiry; `sc serve
+  token rotate <label>` swaps the secret in one step. Expired entries stay in
+  the file. (ADR-0040.)
 - ~~**`sc+https://` / TLS (P29).** `sc serve --http` is plaintext-only; a
   bearer token crosses the wire in cleartext, so a public deployment must
   front with a TLS reverse proxy today. A first-party TLS dependency is

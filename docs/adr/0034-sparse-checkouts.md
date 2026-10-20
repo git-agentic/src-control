@@ -54,35 +54,28 @@ review fix — see Consequences).
   bounds checkout cost the way the budget bounds resident blobs.
 - gc is unchanged: all objects stay reachable (sparse is a disk view, not
   an object-set change).
-- **Boundary: an out-of-sparse plaintext write during a mixed conflict
-  that OUTLIVES the conflict window.** `Repo::materialize_conflict_state`
-  (`crates/repo/src/repo.rs`) gates its own conflict *markers* against the
-  sparse spec up front — an out-of-sparse conflicted path refuses with a
-  widen hint before anything is written. But that gate only covers the
-  marker-write loop; the same function's `to_encrypt`/sidecar-decrypt
-  write loops (protected-content re-encryption inputs and `.theirs`
-  sidecars for an *in-sparse* conflict) are not sparse-scoped. When an
-  IN-sparse conflict co-occurs with an OUT-of-sparse protected/I2 clean
-  change in the same merge, that out-of-sparse plaintext is written to
-  disk outside the sparse view — and, verified by final-review testing,
-  it **persists on disk after completion too**, not just during the
-  conflict window: only `abort` removes it (its `!sparse.matches` removal
-  arm runs on abort); completion's `read_worktree` re-lands the content in
-  the CAS byte-correct, the same as any other carried file, but `commit`
-  does not materialize, so it never deletes the on-disk file. The
-  plaintext stays on disk until the next materializing operation (`switch`,
-  `sparse set`/`disable`, another merge) re-lays the tree — there is no
-  completion-time sweep. This is **not data loss** — the content lands in
-  the CAS byte-correct either way — and **not a new disclosure**: the
-  diff3 content-merge that produces the plaintext already required an
-  authorized identity, and the I2 carried-plaintext case is pre-existing
-  plaintext the sparse gate never claimed to hide from disk. It is a
-  bounded disk-hygiene boundary — the sparse view stays wider than
-  advertised, with no signal, until something else re-lays the tree — not
-  a confidentiality or durability bug. Follow-on: extend the sparse gate
-  to the `to_encrypt`/sidecar write loops so the view holds even
-  mid-conflict (which would also close the post-completion persistence,
-  since there would be nothing out-of-sparse to persist).
+- **Closed (#210): no out-of-sparse plaintext during a mixed conflict.**
+  `Repo::materialize_conflict_state` (`crates/repo/src/repo.rs`) gates its
+  conflict *markers* against the sparse spec up front, and since #210 the
+  same gate covers the `to_encrypt` inputs (content-merged protected files,
+  and ours' carried-plain files under a theirs-only rule). One outside the
+  sparse view refuses the merge, cherry-pick or rebase with a widen hint
+  (`sc sparse set`) before anything is written, exactly like an
+  out-of-sparse conflicted path, so a stop, its completion and its abort
+  leave nothing out of view on disk. From `rebase --continue` the hint
+  says to abort the rebase first, because `sparse set` is refused while a
+  rebase is stopped. Sidecars need no gate on a full clone: each is
+  `<conflicted path>.theirs` beside a conflicted path that already passed
+  the gate (so it is in view even under a file-exact spec such as
+  `src/a.bin`), and abort and completion remove it; a partial clone keeps
+  its stricter sidecar refusal (ADR-0049). The earlier build wrote that
+  plaintext outside the view and left it there after completion (only
+  abort removed it); this was never data loss or a new disclosure, only a
+  view wider than advertised. The cost is that such a merge now needs the
+  view widened first; the alternative, sealing the plaintext at the stop,
+  would need its fresh wraps persisted with the decided root and was not
+  worth the surface. The check already existed for partial clones
+  (ADR-0049 decision 8); it now applies to every clone.
 
 ## Alternatives considered
 
@@ -138,9 +131,9 @@ every claim below is checked against the shipped code, not the plan.
    write to disk. A CLEAN out-of-sparse change never reaches either gate —
    it resolves on tree ids inside `three_way`/replay and lands via the
    ordinary `materialize` skip-write path, no markers involved at all. See
-   the Consequences section above for the one write path this gate does
-   *not* cover (`to_encrypt`/sidecar writes for an in-sparse conflict that
-   co-occurs with an out-of-sparse clean change).
+   the Consequences section above: since #210 the `to_encrypt`
+   writes for an in-sparse conflict that co-occurs with an out-of-sparse
+   clean change are refused by the same gate.
 4. **`sc ws` inherits the host's sparse view, structurally, not by
    convention — and, after a final-review fix, durably against later host
    spec changes.** `Repo::sparse_spec()` is read once in `ws_fork` and
