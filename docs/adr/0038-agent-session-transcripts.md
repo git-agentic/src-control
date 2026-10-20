@@ -672,8 +672,9 @@ Design:
   OS releases it when the holder dies, so there is no stale-lock breaking.
   Threads of one process conflict too (separate open files). Reentrant per
   thread, so a nested critical section reuses the held lock.
-- **Bounded wait**: polls up to 10 seconds, then `Error::Locked` (index lock
-  path). The sections it guards are single file updates, not command
+- **Bounded wait**: polls up to 10 seconds, then `Error::IndexBusy` (a distinct
+  error: its message must not tell anyone to delete the lock file, which would
+  let two holders lock different inodes). The sections it guards are single file updates, not command
   lifetimes.
 - **Lock order**: the index lock is a leaf. Code may take it while holding
   `RepoLock` (a local command, `LocalTransport::open`'s re-evaluation) and
@@ -681,6 +682,10 @@ Design:
   `update_ref` takes `RepoLock` after the ingest has returned, so the two
   cannot deadlock; tests drive `put_pack`-path ingests and `update_ref` from
   threads together.
+- **Atomic groups**: an ingest takes the lock once around its signature and
+  transcript indexing, and gc once around its transcript and signature prunes
+  (the signature prune relies on the transcript prune having rooted the
+  transcript ids), so neither can interleave with the other's half.
 - **Covered**: every read-modify-write or rewrite of `.sc/signatures.v2`,
   `.sc/transcripts`, `.sc/transcript-drops` (the `O_APPEND` line and
   `reindex`'s rewrite), `.sc/transcript-pending` and its trust state: the

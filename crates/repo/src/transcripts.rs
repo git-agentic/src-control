@@ -144,7 +144,7 @@ fn append_drop_locked(layout: &Layout, entry: DropEntry) -> Result<()> {
     f.sync_data()?;
     if is_new {
         // Make the new directory entry durable too.
-        std::fs::File::open(&layout.dot_sc)?.sync_all()?;
+        scl_core::fsutil::fsync_dir(&layout.dot_sc)?;
     }
     Ok(())
 }

@@ -629,12 +629,15 @@ fn ingest_pack_file_impl(
     if !skip_transcripts {
         let _ = crate::transcripts::reevaluate_if_trust_changed(layout, store);
     }
-    // Receiver seam (P22 Task 3): every id above was just written to this
-    // store, so `index_incoming`'s "ids just written" contract holds.
-    crate::signatures::index_incoming(layout, store, &ids)?;
-    // Receiver seam (P30 Task 4): same "ids just written" contract, for
-    // Transcript objects.
-    crate::transcripts::index_incoming(layout, store, &ids)?;
+    // Receiver seams (P22 Task 3 signatures, P30 Task 4 transcripts): every id
+    // above was just written to this store, so `index_incoming`'s "ids just
+    // written" contract holds. Both passes run under one index lock: gc prunes
+    // the transcript and signature indexes together, and between two separate
+    // locks it would drop a signature whose transcript was not yet indexed.
+    crate::lock::with_index_lock(layout, || {
+        crate::signatures::index_incoming(layout, store, &ids)?;
+        crate::transcripts::index_incoming(layout, store, &ids)
+    })?;
     Ok(ids)
 }
 

@@ -10,6 +10,10 @@ pub enum Error {
     RepoExists(String),
     #[error("repo is locked by another process (remove {0} if stale)")]
     Locked(String),
+    /// The short index-update lock (`.sc/index.lock`) stayed busy past its wait.
+    /// Never remove that file: it is an OS lock on a file that stays in place.
+    #[error("the index update lock {0} stayed busy; retry (do not remove the file)")]
+    IndexBusy(String),
     #[error("object {0} is corrupt (failed hash verification on read)")]
     CorruptObject(ObjectId),
     #[error("malformed ref: {0}")]

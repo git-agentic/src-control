@@ -151,7 +151,7 @@ fn append_entries(layout: &Layout, store: &mut scl_core::Store, new: &[Entry]) -
         f.sync_data()?;
         if text.is_none() {
             // Make the new directory entry durable too.
-            std::fs::File::open(&layout.dot_sc)?.sync_all()?;
+            scl_core::fsutil::fsync_dir(&layout.dot_sc)?;
         }
         Ok(())
     })

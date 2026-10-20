@@ -70,13 +70,13 @@ const INDEX_LOCK_WAIT: std::time::Duration =
 /// "Index lock", #260). It serializes the read-modify-write of the derived
 /// index files (`signatures.v2`, `transcripts`, `transcript-pending`...)
 /// between concurrent serve-path ingests and local commands, WITHOUT being
-/// [`RepoLock`]: it is held only around a single index update, never for a
-/// command's lifetime, so it never turns a busy repo into `Locked` for a
+/// [`RepoLock`]: it is held only around one index update (or one coupled
+/// group of them), never for a command's lifetime, so it never turns a busy repo into `Locked` for a
 /// local `sc` command.
 ///
 /// An advisory `flock` on a file that is never removed: the OS drops it when
 /// the holder dies, so there is no stale-lock breaking (and none of its
-/// races). Polls up to [`INDEX_LOCK_WAIT`], then `Error::Locked`. Reentrant per
+/// races). Polls up to [`INDEX_LOCK_WAIT`], then `Error::IndexBusy`. Reentrant per
 /// thread. Lock order: this lock is a leaf. Never acquire [`RepoLock`] (or
 /// wait on anything else) while holding it; taking it under `RepoLock` is fine.
 pub(crate) fn with_index_lock<T>(layout: &Layout, f: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -106,7 +106,7 @@ fn with_index_lock_for<T>(
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(Error::Locked(path.display().to_string()))
+                return Err(Error::IndexBusy(path.display().to_string()))
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
@@ -254,7 +254,7 @@ mod tests {
         // Another thread of the same process waits, then gives up.
         assert!(matches!(
             with_index_lock_for(&layout, std::time::Duration::from_millis(100), || Ok(())),
-            Err(Error::Locked(_))
+            Err(Error::IndexBusy(_))
         ));
         release_tx.send(()).unwrap();
         holder.join().unwrap();
