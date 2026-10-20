@@ -939,8 +939,16 @@ pub(crate) fn clear_dir_obstruction(full: &Path, path: &str) -> Result<()> {
         }
         Ok(true)
     }
+    // Bottom-up `remove_dir`, never `remove_dir_all`: a file created after the
+    // check above makes a directory non-empty and the removal fail, not vanish.
+    fn prune(dir: &Path) -> std::io::Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            prune(&e?.path())?;
+        }
+        std::fs::remove_dir(dir)
+    }
     let is_dir = full.symlink_metadata().is_ok_and(|m| m.is_dir());
-    if is_dir && !(only_dirs(full).unwrap_or(false) && std::fs::remove_dir_all(full).is_ok()) {
+    if is_dir && !(only_dirs(full).unwrap_or(false) && prune(full).is_ok()) {
         return Err(Error::InvalidArgument(format!(
             "cannot write {path}: a directory with untracked or ignored content stands there; \
              move it away, then retry"
