@@ -36,7 +36,7 @@ recorded as an ADR in `docs/adr/`. Keep them in sync when the design changes.
 
 Crate roles are what `ls crates/` + each `Cargo.toml` say; the rules are what
 matters. Strict dependency direction: top-level adapters `{cli, desktop} → repo →
-{vfs, gitio, crypto} → core`, with the separate leaf edges `repo → tlsio`
+{vfs, crypto} → core` (`gitio → core` is linked by `cli`, never by `repo`), with the separate leaf edges `repo → tlsio`
 **and `repo → objio`** (`tlsio` and `objio` are leaves — each depends on no
 other workspace crate, not even `core`). **`core` must never depend on Git,
 worktrees, or crypto.** **`gix` must stay quarantined in `gitio`** — if you
