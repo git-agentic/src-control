@@ -977,6 +977,8 @@ impl Repo {
         if merging || picking {
             let root = self.snapshot(&id)?.root;
             self.remove_conflict_sidecars(&[root])?;
+            // Likewise the files an interrupted widen laid outside the view.
+            self.remove_widen_residue(decided_root)?;
         }
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;
@@ -2333,6 +2335,9 @@ impl Repo {
             self.remove_conflict_plaintext(*root)?;
         }
         self.remove_conflict_sidecars(&sidecar_roots)?;
+        // What an interrupted stopped-op widen laid, which the walk above
+        // (over theirs' tree) cannot see.
+        self.remove_widen_residue(crate::merge_state::read_decided_root(&self.layout)?)?;
         crate::merge_state::clear(&self.layout)?;
         Ok(skipped)
     }

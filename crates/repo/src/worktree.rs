@@ -800,10 +800,42 @@ pub(crate) fn added_view_files(
     Ok((plain, protected))
 }
 
-/// Of the paths an interrupted widen recorded in `.sc/sparse-widen`
-/// (`recorded`), those whose file on disk has exactly the bytes
-/// [`lay_out_added_view`] would write: the widen's own earlier writes. A file
-/// that merely has the same bytes but was never recorded is the user's.
+/// Of `paths`, those that exist in the tree at `root` as plain files and whose
+/// file on disk has exactly the blob's bytes: what an interrupted widen wrote
+/// and nobody changed since. A file that merely has the same bytes but was
+/// never recorded is the user's, which is why callers pass only recorded paths.
+pub(crate) fn recorded_paths_laid(
+    layout: &Layout,
+    store: &mut Store,
+    root: ObjectId,
+    paths: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeSet<String>> {
+    let partial = crate::promisor::load(layout)?.is_some();
+    let mut laid = std::collections::BTreeSet::new();
+    for path in paths {
+        // A lookup that fails (a gap) reads as "not laid".
+        let Ok(Some((blob_id, _, perms))) = tree_entry_at(store, root, path, partial) else {
+            continue;
+        };
+        if perms & PROTECTED != 0 {
+            continue;
+        }
+        let Ok(Object::Blob(bytes)) = store.get(&blob_id) else {
+            continue;
+        };
+        let full = safe_join(&layout.root, path)?;
+        // A symlink is never ours, and a read error reads as "not laid".
+        let is_file = full.symlink_metadata().is_ok_and(|m| m.is_file());
+        if is_file && std::fs::read(&full).is_ok_and(|disk| disk[..] == bytes[..]) {
+            laid.insert(path.clone());
+        }
+    }
+    Ok(laid)
+}
+
+/// Of the paths an interrupted widen recorded (`recorded`), those the widen
+/// from `old` to `new` would write that are already on disk with the decided
+/// root's bytes: the widen's own earlier writes.
 pub(crate) fn added_view_already_laid(
     layout: &Layout,
     store: &mut Store,
@@ -812,22 +844,13 @@ pub(crate) fn added_view_already_laid(
     new: &Sparse,
     recorded: &std::collections::BTreeSet<String>,
 ) -> Result<std::collections::BTreeSet<String>> {
-    let mut laid = std::collections::BTreeSet::new();
-    for (path, blob_id) in added_view_files(store, root, old, new)?.0 {
-        if !recorded.contains(&path) {
-            continue;
-        }
-        let Object::Blob(bytes) = store.get(&blob_id)? else {
-            continue;
-        };
-        let full = safe_join(&layout.root, &path)?;
-        // A symlink is never ours, and a read error reads as "not laid".
-        let is_file = full.symlink_metadata().is_ok_and(|m| m.is_file());
-        if is_file && std::fs::read(&full).is_ok_and(|disk| disk[..] == bytes[..]) {
-            laid.insert(path);
-        }
-    }
-    Ok(laid)
+    let added: std::collections::BTreeSet<String> = added_view_files(store, root, old, new)?
+        .0
+        .into_iter()
+        .map(|(p, _)| p)
+        .filter(|p| recorded.contains(p))
+        .collect();
+    recorded_paths_laid(layout, store, root, &added)
 }
 
 /// Lay out the files that a widened view (`new`, which covers `old`) brings

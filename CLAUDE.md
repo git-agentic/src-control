@@ -264,6 +264,10 @@ transport-adjacent. The rest, imperatively:
   sidecars it wrote are listed apart in `.sc/CONFLICT_SIDECARS`; abort, `rebase
   --continue` and `sc resolve` remove only those, never a `.theirs` file the stop
   did not write; the completing commit leaves them out of the tree and removes them.
+  A stopped-op `sparse set` widen records the files it is writing in
+  `.sc/sparse-widen` (local-only like the rest, removed with the spec write or
+  the op); abort and completion delete what an interrupted widen laid outside
+  the view.
 - **A merge, switch, cherry-pick, rebase, undo or sparse-spec change refuses, before any write, to lay a file or
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
   away and retry. Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded.

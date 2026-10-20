@@ -431,6 +431,44 @@ fn aborting_a_widened_partial_merge_leaves_no_residue() {
     }
 }
 
+/// On a partial clone an interrupted widen laid a subtree only ours has (theirs'
+/// docs tree was never fetched, so the abort's walk over theirs cannot see it).
+/// The abort removes those files using the widen's record, and a fresh widen
+/// then succeeds.
+#[test]
+fn abort_after_an_interrupted_partial_widen_removes_the_subtree_it_laid() {
+    let fx = Fx::origin("abort-widen-ours-only", |_| {});
+    // Cut before main gains its own docs file, so theirs never touches docs/.
+    fx.origin_branch("b1", &[("src/a.txt", b"ONE\ntwo\nthree\n")]);
+    std::fs::write(fx.origin_root.join("docs/mine.md"), b"ours only\n").unwrap();
+    fx.origin.commit("t", "ours docs").unwrap();
+    let clone = fx.clone(true);
+    clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+    assert!(matches!(
+        clone.merge("origin/b1", "t").unwrap_err(),
+        Error::MergeConflicts(1)
+    ));
+    let old = clone.sparse_spec().unwrap();
+    let wide = crate::Sparse::new(vec!["src/".to_string(), "docs/".to_string()]);
+    let decided = crate::merge_state::read_decided_root(clone.layout())
+        .unwrap()
+        .unwrap();
+    clone.lay_out_widened_view(decided, &old, &wide).unwrap();
+    assert!(fx.clone_root.join("docs/mine.md").exists(), "laid");
+
+    clone.merge_abort().unwrap();
+    assert!(!fx.clone_root.join("docs/mine.md").exists(), "no residue");
+    assert!(!clone.layout().sparse_widen_path().exists());
+    assert!(!clone.layout().sparse_prev_path().exists());
+    clone.set_sparse(wide.prefixes(), None).unwrap();
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("docs/mine.md")).unwrap(),
+        b"ours only\n"
+    );
+    drop(clone);
+    fx.cleanup();
+}
+
 /// Aborting restores ours and removes the markers; the carried subtree was
 /// never on disk and the ref never moved.
 #[test]

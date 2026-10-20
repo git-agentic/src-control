@@ -186,8 +186,16 @@ every claim below is checked against the shipped code, not the plan.
    recorded file already on disk with the decided root's bytes as its own
    earlier write; an unrecorded file, even with equal bytes, or a changed one
    still refuses (modes are not compared: `lay_out_added_view` writes none,
-   #237). On a
-   partial clone the new view is recorded in `.sc/sparse_prev` before the
+   #237). The record starts with the stop's decided-root id and is ignored
+   when that does not match (a stale record). When the stop ends with the old
+   view still in force (abort of a merge, pick or rebase, or the completion
+   after an interrupted widen) `Repo::remove_widen_residue` deletes the
+   recorded files that lie outside the view and still have the decided tree's
+   bytes, before the op's state is cleared: the abort's own walk follows the
+   other side's tree and the restored view, so it cannot see an ours-only
+   file or a subtree never fetched for theirs. A file the user edited since is
+   left. On a
+   partial clone the new view is recorded in `.sc/sparse-prev` before the
    writes, so the abort's removal walk covers files an interrupted widen
    laid; the marker is restored to its prior state once the spec is stored.
    The untracked-file guard checks only paths the old view did not match
