@@ -370,11 +370,15 @@ next commit. Instead:
 - The stop is a pure function of the ours inner tip, `MERGE_HEAD` and the
   merge base, none of which can move while the merge is stopped (every
   ref-moving op is guarded). `commit_private` therefore **re-derives** the
-  outcome (`private_three_way`, the same call the stop made) when a sparse
-  spec is in force, and carries out-of-view and protected-skipped paths from
-  it, never from the prior tip. A path absent from the outcome was decided
+  outcome (`private_three_way`, the same call the stop made) on every merge
+  completion, and carries out-of-view and protected-skipped paths from it,
+  never from the prior tip. A path absent from the outcome was decided
   deleted. Nothing new is stored, so the opacity argument above is unchanged.
-  With no sparse spec nothing is re-derived and behavior is as before.
+  It is not limited to sparse: on a full checkout a protected path the
+  completer cannot read (skipped on disk) was carried from the prior tip too,
+  silently reverting a clean public change to it. The re-derivation runs with
+  the completing identity, so a recipient without access to a protected path
+  both sides changed fails the completion rather than altering the outcome.
 - The stop honors the view like the public path (#220): it lays out only
   in-view files, and a conflict outside the view is refused before any write
   (no merge state, no ref move) with a hint to switch to a public branch and
@@ -383,7 +387,8 @@ next commit. Instead:
 
 Pinned by `private_sparse.rs`: the final tree equals the run without sparse
 (deletion kept, add and modify landed, ours-only private edit kept), the stop
-writes nothing outside the view, and an out-of-view conflict refuses cleanly.
+writes nothing outside the view, and an out-of-view conflict refuses cleanly;
+and by `private.rs` tests for the full-checkout protected-path case.
 
 ## Deferred (to ROADMAP.md)
 

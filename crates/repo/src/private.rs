@@ -661,8 +661,8 @@ impl Repo {
 
         // Policy + secrets: tip's, or the union with theirs on merge completion
         // (same discipline as `snapshot_files`' merge-completion arm).
-        // Under a sparse spec, a merge completion also re-derives the merge's
-        // outcome for the paths it cannot read from disk (see below).
+        // A merge completion also re-derives the merge's outcome for the paths
+        // it cannot read from disk (see below).
         let mut decided: Option<BTreeMap<String, (ObjectId, FileMode, u8)>> = None;
         let mut decided_blobs: BTreeMap<ObjectId, Vec<u8>> = BTreeMap::new();
         let (protection, secrets) = match merge_head {
@@ -682,14 +682,12 @@ impl Repo {
                     .merge_base_private(&mut store, &ctx, inner_tip, mh)?
                     .ok_or(Error::NoCommonAncestor)?;
                 let base_snap = self.get_inner_snapshot(&mut store, &ctx, &base)?;
-                if !sparse.is_full() {
-                    let fm = self.private_three_way(
-                        &mut store, &ctx, &prev_snap, &theirs, &base_snap, identity,
-                    )?;
-                    let (entries, blobs, _) = decide_merged(&fm);
-                    decided = Some(entries);
-                    decided_blobs = blobs;
-                }
+                let fm = self.private_three_way(
+                    &mut store, &ctx, &prev_snap, &theirs, &base_snap, identity,
+                )?;
+                let (entries, blobs, _) = decide_merged(&fm);
+                decided = Some(entries);
+                decided_blobs = blobs;
                 let secs = crate::merge::merge_secrets(
                     &base_snap.secrets,
                     &prev_snap.secrets,
@@ -749,8 +747,7 @@ impl Repo {
         }
         // Carry paths that are expected-absent: outside sparse, or PROTECTED
         // and skipped on disk (never silently drop protected content). On a
-        // merge completion under a sparse spec the source is the merge's
-        // decided outcome, not the prior tip, so a path the public side
+        // merge completion the source is the merge's decided outcome, not the prior tip, so a path the public side
         // deleted stays deleted and its clean adds and modifies land (#240,
         // same rule as the public path, #238). It is re-derived rather than
         // recorded: a decided tree cannot sit in unsealed `.sc/` state.
@@ -2469,6 +2466,46 @@ mod tests {
         assert!(perms & PROTECTED != 0, "published entry stays protected");
 
         drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A stopped merge-in must complete a protected path the completer cannot
+    /// read (skipped on disk) from the merge's outcome, not the prior tip, on
+    /// a full checkout too (#240 review): `main` rotated the file and the
+    /// private side never touched it.
+    #[test]
+    fn merge_completion_takes_an_unreadable_protected_path_from_the_merge() {
+        let (root, repo, (alice_sk, _), (bob_sk, bob_pk)) = setup("protmerge");
+        repo.protect("vault/", std::slice::from_ref(&bob_pk), None)
+            .unwrap();
+        write(&root, "vault/key.pem", "PEM-V1\n");
+        repo.commit("tester", "add protected").unwrap();
+        repo.branch_private("fix", &alice_sk, std::slice::from_ref(&bob_pk), &[])
+            .unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        write(&root, "src/lib.rs", "private\n");
+        repo.commit_private("alice", "private work", Some(&alice_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        write(&root, "src/lib.rs", "public\n");
+        write(&root, "vault/key.pem", "PEM-V2\n");
+        repo.commit("tester", "main moves").unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        assert!(matches!(
+            repo.merge_into_private("main", "alice", Some(&alice_sk)),
+            Err(Error::MergeConflicts(1))
+        ));
+        write(&root, "src/lib.rs", "resolved\n");
+        repo.commit_private("alice", "resolve", Some(&alice_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("fix", Some(&bob_sk)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("vault/key.pem")).unwrap(),
+            "PEM-V2\n",
+            "the public rotation was reverted by the stale carry"
+        );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

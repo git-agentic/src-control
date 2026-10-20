@@ -172,8 +172,8 @@ every claim below is checked against the shipped code, not the plan.
    A stopped merge, cherry-pick or rebase on a public branch records a
    decided root (`MERGE`/`PICK`/`REBASE_DECIDED_ROOT`). A merge into a
    private branch records none, because an inner tree must not sit in
-   unsealed `.sc/` state; `commit_private` re-derives the merge outcome under
-   a sparse spec instead and carries from that (#240, ADR-0044 "Merge-in
+   unsealed `.sc/` state; `commit_private` re-derives the merge outcome
+   instead and carries from that (#240, ADR-0044 "Merge-in
    under a sparse spec"), and its stop lays out only in-view files and
    refuses an out-of-view conflict before any write. `snapshot_files` carries an absent
    out-of-view or still-protected path from the decided root. Earlier builds

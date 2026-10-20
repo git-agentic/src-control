@@ -32,9 +32,9 @@ fn docs(root: &Path) -> BTreeMap<String, String> {
     out
 }
 
-/// `main` holds src/lib.rs plus docs/{old,mod,ours}.txt; private `fix` edits
-/// src/lib.rs and docs/ours.txt; `main` then edits src/lib.rs, deletes
-/// docs/old.txt, edits docs/mod.txt and adds docs/new.txt. With `view` set,
+/// `main` holds src/lib.rs plus docs/{old,mod,ours,lines}.txt; private `fix` edits
+/// src/lib.rs, docs/ours.txt and the first line of docs/lines.txt; `main` then edits src/lib.rs, deletes
+/// docs/old.txt, edits docs/mod.txt and adds docs/new.txt and edits the last line of docs/lines.txt. With `view` set,
 /// the sparse spec `src/` is in force on `main` before switching to `fix`,
 /// and `conflict_in_docs` also makes `fix` edit docs/mod.txt (a conflict).
 struct Fixture {
@@ -52,12 +52,14 @@ fn fixture(tag: &str, view: bool, conflict_in_docs: bool) -> Fixture {
     put(&root, "docs/old.txt", "old\n");
     put(&root, "docs/mod.txt", "mod-base\n");
     put(&root, "docs/ours.txt", "ours-base\n");
+    put(&root, "docs/lines.txt", "a\nb\nc\nd\ne\n");
     repo.commit("t", "base").unwrap();
     let (sk, _pk) = scl_crypto::generate_keypair();
     repo.branch_private("fix", &sk, &[], &[]).unwrap();
     repo.switch_with_identity("fix", Some(&sk)).unwrap();
     put(&root, "src/lib.rs", "private\n");
     put(&root, "docs/ours.txt", "ours-edit\n");
+    put(&root, "docs/lines.txt", "A\nb\nc\nd\ne\n");
     if conflict_in_docs {
         put(&root, "docs/mod.txt", "mod-private\n");
     }
@@ -68,6 +70,7 @@ fn fixture(tag: &str, view: bool, conflict_in_docs: bool) -> Fixture {
     std::fs::remove_file(root.join("docs/old.txt")).unwrap();
     put(&root, "docs/mod.txt", "mod-public\n");
     put(&root, "docs/new.txt", "new-public\n");
+    put(&root, "docs/lines.txt", "a\nb\nc\nd\nE\n");
     repo.commit("t", "main moves").unwrap();
     if view {
         repo.set_sparse(&["src/".to_string()], Some(&sk)).unwrap();
@@ -110,6 +113,8 @@ fn sparse_merge_into_private_equals_the_run_without_sparse() {
     assert_eq!(got["mod.txt"], "mod-public\n");
     assert_eq!(got["new.txt"], "new-public\n");
     assert_eq!(got["ours.txt"], "ours-edit\n", "ours-only edit lost");
+    // Both sides edited it, out of view: the merged blob is new and sealed.
+    assert_eq!(got["lines.txt"], "A\nb\nc\nd\nE\n");
     assert_eq!(got, want);
     std::fs::remove_dir_all(&full.root).unwrap();
     std::fs::remove_dir_all(&sparse.root).unwrap();

@@ -226,10 +226,10 @@ transport-adjacent. The rest, imperatively:
   integrating a private branch INTO a public one (merge/cherry-pick/rebase
   from it, or git export/push) is refused everywhere except `sc branch
   publish`. Merging a public branch IN is allowed (keeps an embargo current);
-  under a sparse spec set on the public branch, its conflict stop lays out
-  in-view files only, refuses an out-of-view conflict before any write, and
-  completion re-derives the merge outcome for out-of-view paths instead of
-  carrying the prior tip (#240; no decided root, it would be unsealed).
+  its completion re-derives the merge outcome for paths it cannot read from
+  disk (out of view, or protected and skipped) instead of carrying the prior
+  tip, and under a sparse spec set on the public branch its conflict stop lays
+  out in-view files only and refuses an out-of-view conflict before any write (#240; no decided root, it would be unsealed).
   `sc branch revoke` rotates the KEK but a recipient who already fetched keeps
   the old manifest (rotation ≠ erasure). **Keep identity files outside the
   working tree** — a key committed under a private branch is sealed in and
