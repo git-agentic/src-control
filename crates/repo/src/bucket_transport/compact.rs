@@ -202,11 +202,6 @@ impl BucketTransport {
                 ));
                 return Ok(());
             }
-            if opts.dry_run {
-                rep.packs_merged = replaced.len();
-                rep.packs_created = groups.len();
-                return Ok(());
-            }
             let mut created = Vec::new();
             // The packs actually folded: a source that fills a part alone is
             // left where it is (#263), so this can be a subset of `replaced`.
@@ -239,17 +234,23 @@ impl BucketTransport {
                     // Compressed sizes bound the group, not the decoded bytes held
                     // here; spill to a pack of its own before RAM balloons.
                     if decoded > opts.group_bytes.saturating_mul(DECODED_FACTOR) {
-                        self.flush_part(&mut objects, &mut part, &mut created, &mut merged)?;
+                        self.flush_part(&mut objects, &mut part, &mut created, &mut merged, opts)?;
                         decoded = 0;
                     }
                 }
-                self.flush_part(&mut objects, &mut part, &mut created, &mut merged)?;
+                self.flush_part(&mut objects, &mut part, &mut created, &mut merged, opts)?;
             }
             if created.is_empty() {
                 rep.notes.push(
-                    "no merge would reduce the pack count: every candidate is large once                      decoded, nothing merged"
+                    "no merge would reduce the pack count: every candidate is large once decoded, \
+                     nothing merged"
                         .into(),
                 );
+                return Ok(());
+            }
+            if opts.dry_run {
+                rep.packs_merged = merged.len();
+                rep.packs_created = created.len();
                 return Ok(());
             }
             // Fence + fold in one CAS: the manifest tag we read is the state
@@ -359,13 +360,20 @@ impl BucketTransport {
         part: &mut Vec<&String>,
         created: &mut Vec<String>,
         merged: &mut BTreeSet<String>,
+        opts: &CompactOptions,
     ) -> Result<()> {
         let objects: Vec<(ObjectId, Vec<u8>)> = std::mem::take(objects).into_iter().collect();
         let sources = std::mem::take(part);
         if sources.len() < 2 {
             return Ok(());
         }
-        created.push(self.upload_pack(&objects)?.0);
+        // A dry run reads and splits the same way but uploads nothing, so its
+        // counts match what a real run would do.
+        created.push(if opts.dry_run {
+            String::new()
+        } else {
+            self.upload_pack(&objects)?.0
+        });
         merged.extend(sources.into_iter().cloned());
         Ok(())
     }

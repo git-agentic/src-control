@@ -2916,8 +2916,11 @@ fn is_tracked_case_alias(
         // Inode identity alone proves nothing: on a case-sensitive filesystem
         // an untracked `Foo` can be a hard link to the tracked `foo`. Only a
         // filesystem that answers to both spellings of a name that certainly
-        // exists (`.sc`) aliases case.
-        || root.join(".SC").symlink_metadata().is_ok(),
+        // exists (`.sc`) with the same file aliases case.
+        || {
+            let id = |n: &str| root.join(n).symlink_metadata().map(|m| (m.dev(), m.ino()));
+            matches!((id(".SC"), id(".sc")), (Ok(a), Ok(b)) if a == b)
+        },
         tracked,
         rel,
         |t| {
@@ -3139,6 +3142,7 @@ mod tests {
         if root.join(".SC").symlink_metadata().is_err() {
             drop(repo);
             std::fs::remove_dir_all(&root).unwrap();
+            assert!(!root.exists());
             return;
         }
         std::fs::create_dir_all(root.join("docs")).unwrap();
@@ -3165,6 +3169,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]

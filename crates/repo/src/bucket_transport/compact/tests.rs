@@ -963,6 +963,14 @@ fn candidates_that_are_each_large_once_decoded_are_not_merged_one_by_one() {
     push_compressible(&t, "big-0", 1, 1 << 20);
     push_compressible(&t, "big-1", 2, 1 << 20);
     let before = manifest(&mem);
+    // The dry run reports what the real run will do: nothing.
+    let dry = t
+        .compact(&CompactOptions {
+            dry_run: true,
+            ..opts.clone()
+        })
+        .unwrap();
+    assert_eq!((dry.packs_merged, dry.packs_created), (0, 0), "{dry:?}");
     let rep = t.compact(&opts).unwrap();
     assert_eq!((rep.packs_merged, rep.packs_created), (0, 0), "{rep:?}");
     assert!(
