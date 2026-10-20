@@ -2,8 +2,9 @@
 
 A next-generation version control system built around a snapshot-and-tag model
 (Jujutsu-inspired), with per-file permissions, native committed secrets, and
-in-memory clones as the long-term thesis. Across 34 shipped phases, this
-repository now proves that thesis end to end:
+in-memory clones as the long-term thesis. Across 36 shipped phases plus the
+P37 partial-clone series (37a-37d), this repository now proves that thesis end
+to end:
 
 1. **In-memory virtual worktrees** (the agent wedge) — fork N parallel worktrees
    of a repo entirely in RAM, run and check out against each, and tear them down
@@ -22,8 +23,9 @@ repository now proves that thesis end to end:
    durable `.sc/` repos, branches, three-way merge, history editing
    (cherry-pick/rebase/amend/undo), durable multi-invocation agent sessions,
    signed commits with session-transcript provenance, sparse and partial
-   checkouts, and local/ssh/HTTP+TLS/Git network transports. **Implemented
-   (Phases 3-34.)**
+   checkouts (including merge and agent sessions on a partial clone), local/
+   ssh/HTTP+TLS/bucket/Git network transports, and a read-only native desktop
+   browser. **Implemented (Phases 3-37.)**
 
 The system builds on / interoperates with Git rather than replacing it: it
 imports an existing Git repo's `HEAD` in-process (via `gix`), exports history
@@ -31,9 +33,10 @@ back to Git commits, and reaches hosted Git (e.g. GitHub) through a spawned
 system-git mirror bridge.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design,
-[docs/adr/](docs/adr/) for the architecture decision records covering every
-phase, and [CLAUDE.md](CLAUDE.md) for project conventions and the per-phase
-capability map.
+[docs/adr/](docs/adr/) for the architecture decision records (0001-0054) behind
+every phase, and [CLAUDE.md](CLAUDE.md) for project conventions and the
+per-phase capability map. [CONTRIBUTING.md](CONTRIBUTING.md) covers the
+development workflow.
 
 > ⚠️ **Pre-1.0, not independently audited — don't trust production secrets to it
 > yet.** src-control implements real cryptography (committed-secret envelope
@@ -41,9 +44,10 @@ capability map.
 > TLS), but these are MVP implementations that have **not had an independent
 > security audit**. There are deliberate boundaries you should understand first —
 > e.g. pre-Phase-33 convergent ciphertext in history stays equality-confirmable
-> forever, `sc+https://` trust is TOFU pinning (the first connection to a host is
-> unverified), and rotation cuts off future reads but cannot erase ciphertext
-> already in history. They are consolidated in
+> forever, `sc+https://` trust defaults to TOFU pinning (the first connection to
+> a host is unverified unless you pre-pin it or opt into CA validation), and
+> rotation cuts off future reads but cannot erase ciphertext already in
+> history. They are consolidated in
 > [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md). Report vulnerabilities privately
 > per [SECURITY.md](SECURITY.md).
 
@@ -60,12 +64,17 @@ crates/
           Ed25519 signing (the ONLY crate that links RustCrypto)
   tlsio/  TLS for the sc+https:// transport (the ONLY crate that links
           rustls/rcgen; a leaf — no workspace deps)
+  objio/  object-store buckets for sc+wal:// and sc+s3:// remotes (the ONLY crate
+          that links the S3 SDK; a leaf — no workspace deps)
   repo/   durable .sc repo — refs, branches, working tree, merge, history
           editing, remotes, protection, GC, sparse/partial clone, transcripts,
-          transport
+          transport (ssh, sc+http(s), bucket WAL)
   cli/    `sc` binary
+apps/
+  desktop/ read-only Tauri v2 + React/TypeScript repository browser (see
+          apps/desktop/README.md); calls `repo` directly, never the `sc` binary
 demo/
-  25 end-to-end proof scripts covering everything below, e.g.:
+  27 end-to-end proof scripts covering everything below, e.g.:
   run_demo.sh              independent before/after filesystem diff, zero residue
   run_repo_demo.sh         persistent repo end-to-end demo
   run_ssh_remote_demo.sh   ssh-native transport round trip
@@ -73,10 +82,13 @@ demo/
   run_transcript_demo.sh   sealed agent-session transcript proof
 ```
 
-Dependency direction is strict: `cli → repo → {vfs, gitio, crypto, tlsio} → core`
-(`tlsio` is a leaf). Only `gitio` links `gix`, only `crypto` links RustCrypto,
-and only `tlsio` links rustls, keeping the rest of the system Git-, crypto-,
-and TLS-library-agnostic.
+Dependency direction is strict: the adapters `cli` and `desktop` sit on top of
+`repo`; `repo → {vfs, crypto} → core`, plus the leaf edges `repo → tlsio` and
+`repo → objio` (`tlsio` and `objio` depend on no other workspace crate). `gitio`
+depends only on `core`, and `repo` never links it: `cli` links both and passes
+imported snapshots down. Only `gitio` links `gix`, only `crypto` links
+RustCrypto, only `tlsio` links rustls, and only `objio` links the S3 SDK,
+keeping the rest of the system Git-, crypto-, TLS- and object-store-agnostic.
 
 ## Quick start
 
@@ -113,9 +125,10 @@ cargo run --bin sc -- export --to /path/to/git/repo
 bash demo/run_demo.sh
 ```
 
-See `CLAUDE.md`'s Commands section for the full command surface (merge,
-history editing, secrets lifecycle, sparse/partial clone, ssh/HTTP remotes,
-session transcripts, and more).
+Run `sc --help` (and `sc <command> --help`) for the full command surface:
+merge, history editing, secrets lifecycle, sparse/partial clone, ssh/HTTP(S)/
+bucket remotes, session transcripts, and more. The annotated reference lives in
+the `sc-cli-reference` skill (`.claude/skills/sc-cli-reference/SKILL.md`).
 
 ## How Phase 1 works
 
@@ -142,13 +155,19 @@ permissions via encrypted paths (Phase 7, randomized sealing since Phase 33)
 all ship alongside a full persistent, branchable, content-addressed VCS —
 merge and history editing, durable multi-invocation agent sessions with
 auto-merge, a commit-time secret scanner, secret/permission lifecycle
-(rotation, escrow, revocation tombstones, bulk rewrap), signed commits with
-sealed session-transcript provenance, sparse and partial checkouts, and local,
-ssh-native, sc-native HTTP/TLS (with bearer-token auth and listener resource
-limits), and Git (including hosted GitHub) network transports, plus private
-branches sealed to a recipient set until publish. All 34 phases are
-implemented and tested; `demo/` holds 26 independent end-to-end proofs, one
-per major capability. Remaining follow-ons (transparent lazy-fetch,
-per-case gap-tolerant merge on partial clones, CA-path validation alongside
-TOFU pinning, rotate-for-paths, and similar hardening items) are tracked in
-[ROADMAP.md](ROADMAP.md)'s Deferred section rather than being open MVP scope.
+(rotation, escrow, revocation tombstones, bulk rewrap, `sc rewrap --rotate`
+for protected paths), signed commits with sealed session-transcript
+provenance, sparse and partial checkouts (lazy want-by-id fetch, merge,
+cherry-pick, rebase and agent sessions on a partial clone), and local,
+ssh-native, sc-native HTTP/TLS (bearer tokens with expiry and rotation,
+listener resource limits, TOFU pinning managed by `sc tls`, or CA validation
+via `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system`), bucket (`sc+wal://`, `sc+s3://`),
+and Git (including hosted GitHub) network transports, plus private branches
+sealed to a recipient set until publish and a read-only Tauri desktop
+browser. All 36 phases and P37a-37d are implemented and tested; `demo/` holds
+27 independent end-to-end proofs, one per major capability. Remaining
+follow-ons (transcript delivery gaps on drop and bucket remotes, bucket
+compaction and gc, named concurrent `sc ws` sessions, size/count clone
+filters, an operator-configurable object-size cap, and similar hardening
+items) are tracked in [ROADMAP.md](ROADMAP.md)'s Deferred section and as open
+GitHub issues rather than being open MVP scope.

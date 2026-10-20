@@ -3,8 +3,8 @@
 A next-generation version control system built around a snapshot-and-tag model
 (Jujutsu-inspired) with per-file permissions, native committed secrets, and
 in-memory clones. This document covers the architecture as built — the two
-founding wedges and the full collaborative VCS grown around them across 30
-vertical-slice phases. The rationale behind each major decision is recorded as an
+founding wedges and the full collaborative VCS grown around them across 36
+vertical-slice phases plus the P37 partial-clone series (37a-37d). The rationale behind each major decision is recorded as an
 ADR in [`docs/adr/`](docs/adr/), and a compact per-phase appendix closes this doc.
 
 ## Thesis and MVP scope
@@ -33,10 +33,12 @@ Everything in Phase 1 was designed so Phase 2 dropped in without re-architecting
 secrets are just a special object kind in the same content-addressed store. That
 composability held across every phase since. **All three long-term-thesis pillars
 now ship** — in-RAM worktrees (P1), committed secrets (P2), and per-file
-permissions (P7, encrypted paths) — atop a full collaborative VCS: three-way
-merge and history editing, packfiles + GC, ssh:// / sc+http:// / Git network
-transports, sparse and partial clone, signed commits, and intent-deep provenance
-via sealed agent-session transcripts. The phase-by-phase build log is in
+permissions (P7, encrypted paths; per-branch in P34) — atop a full collaborative
+VCS: three-way merge and history editing, packfiles + GC, ssh:// / sc+http(s):// /
+bucket (sc+wal://, sc+s3://) / Git network transports, sparse and partial clone
+(with lazy fetch, merge and agent sessions on a partial clone), signed commits,
+intent-deep provenance via sealed agent-session transcripts, and a read-only
+native desktop browser. The phase-by-phase build log is in
 [`ROADMAP.md`](ROADMAP.md) and [`CLAUDE.md`](CLAUDE.md); the sections below cover
 the architecture, with a compact per-phase appendix at the end.
 
@@ -61,9 +63,12 @@ to reason about — which is exactly the property Phase 1 is meant to demonstrat
 
 ## System overview
 
-The codebase is a Cargo workspace of eight Rust crates with a strict dependency
-direction (top-level adapters `{cli, desktop} → repo → {vfs, gitio, crypto}
-→ core`, with the separate leaf edge `repo → tlsio`):
+The codebase is a Cargo workspace of eight library/binary crates plus the
+desktop app, with a strict dependency direction: the top-level adapters
+`{cli, desktop}` sit on `repo`; `repo → {vfs, crypto} → core`, plus the separate
+leaf edges `repo → tlsio` and `repo → objio` (`tlsio` and `objio` depend on no
+other workspace crate, not even `core`). `gitio → core` is linked by `cli`, never
+by `repo`:
 
 ```
 src-control/
@@ -75,20 +80,28 @@ src-control/
 │   │             plus a system-git mirror bridge for hosted Git (the only crate linking gix)
 │   ├── crypto/   envelope encryption (secrets + protected paths) AND Ed25519 signing +
 │   │             v2 dual-key identities (scl-crypto; the only crate linking RustCrypto)
+│   ├── tlsio/    rustls/rcgen wrappers for sc+https:// (P32); a leaf, the only crate
+│   │             linking rustls
+│   ├── objio/    `Bucket` trait + directory and S3 backends for sc+wal:// / sc+s3:// (P36);
+│   │             a leaf, the only crate linking the S3 SDK
 │   ├── repo/     durable .sc/ repo: refs/branches/working tree, three-way merge, history
 │   │             editing (cherry-pick/rebase/amend/undo), remotes + wire transport (ssh://,
-│   │             sc+http://), protection + secret lifecycle, GC, sparse & partial clone,
-│   │             signatures & session transcripts, agent workspaces
-│   └── cli/      `sc` binary — the full ~42-command surface (see CLAUDE.md)
-├── apps/desktop/ Tauri v2 top-level adapter + bundled TypeScript renderer;
-│                 native read model only, with no UI dependency in domain crates
+│   │             sc+http(s)://, bucket WAL), protection + secret lifecycle, GC, sparse &
+│   │             partial clone, signatures & session transcripts, agent workspaces
+│   └── cli/      `sc` binary — the full ~43-command surface (`sc --help`; the annotated
+│                 reference is the sc-cli-reference skill)
+├── apps/desktop/ Tauri v2 top-level adapter (`scl-desktop`) + bundled React/TypeScript
+│                 renderer; native read model only, with no UI dependency in domain crates
+├── demo/         27 end-to-end proof scripts (`run_*.sh`)
+├── fuzz/         cargo-fuzz target for the wire decoder (`wire_decode`)
 └── ARCHITECTURE.md
 ```
 
 `core` knows nothing about Git, worktrees, or cryptography. `gitio` is the only
 crate that links `gix`, keeping the Git dependency quarantined behind one
 boundary. `crypto` is the only crate that links the RustCrypto stack, keeping
-the cryptographic dependency quarantined behind another. `repo` owns the `.sc/`
+the cryptographic dependency quarantined behind another; `tlsio` does the same
+for rustls and `objio` for the S3 SDK. `repo` owns the `.sc/`
 on-disk layout and all repo orchestration; it is deliberately **Git-agnostic**
 (it never links `gitio`) — `cli` links both `repo` and `gitio` and passes
 imported snapshots down. This matters because the long-term plan is to own the
@@ -205,8 +218,9 @@ first-class remote, and Phase 18 reaches *hosted* Git (GitHub over https/ssh)
 through a spawned-system-`git` mirror bridge (`gix` can fetch but not push, so a
 lazily-built bare `mirror.git` beside the marks map is the transport). All of it
 keeps `gix` quarantined in `gitio`. This is distinct from sc's **own** network
-transport: `repo` speaks a framed wire protocol over ssh:// (P12) and sc+http://
-(P26) that mirrors its `Transport` trait — no `gix` involved (see the appendix).
+transport: `repo` speaks a framed wire protocol over ssh:// (P12), sc+http://
+(P26) and sc+https:// (P32) that mirrors its `Transport` trait, and treats a
+bucket as a remote (P36) — no `gix` involved (see the appendix).
 
 ## Cryptography and key management
 
@@ -228,7 +242,10 @@ a `BTreeMap` so canonical encoding is insertion-order-independent), kept separat
 from the file tree so `checkout` never materializes them. An authorized context
 decrypts in memory and injects the value into a child process environment; `sc
 secret-demo` proves the authorize/deny/grant flow end-to-end with the same
-zero-residue teardown as Phase 1. See ADR-0010.
+zero-residue teardown as Phase 1. `sc run` injects through the child's
+environment by default; `sc run --secrets-fd N` (ADR-0052, unix) hands the
+values over a pipe on descriptor N instead, which keeps them out of env dumps
+but is still not isolation. See ADR-0010.
 
 The consequence is that a clone in an **unauthorized** context — one whose
 private key is not among the recipients — receives the secret object intact but
@@ -320,14 +337,26 @@ phases but the shape is stable:
   snapshot→transcript-object index, one-to-many (P30). Both gc-rooted, local-only.
 - `sparse` — the local, uncommitted sparse-checkout prefix spec (P24);
   `promisor` — a partial clone's fetch-filter + origin (P27).
-- `serve-tokens.toml` — bearer-token access control for `sc serve --http` (P29).
+- `serve-tokens.toml` — bearer-token access control for `sc serve --http` (P29);
+  tokens may carry an expiry and be rotated in place (`sc serve token add
+  --expires` / `rotate`). `serve-tls/` — the auto-minted `sc+https://` server
+  identity (P32).
+- `promisor-lazy` — empty marker: this partial clone may fill gaps by object id
+  (P37a); `sparse-prev` — the previous sparse spec while a `sparse set` is in
+  flight (P37b).
+- `local-key`, `protected-cache` (and `ws/cache-<i>`) — the P33 keyed stat cache
+  for protected paths; never committed, never transferred.
 - `tmp/` — guard-cleaned scratch for streaming pack transfer (P25).
 - `ws/` — durable agent-session workspaces: `session.toml` manifest + per-agent
   checkouts (P20). `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
   lazily-built bare `mirror.git` for network Git (P10/P18).
 - Transient in-progress state (removed on completion/abort): `MERGE_HEAD`,
-  `PICK_HEAD`, `REBASE_STATE`, and their `*_DECIDED_ROOT` records — an
-  interrupted merge/pick/rebase resumes or aborts cleanly from these.
+  `PICK_HEAD`, `REBASE_STATE`, and their `*_DECIDED_ROOT` records, plus
+  `CONFLICT_PLAINTEXT` / `CONFLICT_SIDECARS` listing what a stopped operation
+  wrote into the working tree — an interrupted merge/pick/rebase resumes or
+  aborts cleanly from these.
+- The `sc+https://` client's pin file is user-level, not part of `.sc/`
+  (`~/.config/sc/known_hosts`, managed with `sc tls`).
 
 ### Git-like working tree
 
@@ -398,11 +427,10 @@ Phase 8 adds three tightly coupled capabilities to the persistent store:
   transport read path resolves packed, sharded, and compressed objects from the
   remote store. This replaces the prior object-at-a-time transfer.
 
-Remaining follow-ons: network Git remotes, HTTP transport, streaming (>4 GiB)
-frames, bulk re-wrap, multiple escrow keys, interactive workspace sessions
-and auto-merge of clean workspace results (merge shipped as Phase 4;
-break-glass escrow shipped as Phase 11; ssh-native network transport shipped
-as Phase 12; agent workspaces shipped as Phase 13).
+Follow-ons named when this phase shipped have since landed as their own phases:
+network Git remotes (P18), the HTTP transport (P26), streaming frames (P25),
+bulk re-wrap and multiple escrow keys (P17), and interactive workspace sessions
+with auto-merge (P20).
 
 ## Phase 9 — Git export (built)
 
@@ -881,9 +909,9 @@ their content, so push's filtered reachability walk still sends only the
 client's new in-filter objects. `commit` refuses (`Error::GappedPathContent`)
 rather than silently drop content under an unfetched subtree. `sc backfill
 --all` is the genuine full-clone escape hatch: fetch everything, verify the
-closure, then remove `.sc/promisor`. Merge, replay, `sc ws fork/harvest`, and
-`sc work` are all refused outright on a partial clone as a deliberate MVP
-coarsening rather than per-case gap tolerance. See ADR-0037.
+closure, then remove `.sc/promisor`. P27 refused merge, replay, `sc ws
+fork/harvest`, and `sc work` outright on a partial clone as a deliberate MVP
+coarsening; P37b-P37d lifted those refusals (see below). See ADR-0037.
 
 ## Phase 28 — security hardening sweep (built)
 
@@ -904,12 +932,15 @@ ADR-0039.
 connection opening, closing P26's stated "unauthenticated" boundary: a
 read-only mode that rejects any write-shaped request before it reaches
 `wire::serve`, a fail-closed bind check, and bearer-token authentication
-against a `.sc/serve-tokens.toml` allowlist. `EC_READONLY` (or equivalent
-server flag) forces the read-only gate independent of tokens, so a
-public-read mirror needs no token management at all. Each gate runs before
+against a `.sc/serve-tokens.toml` allowlist. `--read-only` forces the
+read-only gate independent of tokens (a rejected write gets the typed
+`EC_READONLY` wire error), so a public-read mirror needs no token management at
+all. Each gate runs before
 the P25/P26 wire handshake begins, matching P26's own status-line-before-
 handshake discipline, so a rejected connection never reaches
-`LocalTransport`. See ADR-0040.
+`LocalTransport`. Tokens later gained an optional expiry (`sc serve token add
+--expires`; an expired token gets the same 401 as an unknown one) and `sc serve
+token rotate` (ADR-0040 addendum). See ADR-0040.
 
 ## Phase 30 — agent session transcripts (built)
 
@@ -957,7 +988,7 @@ Proven by `demo/run_limits_demo.sh`. See ADR-0041.
 
 A new leaf crate, `crates/tlsio` (`scl-tlsio`), is the only crate linking
 rustls/rcgen/`ring` — extending the dependency rule with the separate leaf edge
-`repo → tlsio` while leaving `repo → {vfs, gitio, crypto} → core` and the RustCrypto quarantine in
+`repo → tlsio` while leaving `repo → {vfs, crypto} → core` and the RustCrypto quarantine in
 `crates/crypto` untouched. Two seam functions grow a TLS wrap and nothing
 else changes: the client wraps the `TcpStream` before the opening write when
 the URL is `sc+https://`; the server wraps before the opening read when
@@ -970,7 +1001,13 @@ Trust is accept-new TOFU, the SSH `known_hosts` shape: the client pins
 `SC_HTTPS_STRICT=1` refuses unknown hosts). A pin mismatch always
 hard-fails. The server auto-mints a self-signed identity into
 `.sc/serve-tls/` (key `0600`) unless PEM is supplied; `sc serve fingerprint`
-prints the pin an operator distributes out-of-band. **Gate change:** a
+prints the pin an operator distributes out-of-band. Follow-ons: `sc tls
+list/forget/pin/path` manages the pin file (ADR-0053), and a client can opt into
+CA validation instead of pinning with `SC_HTTPS_CA_FILE=<pem>` or
+`SC_HTTPS_CA=system` (ADR-0054; fail-closed, no revocation checking, the pin
+file is neither read nor written). Client connect, TLS handshake and opening
+are bounded to 30 s, and bracketed IPv6 hosts parse in `sc+http(s)://` URLs.
+**Gate change:** a
 non-loopback bind now requires `--read-only`, `--allow-public`, or (`--tls`
 AND ≥1 token) — P29's "tokens alone justify a public bind" is narrowed,
 since a token protecting only a plaintext channel was never the guarantee
@@ -1063,6 +1100,36 @@ messages, paths, timestamps, and inner topology never cross IPC. The WebView has
 no generic dialog, filesystem, URL, process, or object-store command. See
 ADR-0045.
 
+## Phase 36 — bucket WAL remotes: sc+wal:// and sc+s3:// (built)
+
+A remote that needs no server process. `BucketTransport`
+(`crates/repo/src/bucket_transport.rs`) implements the same `Transport` trait as
+the local, ssh and http remotes on top of a flat key/value bucket, structured
+as a write-ahead log of **immutable, content-addressed packs** plus **one
+compare-and-swapped manifest**. A push uploads a pack, appends a parent-linked
+`log/<seq>` entry carrying its ref updates, then CASes the manifest's
+`head_seq` forward (`Bucket::put_if_tag`); losing the CAS is `NonFastForward`,
+exactly as on any other transport, and a loser's orphaned log entry is invisible
+to readers because they walk `parent_seq` back from the manifest. There is no
+leader, lock file or lease. The new leaf crate `objio` holds the `Bucket` trait
+and its two backends (`DirBucket` for `sc+wal://<dir>`, `S3Bucket` for
+`sc+s3://<bucket>/<prefix>`), quarantining the S3 SDK the way `gix` and
+RustCrypto are quarantined.
+
+Reads treat the bucket as untrusted input: manifest, log entries and pack
+records are capped at `MAX_OBJECT_SIZE`, and every WAL record decodes strictly
+and fails closed. P36b adds **checkpoint folding**: once the log tail passes 64
+entries a push opportunistically writes `checkpoints/<seq>` (branch tips plus a
+cumulative pack list) and points the manifest at it, so a cold reader seeds from
+the checkpoint and walks only the tail. P36c adds `sc serve --store <url>`: an
+`sc serve --http`/`--stdio` instance whose `.sc/` home supplies tokens, the TLS
+identity and scratch space while all served content lives in the bucket, so
+instances are disposable. Public content sits in the bucket as plaintext at
+rest (the bucket ACL is the perimeter; sealed content stays ciphertext), and
+`sc clone --filter` is refused against a bucket remote. Bucket compaction and gc
+are not built (open issue #216), and bucket remotes do not carry indexed
+transcripts (#229). See ADR-0046 and `docs/research/walgit-evaluation.md`.
+
 ## Phase 37a — want-by-id fetch (built)
 
 A partial clone marked lazy (`.sc/promisor-lazy`) can read a path outside its
@@ -1074,6 +1141,50 @@ no reachability walk. `Store::get` stays network-free; the only code that dials
 the promisor after clone is `Repo::fetch_by_id_from` in `crates/repo/src/
 fill.rs`, which verifies the reply against the request before writing. A fill
 only adds objects, so push, gc and verify (filter-scoped walks) are unchanged.
-Sparse widening over a filled path and the lifted P27 refusals need
-presence-based walks and are phase 37b. See ADR-0047 and
+Sparse widening over a filled path and the lifted P27 refusals needed
+presence-based walks and are P37b-P37d (below). See ADR-0047 and
 `docs/research/scion-evaluation.md`.
+
+## Phase 37b — presence-based partial clones (built)
+
+The filter records what a clone *asked for*, not what is present: an ordinary
+`sc fetch` on a partial clone sends no filter and advertises its local tips as
+haves, so an object new at an in-filter path can be omitted when it equals an
+out-of-filter object reachable from a have. 37b-i therefore makes push, verify
+and gc walk what the store **holds** (`reachable_objects_partial`) instead of
+the fetch filter; push checks every gap id against the destination before
+sending, a view gap fails with `GapInView` before any write (a preflight at the
+top of `materialize`, plus `undo` and `sparse set`), and a partial clone fetches
+from its origin only. 37b-ii lets a lazy, online clone fill the view's closure
+by id (`ensure_view`) before switch, fast-forward, undo and `sparse set`;
+`sparse set` may widen past the filter; and a by-id reply is capped at
+`min(--max-pack-size, 512 MiB)` and split when refused. `sc export` and `sparse
+disable` stay refused on a partial clone. See ADR-0048.
+
+## Phase 37c — merge, cherry-pick and rebase on a partial clone (built)
+
+`merge_trees` is a tree-recursive three-way merge that carries a subtree **by
+id** when the sides agree and no protection rule applies, reads only where the
+sides differ or a rule intersects, and on a lazy, online clone fills what it
+asks for by id outside the store lock (a non-lazy clone gets the gap error with
+the `sc backfill <path>` hint). A carried protected subtree keeps the complete
+input wrap union. A conflict inside the view is marked and resolved like on a
+full clone (`sc conflicts`, `sc resolve`, `merge --abort`, `sc commit`; the
+out-of-view part is grafted from the decided root); a conflict outside the view,
+or a result that must be sealed outside it, is refused before any ref,
+merge-state or working-tree change. Cherry-pick and rebase share the engine
+through `replay_commit`, and a stopped pick or rebase keeps its carried subtrees
+in the decided root. Content and mode now merge as separate dimensions, so a
+mode-only edit merges and a file/directory collision fails before any write on
+full clones too. See ADR-0049.
+
+## Phase 37d — agent sessions on a partial clone (built)
+
+`sc ws fork/run/harvest/abandon` and `sc work` work on a partial clone, with the
+host's sparse view as the agent's whole world (`sc work` no longer hands agents
+a complete tree there). The view closure is filled (lazy, online) or refused with
+the gap error before anything is written; a workspace commit grafts the
+out-of-view subtrees from the base without reading them; and harvest lands
+through the ADR-0049 merge, with any conflict falling back to a `work-<i>`
+branch as on a full clone. `sc backfill --all` remains the way to a genuine full
+clone. See ADR-0050.
