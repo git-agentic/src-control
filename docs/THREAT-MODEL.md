@@ -218,10 +218,13 @@ too, not just the src-control-side metadata.
   sealed). Only signatures that verify for a held target are indexed, so
   forged signatures stay in the object store (until gc sweeps them) but are
   never indexed, so a `sc serve` or local sender never forwards them and gc
-  never keeps them (a bucket forwards what it holds; receivers filter). A writer to a shared remote
-  who signs with keys of their own can still crowd more than 256 valid
-  signatures ahead of the real one, which keeps the drop inert on every peer
-  that ingests them (a denial of the drop, never an honored one; #257). Writers
+  never keeps them (a bucket forwards what it holds; receivers filter). The signature
+  index keeps one signature per (target, signer) and honoring looks up only the
+  trusted signers, so signatures valid under keys a writer made themselves
+  cannot crowd out the real one (resolved, #257); they cost a line and a
+  check each. Index updates on the serve path take a short `.sc/index.lock`, so
+  concurrent pushes and local commands do not lose index or pending entries
+  (resolved, #260). Writers
   can also evict pending entries from a push-only remote (trust the signer
   before the push). Trust is checked at evaluation and is not retroactive. A tombstone a remote already held before
   upgrading to a build with the pending index is not remembered: trust the

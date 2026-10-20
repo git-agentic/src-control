@@ -68,9 +68,16 @@ impl Layout {
     pub fn oplog_path(&self) -> PathBuf {
         self.dot_sc.join("oplog")
     }
-    /// `.sc/signatures` — the append-only snapshot-signature index (P22):
-    /// one `<snapshot-hex> <sig-object-hex>` line per indexed signature.
+    /// `.sc/signatures.v2` — the signature index (P22, keyed per
+    /// `(target, signer)` since #257): one `<target-hex> <sig-object-hex>
+    /// <signer-hex>` line per indexed signature.
     pub fn signatures_path(&self) -> PathBuf {
+        self.dot_sc.join("signatures.v2")
+    }
+    /// `.sc/signatures` — the pre-#257 index (`<target> <sig>` lines). Read
+    /// once by the migration into [`Self::signatures_path`], then left alone
+    /// so an older binary keeps a file it understands.
+    pub fn signatures_legacy_path(&self) -> PathBuf {
         self.dot_sc.join("signatures")
     }
     /// `.sc/sparse` — the sparse-checkout prefix spec (P24): one prefix per

@@ -31,6 +31,7 @@ use scl_core::{Object, ObjectId, Secret, SignatureObj, Transcript};
 
 use crate::error::{Error, Result};
 use crate::layout::Layout;
+use crate::lock::with_index_lock;
 use crate::repo::Repo;
 use crate::signatures::SigStatus;
 
@@ -113,6 +114,12 @@ fn dropped_ids(layout: &Layout) -> Result<BTreeSet<ObjectId>> {
 /// path holds no repo lock) cannot lose each other's drop line. A racing
 /// duplicate line is harmless: readers treat the file as a set.
 fn append_drop(layout: &Layout, entry: DropEntry) -> Result<()> {
+    // Under the index lock only so `reindex`'s whole-file rewrite cannot drop
+    // a line appended meanwhile.
+    with_index_lock(layout, || append_drop_locked(layout, entry))
+}
+
+fn append_drop_locked(layout: &Layout, entry: DropEntry) -> Result<()> {
     use std::io::Write;
     if read_drops(layout)?.contains(&entry) {
         return Ok(());
@@ -147,15 +154,6 @@ fn append_drop(layout: &Layout, entry: DropEntry) -> Result<()> {
 /// one is only lost to a push-only remote (a fetching peer is re-sent every
 /// retained tombstone on each fetch).
 const MAX_PENDING: usize = 1024;
-
-/// Signature objects `tombstone_honored` reads per tombstone, and how many of
-/// those that claim a trusted key it verifies. A peer can attach any number of
-/// junk signature objects to a target and this runs on every open, so the work
-/// is capped; a real tombstone carries one or two. Signatures by an untrusted
-/// key cost one read and never count against the verification cap, so they
-/// cannot push a trusted one out of it.
-const MAX_SIG_READS: usize = 256;
-const MAX_SIG_VERIFIES: usize = 8;
 
 /// Distinct signature targets `index_incoming` looks up per batch.
 const MAX_SIG_LOOKUPS: usize = 1024;
@@ -198,26 +196,28 @@ fn note_pending(layout: &Layout, new: &[ObjectId], fp: &str) -> Result<()> {
     let mut once = BTreeSet::new();
     let new: Vec<ObjectId> = new.iter().copied().filter(|i| once.insert(*i)).collect();
     let new = &new[new.len().saturating_sub(MAX_PENDING)..];
-    let mut all = read_pending(layout)?;
-    let mut seen: BTreeSet<ObjectId> = all.iter().copied().collect();
-    let mut added = false;
-    for id in new {
-        if seen.insert(*id) {
-            all.push(*id);
-            added = true;
+    with_index_lock(layout, || {
+        let mut all = read_pending(layout)?;
+        let mut seen: BTreeSet<ObjectId> = all.iter().copied().collect();
+        let mut added = false;
+        for id in new {
+            if seen.insert(*id) {
+                all.push(*id);
+                added = true;
+            }
         }
-    }
-    if !added {
-        return Ok(());
-    }
-    let excess = all.len().saturating_sub(MAX_PENDING);
-    all.drain(..excess);
-    write_pending(layout, &all)?;
-    // Entries are judged under the trust in force now; remember which.
-    if read_trust_state(layout).is_none() {
-        save_trust_state(layout, fp, 0)?;
-    }
-    Ok(())
+        if !added {
+            return Ok(());
+        }
+        let excess = all.len().saturating_sub(MAX_PENDING);
+        all.drain(..excess);
+        write_pending(layout, &all)?;
+        // Entries are judged under the trust in force now; remember which.
+        if read_trust_state(layout).is_none() {
+            save_trust_state(layout, fp, 0)?;
+        }
+        Ok(())
+    })
 }
 
 type Trusted = std::collections::HashMap<[u8; 32], String>;
@@ -291,14 +291,21 @@ pub(crate) fn reevaluate_if_trust_changed(
     if !needs_judging(layout, &fp) {
         return Ok(0);
     }
-    let (honored, incomplete) = reevaluate_inner(layout, store, &trusted)?;
-    let failed = match (incomplete, read_trust_state(layout)) {
-        (false, _) => 0,
-        (true, Some((saved, n))) if saved == fp => n + 1,
-        (true, _) => 1,
-    };
-    save_trust_state(layout, &fp, failed)?;
-    Ok(honored)
+    // The pass rewrites the pending list, so it runs under the index lock.
+    // Judged again inside it: a racing pass may have just finished the work.
+    with_index_lock(layout, || {
+        if !needs_judging(layout, &fp) {
+            return Ok(0);
+        }
+        let (honored, incomplete) = reevaluate_inner(layout, store, &trusted)?;
+        let failed = match (incomplete, read_trust_state(layout)) {
+            (false, _) => 0,
+            (true, Some((saved, n))) if saved == fp => n + 1,
+            (true, _) => 1,
+        };
+        save_trust_state(layout, &fp, failed)?;
+        Ok(honored)
+    })
 }
 
 /// Rewrite the whole index file atomically (temp file + rename), so a
@@ -319,18 +326,20 @@ pub(crate) fn append_index(
     snapshot: ObjectId,
     transcript_id: ObjectId,
 ) -> Result<()> {
-    if dropped_ids(layout)?.contains(&transcript_id) {
-        return Ok(());
-    }
-    let mut entries = read_index(layout)?;
-    if entries
-        .iter()
-        .any(|(s, t)| *s == snapshot && *t == transcript_id)
-    {
-        return Ok(());
-    }
-    entries.push((snapshot, transcript_id));
-    write_index(layout, &entries)
+    with_index_lock(layout, || {
+        if dropped_ids(layout)?.contains(&transcript_id) {
+            return Ok(());
+        }
+        let mut entries = read_index(layout)?;
+        if entries
+            .iter()
+            .any(|(s, t)| *s == snapshot && *t == transcript_id)
+        {
+            return Ok(());
+        }
+        entries.push((snapshot, transcript_id));
+        write_index(layout, &entries)
+    })
 }
 
 /// `[signing]` keys listed under `[signers] trusted` in `.sc/recipients.toml`:
@@ -384,8 +393,8 @@ pub(crate) fn drop_digest(tomb: &ObjectId) -> [u8; 32] {
 /// `trusted`. An unsigned or untrusted tombstone stays an inert object.
 fn tombstone_honored(
     store: &mut scl_core::Store,
-    trusted: &std::collections::HashMap<[u8; 32], String>,
-    sigs: &std::collections::HashMap<ObjectId, Vec<ObjectId>>,
+    trusted: &Trusted,
+    sigs: &crate::signatures::SigIndex,
     tomb: ObjectId,
     t: &Transcript,
     dropped: ObjectId,
@@ -400,24 +409,18 @@ fn tombstone_honored(
             _ => return Ok(false),
         }
     }
-    let mut verifies = 0;
-    for sid in sigs
-        .get(&tomb)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .take(MAX_SIG_READS)
-    {
-        if let Object::Signature(sig) = store.get(sid)? {
-            if !trusted.contains_key(&sig.signer) {
-                continue;
-            }
-            if scl_crypto::verify_transcript_sig(&sig.signer, &drop_digest(&tomb), &sig.sig) {
+    // The index holds one signature per (target, signer), so only the trusted
+    // signers are looked up: at most one read and one verification each, and
+    // signatures from keys anyone else made are never reached (#257).
+    for signer in trusted.keys() {
+        let Some(sid) = sigs.by(&tomb, signer) else {
+            continue;
+        };
+        if let Object::Signature(sig) = store.get(&sid)? {
+            if sig.signer == *signer
+                && scl_crypto::verify_transcript_sig(signer, &drop_digest(&tomb), &sig.sig)
+            {
                 return Ok(true);
-            }
-            verifies += 1;
-            if verifies >= MAX_SIG_VERIFIES {
-                break;
             }
         }
     }
@@ -444,6 +447,10 @@ pub fn load(layout: &Layout) -> Result<Vec<(ObjectId, ObjectId)>> {
 /// Returns the number of dropped entries (0 when nothing needed pruning, in
 /// which case the index file is left untouched rather than rewritten).
 pub(crate) fn gc_prune(layout: &Layout, reachable: &mut BTreeSet<ObjectId>) -> Result<usize> {
+    with_index_lock(layout, || gc_prune_locked(layout, reachable))
+}
+
+fn gc_prune_locked(layout: &Layout, reachable: &mut BTreeSet<ObjectId>) -> Result<usize> {
     // Tombstones are load-bearing against resurrection: root them (and keep
     // their lines) even when their snapshot is dead. The dropped transcript
     // itself is never rooted, so it is swept after the grace window.
@@ -489,7 +496,7 @@ pub(crate) fn index_incoming(
 ) -> Result<usize> {
     let mut count = 0;
     let trusted = trusted_signers(layout);
-    let sigs = crate::signatures::index_by_target(layout)?;
+    let sigs = crate::signatures::load_sig_index(layout, None, &trusted)?;
     let mut held = Vec::new();
     // Tombstones already recorded as drops need nothing: every fetch re-sends
     // them all, so skipping them keeps a resend O(new) rather than O(drops^2).
@@ -508,7 +515,7 @@ pub(crate) fn index_incoming(
         if tombstone_honored(store, &trusted, &sigs, id, t, d)? {
             append_drop(layout, (t.snapshot, id, d))?;
             recorded.insert(id);
-        } else if sigs.contains_key(&id) && store.contains(&t.snapshot) {
+        } else if sigs.is_signed(&id) && store.contains(&t.snapshot) {
             held.push(id);
         }
         Ok(())
@@ -578,7 +585,7 @@ fn reevaluate_inner(
     }
     let mut incomplete = false;
     let wanted: BTreeSet<ObjectId> = pending.iter().copied().collect();
-    let sigs = crate::signatures::index_for_targets(layout, &wanted, MAX_SIG_READS)?;
+    let sigs = crate::signatures::load_sig_index(layout, Some(&wanted), trusted)?;
     let (mut keep, mut honored) = (Vec::new(), 0);
     for id in &pending {
         if !store.contains(id) {
@@ -627,7 +634,7 @@ pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<us
     let mut entries: Vec<(ObjectId, ObjectId)> = Vec::new();
     let mut drops: Vec<DropEntry> = Vec::new();
     let trusted = trusted_signers(layout);
-    let sigs = crate::signatures::index_by_target(layout)?;
+    let sigs = crate::signatures::load_sig_index(layout, None, &trusted)?;
     for id in store.all_ids()? {
         if let Object::Transcript(t) = store.get(&id)? {
             if !store.contains(&t.snapshot) {
@@ -650,8 +657,10 @@ pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<us
     entries.sort();
     entries.dedup();
     let count = entries.len();
-    write_index(layout, &entries)?;
-    write_drops(layout, &drops)?;
+    with_index_lock(layout, || {
+        write_index(layout, &entries)?;
+        write_drops(layout, &drops)
+    })?;
     Ok(count)
 }
 
@@ -682,12 +691,13 @@ pub(crate) fn indexed_transcript_ids_for(
     // and an older peer would index it as a live transcript.
     let drops = read_drops(layout)?;
     if !drops.is_empty() {
-        let sigs = crate::signatures::index_by_target(layout)?;
+        let tombs: BTreeSet<ObjectId> = drops.iter().map(|(_, tomb, _)| *tomb).collect();
+        let sigs = crate::signatures::load_sig_index(layout, Some(&tombs), &Default::default())?;
         out.extend(
             drops
                 .into_iter()
                 .filter(|(snap, tomb, _)| {
-                    sigs.contains_key(tomb) && (wanted.contains(snap) || !snapshot_held(snap))
+                    sigs.is_signed(tomb) && (wanted.contains(snap) || !snapshot_held(snap))
                 })
                 .map(|(_, tomb, _)| tomb),
         );
@@ -809,12 +819,16 @@ impl Repo {
             signer: key.public().to_bytes(),
             sig: scl_crypto::sign_transcript_id(key, &drop_digest(&tomb)),
         };
-        let id = {
-            let arc = self.store_arc();
-            let i = arc.lock().unwrap().put(Object::Signature(sig_obj))?;
-            i
-        };
-        crate::signatures::append_index(self.layout(), tomb, id)
+        let arc = self.store_arc();
+        let mut store = arc.lock().unwrap();
+        let id = store.put(Object::Signature(sig_obj))?;
+        crate::signatures::append_index(
+            self.layout(),
+            &mut store,
+            tomb,
+            id,
+            key.public().to_bytes(),
+        )
     }
 
     /// All indexed transcripts for `snapshot`, loaded from the CAS (id +
@@ -899,12 +913,10 @@ impl Repo {
             signer,
             sig,
         };
-        let id = {
-            let arc = self.store_arc();
-            let i = arc.lock().unwrap().put(Object::Signature(sig_obj))?;
-            i
-        };
-        crate::signatures::append_index(self.layout(), tid, id)?;
+        let arc = self.store_arc();
+        let mut store = arc.lock().unwrap();
+        let id = store.put(Object::Signature(sig_obj))?;
+        crate::signatures::append_index(self.layout(), &mut store, tid, id, signer)?;
         Ok(id)
     }
 
@@ -1155,12 +1167,16 @@ pub(crate) mod tests {
 
         // A plain transcript signature over the bare tombstone id (what an
         // older binary's bulk `sc transcript sign` would produce) is not a drop.
+        // (Another victim: the signer holds one index slot per target.)
+        let victim2 = repo
+            .attach_transcript(snap, "a", "v2", b"victim2", &[owner.enc.public()])
+            .unwrap();
         let plain = {
             let id = arc
                 .lock()
                 .unwrap()
                 .put(Object::Transcript(Transcript::drop_tombstone(
-                    snap, &victim,
+                    snap, &victim2,
                 )))
                 .unwrap();
             repo.sign_transcript(id, &owner).unwrap();
@@ -1172,17 +1188,17 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .all(|d| d.1 != plain));
-        assert_eq!(repo.transcripts_for(&snap).unwrap().len(), 1);
+        assert_eq!(repo.transcripts_for(&snap).unwrap().len(), 2);
 
         // A trusted signature on a matching tombstone is honored.
         assert!(ingest(good, Some(&owner)));
-        assert!(repo.transcripts_for(&snap).unwrap().is_empty());
-        // The sender ships the tombstone with its snapshot.
+        assert_eq!(repo.transcripts_for(&snap).unwrap().len(), 1);
+        // The sender ships the tombstone with its snapshot (and the live victim2).
         assert_eq!(
             indexed_transcript_ids_for(repo.layout(), &[snap], &|_| true)
                 .unwrap()
                 .len(),
-            1
+            2
         );
 
         drop(repo);
@@ -1451,7 +1467,7 @@ pub(crate) mod tests {
         // The signature arrives in a later transfer, without the tombstone.
         repo.sign_drop(tomb, owner.signing.as_ref().unwrap())
             .unwrap();
-        let sig = crate::signatures::index_by_target(repo.layout()).unwrap()[&tomb][0];
+        let sig = crate::signatures::indexed_signature_ids_for(repo.layout(), &[tomb]).unwrap()[0];
         let mut store = arc.lock().unwrap();
         index_incoming(repo.layout(), &mut store, &[sig]).unwrap();
         assert_eq!(read_pending(repo.layout()).unwrap(), vec![tomb]);
@@ -1495,7 +1511,7 @@ pub(crate) mod tests {
         // all with ids below the real signature's.
         let mut i = 0u64;
         let mut junk = 0;
-        while junk < MAX_SIG_VERIFIES + 12 {
+        while junk < 20 {
             i += 1;
             let mut sig = [0u8; 64];
             sig[..8].copy_from_slice(&i.to_le_bytes());
@@ -1529,8 +1545,7 @@ pub(crate) mod tests {
         crate::transport::ingest_pack_file(repo.layout(), &mut store, &path).unwrap();
         drop(store);
 
-        let sigs = crate::signatures::index_by_target(repo.layout()).unwrap();
-        let indexed = &sigs[&tomb];
+        let indexed = crate::signatures::indexed_signature_ids_for(repo.layout(), &[tomb]).unwrap();
         assert!(indexed.contains(&real.id()));
         assert!(
             junk_ids.iter().all(|j| !indexed.contains(j)),
@@ -1568,9 +1583,11 @@ pub(crate) mod tests {
             0
         );
         drop(store);
-        assert!(crate::signatures::index_by_target(repo.layout())
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::signatures::indexed_signature_ids_for(repo.layout(), &[ghost])
+                .unwrap()
+                .is_empty()
+        );
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
@@ -1595,7 +1612,7 @@ pub(crate) mod tests {
             .unwrap();
         repo.sign_drop(tomb, owner.signing.as_ref().unwrap())
             .unwrap();
-        let sig = crate::signatures::index_by_target(repo.layout()).unwrap()[&tomb][0];
+        let sig = crate::signatures::indexed_signature_ids_for(repo.layout(), &[tomb]).unwrap()[0];
         let mut store = arc.lock().unwrap();
         index_incoming(repo.layout(), &mut store, &[tomb]).unwrap();
         drop(store);
@@ -1866,5 +1883,199 @@ pub(crate) mod tests {
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn valid_signatures_from_hundreds_of_other_keys_cannot_keep_a_drop_inert() {
+        // #257: a writer who signs the predictable tombstone id with many keys
+        // of their own, ahead of the real signature, used to fill the
+        // per-tombstone read cap. Honoring now looks only at trusted signers.
+        let root = tmp_root("sig-flood");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let key = owner.signing.as_ref().unwrap();
+        let body = repo
+            .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+            .unwrap();
+        trust_signer(&repo, &owner);
+        let arc = repo.store_arc();
+        let tomb = arc
+            .lock()
+            .unwrap()
+            .put(Object::Transcript(Transcript::drop_tombstone(snap, &body)))
+            .unwrap();
+        let junk: Vec<ObjectId> = (0..300)
+            .map(|_| {
+                let (_s, who) = scl_crypto::generate_identity_v2();
+                let k = who.signing.as_ref().unwrap();
+                arc.lock()
+                    .unwrap()
+                    .put(Object::Signature(SignatureObj {
+                        snapshot: tomb,
+                        signer: k.public().to_bytes(),
+                        sig: scl_crypto::sign_transcript_id(k, &drop_digest(&tomb)),
+                    }))
+                    .unwrap()
+            })
+            .collect();
+        let real = arc
+            .lock()
+            .unwrap()
+            .put(Object::Signature(SignatureObj {
+                snapshot: tomb,
+                signer: key.public().to_bytes(),
+                sig: scl_crypto::sign_transcript_id(key, &drop_digest(&tomb)),
+            }))
+            .unwrap();
+        let mut store = arc.lock().unwrap();
+        assert_eq!(
+            crate::signatures::index_incoming(repo.layout(), &mut store, &junk).unwrap(),
+            300,
+            "every valid junk signature is indexed, one slot per key"
+        );
+        crate::signatures::index_incoming(repo.layout(), &mut store, &[real]).unwrap();
+        index_incoming(repo.layout(), &mut store, &[tomb]).unwrap();
+        drop(store);
+        assert_eq!(read_drops(repo.layout()).unwrap().len(), 1, "drop honored");
+        assert!(load(repo.layout()).unwrap().is_empty());
+
+        // A resend of the junk adds nothing: the slots are taken.
+        let mut store = arc.lock().unwrap();
+        crate::signatures::index_incoming(repo.layout(), &mut store, &junk).unwrap();
+        drop(store);
+        assert_eq!(
+            crate::signatures::indexed_signature_ids_for(repo.layout(), &[tomb])
+                .unwrap()
+                .len(),
+            301
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// `n` threads each push a pack (a snapshot signature, a transcript, a
+    /// tombstone for it and the tombstone's untrusted signature) at one served
+    /// directory; every derived index entry must survive (#260). With
+    /// `repo_open` a `Repo` holds the repo lock throughout, like a local `sc`
+    /// command; otherwise each thread also moves a ref, taking the repo lock.
+    fn concurrent_ingests_lose_nothing(tag: &str, repo_open: bool) {
+        let n = 12usize;
+        let src_root = tmp_root(&format!("{tag}-src"));
+        let dst_root = tmp_root(&format!("{tag}-dst"));
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("f"), b"x").unwrap();
+        let snap = src.commit("t", "c1").unwrap();
+        let src_arc = src.store_arc();
+        let mut packs = Vec::new();
+        for i in 0..n {
+            let (_s, who) = scl_crypto::generate_identity_v2();
+            let k = who.signing.as_ref().unwrap();
+            let tid = src
+                .attach_transcript(snap, "a", &format!("s{i}"), b"body", &[who.enc.public()])
+                .unwrap();
+            let tomb = Object::Transcript(Transcript::drop_tombstone(snap, &tid));
+            let tomb_id = tomb.id();
+            let objs = [
+                Object::Signature(SignatureObj {
+                    snapshot: snap,
+                    signer: k.public().to_bytes(),
+                    sig: scl_crypto::sign_snapshot_id(k, snap.as_bytes()),
+                }),
+                src_arc.lock().unwrap().get(&tid).unwrap(),
+                tomb,
+                Object::Signature(SignatureObj {
+                    snapshot: tomb_id,
+                    signer: k.public().to_bytes(),
+                    sig: scl_crypto::sign_transcript_id(k, &drop_digest(&tomb_id)),
+                }),
+            ];
+            let enc: Vec<(ObjectId, Vec<u8>)> = objs.iter().map(|o| (o.id(), o.encode())).collect();
+            let path = dst_root.join(format!("in-{i}.pack"));
+            // dst is created below; the packs live beside it.
+            packs.push((path, enc, tomb_id));
+        }
+        let dst = Repo::init(&dst_root).unwrap();
+        dst.store_arc()
+            .lock()
+            .unwrap()
+            .put(src_arc.lock().unwrap().get(&snap).unwrap())
+            .unwrap();
+        for (path, enc, _) in &packs {
+            std::fs::write(path, scl_core::pack::build_pack(enc).unwrap().0).unwrap();
+        }
+        let layout = dst.layout().clone();
+        let held = if repo_open {
+            Some(dst)
+        } else {
+            drop(dst);
+            None
+        };
+
+        let handles: Vec<_> = packs
+            .iter()
+            .enumerate()
+            .map(|(i, (path, _, _))| {
+                let (root, path) = (dst_root.clone(), path.clone());
+                std::thread::spawn(move || {
+                    let t = crate::transport::LocalTransport::open(&root).unwrap();
+                    t.ingest_from(&path).unwrap();
+                    if !repo_open {
+                        use crate::transport::Transport;
+                        // The repo lock is try-once: retry while another
+                        // connection holds it. Finishing at all shows the
+                        // index lock never waits on it.
+                        let started = std::time::Instant::now();
+                        while let Err(e) = t.update_ref(&format!("b{i}"), &snap, None) {
+                            assert!(matches!(e, Error::Locked(_)), "{e:?}");
+                            assert!(started.elapsed().as_secs() < 30, "update_ref starved");
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let tombs: Vec<ObjectId> = packs.iter().map(|(_, _, t)| *t).collect();
+        let mut targets = tombs.clone();
+        targets.push(snap);
+        assert_eq!(
+            crate::signatures::indexed_signature_ids_for(&layout, &targets)
+                .unwrap()
+                .len(),
+            2 * n,
+            "a signature index entry was lost"
+        );
+        assert_eq!(
+            load(&layout).unwrap().len(),
+            n,
+            "a transcript entry was lost"
+        );
+        let mut pending = read_pending(&layout).unwrap();
+        pending.sort();
+        let mut want = tombs;
+        want.sort();
+        assert_eq!(pending, want, "a pending entry was lost");
+
+        drop(held);
+        drop(src);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_serve_ingests_lose_no_index_entry_beside_a_local_command() {
+        concurrent_ingests_lose_nothing("conc-open", true);
+    }
+
+    #[test]
+    fn concurrent_serve_ingests_lose_no_index_entry_and_do_not_deadlock_with_update_ref() {
+        concurrent_ingests_lose_nothing("conc-ref", false);
     }
 }

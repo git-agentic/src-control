@@ -467,16 +467,13 @@ signature that fails to verify no longer turns a snapshot `Invalid`; it is
 simply absent (`Unsigned`, which `--require` also rejects). A signature
 indexed before this change is read as before.
 
-**Residual limit (#257).** A signature that verifies under a key the attacker
-controls is still indexed. A writer can add more than `MAX_SIG_READS` (256) of
-them over a predictable tombstone id, ahead of the real signature, and
-`tombstone_honored` stops reading at 256 per tombstone, so the drop stays
-inert on every peer that ingests them. This is a denial of the drop on shared
-remotes (not on a single peer), never an honored one. The fix is an index
-keyed by (target, signer) so honoring is a lookup over the trusted signers;
-it is tracked in #257. The caps (`MAX_SIG_READS` 256 reads and
-`MAX_SIG_VERIFIES` 8 failed checks per tombstone) bound the work meanwhile;
-the verification cap is unreachable for signatures indexed by this version.
+**Former residual limit (#257, resolved).** A signature that verified under a
+key the attacker controlled was still indexed, so a writer could add more
+than 256 of them over a predictable tombstone id, ahead of the real one, and
+the capped read in `tombstone_honored` never reached the trusted signer's
+signature (a denial of the drop on every peer that ingested them, never an
+honored one). Resolved by keying the index per (target, signer); see the #257
+and #260 addendum below.
 
 **Pending index.** A push-only or served remote holds the tombstone from an
 earlier push, so `push` (has-object) never re-sends it and `index_incoming`
@@ -522,11 +519,9 @@ never re-runs.
   pending entry. That costs a push-only remote the retry for that tombstone
   (trust the signer before the push, or have a fetching peer re-send it), but
   never a recorded drop and never the rooting of one: gc roots every drop
-  line. The same unlocked read-modify-write applies to `.sc/signatures`,
-  `.sc/transcripts` and the pending rewrite on the serve path; taking the
-  repo lock there changes `Locked` behaviour for concurrent connections and
-  for a local `sc` command that holds the lock for its lifetime, so it is
-  tracked separately as #260 rather than decided here. `O_APPEND` atomicity is
+  line. (The pending file and the other indexes were unlocked
+  read-modify-writes when this addendum was written; the index lock below,
+  #260, serializes them.) `O_APPEND` atomicity is
   a local-filesystem guarantee (none on NFS). `append_drop` starts on a new
   line when the file ends in a torn line.
 - **Bounded.** The file is a FIFO ring of 1024 ids. A writer who pushes many
@@ -562,7 +557,7 @@ never re-runs.
   legitimate signatures from a large fetch (a long signed history), which is a
   worse failure than the cost.
 
-- Re-evaluation scans `.sc/signatures` once per trigger (time proportional to
+- Re-evaluation scans `.sc/signatures.v2` once per trigger (time proportional to
   the file, memory proportional to the pending targets).
 - A bucket serves every signed tombstone-shaped object it holds, and its
   contents are whatever writers uploaded; receivers still judge each one.
@@ -578,3 +573,110 @@ never re-runs.
   drop alone does not push (unchanged). Clone `reindex` rebuilds drops from
   the store (verifying signatures as above) and does not touch the pending
   file.
+
+## Addendum: signature index per signer, and the index lock (issues #257, #260)
+
+Two hardening follow-ups to the #230 delivery work, with no `PROTOCOL_VERSION`
+bump, no new object kind and no change to the trust gate.
+
+### 1. The signature index holds one slot per (target, signer) (#257)
+
+`.sc/signatures` kept every verified signature over a target. A signature
+made by a key the attacker controls verifies, so a writer could index 256 or
+more of them over a tombstone id ahead of the trusted signer's, and the capped
+scan in `tombstone_honored` never reached it. Now:
+
+- **Format.** `.sc/signatures.v2`, one `<target> <sig-object> <signer>` line
+  per signature (signer = 32-byte Ed25519 key, hex). An append is a no-op when
+  the `(target, signer)` slot is taken: the first entry keeps it. This loses
+  nothing: Ed25519 is deterministic, so a signer has one valid signature per
+  target, and for any target kind only one signing domain is acceptable (see
+  `signatures::acceptable`), so a signature in the wrong domain is never
+  indexed and cannot occupy a slot. Entries are bounded by the distinct
+  signers, not by the number of signature objects.
+- **Honoring.** `tombstone_honored` iterates the trusted signers, looks up the
+  one signature each holds over the tombstone (`signatures::SigIndex`), reads
+  that object and verifies the drop digest. At most one read and one
+  verification per trusted signer; signatures by other keys are never read.
+  `MAX_SIG_READS` and `MAX_SIG_VERIFIES` are gone. The index loader keeps
+  per-signer entries only for trusted signers, so a flood costs a file scan,
+  not memory.
+- **Why a new file name.** An older binary parses exactly two columns and
+  skips any other line, then rewrites the file on its next append from the
+  lines it understood, so appending a third column to `.sc/signatures` would
+  make an older binary drop every new entry. The new binary leaves the old
+  file alone and uses `.sc/signatures.v2`.
+- **Migration.** `signatures::migrate_legacy` imports `.sc/signatures` into
+  the v2 file once (when v2 is absent): it reads each signature object for
+  its signer and runs `acceptable` again, because an index written before #230
+  may hold forgeries, and one naming a trusted key would take that signer's
+  slot. Entries that do not verify, or whose object is gone, are dropped, so a
+  snapshot that was `Invalid` only through such an entry reads `Unsigned`
+  (the #230 behavior). It runs at `Repo::open` and `LocalTransport::open`
+  (best effort), and is mandatory before any v2 write (`append_entries`) and
+  before gc prunes, which fail rather than start a v2 file, or root nothing,
+  while legacy entries are unread. The old file is not deleted or rewritten.
+  `reindex` rebuilds v2 from the store and ignores the legacy file.
+- **Downgrade.** An older binary keeps using `.sc/signatures`. Signatures it
+  adds after the upgrade are in the object store but not in v2 (`sc clone`
+  rebuilds the index; there is no standalone reindex command). Signatures
+  made by the new binary are not visible to the older one until it is
+  upgraded.
+- **Forwarding.** `indexed_signature_ids_for` (sender seam for fetch, clone,
+  serve and push) returns the indexed signatures, which are now one per
+  (target, signer), so a sender forwards at most one signature per signer per
+  target. `sc verify` / `sig_status` read all entries of a snapshot, as
+  before: the index is no longer growable past one per key.
+- **Limit.** Distinct attacker keys still get one slot each. Their cost is one
+  line, one object and one Ed25519 check per key at ingest (as in #230); they
+  can no longer stop a drop from being honored, because honoring never reads
+  them.
+
+### 2. The index lock (#260)
+
+Serve-path ingest (`LocalTransport::put_pack` and the wire/HTTP `ingest_from`)
+updated the derived indexes without the repo lock, so two connections, or a
+connection racing a local `sc` command, could lose a signature, transcript or
+pending entry to a read-modify-write race.
+
+Decision: **a dedicated short-lived index lock, `.sc/index.lock`**
+(`lock::with_index_lock`), distinct from `RepoLock`. Alternatives considered:
+
+- *`RepoLock` around the post-ingest updates.* `RepoLock` is try-once and a
+  local `sc` command holds it for its whole life, so a push would fail
+  `Locked` for the duration of any open command, and two concurrent pushes
+  would fail each other. Rejected: it changes `Locked` behavior for serving.
+- *Append-only indexes with `O_APPEND` lines.* Appends do not lose each other,
+  but gc prune, `reindex` and the pending ring (removal, FIFO eviction) are
+  rewrites that still race an append, so a lock is needed anyway. Rejected as
+  not smaller.
+
+Design:
+
+- An advisory `flock` (`File::try_lock`) on a file that is never removed. The
+  OS releases it when the holder dies, so there is no stale-lock breaking.
+  Threads of one process conflict too (separate open files). Reentrant per
+  thread, so a nested critical section reuses the held lock.
+- **Bounded wait**: polls up to 10 seconds, then `Error::Locked` (index lock
+  path). The sections it guards are single file updates, not command
+  lifetimes.
+- **Lock order**: the index lock is a leaf. Code may take it while holding
+  `RepoLock` (a local command, `LocalTransport::open`'s re-evaluation) and
+  never takes `RepoLock` or waits on anything else while holding it.
+  `update_ref` takes `RepoLock` after the ingest has returned, so the two
+  cannot deadlock; tests drive `put_pack`-path ingests and `update_ref` from
+  threads together.
+- **Covered**: every read-modify-write or rewrite of `.sc/signatures.v2`,
+  `.sc/transcripts`, `.sc/transcript-drops` (the `O_APPEND` line and
+  `reindex`'s rewrite), `.sc/transcript-pending` and its trust state: the
+  appends, `gc` prune, `reindex`, `note_pending` and the whole
+  trust-change re-evaluation pass. Readers take no lock (writes are atomic
+  renames or single appended lines).
+- **Unchanged**: `RepoLock` and its `Locked` behavior for local commands. A
+  local command never fails because an ingest holds the index lock, nor the
+  reverse.
+- A failure to get the lock fails that ingest after its objects are stored;
+  the sender's retry is idempotent (objects are content-addressed, index
+  appends dedupe).
+- `flock` is advisory and only as good as the filesystem's support for it
+  (like the `O_APPEND` note above, not guaranteed on NFS).

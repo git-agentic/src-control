@@ -167,6 +167,7 @@ impl LocalTransport {
         // ran it already.
         // Only when the trusted-signer set changed since they were last
         // judged: serving must not take the exclusive lock per connection.
+        let _ = crate::signatures::migrate_legacy(&layout, &mut store);
         if crate::transcripts::trust_changed(&layout) {
             if let Ok(_lock) = RepoLock::acquire(&layout) {
                 let _ = crate::transcripts::reevaluate_if_trust_changed(&layout, &mut store);

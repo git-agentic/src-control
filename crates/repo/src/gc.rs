@@ -102,6 +102,10 @@ fn walk_decided_root(
 pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStats> {
     let mut stats = GcStats::default();
 
+    // A pre-#257 signature index must be imported before it is pruned: an
+    // unread legacy file would otherwise root nothing and lose its objects.
+    signatures::migrate_legacy(layout, store)?;
+
     // Trim oplog records past the grace window BEFORE computing roots, so a
     // just-trimmed record's snapshot doesn't linger as a root this pass (it
     // always keeps the newest record regardless of cutoff).

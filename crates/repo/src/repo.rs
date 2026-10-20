@@ -79,6 +79,9 @@ impl Repo {
         // Honor held tombstones once the trusted-signer set changed (#230). Best
         // effort: a failure must not stop an open, and the next open retries.
         let _ = crate::transcripts::reevaluate_if_trust_changed(&layout, &mut store);
+        // Import a pre-#257 signature index (best effort; every writer and gc
+        // retry it and fail rather than start a v2 file without it).
+        let _ = crate::signatures::migrate_legacy(&layout, &mut store);
         Ok(Repo {
             layout,
             vfs: VfsRepo::new(store),
