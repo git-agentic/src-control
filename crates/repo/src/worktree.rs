@@ -801,12 +801,21 @@ pub(crate) fn added_view_files(
 /// Whether `full` is a regular file whose bytes are exactly the blob `blob_id`:
 /// the one test for "this file is still what the tree says, so it is ours to
 /// delete or overwrite". A symlink, a directory, an unreadable file or any
-/// other bytes read as no. One read of the disk file and no store access, so
-/// it is cheap for a big file and works when the blob is not held (a partial
-/// clone gap).
+/// other bytes read as no. One chunked read of the disk file and no store
+/// access, so memory stays flat for a big file and it works when the blob is
+/// not held (a partial clone gap).
 pub(crate) fn disk_is_blob(full: &Path, blob_id: &ObjectId) -> bool {
-    full.symlink_metadata().is_ok_and(|m| m.is_file())
-        && std::fs::read(full).is_ok_and(|disk| Object::blob(disk).id() == *blob_id)
+    disk_blob_id(full).as_ref() == Some(blob_id)
+}
+
+/// The blob id of the regular file at `full`, hashed in chunks (a big file is
+/// never held in memory); `None` for a symlink, a directory, a missing or
+/// unreadable file.
+fn disk_blob_id(full: &Path) -> Option<ObjectId> {
+    if !full.symlink_metadata().ok()?.is_file() {
+        return None;
+    }
+    Object::blob_id_of_reader(std::fs::File::open(full).ok()?).ok()
 }
 
 /// What [`materialize_restore`] did besides the writes.
@@ -1072,11 +1081,12 @@ pub(crate) fn materialize_with_old_view(
 /// [`materialize`] for an abort, which restores a tip over a stopped
 /// operation's result (`old_root`, the tree the working tree reflects). The
 /// stop's own files go and the rest stay: `owned` is what the stop recorded
-/// writing in plaintext (`CONFLICT_PLAINTEXT`), which cannot be compared with
-/// a tree, so a protected path is removed only if it is there. An in-view
-/// path the restored tree needs but the replaced tree did not track is
-/// written only if nothing of the user's stands there. What it left is in
-/// [`Materialized::kept`] (#255).
+/// writing in plaintext (`CONFLICT_PLAINTEXT`) plus its conflicted paths,
+/// which cannot or need not be compared with a tree, so a protected path is
+/// removed only if it is there and an owned file is overwritten whatever its
+/// bytes. Any other in-view file is written only if it is still the replaced
+/// tree's bytes (or absent): a file the user changed since stays. What it
+/// left is in [`Materialized::kept`] (#255).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize_restore(
     layout: &Layout,
@@ -1144,8 +1154,9 @@ fn materialize_impl(
     // cleared once this call has finished laying the tree out under `sparse`.
     let mut prev_marker_used = false;
     let mut kept = Vec::new();
-    // Paths the replaced tree tracks (within the removal walk's bound).
-    let mut old_tracked: BTreeSet<String> = BTreeSet::new();
+    // Paths the replaced tree tracks (within the removal walk's bound), with
+    // their blob ids.
+    let mut old_tracked: BTreeMap<String, ObjectId> = BTreeMap::new();
     if let Some(old) = old_root {
         // The old-root removal walk: bounded by the spec the old root was
         // laid out under (`old_view`, or `sparse` itself when the spec is
@@ -1228,7 +1239,10 @@ fn materialize_impl(
                 Err(e) => return Err(e.into()),
             }
         }
-        old_tracked = old_files.into_keys().collect();
+        old_tracked = old_files
+            .into_iter()
+            .map(|(p, (blob, ..))| (p, blob))
+            .collect();
     }
     let mut skipped = Vec::new();
     for (path, (blob_id, mode, perms)) in &target {
@@ -1236,18 +1250,21 @@ fn materialize_impl(
             continue;
         }
         let full = safe_join(&layout.root, path)?;
-        // A restore overwrites what the replaced tree tracked (the stop's
-        // markers, or a file the user edited, are discarded by design) and
-        // what the stop recorded, never a file or symlink of the user's at a
-        // path neither covers. A directory is for `clear` to judge.
+        // A restore overwrites a file only if it is still the replaced tree's
+        // (or already the restored one), or the stop recorded it or marked it
+        // conflicted, where an edit is the resolution abort discards. A
+        // plaintext protected file never equals a blob, so it needs the
+        // record. A directory is for `clear` to judge.
         if let Some(owned) = restore_owned.filter(|_| old_root.is_some()) {
-            if !old_tracked.contains(path)
-                && !owned.contains(path)
-                && full.symlink_metadata().is_ok_and(|m| !m.is_dir())
-                && !disk_is_blob(&full, blob_id)
-            {
-                kept.push(path.clone());
-                continue;
+            if !owned.contains(path) && full.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+                let disk = disk_blob_id(&full);
+                let is_stopped = old_tracked
+                    .get(path)
+                    .is_some_and(|old| disk.as_ref() == Some(old));
+                if disk.as_ref() != Some(blob_id) && !is_stopped {
+                    kept.push(path.clone());
+                    continue;
+                }
             }
         }
         let bytes = match store.get(blob_id)? {

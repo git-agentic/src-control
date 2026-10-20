@@ -1614,11 +1614,9 @@ impl Repo {
                     continue;
                 }
                 let full = worktree::safe_join(&self.layout.root, p)?;
-                match std::fs::remove_file(full) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
+                // Best effort, as before: an error here would leave the
+                // conflict files written above with no merge state to abort.
+                let _ = std::fs::remove_file(full);
             }
             crate::merge_state::write(&self.layout, &theirs, &fm.conflicts, None)?;
             return Err(Error::MergeConflicts(fm.conflicts.len()));

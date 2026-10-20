@@ -332,3 +332,77 @@ fn abort_removes_a_protected_file_the_stop_decrypted_and_recorded() {
     assert!(report.kept.is_empty(), "{report:?}");
     finish(&root, repo);
 }
+
+#[test]
+fn abort_keeps_an_edit_of_a_clean_file_and_discards_a_conflict_resolution() {
+    for op in OPS {
+        let (root, repo) = stopped("clean-edit", op, false);
+        put(&root, "docs/e.txt", b"MINE\n");
+        put(&root, "x.txt", b"resolved\n");
+        let report = abort(&repo, op);
+        assert_eq!(read(&root, "docs/e.txt"), b"MINE\n", "{op:?}");
+        assert_eq!(report.kept, vec!["docs/e.txt".to_string()], "{op:?}");
+        let tip = if matches!(op, Op::Rebase) {
+            "FEATURE"
+        } else {
+            "MAIN"
+        };
+        assert_eq!(
+            read(&root, "x.txt"),
+            format!("a\n{tip}\nc\n").into_bytes(),
+            "{op:?}: the resolution of a conflict is discarded"
+        );
+        finish(&root, repo);
+    }
+}
+
+#[test]
+fn abort_keeps_a_user_file_at_a_protected_path_the_stop_removed() {
+    let (sk, pk) = scl_crypto::generate_keypair();
+    let root = root_for("protected-user", Op::Merge);
+    let repo = Repo::init(&root).unwrap();
+    repo.protect("secret/", &[pk], None).unwrap();
+    put(&root, "x.txt", b"a\nb\nc\n");
+    put(&root, "secret/old.txt", b"old\n");
+    repo.commit("me", "base").unwrap();
+    repo.branch("feature").unwrap();
+    put(&root, "x.txt", b"a\nMAIN\nc\n");
+    repo.commit("me", "main").unwrap();
+    repo.switch_with_identity("feature", Some(&sk)).unwrap();
+    // A plain commit would carry the absent protected path forward, so the
+    // deletion is committed as a raw snapshot.
+    let tip = repo.head_tip().unwrap().unwrap();
+    let protection = repo.snapshot(&tip).unwrap().protection;
+    let tree = repo
+        .vfs()
+        .write_tree_with_perms(&[(
+            "x.txt".to_string(),
+            b"a\nFEATURE\nc\n".to_vec(),
+            scl_core::FileMode::FILE,
+            0,
+        )])
+        .unwrap();
+    repo.commit_snapshot(
+        tree,
+        vec![tip],
+        Default::default(),
+        protection,
+        "me",
+        "feature drops the secret",
+    )
+    .unwrap();
+    put(&root, "x.txt", b"a\nFEATURE\nc\n");
+    std::fs::remove_file(root.join("secret/old.txt")).unwrap();
+    repo.switch_with_identity("main", Some(&sk)).unwrap();
+    repo.merge_with_identity("feature", "me", Some(&sk))
+        .unwrap_err();
+    assert!(
+        !root.join("secret/old.txt").exists(),
+        "setup: the stop removed it"
+    );
+    put(&root, "secret/old.txt", b"mine\n");
+    let report = repo.merge_abort().unwrap();
+    assert_eq!(read(&root, "secret/old.txt"), b"mine\n");
+    assert_eq!(report.kept, vec!["secret/old.txt".to_string()]);
+    finish(&root, repo);
+}

@@ -2516,7 +2516,11 @@ impl Repo {
         protection: &scl_core::Protection,
         stopped: Option<ObjectId>,
     ) -> Result<AbortReport> {
-        let owned = crate::conflict_plaintext::read(&self.layout)?;
+        // What the stop owns outright: the plaintext it recorded and the
+        // paths it left conflicted. A user's edit of either is the resolution
+        // abort discards; an edit of any other file is theirs to keep.
+        let mut owned = crate::conflict_plaintext::read(&self.layout)?;
+        owned.extend(self.active_conflicts()?);
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
         // ensure-view-exempt: every caller filled the view before the first removal.

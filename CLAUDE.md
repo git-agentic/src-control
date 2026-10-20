@@ -295,8 +295,8 @@ transport-adjacent. The rest, imperatively:
   abort (`merge_abort`, `cherry_pick_abort`, `rebase_abort`; they return an
   `AbortReport`) finishes anyway: it removes what the stop laid, leaves the
   rest and lists it in `kept` (`sc` prints `left in place (changed since the
-  stop)`), and does not overwrite a user file at a tip path the stop's tree
-  lacked. Recorded plaintext (`CONFLICT_PLAINTEXT`, which now includes the
+  stop)`), and overwrites a file only if it is still the stopped tree's bytes or
+  the stop owns it (recorded plaintext, a conflicted path). Recorded plaintext (`CONFLICT_PLAINTEXT`, which now includes the
   carried protected files a stop decrypted) and sidecars are removed whatever
   their bytes, since an edit of them is the discarded resolution. Merge abort
   compares against the decided root, not theirs' tree.

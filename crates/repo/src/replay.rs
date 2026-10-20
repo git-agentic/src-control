@@ -1688,7 +1688,6 @@ mod tests {
         assert_eq!(repo.head_tip().unwrap(), Some(main_tip));
 
         let before_x = std::fs::read(root.join("x.txt")).unwrap();
-        let before_stable = std::fs::read(root.join("stable.txt")).unwrap();
         let ops_before = repo.oplog().unwrap().len();
 
         let err = repo.cherry_pick("work", "me", None, None).unwrap_err();
@@ -1702,7 +1701,10 @@ mod tests {
         std::fs::write(root.join("x.txt"), b"garbage\n").unwrap();
         std::fs::write(root.join("stable.txt"), b"also garbage\n").unwrap();
 
-        repo.cherry_pick_abort().unwrap();
+        let report = repo.cherry_pick_abort().unwrap();
+        // The pick never touched stable.txt, so the later edit is the user's
+        // (#255): kept and reported, where x.txt (conflicted) is restored.
+        assert_eq!(report.kept, vec!["stable.txt".to_string()]);
 
         assert!(!repo.pick_in_progress(), "state cleared");
         assert_eq!(repo.pick_head().unwrap(), None);
@@ -1724,8 +1726,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(root.join("stable.txt")).unwrap(),
-            before_stable,
-            "stable.txt byte-identical"
+            b"also garbage\n",
+            "an edit of an untouched file survives"
         );
         assert!(
             !root.join("new.txt").exists(),
@@ -6365,7 +6367,6 @@ mod tests {
         let original_tip = repo.head_tip().unwrap().unwrap();
 
         let before_x = std::fs::read(root.join("x.txt")).unwrap();
-        let before_stable = std::fs::read(root.join("stable.txt")).unwrap();
         let ops_before = repo.oplog().unwrap().len();
 
         let outcome = repo.rebase("main", "me", None).unwrap();
@@ -6376,7 +6377,9 @@ mod tests {
         std::fs::write(root.join("x.txt"), b"garbage\n").unwrap();
         std::fs::write(root.join("stable.txt"), b"also garbage\n").unwrap();
 
-        repo.rebase_abort().unwrap();
+        // stable.txt is untouched by the rebase: the later edit is the user's.
+        let report = repo.rebase_abort().unwrap();
+        assert_eq!(report.kept, vec!["stable.txt".to_string()]);
 
         assert!(!repo.rebase_in_progress(), "state cleared");
         assert!(repo.rebase_progress().unwrap().is_none());
@@ -6392,8 +6395,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(root.join("stable.txt")).unwrap(),
-            before_stable,
-            "stable.txt byte-identical"
+            b"also garbage\n",
+            "an edit of an untouched file survives"
         );
         assert_eq!(
             repo.oplog().unwrap().len(),

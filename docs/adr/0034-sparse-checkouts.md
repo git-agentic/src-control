@@ -282,7 +282,8 @@ every claim below is checked against the shipped code, not the plan.
    file the user created there after the stop went too. One rule now: a path is
    deleted or overwritten only if (a) the tree being replaced tracks it and the
    disk file is a regular file with exactly those bytes (`worktree::disk_is_blob`:
-   one read of the disk file, hashed, no store access and no size lookup, so it
+   one chunked read of the disk file, hashed with `Object::blob_id_of_reader`, so
+   memory stays flat for a big file; no store access and no size lookup, so it
    also works on a partial clone's gap), or (b) the stop recorded it
    (`CONFLICT_PLAINTEXT`, `CONFLICT_SIDECARS`, the `sparse-widen` journal) and it
    still matches what was laid where that is checkable. A path that fails the
@@ -298,9 +299,14 @@ every claim below is checked against the shipped code, not the plan.
    (`skipped` for protected paths without a key, `kept` for these) is returned
    by `merge_abort[_with_identity]`, `cherry_pick_abort` and `rebase_abort`, and
    `sc` prints each kept path. The stop itself never refuses on this account
-   (the guards of refinement 7 and #250 still do). A restore also does not write
-   over a file or symlink of the user's at a path the restored tree needs but
-   the stopped tree did not track and the stop did not record.
+   (the guards of refinement 7 and #250 still do). A restore also writes over a
+   file only if it is still the stopped tree's bytes (or already the restored
+   ones), or the stop owns it: recorded plaintext or a path left conflicted
+   (`active_conflicts`), where an edit is the resolution abort discards. So a
+   user's edit of an untouched file, or a file or symlink put at a path the
+   stopped tree lacked, is kept and reported. A conflict already resolved with
+   `sc resolve` leaves the conflict list and is reported as kept if its bytes
+   differ.
    A kept file or symlink standing where a parent directory of a target path
    must be (a stop laid a file `zz` over a tracked `zz/a`, and the user changed
    it) is refused before any removal or write with a message naming it
