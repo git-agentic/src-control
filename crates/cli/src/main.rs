@@ -3747,8 +3747,9 @@ fn run_serve(
                 );
             }
             // `--http`'s `handle_http_connection` gates on `.sc/` presence
-            // before any dispatch, store mode included (a client without a
-            // valid token gets the 401 first, anyone else a 404).
+            // before any dispatch, store mode included (the 404 follows the
+            // auth gate (#207); a listener that requires a token answers 401
+            // first).
             // `--stdio` has no such gate upstream — enforce it here, before
             // touching stdin, so a `--store` session never auto-vivifies
             // `<path>/.sc/tmp/` under an uninitialized directory (which

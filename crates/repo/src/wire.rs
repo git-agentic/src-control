@@ -940,8 +940,8 @@ fn open_bucket_serve_transport(store_url: &str, home: &std::path::Path) -> Resul
 /// this, or `TempServeDir::create_in` will silently `create_dir_all` one
 /// into existence under an uninitialized directory. Both current callers do:
 /// `handle_http_connection` gates on `.sc/` presence before any dispatch
-/// (store mode included; a client without a valid token gets the 401 first,
-/// anyone else a 404) and the CLI's `run_serve`
+/// (store mode included; the 404 follows the auth gate (#207), so a listener
+/// that requires a token answers 401 first) and the CLI's `run_serve`
 /// checks `path.join(".sc").is_dir()` itself before reaching this function
 /// (P36c review — `--stdio` has no upstream gate the way `--http` does, so
 /// it cannot lean on `LocalTransport::open`'s own check the way a

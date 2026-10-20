@@ -266,7 +266,7 @@ impl ScHttpUrl {
             )));
         }
         Ok(ScHttpUrl {
-            host: host.to_string(),
+            host,
             port,
             path,
             tls,
@@ -282,19 +282,20 @@ impl ScHttpUrl {
 }
 
 /// Split a URL authority into host and optional port text. A bracketed IPv6
-/// literal (`[::1]:7777`) yields the bare address; `None` means the brackets
+/// literal (`[::1]:7777`) yields the address in its canonical text form, so
+/// `[::1]` and `[0:0:0:0:0:0:0:1]` share one pin key; `None` means the brackets
 /// are malformed or do not hold an IPv6 address. An unbracketed authority
 /// splits on its first `:`, so a bare IPv6 literal falls out as an empty host
 /// or a bad port for the caller to reject.
-pub(crate) fn split_authority(authority: &str) -> Option<(&str, Option<&str>)> {
+pub(crate) fn split_authority(authority: &str) -> Option<(String, Option<&str>)> {
     let Some(rest) = authority.strip_prefix('[') else {
         return Some(match authority.split_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (authority, None),
+            Some((h, p)) => (h.to_string(), Some(p)),
+            None => (authority.to_string(), None),
         });
     };
     let (host, tail) = rest.split_once(']')?;
-    host.parse::<std::net::Ipv6Addr>().ok()?;
+    let host = host.parse::<std::net::Ipv6Addr>().ok()?.to_string();
     match tail {
         "" => Some((host, None)),
         t => Some((host, Some(t.strip_prefix(':')?))),
@@ -1395,6 +1396,9 @@ mod tests {
         );
         assert!(!u.tls);
         assert_eq!(u.authority(), "[::1]:7777");
+        // Spellings of one address share a host, hence one pin key.
+        let long = ScHttpUrl::parse("sc+http://[0:0:0:0:0:0:0:1]:7777/repo").unwrap();
+        assert_eq!(long.host, "::1");
 
         let u = ScHttpUrl::parse("sc+https://[2001:db8::1]/r").unwrap();
         assert_eq!((u.host.as_str(), u.port), ("2001:db8::1", DEFAULT_PORT));
@@ -1664,6 +1668,7 @@ mod tests {
     fn connect_dials_a_bracketed_ipv6_literal() {
         // Hosts without IPv6 loopback cannot run this.
         let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("skipping: no IPv6 loopback on this host");
             return;
         };
         let port = listener.local_addr().unwrap().port();
