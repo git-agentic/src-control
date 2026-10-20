@@ -165,7 +165,9 @@ fn check_prior(
     match (meta, prior) {
         (None, Some((_, perms))) if perms & PROTECTED == 0 => Err(changed_since_read(p)),
         (None, _) => Ok(()),
-        (Some(m), _) if m.is_dir() => Ok(()), // judged by the directory rules
+        // A directory where a tracked file was is never ours to remove.
+        (Some(m), Some(_)) if m.is_dir() && target.is_none() => Err(changed_since_read(p)),
+        (Some(m), _) if m.is_dir() => Ok(()), // a write: judged by the directory rules
         (Some(_), Some(prior)) if still_read(full, p, prior, cache) => Ok(()),
         // Already the target bytes (a plain file): nothing of the user's to lose.
         // Not for a path the candidate did not track: an ignored file with the
@@ -1050,6 +1052,31 @@ mod tests {
         repo.ws_refresh(None, None, None).unwrap_err();
         assert!(!outside.join("new").exists(), "nothing written outside");
         std::fs::remove_dir_all(&outside).unwrap();
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_directory_that_replaced_a_tracked_file_after_the_plan_is_not_removed() {
+        let root = tmp_root("dir-for-file");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("gone.txt"), "g\n").unwrap();
+        std::fs::write(root.join("keep.txt"), "k\n").unwrap();
+        repo.commit("t", "base").unwrap();
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        host_commit(&repo, &root, &[("gone.txt", None)]);
+        let d = dir.clone();
+        BEFORE_APPLY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(d.join("gone.txt")).unwrap();
+                std::fs::create_dir(d.join("gone.txt")).unwrap();
+                std::fs::write(d.join("gone.txt/mine"), "m\n").unwrap();
+            }))
+        });
+        let _reset = HookGuard;
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("gone.txt changed"), "{err}");
+        assert_eq!(read(&dir, "gone.txt/mine"), "m\n");
         cleanup(repo, &root);
     }
 
