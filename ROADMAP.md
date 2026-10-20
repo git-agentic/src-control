@@ -806,9 +806,13 @@ scale-&-reach horizon):
 - **Per-path/per-ref ACLs (P29).** `sc serve --http` access control is
   all-or-nothing per connection (`ro`/`rw`); scoping a token to specific
   path prefixes or refs is beyond the MVP. Deferred.
-- **Token expiry/rotation metadata (P29).** `sct-` tokens have no expiry
+- ~~**Token expiry/rotation metadata (P29).** `sct-` tokens have no expiry
   field; rotation today is add-new + remove-old with no automation or
-  reminder. Deferred.
+  reminder.~~ **Done.** (#209) `sc serve token add --expires <30d|2030-01-31>`
+  stores an optional `expires_at` (Unix seconds); `verify` treats an expired
+  token like an unknown one (`401`); `list` shows and flags expiry; `sc serve
+  token rotate <label>` swaps the secret in one step. Expired entries stay in
+  the file. (ADR-0040.)
 - ~~**`sc+https://` / TLS (P29).** `sc serve --http` is plaintext-only; a
   bearer token crosses the wire in cleartext, so a public deployment must
   front with a TLS reverse proxy today. A first-party TLS dependency is
