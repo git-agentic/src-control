@@ -1805,6 +1805,13 @@ impl Repo {
         conflicted_paths: &[String],
     ) -> Result<ObjectId> {
         let sparse = self.sparse_spec()?;
+        // `sc sparse set` is refused while a rebase is stopped, so a refusal
+        // reached from `rebase --continue` cannot be fixed by widening in place.
+        let widen = if crate::rebase_state::in_progress(&self.layout) {
+            "abort the rebase (`sc rebase --abort`), widen with `sc sparse set`, then rerun the rebase"
+        } else {
+            "run `sc sparse set` to include it, then retry"
+        };
         let needs_widen: Vec<&String> = conflicted_paths
             .iter()
             .filter(|p| !sparse.matches(p))
@@ -1816,7 +1823,7 @@ impl Repo {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(Error::InvalidArgument(format!(
-                "conflict in {names} is outside your sparse checkout; run `sc sparse set` to include it, then retry"
+                "conflict in {names} is outside your sparse checkout; {widen}"
             )));
         }
         // `to_encrypt` plaintext is written straight to the working tree and
@@ -1828,17 +1835,23 @@ impl Repo {
         if let Some((path, ..)) = to_encrypt.iter().find(|(p, ..)| !sparse.matches(p)) {
             return Err(Error::InvalidArgument(format!(
                 "{op} has conflicts, and {path} (outside your sparse checkout) needs sealing at completion; \
-                 run `sc sparse set` to include it, or `sc backfill --all` on a partial clone, then retry"
+                 {widen} (on a partial clone `sc backfill --all` also works)"
             )));
         }
-        // A sidecar is plaintext written beside a conflicted file. Outside the
-        // view it would sit where completion neither expects nor protects it,
-        // and a later commit would read it back as a plain file.
-        if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !sparse.matches(r)) {
-            return Err(Error::InvalidArgument(format!(
-                "{op} has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
-                 run `sc sparse set` to include it, or `sc backfill --all` on a partial clone, then retry"
-            )));
+        // A sidecar is `<conflicted path>.theirs`, and the conflicted path
+        // passed the gate above, so on a full clone it is beside an in-view
+        // file (a file-exact spec such as `src/a.bin` does not match
+        // `src/a.bin.theirs`, yet that sidecar is in view) and `abort` and
+        // completion remove it. A partial clone keeps the stricter ADR-0049
+        // refusal: outside the view its sidecar would sit where completion
+        // neither expects nor protects it.
+        if self.promisor()?.is_some() {
+            if let Some((rel, _)) = sidecars.iter().find(|(r, _)| !sparse.matches(r)) {
+                return Err(Error::InvalidArgument(format!(
+                    "{op} has conflicts, and its sidecar {rel} would fall outside your sparse checkout; \
+                     {widen}, or run `sc backfill --all`"
+                )));
+            }
         }
         let conflict_root = if carried_subtrees.is_empty() {
             self.vfs.write_tree_with_perms(carried)?
@@ -1883,13 +1896,12 @@ impl Repo {
                 .map(|(p, ..)| p.as_str())
                 .chain(sidecars.iter().map(|(r, _)| r.as_str()));
             for rel in targets {
-                // A path the sparse view never materialized holds no tracked
-                // file on disk, even if the tree tracks it: whatever is there
-                // is the user's own. A failed lookup counts as untracked.
+                // Every target is in the view (gated above; a sidecar is
+                // never tracked, checked above). A failed lookup counts as
+                // untracked.
                 let mut tracked = |p: &str| {
-                    sparse.matches(p)
-                        && worktree::tree_entry_at(&mut store, old_root, p, partial)
-                            .is_ok_and(|e| e.is_some())
+                    worktree::tree_entry_at(&mut store, old_root, p, partial)
+                        .is_ok_and(|e| e.is_some())
                 };
                 match stop_write_blocker(&self.layout.root, rel, &mut tracked)? {
                     None => {}
@@ -5433,6 +5445,7 @@ mod tests {
 
         repo.set_sparse(&["src/".into()], Some(&sk)).unwrap();
         assert!(!root.join("secret/s.txt").exists());
+        let before = repo.head_tip().unwrap();
 
         let err = repo
             .merge_with_identity("feature", "me", Some(&sk))
@@ -5451,6 +5464,12 @@ mod tests {
         assert!(!root.join(".sc/CONFLICT_PLAINTEXT").exists());
         assert!(!root.join(".sc/CONFLICT_SIDECARS").exists());
         assert!(!repo.merge_in_progress());
+        assert_eq!(repo.head_tip().unwrap(), before, "HEAD unchanged");
+        assert_eq!(
+            std::fs::read(root.join("src/a.txt")).unwrap(),
+            b"OURS\nl2\nl3\n",
+            "the in-view file is untouched"
+        );
 
         // Widen and retry: stops on the in-view conflict only.
         repo.set_sparse(&["src/".into(), "secret/".into()], Some(&sk))

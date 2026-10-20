@@ -57,13 +57,18 @@ review fix — see Consequences).
 - **Closed (#210): no out-of-sparse plaintext during a mixed conflict.**
   `Repo::materialize_conflict_state` (`crates/repo/src/repo.rs`) gates its
   conflict *markers* against the sparse spec up front, and since #210 the
-  same gate covers its other two plaintext writes: the `to_encrypt` inputs
-  (content-merged protected files, and ours' carried-plain files under a
-  theirs-only rule) and the `.theirs` sidecars. Any of them outside the
+  same gate covers the `to_encrypt` inputs (content-merged protected files,
+  and ours' carried-plain files under a theirs-only rule). One outside the
   sparse view refuses the merge, cherry-pick or rebase with a widen hint
   (`sc sparse set`) before anything is written, exactly like an
   out-of-sparse conflicted path, so a stop, its completion and its abort
-  leave nothing out of view on disk. The earlier build wrote that
+  leave nothing out of view on disk. From `rebase --continue` the hint
+  says to abort the rebase first, because `sparse set` is refused while a
+  rebase is stopped. Sidecars need no gate on a full clone: each is
+  `<conflicted path>.theirs` beside a conflicted path that already passed
+  the gate (so it is in view even under a file-exact spec such as
+  `src/a.bin`), and abort and completion remove it; a partial clone keeps
+  its stricter sidecar refusal (ADR-0049). The earlier build wrote that
   plaintext outside the view and left it there after completion (only
   abort removed it); this was never data loss or a new disclosure, only a
   view wider than advertised. The cost is that such a merge now needs the
@@ -126,7 +131,7 @@ every claim below is checked against the shipped code, not the plan.
    write to disk. A CLEAN out-of-sparse change never reaches either gate —
    it resolves on tree ids inside `three_way`/replay and lands via the
    ordinary `materialize` skip-write path, no markers involved at all. See
-   the Consequences section above: since #210 the `to_encrypt`/sidecar
+   the Consequences section above: since #210 the `to_encrypt`
    writes for an in-sparse conflict that co-occurs with an out-of-sparse
    clean change are refused by the same gate.
 4. **`sc ws` inherits the host's sparse view, structurally, not by

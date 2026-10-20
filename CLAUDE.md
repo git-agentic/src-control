@@ -171,7 +171,7 @@ transport-adjacent. The rest, imperatively:
   capability, and no DTO field capable of carrying protected ciphertext or
   identity material.
 - **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (and, on a non-lazy clone, one outside the filter), `sc rewrap`,
-  `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view or needs sealing outside it (no ref, state or working-tree change), `sc push` to a git remote, and
+  `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view or whose `.theirs` sidecar would (no ref, state or working-tree change; on every clone, a conflict stop that needs sealing outside the view is refused the same way), `sc push` to a git remote, and
   `sc fetch` from any native remote but the promisor origin.** `sc merge`, `sc cherry-pick` and `sc rebase` work, including conflicts inside the view (P37c). `sc ws` and `sc work` work too (ADR-0050): workspaces and agents see the clone's view only, and harvest lands through the same merge. `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what
   a clone *asked for*, not what is present: after a fetch an in-filter object
@@ -237,7 +237,7 @@ transport-adjacent. The rest, imperatively:
   not isolation. `sc ws run` and `sc work --with-secrets` use the environment.
 - **Sparse is checkout-only**, and a stopped merge/pick/rebase never writes
   outside the view: an out-of-sparse conflicted path, sealing input or sidecar
-  refuses with a `sc sparse set` hint before any write (ADR-0034, #210).
+  refuses with a `sc sparse set` hint before any write (ADR-0034, #210; from `rebase --continue` the hint says to abort first, since `sparse set` is refused mid-rebase).
 - **`.sc/git-remotes/<name>/marks` carries `git_oid ↔ sc_id` identity —
   deleting it is destructive.** Deleting the sibling `mirror.git` is always
   safe (reconstructed on next use). Stale marks self-heal on push/export.
