@@ -825,3 +825,24 @@ fn empty_bucket_and_single_pack_are_noops() {
     assert_eq!((rep.packs_merged, rep.logs_deleted), (0, 0));
     assert_readable(&mem, &refs);
 }
+
+#[test]
+fn a_first_push_that_died_before_the_manifest_leaves_orphans_the_sweep_ages_out() {
+    let mem = Arc::new(MemBucket::default());
+    let (_, objects) = commit("never committed");
+    let (pack, idx) = scl_core::pack::build_pack(&objects).unwrap();
+    let hash = hex::encode(blake3::hash(&pack).as_bytes());
+    let b = mem.bucket();
+    b.put_new(&pack_key(&hash), &pack).unwrap();
+    b.put_new(&idx_key(&hash), &idx).unwrap();
+    let t = open(&mem);
+    // young: kept
+    let rep = t.compact(&CompactOptions::default()).unwrap();
+    assert_eq!((rep.packs_deleted, rep.packs_held_back), (0, 1));
+    assert_eq!(keys(&mem, "packs/").len(), 2);
+    // aged: swept, and the bucket is still a valid empty remote
+    let rep = t.compact(&eager()).unwrap();
+    assert_eq!(rep.packs_deleted, 1, "{rep:?}");
+    assert!(keys(&mem, "packs/").is_empty());
+    assert!(open(&mem).list_refs().unwrap().is_empty());
+}

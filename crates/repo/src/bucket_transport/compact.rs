@@ -21,6 +21,10 @@ use std::time::{Duration, SystemTime};
 /// Replans after a lost manifest CAS or a concurrent compactor before giving up.
 const MAX_ATTEMPTS: u32 = 4;
 
+/// Decoded bytes one merge pack may hold, as a multiple of `group_bytes`
+/// (which counts compressed bytes).
+const DECODED_FACTOR: u64 = 4;
+
 /// Knobs for [`BucketTransport::compact`]. The defaults are what
 /// `sc remote compact` uses.
 #[derive(Debug, Clone)]
@@ -125,11 +129,13 @@ impl BucketTransport {
         };
         self.refresh()?;
         if self.view.borrow().is_none() {
+            // No manifest yet: nothing to merge, but a first push that died after
+            // uploading its pack left debris the sweep can still age out.
             rep.notes
-                .push("bucket has no manifest: nothing to compact".into());
-            return Ok(rep);
+                .push("bucket has no manifest: only aged orphan packs are swept".into());
+        } else {
+            self.consolidate(opts, &mut rep)?;
         }
-        self.consolidate(opts, &mut rep)?;
         // Read the clock after phase 1 so a zero grace sees its own checkpoint.
         let now = opts.now.unwrap_or_else(SystemTime::now);
         self.sweep(opts, now, &mut rep)?;
@@ -188,6 +194,7 @@ impl BucketTransport {
             let mut created = Vec::new();
             for group in &groups {
                 let mut objects: BTreeMap<ObjectId, Vec<u8>> = BTreeMap::new();
+                let mut decoded = 0u64;
                 for hash in group {
                     let Fetched::New { bytes, .. } = self.bucket.get(&pack_key(hash), None)? else {
                         // Either another compactor retired it (the manifest has
@@ -203,12 +210,24 @@ impl BucketTransport {
                         continue 'attempt;
                     };
                     parse_pack_reader(std::io::Cursor::new(&bytes[..]), |id, obj| {
-                        objects.insert(id, obj.encode());
+                        let enc = obj.encode();
+                        decoded += enc.len() as u64;
+                        objects.insert(id, enc);
                         Ok(())
                     })?;
+                    // Compressed sizes bound the group, not the decoded bytes held
+                    // here; spill to a pack of its own before RAM balloons.
+                    if decoded > opts.group_bytes.saturating_mul(DECODED_FACTOR) {
+                        let part: Vec<(ObjectId, Vec<u8>)> =
+                            std::mem::take(&mut objects).into_iter().collect();
+                        created.push(self.upload_pack(&part)?.0);
+                        decoded = 0;
+                    }
                 }
-                let objects: Vec<(ObjectId, Vec<u8>)> = objects.into_iter().collect();
-                created.push(self.upload_pack(&objects)?.0);
+                if !objects.is_empty() {
+                    let objects: Vec<(ObjectId, Vec<u8>)> = objects.into_iter().collect();
+                    created.push(self.upload_pack(&objects)?.0);
+                }
             }
             // Fence + fold in one CAS: the manifest tag we read is the state
             // the checkpoint describes, so a lost CAS just replans.
@@ -315,14 +334,13 @@ impl BucketTransport {
         let old = |m: &ObjectMeta| m.modified <= old_before;
         for _ in 0..MAX_ATTEMPTS {
             self.refresh()?;
-            let (tag, ck_seq, live) = {
-                let view = self.view.borrow();
-                let v = view.as_ref().expect("checked non-empty");
-                (
-                    v.tag.clone(),
+            let (tag, ck_seq, live) = match self.view.borrow().as_ref() {
+                Some(v) => (
+                    Some(v.tag.clone()),
                     v.manifest.checkpoint_seq,
                     v.packs.iter().cloned().collect::<BTreeSet<String>>(),
-                )
+                ),
+                None => (None, 0, BTreeSet::new()),
             };
             let ckpts: Vec<(u64, ObjectMeta)> = self
                 .bucket
@@ -415,8 +433,9 @@ impl BucketTransport {
             if opts.dry_run {
                 if rep.packs_created > 0 {
                     rep.notes.push(
-                        "dry run: packs the planned merge replaces become deletable once it \
-                         lands and the grace window passes"
+                        "dry run: the sweep figures describe the bucket as it is now; the merge \
+                         and what it retires (its replaced packs, the log up to its new \
+                         checkpoint) are not simulated"
                             .into(),
                     );
                 }
@@ -425,7 +444,11 @@ impl BucketTransport {
             // A pack nothing names can still be named by a push that lands
             // while we plan: if the manifest moved, replan the pack set
             // (nothing is deleted against a stale picture).
-            if !matches!(self.bucket.get("manifest", Some(&tag))?, Fetched::Unchanged) {
+            let unmoved = matches!(
+                (&tag, self.bucket.get("manifest", tag.as_deref())?),
+                (Some(_), Fetched::Unchanged) | (None, Fetched::Absent)
+            );
+            if !unmoved {
                 rep.packs_deleted -= del_packs.len();
                 rep.bytes_deleted -= del_packs
                     .iter()

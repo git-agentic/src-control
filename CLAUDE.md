@@ -196,8 +196,8 @@ transport-adjacent. The rest, imperatively:
   `filter` against bucket remotes is refused.
 - **`sc remote compact` deletes bucket objects** (ADR-0055): it needs bucket
   list and delete rights, which pushers and `sc serve --store` instances should
-  not hold. It never touches the manifest and never deletes what the current
-  chain names. Keep `--prune-expire` well above any push's duration (default
+  not hold. It advances the manifest only through the normal CAS (one no-op
+  entry plus a checkpoint) and never deletes what the current chain names. Keep `--prune-expire` well above any push's duration (default
   24h): a writer stalled longer than that between uploading a pack and its
   commit can still lose the pack (the leases follow-on closes it).
 - **`sc serve --store` still requires a local serve home with `.sc/`** —

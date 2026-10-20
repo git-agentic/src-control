@@ -70,8 +70,8 @@ chain a new reader walks, but older checkpoints and log entries still name
 them. They are removed by phase 2, a grace period later.
 
 **Phase 2, sweep (deletes, behind a cutoff).** All deletions are of objects
-that no current or future manifest chain references; the manifest itself is
-never deleted.
+that the current manifest chain does not reference (and, outside the residual
+limit below, no later chain will); the manifest itself is never deleted.
 
 - **Cutoff K.** Let `K` be the highest `checkpoints/<seq>` object with
   `seq <= manifest.checkpoint_seq` whose last-modified time is at least
@@ -207,7 +207,9 @@ The `Bucket` trait gains two methods, implemented by `DirBucket` and
 ## Consequences
 
 - Storage and cold-start cost are bounded by the live data plus one grace
-  window. A bucket that was past `MAX_LIST` regains folding after one run.
+  window. A bucket past `MAX_LIST` on the pack axis regains folding after one run if
+  its small packs merge to a list under the cap; packs above the merge
+  threshold are never rewritten, and the ref axis is not relieved.
 - Compaction needs bucket `list` and `delete` rights, which an ordinary
   pusher or reader does not. See the THREAT-MODEL bucket section.
 - Only one compaction is useful at a time. Concurrent runs are safe (each
