@@ -33,7 +33,8 @@ Architectural quarantine rules (which crate may use what) are in
 | `scl-gitio` | gix, anyhow, thiserror | Git interop (gix quarantined here) |
 | `scl-crypto` | chacha20poly1305, x25519-dalek, ed25519-dalek, sha2, hkdf, rand_core, rand_chacha, zeroize, blake3, hex, thiserror | All cryptography (RustCrypto quarantined here) |
 | `scl-repo` | blake3, hex, libc, regex, serde, thiserror, toml | Persistent store, merge, transports, policy |
-| `scl-tlsio` | rustls, rcgen, ring, rustls-pki-types, hex, thiserror | TLS (quarantined leaf) |
+| `scl-tlsio` | rustls, rustls-native-certs, rcgen, ring, rustls-pki-types, hex, thiserror | TLS (quarantined leaf); `rustls-native-certs` loads the platform roots for `SC_HTTPS_CA=system` (ADR-0054) |
+| `scl-objio` | aws-config, aws-sdk-s3, tokio, blake3, hex, thiserror | Object-store buckets for `sc+wal://` / `sc+s3://` (quarantined leaf; S3 SDK and its async runtime live only here, ADR-0046) |
 | `scl-cli` | clap, anyhow, serde, serde_json, toml, hex | The `sc` binary |
 | `scl-desktop` | tauri, tauri-build, tauri-plugin-dialog, serde, serde_json, toml | Desktop backend (read-only adapter) |
 

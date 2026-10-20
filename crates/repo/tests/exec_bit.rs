@@ -221,3 +221,132 @@ fn ws_checkout_keeps_exec_bit() {
     assert_eq!(committed(&repo, "run.sh"), FileMode::EXEC);
     assert_eq!(committed(&repo, "plain.txt"), FileMode::FILE);
 }
+
+/// Set the on-disk permission bits exactly (a stale or restrictive mode).
+fn chmod(root: &Path, rel: &str, mode: u32) {
+    std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn disk_mode(root: &Path, rel: &str) -> u32 {
+    std::fs::metadata(root.join(rel))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// The decrypted-protected-plaintext path of `materialize` keeps the recorded
+/// bit, clears a stale one, and never widens read bits.
+#[test]
+fn protected_switch_keeps_and_clears_exec_without_widening_reads() {
+    let (repo, root) = base("prot-switch");
+    let (sk, pk) = scl_crypto::generate_keypair();
+    repo.protect("secret/", &[pk], None).unwrap();
+    put(&root, "secret/run.sh", "#!/bin/sh\n", true);
+    repo.commit("t", "add").unwrap();
+    repo.branch("plain").unwrap();
+    repo.switch_with_identity("plain", Some(&sk)).unwrap();
+    put(&root, "secret/run.sh", "not a script\n", false);
+    repo.commit("t", "demote").unwrap();
+
+    // Owner-only file on disk: EXEC adds only the owner execute bit.
+    chmod(&root, "secret/run.sh", 0o600);
+    repo.switch_with_identity("main", Some(&sk)).unwrap();
+    assert_eq!(disk_mode(&root, "secret/run.sh"), 0o700);
+    // EXEC -> FILE clears the stale bits.
+    repo.switch_with_identity("plain", Some(&sk)).unwrap();
+    assert_eq!(disk_mode(&root, "secret/run.sh") & 0o111, 0);
+}
+
+/// The protected conflict write-out lays the recorded bit onto the markers.
+#[test]
+fn protected_conflict_writeout_keeps_exec_bit() {
+    let (repo, root) = base("prot-conflict");
+    let (sk, pk) = scl_crypto::generate_keypair();
+    repo.protect("secret/", &[pk], None).unwrap();
+    put(&root, "secret/run.sh", "l1\nl2\nl3\n", true);
+    repo.commit("t", "base").unwrap();
+    repo.branch("feat").unwrap();
+    put(&root, "secret/run.sh", "MAIN\nl2\nl3\n", true);
+    repo.commit("t", "main").unwrap();
+    repo.switch_with_identity("feat", Some(&sk)).unwrap();
+    put(&root, "secret/run.sh", "FEAT\nl2\nl3\n", true);
+    repo.commit("t", "feat").unwrap();
+    repo.switch_with_identity("main", Some(&sk)).unwrap();
+
+    chmod(&root, "secret/run.sh", 0o600);
+    assert!(repo.merge_with_identity("feat", "t", Some(&sk)).is_err());
+    let text = std::fs::read_to_string(root.join("secret/run.sh")).unwrap();
+    assert!(text.contains("<<<<<<<"), "markers: {text}");
+    // The write-out may recreate the file (umask-dependent read bits).
+    assert!(on_disk_exec(&root, "secret/run.sh"));
+}
+
+/// `sc resolve` recreates a conflicted file the user deleted with its mode.
+#[test]
+fn resolve_after_delete_restores_exec_bit() {
+    let (repo, root) = base("resolve-del");
+    put(&root, "run.sh", "l1\nl2\nl3\n", true);
+    repo.commit("t", "base").unwrap();
+    repo.branch("feat").unwrap();
+    put(&root, "run.sh", "MAIN\nl2\nl3\n", true);
+    repo.commit("t", "main").unwrap();
+    repo.switch("feat").unwrap();
+    put(&root, "run.sh", "FEAT\nl2\nl3\n", true);
+    repo.commit("t", "feat").unwrap();
+    repo.switch("main").unwrap();
+    assert!(repo.merge("feat", "t").is_err());
+
+    std::fs::remove_file(root.join("run.sh")).unwrap();
+    repo.resolve_path("run.sh", scl_repo::ResolveSide::Theirs, None)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("run.sh")).unwrap(),
+        "FEAT\nl2\nl3\n"
+    );
+    assert!(on_disk_exec(&root, "run.sh"));
+}
+
+/// Private branches: `materialize_private` (plain and protected-carried
+/// paths) and the private-merge conflict write-out keep/clear the bit.
+#[test]
+fn private_branch_materialize_and_conflict_writeout_keep_exec_bit() {
+    let (repo, root) = base("private");
+    let (sk, pk) = scl_crypto::generate_keypair();
+    repo.protect("secret/", &[pk], None).unwrap();
+    for rel in ["run.sh", "secret/tool.sh"] {
+        put(&root, rel, "l1\nl2\nl3\n", true);
+    }
+    repo.commit("t", "base").unwrap();
+    repo.branch_private("fix", &sk, &[], &[]).unwrap();
+
+    // Switching in lays both files out executable, from owner-only files.
+    for rel in ["run.sh", "secret/tool.sh"] {
+        chmod(&root, rel, 0o600);
+    }
+    repo.switch_with_identity("fix", Some(&sk)).unwrap();
+    for rel in ["run.sh", "secret/tool.sh"] {
+        assert_eq!(disk_mode(&root, rel), 0o700, "{rel} after switch");
+    }
+
+    // Conflicting edits on both sides stop the merge with markers.
+    for rel in ["run.sh", "secret/tool.sh"] {
+        put(&root, rel, "FIX\nl2\nl3\n", true);
+    }
+    repo.commit_private("t", "private edit", Some(&sk)).unwrap();
+    repo.switch_with_identity("main", Some(&sk)).unwrap();
+    for rel in ["run.sh", "secret/tool.sh"] {
+        put(&root, rel, "MAIN\nl2\nl3\n", true);
+    }
+    repo.commit("t", "main edit").unwrap();
+    repo.switch_with_identity("fix", Some(&sk)).unwrap();
+    for rel in ["run.sh", "secret/tool.sh"] {
+        chmod(&root, rel, 0o600);
+    }
+    assert!(repo.merge_into_private("main", "t", Some(&sk)).is_err());
+    for rel in ["run.sh", "secret/tool.sh"] {
+        let text = std::fs::read_to_string(root.join(rel)).unwrap();
+        assert!(text.contains("<<<<<<<"), "{rel} markers: {text}");
+        assert_eq!(disk_mode(&root, rel), 0o700, "{rel} after conflict");
+    }
+}

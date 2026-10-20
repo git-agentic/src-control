@@ -1,6 +1,6 @@
 # ADR-0037: Partial clone (promisor store + prefix-scoped fetch)
 
-- **Status:** Accepted
+- **Status:** Accepted; the merge, replay and session refusals are lifted by [ADR-0049](0049-merge-on-partial-clones.md) and [ADR-0050](0050-sessions-on-partial-clones.md), and the filter-based walks replaced by [ADR-0048](0048-presence-based-partial-clones.md)
 - **Date:** 2026-07-09
 - **Phase:** 27
 - **Builds on:** ADR-0034 (sparse checkout — the materialize half), ADR-0035 (streaming pack transfer), ADR-0015 (packfiles + reachability gc), ADR-0022/0036 (transports)

@@ -248,6 +248,23 @@ impl Repo {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&full, &bytes)?;
+                // A file the user deleted is recreated at 0644: lay the chosen
+                // side's recorded mode back so an executable stays one.
+                let triple = self.op_triple()?;
+                let chosen_snapshot = match side {
+                    ResolveSide::Ours => triple.ours,
+                    ResolveSide::Theirs => triple.theirs,
+                };
+                let partial = self.promisor()?.is_some();
+                let mode = {
+                    let store_arc = self.vfs.store();
+                    let mut store = store_arc.lock().unwrap();
+                    let snap = store.get_snapshot(&chosen_snapshot)?;
+                    tree_entry_at(&mut store, snap.root, path, partial)?.map(|(_, m, _)| m)
+                };
+                if let Some(mode) = mode {
+                    crate::worktree::apply_file_mode(&full, mode)?;
+                }
 
                 // P33 Task 8: a resolved PROTECTED path's plaintext is now
                 // sitting on disk exactly as the chosen side's ciphertext
@@ -261,12 +278,6 @@ impl Repo {
                 // paths never touch the cache — it exists only to skip
                 // re-sealing convergent-free randomized ciphertext.
                 if kind == ConflictKind::Protected {
-                    let triple = self.op_triple()?;
-                    let chosen_snapshot = match side {
-                        ResolveSide::Ours => triple.ours,
-                        ResolveSide::Theirs => triple.theirs,
-                    };
-                    let partial = self.promisor()?.is_some();
                     let store_arc = self.vfs.store();
                     let blob_id = {
                         let mut store = store_arc.lock().unwrap();

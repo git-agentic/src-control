@@ -43,7 +43,7 @@ impl PrivateCtx {
     /// The inner (plaintext-id) tip snapshot id. At branch creation this is
     /// the public base itself; after the first private commit it is a private
     /// inner id resolvable only through the index.
-    fn inner_tip(&self) -> Result<ObjectId> {
+    pub(crate) fn inner_tip(&self) -> Result<ObjectId> {
         self.index
             .inner_tip
             .ok_or_else(|| Error::BadRef("private branch manifest has no inner tip".into()))
@@ -183,7 +183,7 @@ impl Repo {
         }
     }
 
-    fn get_inner_snapshot(
+    pub(crate) fn get_inner_snapshot(
         &self,
         store: &mut Store,
         ctx: &PrivateCtx,
@@ -712,6 +712,30 @@ impl Repo {
             tracked.extend(d.keys().cloned());
         }
         let files = worktree::read_worktree(&self.layout, &tracked)?;
+        // A sidecar the stop wrote is working-tree scratch: it reaches neither
+        // the scanner nor the sealed tree, unless the merge's outcome tracks
+        // that name (then it is the user's own file).
+        let (files, sidecars) = if merge_head.is_some() {
+            let scratch = crate::conflict_plaintext::read_sidecars(&self.layout)?;
+            let source = decided.as_ref().unwrap_or(&prior);
+            let is_scratch = |p: &str| scratch.contains(p) && !source.contains_key(p);
+            (
+                files
+                    .into_iter()
+                    .filter(|(p, _, _)| !is_scratch(p))
+                    .collect(),
+                scratch,
+            )
+        } else {
+            (files, Default::default())
+        };
+        // Paths the stop wrote in plaintext. One now absent from disk was
+        // deleted by the user: it must not be carried back from the merge.
+        let conflict_plaintext = if merge_head.is_some() {
+            crate::conflict_plaintext::read(&self.layout)?
+        } else {
+            Default::default()
+        };
 
         // Scanner gate on the plaintext partition (protected-prefix files are
         // sealed at publish, exempt here exactly as in a public commit).
@@ -765,7 +789,10 @@ impl Repo {
         // recorded: a decided tree cannot sit in unsealed `.sc/` state.
         let source = decided.as_ref().unwrap_or(&prior);
         for (path, e) in source {
-            if entries.contains_key(path) || disk_paths.contains(path) {
+            if entries.contains_key(path)
+                || disk_paths.contains(path)
+                || conflict_plaintext.contains(path)
+            {
                 continue;
             }
             if !sparse.matches(path) || e.2 & PROTECTED != 0 {
@@ -795,6 +822,7 @@ impl Repo {
             Some(mh) => vec![inner_tip, mh],
         };
         let mut index = ctx.index.clone();
+        let committed_paths: BTreeSet<String> = entries.keys().cloned().collect();
         let new_tip = self.seal_commit(
             &mut store, &ctx, &mut index, &carried, entries, new_blobs, parents, secrets,
             protection, author, message,
@@ -813,6 +841,12 @@ impl Repo {
         };
         let new_mid = store.put(Object::Manifest(new_manifest))?;
         drop(store);
+        // The sidecars were left out of the sealed tree; remove them before
+        // the ref moves, or the next commit would take them. A failure here
+        // fails this commit with nothing moved and the record intact.
+        if !sidecars.is_empty() {
+            self.remove_conflict_sidecars_unless(&mut |p| committed_paths.contains(p))?;
+        }
         refs::write_branch_tip(&self.layout, &branch, &new_mid)?;
         crate::merge_state::clear(&self.layout)?;
         let label = if merge_head.is_some() {
@@ -829,6 +863,51 @@ impl Repo {
             &[(branch.clone(), Some(ctx.manifest_id), Some(new_mid))],
         )?;
         Ok(new_tip)
+    }
+
+    /// Abandon a stopped merge into the private branch at HEAD: put the
+    /// private tip back on disk and clear the merge state. The ref never moved
+    /// during the stop and nothing was stored outside the sealed manifest, so
+    /// only the checkout needs restoring. It needs the identity (the tip is a
+    /// manifest); a caller who cannot open the branch is refused before any
+    /// write, leaving the stop intact for someone who can.
+    pub(crate) fn merge_abort_private(&self, identity: Option<&SecretKey>) -> Result<Vec<String>> {
+        let (branch, mid, manifest) = self
+            .head_private()?
+            .ok_or_else(|| Error::NotPrivateBranch("HEAD".into()))?;
+        let ctx = self.open_private(&branch, mid, manifest, identity)?;
+        let sk = identity.expect("open_private succeeded");
+        let theirs_id = crate::merge_state::read_merge_head(&self.layout)?
+            .expect("in_progress is true but MERGE_HEAD is absent");
+        let sparse = self.sparse_spec()?;
+
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        let inner_tip = ctx.inner_tip()?;
+        let ours = self.get_inner_snapshot(&mut store, &ctx, &inner_tip)?;
+        let theirs = store.get_snapshot(&theirs_id)?;
+        let prior = self.inner_tree_files(&mut store, &ctx, ours.root)?;
+        // The stop wrote files from ours and from theirs, in view only; theirs'
+        // adds are not in the restored tree, so the removal pass must know
+        // them (as the public abort does by passing theirs' root).
+        let mut written: BTreeSet<String> = prior.keys().cloned().collect();
+        written
+            .extend(worktree::tree_file_entries_with_perms(&mut store, theirs.root)?.into_keys());
+        written.retain(|p| sparse.matches(p));
+        let skipped = self.materialize_private(
+            "merge --abort",
+            &mut store,
+            &ctx,
+            ours.root,
+            &written,
+            &ours.protection,
+            sk,
+        )?;
+        drop(store);
+        // After the restore, so a failed restore leaves the sidecars to retry.
+        self.remove_conflict_sidecars_unless(&mut |p| prior.contains_key(p))?;
+        crate::merge_state::clear(&self.layout)?;
+        Ok(skipped)
     }
 
     /// Build inner trees + snapshot from a decided file map, seal everything
@@ -1400,6 +1479,26 @@ impl Repo {
                 plaintext.insert(&f.path, None);
             }
             drop(store);
+            // A sidecar lands beside its conflicted file and is removed again
+            // at completion or abort, so it must not stand on a file either
+            // side tracks or on one the user owns (the public stop's rule).
+            let merged_paths: BTreeSet<String> = fm.files.iter().map(|f| f.path.clone()).collect();
+            for (name, _) in &fm.sidecars {
+                if prior_paths.contains(name) || merged_paths.contains(name) {
+                    return Err(Error::InvalidArgument(format!(
+                        "merge has conflicts, and its sidecar {name} would overwrite a tracked \
+                         file; rename or remove that file, then retry"
+                    )));
+                }
+                let full = worktree::safe_join(&self.layout.root, name)?;
+                if full.symlink_metadata().is_ok() {
+                    return Err(Error::InvalidArgument(format!(
+                        "merge has conflicts, and writing {name} would overwrite an untracked \
+                         or ignored file or directory (possibly a sidecar left by an earlier \
+                         stop); move it away, then retry"
+                    )));
+                }
+            }
             // Removals first: a failed one must fail the stop before any
             // other write, or completion would commit the stale plaintext.
             for (path, pt) in &plaintext {
@@ -1412,6 +1511,29 @@ impl Repo {
                     }
                 }
             }
+            // Record what is about to land on disk in plaintext, and the
+            // sidecars, before writing it: completion and abort need both
+            // (see `conflict_plaintext`). Nothing here is sealed, and it names
+            // only paths the checkout already holds.
+            crate::conflict_plaintext::write(
+                &self.layout,
+                &fm.files
+                    .iter()
+                    .filter(|f| {
+                        sparse.matches(&f.path)
+                            && (f.needs_encrypt
+                                || matches!(plaintext.get(f.path.as_str()), Some(Some(_))))
+                    })
+                    .map(|f| f.path.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            crate::conflict_plaintext::write_sidecars(
+                &self.layout,
+                &fm.sidecars
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             for f in fm.files.iter().filter(|f| sparse.matches(&f.path)) {
                 let full = worktree::safe_join(&self.layout.root, &f.path)?;
                 if matches!(plaintext.get(f.path.as_str()), Some(None)) {

@@ -140,8 +140,9 @@ fn tracked_under(tracked: &BTreeSet<String>, dir: &str) -> bool {
 /// the one place checkout-style writes go through so `read_worktree` (which
 /// reads the mode back from the filesystem) round-trips. EXEC adds an execute
 /// bit wherever the file already has a read bit (the umask-respecting default
-/// stays); FILE clears any execute bits an existing file had. A no-op off unix;
-/// a filesystem that refuses the chmod (no mode bits) is not an error.
+/// stays); FILE clears any execute bits an existing file had; setuid/setgid/
+/// sticky are always cleared. A no-op off unix; a filesystem that refuses the
+/// chmod (no mode bits) is not an error (see [`scl_vfs::apply_file_mode`]).
 pub(crate) fn write_file(path: &Path, bytes: &[u8], mode: FileMode) -> std::io::Result<()> {
     std::fs::write(path, bytes)?;
     apply_file_mode(path, mode)
@@ -149,32 +150,7 @@ pub(crate) fn write_file(path: &Path, bytes: &[u8], mode: FileMode) -> std::io::
 
 /// The mode half of [`write_file`], for a caller that wrote the bytes itself
 /// (the stopped-op widen writes atomically).
-pub(crate) fn apply_file_mode(path: &Path, mode: FileMode) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let cur = std::fs::metadata(path)?.permissions().mode();
-        let want = if mode.0 & 0o111 != 0 {
-            cur | ((cur & 0o444) >> 2)
-        } else {
-            cur & !0o111
-        };
-        if want != cur {
-            match std::fs::set_permissions(path, std::fs::Permissions::from_mode(want)) {
-                Err(e)
-                    if e.kind() != std::io::ErrorKind::Unsupported
-                        && e.kind() != std::io::ErrorKind::PermissionDenied =>
-                {
-                    return Err(e)
-                }
-                _ => {}
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    Ok(())
-}
+pub(crate) use scl_vfs::apply_file_mode;
 
 #[cfg(unix)]
 fn file_mode(path: &Path) -> FileMode {
@@ -1526,5 +1502,29 @@ mod tests {
         assert!(!listed.contains(&"a/skip.tmp".to_string()));
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    /// setuid/setgid/sticky never survive a write (git recreates files and
+    /// carries none over): a pre-existing 02644 file must not become 02755.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_clears_special_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("scl-repo-wt-special-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        for (want, expect) in [(FileMode::EXEC, 0o755), (FileMode::FILE, 0o644)] {
+            std::fs::write(&f, b"x").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o2644)).unwrap();
+            if mode(&f) & 0o2000 == 0 {
+                continue; // filesystem drops the bit: nothing to test
+            }
+            write_file(&f, b"y", want).unwrap();
+            assert_eq!(mode(&f), expect);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
     }
 }

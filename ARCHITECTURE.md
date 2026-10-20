@@ -356,7 +356,8 @@ phases but the shape is stable:
   `PICK_HEAD`, `REBASE_STATE`, and their `*_DECIDED_ROOT` records, plus
   `CONFLICT_PLAINTEXT` / `CONFLICT_SIDECARS` listing what a stopped operation
   wrote into the working tree — an interrupted merge/pick/rebase resumes or
-  aborts cleanly from these.
+  aborts cleanly from these. `sparse-widen` records the files a widening
+  `sparse set` is laying out while an operation is stopped (P24, #224).
 - The `sc+https://` client's pin file is user-level, not part of `.sc/`
   (`$SC_HTTPS_KNOWN_HOSTS`, else `$XDG_CONFIG_HOME/sc/known_hosts`, else
   `~/.config/sc/known_hosts`; managed with `sc tls`).
@@ -369,6 +370,13 @@ branch ref. `switch` materializes the target branch tip into the working tree,
 removing tracked files that are absent from the target, and refuses the
 operation if tracked files are modified or deleted (to prevent data loss). New,
 untracked files are left in place. `status` diffs the working tree against HEAD.
+The write-out paths (switch, merge, rebase, `sparse set`, clone, `ws fork`,
+private and conflict write-outs) apply the recorded file mode through one
+helper (`scl_vfs::apply_file_mode`, also used by `Worktree::checkout`), so an
+executable file stays executable on unix, a stale execute bit is cleared on a
+plain file, and setuid/setgid/sticky are always cleared (#242, #243). `sc
+resolve` applies the chosen side's mode after rewriting a deleted conflicted
+file. A chmod the filesystem refuses is tolerated with a one-time warning.
 
 ### Mode-scoped disk invariant
 
@@ -845,7 +853,10 @@ workspace's never-materialized paths as deletions.
 
 A clean merge/pick/rebase change to an out-of-sparse path lands in the CAS
 without materializing; a CONFLICT there refuses up front with a "run `sc
-sparse set` to include it" hint. Sparse is CHECKOUT-only — every object
+sparse set` to include it" hint. While the operation is stopped, `sparse set`
+accepts only a strict widen (the new spec covers the old one): it lays out the
+newly in-view files from the stop's decided root, leaves protected ones absent,
+and the interrupted write is journaled in `.sc/sparse-widen` (#224). Sparse is CHECKOUT-only — every object
 stays in the CAS regardless of the spec, so `sc gc`'s reachability walk is
 unaffected; not fetching out-of-prefix objects at all is deferred to P27.
 See ADR-0034.
@@ -1004,6 +1015,11 @@ opening, connection-fatal on trip since a mid-stream abort desyncs the frame
 stream), and `--max-pack-size` (default 16 GiB, floor = the max object
 size, 256 MiB by default; lives in the shared `WirePolicy`, so it applies to both
 `--http` and `--stdio`; a counted mid-stream abort replies `EC_TOO_LARGE`).
+Later additions to the same policy: `--max-object-size` (operator-configurable
+per-object cap, #213) and `--max-conn-bytes`, a per-connection write budget on
+both transports that counts every `PutObject` and each `PutPack`'s larger of
+spool and decoded bytes, replies `ConnectionBudgetExceeded` and closes (#233,
+no `PROTOCOL_VERSION` change; see the ADR-0039 additions).
 
 The read-only pre-drain is capped at 8 MiB (`RO_DRAIN_CAP`), and the accept
 loop gained a hardcoded Go-`net/http`-shaped exponential backoff around fd
