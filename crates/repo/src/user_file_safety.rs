@@ -305,10 +305,10 @@ fn abort_never_writes_through_a_symlink_where_a_directory_must_be() {
     finish(&root, repo);
 }
 
-#[test]
-fn abort_removes_a_protected_file_the_stop_decrypted_and_recorded() {
+/// A merge stopped with a protected `secret/new.txt` of theirs decrypted onto disk.
+fn stopped_with_a_decrypted_file(tag: &str) -> (PathBuf, Repo) {
     let (sk, pk) = scl_crypto::generate_keypair();
-    let root = root_for("protected", Op::Merge);
+    let root = root_for(tag, Op::Merge);
     let repo = Repo::init(&root).unwrap();
     repo.protect("secret/", &[pk], None).unwrap();
     put(&root, "x.txt", b"a\nb\nc\n");
@@ -327,9 +327,32 @@ fn abort_removes_a_protected_file_the_stop_decrypted_and_recorded() {
     assert!(crate::conflict_plaintext::read(repo.layout())
         .unwrap()
         .contains("secret/new.txt"));
+    (root, repo)
+}
+
+#[test]
+fn abort_removes_a_protected_file_the_stop_decrypted_and_recorded() {
+    let (root, repo) = stopped_with_a_decrypted_file("protected");
     let report = repo.merge_abort().unwrap();
     assert!(!root.join("secret/new.txt").exists(), "plaintext survived");
     assert!(report.kept.is_empty(), "{report:?}");
+    finish(&root, repo);
+}
+
+#[cfg(unix)]
+#[test]
+fn abort_keeps_a_symlink_at_a_recorded_protected_path() {
+    let (root, repo) = stopped_with_a_decrypted_file("protected-symlink");
+    std::fs::remove_file(root.join("secret/new.txt")).unwrap();
+    std::fs::write(root.join("elsewhere"), b"x\n").unwrap();
+    std::os::unix::fs::symlink("elsewhere", root.join("secret/new.txt")).unwrap();
+    let report = repo.merge_abort().unwrap();
+    assert!(root
+        .join("secret/new.txt")
+        .symlink_metadata()
+        .unwrap()
+        .is_symlink());
+    assert_eq!(report.kept, vec!["secret/new.txt".to_string()]);
     finish(&root, repo);
 }
 

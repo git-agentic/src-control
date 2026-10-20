@@ -2001,6 +2001,7 @@ impl Repo {
             // A carried protected file the identity could read is now on disk
             // in plaintext, though no tree records that: abort may delete it
             // only because it is recorded (#255), like the private stop.
+            let skipped: std::collections::HashSet<&String> = skipped.iter().collect();
             decrypted = worktree::tree_file_entries_with_perms_sparse(
                 &mut store,
                 conflict_root,
@@ -2064,7 +2065,12 @@ impl Repo {
                 Ok(Some((_, _, perms))) => perms & scl_core::PROTECTED != 0,
                 Err(_) => false,
             };
-            if remove {
+            // A regular file only: the stop wrote one, so a symlink there is
+            // the user's (a restore reports it as kept).
+            let is_file = worktree::safe_join(&self.layout.root, &path)?
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_file());
+            if remove && is_file {
                 // Only an already-absent file is fine: any other failure must
                 // stop the abort before its state is cleared, or the decrypted
                 // text stays on disk with nothing left to retry.
