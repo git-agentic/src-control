@@ -1354,8 +1354,11 @@ impl Repo {
                     continue;
                 }
                 let full = worktree::safe_join(&self.layout.root, &f.path)?;
-                let on_disk = match std::fs::read(&full) {
-                    Ok(b) => Some(b),
+                // A symlink (even one whose target reads as the old bytes)
+                // is the user's file, never the checkout's copy.
+                let on_disk = match std::fs::symlink_metadata(&full) {
+                    Ok(m) if m.file_type().is_file() => Some(Some(std::fs::read(&full)?)),
+                    Ok(_) => Some(None),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(e) => return Err(e.into()),
                 };
@@ -1371,7 +1374,7 @@ impl Repo {
                                 sk,
                                 &f.path,
                             )
-                            .map(|pt| pt.as_slice() == disk.as_slice())
+                            .map(|pt| Some(pt.as_slice()) == disk.as_deref())
                             .unwrap_or(false)
                         }
                         _ => false,
@@ -2768,6 +2771,34 @@ mod tests {
                 "nothing else was written"
             );
         }
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// A symlink at an unreadable protected path is the user's file even when
+    /// its target reads as the old plaintext: the stop refuses, leaves it.
+    #[cfg(unix)]
+    #[test]
+    fn private_stop_refuses_a_symlink_at_an_unreadable_protected_path() {
+        let (root, repo, alice_sk) = revoked_addition_setup("protsymlink");
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        write(&root, "vault/key.pem", "PEM-V2\n");
+        repo.commit("tester", "rotate key").unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        // Tracked vault/key.pem replaced by a link whose target reads "PEM-V1".
+        write(&root, "elsewhere.txt", "PEM-V1\n");
+        std::fs::remove_file(root.join("vault/key.pem")).unwrap();
+        std::os::unix::fs::symlink("../elsewhere.txt", root.join("vault/key.pem")).unwrap();
+        let err = repo
+            .merge_into_private("main", "alice", Some(&alice_sk))
+            .unwrap_err();
+        assert!(err.to_string().contains("vault/key.pem"), "{err}");
+        assert!(std::fs::symlink_metadata(root.join("vault/key.pem"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!crate::merge_state::in_progress(repo.layout()));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
