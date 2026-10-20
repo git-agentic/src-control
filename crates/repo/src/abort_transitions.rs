@@ -402,3 +402,23 @@ fn private_switch_crosses_a_directory_to_file_transition() {
     assert_shape(&root, Shape::File);
     finish(&root, repo);
 }
+
+/// Adopting a branch into an unborn one has no old tree and no untracked
+/// guard: an empty directory of the user's where a file must go is kept, and
+/// the merge fails rather than deleting it.
+#[test]
+fn unborn_adoption_keeps_an_empty_directory_where_a_file_must_go() {
+    let src = tmp_root("unborn-src");
+    let origin = Repo::init(&src).unwrap();
+    std::fs::write(src.join("x"), b"file\n").unwrap();
+    origin.commit("me", "base").unwrap();
+    let dst = tmp_root("unborn-dst");
+    let repo = Repo::init(&dst).unwrap();
+    repo.remote_add("origin", src.to_str().unwrap()).unwrap();
+    repo.fetch("origin").unwrap();
+    std::fs::create_dir(dst.join("x")).unwrap();
+    assert!(repo.merge("origin/main", "me").is_err());
+    assert!(dst.join("x").is_dir(), "the user's directory must survive");
+    finish(&dst, repo);
+    finish(&src, origin);
+}

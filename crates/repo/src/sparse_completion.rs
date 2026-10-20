@@ -308,3 +308,227 @@ fn a_completion_keeps_the_other_sides_protected_deletion() {
         assert_eq!(s["src/a.txt"], b"a\nFEAT\nc\n");
     }
 }
+
+/// Set up `op` of `feature` against `main` under sparse `src/` (both touch
+/// `src/a.txt`, so it stops) where the other side adds `docs/new.txt`, outside
+/// the view: `feature` for a merge or pick, `main` for a rebase (which replays
+/// `feature` onto it). The caller gets the repo before the operation starts.
+fn collision_setup(tag: &str, op: Op) -> (std::path::PathBuf, Repo) {
+    let root =
+        std::env::temp_dir().join(format!("scl-sparse-collision-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let repo = Repo::init(&root).unwrap();
+    apply(&root, &[BASE_A, Edit::Write("docs/keep.txt", b"keep\n")]);
+    repo.commit("me", "base").unwrap();
+    repo.branch("feature").unwrap();
+    let added = || Edit::Write("docs/new.txt", b"theirs\n");
+    let rebase = matches!(op, Op::Rebase);
+    apply(&root, &[MAIN_A]);
+    if rebase {
+        apply(&root, &[added()]);
+    }
+    repo.commit("me", "main").unwrap();
+    repo.switch("feature").unwrap();
+    apply(&root, &[FEAT_A]);
+    if !rebase {
+        apply(&root, &[added()]);
+    }
+    repo.commit("me", "feature").unwrap();
+    repo.set_sparse(&["src/".into()], None).unwrap();
+    if !matches!(op, Op::Rebase) {
+        repo.switch("main").unwrap();
+    }
+    (root, repo)
+}
+
+/// Start `op`: it stops on `src/a.txt` (an `Err`), or is refused.
+fn start(repo: &Repo, op: Op) -> crate::error::Result<()> {
+    match op {
+        Op::Merge => repo.merge_with_identity("feature", "me", None).map(drop),
+        Op::Pick => repo.cherry_pick("feature", "me", None, None).map(drop),
+        Op::Rebase => match repo.rebase("main", "me", None)? {
+            crate::replay::RebaseResult::Stopped { .. } => {
+                Err(crate::error::Error::MergeConflicts(1))
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+fn in_progress(repo: &Repo) -> bool {
+    crate::merge_state::in_progress(repo.layout())
+        || crate::pick_state::in_progress(repo.layout())
+        || crate::rebase_state::in_progress(repo.layout())
+}
+
+#[test]
+fn a_stop_refuses_an_untracked_file_where_the_other_side_adds_one_out_of_view() {
+    for op in ops() {
+        let (root, repo) = collision_setup(&tag(op, "collide"), op);
+        let mine = root.join("docs/new.txt");
+        std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        std::fs::write(&mine, b"MINE\n").unwrap();
+        let before = std::fs::read(root.join("src/a.txt")).unwrap();
+
+        let err = start(&repo, op).unwrap_err().to_string();
+        assert!(err.contains("docs/new.txt"), "{op:?}: {err}");
+        assert!(err.contains("move it away"), "{op:?}: {err}");
+        assert!(!in_progress(&repo), "{op:?}: refusal left state behind");
+        assert_eq!(std::fs::read(&mine).unwrap(), b"MINE\n", "{op:?}");
+        assert_eq!(
+            std::fs::read(root.join("src/a.txt")).unwrap(),
+            before,
+            "{op:?}: nothing written"
+        );
+
+        // Move it away and retry: the other side's file lands, as without sparse.
+        std::fs::remove_file(&mine).unwrap();
+        start(&repo, op).unwrap_err();
+        assert!(in_progress(&repo), "{op:?}: the retry must stop");
+        repo.resolve_path("src/a.txt", ResolveSide::Theirs, None)
+            .unwrap();
+        match op {
+            Op::Rebase => drop(repo.rebase_continue("me", None).unwrap()),
+            _ => drop(repo.commit("me", "complete").unwrap()),
+        }
+        let tip = repo.head_tip().unwrap().unwrap();
+        let store_arc = repo.vfs().store();
+        let mut s = store_arc.lock().unwrap();
+        let tree = s.get_snapshot(&tip).unwrap().root;
+        let files = worktree::tree_file_entries_with_perms(&mut s, tree).unwrap();
+        let id = files["docs/new.txt"].0;
+        assert!(
+            matches!(s.get(&id).unwrap(), Object::Blob(b) if &b[..] == b"theirs\n"),
+            "{op:?}: the addition lands"
+        );
+        drop(s);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "temp repo must be removed");
+    }
+}
+
+/// Any directory where the other side adds an out-of-view file is the user's,
+/// empty or not: `stop_write_blocker` accepts a directory of tracked files
+/// (#247), but nothing out of view is laid out, so none is tracked here.
+#[test]
+fn a_stop_refuses_any_directory_where_the_other_side_adds_a_file_out_of_view() {
+    for op in ops() {
+        for with_file in [false, true] {
+            let (root, repo) = collision_setup(&tag(op, &format!("dir-{with_file}")), op);
+            let dir = root.join("docs/new.txt");
+            std::fs::create_dir_all(&dir).unwrap();
+            if with_file {
+                std::fs::write(dir.join("mine"), b"MINE\n").unwrap();
+            }
+            let err = start(&repo, op).unwrap_err().to_string();
+            assert!(err.contains("docs/new.txt"), "{op:?}: {err}");
+            assert!(!in_progress(&repo), "{op:?}: refusal left state behind");
+            assert!(dir.is_dir(), "{op:?}: the directory is untouched");
+            drop(repo);
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(!root.exists(), "temp repo must be removed");
+        }
+    }
+}
+
+/// A file standing where the other side needs a parent directory out of view.
+#[test]
+fn a_stop_refuses_an_untracked_file_where_an_out_of_view_directory_must_be() {
+    for op in ops() {
+        let (root, repo) = collision_setup(&tag(op, "parent"), op);
+        // The user's `docs` is a file where `docs/new.txt` needs a directory.
+        std::fs::remove_dir_all(root.join("docs")).ok();
+        std::fs::write(root.join("docs"), b"MINE\n").unwrap();
+        let err = start(&repo, op).unwrap_err().to_string();
+        assert!(err.contains("docs/new.txt"), "{op:?}: {err}");
+        assert!(!in_progress(&repo), "{op:?}");
+        assert_eq!(std::fs::read(root.join("docs")).unwrap(), b"MINE\n");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "temp repo must be removed");
+    }
+}
+
+/// An unrelated untracked file out of view is not in the way, and an abort
+/// leaves it alone.
+#[test]
+fn a_stop_and_abort_leave_an_unrelated_out_of_view_file() {
+    for op in ops() {
+        let (root, repo) = collision_setup(&tag(op, "abort"), op);
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/mine.txt"), b"MINE\n").unwrap();
+        start(&repo, op).unwrap_err();
+        assert!(in_progress(&repo), "{op:?}: it stops");
+        match op {
+            Op::Merge => drop(repo.merge_abort().unwrap()),
+            Op::Pick => drop(repo.cherry_pick_abort().unwrap()),
+            Op::Rebase => drop(repo.rebase_abort().unwrap()),
+        }
+        assert_eq!(
+            std::fs::read(root.join("docs/mine.txt")).unwrap(),
+            b"MINE\n",
+            "{op:?}"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "temp repo must be removed");
+    }
+}
+
+/// The same collision on operations that never stop: the result is exact, but
+/// the next commit would read the user's file in its place.
+#[test]
+fn a_clean_operation_refuses_an_untracked_file_where_it_adds_one_out_of_view() {
+    // (name, `main` also moves, then the operation)
+    type Run = fn(&Repo) -> crate::error::Result<()>;
+    let ops: [(&str, bool, Run); 3] = [
+        ("merge", true, |r| {
+            r.merge_with_identity("feature", "me", None).map(drop)
+        }),
+        ("ff", false, |r| {
+            r.merge_with_identity("feature", "me", None).map(drop)
+        }),
+        ("switch", false, |r| r.switch("feature").map(drop)),
+    ];
+    for (name, main_moves, run) in ops {
+        let root =
+            std::env::temp_dir().join(format!("scl-sparse-clean-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = Repo::init(&root).unwrap();
+        apply(&root, &[BASE_A, Edit::Write("docs/keep.txt", b"keep\n")]);
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        if main_moves {
+            apply(&root, &[MAIN_A]);
+            repo.commit("me", "main").unwrap();
+        }
+        repo.switch("feature").unwrap();
+        apply(&root, &[Edit::Write("docs/new.txt", b"theirs\n")]);
+        repo.commit("me", "feature").unwrap();
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        repo.switch("main").unwrap();
+        apply(&root, &[Edit::Write("docs/new.txt", b"MINE\n")]);
+        let before = repo.head_tip().unwrap();
+
+        let err = run(&repo).unwrap_err().to_string();
+        assert!(
+            err.contains("docs/new.txt") && err.contains("move it away"),
+            "{name}: {err}"
+        );
+        assert_eq!(repo.head_tip().unwrap(), before, "{name}: no ref moved");
+        assert_eq!(std::fs::read(root.join("docs/new.txt")).unwrap(), b"MINE\n");
+
+        std::fs::remove_file(root.join("docs/new.txt")).unwrap();
+        run(&repo).unwrap();
+        assert!(
+            repo.status().unwrap().added.is_empty(),
+            "{name}: clean after"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "temp repo must be removed");
+    }
+}

@@ -2072,7 +2072,11 @@ impl Repo {
                 .collect()
             }
         };
-        self.refuse_untracked_overwrite_vs(op, &old, target_root)
+        self.refuse_untracked_overwrite_vs(op, &old, target_root)?;
+        match old_root {
+            Some(old) => self.refuse_untracked_out_of_view(op, old, target_root),
+            None => Ok(()),
+        }
     }
 
     /// Refuse, before any write, a forward operation (`op`) whose result would
@@ -2200,6 +2204,91 @@ impl Repo {
                          {rel}; move it away, then retry"
                     )))
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse, before any write, an operation (`op`) whose result adds a file
+    /// outside the sparse view at a path where the user already has an
+    /// untracked or ignored file or directory. Nothing is written there, but
+    /// a later commit (a stop's completion, or the next ordinary one) reads
+    /// the working tree, where a file wins over the tree, and would commit the
+    /// user's bytes instead of the addition, silently (#248). `old_root` is
+    /// the tree the working tree reflects, `target_root` the result. A path
+    /// `old_root` already tracks is not an addition, and is left to the
+    /// ordinary tracked-file rules.
+    pub(crate) fn refuse_untracked_out_of_view(
+        &self,
+        op: &str,
+        old_root: ObjectId,
+        target_root: ObjectId,
+    ) -> Result<()> {
+        let sparse = self.sparse_spec()?;
+        if sparse.is_full() {
+            return Ok(());
+        }
+        let partial = self.promisor()?.is_some();
+        let (old, target) = {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let mut paths = |root| -> Result<std::collections::BTreeSet<String>> {
+                // A partial clone lacks some subtrees: read what it holds.
+                Ok(if partial {
+                    worktree::tree_file_entries_with_perms_sparse_present(
+                        &mut store,
+                        root,
+                        &crate::Sparse::default(),
+                    )?
+                } else {
+                    worktree::tree_file_entries_with_perms(&mut store, root)?
+                }
+                .into_keys()
+                .collect())
+            };
+            (paths(old_root)?, paths(target_root)?)
+        };
+        self.refuse_untracked_out_of_view_paths(op, &sparse, &old, &target)
+    }
+
+    /// The path-list core of [`Repo::refuse_untracked_out_of_view`], for a
+    /// caller that already holds both trees' file paths (a private branch's
+    /// decrypted trees).
+    pub(crate) fn refuse_untracked_out_of_view_paths(
+        &self,
+        op: &str,
+        sparse: &crate::Sparse,
+        old: &std::collections::BTreeSet<String>,
+        target: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        // `rel` is not in `old`, and a tree holds no file at an ancestor of
+        // another of its paths, so nothing on the way is a tracked file.
+        // Nothing outside the view is laid out, so no tracked file can be on
+        // disk there and any directory at `rel` is the user's. `stop_write_blocker`
+        // accepts a directory of tracked files (#247), so refuse one here first.
+        // Only a case alias of a path `old` laid out, so inside the view (a
+        // case-only rename on a case-insensitive filesystem), is the tracked
+        // file; an out-of-view old path was never on disk.
+        let root = &self.layout.root;
+        let laid_out = std::cell::OnceCell::new();
+        let mut is_tracked = |p: &str| {
+            let laid_out: &std::collections::BTreeSet<String> = laid_out
+                .get_or_init(|| old.iter().filter(|o| sparse.matches(o)).cloned().collect());
+            is_tracked_case_alias(root, laid_out, p)
+        };
+        for rel in target
+            .iter()
+            .filter(|p| !sparse.matches(p) && !old.contains(*p))
+        {
+            let is_dir = worktree::safe_join(&self.layout.root, rel)?
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_dir());
+            if is_dir || stop_write_blocker(&self.layout.root, rel, &mut is_tracked)?.is_some() {
+                return Err(Error::InvalidArgument(format!(
+                    "{op} would add {rel} (outside your sparse checkout), where an untracked or \
+                     ignored file or directory already stands; a later commit would take that \
+                     instead of the addition; move it away, then retry"
+                )));
             }
         }
         Ok(())
@@ -2536,6 +2625,26 @@ impl Repo {
         // before the first stale file is removed or written (ADR-0048).
         self.ensure_view(target_root, &self.sparse_spec()?)?;
         self.refuse_untracked_overwrite_vs("switch", &old_paths, target_root)?;
+        match old_root {
+            Some(old) => self.refuse_untracked_out_of_view("switch", old, target_root)?,
+            // Leaving a private branch: `old_paths` is its full inner tree
+            // (partial clones refuse private branches).
+            None => {
+                let target: std::collections::BTreeSet<String> = {
+                    let store_arc = self.vfs.store();
+                    let mut store = store_arc.lock().unwrap();
+                    worktree::tree_file_entries_with_perms(&mut store, target_root)?
+                        .into_keys()
+                        .collect()
+                };
+                self.refuse_untracked_out_of_view_paths(
+                    "switch",
+                    &self.sparse_spec()?,
+                    &old_paths,
+                    &target,
+                )?;
+            }
+        }
         if head_priv.is_some() {
             // Remove private-tip paths the public target doesn't track,
             // BEFORE materialize lays the target down.
