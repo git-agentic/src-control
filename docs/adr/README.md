@@ -65,6 +65,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0052](0052-secret-injection-by-fd.md) | Secret injection by file descriptor (`sc run --secrets-fd`) | Accepted (built) | — |
 | [0053](0053-tls-pin-management.md) | TLS pin management (`sc tls`) | Accepted (built) | — |
 | [0054](0054-tls-ca-validation.md) | CA-path validation for `sc+https://` | Accepted (built) | — |
+| [0055](0055-blob-size-clone-filter.md) | Blob-size clone filter (`--filter blob:limit=<size>`) | Accepted (built) | 27 |
 | [0056](0056-named-concurrent-ws-sessions.md) | Named and concurrent `sc ws` sessions | Accepted (built; refresh designed, deferred) | 20 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are

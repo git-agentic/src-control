@@ -142,7 +142,7 @@ the code, those win.
 | P24 | Sparse checkouts: `.sc/sparse` local prefix spec; checkout-only (CAS keeps everything) | [0034](docs/adr/0034-sparse-checkouts.md) |
 | P25 | Streaming pack transfer: bounded RAM on both sides, `ST_PACK_CHUNK` frames (`SC_PACK_CHUNK` tunes), two-pass atomic-after-verify ingest | [0035](docs/adr/0035-streaming-transfer.md) |
 | P26 | `sc+http://` transport: `sc serve --http`, thread-per-connection, status-line-before-handshake opening | [0036](docs/adr/0036-http-transport.md) |
-| P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3 | [0037](docs/adr/0037-partial-clone.md) |
+| P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3. Blob-size filter (#217): `--filter blob:limit=<size>` (combinable with prefixes; `blob:` is reserved) leaves out blobs of at least that size unless a ref tip reaches them, evaluated by the server (`GetPack.blob_limit`, wire v6); the gap is absence as in ADR-0048, `sc backfill <path>` or a lazy fill repairs it, `.sc/promisor-blob-limit` records limit and scope | [0037](docs/adr/0037-partial-clone.md), [0055](docs/adr/0055-blob-size-clone-filter.md) |
 | P28 | Security hardening: a max object size (default 256 MiB; `--max-object-size` / `SC_MAX_OBJECT_SIZE`, 2 MiB to 1 GiB) caps every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | P29 | `sc serve --http` access control: bearer tokens (`sc serve token add [--expires]`/`rotate`/`remove`/`list`; an expired token gets the same 401 as an unknown one), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
 | P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex; retained signed tombstones ride a transfer when their snapshot is in it or was collected by the sender, only verifying signatures are indexed, and held-but-untrusted tombstones are re-judged from `.sc/transcript-pending` when the trusted-signer set changes (#230) | [0038](docs/adr/0038-agent-session-transcripts.md) |
@@ -163,8 +163,11 @@ Cross-cutting current facts that bite. Security boundaries are consolidated in
 `docs/THREAT-MODEL.md` — read it before touching anything crypto- or
 transport-adjacent. The rest, imperatively:
 
-- **Wire protocol is version 5** (bumped from 4 in P37 for the additive
-  `GetObjects` verb; 3 to 4 in P34 for the sealed-branch object kinds). The max object size (`scl_core::max_object_size()`, default 256 MiB;
+- **Wire protocol is version 6** (bumped from 5 in #217 for `GetPack.blob_limit`,
+  ADR-0055; 4 to 5 in P37 for the additive `GetObjects` verb; 3 to 4 in P34 for
+  the sealed-branch object kinds). Servers and clients upgrade together: every
+  mixed pair fails closed at the handshake, ssh remotes included (they run the
+  remote host's own `sc` binary). The max object size (`scl_core::max_object_size()`, default 256 MiB;
   `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE` set it, range 2 MiB to
   1 GiB, out of range aborts startup, ADR-0039 addendum) guards the
   transfer path only — a larger blob commits locally but fails every
@@ -184,7 +187,7 @@ transport-adjacent. The rest, imperatively:
   identity material. Opening a repository can write the derived transcript-drop
   indexes (`.sc/transcript-drops`, `.sc/transcript-pending`) when the trusted
   signer set changed; no key material is involved (#230).
-- **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (and, on a non-lazy clone, one outside the filter), `sc rewrap`,
+- **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (and `sparse disable`; both are allowed on a size-only `AllPaths` clone, ADR-0055), on a non-lazy clone a `sparse set` outside the filter, `sc rewrap`,
   `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view (a `.theirs` sidecar sits beside its conflicted path, so it is in view whenever that path is; ADR-0049) (no ref, state or working-tree change; on every clone, a conflict stop that needs sealing outside the view is refused the same way), `sc push` to a git remote, and
   `sc fetch` from any native remote but the promisor origin.** `sc merge`, `sc cherry-pick` and `sc rebase` work, including conflicts inside the view (P37c). `sc ws` and `sc work` work too (ADR-0050): workspaces and agents see the clone's view only, and harvest lands through the same merge. `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what
@@ -193,6 +196,13 @@ transport-adjacent. The rest, imperatively:
   or `sparse set` fetches what its view needs by id first; on a non-lazy or
   offline clone it fails with `GapInView` (nothing changed) and names the
   `sc backfill <prefix>` that repairs it.
+  A `--filter blob:limit=<size>` clone (ADR-0055) is partial too: a blob of at
+  least that size is left out unless a ref tip reaches it, tips are complete at
+  clone time only, a later fetch can bring one that points at a gapped blob, and
+  with a limit the gap errors name the file's own path (`GapBySize`, or
+  `GapInView` with the limit as a cause). A size-only clone has an `AllPaths`
+  scope and a full sparse view, and a lazy one still fills on switch, undo, merge
+  and replay. `sc fetch` is not limit-aware, and the object-count limit is deferred.
 - **Bucket remotes hold public content plaintext at rest** — bucket ACL is
   the perimeter (sealed content stays ciphertext, unchanged); partial-clone
   `filter` against bucket remotes is refused.
@@ -313,7 +323,7 @@ transport-adjacent. The rest, imperatively:
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here); entries that name an issue mirror the open
 GitHub issues. Standing entries: `sc ws` workspace refresh (#215),
-blob-size clone filters (#217), bucket compaction and gc (#216), the non-unix
+a limit-aware `sc fetch` and an object-count clone limit (#217 remainder), bucket compaction and gc (#216), the non-unix
 `.sc/local-key` ACL (#214), and the open
 sparse, private-branch and abort edge cases (#241, #246, #247, #248).
 

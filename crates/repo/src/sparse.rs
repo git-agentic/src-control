@@ -337,13 +337,16 @@ impl Repo {
         // tree) — so a refused widen leaves nothing partially written.
         if let Some(promisor) = self.promisor()? {
             // No prefixes means a full checkout, which is what `sparse
-            // disable` is, and that is refused on a partial clone.
-            if prefixes.is_empty() {
+            // disable` is, and that is refused on a partial clone. A size-only
+            // clone (ADR-0055, `AllPaths`) is the exception: a full view is its
+            // starting state, so a narrowed view must be able to return to it.
+            // The view closure is filled (lazy) or refused (`GapInView`) below.
+            if prefixes.is_empty() && !promisor.is_all_paths() {
                 return Err(Error::InvalidArgument(format!(
                     "cannot set an empty sparse spec (a full checkout) on a partial clone: \
                      only [{}] was fetched; run `sc backfill --all` to convert to a full \
                      clone first, or name a prefix within it",
-                    promisor.prefixes().join(", ")
+                    promisor.describe()
                 )));
             }
             // A lazy clone may widen the view past its fetch filter: the
@@ -743,11 +746,16 @@ impl Repo {
         // the origin). Refuse up front, before any disk write, pointing at
         // backfill — same preflight discipline as `set_sparse` above.
         if let Some(promisor) = self.promisor()? {
+            // A size-only clone's scope is every path, so disabling sparse only
+            // restores its full view: the same operation as an empty spec.
+            if promisor.is_all_paths() {
+                return self.set_sparse(&[], identity);
+            }
             return Err(Error::InvalidArgument(format!(
                 "cannot disable sparse checkout (full materialization) on a partial clone: \
                  only [{}] was fetched; run `sc backfill --all` to convert to a full clone \
                  first, or `sc sparse set` to a prefix within it",
-                promisor.prefixes().join(", ")
+                promisor.describe()
             )));
         }
         let dirty = self.status()?;

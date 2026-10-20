@@ -382,6 +382,18 @@ cargo run --bin sc -- clone --filter <prefix…> <src> <dst>   # partial clone (
                                               # prefixes; writes .sc/promisor + .sc/sparse to
                                               # the same prefixes; not supported over a
                                               # git-bridge remote
+cargo run --bin sc -- clone --filter blob:limit=<size> [--filter <prefix…>] [--lazy] <src> <dst>
+                                              # blob-size partial clone (ADR-0055, #217):
+                                              # <size> is bytes or a KiB/MiB/GiB suffix; blobs of
+                                              # AT LEAST that size that no ref tip reaches are
+                                              # left out (old revisions of large files), every tip
+                                              # and the checkout stay complete; blob:limit=0 = no
+                                              # blobs beyond the tips. `blob:` is reserved in
+                                              # --filter (blob:none is an error), once only; a
+                                              # limit above 1 GiB is an error.
+                                              # Server-evaluated: wire v6, upgrade both sides.
+                                              # Repair: `sc backfill <file>`, a lazy fill, or
+                                              # `backfill --all`; fetch is not limit-aware
 cargo run --bin sc -- backfill <prefix…>      # widen a partial clone: fetch objects under
                                               # these prefixes from the promisor origin and
                                               # widen .sc/promisor; errors if this repo isn't
@@ -408,7 +420,10 @@ bash demo/run_lazy_fetch_demo.sh              # by-id fetch proof (P37a): cat of
                                               # exactly 3 objects (2 trees + blob), the sibling
                                               # stays unfetched, offline/non-lazy keep the gap
                                               # error, and a read-only sc+http server answers
-                                              # GetObjects (protocol v5)
+                                              # GetObjects
+bash demo/run_blob_limit_demo.sh              # blob-size filter proof (ADR-0055): old large
+                                              # blob left out, tip checkout whole, verify/gc/
+                                              # push fine, --lazy, prefix+limit, backfill repair
 bash demo/run_partial_clone_demo.sh           # partial clone proof (P27): sc clone --filter
                                               # src/ fetches fewer objects than a full clone
                                               # (object-store count + sc verify's gap report);

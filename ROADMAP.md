@@ -593,6 +593,16 @@ across every phase.
   carried even under a rule); conflicts inside the view are marked and
   resolved as on a full clone, conflicts outside it are refused before any
   write. (ADR-0049.)
+- **Phase 27 follow-on — Blob-size clone filter (#217).** `sc clone --filter
+  blob:limit=<size>` (combinable with prefix filters; `blob:` is reserved) leaves
+  out blobs of at least that size that no ref tip's root tree reaches, so old
+  revisions of large files stay on the server while every tip and the checkout
+  are complete. The server evaluates it (`GetPack.blob_limit`, `PROTOCOL_VERSION`
+  6; client and server upgrade together). The gap is absence (ADR-0048), recorded
+  by `.sc/promisor-blob-limit` with an explicit `AllPaths`/`Prefixes` scope; a lazy
+  clone fills by id (a full view included), and otherwise the gap error names the
+  file and `sc backfill <path>` repairs it. Proven by `demo/run_blob_limit_demo.sh`.
+  (ADR-0055.)
 - **Phase 37d — Agent sessions on a partial clone.** `sc ws` and `sc work` work
   on a partial clone: a workspace sees the host's sparse view, and harvest lands
   through the ADR-0049 merge. (ADR-0050.)
@@ -666,6 +676,7 @@ under Deferred below.
 | **P37a — Want-by-id fetch (`sc cat`)** | Read outside a partial clone's filter without backfilling everything | `sc clone --filter src/ --lazy`; `sc cat main:docs/api/guide.bin` fetches exactly the absent trees and the blob by object id (`GetObjects`, wire v5), sibling untouched; `SC_OFFLINE=1` and non-lazy clones keep the gap error; proven by `demo/run_lazy_fetch_demo.sh` | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
 | **P37b — Presence-based partial clones** | Make push, verify, gc and the view agree on what a partial clone holds | `reachable_objects_partial` walks the store, not the filter; `GapInView` before any write; on a lazy, online clone the view closure is filled by id before switch, fast-forward, undo and `sparse set` (which may widen past the filter) | [0048](docs/adr/0048-presence-based-partial-clones.md) |
 | **P37c — Merge on partial clones** | `sc merge`, `sc cherry-pick` and `sc rebase` without a full clone | tree-recursive engine carries subtrees by id; conflicts in the view are marked and resolved with `sc conflicts`/`sc resolve`; conflicts outside the view are refused before any write | [0049](docs/adr/0049-merge-on-partial-clones.md) |
+| **P27 follow-on — Blob-size clone filter (#217)** | Clone a repo with large binary history without fetching old revisions | `sc clone --filter blob:limit=1MiB <src> <dst>` (with or without prefixes) leaves out old large blobs, the tip checkout is whole; verify/gc/push work; `--lazy` fills by id, `sc backfill <path>` repairs; wire v6; proven by `demo/run_blob_limit_demo.sh` | [0055](docs/adr/0055-blob-size-clone-filter.md) |
 | **P37d — Sessions on partial clones** | Agent workspaces on a partial clone | `sc ws fork/run/harvest/abandon` and `sc work` see the clone's sparse view; harvest lands through the ADR-0049 merge, conflicts fall back to `work-<i>` | [0050](docs/adr/0050-sessions-on-partial-clones.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
@@ -790,10 +801,11 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   everything else reports a gap with the `sc backfill` repair. Dialing the promisor origin
   from any read path is still deferred (offline breakage, surprise latency,
   fetch-during-gc).
-- **Blob-size and object-count clone filters (#217, P27).** `sc clone --filter`
-  is prefix-only; git's `--filter=blob:limit` size axis needs a decision on the
-  repair path for a size gap, where the filter is evaluated, and protected
-  content first.
+- **Remainder of #217 (P27): a limit-aware `sc fetch` and an object-count clone
+  limit.** The blob-size filter shipped (ADR-0055); `sc fetch` stays unfiltered,
+  so the limit bounds the initial transfer, not later growth, and a limit-aware
+  fetch needs per-path exemptions for backfilled files. An object-count limit has
+  no stable definition (the transfer set is id-ordered) and no git precedent.
 - **`sc rewrap` on partial clones — refused (P37).** `Repo::rewrap` calls
   `refuse_on_partial`; a paths-only/streaming rebuild that would lift the
   refusal remains a possible follow-on.

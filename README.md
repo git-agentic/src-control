@@ -169,8 +169,8 @@ via `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system`), bucket (`sc+wal://`, `sc+s3://`),
 and Git (including hosted GitHub) network transports, plus private branches
 sealed to a recipient set until publish and a read-only Tauri desktop
 browser. All 36 phases and P37a-37d are implemented and tested; `demo/` holds
-27 independent end-to-end proofs, one per major capability. Remaining
+28 independent end-to-end proofs, one per major capability. Remaining
 follow-ons (transcript drop delivery gaps, bucket compaction and gc, `sc ws`
-workspace refresh, size/count clone filters, and similar hardening
+workspace refresh, a limit-aware fetch and an object-count clone limit, and similar hardening
 items) are tracked in [ROADMAP.md](ROADMAP.md)'s Deferred section and as open
 GitHub issues rather than being open MVP scope.

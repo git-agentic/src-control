@@ -53,8 +53,20 @@ pub enum Error {
     /// out of the reply. Raised before anything is written, so the working
     /// tree and refs are untouched. `prefix` is the filter prefix that
     /// `sc backfill` can act on.
-    #[error("{path} is missing from this partial clone's local objects (an earlier fetch left a gap inside the checked-out view); nothing was changed. Run `sc backfill {prefix}` to repair it")]
-    GapInView { path: String, prefix: String },
+    #[error("{path} is missing from this partial clone's local objects ({}); nothing was changed. Run {} to repair it", gap_cause(*.blob_limit), repair_command(.prefix))]
+    GapInView {
+        path: String,
+        prefix: String,
+        /// The clone's `blob:limit` (ADR-0055), when it has one: then `prefix`
+        /// is the file's own path, and the message names the limit as a cause.
+        blob_limit: Option<u64>,
+    },
+    /// A path inside a partial clone's scope is absent and the clone was made
+    /// with a blob-size limit (ADR-0055): the blob is a large old version the
+    /// clone left out, or a fetch brought a tip that points at one. `sc
+    /// backfill <path>` fetches every version of that file.
+    #[error("{path} was left out of this partial clone (blob:limit={limit}); run `sc backfill {path}` to fetch it first")]
+    GapBySize { path: String, limit: u64 },
     /// A push found an object the local store lacks (referenced by `referrer`)
     /// that the destination does not hold either (ADR-0048). Pushing the new
     /// tip would leave the destination with a tree that names an object it
@@ -190,3 +202,23 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The cause clause of [`Error::GapInView`].
+fn gap_cause(blob_limit: Option<u64>) -> String {
+    match blob_limit {
+        Some(limit) => format!(
+            "blob:limit={limit} left this out of the clone, or an earlier fetch left a gap inside the checked-out view"
+        ),
+        None => "an earlier fetch left a gap inside the checked-out view".to_string(),
+    }
+}
+
+/// The `sc backfill` command that repairs a gap: a prefix names a path; a gap
+/// at the root tree has none, and only a full backfill covers it.
+fn repair_command(prefix: &str) -> String {
+    if prefix.is_empty() {
+        "`sc backfill --all`".to_string()
+    } else {
+        format!("`sc backfill {prefix}`")
+    }
+}

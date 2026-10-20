@@ -122,6 +122,13 @@ impl Layout {
     pub fn promisor_path(&self) -> PathBuf {
         self.dot_sc.join("promisor")
     }
+    /// `.sc/promisor-blob-limit` — the blob-size limit a partial clone was
+    /// made with and whether its scope is every path (ADR-0055). A separate
+    /// file for the same reason as `promisor-lazy`: a line in `.sc/promisor`
+    /// is a path prefix, and any text is a legal path.
+    pub fn promisor_blob_limit_path(&self) -> PathBuf {
+        self.dot_sc.join("promisor-blob-limit")
+    }
     /// `.sc/promisor-lazy` — empty marker (P37): this partial clone may fill
     /// gaps from its promisor remote by object id (ADR-0047). A separate file,
     /// not a field in `.sc/promisor`, because that file's lines after
