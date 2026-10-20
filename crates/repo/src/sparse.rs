@@ -395,7 +395,6 @@ impl Repo {
                 &old_spec,
                 &spec,
                 &Default::default(),
-                true,
             )?;
         }
         // Crash safety: record the spec being replaced before the new one is
@@ -543,14 +542,7 @@ impl Repo {
             )?
         };
         for root in roots {
-            self.refuse_untracked_for_view_change(
-                "sparse set",
-                root,
-                old,
-                new,
-                &already_laid,
-                false,
-            )?;
+            self.refuse_untracked_for_view_change("sparse set", root, old, new, &already_laid)?;
         }
         // Every guard passed, so each path below is the widen's to write:
         // record them (keeping an earlier interrupted run's) before the first.
@@ -773,7 +765,6 @@ impl Repo {
                 &self.sparse_spec()?,
                 &Sparse::default(),
                 &Default::default(),
-                true,
             )?;
         }
         clear(self.layout())?;

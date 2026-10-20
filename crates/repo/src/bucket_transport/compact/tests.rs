@@ -10,7 +10,7 @@ use crate::walfmt::{idx_key, RefUpdate};
 use scl_core::Object;
 use scl_objio::{Bucket, DirBucket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// In-memory `Bucket` with the same semantics as `DirBucket`.
@@ -853,6 +853,7 @@ fn a_manifest_that_moves_during_pack_deletion_stops_the_deletes() {
     // else: the sweep must notice at its next look and keep the rest.
     struct PushOnFirstPackDelete {
         inner: Shared,
+        freed: Arc<AtomicU64>,
         fired: Mutex<bool>,
     }
     impl Bucket for PushOnFirstPackDelete {
@@ -880,6 +881,9 @@ fn a_manifest_that_moves_during_pack_deletion_stops_the_deletes() {
             self.inner.exists(k)
         }
         fn delete(&self, k: &str) -> scl_objio::Result<()> {
+            if let Fetched::New { bytes, .. } = self.inner.get(k, None)? {
+                self.freed.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            }
             self.inner.delete(k)?;
             let mut fired = self.fired.lock().unwrap();
             if k.starts_with("packs/") && !*fired {
@@ -892,9 +896,11 @@ fn a_manifest_that_moves_during_pack_deletion_stops_the_deletes() {
     }
     let mem = Arc::new(MemBucket::default());
     let refs = push_commits(&open(&mem), "w", 70);
+    let freed = Arc::new(AtomicU64::new(0));
     let t = BucketTransport::from_bucket(Box::new(PushOnFirstPackDelete {
         inner: Shared(mem.clone()),
         fired: Mutex::new(false),
+        freed: freed.clone(),
     }))
     .unwrap();
     let rep = t.compact(&eager()).unwrap();
@@ -905,6 +911,9 @@ fn a_manifest_that_moves_during_pack_deletion_stops_the_deletes() {
         "{rep:?}"
     );
     assert!(rep.packs_deleted < 70, "{rep:?}");
+    // The packs kept after the manifest moved are not counted as reclaimed
+    // (#263): the report equals what really left the bucket.
+    assert_eq!(rep.bytes_deleted, freed.load(Ordering::SeqCst), "{rep:?}");
     // some old packs were kept, the bucket is readable, and a rerun finishes
     assert!(keys(&mem, "packs/").len() > 4);
     let mut all = refs;
@@ -913,4 +922,72 @@ fn a_manifest_that_moves_during_pack_deletion_stops_the_deletes() {
     open(&mem).compact(&eager()).unwrap();
     assert_eq!(keys(&mem, "packs/").len(), 2);
     assert_readable(&mem, &all);
+}
+
+/// A branch whose tip carries one `len`-byte blob of `fill`: a pack that is a
+/// few hundred bytes on disk but `len` decoded.
+fn push_compressible(t: &BucketTransport, branch: &str, fill: u8, len: usize) {
+    let blob = Object::blob(vec![fill; len]);
+    let tree = Object::Tree(scl_core::Tree::new(vec![scl_core::TreeEntry {
+        name: "f".into(),
+        kind: scl_core::EntryKind::Blob,
+        id: blob.id(),
+        mode: scl_core::FileMode(0o644),
+        perms: 0,
+    }]));
+    let snap = Object::Snapshot(scl_core::Snapshot {
+        root: tree.id(),
+        parents: vec![],
+        author: "t".into(),
+        timestamp: 1,
+        message: branch.into(),
+        secrets: Default::default(),
+        protection: Default::default(),
+    });
+    for o in [&blob, &tree, &snap] {
+        t.put_object(&o.id(), &o.encode()).unwrap();
+    }
+    t.update_ref(branch, &snap.id(), None).unwrap();
+}
+
+#[test]
+fn candidates_that_are_each_large_once_decoded_are_not_merged_one_by_one() {
+    let mem = Arc::new(MemBucket::default());
+    let t = open(&mem);
+    // Tiny on disk, so both are candidates and share one group; each decodes
+    // past the spill limit (4 x group_bytes) on its own.
+    let opts = CompactOptions {
+        group_bytes: 64 << 10,
+        ..eager()
+    };
+    push_compressible(&t, "big-0", 1, 1 << 20);
+    push_compressible(&t, "big-1", 2, 1 << 20);
+    let before = manifest(&mem);
+    let rep = t.compact(&opts).unwrap();
+    assert_eq!((rep.packs_merged, rep.packs_created), (0, 0), "{rep:?}");
+    assert!(
+        rep.notes
+            .iter()
+            .any(|n| n.contains("reduce the pack count")),
+        "{rep:?}"
+    );
+    assert_eq!(manifest(&mem), before, "no empty log entry or checkpoint");
+    assert_eq!(keys(&mem, "packs/").len(), 4);
+
+    // Small packs beside them still merge, into fewer packs than they were.
+    push_commits(&t, "s", 2);
+    let rep = t.compact(&opts).unwrap();
+    assert!(rep.packs_merged >= 2, "{rep:?}");
+    assert!(rep.packs_created < rep.packs_merged, "{rep:?}");
+    let t2 = open(&mem);
+    for b in ["big-0", "big-1", "s-0", "s-1"] {
+        let tip = t2
+            .list_refs()
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n == b)
+            .unwrap()
+            .1;
+        t2.get_object(&tip).unwrap();
+    }
 }

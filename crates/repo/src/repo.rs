@@ -2177,10 +2177,11 @@ impl Repo {
     /// there. Paths the old view matched are not checked: they are not written
     /// (a stopped op may have turned one into a directory, say). `already_laid`
     /// names paths that count as tracked because an earlier, interrupted run of
-    /// the same change wrote them. `alias_ok` lets a case alias of a laid-out
-    /// path count as tracked; a stopped-op widen passes false, because writing
-    /// a newly visible `SRC/a.txt` would overwrite the user's `src/a.txt`. Same rules as
-    /// [`Repo::refuse_untracked_overwrite_vs`].
+    /// the same change wrote them. A case alias of a laid-out path never counts
+    /// as tracked here (#241): both spellings come from this one tree, so on a
+    /// case-insensitive filesystem a newly visible `SRC/a.txt` is the laid-out
+    /// `src/a.txt` itself, and writing it would replace that file's bytes. Same
+    /// rules as [`Repo::refuse_untracked_overwrite_vs`].
     pub(crate) fn refuse_untracked_for_view_change(
         &self,
         op: &str,
@@ -2188,7 +2189,6 @@ impl Repo {
         old_view: &crate::Sparse,
         new_view: &crate::Sparse,
         already_laid: &std::collections::BTreeSet<String>,
-        alias_ok: bool,
     ) -> Result<()> {
         let partial = self.promisor()?.is_some();
         let (mut laid_out, target) = {
@@ -2211,7 +2211,7 @@ impl Repo {
             &laid_out,
             target.iter().filter(|p| !old_view.matches(p)),
             new_view,
-            alias_ok,
+            false,
         )
     }
 
@@ -2909,24 +2909,42 @@ fn is_tracked_case_alias(
     rel: &str,
 ) -> bool {
     use std::os::unix::fs::MetadataExt;
-    // Inode identity alone proves nothing: on a case-sensitive filesystem an
-    // untracked `Foo` can be a hard link to the tracked `foo`. Only a
-    // filesystem that answers to both spellings of a name that certainly
-    // exists (`.sc`) aliases case.
-    if root.join(".SC").symlink_metadata().is_err() {
-        return false;
-    }
     let Ok(here) = root.join(rel).symlink_metadata() else {
         return false;
     };
-    tracked
-        .iter()
-        .filter(|t| t.as_str() != rel && t.eq_ignore_ascii_case(rel))
-        .any(|t| {
+    case_alias_of_tracked(
+        // Inode identity alone proves nothing: on a case-sensitive filesystem
+        // an untracked `Foo` can be a hard link to the tracked `foo`. Only a
+        // filesystem that answers to both spellings of a name that certainly
+        // exists (`.sc`) aliases case.
+        || root.join(".SC").symlink_metadata().is_ok(),
+        tracked,
+        rel,
+        |t| {
             root.join(t)
                 .symlink_metadata()
                 .is_ok_and(|m| m.dev() == here.dev() && m.ino() == here.ino())
-        })
+        },
+    )
+}
+
+/// The decision behind [`is_tracked_case_alias`], with the two filesystem
+/// facts injected so it is testable without one: `case_insensitive` says the
+/// filesystem folds case (asked at most once, and only when a tracked path
+/// differing from `rel` only in case exists), `same_file(t)` that the tracked
+/// path `t` is the very file at `rel`.
+#[cfg(unix)]
+fn case_alias_of_tracked(
+    case_insensitive: impl FnOnce() -> bool,
+    tracked: &std::collections::BTreeSet<String>,
+    rel: &str,
+    same_file: impl Fn(&str) -> bool,
+) -> bool {
+    let mut candidates = tracked
+        .iter()
+        .filter(|t| t.as_str() != rel && t.eq_ignore_ascii_case(rel))
+        .peekable();
+    candidates.peek().is_some() && case_insensitive() && candidates.any(|t| same_file(t))
 }
 
 #[cfg(not(unix))]
@@ -3075,6 +3093,74 @@ mod tests {
             .unwrap();
         let err = repo
             .refuse_untracked_paths_in("t", &tracked, target.iter(), &sparse, false)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The alias decision with the filesystem injected, so every platform runs
+    /// it: a case-sensitive filesystem never aliases, and a case-insensitive
+    /// one only for a case-variant that is the very same file.
+    #[cfg(unix)]
+    #[test]
+    fn the_case_alias_decision_needs_a_folding_filesystem_and_the_same_file() {
+        let tracked: std::collections::BTreeSet<String> =
+            ["docs/a.txt".to_string(), "other".to_string()].into();
+        let ask =
+            |ci: bool, rel: &str, same: bool| case_alias_of_tracked(|| ci, &tracked, rel, |_| same);
+        assert!(ask(true, "Docs/a.txt", true));
+        // Case-sensitive: a hard link or a user's own `Docs/a.txt` is not it.
+        assert!(!ask(false, "Docs/a.txt", true));
+        // Case-insensitive but another inode: the user's file, kept.
+        assert!(!ask(true, "Docs/a.txt", false));
+        // The tracked spelling itself and a name with no case-variant never alias.
+        assert!(!ask(true, "docs/a.txt", true));
+        assert!(!ask(true, "Nope", true));
+        // The filesystem is probed only when a case-variant exists.
+        assert!(!case_alias_of_tracked(
+            || panic!("probed without a candidate"),
+            &tracked,
+            "Nope",
+            |_| true
+        ));
+    }
+
+    /// A sparse view change over one tree holding `docs/a.txt` and `Docs/a.txt`
+    /// (#241). On a case-insensitive filesystem the laid-out `docs/a.txt` is
+    /// already what stands at `Docs/a.txt`, and writing it would replace that
+    /// file, so the guard must refuse; it must not count the alias as tracked.
+    /// Skipped on a case-sensitive filesystem, where nothing stands there.
+    #[cfg(unix)]
+    #[test]
+    fn a_view_change_refuses_a_newly_visible_case_alias_of_a_laid_out_file() {
+        let root = tmp_root("view-case-alias");
+        let repo = Repo::init(&root).unwrap();
+        if root.join(".SC").symlink_metadata().is_err() {
+            drop(repo);
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/a.txt"), b"laid out\n").unwrap();
+        let tree = {
+            let store_arc = repo.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let mut entries = std::collections::BTreeMap::new();
+            for (path, body) in [("docs/a.txt", "laid out\n"), ("Docs/a.txt", "other\n")] {
+                let id = store.put(scl_core::Object::blob(body)).unwrap();
+                entries.insert(path.to_string(), (id, scl_core::FileMode(0o644), 0));
+            }
+            let (tree, objs) = crate::private::build_tree_objects(&entries);
+            for o in objs {
+                store.put(o).unwrap();
+            }
+            tree
+        };
+        let old = crate::Sparse::new(vec!["docs/".into()]);
+        let new = crate::Sparse::new(vec!["docs/".into(), "Docs/".into()]);
+        let err = repo
+            .refuse_untracked_for_view_change("sparse set", tree, &old, &new, &Default::default())
             .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
         drop(repo);

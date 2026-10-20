@@ -344,7 +344,7 @@ truth — do not re-list items here); entries that name an issue mirror the open
 GitHub issues. Standing entries: `sc ws` workspace refresh (#215),
 a limit-aware `sc fetch` and an object-count clone limit (#217 remainder), the non-unix
 `.sc/local-key` ACL (#214), and the open
-sparse guard and user-file safety limits (#241, ADR-0034 refinement 8).
+user-file safety limits of the sparse guard (ADR-0034 refinement 8).
 
 ## Agent skills
 

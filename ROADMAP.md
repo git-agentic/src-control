@@ -782,9 +782,6 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   conflict, re-materialize under the recorded view) but not built: it needs a
   headless merge-into-tree entry point and a re-materialize that keeps files an
   agent may have open. Abandon and re-fork covers it meanwhile.
-- **Sparse untracked-file guard edge cases.** #241: on a case-insensitive
-  filesystem the untracked-file guard can alias an old-view path with a newly
-  in-view one.
 - **User-file safety limits (ADR-0034 refinement 8, ADR-0044).** A file whose
   bytes equal the tracked or laid ones cannot be told from the stop's own
   write, so it is removed. `merge --abort` of a private-branch merge, which
