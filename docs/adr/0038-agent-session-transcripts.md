@@ -182,13 +182,10 @@ pipe-safety discipline).
    objects, so no `.sc/transcripts` or `.sc/signatures` entry created by this
    transfer points at a transcript the repo does not hold.
 4. **Remotes where the flag does nothing.** Git remotes never carry
-   transcripts. Bucket remotes (`sc+wal://`, `sc+s3://`) never serve them:
-   `BucketTransport::get_pack` walks reachability only, so a fetch or clone
-   from a bucket delivers no transcripts or transcript signatures whether or
-   not the flag is given, and a plain fetch does not change that. For `push`
-   the flag still works: a normal bucket push uploads and stores the
-   transcripts (they are simply never served back), and `--no-transcripts`
-   skips that upload. The serving gap is tracked in #229.
+   transcripts, so the flag is a no-op there. Bucket remotes (`sc+wal://`,
+   `sc+s3://`) serve transcripts since #229 (see the bucket addendum below),
+   so the flag works on them like on any native remote: fetch and clone
+   discard what the bucket over-sends, and push skips the upload.
 5. **Interaction with transcript-drop tombstones (second addendum below,
    #212).** A drop tombstone is a `Transcript` object with an empty envelope,
    so `--no-transcripts` treats it like any other transcript: the pack is
@@ -370,3 +367,51 @@ reported anywhere (it is pruned by gc, hidden before that).
   digest, so it never authorizes a drop.
 - `sc export` still counts only transcripts that are not tombstones; a
   dropped body that gc has not swept yet is still counted as dropped history.
+
+## Addendum: bucket remotes serve transcripts and signatures (issue #229)
+
+Before this change `BucketTransport::get_pack` built its pack from
+reachability only. A push to a bucket uploaded signatures, transcripts and
+signed drop tombstones (the sender seam runs on the pushing side), but a
+fetch or clone never got them back: snapshot signatures were lost too, so a
+signed snapshot cloned from a bucket was `Unsigned` and `sc verify --require`
+failed. (Confirmed by test before the fix; the issue left this open.)
+
+- **No format change, no `PROTOCOL_VERSION` bump.** A bucket keeps no
+  `.sc/signatures` or `.sc/transcripts` index, and its pack idx carries no
+  object kind. `get_pack` therefore rebuilds the sender seam from the packs
+  the manifest chain already names: it decodes each on-chain pack once
+  (`parse_pack_reader`, same hash and `MAX_OBJECT_SIZE` guards as any
+  untrusted pack), keeps only `{id, target}` for signatures and
+  `{id, snapshot, is-tombstone}` for transcripts, and applies the same rule as
+  `LocalTransport::build_pack_tempfile`: over-send every transcript attached
+  to a snapshot in the want or have closure, plus signatures over those
+  snapshots and over the chosen transcripts and tombstones, never subtracting
+  them via the have set. A tombstone is sent only if a signature covers it
+  (an unsigned drop is never pushed anyway).
+- **Trust stays on the receiver.** The bucket cannot judge a tombstone, so it
+  serves what it holds; `index_incoming` and clone `reindex` still honor a
+  tombstone only for a signer under `[signers] trusted`. A transcript the
+  bucket still holds next to its tombstone is served too, and a bucket cannot
+  filter it the way `LocalTransport` filters through its drop set. So unlike a
+  clone of a local origin that honored the drop (which never receives the
+  body), a clone from a bucket receives the body and the tombstone together;
+  the receiver never indexes a dropped id once it trusts the signer, and until
+  then shows the transcript. Withholding the body whenever a signed tombstone
+  exists would let anyone with bucket write access hide transcripts from
+  peers.
+- **`--no-transcripts`** needs nothing bucket-specific: the receiver-side skip
+  in `ingest_pack_file` applies to the over-sent transcripts, tombstones and
+  their signatures. Snapshot signatures still arrive.
+- **Cost.** The scan downloads and decodes every on-chain pack body once per
+  `BucketTransport` (leaf results cached per pack hash; packs are immutable),
+  including packs the transfer does not otherwise touch, and every fetch
+  (also `--no-transcripts`, which still needs the snapshot signatures) pays
+  it. That is the same order as the existing `get_pack`, whose have/want
+  reachability walks already fetch every pack that holds a reachable commit
+  or tree, but it is up to a second download of each pack per fresh transport
+  (each CLI fetch). Peak RAM is one pack body plus one decoded object (the
+  walk's cached body is released before the scan). A persisted per-pack leaf sidecar
+  would avoid the decode; deferred in `ROADMAP.md`.
+- `sc serve --store` uses the same `get_pack`, so served-bucket fetch and
+  clone get the same behavior.
