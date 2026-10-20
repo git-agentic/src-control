@@ -142,7 +142,7 @@ fn fetch_leaves_in_filter_gap_gc_works_and_ff_fails_before_writing() {
     let head_before = refs::read_branch_tip(clone.layout(), "main").unwrap();
     let err = clone.merge("origin/main", "t").unwrap_err();
     match &err {
-        Error::GapInView { path, prefix } => {
+        Error::GapInView { path, prefix, .. } => {
             assert_eq!(path, "src/readme.txt");
             assert_eq!(prefix, "src/");
         }

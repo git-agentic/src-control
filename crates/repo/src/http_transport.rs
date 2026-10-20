@@ -646,7 +646,7 @@ impl Transport for HttpTransport {
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
-        filter: Option<&[String]>,
+        filter: Option<&crate::promisor::PackFilter>,
         out: &mut dyn Write,
     ) -> Result<()> {
         self.client.get_pack(wants, haves, filter, out)
@@ -2784,6 +2784,7 @@ mod tests {
                 wants: vec![tip],
                 haves: vec![],
                 filter: vec![],
+                blob_limit: None,
             }
             .encode(),
         )

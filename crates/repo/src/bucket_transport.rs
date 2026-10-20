@@ -10,9 +10,17 @@ use crate::walfmt::{
 use scl_core::pack::{parse_index, read_object_at_bounded, IndexEntry, PackWriter};
 use scl_core::{Object, ObjectId};
 use scl_objio::{Bucket, Fetched};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io::Write;
+
+mod compact;
+pub use compact::{CompactOptions, CompactReport};
+
+/// How many times a read restarts from a fresh manifest after an object the
+/// view names has vanished (ADR-0057). Each restart needs the manifest to have
+/// moved, so a handful is plenty: one per compaction that lands mid-read.
+const MAX_RESTARTS: u32 = 8;
 
 /// Reconstructed state of the WAL at one manifest tag: the manifest itself,
 /// the flattened branch tips after replaying the parent chain oldest-first,
@@ -71,6 +79,14 @@ pub struct BucketTransport {
     /// it spares a long-lived `serve --store` session from re-reading every
     /// pack body on each `get_pack`.
     leaf_cache: RefCell<BTreeMap<String, Vec<Leaf>>>,
+    /// Set whenever a read finds an object the manifest chain names absent
+    /// (ADR-0057): the signal for `refresh`/`restarting` to re-read the
+    /// manifest and tell a compaction that moved on (restart) from a corrupt
+    /// bucket (fail closed).
+    saw_absent: Cell<bool>,
+    /// Tag of the manifest the in-progress `refresh_once` is building from, so
+    /// a failed attempt can say which manifest it failed on.
+    attempt_tag: RefCell<Option<String>>,
 }
 
 /// A leaf object a pack holds that no tree or snapshot references, so the
@@ -218,6 +234,8 @@ impl BucketTransport {
             staged: RefCell::new(Vec::new()),
             pending_packs: RefCell::new(Vec::new()),
             leaf_cache: RefCell::new(BTreeMap::new()),
+            saw_absent: Cell::new(false),
+            attempt_tag: RefCell::new(None),
         };
         t.refresh()?;
         Ok(t)
@@ -228,7 +246,59 @@ impl BucketTransport {
     /// (P36b) — seeded from that checkpoint's own `refs`/`packs` rather than
     /// replayed from `0` — then folding the tail entries on top (seq numbers
     /// are claims; the chain is the truth — off-chain entries are garbage).
+    ///
+    /// A compaction (ADR-0057) can delete log entries, checkpoints or packs
+    /// between reading the manifest and reading what it names. When that
+    /// happens the manifest has necessarily moved on, so the read restarts from
+    /// the new one; if the same manifest fails twice with a key absent, the
+    /// bucket is corrupt and the error stands.
     fn refresh(&self) -> Result<()> {
+        let mut failed_on: Option<String> = None;
+        for _ in 0..MAX_RESTARTS {
+            self.saw_absent.set(false);
+            *self.attempt_tag.borrow_mut() = None;
+            match self.refresh_once() {
+                Err(e) if self.saw_absent.get() => {
+                    let tag = self.attempt_tag.borrow_mut().take();
+                    if tag.is_none() || tag == failed_on {
+                        return Err(e);
+                    }
+                    failed_on = tag;
+                }
+                r => return r,
+            }
+        }
+        self.refresh_once()
+    }
+
+    /// Record that a key the chain names is absent and build the error for it.
+    fn gone(&self, msg: String) -> Error {
+        self.saw_absent.set(true);
+        Error::Wal(msg)
+    }
+
+    /// Run a read against the current view; if it finds a named object gone
+    /// (a compaction deleted it), re-read the manifest and run it again. An unchanged manifest means the absence is real: fail closed.
+    fn restarting<T>(&self, mut f: impl FnMut() -> Result<T>) -> Result<T> {
+        for _ in 0..MAX_RESTARTS {
+            self.saw_absent.set(false);
+            let before = self.view.borrow().as_ref().map(|v| v.tag.clone());
+            match f() {
+                Err(e) if self.saw_absent.get() => {
+                    // A conditional read: `Unchanged` keeps the view and its tag.
+                    self.refresh()?;
+                    let after = self.view.borrow().as_ref().map(|v| v.tag.clone());
+                    if before == after {
+                        return Err(e);
+                    }
+                }
+                r => return r,
+            }
+        }
+        f()
+    }
+
+    fn refresh_once(&self) -> Result<()> {
         let cached_tag = self.view.borrow().as_ref().map(|v| v.tag.clone());
         match self.bucket.get("manifest", cached_tag.as_deref())? {
             Fetched::Unchanged => Ok(()),
@@ -237,6 +307,7 @@ impl BucketTransport {
                 Ok(())
             }
             Fetched::New { bytes, tag } => {
+                *self.attempt_tag.borrow_mut() = Some(tag.clone());
                 let bytes = capped("manifest", bytes)?;
                 let manifest = Manifest::decode(&bytes)?;
                 let stop = manifest.checkpoint_seq;
@@ -247,7 +318,7 @@ impl BucketTransport {
                     let ck_bytes = match self.bucket.get(&checkpoint_key(stop), None)? {
                         Fetched::New { bytes, .. } => capped("checkpoint", bytes)?,
                         _ => {
-                            return Err(Error::Wal(format!(
+                            return Err(self.gone(format!(
                                 "checkpoint {stop} referenced by manifest but absent"
                             )))
                         }
@@ -277,9 +348,9 @@ impl BucketTransport {
                         )));
                     }
                     let Fetched::New { bytes, .. } = self.bucket.get(&log_key(seq), None)? else {
-                        return Err(Error::Wal(format!(
-                            "log entry {seq} referenced by chain but absent"
-                        )));
+                        return Err(
+                            self.gone(format!("log entry {seq} referenced by chain but absent"))
+                        );
                     };
                     let e = LogEntry::decode(&capped("log entry", bytes)?)?;
                     if e.seq != seq {
@@ -312,12 +383,17 @@ impl BucketTransport {
                 let mut index = BTreeMap::new();
                 for hash in &packs {
                     let Fetched::New { bytes, .. } = self.bucket.get(&idx_key(hash), None)? else {
-                        return Err(Error::Wal(format!("pack {hash} on chain but idx absent")));
+                        return Err(self.gone(format!("pack {hash} on chain but idx absent")));
                     };
                     let bytes = capped("pack idx", bytes)?;
                     for IndexEntry { id, offset, length } in parse_index(&bytes)? {
                         index.insert(id, (hash.clone(), offset, length));
                     }
+                }
+                // Packs a compaction retired will never be asked about again.
+                {
+                    let live: std::collections::HashSet<&String> = packs.iter().collect();
+                    self.leaf_cache.borrow_mut().retain(|h, _| live.contains(h));
                 }
                 *self.view.borrow_mut() = Some(WalView {
                     tag,
@@ -334,6 +410,10 @@ impl BucketTransport {
     /// Canonical `encode()` bytes of one object, fetched via its pack
     /// (downloaded once per distinct pack hash and cached for walk locality).
     fn object_bytes(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        self.restarting(|| self.object_bytes_once(id))
+    }
+
+    fn object_bytes_once(&self, id: &ObjectId) -> Result<Vec<u8>> {
         let (hash, offset, _len) = {
             let view = self.view.borrow();
             let view = view
@@ -347,7 +427,7 @@ impl BucketTransport {
         let mut cache = self.pack_cache.borrow_mut();
         if cache.as_ref().map(|(h, _)| h.as_str()) != Some(hash.as_str()) {
             let Fetched::New { bytes, .. } = self.bucket.get(&pack_key(&hash), None)? else {
-                return Err(Error::Wal(format!("pack {hash} on chain but body absent")));
+                return Err(self.gone(format!("pack {hash} on chain but body absent")));
             };
             *cache = Some((hash.clone(), bytes));
         }
@@ -366,7 +446,7 @@ impl BucketTransport {
             return Ok(hit.clone());
         }
         let Fetched::New { bytes, .. } = self.bucket.get(&pack_key(hash), None)? else {
-            return Err(Error::Wal(format!("pack {hash} on chain but body absent")));
+            return Err(self.gone(format!("pack {hash} on chain but body absent")));
         };
         let mut leaves = Vec::new();
         scl_core::pack::parse_pack_reader(std::io::Cursor::new(&bytes[..]), |id, obj| {
@@ -400,6 +480,13 @@ impl BucketTransport {
     /// An unsigned tombstone is withheld, as on `LocalTransport`. Whether a
     /// tombstone is honored is the receiver's call (`index_incoming`).
     fn leaf_ids_for(&self, snaps: &std::collections::BTreeSet<ObjectId>) -> Result<Vec<ObjectId>> {
+        self.restarting(|| self.leaf_ids_for_once(snaps))
+    }
+
+    fn leaf_ids_for_once(
+        &self,
+        snaps: &std::collections::BTreeSet<ObjectId>,
+    ) -> Result<Vec<ObjectId>> {
         let packs = match self.view.borrow().as_ref() {
             Some(v) => v.packs.clone(),
             None => return Ok(Vec::new()),
@@ -474,6 +561,25 @@ impl BucketTransport {
         }
     }
 
+    /// Fail if a pack this push is about to commit has vanished from the bucket
+    /// (a compaction swept it as an unreferenced orphan after an unusually long
+    /// gap, ADR-0057). Committing a log entry that names a deleted pack would
+    /// corrupt the remote; failing lets the caller retry the push, which
+    /// re-uploads. Two HEADs per pending pack (read rights only: pushers need
+    /// no list or delete rights).
+    /// Called right before the manifest CAS.
+    fn ensure_packs_present(&self, hashes: &[String]) -> Result<()> {
+        for hash in hashes {
+            if !(self.bucket.exists(&pack_key(hash))? && self.bucket.exists(&idx_key(hash))?) {
+                return Err(Error::Remote(format!(
+                    "pack {hash} was removed from the bucket before this push committed \
+                     (bucket compaction swept it); retry the push"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Opportunistic, coordinator-free checkpoint fold. Called after a
     /// successful commit; every failure path is deliberately non-fatal —
     /// the checkpoint is derived data any reader can rebuild from the log,
@@ -524,9 +630,8 @@ impl BucketTransport {
             // best-effort by design (see the doc above) — and let every
             // reader keep doing the slower but correct full-tail walk back
             // to the last checkpoint that DID fit. Durable relief is
-            // compaction (ROADMAP "Bucket compaction/gc"), which can retire
-            // refs/packs instead of letting them accumulate into ever-larger
-            // checkpoints forever.
+            // `compact` (ADR-0057), which merges small packs so the pack
+            // axis fits again. The ref axis is live state and is not relieved.
             return Ok(());
         }
         let ck = Checkpoint {
@@ -608,7 +713,7 @@ impl Transport for BucketTransport {
         &self,
         wants: &[ObjectId],
         haves: &[ObjectId],
-        filter: Option<&[String]>,
+        filter: Option<&crate::promisor::PackFilter>,
         out: &mut dyn Write,
     ) -> Result<()> {
         if filter.is_some() {
@@ -697,7 +802,7 @@ impl Transport for BucketTransport {
         // this function — success, failure, or the loop below — simply lets
         // `pending` go out of scope; the packs themselves stay uploaded in
         // the bucket regardless (content-addressed, inert orphan garbage if
-        // never referenced — correct per spec, compaction is a later phase).
+        // never referenced — correct per spec; `compact` sweeps it later, ADR-0057).
         let pending: Vec<String> = std::mem::take(&mut *self.pending_packs.borrow_mut());
         const MAX_CAS_RETRIES: u32 = 16;
         for _ in 0..MAX_CAS_RETRIES {
@@ -756,6 +861,9 @@ impl Transport for BucketTransport {
                 checkpoint_seq,
                 head_branch,
             };
+            // Last look before the commit point, to keep the window in which a
+            // concurrent sweep could still remove a pack as small as possible.
+            self.ensure_packs_present(&pending)?;
             if self
                 .bucket
                 .put_if_tag("manifest", &manifest.encode(), prev_tag.as_deref())?
@@ -922,7 +1030,22 @@ mod tests {
         // filter is refused loudly, not ignored
         let filt = vec!["src/".to_string()];
         assert!(t
-            .get_pack(&[tip], &[], Some(&filt), &mut Vec::new())
+            .get_pack(
+                &[tip],
+                &[],
+                crate::promisor::PackFilter::new(&filt, None).as_ref(),
+                &mut Vec::new()
+            )
+            .is_err());
+        // ... and so is a size-only filter (ADR-0055): "filter active" is
+        // `prefixes || blob_limit`, not "prefixes non-empty".
+        assert!(t
+            .get_pack(
+                &[tip],
+                &[],
+                crate::promisor::PackFilter::new(&[], Some(1024)).as_ref(),
+                &mut Vec::new()
+            )
             .is_err());
         drop(t);
         std::fs::remove_dir_all(&broot).unwrap();
@@ -1737,6 +1860,15 @@ mod tests {
         fn list(&self, prefix: &str) -> scl_objio::Result<Vec<String>> {
             self.0.list(prefix)
         }
+        fn list_meta(&self, prefix: &str) -> scl_objio::Result<Vec<scl_objio::ObjectMeta>> {
+            self.0.list_meta(prefix)
+        }
+        fn exists(&self, key: &str) -> scl_objio::Result<bool> {
+            self.0.exists(key)
+        }
+        fn delete(&self, key: &str) -> scl_objio::Result<()> {
+            self.0.delete(key)
+        }
     }
 
     #[test]
@@ -1914,6 +2046,68 @@ mod tests {
 
         drop(a);
         drop(b);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!base.exists());
+    }
+
+    /// #216 x #229: compaction merges the packs the sender seam scans for
+    /// signatures, transcripts and tombstones, so a clone after it must still
+    /// be served all three.
+    #[test]
+    fn a_clone_after_compaction_still_gets_signatures_transcripts_and_tombstones() {
+        let (a, url, snap, tid, identity, base) = signed_bucket_origin("compact");
+        for (i, f) in ["f2", "f3"].iter().enumerate() {
+            std::fs::write(base.join("a").join(f), format!("more {i}")).unwrap();
+            a.commit("t", &format!("c{}", i + 2)).unwrap();
+            a.push("origin").unwrap();
+        }
+        let compact = || {
+            BucketTransport::open(&url)
+                .unwrap()
+                .compact(&crate::bucket_transport::CompactOptions {
+                    prune_expire: std::time::Duration::ZERO,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let rep = compact();
+        assert!(rep.packs_merged >= 3 && rep.packs_deleted >= 3, "{rep:?}");
+        let bucket = base.join("bucket");
+        let count = |sub: &str| std::fs::read_dir(bucket.join(sub)).unwrap().count();
+        assert_eq!(count("packs"), 2, "merged into one pack + idx");
+
+        let b = crate::repo::Repo::clone_url(&url, base.join("b")).unwrap();
+        assert_eq!(
+            b.sig_status(&snap, &trust_map(&identity)).unwrap(),
+            crate::signatures::SigStatus::Trusted("alice".to_string())
+        );
+        assert!(b
+            .transcripts_for(&snap)
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t == tid));
+        assert_eq!(b.signatures_for(&tid).unwrap().len(), 1);
+
+        // A signed drop pushed on top of the compacted bucket, then compacted again.
+        crate::transcripts::tests::trust_signer(&a, &identity);
+        a.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        std::fs::write(base.join("a/f4"), b"four").unwrap();
+        a.commit("t", "c5").unwrap();
+        a.push("origin").unwrap();
+        compact();
+        let tomb = ObjectId::of(
+            &Object::Transcript(scl_core::Transcript::drop_tombstone(snap, &tid)).encode(),
+        );
+        let c = crate::repo::Repo::clone_url(&url, base.join("c")).unwrap();
+        assert!(
+            c.store_arc().lock().unwrap().contains(&tomb),
+            "the tombstone survives compaction and is served"
+        );
+        crate::transcripts::tests::trust_signer(&b, &identity);
+        b.fetch("origin").unwrap();
+        assert!(b.transcripts_for(&snap).unwrap().is_empty());
+
+        drop((a, b, c));
         std::fs::remove_dir_all(&base).unwrap();
         assert!(!base.exists());
     }

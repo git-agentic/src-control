@@ -27,6 +27,8 @@ mod partial_replay;
 #[cfg(test)]
 mod partial_sessions;
 #[cfg(test)]
+mod partial_size;
+#[cfg(test)]
 mod partial_walks;
 pub mod pick_state;
 pub mod private;
@@ -66,14 +68,16 @@ pub mod workspace;
 pub mod worktree;
 pub(crate) mod ws;
 
-pub use bucket_transport::{BucketScheme, BucketTransport, BucketUrl};
+pub use bucket_transport::{
+    BucketScheme, BucketTransport, BucketUrl, CompactOptions, CompactReport,
+};
 pub use conflicts::{ActiveOp, ConflictKind, ConflictVersions, ResolveSide, Side};
 pub use error::{Error, Result};
 pub use gc::GcStats;
 pub use git_marks::MarksStore;
 pub use http_transport::ScHttpUrl;
 pub use oplog::{OpRecord, UndoOutcome};
-pub use promisor::Promisor;
+pub use promisor::{PackFilter, Promisor, Scope};
 pub use protect_ops::PrefixRecipient;
 pub use remote::{RemoteConfig, RemoteKind};
 pub use replay::{PickResult, RebaseResult};

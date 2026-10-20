@@ -418,9 +418,28 @@ too, not just the src-control-side metadata.
   from the key it was fetched at, and a log chain that steps past the
   checkpoint without landing on it. A writer with bucket access can fold a
   checkpoint, but it is derived data any reader can refold from the log, and a
-  lost manifest CAS drops a fold silently. Nothing is ever removed from a
-  bucket (no compaction or gc yet, #216), so a hostile writer can grow it
-  without bound; bucket quotas are the operator's bound.
+  lost manifest CAS drops a fold silently. A hostile writer can grow a bucket
+  without bound; bucket quotas are the operator's bound, and `sc remote
+  compact` reclaims what is unreferenced (below).
+- **Compaction deletes data, so it is a privileged operation (#216,
+  ADR-0057).** `sc remote compact` needs bucket **list and delete** rights in
+  addition to the get/put/head permissions a pusher holds (pushes themselves need no list
+  or delete rights). Grant them to a dedicated operator or
+  scheduled-job identity, not to ordinary pushers, read-only clients or the
+  `sc serve --store` instances (they never need them: compaction is not a wire
+  verb, so a served bucket's clients cannot trigger a delete). It cannot
+  create new authority: it never touches the manifest's refs, only removes
+  objects no current manifest chain names, and a writer who can already
+  write to the bucket can do worse with raw access. What it does change for a
+  hostile or mistaken writer: (a) a stalled push whose uploaded pack is older
+  than `--prune-expire` can lose it and fail on retry, or, if its pack is byte-identical to an old
+  orphan that a sweep is deleting at that moment, commit an entry naming a
+  deleted pack, which
+  makes the remote unreadable until fixed (hence the 24h default, and
+  leases as the real fix); (b) a hostile write that fills `log/` or
+  `checkpoints/` with junk is reclaimed once it falls behind the cutoff; junk
+  at a far-future seq never falls behind it, and an undecodable one stops pack
+  deletion (fail closed, the report names the key to remove by hand). Use `--dry-run` first on a new bucket.
 - **Sealed content stays end-to-end sealed, unchanged.** Protected-path
   ciphertext (ADR-0014/0043) and committed secrets travel through a bucket
   remote exactly as through any other transport: a bucket reader without the
@@ -541,6 +560,24 @@ too, not just the src-control-side metadata.
   no longer holds the repo lock (ADR-0056), so an `sc` it runs from inside the
   workspace finds the host repo and can change it, as a hand-started agent always
   could.
+- **A blob-size limit (`--filter blob:limit=<size>`, ADR-0055) is request scope
+  like the prefix filter, and the server evaluates it.** It hides nothing: any
+  client that can read the repository can fetch the left-out blobs (`sc
+  backfill`, by-id fill), and a server that sends fewer blobs than asked can
+  only create a gap, which surfaces as `GapInView`/`GapBySize` or a fill error
+  before any write, never as wrong content (objects are hash-verified). The
+  size is the stored payload length, so for a protected path it is the
+  ciphertext size, which anyone who can fetch the object already sees; the
+  filter reveals nothing new. A limited `GetPack` makes the server stream-measure
+  each distinct candidate blob once (`Store::blob_size`, fixed buffer, hash
+  checked, cached by id; a limit of 0 or `u64::MAX` measures nothing), bounded by
+  the stored bytes of those blobs. A blob that is kept is read twice, once to
+  measure and once to write the pack, so the read cost is at most twice an
+  unfiltered `GetPack`'s, which already reads every blob into its pack. Reads are not budgeted (#233 budgets writes)
+  and the filter does not change that; the listener limits are the bound. Every
+  active filter, a limit alone included, still excludes private branches and is
+  refused by bucket remotes. The wire bump (version 6) makes a mixed-version pair
+  fail closed at the handshake in both directions.
 - **Operations that need a complete closure refuse on a partial clone, fail
   closed:** `sc export`, `sc rewrap`, `sc grant`/`revoke`, private branches, and
   `sc push` to a git remote. They refuse rather than run on partial data.

@@ -310,8 +310,13 @@ enum Cmd {
         git: bool,
         /// Partial clone (P27): only fetch objects under this path prefix
         /// (repeatable). Writes `.sc/promisor` + `.sc/sparse`; missing
-        /// objects can later be pulled in with `sc backfill`. Not supported
-        /// over a git-bridge remote.
+        /// objects can later be pulled in with `sc backfill`. Also accepts
+        /// `blob:limit=<size>` (bytes, or a KiB/MiB/GiB suffix; ADR-0055),
+        /// once: blobs of at least that size are left out unless a ref tip
+        /// reaches them, so old versions of large files stay on the server.
+        /// `blob:` is reserved (a prefix cannot start with it); `blob:limit=0`
+        /// leaves out every blob no tip reaches. Not supported over a
+        /// git-bridge remote.
         #[arg(long)]
         filter: Vec<String>,
         /// Mark the partial clone lazy (P37): `sc cat` may fetch the trees
@@ -828,6 +833,23 @@ enum RemoteOp {
     },
     /// List configured remotes.
     List,
+    /// Compact a bucket remote (`sc+wal://`, `sc+s3://`): merge small packs,
+    /// then delete log entries, checkpoints and packs no reader or writer can
+    /// still need (ADR-0057). Needs bucket list and delete rights.
+    Compact {
+        name: String,
+        /// Plan and report; write and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete only what has been unreferenced for at least this long
+        /// (e.g. 24h, 7d). Keep it well above any push's duration.
+        #[arg(long, default_value = "24h")]
+        prune_expire: String,
+        /// Allow a --prune-expire under 1h. Only safe while nothing pushes to
+        /// or fetches from the bucket: a push in flight can lose its pack.
+        #[arg(long)]
+        allow_short_grace: bool,
+    },
 }
 
 /// Top-level `sc serve` subcommand namespace, distinct from the plain
@@ -3014,10 +3036,7 @@ fn run_verify(refname: Option<String>, require: bool) -> Result<()> {
     // EXPECTED to be absent on a partial clone, never missing/corrupt — print
     // a count instead of treating them as a verify failure.
     if let Some(gaps) = repo.partial_gap_count(&[tip])? {
-        let prefixes = repo
-            .promisor()?
-            .map(|p| p.prefixes().join(", "))
-            .unwrap_or_default();
+        let prefixes = repo.promisor()?.map(|p| p.describe()).unwrap_or_default();
         print_line(&format!(
             "partial: {gaps} object(s) outside filter [{prefixes}]"
         ));
@@ -3774,19 +3793,20 @@ fn run_clone(
         return run_clone_git(&src, &dst);
     }
     let src = absolute_local_source(src);
-    let filter_opt = (!filter.is_empty()).then_some(filter.as_slice());
-    let repo = scl_repo::Repo::clone_url_opts(&src, &dst, filter_opt, no_transcripts)?;
+    let (prefixes, blob_limit) = scl_repo::promisor::parse_clone_filters(&filter)?;
+    let repo =
+        scl_repo::Repo::clone_url_limited(&src, &dst, &prefixes, blob_limit, no_transcripts)?;
     if lazy {
         scl_repo::promisor::set_lazy(repo.layout(), true)?;
     }
     let n = repo.branches()?.len();
-    if filter_opt.is_some() {
+    if let Some(promisor) = repo.promisor()? {
         println!(
             "cloned {} into {} ({} branch(es), partial: {})",
             src,
             dst.display(),
             n,
-            filter.join(", ")
+            promisor.describe()
         );
     } else {
         println!("cloned {} into {} ({} branch(es))", src, dst.display(), n);
@@ -4161,6 +4181,36 @@ fn run_remote(op: RemoteOp) -> Result<()> {
                 println!("added remote {name} -> {url}");
             }
         }
+        RemoteOp::Compact {
+            name,
+            dry_run,
+            prune_expire,
+            allow_short_grace,
+        } => {
+            let grace = parse_duration(&prune_expire)?;
+            if grace < std::time::Duration::from_secs(3600) && !allow_short_grace {
+                anyhow::bail!(
+                    "--prune-expire under 1h can delete a pack an in-flight push has uploaded but \
+                     not committed; pass --allow-short-grace only if nothing is pushing or fetching"
+                );
+            }
+            let url = repo
+                .remotes()?
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, u)| u)
+                .ok_or_else(|| anyhow::anyhow!("no such remote: {name}"))?;
+            if !(url.starts_with("sc+wal://") || url.starts_with("sc+s3://")) {
+                anyhow::bail!("remote '{name}' is not a bucket remote ({url}); nothing to compact");
+            }
+            let transport = scl_repo::BucketTransport::open(&url)?;
+            let rep = transport.compact(&scl_repo::CompactOptions {
+                prune_expire: grace,
+                dry_run,
+                ..Default::default()
+            })?;
+            print_compact_report(&name, &url, &rep);
+        }
         RemoteOp::List => {
             let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
             for (name, url) in repo.remotes()? {
@@ -4173,6 +4223,41 @@ fn run_remote(op: RemoteOp) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Human-readable summary of a bucket compaction (`dry_run` reads "would").
+fn print_compact_report(name: &str, url: &str, rep: &scl_repo::CompactReport) {
+    let (merge, delete) = if rep.dry_run {
+        ("would merge", "would delete")
+    } else {
+        ("merged", "deleted")
+    };
+    println!(
+        "compact {name} ({url}){}",
+        if rep.dry_run { " [dry run]" } else { "" }
+    );
+    println!(
+        "  {merge} {} pack(s) into {}",
+        rep.packs_merged, rep.packs_created
+    );
+    println!(
+        "  {delete} {} log entr{}, {} checkpoint(s), {} pack(s) ({} bytes), cutoff checkpoint {}",
+        rep.logs_deleted,
+        if rep.logs_deleted == 1 { "y" } else { "ies" },
+        rep.checkpoints_deleted,
+        rep.packs_deleted,
+        rep.bytes_deleted,
+        rep.cutoff
+    );
+    if rep.packs_held_back > 0 {
+        println!(
+            "  kept {} unreferenced pack(s) younger than the grace window",
+            rep.packs_held_back
+        );
+    }
+    for note in &rep.notes {
+        println!("  note: {note}");
+    }
 }
 
 /// Fetch from `remote`, dispatching on its configured kind: a `git`-kind
