@@ -1022,6 +1022,15 @@ pub(crate) fn materialize_with_old_view(
     // (partial clones only; ADR-0048). The check lives here so every caller
     // is covered and none can forget it.
     preflight_view(layout, store, target_root, sparse)?;
+    // With no old tree there is no removal pass, so an empty directory at a
+    // target path is the user's, not a husk: leave it, and let the write fail.
+    let clear = |full: &Path, path: &str| {
+        if old_root.is_some() {
+            clear_dir_obstruction(full, path)
+        } else {
+            Ok(())
+        }
+    };
     // Gap-tolerant when sparse is active (P27 Task 4): a promisor-filtered
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
     // walk here would `NotFound` on them.
@@ -1108,7 +1117,7 @@ pub(crate) fn materialize_with_old_view(
             })();
             match decrypted {
                 Some(pt) => {
-                    clear_dir_obstruction(&full, path)?;
+                    clear(&full, path)?;
                     if let Some(parent) = full.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -1134,7 +1143,7 @@ pub(crate) fn materialize_with_old_view(
                     // can't linger when a path becomes protected across a switch for
                     // a non-recipient (confidentiality). A failed removal must
                     // surface — swallowing it leaves plaintext on disk.
-                    clear_dir_obstruction(&full, path)?;
+                    clear(&full, path)?;
                     match std::fs::remove_file(&full) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1144,7 +1153,7 @@ pub(crate) fn materialize_with_old_view(
                 }
             }
         } else {
-            clear_dir_obstruction(&full, path)?;
+            clear(&full, path)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
             }
