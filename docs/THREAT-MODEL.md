@@ -200,6 +200,16 @@ too, not just the src-control-side metadata.
   transcript remaining readable to *authorized* transcript recipients (the P5
   scanner warns at attach time but never blocks; rotation of the underlying secret
   remedies).
+- **Drop tombstones (`sc transcript drop`, ADR-0038 addendum).** A drop is honored
+  by a peer only if it carries a signature over its drop digest from a key under
+  that peer's `[signers] trusted` list, and its snapshot checks out. An unsigned or
+  untrusted tombstone is inert. The new power: any trusted signer can hide
+  transcripts on every peer that trusts it and make those peers' gc reclaim the
+  bodies. Drop is not erasure: peers without the tombstone keep the body,
+  `GetObjects` serves it until gc sweeps it, and a peer that still holds it can
+  re-send it. A tombstone ignored on arrival stays ignored on a push-only or
+  served remote, so configure `[signers] trusted` there before the first drop
+  push. Trust is checked at ingest and is not retroactive.
 
 ## Network transport (`sc serve --http` / `sc+http(s)://` / `ssh://`) — ADR-0022/0036/0040/0041/0042
 

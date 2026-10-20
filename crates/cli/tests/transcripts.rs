@@ -288,3 +288,68 @@ fn ws_harvest_transcript_prints_landing_before_reporting_attach_failure() {
 
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn drop_removes_transcript_from_list_and_show() {
+    let root = tmp("drop");
+    let repo = root.join("work");
+    std::fs::create_dir_all(&repo).unwrap();
+    let keys = root.join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+    let (id, enc_pk, _sig_pk) = keygen(&keys, "alice");
+    assert!(sc(&repo, &["init"]).status.success());
+    std::fs::write(
+        repo.join(".sc/recipients.toml"),
+        format!("[recipients]\nalice = \"{enc_pk}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
+    assert!(sc(&repo, &["commit", "-m", "c1"]).status.success());
+    let body = keys.join("session.txt");
+    std::fs::write(&body, "USER: hi\n").unwrap();
+    assert!(sc(
+        &repo,
+        &["transcript", "attach", "main", body.to_str().unwrap()]
+    )
+    .status
+    .success());
+
+    let list = stdout(&sc(&repo, &["transcript", "list", "--json"]));
+    let tid = serde_json::from_str::<serde_json::Value>(&list).unwrap()[0]["transcript"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let drop = sc(
+        &repo,
+        &[
+            "transcript",
+            "drop",
+            &tid[..12],
+            "--identity",
+            id.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        drop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&drop.stderr)
+    );
+    assert!(stdout(&sc(&repo, &["transcript", "list"])).contains("no transcripts"));
+    let show = stdout(&sc(
+        &repo,
+        &[
+            "transcript",
+            "show",
+            "main",
+            "--identity",
+            id.to_str().unwrap(),
+        ],
+    ));
+    assert!(show.contains("no transcripts attached"), "{show}");
+    assert!(
+        !sc(&repo, &["transcript", "drop", &tid]).status.success(),
+        "dropping twice is an error"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
