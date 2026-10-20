@@ -268,5 +268,8 @@ every claim below is checked against the shipped code, not the plan.
    copy of it is read as an edit; a stop's `materialize` can still delete it),
    nor is anything in the view (the existing guard). Completion still reads a file
    the user creates after a stop at such a path; that is their resolution, as
-   for an edited tracked file (refinement 5). Pinned by `sparse_completion.rs`
+   for an edited tracked file (refinement 5). On a partial clone the guard sees
+   only the subtrees the store holds, so an addition inside a carried, absent
+   subtree is not checked; it is not silent, because the commit then fails with
+   `GappedPathContent` naming the path (move the file away and retry). Pinned by `sparse_completion.rs`
    and `private_sparse.rs`.
