@@ -364,11 +364,13 @@ pub(crate) fn indexed_transcript_ids_for(
     // Signed tombstones travel with their snapshot so a drop propagates. An
     // unsigned (local-only) drop is never sent: peers would ignore it, and an
     // older peer would index it as a live transcript.
-    for (snap, tomb, _) in read_drops(layout)? {
-        if wanted.contains(&snap)
-            && !crate::signatures::indexed_signature_ids_for(layout, &[tomb])?.is_empty()
-        {
-            out.insert(tomb);
+    let drops = read_drops(layout)?;
+    if !drops.is_empty() {
+        let sigs = crate::signatures::index_by_target(layout)?;
+        for (snap, tomb, _) in drops {
+            if wanted.contains(&snap) && sigs.contains_key(&tomb) {
+                out.insert(tomb);
+            }
         }
     }
     Ok(out.into_iter().collect())
