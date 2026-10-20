@@ -299,11 +299,14 @@ fn origin_with_transcript(
     std::fs::create_dir_all(&origin).unwrap();
     let keys = root.join("keys");
     std::fs::create_dir_all(&keys).unwrap();
-    let (id, enc_pk, _sig_pk) = keygen(&keys, "alice");
+    let (id, enc_pk, sig_pk) = keygen(&keys, "alice");
     assert!(sc(&origin, &["init"]).status.success());
     std::fs::write(
         origin.join(".sc/recipients.toml"),
-        format!("[recipients]\nalice = \"{enc_pk}\"\n"),
+        format!(
+            "[recipients]\nalice = \"{enc_pk}\"\n\n[signing]\nalice = \"{sig_pk}\"\n\n\
+             [signers]\ntrusted = [\"alice\"]\n"
+        ),
     )
     .unwrap();
     std::fs::write(origin.join("a.txt"), "hello\n").unwrap();
@@ -336,6 +339,16 @@ fn origin_with_transcript(
     (root, origin, id)
 }
 
+/// recipients.toml is local config, not cloned: copy it so `sc verify
+/// --require` can resolve the trusted signer in `dst`.
+fn share_config(origin: &Path, dst: &Path) {
+    std::fs::copy(
+        origin.join(".sc/recipients.toml"),
+        dst.join(".sc/recipients.toml"),
+    )
+    .unwrap();
+}
+
 /// Number of lines in a repo's `.sc/transcripts` index (0 if absent).
 fn transcript_index_len(repo: &Path) -> usize {
     std::fs::read_to_string(repo.join(".sc/transcripts"))
@@ -351,15 +364,21 @@ fn assert_snapshot_ok_and_no_transcript(repo: &Path, refname: &str, file: &str) 
         "snapshot content transfers: {}",
         String::from_utf8_lossy(&cat.stderr)
     );
-    let verify = sc(repo, &["verify", refname]);
+    let verify = sc(repo, &["verify", "--require", refname]);
     assert!(
         verify.status.success(),
         "snapshot signature verifies: {}",
         String::from_utf8_lossy(&verify.stderr)
     );
     assert_eq!(transcript_index_len(repo), 0, "no transcript index entry");
+    let log = sc(repo, &["log"]);
     assert!(
-        !stdout(&sc(repo, &["log", refname])).contains("transcript:"),
+        log.status.success(),
+        "log: {}",
+        String::from_utf8_lossy(&log.stderr)
+    );
+    assert!(
+        !stdout(&log).contains("transcript:"),
         "log shows no transcript marker"
     );
 }
@@ -382,6 +401,7 @@ fn clone_no_transcripts_leaves_transcripts_out_and_plain_fetch_brings_them() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    share_config(&origin, &dst);
     assert_snapshot_ok_and_no_transcript(&dst, "main", "a.txt");
 
     // Per command: a later plain fetch brings the sealed transcript in.
@@ -404,7 +424,7 @@ fn clone_no_transcripts_leaves_transcripts_out_and_plain_fetch_brings_them() {
 
 #[test]
 fn fetch_no_transcripts_leaves_transcripts_out() {
-    let (root, origin, _id) = origin_with_transcript("nt-fetch");
+    let (root, origin, id) = origin_with_transcript("nt-fetch");
     let dst = root.join("clone");
     assert!(sc(
         &root,
@@ -417,9 +437,16 @@ fn fetch_no_transcripts_leaves_transcripts_out() {
     )
     .status
     .success());
+    share_config(&origin, &dst);
     // Origin moves on with a second commit; the clone fetches it opted out.
     std::fs::write(origin.join("b.txt"), "two\n").unwrap();
     assert!(sc(&origin, &["commit", "-m", "c2"]).status.success());
+    assert!(sc(
+        &origin,
+        &["sign", "main", "--identity", id.to_str().unwrap()]
+    )
+    .status
+    .success());
     let out = sc(&dst, &["fetch", "--no-transcripts"]);
     assert!(
         out.status.success(),
@@ -446,12 +473,7 @@ fn push_no_transcripts_sends_snapshot_but_not_transcript() {
     .success());
     // The clone commits, signs and attaches a transcript, then pushes opted out.
     let idp = id.to_str().unwrap();
-    // recipients.toml is local config, not cloned.
-    std::fs::copy(
-        origin.join(".sc/recipients.toml"),
-        dst.join(".sc/recipients.toml"),
-    )
-    .unwrap();
+    share_config(&origin, &dst);
     std::fs::write(dst.join("b.txt"), "two\n").unwrap();
     assert!(sc(&dst, &["commit", "-m", "c2"]).status.success());
     assert!(sc(&dst, &["sign", "main", "--identity", idp])
@@ -481,7 +503,9 @@ fn push_no_transcripts_sends_snapshot_but_not_transcript() {
     );
     // Origin got the new snapshot (verifiable) and no new transcript.
     assert!(sc(&origin, &["cat", "main:b.txt"]).status.success());
-    assert!(sc(&origin, &["verify", "main"]).status.success());
+    assert!(sc(&origin, &["verify", "--require", "main"])
+        .status
+        .success());
     assert_eq!(transcript_index_len(&origin), before);
     std::fs::remove_dir_all(&root).unwrap();
 }
