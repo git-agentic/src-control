@@ -40,7 +40,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0027](0027-bulk-rewrap-and-multi-escrow.md) | Bulk re-wrap and multiple escrow keys | Accepted | 17 |
 | [0028](0028-network-git-remotes.md) | Network Git remotes (GitHub over https/ssh) | Accepted | 18 |
 | [0029](0029-history-editing-polish.md) | History-editing polish — amend, resumable rebase, pick abort, merge replay | Accepted | 19 |
-| [0030](0030-agent-sessions-and-automerge.md) | Agent sessions and auto-merge of clean results | Accepted | 20 |
+| [0030](0030-agent-sessions-and-automerge.md) | Agent sessions and auto-merge of clean results | Accepted; one-session rule superseded by 0056 | 20 |
 | [0031](0031-hardening-consolidation.md) | Hardening & consolidation sweep — closing the P16–P20 review tail | Accepted | 21 |
 | [0032](0032-signed-commits-provenance.md) | Signed commits & provenance | Accepted | 22 |
 | [0033](0033-merge-ergonomics.md) | Merge ergonomics — conflict UX beyond markers | Accepted | 23 |
@@ -66,6 +66,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0053](0053-tls-pin-management.md) | TLS pin management (`sc tls`) | Accepted (built) | — |
 | [0054](0054-tls-ca-validation.md) | CA-path validation for `sc+https://` | Accepted (built) | — |
 | [0055](0055-bucket-compaction.md) | Bucket remote compaction and gc (`sc remote compact`) | Accepted (built) | 36 |
+| [0056](0056-named-concurrent-ws-sessions.md) | Named and concurrent `sc ws` sessions | Accepted (built; refresh designed, deferred) | 20 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,

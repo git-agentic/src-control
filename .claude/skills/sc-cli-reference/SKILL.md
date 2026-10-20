@@ -159,19 +159,26 @@ cargo run --bin sc -- work --agents 3 [--name <base>] -- <cmd>   # fork agent wo
                                                  # (--with-secrets --identity <key> injects
                                                  # decrypted secrets into each agent env)
 bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
-cargo run --bin sc -- ws fork --agents N [--identity <key>]  # durable multi-invocation
+cargo run --bin sc -- ws fork --agents N [--name <n>] [--identity <key>]  # durable multi-invocation
                                               # session: materializes N checkouts under
-                                              # .sc/ws/<i>/ and persists a manifest (P20)
-cargo run --bin sc -- ws list                 # open session's workspaces, changed/unchanged
-cargo run --bin sc -- ws run <i> [--with-secrets --identity <key>] -- <cmd>   # run <cmd> in
+                                              # .sc/ws/<i>/ and persists a manifest (P20).
+                                              # --name opens a further named session in
+                                              # .sc/ws-<n>/ beside the unnamed one (ADR-0056);
+                                              # a name already open is refused
+cargo run --bin sc -- ws list [--session <n>] # every open session's workspaces, changed/unchanged
+                                              # (or just session <n>'s)
+cargo run --bin sc -- ws run [--session <n>] <i> [--with-secrets --identity <key>] -- <cmd>   # run <cmd> in
                                               # workspace i (SC_WORKSPACE/SC_WORKSPACE_DIR set)
-cargo run --bin sc -- ws harvest [--into <branch>] [--identity <key>]   # probe + auto-merge
+cargo run --bin sc -- ws harvest [--session <n>] [--into <branch>] [--identity <key>]   # probe + auto-merge
                                               # every live workspace onto the landing branch
                                               # (default the session's base branch, which must
                                               # be checked out); clean lands cumulatively,
-                                              # conflicts fall back to work-<i> (always `work`;
-                                              # `--name` is `sc work` only)
-cargo run --bin sc -- ws abandon [<i>]        # drop one workspace or the whole session
+                                              # conflicts fall back to work-<i> (<n>-<i> for a
+                                              # named session); with several sessions the first
+                                              # harvest wins, a later conflicting one falls back.
+                                              # Omitting --session means the unnamed session,
+                                              # never a guessed named one
+cargo run --bin sc -- ws abandon [--session <n>] [<i>]  # drop one workspace or the whole session
 bash demo/run_ws_demo.sh                      # multi-invocation session + auto-merge proof (P20)
 cargo run --bin sc -- cherry-pick <ref> [--identity <key>]   # replay one commit onto the
                                               # current branch (--identity as above)
