@@ -97,7 +97,8 @@ fn run(tag: &str, op: Op, sparse: bool) -> BTreeMap<String, Vec<u8>> {
     }
     drop(s);
     drop(repo);
-    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists(), "temp repo must be removed");
     out
 }
 
