@@ -64,6 +64,9 @@ cargo run --bin sc -- merge <public-branch> --identity <key>   # ON a private br
                                              # public branch IN (keeps an embargo current); the
                                              # reverse (merge/cherry-pick/rebase FROM a private
                                              # branch) is refused — publish first
+cargo run --bin sc -- merge --abort --identity <key>   # ON a private branch: abort a stopped merge
+                                             # (restores the private tip's checkout; the key is
+                                             # required, a keyless abort refuses and leaves the stop)
 cargo run --bin sc -- merge <ref> [--identity <key>]   # three-way merge (ff when possible; exits
                                              # 1 on conflicts; --identity only needed when a
                                              # protected path diverged in content on both sides)
