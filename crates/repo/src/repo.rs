@@ -938,6 +938,11 @@ impl Repo {
         // in the pick arm avoids double-managing (and clobbering) the cache
         // `assemble_completion_snapshot` already saved.
         let mut cache: Option<crate::cache::ProtectedCache> = None;
+        // Files an interrupted widen laid outside the view go before the
+        // working tree is read, or they would be read as completion input.
+        if merging || picking {
+            self.remove_widen_residue(decided_root)?;
+        }
         let id = match (tip, merge_head, pick_head) {
             (Some(t), None, Some(ph)) => self.assemble_completion_snapshot(
                 t,
@@ -975,8 +980,6 @@ impl Repo {
         if merging || picking {
             let root = self.snapshot(&id)?.root;
             self.remove_conflict_sidecars(&[root])?;
-            // Likewise the files an interrupted widen laid outside the view.
-            self.remove_widen_residue(decided_root)?;
         }
         refs::write_branch_tip(&self.layout, &head, &id)?;
         crate::merge_state::clear(&self.layout)?;

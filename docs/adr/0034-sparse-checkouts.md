@@ -194,7 +194,8 @@ every claim below is checked against the shipped code, not the plan.
    bytes, before the op's state is cleared: the abort's own walk follows the
    other side's tree and the restored view, so it cannot see an ours-only
    file or a subtree never fetched for theirs. A file the user edited since is
-   left. On a
+   left. The cleanup runs before the working tree is read for completion, and a retry with a
+   different target keeps the earlier target's paths recorded. On a
    partial clone the new view is recorded in `.sc/sparse-prev` before the
    writes, so the abort's removal walk covers files an interrupted widen
    laid; the marker is restored to its prior state once the spec is stored.

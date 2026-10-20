@@ -551,7 +551,28 @@ impl Repo {
     /// `sparse-prev` marker an earlier interrupted `sparse set` left.
     fn finish_widen(&self, new: &Sparse, prev: Option<Sparse>) -> Result<()> {
         store(self.layout(), new)?;
-        remove_if_exists(&self.layout().sparse_widen_path())?;
+        // Paths an earlier interrupted widen (a different target) laid that
+        // the new view does not cover stay recorded, so abort and completion
+        // still clean them up.
+        let record = self.layout().sparse_widen_path();
+        match std::fs::read_to_string(&record) {
+            Ok(text) => {
+                let mut lines = text.lines();
+                let header = lines.next().unwrap_or_default();
+                let kept: Vec<&str> = lines.filter(|p| !p.is_empty() && !new.matches(p)).collect();
+                if kept.is_empty() {
+                    remove_if_exists(&record)?;
+                } else {
+                    let body: String = kept.iter().map(|p| format!("{p}\n")).collect();
+                    scl_core::fsutil::atomic_write_durable(
+                        &record,
+                        format!("{header}\n{body}").as_bytes(),
+                    )?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         if self.promisor()?.is_some() {
             match prev {
                 Some(p) => store_prev(self.layout(), &p)?,

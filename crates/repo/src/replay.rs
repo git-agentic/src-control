@@ -1208,6 +1208,8 @@ impl Repo {
             // construction; `rebase` refuses up front if a merge commit is
             // in the replayed range), so the registry base is always the
             // conflicted commit's own first parent.
+            // Before the working tree is read (see `commit`).
+            self.remove_widen_residue(decided)?;
             let new_tip = self.assemble_completion_snapshot(
                 st.acc_tip,
                 st.conflicted,
@@ -3356,6 +3358,34 @@ mod tests {
             repo.rebase_continue("me", None).unwrap(),
             RebaseResult::Rebased { .. }
         ));
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// A widen interrupted after its writes, retried with a different target:
+    /// the first target's files stay recorded, and the abort removes them.
+    #[test]
+    fn a_changed_retry_keeps_the_first_widens_record_for_the_abort() {
+        let (root, repo) = rebase_refused_at_an_out_of_view_conflict("sparse-rebase-retry-other");
+        let old = repo.sparse_spec().unwrap();
+        let first = Sparse::new(vec!["src/".into(), "docs/".into()]);
+        let decided = crate::rebase_state::read_decided_root(repo.layout())
+            .unwrap()
+            .unwrap();
+        repo.lay_out_widened_view(decided, &old, &first).unwrap();
+        assert!(root.join("docs/y.txt").exists());
+
+        repo.set_sparse(&["src/".into(), "lib/".into()], None)
+            .unwrap();
+        assert!(root.join("lib/z.txt").exists());
+        assert!(
+            repo.layout().sparse_widen_path().exists(),
+            "the docs/ files are still recorded"
+        );
+        repo.rebase_abort().unwrap();
+        assert!(!root.join("docs/y.txt").exists());
+        assert!(!root.join("docs/x.txt").exists());
+        assert!(!repo.layout().sparse_widen_path().exists());
         drop(repo);
         remove_root(&root);
     }
