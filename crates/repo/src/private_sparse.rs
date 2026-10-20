@@ -160,3 +160,33 @@ fn replay_onto_a_private_branch_stays_refused_under_sparse() {
     std::fs::remove_dir_all(&f.root).unwrap();
     assert!(!f.root.exists(), "test dir left behind");
 }
+
+#[test]
+fn an_untracked_file_where_the_public_side_adds_one_out_of_view_is_refused() {
+    let f = fixture("collide", true, false);
+    let mine = f.root.join("docs/new.txt");
+    std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+    std::fs::write(&mine, "MINE\n").unwrap();
+    let (_, before, _) = f.repo.head_private().unwrap().unwrap();
+    let err = f
+        .repo
+        .merge_into_private("main", "alice", Some(&f.sk))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("docs/new.txt"), "{err}");
+    assert!(err.contains("move it away"), "{err}");
+    assert!(!crate::merge_state::in_progress(f.repo.layout()));
+    assert_eq!(f.repo.head_private().unwrap().unwrap().1, before);
+    assert_eq!(std::fs::read_to_string(&mine).unwrap(), "MINE\n");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
+        "private\n",
+        "refusal wrote nothing"
+    );
+    // Moved away, the same run lands the public addition.
+    std::fs::remove_file(&mine).unwrap();
+    let got = run(&f, true);
+    assert_eq!(got["new.txt"], "new-public\n");
+    std::fs::remove_dir_all(&f.root).unwrap();
+    assert!(!f.root.exists(), "test dir left behind");
+}

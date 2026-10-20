@@ -383,6 +383,12 @@ impl Repo {
         // Before the first removal or write: nothing of the user's may be
         // replaced (see `refuse_untracked_paths`).
         self.refuse_untracked_paths(op, old_paths, target.keys())?;
+        self.refuse_untracked_out_of_view_paths(
+            op,
+            &sparse,
+            old_paths,
+            &target.keys().cloned().collect(),
+        )?;
         for p in old_paths {
             if !target.contains_key(p) || !sparse.matches(p) {
                 let full = worktree::safe_join(&self.layout.root, p)?;
@@ -1333,6 +1339,10 @@ impl Repo {
             // value (`commit_private`, #240). It reads MERGE_HEAD.
             let prior_entries = self.inner_tree_files(&mut store, &ctx, ours_snap.root)?;
             let prior_paths: BTreeSet<String> = prior_entries.keys().cloned().collect();
+            // Completion reads the working tree, where a file wins over the
+            // merge's addition: refuse one in the way outside the view (#248).
+            let merged_paths: BTreeSet<String> = fm.files.iter().map(|f| f.path.clone()).collect();
+            self.refuse_untracked_out_of_view_paths("merge", &sparse, &prior_paths, &merged_paths)?;
             // Carried protected ciphertext: decrypt for the resolver to see
             // (completion re-seals it as needed). One this recipient cannot
             // read has its old plaintext dropped, so completion carries the
@@ -1420,7 +1430,6 @@ impl Repo {
                 let full = worktree::safe_join(&self.layout.root, name)?;
                 std::fs::write(&full, bytes)?;
             }
-            let merged_paths: BTreeSet<String> = fm.files.iter().map(|f| f.path.clone()).collect();
             for p in prior_paths.difference(&merged_paths) {
                 if !sparse.matches(p) {
                     continue;

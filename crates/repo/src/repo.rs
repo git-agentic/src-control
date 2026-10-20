@@ -2056,7 +2056,11 @@ impl Repo {
                 .collect()
             }
         };
-        self.refuse_untracked_overwrite_vs(op, &old, target_root)
+        self.refuse_untracked_overwrite_vs(op, &old, target_root)?;
+        match old_root {
+            Some(old) => self.refuse_untracked_out_of_view(op, old, target_root),
+            None => Ok(()),
+        }
     }
 
     /// Refuse, before any write, a forward operation (`op`) whose result would
@@ -2184,6 +2188,75 @@ impl Repo {
                          {rel}; move it away, then retry"
                     )))
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse, before any write, an operation (`op`) whose result adds a file
+    /// outside the sparse view at a path where the user already has an
+    /// untracked or ignored file or directory. Nothing is written there, but
+    /// a later commit (a stop's completion, or the next ordinary one) reads
+    /// the working tree, where a file wins over the tree, and would commit the
+    /// user's bytes instead of the addition, silently (#248). `old_root` is
+    /// the tree the working tree reflects, `target_root` the result. A path
+    /// `old_root` already tracks is the user's tracked file, not a collision.
+    pub(crate) fn refuse_untracked_out_of_view(
+        &self,
+        op: &str,
+        old_root: ObjectId,
+        target_root: ObjectId,
+    ) -> Result<()> {
+        let sparse = self.sparse_spec()?;
+        if sparse.is_full() {
+            return Ok(());
+        }
+        let partial = self.promisor()?.is_some();
+        let (old, target) = {
+            let store_arc = self.vfs.store();
+            let mut store = store_arc.lock().unwrap();
+            let mut paths = |root| -> Result<std::collections::BTreeSet<String>> {
+                // A partial clone lacks some subtrees: read what it holds.
+                Ok(if partial {
+                    worktree::tree_file_entries_with_perms_sparse_present(
+                        &mut store,
+                        root,
+                        &crate::Sparse::default(),
+                    )?
+                } else {
+                    worktree::tree_file_entries_with_perms(&mut store, root)?
+                }
+                .into_keys()
+                .collect())
+            };
+            (paths(old_root)?, paths(target_root)?)
+        };
+        self.refuse_untracked_out_of_view_paths(op, &sparse, &old, &target)
+    }
+
+    /// The path-list core of [`Repo::refuse_untracked_out_of_view`], for a
+    /// caller that already holds both trees' file paths (a private branch's
+    /// decrypted trees).
+    pub(crate) fn refuse_untracked_out_of_view_paths(
+        &self,
+        op: &str,
+        sparse: &crate::Sparse,
+        old: &std::collections::BTreeSet<String>,
+        target: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        // A prefix that is a file in `old` yet a directory in `target` is not
+        // the tracked file either: nothing removes it out of view.
+        let mut is_tracked = |p: &str| old.contains(p) && target.contains(p);
+        for rel in target
+            .iter()
+            .filter(|p| !sparse.matches(p) && !old.contains(*p))
+        {
+            if stop_write_blocker(&self.layout.root, rel, &mut is_tracked)?.is_some() {
+                return Err(Error::InvalidArgument(format!(
+                    "{op} would add {rel} (outside your sparse checkout), where an untracked or \
+                     ignored file or directory already stands; a later commit would take that \
+                     instead of the addition; move it away, then retry"
+                )));
             }
         }
         Ok(())
@@ -2490,6 +2563,9 @@ impl Repo {
         // before the first stale file is removed or written (ADR-0048).
         self.ensure_view(target_root, &self.sparse_spec()?)?;
         self.refuse_untracked_overwrite_vs("switch", &old_paths, target_root)?;
+        if let Some(old) = old_root {
+            self.refuse_untracked_out_of_view("switch", old, target_root)?;
+        }
         if head_priv.is_some() {
             // Remove private-tip paths the public target doesn't track,
             // BEFORE materialize lays the target down.
