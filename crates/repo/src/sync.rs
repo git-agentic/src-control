@@ -1334,7 +1334,9 @@ mod tests {
 
         drop(b);
         std::fs::remove_dir_all(&a_root).unwrap();
+        assert!(!a_root.exists());
         std::fs::remove_dir_all(&b_root).unwrap();
+        assert!(!b_root.exists());
     }
 
     #[test]
@@ -1395,6 +1397,7 @@ mod tests {
         drop((b, c, d));
         for root in [&a_root, &b_root, &c_root, &d_root] {
             std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
         }
     }
 
@@ -1421,7 +1424,9 @@ mod tests {
 
         drop(b);
         std::fs::remove_dir_all(&a_root).unwrap();
+        assert!(!a_root.exists());
         std::fs::remove_dir_all(&b_root).unwrap();
+        assert!(!b_root.exists());
     }
 
     #[test]
@@ -1467,6 +1472,7 @@ mod tests {
         drop((b, c, d));
         for root in [&a_root, &b_root, &c_root, &d_root] {
             std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
         }
     }
 

@@ -1122,6 +1122,7 @@ pub(crate) mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]
@@ -1186,6 +1187,7 @@ pub(crate) mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]
@@ -1211,5 +1213,6 @@ pub(crate) mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 }

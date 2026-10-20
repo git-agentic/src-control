@@ -257,8 +257,9 @@ over-send, whatever order the lines landed in.
   A tombstone that fails the checks stays an inert object. A fetching peer
   re-evaluates it whenever it is sent again (for example after the operator
   adds the signer to the trust list and fetches). `push` never re-sends an
-  object the remote already holds, so a remote that received the tombstone by
-  push before trusting the signer keeps it inert.
+  object the remote already holds; a remote that received the tombstone by
+  push before trusting the signer re-evaluates it from
+  `.sc/transcript-pending` (#230, delivery addendum below).
 - **sender:** the over-send of every transfer includes each retained
   tombstone that has an indexed signature, with its signatures (selection
   widened by #230, see the delivery addendum below; it was the tombstones of
@@ -315,7 +316,7 @@ this follows from drop not being erasure.
 Trade-offs. Trust is local configuration, not repository content, so a fresh
 clone ignores tombstones until its operator trusts the signer and fetches
 again (a clone of a store that already honored the drop never receives the
-body in the first place). Trust is checked at ingest, not retroactively, so removing a signer
+body in the first place). Trust is checked when a tombstone is evaluated (at ingest, or on a later open or ingest for a held one, #230), not retroactively, so removing a signer
 later does not undo drops already recorded. "Trusted signer" is the same
 project-level authority that can sign commits; it is deliberately not
 narrowed to the transcript's recipients or its own signer, because
