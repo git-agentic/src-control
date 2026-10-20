@@ -89,7 +89,7 @@ Storage and knobs:
 
 - `~/.config/sc/known_hosts` (`$XDG_CONFIG_HOME/sc/known_hosts` if set,
   falling back to `$HOME/.config/sc/known_hosts`; `SC_HTTPS_KNOWN_HOSTS`
-  overrides the path outright), one `host:port sha256:<hex>` line per pin.
+  overrides the path outright), one `host:port sha256:<hex>` line per pin (an IPv6 literal host is bracketed, `[::1]:7777`, and stored in its canonical text form).
 - `SC_HTTPS_FINGERPRINT=sha256:<hex>` pre-pins a connection (e.g. for CI)
   without ever writing to the known_hosts file — an explicit, non-persisted
   override.

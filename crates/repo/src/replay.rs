@@ -2820,9 +2820,10 @@ mod tests {
     /// A full clone with a sparse view: the tree tracks a protected path the
     /// view never materialized, and the user keeps an ignored local copy there.
     /// An in-view conflict together with a clean protected merge of that path
-    /// would write plaintext over it, so the stop refuses.
+    /// would write plaintext over it, so the stop refuses (since #210 on the
+    /// sparse gate, before the untracked-overwrite check is reached).
     #[test]
-    fn a_conflict_stop_does_not_treat_an_out_of_view_path_as_materialized() {
+    fn a_conflict_stop_refuses_an_out_of_view_sealing_input_and_keeps_the_local_copy() {
         let root = tmp_root("mg-sparse-untracked");
         let repo = Repo::init(&root).unwrap();
         let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
@@ -2851,7 +2852,7 @@ mod tests {
             .merge_with_identity("work", "me", Some(&alice_sk))
             .unwrap_err();
         assert!(
-            matches!(&err, Error::InvalidArgument(m) if m.contains("overwrite an untracked")),
+            matches!(&err, Error::InvalidArgument(m) if m.contains("outside your sparse checkout")),
             "got {err:?}"
         );
         assert!(!repo.merge_in_progress());
@@ -2861,6 +2862,184 @@ mod tests {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `main` and `work` both edit `src/a.txt` (a conflict) and a line of the
+    /// protected `vault/s.txt` (a clean content merge needing the identity);
+    /// `work` also edits `src/b.txt` in a second commit. `main` is checked out
+    /// with the view narrowed to `src/`, so the merge's sealing input lies
+    /// outside it.
+    fn mixed_conflict_fixture(name: &str) -> (std::path::PathBuf, Repo, scl_crypto::SecretKey) {
+        let root = tmp_root(name);
+        let repo = Repo::init(&root).unwrap();
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("vault/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("vault")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("src/b.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("vault/s.txt"), b"s1\ns2\ns3\ns4\ns5\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("src/b.txt"), b"OURS\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("vault/s.txt"), b"OURS\ns2\ns3\ns4\ns5\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch_with_identity("work", Some(&sk)).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        repo.commit("me", "work 1").unwrap();
+        std::fs::write(root.join("src/b.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("vault/s.txt"), b"s1\ns2\ns3\ns4\nTHEIRS\n").unwrap();
+        repo.commit("me", "work 2").unwrap();
+        (root, repo, sk)
+    }
+
+    fn assert_widen_refusal(err: &Error, path: &str) {
+        match err {
+            Error::InvalidArgument(m) => {
+                assert!(m.contains(path), "names the path: {m}");
+                assert!(m.contains("outside your sparse checkout"), "{m}");
+            }
+            other => panic!("expected the sparse refusal, got {other:?}"),
+        }
+    }
+
+    /// The stop writes nothing: no file out of view, no bookkeeping, and the
+    /// in-view file keeps the user's content.
+    fn assert_nothing_written(root: &std::path::Path) {
+        assert!(!root.join("vault/s.txt").exists(), "nothing out of view");
+        assert!(!root.join(".sc/CONFLICT_PLAINTEXT").exists());
+        assert!(!root.join(".sc/CONFLICT_SIDECARS").exists());
+        assert_eq!(
+            std::fs::read(root.join("src/a.txt")).unwrap(),
+            b"OURS\nl2\nl3\n",
+            "the in-view file is untouched"
+        );
+    }
+
+    /// A cherry-pick with an in-view conflict and an out-of-view protected
+    /// content merge refuses before any write, on a full clone.
+    #[test]
+    fn a_cherry_pick_with_an_out_of_view_sealing_input_refuses_before_any_write() {
+        let (root, repo, sk) = mixed_conflict_fixture("sparse-pick-vault");
+        repo.switch_with_identity("main", Some(&sk)).unwrap();
+        repo.set_sparse(&["src/".into()], Some(&sk)).unwrap();
+        let before = repo.head_tip().unwrap();
+        let err = repo.cherry_pick("work", "me", Some(&sk), None).unwrap_err();
+        assert_widen_refusal(&err, "vault/s.txt");
+        assert!(!repo.pick_in_progress());
+        assert_eq!(repo.head_tip().unwrap(), before);
+        assert_nothing_written(&root);
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// `sc sparse set` is refused while a rebase is stopped, so a refusal
+    /// reached from `--continue` must send the user to abort first.
+    #[test]
+    fn a_rebase_continue_refusal_points_at_abort_not_at_sparse_set() {
+        let (root, repo, sk) = mixed_conflict_fixture("sparse-rebase-vault");
+        repo.set_sparse(&["src/".into()], Some(&sk)).unwrap();
+        // Commit 1 only touches src/a.txt: an in-view conflict, no sealing.
+        assert!(matches!(
+            repo.rebase("main", "me", Some(&sk)).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        std::fs::write(root.join("src/a.txt"), b"RESOLVED\nl2\nl3\n").unwrap();
+        // Commit 2 conflicts on src/b.txt and merges vault/s.txt out of view.
+        let err = repo.rebase_continue("me", Some(&sk)).unwrap_err();
+        assert_widen_refusal(&err, "vault/s.txt");
+        let Error::InvalidArgument(m) = &err else {
+            unreachable!()
+        };
+        assert!(m.contains("sc rebase --abort"), "{m}");
+        assert!(repo.rebase_in_progress(), "the rebase is still stopped");
+        assert!(matches!(
+            repo.set_sparse(&["src/".into(), "vault/".into()], Some(&sk)),
+            Err(Error::RebaseInProgress)
+        ));
+        assert!(!root.join("vault/s.txt").exists(), "nothing out of view");
+        repo.rebase_abort().unwrap();
+        assert!(!root.join("vault/s.txt").exists(), "nothing after abort");
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// A plain file of ours under a rule only theirs has is routed to sealing
+    /// too (the I2 case); outside the view it refuses the same way.
+    #[test]
+    fn a_plain_file_under_a_theirs_only_rule_outside_the_view_refuses_the_stop() {
+        let root = tmp_root("sparse-i2-vault");
+        let repo = Repo::init(&root).unwrap();
+        let (sk, pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        std::fs::create_dir_all(root.join("vault")).unwrap();
+        std::fs::write(root.join("vault/s.txt"), b"plain\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.protect("vault/", &[pk], None).unwrap();
+        repo.switch("main").unwrap();
+        repo.set_sparse(&["src/".into()], Some(&sk)).unwrap();
+
+        let err = repo
+            .merge_with_identity("work", "me", Some(&sk))
+            .unwrap_err();
+        assert_widen_refusal(&err, "vault/s.txt");
+        assert!(!repo.merge_in_progress());
+        assert_nothing_written(&root);
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// With a file-exact view (`src/a.bin`) the sidecar `src/a.bin.theirs`
+    /// does not match the spec, yet it sits beside an in-view conflict: the
+    /// stop must write it, and abort and completion must remove it.
+    #[test]
+    fn a_binary_conflict_in_a_file_exact_view_writes_and_removes_its_sidecar() {
+        let root = tmp_root("sparse-file-exact");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.bin"), b"\xff\xfebase\n").unwrap();
+        std::fs::write(root.join("other.txt"), b"x\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("src/a.bin"), b"\xff\xfeOURS\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("src/a.bin"), b"\xff\xfeTHEIRS\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        repo.set_sparse(&["src/a.bin".into()], None).unwrap();
+        assert!(!root.join("other.txt").exists());
+
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(1)
+        ));
+        assert!(root.join("src/a.bin.theirs").exists(), "sidecar written");
+        repo.merge_abort().unwrap();
+        assert!(!root.join("src/a.bin.theirs").exists(), "sidecar removed");
+        assert!(!root.join(".sc/CONFLICT_SIDECARS").exists());
+
+        // Completion: resolve, commit; the sidecar is in neither the tree nor
+        // the working tree.
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(1)
+        ));
+        std::fs::write(root.join("src/a.bin"), b"\xff\xferesolved\n").unwrap();
+        repo.commit("me", "merge").unwrap();
+        assert!(!repo.tracked_paths().unwrap().contains("src/a.bin.theirs"));
+        assert!(!root.join("src/a.bin.theirs").exists(), "scratch removed");
+        assert!(!root.join(".sc/CONFLICT_SIDECARS").exists());
+        drop(repo);
+        remove_root(&root);
     }
 
     /// A binary conflict writes `<path>.theirs`. An untracked file already
