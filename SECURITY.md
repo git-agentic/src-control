@@ -29,7 +29,9 @@ it are consolidated in [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md). In brief:
 - **Bucket remotes (`sc+wal://`, `sc+s3://`) put the bucket's ACL on the
   perimeter.** Public content sits in the bucket as plaintext at rest and a
   writer with raw bucket access can move refs outside the `sc` client; sealed
-  content stays ciphertext.
+  content stays ciphertext. Signatures and transcripts do not travel through a
+  bucket (#229): a signed commit pushed there reads as unsigned after a fetch or
+  clone from the bucket, so `sc verify --require` cannot vouch for it.
 - Committed secrets injected by `sc run` live in an **authorized local process
   context, not strong isolation** — same-user processes can observe the child
   environment. `sc run --secrets-fd N` keeps them out of the environment but

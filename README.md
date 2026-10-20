@@ -166,7 +166,8 @@ and Git (including hosted GitHub) network transports, plus private branches
 sealed to a recipient set until publish and a read-only Tauri desktop
 browser. All 36 phases and P37a-37d are implemented and tested; `demo/` holds
 27 independent end-to-end proofs, one per major capability. Remaining
-follow-ons (transcript delivery gaps on drop and bucket remotes, bucket
+follow-ons (signatures and transcripts not travelling through bucket remotes
+(#229), transcript drop delivery gaps, bucket
 compaction and gc, named concurrent `sc ws` sessions, size/count clone
 filters, an operator-configurable object-size cap, and similar hardening
 items) are tracked in [ROADMAP.md](ROADMAP.md)'s Deferred section and as open

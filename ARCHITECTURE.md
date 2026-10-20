@@ -1132,8 +1132,12 @@ identity and scratch space while all served content lives in the bucket, so
 instances are disposable. Public content sits in the bucket as plaintext at
 rest (the bucket ACL is the perimeter; sealed content stays ciphertext), and
 `sc clone --filter` is refused against a bucket remote. Bucket compaction and gc
-are not built (open issue #216), and bucket remotes do not carry indexed
-transcripts (#229). See ADR-0046 and `docs/research/walgit-evaluation.md`.
+are not built (open issue #216). A bucket's `get_pack` is reachability-only, so
+signatures and transcripts do not travel through it (open issue #229): a signed
+commit pushed to a bucket remote shows as unsigned after a later fetch or clone
+from that bucket (including through `sc serve --store`), and attached
+transcripts are stored but never served back. Verify signed history from a
+non-bucket remote until that is fixed. See ADR-0046 and `docs/research/walgit-evaluation.md`.
 
 ## Phase 37a — want-by-id fetch (built)
 
