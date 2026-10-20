@@ -384,7 +384,9 @@ pub(crate) fn reevaluate_pending(layout: &Layout, store: &mut scl_core::Store) -
         let Some(dropped) = t.dropped_id() else {
             continue;
         };
-        if tombstone_honored(store, &trusted, &sigs, *id, &t, dropped)? {
+        // An unreadable object keeps the entry for the next trigger rather
+        // than aborting the rest.
+        if tombstone_honored(store, &trusted, &sigs, *id, &t, dropped).unwrap_or(false) {
             append_drop(layout, (t.snapshot, *id, dropped))?;
             honored += 1;
         } else {

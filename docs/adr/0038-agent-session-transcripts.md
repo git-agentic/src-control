@@ -482,6 +482,15 @@ re-runs. Fix: a small local index plus re-evaluation.
 
 ### Not changed
 
+A tombstone a repo already held when it upgraded to this build has no pending
+entry, so a push-only remote in that state still needs the signer trusted
+before the drop is pushed (a fetching peer is re-sent it and recovers). A
+one-time full-store scan would fix it but is unbounded, so it is not done.
+`Repo::open` now may update the derived drop indexes under the lock it already
+takes; failures there are ignored, not reported. A pending entry also costs
+re-evaluation work on each ingest, including a lazy by-id gap fill, up to the
+1024 cap.
+
 `push` still returns early when the remote tip equals the local tip, so a
 drop alone does not push (unchanged). Clone `reindex` is unchanged: it
 rebuilds drops from the store and does not touch the pending file.

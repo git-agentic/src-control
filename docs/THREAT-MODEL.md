@@ -213,7 +213,9 @@ too, not just the src-control-side metadata.
   served remote. Every retained signed tombstone is sent on every transfer, so
   a peer is told even after gc collected the snapshot; a peer that pushes junk
   can only evict pending entries, not get one honored. Trust is checked at
-  evaluation and is not retroactive.
+  evaluation and is not retroactive. A tombstone a remote already held before
+  upgrading to a build with the pending index is not remembered: trust the
+  signer before the drop is pushed, or have a fetching peer re-send it.
 
 ## Network transport (`sc serve --http` / `sc+http(s)://` / `ssh://`) — ADR-0022/0036/0040/0041/0042
 
