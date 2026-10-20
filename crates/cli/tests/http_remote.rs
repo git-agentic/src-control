@@ -231,6 +231,33 @@ fn serve_token_expires_and_rotate() {
     assert!(!sc(&root, &["serve", "token", "rotate", "missing"])
         .status
         .success());
+
+    // A past expires_at (written directly: `add` refuses one) is flagged.
+    let path = root.join(".sc").join("serve-tokens.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let past: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.starts_with("expires_at") {
+                "expires_at = 1".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    std::fs::write(&path, past.join("\n")).unwrap();
+    let list = sc(&root, &["serve", "token", "list"]);
+    let out = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        out.contains("EXPIRED") && out.contains("1970-01-01"),
+        "{out}"
+    );
+    assert!(
+        !sc(&root, &["serve", "token", "rotate", "t"])
+            .status
+            .success(),
+        "rotating an expired token is refused"
+    );
 }
 
 /// An invalid `--scope` is rejected with a clear message rather than
