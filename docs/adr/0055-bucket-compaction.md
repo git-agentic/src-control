@@ -85,10 +85,14 @@ never deleted.
   not). A pack named by an old checkpoint or a straggler's in-flight entry is
   therefore kept. If a retained object cannot be decoded the sweep stops
   without deleting packs (fail closed).
-- **Order:** log entries, then older checkpoints, then idx, then pack. Every
-  prefix of this order leaves a bucket a cold start reads, because none of
-  these are reachable from the manifest being deleted-against. The manifest
-  is re-read before each batch; if it moved the sweep stops and reports it.
+- **Order:** log entries, then older checkpoints, then (for each pack) idx,
+  then pack. Every prefix of this order leaves a bucket a cold start reads,
+  because none of these are reachable from the manifest being deleted against.
+  Log entries and checkpoints behind the cutoff are safe whatever the manifest
+  does meanwhile (the cutoff only grows). Pack deletion alone is gated on the
+  manifest being unchanged since the pack set was computed; if it moved, the
+  pack set is replanned (bounded), and otherwise the run keeps the packs and
+  says so.
 - `K` rather than "the current checkpoint" matters on a busy remote: folds
   happen every 64 pushes, so the newest checkpoint is rarely `grace` old,
   while an older one is.
@@ -134,9 +138,10 @@ store offers no atomic "delete if the manifest is unchanged". Two defenses:
    time is at least `grace` old (default 24 h). A writer's gap between upload
    and CAS is milliseconds to minutes.
 2. **Verify before commit.** `update_ref` checks (`list_meta("packs/<hash>.")`)
-   that each pending pack and idx still exist before every log-slot claim, and
-   fails with a clear retry-the-push error if not, instead of committing an
-   entry that names a deleted pack.
+   that each pending pack and idx still exist immediately before every
+   manifest CAS (after the log slot is claimed), and fails with a clear
+   retry-the-push error if not, instead of committing an entry that names a
+   deleted pack. The window left is one bucket round trip.
 
 **Residual limit (documented, not closed).** A writer that stalls longer than
 `grace` between uploading a pack and its CAS, or re-pushes byte-identical

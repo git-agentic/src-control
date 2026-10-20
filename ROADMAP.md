@@ -564,7 +564,9 @@ across every phase.
   Public content is plaintext at rest (the bucket ACL is the perimeter);
   `clone --filter` is refused. `get_pack` serves signatures, transcripts and
   signed drop tombstones by decoding the on-chain packs (#229, no format
-  change). (ADR-0046.)
+  change). `sc remote compact` (#216) merges small packs and deletes the log
+  entries, checkpoints and unreferenced packs behind an aged cutoff; readers
+  restart on a moved manifest; no format change. (ADR-0046, ADR-0055.)
 - **Phase 37a — Want-by-id fetch.** A batched `GetObjects` verb (wire v5), an
   opt-in `.sc/promisor-lazy` marker, and `sc cat <ref>:<path>`, which fills only
   the absent trees and the blob on its path. `Store::get` stays network-free.
@@ -649,7 +651,7 @@ under Deferred below.
 | **P33 — Randomized protected encryption** | Close equality confirmation for new protected content | fresh DEK + nonce per seal, dual-read/randomized-write, keyed local stat cache, rewrap upgrade | [0043](docs/adr/0043-randomized-protected-encryption.md) |
 | **P34 — Private branches** | Keep an entire branch opaque before publication | sealed object closure behind a manifest; O(1) grant, KEK-rotating revoke, scanner-gated publish | [0044](docs/adr/0044-per-branch-access-control.md) |
 | **P35 — Native desktop browser** | Prove native `.sc` objects can power a polished visual tool | Tauri app opens a repository and browses refs, snapshot DAG/provenance, public trees, and first-parent diffs while locked/private states remain safe | [0045](docs/adr/0045-native-desktop-read-model.md) |
-| **P36 — Bucket WAL remotes** | Sync through an object store with no long-lived server | `sc remote add <name> sc+wal://<dir>` or `sc+s3://<bucket>/<prefix>`; immutable packs plus one CAS'd manifest, checkpoints for cold start (P36b), `sc serve --store <url>` for a disposable bucket-backed server (P36c); signatures, transcripts and drop tombstones travel (#229); covered by unit and integration tests, no demo script | [0046](docs/adr/0046-wal-bucket-remotes.md) |
+| **P36 — Bucket WAL remotes** | Sync through an object store with no long-lived server | `sc remote add <name> sc+wal://<dir>` or `sc+s3://<bucket>/<prefix>`; immutable packs plus one CAS'd manifest, checkpoints for cold start (P36b), `sc serve --store <url>` for a disposable bucket-backed server (P36c); signatures, transcripts and drop tombstones travel (#229); `sc remote compact` prunes and merges (#216); covered by unit and integration tests, no demo script | [0046](docs/adr/0046-wal-bucket-remotes.md), [0055](docs/adr/0055-bucket-compaction.md) |
 | **P37a — Want-by-id fetch (`sc cat`)** | Read outside a partial clone's filter without backfilling everything | `sc clone --filter src/ --lazy`; `sc cat main:docs/api/guide.bin` fetches exactly the absent trees and the blob by object id (`GetObjects`, wire v5), sibling untouched; `SC_OFFLINE=1` and non-lazy clones keep the gap error; proven by `demo/run_lazy_fetch_demo.sh` | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
 | **P37b — Presence-based partial clones** | Make push, verify, gc and the view agree on what a partial clone holds | `reachable_objects_partial` walks the store, not the filter; `GapInView` before any write; on a lazy, online clone the view closure is filled by id before switch, fast-forward, undo and `sparse set` (which may widen past the filter) | [0048](docs/adr/0048-presence-based-partial-clones.md) |
 | **P37c — Merge on partial clones** | `sc merge`, `sc cherry-pick` and `sc rebase` without a full clone | tree-recursive engine carries subtrees by id; conflicts in the view are marked and resolved with `sc conflicts`/`sc resolve`; conflicts outside the view are refused before any write | [0049](docs/adr/0049-merge-on-partial-clones.md) |
@@ -873,22 +875,12 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   fetch-time freshness attestation so a hostile remote can't re-serve a
   stale pre-revoke manifest — the same gittuf-shaped signed-ref effort the
   P22 provenance boundary already defers.
-- **Bucket compaction/gc (#216, P36a follow-on).** The WAL log (`log/<seq>` keys,
-  each a hand-rolled versioned binary `walfmt` entry, not protobuf) grows
-  unboundedly with no compaction — a cold-start reader now stops at the
-  latest checkpoint (P36b) instead of walking to `0`, but no log entry,
-  checkpoint, or superseded pack is ever actually removed from the bucket.
-  Deferred until a safe pruning cutoff (e.g. "no reader can still need
-  anything before checkpoint N") is designed. Compaction is also what
-  relieves `walfmt::MAX_LIST` (65536): a checkpoint fold with more refs or
-  packs than that cap is skipped outright (`maybe_fold_checkpoint`'s guard,
-  P36b review) rather than writing an object `Checkpoint::decode` would then
-  refuse to read back, so a remote whose live ref/pack count grows past the
-  cap loses folding entirely until compaction can retire entries below it.
 - **Leases (P36a follow-on).** The only cross-writer coordination today is
   the manifest's compare-and-swap; there is no lease/TTL primitive for
   operations that need to hold exclusive intent across more than one bucket
-  round-trip (e.g. a long-running compaction). Deferred.
+  round-trip (e.g. a long-running compaction). Deferred. It would also close
+  the one residual hazard ADR-0055 documents: a writer stalled longer than
+  `sc remote compact --prune-expire` between uploading a pack and committing it.
 - **Derived-data layer (Scion-inspired, after P37).** Blame, path history,
   commit-graph skip lists and copy-detection computed by one generic
   recursive mechanism over snapshots, stored outside the CAS and rebuildable

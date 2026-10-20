@@ -106,7 +106,8 @@ confidentiality perimeter for public content, not the sc protocol.
   suite).
 - The log grows unboundedly with no compaction yet — every open reader walks
   the full parent chain back from `head_seq`. Checkpoint folding (P36b) and
-  bucket GC/compaction are deferred (see `ROADMAP.md`).
+  bucket GC/compaction are deferred (see `ROADMAP.md`). *(Both are built:
+  P36b below, compaction and gc in ADR-0055.)*
 - `sc serve` still cannot host a bucket as its backing store (P36c) — a
   bucket remote today is written to directly by every `sc push`/`sc fetch`
   client, not brokered through a server process.
@@ -218,3 +219,27 @@ hash). No manifest, log, checkpoint or idx change and no `PROTOCOL_VERSION`
 bump. The receiver's trust gate for tombstones and the `--no-transcripts`
 skip are unchanged. Rationale and cost in ADR-0038's #229 addendum.
 
+## As built (#216, 2026-10): compaction and gc
+
+`sc remote compact <name> [--dry-run] [--prune-expire 24h]` merges small live
+packs behind one manifest CAS, then deletes log entries, checkpoints and
+unreferenced packs that no reader or writer can still need. The design, the
+pruning cutoff, the reader and writer protocols and the residual limit live in
+ADR-0055. Effects on this ADR's contracts:
+
+- **No format change.** The manifest, log entry and checkpoint encodings and
+  `PROTOCOL_VERSION` are untouched. Compaction writes a log entry with
+  `updates = []` and a checkpoint whose `packs` list is a covering set rather
+  than a literal accumulation; both decode in every released reader.
+- **Readers restart instead of failing when an object they just read about
+  is gone.** The "absent checkpoint / log entry / idx / pack" refusals in
+  P36b stay fail-closed, but only after a re-read of the manifest shows it did
+  not move. A moved manifest restarts the read on the new one.
+- **A pending pack is verified present right before the manifest CAS**, so a
+  push whose pack was swept fails with a retry message rather than committing
+  an entry that names a deleted pack.
+- `objio`'s `Bucket` gained `list_meta` and `delete`. The "nothing already in
+  the bucket is ever overwritten" property holds; compaction only adds new
+  objects and removes unreferenced ones.
+- The ADR-0046 `MAX_LIST` fold guard is unchanged. Compaction is what makes a
+  skipped fold recoverable, on the pack axis.
