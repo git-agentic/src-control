@@ -226,8 +226,15 @@ impl BucketTransport {
                     kept.push(h.clone());
                 }
             }
-            if kept.len() > MAX_LIST {
-                continue 'attempt; // new pushes pushed the list over the cap
+            // Recheck both axes on the state we are about to publish: pushes
+            // that landed while we merged can have pushed either over the cap,
+            // and an undecodable checkpoint would brick the remote.
+            if super::fold_would_overflow(refs.len(), kept.len()) {
+                rep.notes.push(
+                    "new pushes took the checkpoint over the cap while merging: nothing merged"
+                        .into(),
+                );
+                return Ok(());
             }
             let mut try_seq = head_seq + 1;
             let entry = LogEntry {
