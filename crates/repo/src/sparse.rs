@@ -390,6 +390,7 @@ impl Repo {
                 &old_spec,
                 &spec,
                 &Default::default(),
+                true,
             )?;
         }
         // Crash safety: record the spec being replaced before the new one is
@@ -537,7 +538,14 @@ impl Repo {
             )?
         };
         for root in roots {
-            self.refuse_untracked_for_view_change("sparse set", root, old, new, &already_laid)?;
+            self.refuse_untracked_for_view_change(
+                "sparse set",
+                root,
+                old,
+                new,
+                &already_laid,
+                false,
+            )?;
         }
         // Every guard passed, so each path below is the widen's to write:
         // record them (keeping an earlier interrupted run's) before the first.
@@ -604,21 +612,33 @@ impl Repo {
     }
 
     /// Delete the files an interrupted stopped-op widen wrote, when the stop
-    /// ends (abort or completion) with the old view still in force. Abort's
-    /// removal walk follows the other side's tree and the restored view, so it
-    /// cannot see an ours-only file or a subtree it never fetched; this uses
-    /// the `.sc/sparse-widen` record instead. A path is removed only if the
+    /// ends with the old view still in force. A path is removed only if the
     /// record names `decided` (a stale record from another stop is ignored),
     /// the path is outside the current view, and its bytes still equal the
-    /// decided tree's: a file the user edited since is theirs. Call it before
+    /// decided tree's, so a file the user edited since is left. Call it before
     /// the stopped op's state, which removes the record, is cleared.
-    pub(crate) fn remove_widen_residue(&self, decided: Option<scl_core::ObjectId>) -> Result<()> {
+    ///
+    /// On completion this is what keeps the files out of the commit's input.
+    /// On abort it only covers what the abort's own walk cannot see (an
+    /// ours-only file, or a subtree never fetched for theirs): that walk
+    /// removes any out-of-view path theirs tracks regardless of bytes, by
+    /// design (abort restores ours). Returns whether a valid record existed.
+    pub(crate) fn remove_widen_residue(&self, decided: Option<scl_core::ObjectId>) -> Result<bool> {
+        Ok(self.remove_widen_residue_keeping(decided)?.is_some())
+    }
+
+    /// [`Repo::remove_widen_residue`], returning the recorded out-of-view
+    /// paths it kept (`None`: no valid record).
+    fn remove_widen_residue_keeping(
+        &self,
+        decided: Option<scl_core::ObjectId>,
+    ) -> Result<Option<Vec<String>>> {
         let Some(decided) = decided else {
-            return Ok(());
+            return Ok(None);
         };
         let recorded = load_widen(self.layout(), decided)?;
         if recorded.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let view = self.sparse_spec()?;
         let outside: std::collections::BTreeSet<String> =
@@ -628,12 +648,47 @@ impl Repo {
             let mut s = store_arc.lock().unwrap();
             crate::worktree::recorded_paths_laid(self.layout(), &mut s, decided, &outside)?
         };
-        for path in laid {
-            match std::fs::remove_file(crate::worktree::safe_join(&self.layout.root, &path)?) {
+        for path in &laid {
+            match std::fs::remove_file(crate::worktree::safe_join(&self.layout.root, path)?) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
+        }
+        Ok(Some(
+            outside.into_iter().filter(|p| !laid.contains(p)).collect(),
+        ))
+    }
+
+    /// [`Repo::remove_widen_residue`] for the completion of a stopped op. A
+    /// partial clone's interrupted widen also left its wider bound in
+    /// `.sc/sparse-prev`; with the residue handled that bound is stale, and
+    /// the next `materialize` with an old root would delete tracked files
+    /// under it without a byte check (an edited kept residue file included),
+    /// so it goes too.
+    pub(crate) fn finish_widen_at_completion(
+        &self,
+        decided: Option<scl_core::ObjectId>,
+    ) -> Result<()> {
+        let Some(kept) = self.remove_widen_residue_keeping(decided)? else {
+            return Ok(());
+        };
+        let partial = self.promisor()?.is_some();
+        // On a full clone a kept (user-edited) file outside the view is read
+        // like any tracked file there and committed with the user's edit. A
+        // partial clone cannot graft it into the result, so say what to do.
+        if partial {
+            if let Some(p) = kept
+                .iter()
+                .find(|p| std::fs::symlink_metadata(self.layout.root.join(p)).is_ok())
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "{p} lies outside your sparse checkout and differs from what the merge \
+                     decided (an interrupted `sc sparse set` laid it out): move your copy \
+                     away or restore it, then retry"
+                )));
+            }
+            clear_prev(self.layout())?;
         }
         Ok(())
     }
@@ -708,6 +763,7 @@ impl Repo {
                 &self.sparse_spec()?,
                 &Sparse::default(),
                 &Default::default(),
+                true,
             )?;
         }
         clear(self.layout())?;

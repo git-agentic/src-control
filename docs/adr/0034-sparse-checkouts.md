@@ -196,14 +196,26 @@ every claim below is checked against the shipped code, not the plan.
    bytes, before the op's state is cleared: the abort's own walk follows the
    other side's tree and the restored view, so it cannot see an ours-only
    file or a subtree never fetched for theirs. A file the user edited since is
-   left. The cleanup runs before the working tree is read for completion, and a retry with a
+   left by this cleanup; the abort's own walk still removes any out-of-view path theirs
+   tracks, whatever its bytes (abort restores ours). At completion a kept edited
+   file outside the view is, on a full clone, read like any tracked file and committed
+   with the user's edit (intended: it is their change, and a sparse full clone reads
+   tracked files wherever they sit); on a partial clone the commit is refused naming
+   the file, because the result cannot graft it, until it is moved away. On a partial
+   clone, completion also drops the `.sc/sparse-prev` bound the interrupted widen
+   left, so a later materialize cannot delete tracked files under it unchecked. The cleanup runs before the working tree is read for completion, and a retry with a
    different target keeps the earlier target's paths recorded. On a
    partial clone the new view is recorded in `.sc/sparse-prev` before the
    writes, so the abort's removal walk covers files an interrupted widen
    laid; the marker is restored to its prior state once the spec is stored.
    The untracked-file guard checks only paths the old view did not match
    (those it laid out are not written, and a stopped op may have turned one
-   into a directory). Widening to the same spec is a quiet no-op. The
+   into a directory). Widening to the same spec is a quiet no-op. The guard does not count a case
+   alias of a laid-out path as tracked (`alias_ok = false`): on a case-insensitive
+   filesystem a decided `SRC/a.txt` would otherwise be written over the user's
+   resolution of `src/a.txt`. A crash between an atomic write's temp file
+   (`<name>.<pid>.<n>.tmp`) and its rename leaves that temp file beside the target;
+   it is not recorded, delete it. The
    decided root is the right source: it is what completion carries an
    out-of-view path from (refinement 6). For a resumed rebase (`resolved`) the accumulator
    can differ from it outside the view, but the next `--continue` re-lays

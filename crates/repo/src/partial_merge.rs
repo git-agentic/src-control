@@ -469,6 +469,66 @@ fn abort_after_an_interrupted_partial_widen_removes_the_subtree_it_laid() {
     fx.cleanup();
 }
 
+/// Completing a stopped merge after an interrupted widen on a partial clone
+/// removes what the widen laid and the `sparse-prev` bound it left, so a later
+/// materialize cannot delete tracked files under that bound unchecked. A file
+/// the user edited since is kept (and the bound is still dropped).
+#[test]
+fn completing_after_an_interrupted_partial_widen_clears_the_bound() {
+    for edited in [false, true] {
+        let fx = Fx::origin(
+            if edited {
+                "complete-widen-ed"
+            } else {
+                "complete-widen"
+            },
+            |_| {},
+        );
+        fx.origin_branch(
+            "b1",
+            &[
+                ("src/a.txt", b"ONE\ntwo\nthree\n"),
+                ("docs/new.md", b"added by theirs\n"),
+            ],
+        );
+        let clone = fx.clone(true);
+        clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+        assert!(matches!(
+            clone.merge("origin/b1", "t").unwrap_err(),
+            Error::MergeConflicts(1)
+        ));
+        let old = clone.sparse_spec().unwrap();
+        let wide = crate::Sparse::new(vec!["src/".to_string(), "docs/".to_string()]);
+        let decided = crate::merge_state::read_decided_root(clone.layout())
+            .unwrap()
+            .unwrap();
+        clone.lay_out_widened_view(decided, &old, &wide).unwrap();
+        assert!(clone.layout().sparse_prev_path().exists(), "premise");
+        if edited {
+            std::fs::write(fx.clone_root.join("docs/new.md"), b"my edit\n").unwrap();
+        }
+
+        std::fs::write(fx.clone_root.join("src/a.txt"), b"MERGED\ntwo\nthree\n").unwrap();
+        if edited {
+            // Refused with the path named, nothing moved; moving it away lets
+            // the commit through.
+            let err = clone.commit("t", "merge").unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidArgument(m) if m.contains("docs/new.md")),
+                "got {err:?}"
+            );
+            assert!(clone.merge_in_progress());
+            std::fs::remove_file(fx.clone_root.join("docs/new.md")).unwrap();
+        }
+        clone.commit("t", "merge").unwrap();
+        assert!(!clone.layout().sparse_prev_path().exists());
+        assert!(!clone.layout().sparse_widen_path().exists());
+        assert!(!fx.clone_root.join("docs/new.md").exists());
+        drop(clone);
+        fx.cleanup();
+    }
+}
+
 /// Aborting restores ours and removes the markers; the carried subtree was
 /// never on disk and the ref never moved.
 #[test]

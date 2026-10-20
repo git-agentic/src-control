@@ -1088,7 +1088,7 @@ impl Repo {
             )?;
         }
         // Files an interrupted widen of the last stop laid outside the view.
-        self.remove_widen_residue(crate::rebase_state::read_decided_root(&self.layout)?)?;
+        self.finish_widen_at_completion(crate::rebase_state::read_decided_root(&self.layout)?)?;
         refs::write_branch_tip(&self.layout, &head, &acc_tip)?;
         cache.save_best_effort();
         crate::oplog::record(
@@ -1209,7 +1209,7 @@ impl Repo {
             // in the replayed range), so the registry base is always the
             // conflicted commit's own first parent.
             // Before the working tree is read (see `commit`).
-            self.remove_widen_residue(decided)?;
+            self.finish_widen_at_completion(decided)?;
             let new_tip = self.assemble_completion_snapshot(
                 st.acc_tip,
                 st.conflicted,
