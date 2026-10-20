@@ -86,15 +86,19 @@ Code-verified against `crates/crypto/src/signing.rs`,
   found, regardless of position — a snapshot with one invalid signature
   and one valid-and-trusted signature is `Invalid`, full stop. Only once
   every signature verifies does trust ranking apply: `Trusted` beats
-  `Untrusted` beats `Unsigned` (no signatures at all).
+  `Untrusted` beats `Unsigned` (no signatures at all). Since #230 a
+  *received* signature is verified before it is indexed and a forged one is
+  dropped, so ingest never produces `Invalid` (ADR-0038, "Index only
+  signatures that verify").
 - **Transfer needs zero wire changes.** Signatures are ordinary CAS
   objects, so they ride the existing pack format unmodified. The receiver
   side runs `put_pack` then `index_incoming` over the newly-written ids;
-  `index_incoming` treats a missing snapshot for an incoming signature as
-  a **hard error** (`NotFound`), not a skip — the seam's contract is that
+  `index_incoming` treats an incoming signature id that is not in the
+  store as a **hard error** (`NotFound`) — the seam's contract is that
   every id just written by `put_pack` is retrievable, so a `NotFound`
-  here means the transfer itself is broken, not that the signature is
-  stale.
+  here means the transfer itself is broken. A signature whose *target* is
+  not held, or that does not verify, is silently not indexed (#230,
+  ADR-0038).
   - **Review-caught Critical:** the first cut of `fetch` conflated
     "already have the snapshot" with "already have its signatures" —
     a re-fetch of an already-possessed commit skipped resending its

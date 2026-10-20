@@ -809,7 +809,9 @@ key and an Ed25519 signing key in a single `scl-id-<hex>` file (a v1
 `scl-sk-` identity still parses and encrypts, but can't sign). Verification
 (`sig_status`) is strict four-state — `Invalid` beats `Trusted` beats
 `Untrusted` beats `Unsigned` — and `sc verify [<ref>] [--require]` walks
-every parent, not just the mainline.
+every parent, not just the mainline. A received signature is verified before
+it is indexed and a forged one is dropped (ADR-0038 addendum, #230), so a
+transfer cannot make a snapshot `Invalid`.
 
 Transfer needed zero wire changes: signatures ride the existing pack as
 ordinary objects, reindexed by id on receipt. `recipients.toml` gains

@@ -458,8 +458,11 @@ that sort ahead of the real one. `signatures::index_incoming` and `reindex`
 therefore index a signature only if its target is held and it verifies under
 the key it names, in the domain of its target kind (snapshot domain for a
 snapshot, transcript domain for a transcript, the drop digest for a
-tombstone). Forged and dangling signatures are never indexed, so never
-forwarded to a downstream peer and never kept by gc. Side effect: a received
+tombstone). Forged and dangling signatures are never indexed, so a
+`LocalTransport` or `sc serve` sender never forwards them (it sends indexed
+signatures) and gc never keeps them. A bucket is the exception: `get_pack`
+forwards the on-chain signatures it finds unverified, and the receiver's
+ingest filters them. Side effect: a received
 signature that fails to verify no longer turns a snapshot `Invalid`; it is
 simply absent (`Unsigned`, which `--require` also rejects). A signature
 indexed before this change is read as before.
@@ -504,9 +507,13 @@ never re-runs.
   lock is busy, so a served remote does not take the exclusive lock per
   connection) and before the indexing step of every ingest except a
   `--no-transcripts` one. All are best effort: a failure never fails an open
-  or a transfer, and the fingerprint is saved only after a successful pass,
-  so the next trigger retries (this includes an object that fails to
-  read: the fingerprint stays old until a pass completes).
+  or a transfer, and the fingerprint is saved with the pass's outcome
+  (`<fingerprint> <failed passes>`), computed from the same trusted-signer map
+  the entries were judged with. A pass in which an object failed to read does
+  not count as done and is retried by the next trigger, at most
+  `MAX_RETRIES` (3) times per trusted set, so an unreadable object cannot make
+  every open or served connection take the exclusive lock forever; a changed
+  trusted set resets the count.
 - **Lost-update safety.** `append_drop` appends one short line with
   `O_APPEND` and `fsync` instead of rewriting the file, so concurrent
   ingests (the HTTP serve path holds no repo lock) cannot lose a drop line. A
@@ -515,7 +522,13 @@ never re-runs.
   pending entry. That costs a push-only remote the retry for that tombstone
   (trust the signer before the push, or have a fetching peer re-send it), but
   never a recorded drop and never the rooting of one: gc roots every drop
-  line.
+  line. The same unlocked read-modify-write applies to `.sc/signatures`,
+  `.sc/transcripts` and the pending rewrite on the serve path; taking the
+  repo lock there changes `Locked` behaviour for concurrent connections and
+  for a local `sc` command that holds the lock for its lifetime, so it is
+  tracked separately as #260 rather than decided here. `O_APPEND` atomicity is
+  a local-filesystem guarantee (none on NFS). `append_drop` starts on a new
+  line when the file ends in a torn line.
 - **Bounded.** The file is a FIFO ring of 1024 ids. A writer who pushes many
   signed tombstones evicts older entries, so a genuine pending entry can be
   lost on a push-only remote; a fetching peer is re-sent every qualifying

@@ -107,7 +107,8 @@ fn dropped_ids(layout: &Layout) -> Result<BTreeSet<ObjectId>> {
 }
 
 /// Record one tombstone, deduping an identical existing line. The line is
-/// appended (one short `O_APPEND` write, atomic on a local filesystem), not
+/// appended (one short `O_APPEND` write; atomic on a local filesystem only, NFS
+/// gives no such guarantee), not
 /// merged into a rewrite of the file, so concurrent ingests (the HTTP serve
 /// path holds no repo lock) cannot lose each other's drop line. A racing
 /// duplicate line is harmless: readers treat the file as a set.
@@ -116,14 +117,18 @@ fn append_drop(layout: &Layout, entry: DropEntry) -> Result<()> {
     if read_drops(layout)?.contains(&entry) {
         return Ok(());
     }
+    let path = layout.transcript_drops_path();
+    let is_new = !path.exists();
+    // A crash or ENOSPC mid-write can leave a line without its newline; start
+    // on a fresh line so this one is not merged into the torn tail.
+    let torn = std::fs::read(&path).is_ok_and(|b| b.last().is_some_and(|c| *c != b'\n'));
     let line = format!(
-        "{} {} {}\n",
+        "{}{} {} {}\n",
+        if torn { "\n" } else { "" },
         entry.0.to_hex(),
         entry.1.to_hex(),
         entry.2.to_hex()
     );
-    let path = layout.transcript_drops_path();
-    let is_new = !path.exists();
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -182,8 +187,9 @@ fn write_pending(layout: &Layout, ids: &[ObjectId]) -> Result<()> {
 }
 
 /// Remember `new` tombstones for re-evaluation, deduped, newest last, capped
-/// at [`MAX_PENDING`]. Writes only when the set changes.
-fn note_pending(layout: &Layout, new: &[ObjectId]) -> Result<()> {
+/// at [`MAX_PENDING`]. Writes only when the set changes. `fp` is the trusted
+/// set they were just judged under.
+fn note_pending(layout: &Layout, new: &[ObjectId], fp: &str) -> Result<()> {
     if new.is_empty() {
         return Ok(());
     }
@@ -208,59 +214,90 @@ fn note_pending(layout: &Layout, new: &[ObjectId]) -> Result<()> {
     all.drain(..excess);
     write_pending(layout, &all)?;
     // Entries are judged under the trust in force now; remember which.
-    if !layout.transcript_pending_trust_path().exists() {
-        save_trust_fp(layout)?;
+    if read_trust_state(layout).is_none() {
+        save_trust_state(layout, fp, 0)?;
     }
     Ok(())
 }
 
+type Trusted = std::collections::HashMap<[u8; 32], String>;
+
+/// Failed passes (an object would not read) after which the same trusted set
+/// is not retried again, so an unreadable object cannot make every open or
+/// served connection take the exclusive lock forever. A changed set retries.
+const MAX_RETRIES: u32 = 3;
+
 /// Fingerprint of the trusted-signer key set (the only configuration the
 /// honoring check reads), so an unrelated edit to `recipients.toml` does not
-/// count as a trust change.
-fn trust_fp(layout: &Layout) -> String {
-    let mut keys: Vec<[u8; 32]> = trusted_signers(layout).into_keys().collect();
+/// count as a trust change. Computed from the same map used for judging, so
+/// the value saved is the set the entries were judged under.
+fn fp_of(trusted: &Trusted) -> String {
+    let mut keys: Vec<&[u8; 32]> = trusted.keys().collect();
     keys.sort();
     let mut h = blake3::Hasher::new();
     for k in keys {
-        h.update(&k);
+        h.update(k.as_slice());
     }
     h.finalize().to_hex().to_string()
 }
 
-fn save_trust_fp(layout: &Layout) -> Result<()> {
+/// `.sc/transcript-pending-trust`: `<fingerprint> <failed passes>`.
+fn read_trust_state(layout: &Layout) -> Option<(String, u32)> {
+    let s = std::fs::read_to_string(layout.transcript_pending_trust_path()).ok()?;
+    let mut it = s.split_whitespace();
+    let fp = it.next()?.to_string();
+    Some((fp, it.next().and_then(|n| n.parse().ok()).unwrap_or(0)))
+}
+
+fn save_trust_state(layout: &Layout, fp: &str, failed: u32) -> Result<()> {
     scl_core::fsutil::atomic_write_durable(
         &layout.transcript_pending_trust_path(),
-        trust_fp(layout).as_bytes(),
+        format!("{fp} {failed}").as_bytes(),
     )?;
     Ok(())
 }
 
-/// Whether tombstones are pending and the trusted-signer set differs from the
-/// one they were last judged under. One `exists` check when nothing is
-/// pending; no lock and no store access, so a server can call it per
-/// connection.
-pub(crate) fn trust_changed(layout: &Layout) -> bool {
+/// Pending tombstones exist and were last judged under another trusted set,
+/// or a pass failed and retries remain.
+fn needs_judging(layout: &Layout, fp: &str) -> bool {
     layout.transcript_pending_path().exists()
-        && std::fs::read_to_string(layout.transcript_pending_trust_path()).ok()
-            != Some(trust_fp(layout))
+        && match read_trust_state(layout) {
+            None => true,
+            Some((saved, failed)) => saved != fp || (failed > 0 && failed < MAX_RETRIES),
+        }
 }
 
-/// [`reevaluate_pending`] when [`trust_changed`], then record the new trust.
-/// The re-check triggers (open, transport open, ingest) all go through here
-/// so none of them does work or takes a lock while the trust is unchanged.
+/// Whether [`reevaluate_if_trust_changed`] has work. One `exists` check when
+/// nothing is pending; no lock and no store access, so a server can call it
+/// per connection.
+pub(crate) fn trust_changed(layout: &Layout) -> bool {
+    layout.transcript_pending_path().exists()
+        && needs_judging(layout, &fp_of(&trusted_signers(layout)))
+}
+
+/// Judge the pending tombstones again when [`trust_changed`], then record the
+/// trust they were judged under. The re-check triggers (open, transport open,
+/// ingest) all go through here so none of them does work or takes a lock
+/// while the trust is unchanged. An entry that could not be read keeps the
+/// pass "failed" (up to [`MAX_RETRIES`] times per trusted set) instead of
+/// advancing the fingerprint, so repairing the object lets a later trigger
+/// try again.
 pub(crate) fn reevaluate_if_trust_changed(
     layout: &Layout,
     store: &mut scl_core::Store,
 ) -> Result<usize> {
-    if !trust_changed(layout) {
+    let trusted = trusted_signers(layout);
+    let fp = fp_of(&trusted);
+    if !needs_judging(layout, &fp) {
         return Ok(0);
     }
-    let (honored, incomplete) = reevaluate_inner(layout, store)?;
-    // An entry that could not be read keeps the old fingerprint, so the next
-    // trigger tries again once the object is repaired.
-    if !incomplete {
-        save_trust_fp(layout)?;
-    }
+    let (honored, incomplete) = reevaluate_inner(layout, store, &trusted)?;
+    let failed = match (incomplete, read_trust_state(layout)) {
+        (false, _) => 0,
+        (true, Some((saved, n))) if saved == fp => n + 1,
+        (true, _) => 1,
+    };
+    save_trust_state(layout, &fp, failed)?;
     Ok(honored)
 }
 
@@ -513,7 +550,7 @@ pub(crate) fn index_incoming(
             _ => {}
         }
     }
-    note_pending(layout, &held)?;
+    note_pending(layout, &held, &fp_of(&trusted))?;
     Ok(count)
 }
 
@@ -525,18 +562,21 @@ pub(crate) fn index_incoming(
 /// Returns how many drops were honored.
 #[cfg(test)]
 pub(crate) fn reevaluate_pending(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
-    Ok(reevaluate_inner(layout, store)?.0)
+    Ok(reevaluate_inner(layout, store, &trusted_signers(layout))?.0)
 }
 
 /// [`reevaluate_pending`] plus whether some entry could not be judged because
 /// an object failed to read.
-fn reevaluate_inner(layout: &Layout, store: &mut scl_core::Store) -> Result<(usize, bool)> {
+fn reevaluate_inner(
+    layout: &Layout,
+    store: &mut scl_core::Store,
+    trusted: &Trusted,
+) -> Result<(usize, bool)> {
     let pending = read_pending(layout)?;
     if pending.is_empty() {
         return Ok((0, false));
     }
     let mut incomplete = false;
-    let trusted = trusted_signers(layout);
     let wanted: BTreeSet<ObjectId> = pending.iter().copied().collect();
     let sigs = crate::signatures::index_for_targets(layout, &wanted, MAX_SIG_READS)?;
     let (mut keep, mut honored) = (Vec::new(), 0);
@@ -559,7 +599,7 @@ fn reevaluate_inner(layout: &Layout, store: &mut scl_core::Store) -> Result<(usi
         };
         // An unreadable object keeps the entry for the next trigger rather
         // than aborting the rest.
-        match tombstone_honored(store, &trusted, &sigs, *id, &t, dropped) {
+        match tombstone_honored(store, trusted, &sigs, *id, &t, dropped) {
             Ok(true) => {
                 append_drop(layout, (t.snapshot, *id, dropped))?;
                 honored += 1;
@@ -1667,7 +1707,7 @@ pub(crate) mod tests {
         let b = ObjectId::of(b"b");
         let mut batch = vec![a];
         batch.extend(std::iter::repeat_n(b, MAX_PENDING + 10));
-        note_pending(repo.layout(), &batch).unwrap();
+        note_pending(repo.layout(), &batch, "fp").unwrap();
         assert_eq!(read_pending(repo.layout()).unwrap(), vec![a, b]);
 
         drop(repo);
@@ -1682,8 +1722,8 @@ pub(crate) mod tests {
         let ids: Vec<ObjectId> = (0..MAX_PENDING + 5)
             .map(|i| ObjectId::of(format!("t{i}").as_bytes()))
             .collect();
-        note_pending(repo.layout(), &ids).unwrap();
-        note_pending(repo.layout(), &ids[10..13]).unwrap(); // dedup, no growth
+        note_pending(repo.layout(), &ids, "fp").unwrap();
+        note_pending(repo.layout(), &ids[10..13], "fp").unwrap(); // dedup, no growth
         let held = read_pending(repo.layout()).unwrap();
         assert_eq!(held.len(), MAX_PENDING);
         assert_eq!(held[0], ids[5], "oldest evicted");
@@ -1696,6 +1736,133 @@ pub(crate) mod tests {
         drop(store);
         assert!(!repo.layout().transcript_pending_path().exists());
 
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_drop_signature_sorting_below_its_tombstone_in_the_pack_is_indexed_and_honored() {
+        let root = tmp_root("sig-below-tomb");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let key = owner.signing.as_ref().unwrap();
+        trust_signer(&repo, &owner);
+        // Sealing is randomized, so each attach mints a new body (and tombstone
+        // id) until the signature's id sorts below the tombstone's.
+        let (body, tomb_obj, sig_obj) = loop {
+            let body = repo
+                .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+                .unwrap();
+            let tomb_obj = Object::Transcript(Transcript::drop_tombstone(snap, &body));
+            let tomb = tomb_obj.id();
+            let sig_obj = Object::Signature(SignatureObj {
+                snapshot: tomb,
+                signer: key.public().to_bytes(),
+                sig: scl_crypto::sign_transcript_id(key, &drop_digest(&tomb)),
+            });
+            if sig_obj.id() < tomb {
+                break (body, tomb_obj, sig_obj);
+            }
+        };
+        let _ = body;
+        let mut objs = [tomb_obj, sig_obj.clone()];
+        objs.sort_by_key(Object::id);
+        assert_eq!(objs[0].id(), sig_obj.id());
+        let enc: Vec<(ObjectId, Vec<u8>)> = objs.iter().map(|o| (o.id(), o.encode())).collect();
+        let (pack, _idx) = scl_core::pack::build_pack(&enc).unwrap();
+        let path = root.join("in.pack");
+        std::fs::write(&path, pack).unwrap();
+        let arc = repo.store_arc();
+        let mut store = arc.lock().unwrap();
+        crate::transport::ingest_pack_file(repo.layout(), &mut store, &path).unwrap();
+        drop(store);
+        assert_eq!(read_drops(repo.layout()).unwrap().len(), 1);
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_torn_drop_line_does_not_swallow_the_next_append() {
+        let root = tmp_root("torn");
+        let repo = Repo::init(&root).unwrap();
+        let e = |t: &str| ObjectId::of(t.as_bytes());
+        append_drop(repo.layout(), (e("s1"), e("t1"), e("d1"))).unwrap();
+        // A crash left half a line with no newline.
+        let path = repo.layout().transcript_drops_path();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, &e("s2").to_hex().as_bytes()[..20]).unwrap();
+        drop(f);
+        append_drop(repo.layout(), (e("s3"), e("t3"), e("d3"))).unwrap();
+        let drops = read_drops(repo.layout()).unwrap();
+        assert_eq!(drops.len(), 2, "the torn line is skipped, the next is kept");
+        assert!(drops.contains(&(e("s3"), e("t3"), e("d3"))));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn an_unreadable_pending_object_is_retried_a_bounded_number_of_times() {
+        let root = tmp_root("retries");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let body = repo
+            .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+            .unwrap();
+        let arc = repo.store_arc();
+        let tomb = arc
+            .lock()
+            .unwrap()
+            .put(Object::Transcript(Transcript::drop_tombstone(snap, &body)))
+            .unwrap();
+        repo.sign_drop(tomb, owner.signing.as_ref().unwrap())
+            .unwrap();
+        let mut store = arc.lock().unwrap();
+        index_incoming(repo.layout(), &mut store, &[tomb]).unwrap();
+        assert_eq!(read_pending(repo.layout()).unwrap(), vec![tomb]);
+        drop(store);
+
+        // Make the tombstone unreadable but still "contained".
+        let path = std::fs::read_dir(repo.layout().objects_dir())
+            .unwrap()
+            .flat_map(|d| std::fs::read_dir(d.unwrap().path()).into_iter().flatten())
+            .map(|f| f.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&tomb.to_hex()[2..])
+            });
+        let path = path.expect("the tombstone is a loose object");
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"garbage").unwrap();
+        // A fresh store, so no cached copy hides the damage.
+        let mut fresh =
+            scl_core::Store::open_persistent(repo.layout().objects_dir(), 1 << 20).unwrap();
+        trust_signer(&repo, &owner);
+        for _ in 0..MAX_RETRIES {
+            assert!(trust_changed(repo.layout()));
+            reevaluate_if_trust_changed(repo.layout(), &mut fresh).unwrap();
+        }
+        assert!(!trust_changed(repo.layout()), "retries are bounded");
+        assert_eq!(
+            read_pending(repo.layout()).unwrap(),
+            vec![tomb],
+            "entry kept"
+        );
+
+        std::fs::write(&path, saved).unwrap();
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
