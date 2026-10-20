@@ -18,15 +18,15 @@ const SRC_LAST: &[u8] = b"one\ntwo\nTHREE\n";
 fn fork_materializes_only_the_view() {
     let fx = Fx::origin("ws-view", |_| {});
     let clone = fx.clone(false);
-    let session = clone.ws_fork(2, "t", None).unwrap();
+    let session = clone.ws_fork(None, 2, "t", None).unwrap();
     assert_eq!(session.workspaces.len(), 2);
     for ws in &session.workspaces {
         assert_eq!(std::fs::read(ws.dir.join("src/a.txt")).unwrap(), SRC_A);
         assert!(!ws.dir.join("docs").exists(), "docs is outside the view");
         assert!(!ws.dir.join("lib").exists());
     }
-    clone.ws_abandon(None).unwrap();
-    assert!(clone.ws_session().unwrap().is_none());
+    clone.ws_abandon(None, None).unwrap();
+    assert!(clone.ws_session(None).unwrap().is_none());
     drop(clone);
     fx.cleanup();
 }
@@ -41,14 +41,14 @@ fn harvest_lands_a_clean_merge_and_carries_the_out_of_view_subtrees() {
         .unwrap()
         .unwrap();
     let docs = dir_id(&clone, &base, "docs");
-    let session = clone.ws_fork(1, "t", None).unwrap();
+    let session = clone.ws_fork(None, 1, "t", None).unwrap();
     std::fs::write(session.workspaces[0].dir.join("src/a.txt"), SRC_FIRST).unwrap();
 
     // The host moves on in the same file, on another line.
     std::fs::write(fx.clone_root.join("src/a.txt"), SRC_LAST).unwrap();
     let host_tip = clone.commit("t", "host edit").unwrap();
 
-    let outcomes = clone.ws_harvest(None, "t", None).unwrap();
+    let outcomes = clone.ws_harvest(None, None, "t", None).unwrap();
     let merged = match outcomes.as_slice() {
         [WsHarvestOutcome::Landed { merged_tip, .. }] => *merged_tip,
         other => panic!("expected a clean landing, got {other:?}"),
@@ -63,7 +63,10 @@ fn harvest_lands_a_clean_merge_and_carries_the_out_of_view_subtrees() {
     assert_eq!(dir_id(&clone, &merged, "docs"), docs, "docs is unchanged");
     assert!(!has(&clone, &docs), "and was never read or fetched");
     assert!(!fx.clone_root.join("docs").exists());
-    assert!(clone.ws_session().unwrap().is_none(), "the session ended");
+    assert!(
+        clone.ws_session(None).unwrap().is_none(),
+        "the session ended"
+    );
     drop(clone);
     fx.cleanup();
 }
@@ -74,12 +77,12 @@ fn harvest_lands_a_clean_merge_and_carries_the_out_of_view_subtrees() {
 fn harvest_conflict_falls_back_to_a_branch() {
     let fx = Fx::origin("ws-conflict", |_| {});
     let clone = fx.clone(false);
-    let session = clone.ws_fork(1, "t", None).unwrap();
+    let session = clone.ws_fork(None, 1, "t", None).unwrap();
     std::fs::write(session.workspaces[0].dir.join("src/a.txt"), SRC_FIRST).unwrap();
     std::fs::write(fx.clone_root.join("src/a.txt"), b"uno\ntwo\nthree\n").unwrap();
     let host_tip = clone.commit("t", "host edit").unwrap();
 
-    let outcomes = clone.ws_harvest(None, "t", None).unwrap();
+    let outcomes = clone.ws_harvest(None, None, "t", None).unwrap();
     match outcomes.as_slice() {
         [WsHarvestOutcome::FallbackBranch { branch, .. }] => {
             assert_eq!(branch, "work-1");
@@ -99,13 +102,67 @@ fn harvest_conflict_falls_back_to_a_branch() {
     fx.cleanup();
 }
 
+/// Two named sessions on one partial clone (ADR-0056): each is forked under the
+/// host's view, they edit different lines of one file, and they land one after
+/// the other. The second is a real merge over the first, and `docs/` is carried
+/// by id the whole time, never read.
+#[test]
+fn two_named_sessions_land_independently_under_the_view() {
+    let fx = Fx::origin("ws-named", |_| {});
+    let clone = fx.clone(false);
+    let base = refs::read_branch_tip(clone.layout(), "main")
+        .unwrap()
+        .unwrap();
+    let docs = dir_id(&clone, &base, "docs");
+
+    let a = clone.ws_fork(Some("a"), 1, "t", None).unwrap();
+    let b = clone.ws_fork(Some("b"), 1, "t", None).unwrap();
+    for ws in a.workspaces.iter().chain(&b.workspaces) {
+        assert_eq!(std::fs::read(ws.dir.join("src/a.txt")).unwrap(), SRC_A);
+        assert!(!ws.dir.join("docs").exists(), "docs is outside the view");
+    }
+    std::fs::write(a.workspaces[0].dir.join("src/a.txt"), SRC_FIRST).unwrap();
+    std::fs::write(b.workspaces[0].dir.join("src/a.txt"), SRC_LAST).unwrap();
+
+    let first = match clone
+        .ws_harvest(Some("a"), None, "t", None)
+        .unwrap()
+        .as_slice()
+    {
+        [WsHarvestOutcome::Landed { merged_tip, .. }] => *merged_tip,
+        other => panic!("expected a landing, got {other:?}"),
+    };
+    assert!(
+        clone.ws_session(Some("b")).unwrap().is_some(),
+        "b is still open"
+    );
+    let merged = match clone
+        .ws_harvest(Some("b"), None, "t", None)
+        .unwrap()
+        .as_slice()
+    {
+        [WsHarvestOutcome::Landed { merged_tip, .. }] => *merged_tip,
+        other => panic!("expected a landing, got {other:?}"),
+    };
+    assert_eq!(clone.snapshot(&merged).unwrap().parents[0], first);
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
+        b"ONE\ntwo\nTHREE\n"
+    );
+    assert_eq!(dir_id(&clone, &merged, "docs"), docs, "docs is unchanged");
+    assert!(!has(&clone, &docs), "and was never read or fetched");
+    assert!(clone.ws_sessions().unwrap().is_empty());
+    drop(clone);
+    fx.cleanup();
+}
+
 /// An untouched workspace harvests as unchanged, with no branch minted.
 #[test]
 fn harvest_of_an_untouched_workspace_is_unchanged() {
     let fx = Fx::origin("ws-unchanged", |_| {});
     let clone = fx.clone(false);
-    clone.ws_fork(1, "t", None).unwrap();
-    let outcomes = clone.ws_harvest(None, "t", None).unwrap();
+    clone.ws_fork(None, 1, "t", None).unwrap();
+    let outcomes = clone.ws_harvest(None, None, "t", None).unwrap();
     assert!(matches!(
         outcomes.as_slice(),
         [WsHarvestOutcome::Unchanged { .. }]
@@ -192,12 +249,12 @@ fn fork_and_work_refuse_a_view_gap_before_writing_anything() {
         "premise: a gap"
     );
 
-    let err = clone.ws_fork(1, "t", None).unwrap_err();
+    let err = clone.ws_fork(None, 1, "t", None).unwrap_err();
     assert!(
         matches!(err, crate::error::Error::GapInView { .. }),
         "got {err:?}"
     );
-    assert!(clone.ws_session().unwrap().is_none());
+    assert!(clone.ws_session(None).unwrap().is_none());
     assert!(!clone.layout().dot_sc.join("ws").exists(), "no session dir");
 
     let scratch = std::env::temp_dir().join(format!("scl-work-gap-{}", std::process::id()));
@@ -223,7 +280,7 @@ fn a_failing_probe_leaves_no_candidate_branch() {
     let fx = crate::partial_merge::protected_origin("ws-probe", &pk);
     let b1 = fx.origin_branch("b1", &[("vault/s.txt", b"L1\nl2\nl3\n")]);
     let clone = fx.clone(false);
-    let session = clone.ws_fork(1, "t", None).unwrap();
+    let session = clone.ws_fork(None, 1, "t", None).unwrap();
     std::fs::write(session.workspaces[0].dir.join("src/a.txt"), SRC_FIRST).unwrap();
     // The host fast-forwards to a commit that changed the protected vault/,
     // which the clone does not hold and cannot fetch.
@@ -233,7 +290,7 @@ fn a_failing_probe_leaves_no_candidate_branch() {
         Some(b1)
     );
 
-    let err = clone.ws_harvest(None, "t", None).unwrap_err();
+    let err = clone.ws_harvest(None, None, "t", None).unwrap_err();
     eprintln!("probe error: {err:?}");
     assert!(
         refs::read_branch_tip(clone.layout(), "work-1")
@@ -242,14 +299,14 @@ fn a_failing_probe_leaves_no_candidate_branch() {
         "no candidate branch may survive a failed harvest ({err:?})"
     );
     assert!(
-        clone.ws_session().unwrap().is_some(),
+        clone.ws_session(None).unwrap().is_some(),
         "the workspace stays live"
     );
     assert_eq!(
         refs::read_branch_tip(clone.layout(), "main").unwrap(),
         Some(b1)
     );
-    clone.ws_abandon(None).unwrap();
+    clone.ws_abandon(None, None).unwrap();
     drop(clone);
     fx.cleanup();
 }

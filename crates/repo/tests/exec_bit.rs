@@ -211,13 +211,13 @@ fn ws_checkout_keeps_exec_bit() {
     put(&root, "plain.txt", "p", false);
     repo.commit("t", "add").unwrap();
 
-    let session = repo.ws_fork(1, "t", None).unwrap();
+    let session = repo.ws_fork(None, 1, "t", None).unwrap();
     let dir = &session.workspaces[0].dir;
     assert!(on_disk_exec(dir, "run.sh"));
     assert!(!on_disk_exec(dir, "plain.txt"));
     // Harvesting an edit of another file must not demote the script.
     std::fs::write(dir.join("plain.txt"), "edited").unwrap();
-    repo.ws_harvest(None, "t", None).unwrap();
+    repo.ws_harvest(None, None, "t", None).unwrap();
     assert_eq!(committed(&repo, "run.sh"), FileMode::EXEC);
     assert_eq!(committed(&repo, "plain.txt"), FileMode::FILE);
 }

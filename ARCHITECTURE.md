@@ -346,11 +346,11 @@ phases but the shape is stable:
 - `promisor-lazy` — empty marker: this partial clone may fill gaps by object id
   (P37a); `sparse-prev` — the previous sparse spec while a `sparse set` is in
   flight (P37b).
-- `local-key`, `protected-cache` (and `ws/cache-<i>`) — the P33 keyed stat cache
+- `local-key`, `protected-cache` (and `ws/cache-<i>`, `ws-<name>/cache-<i>`) — the P33 keyed stat cache
   for protected paths; never committed, never transferred.
 - `tmp/` — guard-cleaned scratch for streaming pack transfer (P25).
 - `ws/` — durable agent-session workspaces: `session.toml` manifest + per-agent
-  checkouts (P20). `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
+  checkouts (P20); `ws-<name>/` — the same for a named session (ADR-0056). `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
   lazily-built bare `mirror.git` for network Git (P10/P18).
 - Transient in-progress state (removed on completion/abort): `MERGE_HEAD`,
   `PICK_HEAD`, `REBASE_STATE`, and their `*_DECIDED_ROOT` records, plus
@@ -781,6 +781,19 @@ guard family as a ref-mover.
 directory, so a crash between the two never strands a `live = true` entry
 pointing at a directory that no longer exists. See ADR-0030.
 
+Named sessions (ADR-0056). `sc ws fork --name <n>` opens a further session in a
+sibling root, `.sc/ws-<n>/` (manifest, `<i>/` checkouts and `cache-<i>` inside),
+so the unnamed session's layout is untouched and tearing one session down never
+touches another. `list`/`run`/`harvest`/`abandon` take `--session <n>`; without
+it they mean the unnamed session and never guess a named one. Fallback branches
+and `SC_WORKSPACE` are `<n>-<i>` (`work-<i>` unnamed). The repo lock serializes
+every `sc` command, so harvests of different sessions run one at a time in
+invocation order: the first lands, a later one merges over it or falls back.
+`sc ws run` resolves its workspace and secret environment under the lock, then
+releases it before spawning the command (`WsRunPlan`), so other sessions stay
+usable while an agent runs. gc roots every open session's base snapshot.
+Workspace refresh is designed in the ADR and not built.
+
 ## Phase 21 — hardening & consolidation sweep (built)
 
 No new capability axis — a sweep closing the P16–P20 review tail. Every
@@ -809,7 +822,9 @@ key and an Ed25519 signing key in a single `scl-id-<hex>` file (a v1
 `scl-sk-` identity still parses and encrypts, but can't sign). Verification
 (`sig_status`) is strict four-state — `Invalid` beats `Trusted` beats
 `Untrusted` beats `Unsigned` — and `sc verify [<ref>] [--require]` walks
-every parent, not just the mainline.
+every parent, not just the mainline. A received signature is verified before
+it is indexed and a forged one is dropped (ADR-0038 addendum, #230), so a
+transfer cannot make a snapshot `Invalid`.
 
 Transfer needed zero wire changes: signatures ride the existing pack as
 ordinary objects, reindexed by id on receipt. `recipients.toml` gains
@@ -988,14 +1003,17 @@ without a new object tag or wire change: a drop is a **tombstone**, a
 dropped id, recorded in a local `.sc/transcript-drops` index and treated as a
 grow-only set (no undrop; re-attach to restore). Reads, `sc log` markers and
 the over-send filter through the drop set, and `sc gc` reclaims the body. A
-tombstone travels with fetch and push only when it is signed (a push that finds
-the remote already at the same branch tip sends nothing, so a drop made
-afterwards propagates once a push moves the branch or the remote fetches), and
+tombstone travels with fetch and push only when it is signed, and a
+retained signed tombstone rides a transfer when its snapshot is in it or was
+collected by the sender's gc, so a stale peer is told (a push that finds the remote already at
+the same branch tip sends nothing, so a drop made afterwards propagates once a
+push moves the branch or the remote fetches), and
 a receiving peer honors it only if the signature comes from a key in its `[signers]
 trusted` list; an unsigned drop is local-only, and an untrusted tombstone stays
 inert. Drop is not erasure: a peer that never receives an honored tombstone
-keeps the sealed body, and a remote that received a tombstone before trusting
-its signer keeps it inert (#230). `sc push --no-transcripts` leaves transcripts and their signatures out of the
+keeps the sealed body. A tombstone held before its signer was trusted is
+remembered in `.sc/transcript-pending` (capped at 1024, newest kept) and
+honored on the next open or ingest once the signer is trusted (#230). `sc push --no-transcripts` leaves transcripts and their signatures out of the
 pack (saving bandwidth); `sc clone|fetch --no-transcripts` cannot, because the
 server still sends the full pack, so the receiver hash-checks every record and
 then discards transcripts and their signatures, writing and indexing none

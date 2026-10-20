@@ -531,7 +531,9 @@ impl Repo {
             let transcript_ids = if no_transcripts {
                 Vec::new()
             } else {
-                crate::transcripts::indexed_transcript_ids_for(&self.layout, &snaps)?
+                crate::transcripts::indexed_transcript_ids_for(&self.layout, &snaps, &|id| {
+                    store.contains(id)
+                })?
             };
             let sig_targets: Vec<ObjectId> =
                 snaps.iter().chain(transcript_ids.iter()).copied().collect();
@@ -1278,6 +1280,235 @@ mod tests {
         drop(b);
         std::fs::remove_dir_all(&a_root).unwrap();
         std::fs::remove_dir_all(&b_root).unwrap();
+    }
+
+    fn tombstone_id(snap: ObjectId, tid: ObjectId) -> ObjectId {
+        ObjectId::of(
+            &scl_core::Object::Transcript(scl_core::Transcript::drop_tombstone(snap, &tid))
+                .encode(),
+        )
+    }
+
+    #[test]
+    fn stale_peer_learns_a_drop_after_the_droppers_gc_collected_the_snapshot() {
+        // #230 gap 1: the tombstone outlives its snapshot on the dropper, so
+        // the snapshot is in no transfer set, yet a peer that still holds the
+        // body and the snapshot must be told.
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-tomb-gc-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-tomb-gc-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&a_root);
+        let _ = std::fs::remove_dir_all(&b_root);
+        std::fs::create_dir_all(&a_root).unwrap();
+        let a = Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f0"), b"zero").unwrap();
+        let c0 = a.commit("t", "c0").unwrap();
+        std::fs::write(a_root.join("f1"), b"one").unwrap();
+        let c1 = a.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let tid = a
+            .attach_transcript(c1, "claude-code", "s1", b"body", &[identity.enc.public()])
+            .unwrap();
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        assert_eq!(b.transcripts_for(&c1).unwrap().len(), 1);
+        crate::transcripts::tests::trust_signer(&b, &identity);
+
+        a.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        // Rewind past c1 and forget the oplog roots, so gc collects it.
+        crate::refs::write_branch_tip(a.layout(), "main", &c0).unwrap();
+        std::fs::remove_file(a.layout().oplog_path()).unwrap();
+        std::fs::write(a_root.join("f2"), b"two").unwrap();
+        a.commit("t", "c2").unwrap();
+        a.gc(std::time::Duration::from_secs(0)).unwrap();
+        assert!(
+            !a.store_arc().lock().unwrap().contains(&c1),
+            "gc collected the dropped transcript's snapshot"
+        );
+        assert!(a
+            .store_arc()
+            .lock()
+            .unwrap()
+            .contains(&tombstone_id(c1, tid)));
+        drop(a);
+
+        b.fetch("origin").unwrap();
+        assert!(b.transcripts_for(&c1).unwrap().is_empty());
+
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        assert!(!a_root.exists());
+        std::fs::remove_dir_all(&b_root).unwrap();
+        assert!(!b_root.exists());
+    }
+
+    #[test]
+    fn push_only_remote_honors_a_held_tombstone_once_the_signer_is_trusted() {
+        // #230 gap 2: the remote got the tombstone by push while it did not
+        // trust the signer. Trusting later must be enough: push never
+        // re-sends an object the remote holds.
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-tomb-late-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-tomb-late-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        let (a, snap, tid, identity) = origin_with_signed_transcript(&a_root);
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        drop(a); // push takes the origin's repo lock
+
+        b.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        std::fs::write(b_root.join("f2"), b"two").unwrap();
+        b.commit("t", "c2").unwrap();
+        b.push("origin").unwrap();
+
+        let a = Repo::open(&a_root).unwrap();
+        assert_eq!(
+            a.transcripts_for(&snap).unwrap().len(),
+            1,
+            "untrusted signer: the tombstone is held but inert"
+        );
+        assert!(a.layout().transcript_pending_path().exists());
+        crate::transcripts::tests::trust_signer(&a, &identity);
+        drop(a);
+
+        // No re-push, no operator workaround: the next open re-evaluates.
+        let a = Repo::open(&a_root).unwrap();
+        assert!(a.transcripts_for(&snap).unwrap().is_empty());
+        assert!(!a.layout().transcript_pending_path().exists());
+        drop(a);
+
+        // A push that sends other objects re-evaluates too (long-lived server).
+        let c_root = std::env::temp_dir().join(format!("scl-tomb-late-c-{pid}"));
+        let _ = std::fs::remove_dir_all(&c_root);
+        let (c, snap_c, tid_c, id_c) = origin_with_signed_transcript(&c_root);
+        let d_root = std::env::temp_dir().join(format!("scl-tomb-late-d-{pid}"));
+        let _ = std::fs::remove_dir_all(&d_root);
+        let d = Repo::clone_to(&c_root, &d_root).unwrap();
+        drop(c);
+        d.drop_transcript(&tid_c.to_hex(), Some(&id_c)).unwrap();
+        std::fs::write(d_root.join("f2"), b"two").unwrap();
+        d.commit("t", "c2").unwrap();
+        d.push("origin").unwrap();
+        let c = Repo::open(&c_root).unwrap();
+        crate::transcripts::tests::trust_signer(&c, &id_c);
+        drop(c);
+        std::fs::write(d_root.join("f3"), b"three").unwrap();
+        d.commit("t", "c3").unwrap();
+        d.push("origin").unwrap();
+        let c = Repo::open(&c_root).unwrap();
+        assert!(c.transcripts_for(&snap_c).unwrap().is_empty());
+
+        drop((b, c, d));
+        for root in [&a_root, &b_root, &c_root, &d_root] {
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn served_remote_honors_a_held_tombstone_when_a_transport_opens_it() {
+        // A `sc serve` or local-path remote never goes through `Repo::open`.
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-tomb-serve-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-tomb-serve-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        let (a, snap, tid, identity) = origin_with_signed_transcript(&a_root);
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        drop(a);
+        b.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        std::fs::write(b_root.join("f2"), b"two").unwrap();
+        b.commit("t", "c2").unwrap();
+        b.push("origin").unwrap();
+
+        let a = Repo::open(&a_root).unwrap();
+        crate::transcripts::tests::trust_signer(&a, &identity);
+        drop(a);
+        let _served = crate::transport::LocalTransport::open(&a_root).unwrap();
+        assert!(!crate::layout::Layout::at(&a_root)
+            .transcript_pending_path()
+            .exists());
+        drop(_served);
+        let a = Repo::open(&a_root).unwrap();
+        assert!(a.transcripts_for(&snap).unwrap().is_empty());
+
+        drop((a, b));
+        for root in [&a_root, &b_root] {
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn a_peer_that_never_trusts_the_signer_never_honors_the_tombstone() {
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-tomb-never-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-tomb-never-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        let (a, snap, tid, identity) = origin_with_signed_transcript(&a_root);
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        a.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        let (_s, other) = scl_crypto::generate_identity_v2();
+        crate::transcripts::tests::trust_signer(&b, &other);
+        drop(a);
+
+        for _ in 0..2 {
+            b.fetch("origin").unwrap();
+        }
+        drop(b);
+        let b = Repo::open(&b_root).unwrap();
+        assert_eq!(b.transcripts_for(&snap).unwrap().len(), 1);
+        assert!(crate::transcripts::tests::pending_count(&b) <= 1);
+
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        assert!(!a_root.exists());
+        std::fs::remove_dir_all(&b_root).unwrap();
+        assert!(!b_root.exists());
+    }
+
+    #[test]
+    fn no_transcripts_transfers_neither_hold_nor_remember_a_tombstone() {
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-tomb-nt-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-tomb-nt-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        let (a, snap, tid, identity) = origin_with_signed_transcript(&a_root);
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        let tomb = tombstone_id(snap, tid);
+
+        // Fetch side: the dropper's tombstone is not stored or remembered.
+        a.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        drop(a);
+        b.fetch_opts("origin", true).unwrap();
+        assert!(!b.store_arc().lock().unwrap().contains(&tomb));
+        assert!(!b.layout().transcript_pending_path().exists());
+        b.fetch("origin").unwrap();
+        assert!(b.layout().transcript_pending_path().exists());
+        assert_eq!(b.transcripts_for(&snap).unwrap().len(), 1);
+
+        // Push side: `--no-transcripts` leaves the tombstone at home.
+        let c_root = std::env::temp_dir().join(format!("scl-tomb-nt-c-{pid}"));
+        let _ = std::fs::remove_dir_all(&c_root);
+        let (c, snap_c, tid_c, id_c) = origin_with_signed_transcript(&c_root);
+        let d_root = std::env::temp_dir().join(format!("scl-tomb-nt-d-{pid}"));
+        let _ = std::fs::remove_dir_all(&d_root);
+        let d = Repo::clone_to(&c_root, &d_root).unwrap();
+        drop(c);
+        d.drop_transcript(&tid_c.to_hex(), Some(&id_c)).unwrap();
+        std::fs::write(d_root.join("f2"), b"two").unwrap();
+        d.commit("t", "c2").unwrap();
+        d.push_opts("origin", true).unwrap();
+        let c = Repo::open(&c_root).unwrap();
+        assert!(!c
+            .store_arc()
+            .lock()
+            .unwrap()
+            .contains(&tombstone_id(snap_c, tid_c)));
+        assert!(!c.layout().transcript_pending_path().exists());
+
+        drop((b, c, d));
+        for root in [&a_root, &b_root, &c_root, &d_root] {
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
+        }
     }
 
     #[test]

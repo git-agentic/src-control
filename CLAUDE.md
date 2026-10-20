@@ -135,7 +135,7 @@ the code, those win.
 | P17 | `sc rewrap`: one-commit bulk cutover of secrets + protected wrap lists to current recipients/escrow; escrow is a managed list; `--rotate` also re-seals every protected blob under a fresh key | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md), [0051](docs/adr/0051-rotate-protected-paths.md) |
 | P18 | Hosted Git (GitHub https/ssh) via system-git mirror bridge (`SC_GIT` overrides); auth delegated to git | [0028](docs/adr/0028-network-git-remotes.md) |
 | P19 | Resumable rebase (stop → resolve → `--continue`; one oplog record total), `cherry-pick --abort`/`--mainline <N>`, `sc amend` | [0029](docs/adr/0029-history-editing-polish.md) |
-| P20 | Durable multi-invocation agent sessions: `sc ws fork/list/run/harvest/abandon` under `.sc/ws/`; harvest auto-merges, conflicts fall back to `work-<i>` | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
+| P20 | Durable multi-invocation agent sessions: `sc ws fork/list/run/harvest/abandon` under `.sc/ws/`; harvest auto-merges, conflicts fall back to `work-<i>`. `fork --name <n>` opens a further named session in `.sc/ws-<n>/` (`--session <n>` on the other verbs; fallback branches and `SC_WORKSPACE` are `<n>-<i>`); sessions are harvested independently, first harvest wins; `ws run` releases the repo lock while the command runs; refresh is designed, not built (#215) | [0030](docs/adr/0030-agent-sessions-and-automerge.md), [0056](docs/adr/0056-named-concurrent-ws-sessions.md) |
 | P21 | Hardening sweep: in-progress guards on all policy ops, git-marks self-heal, abort protected-skip parity, ws `"landed"` status | [0031](docs/adr/0031-hardening-consolidation.md) |
 | P22 | Signed commits: v2 identities (one seed → X25519 + Ed25519), signatures as CAS objects, `sc sign`/`sc verify [--require]` | [0032](docs/adr/0032-signed-commits-provenance.md) |
 | P23 | `sc conflicts`/`sc resolve --ours\|--theirs`: whole-file conflict resolution without hand-edited markers | [0033](docs/adr/0033-merge-ergonomics.md) |
@@ -145,7 +145,7 @@ the code, those win.
 | P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3 | [0037](docs/adr/0037-partial-clone.md) |
 | P28 | Security hardening: a max object size (default 256 MiB; `--max-object-size` / `SC_MAX_OBJECT_SIZE`, 2 MiB to 1 GiB) caps every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | P29 | `sc serve --http` access control: bearer tokens (`sc serve token add [--expires]`/`rotate`/`remove`/`list`; an expired token gets the same 401 as an unknown one), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
-| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex | [0038](docs/adr/0038-agent-session-transcripts.md) |
+| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex; retained signed tombstones ride a transfer when their snapshot is in it or was collected by the sender, only verifying signatures are indexed, and held-but-untrusted tombstones are re-judged from `.sc/transcript-pending` when the trusted-signer set changes (#230) | [0038](docs/adr/0038-agent-session-transcripts.md) |
 | P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff; later `--max-conn-bytes` per-connection write budget (#233) | [0041](docs/adr/0041-listener-resource-limits.md) |
 | P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning (`sc tls list/forget/pin/path` manages the pin file); `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system` validate against a CA instead; client connect/handshake bounded; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md), [0053](docs/adr/0053-tls-pin-management.md), [0054](docs/adr/0054-tls-ca-validation.md) |
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
@@ -181,7 +181,9 @@ transport-adjacent. The rest, imperatively:
 - **The P35 desktop app is a keyless, read-only top-level adapter.** Its
   renderer has five typed repository commands, no general filesystem/shell
   capability, and no DTO field capable of carrying protected ciphertext or
-  identity material.
+  identity material. Opening a repository can write the derived transcript-drop
+  indexes (`.sc/transcript-drops`, `.sc/transcript-pending`) when the trusted
+  signer set changed; no key material is involved (#230).
 - **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (and, on a non-lazy clone, one outside the filter), `sc rewrap`,
   `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view (a `.theirs` sidecar sits beside its conflicted path, so it is in view whenever that path is; ADR-0049) (no ref, state or working-tree change; on every clone, a conflict stop that needs sealing outside the view is refused the same way), `sc push` to a git remote, and
   `sc fetch` from any native remote but the promisor origin.** `sc merge`, `sc cherry-pick` and `sc rebase` work, including conflicts inside the view (P37c). `sc ws` and `sc work` work too (ADR-0050): workspaces and agents see the clone's view only, and harvest lands through the same merge. `sc backfill --all`
@@ -209,7 +211,7 @@ transport-adjacent. The rest, imperatively:
   to randomized, or with `--rotate`; only a plain rewrap over an all-randomized
   tip is policy-only.
 - **`.sc/local-key` and the per-checkout protected caches
-  (`.sc/protected-cache`, `.sc/ws/cache-<i>`) are never committed and never
+  (`.sc/protected-cache`, `<ws session root>/cache-<i>`) are never committed and never
   transferred.** Cache saves are best-effort and ordered after ref moves; a
   cache failure may cause a spurious re-seal but never incorrectness. The key
   is owner-only on unix only; non-unix keeps default permissions and warns once
@@ -275,7 +277,13 @@ transport-adjacent. The rest, imperatively:
   safe (reconstructed on next use). Stale marks self-heal on push/export.
 - **`sc ws harvest` lands on the currently-checked-out branch** (default the
   session's base; `--into` must also be checked out) — it refuses with a
-  `sc switch` hint otherwise.
+  `sc switch` hint otherwise. Several `sc ws` sessions may be open (the unnamed
+  one in `.sc/ws/`, named ones in `.sc/ws-<name>/`); `list`/`run`/`harvest`/
+  `abandon` take `--session <name>` and never guess a named session when none
+  is given. Harvests of different sessions run one at a time (repo lock), in
+  invocation order: the first lands, a later conflicting one falls back to
+  `<name>-<i>`. Do not run a pre-ADR-0056 `sc` against a repo with named
+  sessions open (its gc would not root their bases).
 - **A stopped merge/pick/rebase lists the paths it wrote as plaintext in
   `.sc/CONFLICT_PLAINTEXT`.** Protected conflict text never enters the CAS, so no
   tree records it; completion treats a listed path absent from disk as deleted,
@@ -317,9 +325,9 @@ transport-adjacent. The rest, imperatively:
 
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here); entries that name an issue mirror the open
-GitHub issues. Standing entries: named/concurrent `sc ws` sessions (#215),
+GitHub issues. Standing entries: `sc ws` workspace refresh (#215),
 blob-size clone filters (#217), bucket compaction and gc (#216), the non-unix
-`.sc/local-key` ACL (#214), transcript-drop delivery gaps (#230), and the open
+`.sc/local-key` ACL (#214), and the open
 sparse guard and user-file safety limits (#241, ADR-0034 refinement 8).
 
 ## Agent skills

@@ -190,7 +190,15 @@ across every phase.
   the session's base snapshot gated on manifest presence. Proven by
   `demo/run_ws_demo.sh` (fork/edit/harvest across separate invocations:
   two cumulative clean auto-merges, one conflict fallback, an `sc undo`
-  of a landing, zero residue at session end). (ADR-0030.)
+  of a landing, zero residue at session end). (ADR-0030.) Follow-on (#215,
+  ADR-0056): `sc ws fork --name <n>` opens further named sessions beside the
+  unnamed one, each in `.sc/ws-<n>/` with its own manifest and caches
+  (`--session <n>` on `list`/`run`/`harvest`/`abandon`; fallback branches and
+  `SC_WORKSPACE` are `<n>-<i>`); the unnamed layout is unchanged, no migration.
+  Harvests of different sessions are serialized by the repo lock and land in
+  invocation order (first wins, a later conflict falls back); `sc ws run`
+  releases the repo lock while its command runs, so other sessions stay usable.
+  Workspace refresh is designed in ADR-0056 and still deferred.
 - **Phase 21 — Hardening & consolidation.** Closes the P16–P20 review
   tail with no new capability axis. Every commit-creating policy op
   (`protect`/`grant`/`revoke`/`secret add`/`secret rotate`/`secret
@@ -480,8 +488,13 @@ across every phase.
   grow-only drop tombstone (a bare `Transcript` object, so no wire change)
   hides the body from `list`/`show`, travels with fetch/clone, blocks
   resurrection in either arrival order, and is kept by gc while the dropped
-  body is swept at gc (after the grace window if loose). (ADR-0038 addendum;
-  delivery gaps tracked in #230.)
+  body is swept at gc (after the grace window if loose). (ADR-0038 addendum.)
+  Issue #230 closed the delivery gaps: a retained signed tombstone rides
+  a transfer when its snapshot is in it or was collected by the sender's gc (so
+  a stale peer is told), only verifying signatures enter the signature index,
+  and a remote that held a tombstone before trusting the signer re-judges it
+  from a capped `.sc/transcript-pending` index when the trusted-signer set
+  changes. Crowding by valid signatures from attacker keys is tracked in #257.
 
 - **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
   (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"
@@ -750,13 +763,12 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
-- **Named/multiple concurrent ws sessions (#215, P20).** P20 ships one unnamed
-  session per repo; named or concurrent sessions and workspace re-fork/refresh
-  from a newer tip need a design decision first.
-- **Transcript drop delivery gaps (#230, ADR-0038 addendum).** A tombstone is
-  not sent after the dropper's gc removed its snapshot, and a tombstone a
-  push-only remote received before trusting the signer is not re-evaluated
-  later; both are documented limits, not regressions.
+- **`sc ws` workspace refresh (#215, P20).** Named and concurrent sessions
+  shipped (ADR-0056). Moving a live workspace onto a newer tip is designed there
+  (replay the workspace's commit with the ADR-0049 engine, refuse on any
+  conflict, re-materialize under the recorded view) but not built: it needs a
+  headless merge-into-tree entry point and a re-materialize that keeps files an
+  agent may have open. Abandon and re-fork covers it meanwhile.
 - **Sparse untracked-file guard edge cases.** #241: on a case-insensitive
   filesystem the untracked-file guard can alias an old-view path with a newly
   in-view one.
