@@ -774,6 +774,34 @@ pub(crate) fn preflight_view(
     Ok(())
 }
 
+/// The paths a widened view (`new`, which covers `old`) brings in from `root`
+/// that are already on disk with exactly the bytes [`lay_out_added_view`]
+/// would write: what an interrupted run of the same widen left behind.
+pub(crate) fn added_view_already_laid(
+    layout: &Layout,
+    store: &mut Store,
+    root: ObjectId,
+    old: &Sparse,
+    new: &Sparse,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut laid = std::collections::BTreeSet::new();
+    for (path, (blob_id, _mode, perms)) in tree_file_entries_with_perms_sparse(store, root, new)? {
+        if old.matches(&path) || perms & PROTECTED != 0 {
+            continue;
+        }
+        let Object::Blob(bytes) = store.get(&blob_id)? else {
+            continue;
+        };
+        let full = safe_join(&layout.root, &path)?;
+        // A symlink is never ours, and a read error reads as "not laid".
+        let is_file = full.symlink_metadata().is_ok_and(|m| m.is_file());
+        if is_file && std::fs::read(&full).is_ok_and(|disk| disk[..] == bytes[..]) {
+            laid.insert(path);
+        }
+    }
+    Ok(laid)
+}
+
 /// Lay out the files that a widened view (`new`, which covers `old`) brings
 /// in from `root`, and nothing else: no removal pass, and no rewrite of a path
 /// `old` already laid out (it may hold conflict markers or the user's

@@ -180,10 +180,20 @@ every claim below is checked against the shipped code, not the plan.
    view and runs `refuse_untracked_for_view_change`, then writes
    only the files `old` did not match (`worktree::lay_out_added_view`) and
    stores the spec last, so a crash leaves extra out-of-view files, never a
-   view with files missing (a retry of the same widen after such a crash is
-   refused by the untracked-file guard; delete the laid files and rerun). The
-   decided root is the right source: it is what completion carries an
-   out-of-view path from. For a resumed rebase (`resolved`) the accumulator
+   view with files missing. A retry treats a file already on disk with the
+   decided root's bytes as its own earlier write (modes are not compared:
+   `lay_out_added_view` writes none, #237) and a changed one still refuses. On a
+   partial clone the new view is recorded in `.sc/sparse_prev` before the
+   writes, so the abort's removal walk covers files an interrupted widen
+   laid; the marker is restored to its prior state once the spec is stored.
+   The untracked-file guard checks only paths the old view did not match
+   (those it laid out are not written, and a stopped op may have turned one
+   into a directory). Widening to the same spec is a quiet no-op. The
+   decided root is the right source: it is what completion is meant to carry
+   an out-of-view path from (not always true today: a clean out-of-view
+   deletion by the other side can be resurrected from the tip on a full
+   clone, #238, which is why a widen *before* completing yields the right tree
+   and a narrow view does not). For a resumed rebase (`resolved`) the accumulator
    can differ from it outside the view, but the next `--continue` re-lays
    the tree from the accumulator under the new spec, so what the widen laid
    is overwritten there. A full spec is `disable` and stays refused. Markers, the resolution,

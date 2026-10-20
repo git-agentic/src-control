@@ -749,7 +749,11 @@ scale-&-reach horizon):
   narrow) while a merge, cherry-pick or rebase is stopped: the files coming into
   view are laid out from the stop's decided root, so `rebase --continue`'s
   out-of-view refusal no longer needs an abort. Protected files that come into
-  view mid-stop stay absent (not decrypted) until completion.
+  view mid-stop are not decrypted: they stay absent from disk and completion
+  carries them. A rebase's final fold re-lays the tree and decrypts them with
+  `--identity`; a merge or cherry-pick finished with `sc commit` writes no
+  working tree, so they stay absent until the next operation that does (a
+  `switch`, or `sparse set` again).
 - **Transparent lazy-fetch for partial clones (P27).** `sc backfill` is
   explicit-only by design (ADR-0037's "no network in read paths" choice);
   the identical filtered-walk/gap infra could instead dial the promisor

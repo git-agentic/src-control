@@ -332,7 +332,13 @@ impl Repo {
             }
             // Widening lays tracked files onto disk: refuse before anything is
             // stored if one would replace a file the user owns.
-            self.refuse_untracked_for_view_change("sparse set", snap.root, &old_spec, &spec)?;
+            self.refuse_untracked_for_view_change(
+                "sparse set",
+                snap.root,
+                &old_spec,
+                &spec,
+                &Default::default(),
+            )?;
         }
         // Crash safety: record the spec being replaced before the new one is
         // stored. If the process dies before the re-lay finishes, the marker
@@ -425,6 +431,10 @@ impl Repo {
         old: &Sparse,
         new: &Sparse,
     ) -> Result<Vec<String>> {
+        // Same view: nothing comes into view, so there is nothing to write.
+        if new.covers(old) && old.covers(new) {
+            return Ok(Vec::new());
+        }
         // Before any write, for every tree the stopped op still reads over
         // the new view (the decided root; the tip, which `--abort` and the
         // completion's `tracked_paths_at` read; a rebase's accumulator):
@@ -438,19 +448,42 @@ impl Repo {
             roots.push(self.snapshot(&st.acc_tip)?.root);
         }
         let store_arc = self.vfs().store();
-        for root in roots {
+        for &root in &roots {
             self.ensure_view(root, new)?;
-            {
-                let mut s = store_arc.lock().unwrap();
-                crate::worktree::preflight_view(self.layout(), &mut s, root, new)?;
-            }
-            self.refuse_untracked_for_view_change("sparse set", root, old, new)?;
+            let mut s = store_arc.lock().unwrap();
+            crate::worktree::preflight_view(self.layout(), &mut s, root, new)?;
+        }
+        // Files an interrupted run of this same widen already wrote (same
+        // bytes as the decided root): a retry may rewrite them, not refuse.
+        let already_laid = {
+            let mut s = store_arc.lock().unwrap();
+            crate::worktree::added_view_already_laid(self.layout(), &mut s, decided, old, new)?
+        };
+        for root in roots {
+            self.refuse_untracked_for_view_change("sparse set", root, old, new, &already_laid)?;
+        }
+        // A partial clone's abort removes only what its removal walk can see,
+        // which is the spec's view plus this marker. The files are laid before
+        // the spec is stored, so record the new view first; a crash then
+        // leaves a bound that covers them. An earlier interrupted `sparse set`
+        // may have left its own marker: keep it.
+        let partial = self.promisor()?.is_some();
+        let prev = load_prev(self.layout())?;
+        if partial {
+            let bound = prev.as_ref().map_or_else(|| new.clone(), |p| p.union(new));
+            store_prev(self.layout(), &bound)?;
         }
         let skipped = {
             let mut s = store_arc.lock().unwrap();
             crate::worktree::lay_out_added_view(self.layout(), &mut s, decided, old, new)?
         };
         store(self.layout(), new)?;
+        if partial {
+            match prev {
+                Some(p) => store_prev(self.layout(), &p)?,
+                None => clear_prev(self.layout())?,
+            }
+        }
         Ok(skipped)
     }
 
@@ -523,6 +556,7 @@ impl Repo {
                 root,
                 &self.sparse_spec()?,
                 &Sparse::default(),
+                &Default::default(),
             )?;
         }
         clear(self.layout())?;

@@ -2090,9 +2090,12 @@ impl Repo {
     }
 
     /// Refuse a sparse-spec change (`op`) that would lay a tracked file onto an
-    /// untracked or ignored one: a path newly in view (`new_view`) that the
-    /// tree `root` tracks, with something already standing there and the old
-    /// view (`old_view`) not having laid it out. Same rules as
+    /// untracked or ignored one: a path newly in view (`new_view` and not
+    /// `old_view`) that the tree `root` tracks, with something already standing
+    /// there. Paths the old view matched are not checked: they are not written
+    /// (a stopped op may have turned one into a directory, say). `already_laid`
+    /// names paths that count as tracked because an earlier, interrupted run of
+    /// the same change wrote them. Same rules as
     /// [`Repo::refuse_untracked_overwrite_vs`].
     pub(crate) fn refuse_untracked_for_view_change(
         &self,
@@ -2100,9 +2103,10 @@ impl Repo {
         root: ObjectId,
         old_view: &crate::Sparse,
         new_view: &crate::Sparse,
+        already_laid: &std::collections::BTreeSet<String>,
     ) -> Result<()> {
         let partial = self.promisor()?.is_some();
-        let (laid_out, target) = {
+        let (mut laid_out, target) = {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
             let mut files = |view: &crate::Sparse| -> Result<std::collections::BTreeSet<String>> {
@@ -2116,7 +2120,13 @@ impl Repo {
             };
             (files(old_view)?, files(new_view)?)
         };
-        self.refuse_untracked_paths_in(op, &laid_out, target.iter(), new_view)
+        laid_out.extend(already_laid.iter().cloned());
+        self.refuse_untracked_paths_in(
+            op,
+            &laid_out,
+            target.iter().filter(|p| !old_view.matches(p)),
+            new_view,
+        )
     }
 
     /// The path-list core of [`Repo::refuse_untracked_overwrite_vs`], for a

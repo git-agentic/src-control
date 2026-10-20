@@ -1341,6 +1341,7 @@ pub enum RebaseResult {
 mod tests {
     use super::*;
     use crate::worktree::tree_file_ids;
+    use crate::Sparse;
 
     fn tmp_root(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("scl-repo-replay-{tag}-{}", std::process::id()));
@@ -3248,6 +3249,178 @@ mod tests {
         repo.merge_abort().unwrap();
         drop(repo);
         remove_root(&root);
+    }
+
+    /// A replayed commit turned `src/x` (a file) into the directory `src/x/`.
+    /// The widen never writes under `src/` (the old view laid it out), so that
+    /// directory is not an obstacle, and the rebase finishes after it.
+    #[test]
+    fn widening_a_stopped_rebase_ignores_a_directory_the_old_view_laid_out() {
+        let root = tmp_root("sparse-rebase-file-to-dir");
+        let repo = Repo::init(&root).unwrap();
+        for d in ["src", "docs"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("src/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("src/x"), b"x\n").unwrap();
+        std::fs::write(root.join("docs/x.txt"), b"x1\nx2\nx3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("docs/x.txt"), b"OURS\nx2\nx3\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        std::fs::remove_file(root.join("src/x")).unwrap();
+        std::fs::create_dir_all(root.join("src/x")).unwrap();
+        std::fs::write(root.join("src/x/y"), b"y\n").unwrap();
+        repo.commit("me", "work 1").unwrap();
+        std::fs::write(root.join("docs/x.txt"), b"THEIRS\nx2\nx3\n").unwrap();
+        repo.commit("me", "work 2").unwrap();
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        assert!(matches!(
+            repo.rebase("main", "me", None).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        assert!(root.join("src/x/y").is_file(), "src/x is a directory now");
+        std::fs::write(root.join("src/a.txt"), b"RESOLVED\nl2\nl3\n").unwrap();
+        let err = repo.rebase_continue("me", None).unwrap_err();
+        assert_widen_refusal(&err, "docs/x.txt");
+
+        repo.set_sparse(&["src/".into(), "docs/".into()], None)
+            .unwrap();
+        assert!(matches!(
+            repo.rebase_continue("me", None).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        std::fs::write(root.join("docs/x.txt"), b"MERGED\nx2\nx3\n").unwrap();
+        assert!(matches!(
+            repo.rebase_continue("me", None).unwrap(),
+            RebaseResult::Rebased { replayed: 2, .. }
+        ));
+        assert_eq!(std::fs::read(root.join("src/x/y")).unwrap(), b"y\n");
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// A widen interrupted after it wrote the files but before it stored the
+    /// spec: the retry rewrites them instead of refusing, and the rebase
+    /// finishes.
+    #[test]
+    fn a_widen_interrupted_after_laying_files_can_be_retried() {
+        let (root, repo) = rebase_refused_at_an_out_of_view_conflict("sparse-rebase-retry");
+        let old = repo.sparse_spec().unwrap();
+        let new = Sparse::new(vec!["src/".into(), "docs/".into()]);
+        let decided = crate::rebase_state::read_decided_root(repo.layout())
+            .unwrap()
+            .unwrap();
+        {
+            let store = repo.vfs().store();
+            let mut s = store.lock().unwrap();
+            crate::worktree::lay_out_added_view(repo.layout(), &mut s, decided, &old, &new)
+                .unwrap();
+        }
+        assert!(root.join("docs/y.txt").exists(), "laid, spec not stored");
+        assert_eq!(repo.sparse_spec().unwrap(), old);
+
+        // A file the user changed since is still theirs and still refused.
+        std::fs::write(root.join("docs/y.txt"), b"MINE\n").unwrap();
+        assert!(repo.set_sparse(new.prefixes(), None).is_err());
+        std::fs::write(root.join("docs/y.txt"), b"Y-work\n").unwrap();
+
+        repo.set_sparse(new.prefixes(), None).unwrap();
+        // The same spec again is a quiet no-op.
+        assert!(repo.set_sparse(new.prefixes(), None).unwrap().is_empty());
+        assert!(matches!(
+            repo.rebase_continue("me", None).unwrap(),
+            RebaseResult::Stopped { .. }
+        ));
+        std::fs::write(root.join("docs/x.txt"), b"MERGED\nx2\nx3\n").unwrap();
+        assert!(matches!(
+            repo.rebase_continue("me", None).unwrap(),
+            RebaseResult::Rebased { .. }
+        ));
+        drop(repo);
+        remove_root(&root);
+    }
+
+    /// `main` and `work` both edit `src/a.txt` (a conflict); `work` also
+    /// deletes `docs/del.txt` and adds `docs/new.txt`, both cleanly and in
+    /// view only after a widen. Runs `op` with the view narrowed to `src/` and
+    /// widened mid-stop (or never narrowed), and returns the resulting tree.
+    fn deletion_and_add_fixture(
+        name: &str,
+        narrow: bool,
+        op: impl Fn(&Repo, &std::path::Path),
+    ) -> scl_core::ObjectId {
+        let root = tmp_root(name);
+        let repo = Repo::init(&root).unwrap();
+        for d in ["src", "docs"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("src/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("docs/del.txt"), b"del\n").unwrap();
+        std::fs::write(root.join("docs/keep.txt"), b"keep\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        std::fs::remove_file(root.join("docs/del.txt")).unwrap();
+        std::fs::write(root.join("docs/new.txt"), b"new\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        if narrow {
+            repo.set_sparse(&["src/".into()], None).unwrap();
+        }
+        op(&repo, &root);
+        let tip = repo.head_tip().unwrap().unwrap();
+        let tree = repo.snapshot(&tip).unwrap().root;
+        drop(repo);
+        remove_root(&root);
+        tree
+    }
+
+    /// Widening mid-stop gives the tree a run without sparse gives, for a
+    /// clean deletion and a clean add that only come into view with the widen.
+    #[test]
+    fn a_widened_merge_equals_the_merge_without_sparse() {
+        let run = |narrow: bool| {
+            deletion_and_add_fixture("sparse-eq-merge", narrow, |repo, root| {
+                assert!(matches!(
+                    repo.merge("work", "me").unwrap_err(),
+                    Error::MergeConflicts(1)
+                ));
+                if narrow {
+                    repo.set_sparse(&["src/".into(), "docs/".into()], None)
+                        .unwrap();
+                }
+                std::fs::write(root.join("src/a.txt"), b"MERGED\nl2\nl3\n").unwrap();
+                repo.commit("me", "merge").unwrap();
+            })
+        };
+        assert_eq!(run(true), run(false));
+    }
+
+    /// The same for a cherry-pick.
+    #[test]
+    fn a_widened_pick_equals_the_pick_without_sparse() {
+        let run = |narrow: bool| {
+            deletion_and_add_fixture("sparse-eq-pick", narrow, |repo, root| {
+                assert!(matches!(
+                    repo.cherry_pick("work", "me", None, None).unwrap_err(),
+                    Error::PickConflicts(1)
+                ));
+                if narrow {
+                    repo.set_sparse(&["src/".into(), "docs/".into()], None)
+                        .unwrap();
+                }
+                std::fs::write(root.join("src/a.txt"), b"MERGED\nl2\nl3\n").unwrap();
+                repo.commit("me", "pick").unwrap();
+            })
+        };
+        assert_eq!(run(true), run(false));
     }
 
     /// A merge that is stopped can be widened too: the files that come into

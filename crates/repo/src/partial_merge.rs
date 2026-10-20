@@ -371,6 +371,66 @@ fn widening_a_stopped_partial_merge_fills_and_lays_out_the_carried_subtree() {
     fx.cleanup();
 }
 
+/// Aborting a stopped merge after a widen removes what the widen laid out,
+/// and leaves no marker: a file only theirs added is gone, ours' files are back.
+/// A widen interrupted after its writes (simulated: files laid, spec not
+/// stored, marker as the widen records it) is cleaned by the abort too, which
+/// the spec's view alone could not see on a partial clone.
+#[test]
+fn aborting_a_widened_partial_merge_leaves_no_residue() {
+    for interrupted in [false, true] {
+        let fx = Fx::origin(
+            if interrupted {
+                "abort-widen-int"
+            } else {
+                "abort-widen"
+            },
+            |_| {},
+        );
+        fx.origin_branch(
+            "b1",
+            &[
+                ("src/a.txt", b"ONE\ntwo\nthree\n"),
+                ("docs/new.md", b"added by theirs\n"),
+            ],
+        );
+        let clone = fx.clone(true);
+        clone_edit_src(&fx, &clone, b"uno\ntwo\nthree\n");
+        assert!(matches!(
+            clone.merge("origin/b1", "t").unwrap_err(),
+            Error::MergeConflicts(1)
+        ));
+        let old = clone.sparse_spec().unwrap();
+        let wide = crate::Sparse::new(vec!["src/".to_string(), "docs/".to_string()]);
+        if interrupted {
+            let decided = crate::merge_state::read_decided_root(clone.layout())
+                .unwrap()
+                .unwrap();
+            clone.ensure_view(decided, &wide).unwrap();
+            crate::sparse::store_prev(clone.layout(), &wide).unwrap();
+            let store = clone.vfs().store();
+            let mut s = store.lock().unwrap();
+            crate::worktree::lay_out_added_view(clone.layout(), &mut s, decided, &old, &wide)
+                .unwrap();
+        } else {
+            clone.set_sparse(wide.prefixes(), None).unwrap();
+            assert!(!fx.clone_root.join(".sc/sparse_prev").exists());
+        }
+        assert!(fx.clone_root.join("docs/new.md").exists(), "laid");
+
+        clone.merge_abort().unwrap();
+        assert!(!fx.clone_root.join("docs/new.md").exists(), "no residue");
+        assert!(!fx.clone_root.join(".sc/sparse_prev").exists());
+        assert_eq!(
+            std::fs::read(fx.clone_root.join("src/a.txt")).unwrap(),
+            b"uno\ntwo\nthree\n"
+        );
+        assert!(clone.status().unwrap().modified.is_empty());
+        drop(clone);
+        fx.cleanup();
+    }
+}
+
 /// Aborting restores ours and removes the markers; the carried subtree was
 /// never on disk and the ref never moved.
 #[test]
