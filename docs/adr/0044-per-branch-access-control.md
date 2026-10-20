@@ -384,7 +384,11 @@ the next commit. Instead:
   the merge stays stopped for someone who can. Where the merged entry is
   unreadable to the completer (for example the public side revoked them and
   rotated the file), the stop removes the stale plaintext it would otherwise
-  leave behind, so completion carries the merged entry, not the old one.
+  leave behind, so completion carries the merged entry, not the old one. It
+  removes only a file that is byte-identical to the tracked prior-tip
+  plaintext; any other file at that path is the user's, and the stop refuses
+  naming the path before any write. Removals run first and a failed one fails
+  the stop before any other write or state change.
   Paths the merge decided are also read from disk regardless of the private
   side's `.scignore` (as `with_decided_paths` does publicly, ADR-0049 q19).
   The completion's scanner gate covers only files read from disk; re-derived

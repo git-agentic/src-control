@@ -1331,34 +1331,84 @@ impl Repo {
             // identity by construction). Never through the CAS. Out-of-view
             // paths are not laid out; completion re-derives their merged
             // value (`commit_private`, #240). It reads MERGE_HEAD.
-            let prior_paths: BTreeSet<String> = self
-                .inner_tree_files(&mut store, &ctx, ours_snap.root)?
-                .into_keys()
-                .collect();
+            let prior_entries = self.inner_tree_files(&mut store, &ctx, ours_snap.root)?;
+            let prior_paths: BTreeSet<String> = prior_entries.keys().cloned().collect();
+            // Carried protected ciphertext: decrypt for the resolver to see
+            // (completion re-seals it as needed). One this recipient cannot
+            // read has its old plaintext dropped, so completion carries the
+            // merged entry instead of recommitting the stale one. Decide all
+            // of it, and refuse a collision, before writing anything.
+            let prots = Protection {
+                prefixes: prefixes.clone(),
+                wrapped: fm.wrapped_carry.clone(),
+            };
+            let mut plaintext: BTreeMap<&str, Option<Vec<u8>>> = BTreeMap::new();
+            for f in fm.files.iter().filter(|f| sparse.matches(&f.path)) {
+                if f.perms & PROTECTED == 0 || f.needs_encrypt {
+                    continue;
+                }
+                let id = Object::blob(f.bytes.clone()).id();
+                if let Ok(pt) = crate::protect::decrypt_with(&f.bytes, &id, &[&prots], sk, &f.path)
+                {
+                    plaintext.insert(&f.path, Some(pt.to_vec()));
+                    continue;
+                }
+                let full = worktree::safe_join(&self.layout.root, &f.path)?;
+                let on_disk = match std::fs::read(&full) {
+                    Ok(b) => Some(b),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e.into()),
+                };
+                if let Some(disk) = on_disk {
+                    // Only the tracked prior-tip plaintext is ours to drop.
+                    let stale = match prior_entries.get(&f.path) {
+                        Some((pid, _, perms)) if perms & PROTECTED != 0 => {
+                            let ct = self.inner_blob(&mut store, &ctx, pid)?;
+                            crate::protect::decrypt_with(
+                                &ct,
+                                pid,
+                                &[&ours_snap.protection],
+                                sk,
+                                &f.path,
+                            )
+                            .map(|pt| pt.as_slice() == disk.as_slice())
+                            .unwrap_or(false)
+                        }
+                        _ => false,
+                    };
+                    if !stale {
+                        return Err(Error::InvalidArgument(format!(
+                            "{} exists and is not the tracked copy, but the merged version is \
+                             protected and you cannot read it; move it away, then retry",
+                            f.path
+                        )));
+                    }
+                }
+                plaintext.insert(&f.path, None);
+            }
             drop(store);
+            // Removals first: a failed one must fail the stop before any
+            // other write, or completion would commit the stale plaintext.
+            for (path, pt) in &plaintext {
+                if pt.is_none() {
+                    let full = worktree::safe_join(&self.layout.root, path)?;
+                    match std::fs::remove_file(&full) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
             for f in fm.files.iter().filter(|f| sparse.matches(&f.path)) {
                 let full = worktree::safe_join(&self.layout.root, &f.path)?;
+                if matches!(plaintext.get(f.path.as_str()), Some(None)) {
+                    continue;
+                }
                 if let Some(parent) = full.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                if f.perms & PROTECTED != 0 && !f.needs_encrypt {
-                    // Carried ciphertext: write the decrypted form for the
-                    // resolver to see; completion re-seals it as needed.
-                    let id = Object::blob(f.bytes.clone()).id();
-                    let prots = Protection {
-                        prefixes: prefixes.clone(),
-                        wrapped: fm.wrapped_carry.clone(),
-                    };
-                    match crate::protect::decrypt_with(&f.bytes, &id, &[&prots], sk, &f.path) {
-                        Ok(pt) => worktree::write_file(&full, &pt[..], f.mode)?,
-                        Err(_) => {
-                            // Undecryptable by this recipient: drop the old
-                            // plaintext so completion carries the merged entry
-                            // instead of recommitting the stale one.
-                            let _ = std::fs::remove_file(&full);
-                            continue;
-                        }
-                    }
+                if let Some(Some(pt)) = plaintext.get(f.path.as_str()) {
+                    worktree::write_file(&full, &pt[..], f.mode)?;
                 } else {
                     worktree::write_file(&full, &f.bytes, f.mode)?;
                 }
@@ -2632,6 +2682,92 @@ mod tests {
         let files = repo.inner_tree_files(&mut store, &ctx, snap.root).unwrap();
         assert!(files.contains_key("src/build.log"), "public add dropped");
         drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// Scenario shared by the two stop-time protected tests: `vault/` is
+    /// protected to alice and bob, the private `fix` has both as recipients,
+    /// and `main` revokes alice, adds `vault/new.pem` (sealed to bob only) and
+    /// edits `src/lib.rs` so the merge stops on that one conflict.
+    fn revoked_addition_setup(tag: &str) -> (std::path::PathBuf, Repo, SecretKey) {
+        let (root, repo, (alice_sk, alice_pk), (_bob_sk, bob_pk)) = setup(tag);
+        repo.protect("vault/", &[alice_pk.clone(), bob_pk.clone()], None)
+            .unwrap();
+        write(&root, "vault/key.pem", "PEM-V1\n");
+        repo.commit("tester", "add protected").unwrap();
+        repo.branch_private("fix", &alice_sk, std::slice::from_ref(&bob_pk), &[])
+            .unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        write(&root, "src/lib.rs", "private\n");
+        repo.commit_private("alice", "private work", Some(&alice_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        repo.revoke("vault/", &alice_pk.recipient_id()).unwrap();
+        write(&root, "vault/new.pem", "PEM-NEW\n");
+        write(&root, "src/lib.rs", "public\n");
+        repo.commit("tester", "rotate").unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        (root, repo, alice_sk)
+    }
+
+    /// An untracked file at a path whose merged protected version the
+    /// recipient cannot read is the user's, not stale plaintext: the stop
+    /// refuses before any write and leaves it intact.
+    #[test]
+    fn private_stop_refuses_an_untracked_file_at_an_unreadable_protected_path() {
+        let (root, repo, alice_sk) = revoked_addition_setup("protuntracked");
+        write(&root, "vault/new.pem", "MINE\n");
+        let (_, before, _) = repo.head_private().unwrap().unwrap();
+        let err = repo
+            .merge_into_private("main", "alice", Some(&alice_sk))
+            .unwrap_err();
+        assert!(err.to_string().contains("vault/new.pem"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("vault/new.pem")).unwrap(),
+            "MINE\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "private\n",
+            "refusal wrote nothing"
+        );
+        assert!(!crate::merge_state::in_progress(repo.layout()));
+        assert_eq!(repo.head_private().unwrap().unwrap().1, before);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// If the stale plaintext cannot be removed the stop fails before any
+    /// write or state change; it must not stop and let completion commit it.
+    #[cfg(unix)]
+    #[test]
+    fn private_stop_fails_when_stale_protected_plaintext_cannot_be_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, repo, alice_sk) = revoked_addition_setup("protrmfail");
+        // The tracked copy of vault/key.pem is stale once main rotates it.
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        write(&root, "vault/key.pem", "PEM-V2\n");
+        repo.commit("tester", "rotate key").unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        let (_, before, _) = repo.head_private().unwrap().unwrap();
+        let dir = root.join("vault");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let can_write = std::fs::write(dir.join("probe"), b"x").is_ok();
+        let res = repo.merge_into_private("main", "alice", Some(&alice_sk));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !can_write {
+            assert!(matches!(res, Err(Error::Io(_))), "{res:?}");
+            assert!(!crate::merge_state::in_progress(repo.layout()));
+            assert_eq!(repo.head_private().unwrap().unwrap().1, before);
+            assert_eq!(
+                std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+                "private\n",
+                "nothing else was written"
+            );
+        }
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
