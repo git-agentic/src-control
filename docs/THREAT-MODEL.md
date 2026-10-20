@@ -517,9 +517,11 @@ too, not just the src-control-side metadata.
 - **A session on a partial clone sees the host's view and nothing else
   (ADR-0050).** An agent from `sc work` or `sc ws` cannot read or change what the
   clone does not hold, and a workspace commit grafts the out-of-view subtrees
-  from the base by id. This bounds what an agent touches by default; it is not a
-  confidentiality boundary against the user, who can widen the view with
-  `sc sparse set`.
+  from the base by id. This scopes what a session lays out, not what an agent can
+  reach: an agent is a same-user process that can read the host repository's
+  store and working tree and, on a lazy clone, fetch more (`sc sparse set`,
+  `sc cat`, `sc backfill`). It is not an isolation boundary (compare Secret
+  injection).
 - **Operations that need a complete closure refuse on a partial clone, fail
   closed:** `sc export`, `sc rewrap`, `sc grant`/`revoke`, private branches, and
   `sc push` to a git remote. They refuse rather than run on partial data.

@@ -73,8 +73,10 @@ ahead of 0015–0016.
 ## Status legend
 
 - **Proposed** — under discussion, not yet built.
-- **Accepted** — decided and implemented. `Accepted (built)` marks a multi-step
-  ADR whose steps (such as 37b-i and 37b-ii in ADR-0048) have all landed.
+- **Accepted** — decided and implemented. `Accepted (built)` is the same state
+  stated explicitly: the ADR was written ahead of, or in steps with, its
+  implementation (such as 37b-i and 37b-ii in ADR-0048, or ADR-0051 to 0054),
+  and everything it decides has landed.
 - **Accepted; … by ADR-NNNN** — still the record of its decision, but a later ADR
   changed a current fact (a refusal lifted, a deferred item built, a default
   narrowed). The body is left as written; read the pointer for today's behavior.

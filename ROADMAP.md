@@ -739,7 +739,10 @@ These apply across phases rather than to one:
 
 Tracked but out of scope for this roadmap horizon. Entries that name an issue
 (`#NNN`) mirror the open GitHub issues; the rest have no issue yet. Shipped
-items live under Done above, not here.
+items were removed from this list: the larger ones are under Done above, the
+smaller ones (protected-cache hygiene, theirs-side resolve carry, sparse and
+P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
+`CLAUDE.md`, `ARCHITECTURE.md` and the ADRs.
 
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
@@ -794,6 +797,17 @@ items live under Done above, not here.
 - **fd secret injection beyond `sc run` (ADR-0052 follow-on).** `sc run
   --secrets-fd N` shipped. Not built: the same mode for `sc ws run` and
   `sc work --with-secrets`, and a stdin variant.
+- **Completion can commit a leftover `.theirs` sidecar after a crash (known
+  limit).** A stopped merge/pick/rebase records the sidecars it wrote in
+  `.sc/CONFLICT_SIDECARS`, and the completing commit leaves them out of the tree
+  and unlinks them. The sweep retires the record before it unlinks, so a crash
+  between the two leaves the scratch file on disk with no record, and a retried
+  `sc commit` would commit it as ordinary content. The opposite order would
+  risk deleting a file the user recreated at that path; closing both needs a
+  journal.
+- **TLS session-resumption knobs (ADR-0042 follow-on).** Not evaluated; a later
+  throughput pass if repeated short-lived connections to one host show
+  handshake cost.
 - **Further serve budgets (ADR-0039 second addendum follow-on).** `--max-conn-bytes`
   shipped (#233). Not built: a request-count or CPU budget, and a per-peer
   (cross-connection) budget.
