@@ -356,7 +356,8 @@ phases but the shape is stable:
   wrote into the working tree — an interrupted merge/pick/rebase resumes or
   aborts cleanly from these.
 - The `sc+https://` client's pin file is user-level, not part of `.sc/`
-  (`~/.config/sc/known_hosts`, managed with `sc tls`).
+  (`$SC_HTTPS_KNOWN_HOSTS`, else `$XDG_CONFIG_HOME/sc/known_hosts`, else
+  `~/.config/sc/known_hosts`; managed with `sc tls`).
 
 ### Git-like working tree
 
@@ -905,8 +906,8 @@ explicitly and offline — no lazy-fetch from inside a read path.
 Building a *new* commit on a partial clone needed real machinery beyond
 carry-by-id: `worktree::graft_out_of_sparse` splices the tip's untouched
 out-of-filter subtrees back into a freshly built root by id, never reading
-their content, so push's filtered reachability walk still sends only the
-client's new in-filter objects. `commit` refuses (`Error::GappedPathContent`)
+their content, so push's filtered reachability walk (until P37b-i made it
+presence-based) still sent only the client's new in-filter objects. `commit` refuses (`Error::GappedPathContent`)
 rather than silently drop content under an unfetched subtree. `sc backfill
 --all` is the genuine full-clone escape hatch: fetch everything, verify the
 closure, then remove `.sc/promisor`. P27 refused merge, replay, `sc ws
@@ -930,15 +931,16 @@ ADR-0039.
 
 `sc serve --http` gains three composed access-control gates at the
 connection opening, closing P26's stated "unauthenticated" boundary: a
-read-only mode that rejects any write-shaped request before it reaches
-`wire::serve`, a fail-closed bind check, and bearer-token authentication
+read-only mode that rejects each mutating request inside
+`wire::serve_with_policy` before any store write, a fail-closed bind check, and bearer-token authentication
 against a `.sc/serve-tokens.toml` allowlist. `--read-only` forces the
 read-only gate independent of tokens (a rejected write gets the typed
 `EC_READONLY` wire error), so a public-read mirror needs no token management at
-all. Each gate runs before
-the P25/P26 wire handshake begins, matching P26's own status-line-before-
-handshake discipline, so a rejected connection never reaches
-`LocalTransport`. Tokens later gained an optional expiry (`sc serve token add
+all. The bind and token gates
+run before the P25/P26 wire handshake begins, matching P26's own
+status-line-before-handshake discipline, so a connection they reject never
+reaches `LocalTransport`; the read-only gate is enforced per request after the
+handshake. Tokens later gained an optional expiry (`sc serve token add
 --expires`; an expired token gets the same 401 as an unknown one) and `sc serve
 token rotate` (ADR-0040 addendum). See ADR-0040.
 
@@ -996,8 +998,9 @@ the URL is `sc+https://`; the server wraps before the opening read when
 byte-for-byte unchanged; `PROTOCOL_VERSION` stays 3.
 
 Trust is accept-new TOFU, the SSH `known_hosts` shape: the client pins
-`SHA-256(SPKI DER)` per host in `~/.config/sc/known_hosts`
-(`SC_HTTPS_KNOWN_HOSTS` overrides; `SC_HTTPS_FINGERPRINT` pre-pins for CI;
+`SHA-256(SPKI DER)` per host in the pin file (`$SC_HTTPS_KNOWN_HOSTS`, else
+`$XDG_CONFIG_HOME/sc/known_hosts`, else `~/.config/sc/known_hosts`;
+`SC_HTTPS_FINGERPRINT` pre-pins for CI;
 `SC_HTTPS_STRICT=1` refuses unknown hosts). A pin mismatch always
 hard-fails. The server auto-mints a self-signed identity into
 `.sc/serve-tls/` (key `0600`) unless PEM is supplied; `sc serve fingerprint`
@@ -1006,7 +1009,7 @@ list/forget/pin/path` manages the pin file (ADR-0053), and a client can opt into
 CA validation instead of pinning with `SC_HTTPS_CA_FILE=<pem>` or
 `SC_HTTPS_CA=system` (ADR-0054; fail-closed, no revocation checking, the pin
 file is neither read nor written). Client connect, TLS handshake and opening
-are bounded to 30 s, and bracketed IPv6 hosts parse in `sc+http(s)://` URLs.
+are each held to a 30 s inactivity bound, and bracketed IPv6 hosts parse in `sc+http(s)://` URLs.
 **Gate change:** a
 non-loopback bind now requires `--read-only`, `--allow-public`, or (`--tls`
 AND ≥1 token) — P29's "tokens alone justify a public bind" is narrowed,
@@ -1142,7 +1145,8 @@ with the objects it can serve plus the ids it will not send, with no haves and
 no reachability walk. `Store::get` stays network-free; the only code that dials
 the promisor after clone is `Repo::fetch_by_id_from` in `crates/repo/src/
 fill.rs`, which verifies the reply against the request before writing. A fill
-only adds objects, so push, gc and verify (filter-scoped walks) are unchanged.
+only adds objects; push, gc and verify were filter-scoped walks when P37a
+shipped and became presence-based in P37b-i (below).
 Sparse widening over a filled path and the lifted P27 refusals needed
 presence-based walks and are P37b-P37d (below). See ADR-0047 and
 `docs/research/scion-evaluation.md`.
