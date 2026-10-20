@@ -473,3 +473,37 @@ fn abort_discards_the_resolution_of_a_modify_delete_conflict() {
         finish(&root, repo);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn abort_never_deletes_through_a_symlinked_parent_directory() {
+    for op in [Op::Merge, Op::Pick] {
+        let root = root_for("link-parent", op);
+        let repo = Repo::init(&root).unwrap();
+        put(&root, "d/y.txt", b"y\n");
+        put(&root, "x.txt", b"keep\n");
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        std::fs::remove_file(root.join("d/y.txt")).unwrap();
+        repo.commit("me", "main deletes d/y").unwrap();
+        repo.switch("feature").unwrap();
+        put(&root, "d/y.txt", b"y changed\n");
+        repo.commit("me", "feature edits d/y").unwrap();
+        repo.switch("main").unwrap();
+        stop(&repo, op);
+        let outside = root.with_extension("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("y.txt"), b"precious\n").unwrap();
+        std::fs::remove_dir_all(root.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
+        let report = abort(&repo, op);
+        assert_eq!(
+            std::fs::read(outside.join("y.txt")).unwrap(),
+            b"precious\n",
+            "{op:?}"
+        );
+        assert_eq!(report.kept, vec!["d/y.txt".to_string()], "{op:?}");
+        std::fs::remove_dir_all(&outside).unwrap();
+        finish(&root, repo);
+    }
+}

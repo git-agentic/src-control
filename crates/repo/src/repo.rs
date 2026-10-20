@@ -2081,23 +2081,17 @@ impl Repo {
                 Err(_) => false,
             };
             // A regular file only: the stop wrote one, so a symlink there is
-            // the user's (a restore reports it as kept).
-            let is_file = match worktree::safe_join(&self.layout.root, &path)?.symlink_metadata() {
-                Ok(m) => m.is_file(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                // Not knowing what stands there must stop the abort before
-                // its state is cleared, like a failed removal.
-                Err(e) => return Err(e.into()),
-            };
-            if remove && !is_file {
-                // Not the stop's regular file (a symlink or directory the user
-                // put there): left, and told to the caller.
-                if worktree::safe_join(&self.layout.root, &path)?
-                    .symlink_metadata()
-                    .is_ok()
-                {
-                    retained.push(path.clone());
-                }
+            // the user's, and so is anything behind a symlinked parent.
+            let full = worktree::safe_join(&self.layout.root, &path)?;
+            // Not knowing what stands there must stop the abort before its
+            // state is cleared, like a failed removal.
+            let meta = worktree::lstat(&full)?;
+            let behind_link = worktree::under_symlink(&self.layout.root, &path);
+            let is_file = !behind_link && meta.as_ref().is_some_and(|m| m.is_file());
+            if remove && meta.as_ref().is_some_and(|m| m.is_symlink() || behind_link) {
+                // The user's link where the stop wrote plaintext: left, and
+                // told to the caller.
+                retained.push(path.clone());
             }
             if remove && is_file {
                 // Only an already-absent file is fine: any other failure must

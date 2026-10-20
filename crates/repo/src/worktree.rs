@@ -906,6 +906,43 @@ pub(crate) fn lay_out_added_view(
     Ok(protected)
 }
 
+/// Whether a parent directory of the tracked path `rel` under `root` is a
+/// symlink: a file reached through it lies outside the working tree, so it is
+/// never ours to delete. Reads only.
+pub(crate) fn under_symlink(root: &Path, rel: &str) -> bool {
+    let mut end = 0;
+    while let Some(i) = rel[end..].find('/') {
+        end += i;
+        if root
+            .join(&rel[..end])
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_symlink())
+        {
+            return true;
+        }
+        end += 1;
+    }
+    false
+}
+
+/// `symlink_metadata` that reads "nothing there" (also when a parent is a
+/// file) as `None`, and surfaces any other failure: not knowing what stands
+/// at a path must stop the caller before it clears state.
+pub(crate) fn lstat(full: &Path) -> Result<Option<std::fs::Metadata>> {
+    match full.symlink_metadata() {
+        Ok(m) => Ok(Some(m)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Refuse, before anything is written, a target path (`paths`) with a file or
 /// symlink standing where one of its parent directories must be, unless
 /// `removable` names it (the removal pass is about to delete it). Writing
@@ -1193,24 +1230,25 @@ fn materialize_impl(
         let mut removals: BTreeSet<&str> = BTreeSet::new();
         for (p, (blob_id, _, perms)) in old_files.iter().filter(|(p, _)| gone(p)) {
             let full = safe_join(&layout.root, p)?;
-            if full.symlink_metadata().is_err() {
+            if lstat(&full)?.is_none() {
                 continue;
             }
-            let ours = if perms & PROTECTED != 0 {
-                // Plaintext cannot be compared without a key, and leftover
-                // plaintext of a protected file must not linger: a forward op
-                // removes it, a restore only if the stop recorded it. Only a
-                // file is ever unlinked.
-                full.symlink_metadata().is_ok_and(|m| m.is_file())
-                    && restore_owned.is_none_or(|owned| owned.contains(p))
-            } else {
-                // Still the tree's bytes, or a path the stop owns (recorded
-                // plaintext, a live conflict) where an edit is the resolution
-                // a restore discards. Only a regular file either way.
-                disk_is_blob(&full, blob_id)
-                    || (restore_owned.is_some_and(|owned| owned.contains(p))
-                        && full.symlink_metadata().is_ok_and(|m| m.is_file()))
-            };
+            let ours = !under_symlink(&layout.root, p)
+                && if perms & PROTECTED != 0 {
+                    // Plaintext cannot be compared without a key, and leftover
+                    // plaintext of a protected file must not linger: a forward op
+                    // removes it, a restore only if the stop recorded it. Only a
+                    // file is ever unlinked.
+                    full.symlink_metadata().is_ok_and(|m| m.is_file())
+                        && restore_owned.is_none_or(|owned| owned.contains(p))
+                } else {
+                    // Still the tree's bytes, or a path the stop owns (recorded
+                    // plaintext, a live conflict) where an edit is the resolution
+                    // a restore discards. Only a regular file either way.
+                    disk_is_blob(&full, blob_id)
+                        || (restore_owned.is_some_and(|owned| owned.contains(p))
+                            && full.symlink_metadata().is_ok_and(|m| m.is_file()))
+                };
             if ours {
                 removals.insert(p);
             } else if sparse.matches(p) {

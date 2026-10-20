@@ -403,7 +403,10 @@ impl Repo {
             &|c| old_paths.contains(c) && !target.contains_key(c),
         )?;
         for p in old_paths {
-            if !target.contains_key(p) && sparse.matches(p) {
+            if !target.contains_key(p)
+                && sparse.matches(p)
+                && !worktree::under_symlink(&self.layout.root, p)
+            {
                 let full = worktree::safe_join(&self.layout.root, p)?;
                 match std::fs::remove_file(full) {
                     Ok(()) => {}
@@ -934,16 +937,15 @@ impl Repo {
                 continue;
             }
             let full = worktree::safe_join(&self.layout.root, &p)?;
-            let meta = match full.symlink_metadata() {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                // Not knowing what stands there must stop the abort before it
-                // clears the stop's records (decrypted text could linger).
-                Err(e) => return Err(e.into()),
+            // Not knowing what stands there must stop the abort before it
+            // clears the stop's records (decrypted text could linger).
+            let Some(meta) = worktree::lstat(&full)? else {
+                continue;
             };
             let recorded = plaintext.contains(&p);
             // The stop wrote regular files: a symlink there is the user's.
             let ours = meta.is_file()
+                && !worktree::under_symlink(&self.layout.root, &p)
                 && if perms & PROTECTED != 0 {
                     recorded
                 } else {
