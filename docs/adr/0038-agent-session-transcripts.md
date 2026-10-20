@@ -505,7 +505,8 @@ never re-runs.
   connection) and before the indexing step of every ingest except a
   `--no-transcripts` one. All are best effort: a failure never fails an open
   or a transfer, and the fingerprint is saved only after a successful pass,
-  so the next trigger retries.
+  so the next trigger retries (this includes an object that fails to
+  read: the fingerprint stays old until a pass completes).
 - **Lost-update safety.** `append_drop` appends one short line with
   `O_APPEND` and `fsync` instead of rewriting the file, so concurrent
   ingests (the HTTP serve path holds no repo lock) cannot lose a drop line. A
@@ -531,6 +532,12 @@ never re-runs.
   signer later does not undo a recorded drop.
 
 ### Other accepted limits
+
+- Verifying a signature before indexing costs one Ed25519 check per incoming
+  signature object, linear in the pack size like hash-checking its records. A
+  per-ingest verification budget was considered and refused: it would drop
+  legitimate signatures from a large fetch (a long signed history), which is a
+  worse failure than the cost.
 
 - Re-evaluation scans `.sc/signatures` once per trigger (time proportional to
   the file, memory proportional to the pending targets).

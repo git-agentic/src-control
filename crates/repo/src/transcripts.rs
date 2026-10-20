@@ -249,8 +249,12 @@ pub(crate) fn reevaluate_if_trust_changed(
     if !trust_changed(layout) {
         return Ok(0);
     }
-    let honored = reevaluate_pending(layout, store)?;
-    save_trust_fp(layout)?;
+    let (honored, incomplete) = reevaluate_inner(layout, store)?;
+    // An entry that could not be read keeps the old fingerprint, so the next
+    // trigger tries again once the object is repaired.
+    if !incomplete {
+        save_trust_fp(layout)?;
+    }
     Ok(honored)
 }
 
@@ -514,10 +518,17 @@ pub(crate) fn index_incoming(
 /// object is gone, or that no longer decodes as a tombstone, is forgotten.
 /// Returns how many drops were honored.
 pub(crate) fn reevaluate_pending(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
+    Ok(reevaluate_inner(layout, store)?.0)
+}
+
+/// [`reevaluate_pending`] plus whether some entry could not be judged because
+/// an object failed to read.
+fn reevaluate_inner(layout: &Layout, store: &mut scl_core::Store) -> Result<(usize, bool)> {
     let pending = read_pending(layout)?;
     if pending.is_empty() {
-        return Ok(0);
+        return Ok((0, false));
     }
+    let mut incomplete = false;
     let trusted = trusted_signers(layout);
     let wanted: BTreeSet<ObjectId> = pending.iter().copied().collect();
     let sigs = crate::signatures::index_for_targets(layout, &wanted, MAX_SIG_READS)?;
@@ -531,6 +542,7 @@ pub(crate) fn reevaluate_pending(layout: &Layout, store: &mut scl_core::Store) -
             Ok(_) => continue,
             // Unreadable now, maybe fine later: keep it.
             Err(_) => {
+                incomplete = true;
                 keep.push(*id);
                 continue;
             }
@@ -540,17 +552,22 @@ pub(crate) fn reevaluate_pending(layout: &Layout, store: &mut scl_core::Store) -
         };
         // An unreadable object keeps the entry for the next trigger rather
         // than aborting the rest.
-        if tombstone_honored(store, &trusted, &sigs, *id, &t, dropped).unwrap_or(false) {
-            append_drop(layout, (t.snapshot, *id, dropped))?;
-            honored += 1;
-        } else {
-            keep.push(*id);
+        match tombstone_honored(store, &trusted, &sigs, *id, &t, dropped) {
+            Ok(true) => {
+                append_drop(layout, (t.snapshot, *id, dropped))?;
+                honored += 1;
+            }
+            Ok(false) => keep.push(*id),
+            Err(_) => {
+                incomplete = true;
+                keep.push(*id);
+            }
         }
     }
     if keep.len() != pending.len() {
         write_pending(layout, &keep)?;
     }
-    Ok(honored)
+    Ok((honored, incomplete))
 }
 
 /// Full-store rebuild of the transcript index (clone path): scan every
