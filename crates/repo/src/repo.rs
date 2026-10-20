@@ -658,13 +658,13 @@ impl Repo {
         //    committed the stale ours blob.) A path PRESENT in the decided
         //    tree is decided, period: parents are never consulted for it.
         // 2. The parents — `tip` only on a non-merge commit (unchanged
-        //    behavior), both parents on merge completion for paths the
-        //    decided tree doesn't know (and as full fallback when the merge
-        //    state predates the decided-root record, i.e. was written by an
-        //    older code path). Ours wins across parents. With a decided root
-        //    the parents supply only still-protected paths, never the
-        //    out-of-sparse carry: a plain path missing from the decided root
-        //    was decided deleted (#238). A pick's non-parent
+        //    behavior), both parents on a merge completion only as the full
+        //    fallback when the state predates the decided-root record (written
+        //    by an older code path). Ours wins across parents. With a decided
+        //    root the parents are NOT consulted at all: it holds every
+        //    surviving path, so a path missing from it (protected or
+        //    out-of-sparse) was decided deleted and must not come back
+        //    (#238). A pick's non-parent
         //    `pick_head` is NOT a source: any picked-side content the pick
         //    kept is in the decided tree — a protected path in the picked
         //    commit but absent from the decided tree was decided *deleted*
@@ -701,38 +701,32 @@ impl Repo {
             let store_arc = self.vfs.store();
             let mut store = store_arc.lock().unwrap();
 
-            // Decided tree first (merge completion only), then the parents
-            // restricted to paths outside the decided tree.
-            // The flag marks a parent behind a decided root: it may still
-            // supply a protected path, but never an out-of-sparse carry (#238).
+            // The decided tree (merge, pick or rebase completion) is the only
+            // source when one exists; the parents are the fallback for a plain
+            // commit and for state written without a decided root.
             type Entries = std::collections::BTreeMap<String, (ObjectId, scl_core::FileMode, u8)>;
-            let mut sources: Vec<(Entries, bool)> = Vec::new();
-            let mut decided_paths: std::collections::BTreeSet<String> = Default::default();
+            let mut sources: Vec<Entries> = Vec::new();
             if let Some(dr) = decided_root {
-                let decided = if partial {
+                sources.push(if partial {
                     worktree::tree_file_entries_with_perms_sparse(&mut store, dr, sparse)?
                 } else {
                     worktree::tree_file_entries_with_perms(&mut store, dr)?
-                };
-                decided_paths = decided.keys().cloned().collect();
-                sources.push((decided, false));
-            }
-            for parent in tip.into_iter().chain(merge_head) {
-                let parent_root = store.get_snapshot(&parent)?.root;
-                let mut entries = if partial {
-                    // A parent is only a fallback behind the decided root
-                    // (merge completion); a subtree it lacks was never the
-                    // only record of a path, so skip it, not fail.
-                    worktree::tree_file_entries_with_perms_sparse_present(
-                        &mut store,
-                        parent_root,
-                        sparse,
-                    )?
-                } else {
-                    worktree::tree_file_entries_with_perms(&mut store, parent_root)?
-                };
-                entries.retain(|p, _| !decided_paths.contains(p));
-                sources.push((entries, decided_root.is_some()));
+                });
+            } else {
+                for parent in tip.into_iter().chain(merge_head) {
+                    let parent_root = store.get_snapshot(&parent)?.root;
+                    sources.push(if partial {
+                        // A subtree a parent lacks was never the only record
+                        // of a path, so skip it, not fail.
+                        worktree::tree_file_entries_with_perms_sparse_present(
+                            &mut store,
+                            parent_root,
+                            sparse,
+                        )?
+                    } else {
+                        worktree::tree_file_entries_with_perms(&mut store, parent_root)?
+                    });
+                }
             }
 
             // Paths the stopped operation wrote in plaintext. One of them that
@@ -744,17 +738,14 @@ impl Repo {
             } else {
                 Default::default()
             };
-            for (entries, behind_decided) in sources {
+            for entries in sources {
                 for (path, (blob_id, mode, perms)) in entries {
                     if on_disk.contains(&path) || conflict_plaintext.contains(&path) {
                         continue;
                     }
                     let still_protected = perms & scl_core::PROTECTED != 0
                         && crate::protect::matching_prefix(&protection, &path).is_some();
-                    // A path missing from the decided root was decided deleted
-                    // (the other side's clean deletion included): a parent must
-                    // not carry it back just because it is out of view.
-                    let out_of_sparse = !behind_decided && !sparse.matches(&path);
+                    let out_of_sparse = !sparse.matches(&path);
                     if !still_protected && !out_of_sparse {
                         continue;
                     }

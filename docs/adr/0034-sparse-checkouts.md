@@ -168,14 +168,22 @@ every claim below is checked against the shipped code, not the plan.
    `MergeInProgress`/`PickInProgress`/`RebaseInProgress` errors the P21
    policy-op guards already use elsewhere, added in review before Task 4
    landed rather than discovered after.
-6. **Completion carries out-of-view paths from the decided root, not the
-   parents (#238).** A stopped merge, cherry-pick or rebase on a full clone
-   records a decided root, and `snapshot_files` carries an absent out-of-view
-   path from it. Earlier builds also read the tip and merge head, so an
-   out-of-view file the other side had cleanly deleted came back from the
-   tip, silently losing the deletion. With a decided root the parents now
-   supply only still-protected paths; they remain the full fallback for
-   state written without a decided root. Pinned by
-   `sparse_completion.rs` (merge, pick, rebase: the deletion stays, a clean
-   add and modify land, ours-side-only out-of-view changes are kept, and the
-   tree equals the result without sparse).
+6. **Completion carries from the decided root, not the parents (#238).**
+   A stopped merge, cherry-pick or rebase on a public branch records a
+   decided root (`MERGE`/`PICK`/`REBASE_DECIDED_ROOT`); a merge into a
+   private branch writes none and completes through `commit_private`, which
+   this refinement does not cover. `snapshot_files` carries an absent
+   out-of-view or still-protected path from the decided root. Earlier builds
+   also read the tip and merge head, so a path the other side had cleanly
+   deleted (an out-of-view file, or a protected file) came back from the tip
+   and the deletion was silently lost; a file the other side turned into a
+   directory was carried beside it, a corrupt tree. With a decided root the
+   parents are no longer consulted: on a full clone it holds every surviving
+   entry (protected ones as ciphertext), and conflicted paths and sealing
+   inputs are on disk or in `CONFLICT_PLAINTEXT`. They stay the full fallback
+   for state written without a decided root. Pinned by `sparse_completion.rs`
+   (merge, pick, rebase: deletion kept, clean add and modify land, ours-side
+   out-of-view changes kept, equal to the run without sparse; file to
+   directory; an out-of-view exec bit; a protected deletion). PR #236
+   owns refinement 5; its "not always true today ... #238" sentence goes away
+   once both land.
