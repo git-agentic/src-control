@@ -652,6 +652,7 @@ impl Repo {
         let ctx = self.open_private(&branch, mid, manifest, identity)?;
         let sk = identity.expect("open_private succeeded");
         let merge_head = crate::merge_state::read_merge_head(&self.layout)?;
+        let sparse = self.sparse_spec()?;
 
         let store_arc = self.vfs.store();
         let mut store = store_arc.lock().unwrap();
@@ -660,6 +661,10 @@ impl Repo {
 
         // Policy + secrets: tip's, or the union with theirs on merge completion
         // (same discipline as `snapshot_files`' merge-completion arm).
+        // Under a sparse spec, a merge completion also re-derives the merge's
+        // outcome for the paths it cannot read from disk (see below).
+        let mut decided: Option<BTreeMap<String, (ObjectId, FileMode, u8)>> = None;
+        let mut decided_blobs: BTreeMap<ObjectId, Vec<u8>> = BTreeMap::new();
         let (protection, secrets) = match merge_head {
             None => (prev_snap.protection.clone(), prev_snap.secrets.clone()),
             Some(mh) => {
@@ -676,9 +681,17 @@ impl Repo {
                 let base = self
                     .merge_base_private(&mut store, &ctx, inner_tip, mh)?
                     .ok_or(Error::NoCommonAncestor)?;
-                let base_secrets = self.get_inner_snapshot(&mut store, &ctx, &base)?.secrets;
+                let base_snap = self.get_inner_snapshot(&mut store, &ctx, &base)?;
+                if !sparse.is_full() {
+                    let fm = self.private_three_way(
+                        &mut store, &ctx, &prev_snap, &theirs, &base_snap, identity,
+                    )?;
+                    let (entries, blobs, _) = decide_merged(&fm);
+                    decided = Some(entries);
+                    decided_blobs = blobs;
+                }
                 let secs = crate::merge::merge_secrets(
-                    &base_secrets,
+                    &base_snap.secrets,
                     &prev_snap.secrets,
                     &theirs.secrets,
                 )?;
@@ -689,7 +702,6 @@ impl Repo {
         let prior = self.inner_tree_files(&mut store, &ctx, prev_snap.root)?;
         let tracked: BTreeSet<String> = prior.keys().cloned().collect();
         let files = worktree::read_worktree(&self.layout, &tracked)?;
-        let sparse = self.sparse_spec()?;
 
         // Scanner gate on the plaintext partition (protected-prefix files are
         // sealed at publish, exempt here exactly as in a public commit).
@@ -735,14 +747,23 @@ impl Repo {
                 }
             }
         }
-        // Carry prior paths that are expected-absent: outside sparse, or
-        // PROTECTED and skipped on disk (never silently drop protected content).
-        for (path, e) in &prior {
+        // Carry paths that are expected-absent: outside sparse, or PROTECTED
+        // and skipped on disk (never silently drop protected content). On a
+        // merge completion under a sparse spec the source is the merge's
+        // decided outcome, not the prior tip, so a path the public side
+        // deleted stays deleted and its clean adds and modifies land (#240,
+        // same rule as the public path, #238). It is re-derived rather than
+        // recorded: a decided tree cannot sit in unsealed `.sc/` state.
+        let source = decided.as_ref().unwrap_or(&prior);
+        for (path, e) in source {
             if entries.contains_key(path) || disk_paths.contains(path) {
                 continue;
             }
             if !sparse.matches(path) || e.2 & PROTECTED != 0 {
                 entries.insert(path.clone(), *e);
+                if let Some(bytes) = decided_blobs.get(&e.0) {
+                    new_blobs.entry(e.0).or_insert_with(|| bytes.clone());
+                }
             }
         }
 
@@ -1265,18 +1286,12 @@ impl Repo {
             .ok_or(Error::NoCommonAncestor)?;
         let base_snap = self.get_inner_snapshot(&mut store, &ctx, &base)?;
 
-        // Stage the three tree closures in a RAM-only store and run the
-        // existing three-way. Inner objects decode to plaintext values whose
-        // ids are exactly the inner ids the trees reference.
-        let mut ram = Store::with_budget(usize::MAX / 2);
-        self.copy_closure_inner(&mut store, &ctx, ours_snap.root, &mut ram)?;
-        copy_closure_public(&mut store, theirs_snap.root, &mut ram)?;
-        copy_closure_public(&mut store, base_snap.root, &mut ram)?;
-        let fm = crate::merge::three_way_files(
-            &mut ram,
-            Some((base_snap.root, &base_snap.protection)),
-            (ours_snap.root, &ours_snap.protection),
-            (theirs_snap.root, &theirs_snap.protection),
+        let fm = self.private_three_way(
+            &mut store,
+            &ctx,
+            &ours_snap,
+            &theirs_snap,
+            &base_snap,
             identity,
         )?;
         let secrets = crate::merge::merge_secrets(
@@ -1289,39 +1304,36 @@ impl Repo {
             &theirs_snap.protection.prefixes,
         );
 
-        // Decide the merged file map for the inner world:
-        // - carried PROTECTED ciphertext keeps its id + wraps;
-        // - everything else (plain carries, diff3 outputs, decrypted
-        //   protected merges) becomes a plain inner blob — publish re-seals
-        //   protected prefixes into public form.
-        let mut entries: BTreeMap<String, (ObjectId, FileMode, u8)> = BTreeMap::new();
-        let mut new_blobs: BTreeMap<ObjectId, Vec<u8>> = BTreeMap::new();
-        let mut wrapped: BTreeMap<ObjectId, Vec<WrappedKey>> = BTreeMap::new();
-        for f in &fm.files {
-            if f.perms & PROTECTED != 0 && !f.needs_encrypt {
-                let id = Object::blob(f.bytes.clone()).id();
-                if let Some(wks) = fm.wrapped_carry.get(&id) {
-                    wrapped.insert(id, wks.clone());
-                }
-                entries.insert(f.path.clone(), (id, f.mode, f.perms));
-            } else {
-                let id = Object::blob(f.bytes.clone()).id();
-                new_blobs.entry(id).or_insert_with(|| f.bytes.clone());
-                entries.insert(f.path.clone(), (id, f.mode, 0));
-            }
-        }
+        let (entries, new_blobs, wrapped) = decide_merged(&fm);
 
         if !fm.conflicts.is_empty() {
-            // Conflict state: everything lands on disk in plaintext (markers,
-            // sidecars, decrypted protected content — we hold the identity by
-            // construction). Never through the CAS. Completion is the next
-            // `commit_private`, which reads MERGE_HEAD.
+            // A conflict outside the sparse view has nowhere to show its
+            // markers: refuse before any write, like the public path (#220).
+            let sparse = self.sparse_spec()?;
+            let outside: Vec<&str> = fm
+                .conflicts
+                .iter()
+                .map(String::as_str)
+                .filter(|p| !sparse.matches(p))
+                .collect();
+            if !outside.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "conflict in {} is outside your sparse checkout; switch to a public branch, \
+                     run `sc sparse set` to include it, then retry",
+                    outside.join(", ")
+                )));
+            }
+            // Conflict state: the IN-VIEW files land on disk in plaintext
+            // (markers, sidecars, decrypted protected content — we hold the
+            // identity by construction). Never through the CAS. Out-of-view
+            // paths are not laid out; completion re-derives their merged
+            // value (`commit_private`, #240). It reads MERGE_HEAD.
             let prior_paths: BTreeSet<String> = self
                 .inner_tree_files(&mut store, &ctx, ours_snap.root)?
                 .into_keys()
                 .collect();
             drop(store);
-            for f in &fm.files {
+            for f in fm.files.iter().filter(|f| sparse.matches(&f.path)) {
                 let full = worktree::safe_join(&self.layout.root, &f.path)?;
                 if let Some(parent) = full.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -1348,6 +1360,9 @@ impl Repo {
             }
             let merged_paths: BTreeSet<String> = fm.files.iter().map(|f| f.path.clone()).collect();
             for p in prior_paths.difference(&merged_paths) {
+                if !sparse.matches(p) {
+                    continue;
+                }
                 let full = worktree::safe_join(&self.layout.root, p)?;
                 let _ = std::fs::remove_file(full);
             }
@@ -1432,6 +1447,34 @@ impl Repo {
             &[(head.clone(), Some(ctx.manifest_id), Some(new_mid))],
         )?;
         Ok((new_tip, skipped))
+    }
+
+    /// The three-way of a public `theirs` into the private `ours`, run against
+    /// a RAM-only store holding the three tree closures (decrypted inner
+    /// objects hash to their inner ids, so content addressing is consistent
+    /// and no plaintext ever touches disk). Deterministic in its inputs, so
+    /// `commit_private` re-derives a stopped merge's outcome instead of
+    /// persisting it (#240).
+    fn private_three_way(
+        &self,
+        store: &mut Store,
+        ctx: &PrivateCtx,
+        ours: &Snapshot,
+        theirs: &Snapshot,
+        base: &Snapshot,
+        identity: Option<&SecretKey>,
+    ) -> Result<crate::merge::FileMerge> {
+        let mut ram = Store::with_budget(usize::MAX / 2);
+        self.copy_closure_inner(store, ctx, ours.root, &mut ram)?;
+        copy_closure_public(store, theirs.root, &mut ram)?;
+        copy_closure_public(store, base.root, &mut ram)?;
+        crate::merge::three_way_files(
+            &mut ram,
+            Some((base.root, &base.protection)),
+            (ours.root, &ours.protection),
+            (theirs.root, &theirs.protection),
+            identity,
+        )
     }
 
     /// Copy an inner tree closure (trees + blobs, decoded plaintext values)
@@ -1629,6 +1672,36 @@ impl Repo {
         )?;
         Ok((published_tip, resealed))
     }
+}
+
+/// Decide the merged file map for the inner world: carried PROTECTED
+/// ciphertext keeps its id + wraps; everything else (plain carries, diff3
+/// outputs, decrypted protected merges) becomes a plain inner blob — publish
+/// re-seals protected prefixes into public form.
+#[allow(clippy::type_complexity)]
+fn decide_merged(
+    fm: &crate::merge::FileMerge,
+) -> (
+    BTreeMap<String, (ObjectId, FileMode, u8)>,
+    BTreeMap<ObjectId, Vec<u8>>,
+    BTreeMap<ObjectId, Vec<WrappedKey>>,
+) {
+    let mut entries = BTreeMap::new();
+    let mut new_blobs = BTreeMap::new();
+    let mut wrapped = BTreeMap::new();
+    for f in &fm.files {
+        let id = Object::blob(f.bytes.clone()).id();
+        if f.perms & PROTECTED != 0 && !f.needs_encrypt {
+            if let Some(wks) = fm.wrapped_carry.get(&id) {
+                wrapped.insert(id, wks.clone());
+            }
+            entries.insert(f.path.clone(), (id, f.mode, f.perms));
+        } else {
+            new_blobs.entry(id).or_insert_with(|| f.bytes.clone());
+            entries.insert(f.path.clone(), (id, f.mode, 0));
+        }
+    }
+    (entries, new_blobs, wrapped)
 }
 
 /// Copy a PUBLIC tree closure (trees + blobs) into the RAM store.

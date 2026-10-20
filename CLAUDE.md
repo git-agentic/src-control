@@ -225,7 +225,11 @@ transport-adjacent. The rest, imperatively:
   attach`, `sign`, creating a child branch) refuses on a private branch; and
   integrating a private branch INTO a public one (merge/cherry-pick/rebase
   from it, or git export/push) is refused everywhere except `sc branch
-  publish`. Merging a public branch IN is allowed (keeps an embargo current).
+  publish`. Merging a public branch IN is allowed (keeps an embargo current);
+  under a sparse spec set on the public branch, its conflict stop lays out
+  in-view files only, refuses an out-of-view conflict before any write, and
+  completion re-derives the merge outcome for out-of-view paths instead of
+  carrying the prior tip (#240; no decided root, it would be unsealed).
   `sc branch revoke` rotates the KEK but a recipient who already fetched keeps
   the old manifest (rotation ≠ erasure). **Keep identity files outside the
   working tree** — a key committed under a private branch is sealed in and
@@ -240,7 +244,8 @@ transport-adjacent. The rest, imperatively:
   environment (they arrive on fd N as NUL-terminated `NAME=VALUE` records,
   `SC_SECRETS_FD` names it): hygiene against env dumps and inheritance, still
   not isolation. `sc ws run` and `sc work --with-secrets` use the environment.
-- **Sparse is checkout-only**, and a stopped merge/pick/rebase writes no
+- **Sparse is checkout-only** (a spec set on a public branch still applies on a
+  private one, where `sparse set` is refused), and a stopped merge/pick/rebase writes no
   conflict marker or sealing-input plaintext outside the view: an out-of-sparse
   conflicted path or sealing input refuses with a `sc sparse set` hint before
   any write (ADR-0034, #210; from `rebase --continue` the hint says to abort

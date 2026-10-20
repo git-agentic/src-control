@@ -215,8 +215,11 @@ sealed trees — that inability is the feature. So:
   ref created).
 - Everywhere else, a private branch travels as its whole manifest closure
   or not at all.
-- `sc sparse` on a private branch works normally for a recipient — sparse
-  is checkout-only (ADR-0034) and applies after decryption.
+- `sc sparse set/disable` is refused while a private branch is checked out
+  (`refuse_on_private`), but a spec set on a public branch stays in force
+  when you switch onto one: sparse is checkout-only (ADR-0034) and applies
+  after decryption. Merging a public branch in and committing honor it (see
+  "Merge-in under a sparse spec" below).
 
 No P27 promisor/gap machinery grows manifest-aware cases.
 
@@ -349,6 +352,38 @@ The decision shipped as designed; the concrete shape settled as follows.
   (reachability from the manifest alone includes the merged blob) and
   `recipient_opens_a_merged_branch_cloned_without_the_public_source` (a peer
   that never received the public branch still opens the merged private one).
+
+## Merge-in under a sparse spec (#240)
+
+A conflicted `merge_into_private` completes through `commit_private`, which
+carries the paths it cannot read from disk (outside the sparse view, or
+protected and skipped). It used to carry them from the prior private tip, so
+a path the public side had cleanly deleted outside the view came back, and
+its clean adds and modifies there were lost. The public path fixed the same
+class in #238 by completing from a recorded decided root (ADR-0034
+refinement 6). **A private merge records none**, on purpose: a decided inner
+tree is plaintext about the private tree (paths, plaintext blob ids), and
+`.sc/MERGE_*` is unsealed. Sealing it under the branch KEK would need a
+second index outside the manifest, for a state that lives only until the
+next commit. Instead:
+
+- The stop is a pure function of the ours inner tip, `MERGE_HEAD` and the
+  merge base, none of which can move while the merge is stopped (every
+  ref-moving op is guarded). `commit_private` therefore **re-derives** the
+  outcome (`private_three_way`, the same call the stop made) when a sparse
+  spec is in force, and carries out-of-view and protected-skipped paths from
+  it, never from the prior tip. A path absent from the outcome was decided
+  deleted. Nothing new is stored, so the opacity argument above is unchanged.
+  With no sparse spec nothing is re-derived and behavior is as before.
+- The stop honors the view like the public path (#220): it lays out only
+  in-view files, and a conflict outside the view is refused before any write
+  (no merge state, no ref move) with a hint to switch to a public branch and
+  `sc sparse set` to include it. Earlier builds wrote every merged file,
+  including out-of-view ones, so the checkout was wider than advertised.
+
+Pinned by `private_sparse.rs`: the final tree equals the run without sparse
+(deletion kept, add and modify landed, ours-only private edit kept), the stop
+writes nothing outside the view, and an out-of-view conflict refuses cleanly.
 
 ## Deferred (to ROADMAP.md)
 

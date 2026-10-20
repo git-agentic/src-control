@@ -132,3 +132,15 @@ fn an_out_of_view_conflict_is_refused_before_any_write() {
     assert_eq!(f.repo.head_private().unwrap().unwrap().1, before);
     std::fs::remove_dir_all(&f.root).unwrap();
 }
+
+#[test]
+fn replay_onto_a_private_branch_stays_refused_under_sparse() {
+    let f = fixture("replay", true, false);
+    assert!(f
+        .repo
+        .cherry_pick("main", "alice", Some(&f.sk), None)
+        .is_err());
+    assert!(f.repo.rebase("main", "alice", Some(&f.sk)).is_err());
+    assert!(docs(&f.root).is_empty());
+    std::fs::remove_dir_all(&f.root).unwrap();
+}
