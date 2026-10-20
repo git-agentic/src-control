@@ -485,6 +485,45 @@ fn a_failure_at_every_operation_boundary_leaves_a_readable_bucket() {
     assert!(n > 20, "the loop should cross many boundaries, got {n}");
 }
 
+/// Stops a concurrency test from hanging: a worker that panics raises the flag
+/// (and the main thread always does, on exit), so one failure releases every
+/// loop instead of leaving the scope waiting on workers that never see `done`.
+struct Stop<'a>(&'a AtomicBool, bool);
+impl Drop for Stop<'_> {
+    fn drop(&mut self) {
+        if self.1 || std::thread::panicking() {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Aborts the process with each worker's last-known step if the test is still
+/// running at `limit`: a worker stuck inside a call (a lock, a bucket op) can
+/// not be unwound, so the hang becomes a diagnosed failure. Written straight to
+/// stderr because the harness captures `eprintln!` until the test ends.
+fn watchdog<'a>(
+    s: &'a std::thread::Scope<'a, '_>,
+    finished: &'a AtomicBool,
+    status: &'a Mutex<BTreeMap<String, String>>,
+    limit: Duration,
+) {
+    s.spawn(move || {
+        let start = std::time::Instant::now();
+        while !finished.load(Ordering::SeqCst) {
+            if start.elapsed() > limit {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "WATCHDOG: test still running after {limit:?}; last steps: {:#?}",
+                    status.lock().map(|m| m.clone()).unwrap_or_default()
+                );
+                std::process::abort();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+}
+
 #[test]
 fn readers_and_writers_stay_consistent_while_compaction_runs() {
     let root = scratch("concurrent");
@@ -502,24 +541,50 @@ fn readers_and_writers_stay_consistent_while_compaction_runs() {
     };
     let landed = Mutex::new(Vec::new());
     let deleted = std::sync::atomic::AtomicUsize::new(0);
+    let finished = AtomicBool::new(false);
+    let status = Mutex::new(BTreeMap::new());
+    let note = |who: String, what: String| {
+        status.lock().unwrap().insert(who, what);
+    };
     std::thread::scope(|s| {
+        let _finish = Stop(&finished, true);
+        let _stop = Stop(&done, false);
+        watchdog(s, &finished, &status, Duration::from_secs(180));
+        let note = &note;
         let writers: Vec<_> = (0..WRITERS)
             .map(|w| {
-                let (root, landed) = (&root, &landed);
+                let (root, landed, done) = (&root, &landed, &done);
                 s.spawn(move || {
+                    let _stop = Stop(done, false);
                     let t = open(root);
                     for i in 0..PER_WRITER {
                         let (tip, objects) = commit(&format!("writer-{w}-{i}"));
                         let branch = format!("writer-{w}-{i}");
+                        let mut attempts = 0u32;
                         loop {
+                            attempts += 1;
+                            note(
+                                format!("writer-{w}"),
+                                format!("push {i}, attempt {attempts}"),
+                            );
+                            // A sweep only takes a pack older than GRACE, so a
+                            // push that keeps losing its pack is not progressing.
+                            assert!(attempts < 200, "writer {w}: push {i} never landed");
+                            assert!(
+                                !done.load(Ordering::SeqCst),
+                                "writer {w}: another worker failed"
+                            );
                             for (id, bytes) in &objects {
                                 t.put_object(id, bytes).unwrap();
                             }
                             match t.update_ref(&branch, &tip, None) {
                                 Ok(()) => break,
-                                // The documented guard: a pack swept before
-                                // commit fails the push; the retry re-uploads.
-                                Err(Error::Remote(m)) if m.contains("removed from the bucket") => {}
+                                // The documented outcomes a rerun fixes: a pack
+                                // swept before commit (the retry re-uploads), and
+                                // 16 lost manifest CASes against the compactors.
+                                Err(Error::Remote(m))
+                                    if m.contains("removed from the bucket")
+                                        || m.contains("manifest cas contention") => {}
                                 Err(e) => panic!("writer {w}: {e}"),
                             }
                         }
@@ -533,11 +598,13 @@ fn readers_and_writers_stay_consistent_while_compaction_runs() {
             .map(|r| {
                 let (root, done, seeded) = (&root, &done, &seeded);
                 s.spawn(move || {
+                    let _stop = Stop(done, false);
                     let long_lived = open(root);
                     let mut seen = seeded.len();
                     let mut rounds = 0u32;
                     while !done.load(Ordering::SeqCst) || rounds < 3 {
                         rounds += 1;
+                        note(format!("reader-{r}"), format!("round {rounds}"));
                         // alternate a long-lived (stale-view) reader and a cold start
                         let cold;
                         let t = if rounds.is_multiple_of(3) {
@@ -558,18 +625,24 @@ fn readers_and_writers_stay_consistent_while_compaction_runs() {
                         let tips: Vec<ObjectId> = refs.iter().map(|(_, id)| *id).collect();
                         t.get_pack(&tips, &[], None, &mut Vec::new())
                             .unwrap_or_else(|e| panic!("reader {r}: get_pack: {e}"));
+                        // Readers that never pause starve the writers' lock holders
+                        // of filesystem time on a loaded machine.
+                        std::thread::sleep(Duration::from_millis(5));
                     }
                 })
             })
             .collect();
         // Two compactors at once: the ADR promises that is safe (just wasteful).
         let compactors: Vec<_> = (0..2)
-            .map(|_| {
-                s.spawn(|| {
-                    let t = open(&root);
+            .map(|c| {
+                let (root, done, opts, deleted) = (&root, &done, &opts, &deleted);
+                s.spawn(move || {
+                    let _stop = Stop(done, false);
+                    let t = open(root);
                     let mut runs = 0u32;
                     while !done.load(Ordering::SeqCst) {
-                        match t.compact(&opts) {
+                        note(format!("compactor-{c}"), format!("run {runs}"));
+                        match t.compact(opts) {
                             Ok(rep) => {
                                 deleted.fetch_add(
                                     rep.logs_deleted + rep.checkpoints_deleted + rep.packs_deleted,
