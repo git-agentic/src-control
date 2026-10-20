@@ -1372,6 +1372,49 @@ mod tests {
     }
 
     #[test]
+    fn a_live_workspace_cache_is_pruned_when_a_protected_file_is_deleted() {
+        // #204 through the ws path: the cache file at `.sc/ws/cache-<i>` only
+        // outlives a harvest while the workspace stays live, so a scanner
+        // rejection keeps it open. The deleted protected file's entry must be
+        // gone from the saved cache; the surviving one stays.
+        let root = tmp_root("ws-cache-prune");
+        let repo = init(&root);
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/keep"), "kept\n").unwrap();
+        std::fs::write(root.join("secret/gone"), "doomed\n").unwrap();
+        repo.commit("t", "add protected").unwrap();
+
+        let session = repo.ws_fork(1, "t", Some(&sk)).unwrap();
+        let dir = session.workspaces[0].dir.clone();
+        let cache_file = repo.layout().ws_cache_path(1);
+        let cached = |name: &str| {
+            std::fs::read_to_string(&cache_file)
+                .unwrap()
+                .lines()
+                .any(|l| l.ends_with(&format!(" {name}")))
+        };
+        assert!(cached("secret/keep") && cached("secret/gone"), "setup");
+
+        std::fs::remove_file(dir.join("secret/gone")).unwrap();
+        // An AWS-style key id trips the P5 scanner, so the workspace stays live.
+        std::fs::write(dir.join("leak.txt"), "AKIAIOSFODNN7EXAMPLE\n").unwrap();
+        let outcomes = repo.ws_harvest(None, "t", Some(&sk)).unwrap();
+        assert!(
+            matches!(outcomes[0], WsHarvestOutcome::Rejected { index: 1, .. }),
+            "got {outcomes:?}"
+        );
+
+        assert!(cached("secret/keep"), "a surviving file keeps its entry");
+        assert!(!cached("secret/gone"), "the deleted file's entry is pruned");
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test must leave no residue");
+    }
+
+    #[test]
     fn ws_changed_for_ignores_untouched_randomized_protected_file() {
         // P33 Task 7 (ws_changed_for arm): before this fix, `ws_changed_for`
         // always passed `None` for the cache, so a RANDOMIZED protected
