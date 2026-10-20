@@ -1,6 +1,6 @@
 //! S3-compatible `Bucket` backend (AWS, MinIO, R2 via AWS_ENDPOINT_URL_S3).
 
-use crate::{validate_key, Bucket, Error, Fetched, Result};
+use crate::{validate_key, Bucket, Error, Fetched, ObjectMeta, Result};
 
 /// A `Bucket` backed by an S3-compatible object store. Credentials, region,
 /// and endpoint come entirely from the SDK's standard chain (`AWS_*` env,
@@ -172,6 +172,70 @@ impl Bucket for S3Bucket {
         }
         out.sort();
         Ok(out)
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        // Raw string prefix (no directory scoping), unlike `list`.
+        validate_key(prefix.trim_end_matches('/'))?;
+        let full = if self.prefix.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{}/{prefix}", self.prefix)
+        };
+        let strip = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", self.prefix)
+        };
+        let mut out = Vec::new();
+        let mut cont: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&full);
+            if let Some(c) = &cont {
+                req = req.continuation_token(c);
+            }
+            let resp = self
+                .rt
+                .block_on(req.send())
+                .map_err(|e| Error::Backend(format!("s3 list: {e}")))?;
+            for obj in resp.contents() {
+                let Some(k) = obj.key() else { continue };
+                let modified = obj
+                    .last_modified()
+                    .and_then(|t| std::time::SystemTime::try_from(*t).ok())
+                    .ok_or_else(|| Error::Backend(format!("s3 list: no LastModified for {k}")))?;
+                out.push(ObjectMeta {
+                    key: k.strip_prefix(&strip).unwrap_or(k).to_string(),
+                    size: obj.size().unwrap_or(0).max(0) as u64,
+                    modified,
+                });
+            }
+            match resp.next_continuation_token() {
+                Some(c) => cont = Some(c.to_string()),
+                None => break,
+            }
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(out)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let k = self.full_key(key)?;
+        // S3 DeleteObject succeeds on an absent key, which is the contract.
+        self.rt
+            .block_on(
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(&k)
+                    .send(),
+            )
+            .map(|_| ())
+            .map_err(|e| Error::Backend(format!("s3 delete {k}: {e}")))
     }
 }
 

@@ -1,6 +1,6 @@
 //! Local-directory `Bucket` — the test/demo backend behind `sc+wal://`.
 
-use crate::{validate_key, Bucket, Error, Fetched, Result};
+use crate::{validate_key, Bucket, Error, Fetched, ObjectMeta, Result};
 use std::path::{Path, PathBuf};
 
 /// A local filesystem bucket implementation using a directory as the backing
@@ -116,7 +116,11 @@ impl Bucket for DirBucket {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+        Ok(self.list_meta(prefix)?.into_iter().map(|m| m.key).collect())
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<ObjectMeta>) -> std::io::Result<()> {
             let rd = match std::fs::read_dir(dir) {
                 Ok(rd) => rd,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -131,15 +135,25 @@ impl Bucket for DirBucket {
                 }) {
                     continue;
                 }
-                if p.is_dir() {
+                // A concurrent delete/rename can remove the entry between the
+                // readdir and the stat; a key that is gone is just not listed.
+                let md = match std::fs::metadata(&p) {
+                    Ok(md) => md,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                if md.is_dir() {
                     walk(&p, root, out)?;
                 } else {
-                    out.push(
-                        p.strip_prefix(root)
+                    out.push(ObjectMeta {
+                        key: p
+                            .strip_prefix(root)
                             .unwrap()
                             .to_string_lossy()
                             .replace('\\', "/"),
-                    );
+                        size: md.len(),
+                        modified: md.modified()?,
+                    });
                 }
             }
             Ok(())
@@ -147,8 +161,16 @@ impl Bucket for DirBucket {
         validate_key(prefix.trim_end_matches('/'))?;
         let mut out = Vec::new();
         walk(&self.root, &self.root, &mut out)?;
-        out.retain(|k| k.starts_with(prefix));
-        out.sort();
+        out.retain(|m| m.key.starts_with(prefix));
+        out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        match std::fs::remove_file(self.key_path(key)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }

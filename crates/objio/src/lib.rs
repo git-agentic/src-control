@@ -34,8 +34,18 @@ pub enum Fetched {
     New { bytes: Vec<u8>, tag: String },
 }
 
+/// A listed key with the metadata compaction needs (ADR-0055).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMeta {
+    pub key: String,
+    pub size: u64,
+    /// Last-modified time as the bucket reports it (S3 `LastModified`, file mtime).
+    pub modified: std::time::SystemTime,
+}
+
 /// A flat key/value object store with the three primitives the WAL needs:
-/// conditional read, create-if-absent, and compare-and-swap overwrite.
+/// conditional read, create-if-absent, and compare-and-swap overwrite; plus
+/// the metadata listing and delete that compaction (ADR-0055) adds.
 pub trait Bucket: Send {
     /// Conditional read. `cached_tag` matching the current value returns
     /// [`Fetched::Unchanged`] without transferring bytes.
@@ -54,6 +64,12 @@ pub trait Bucket: Send {
     ) -> Result<Option<String>>;
     /// Keys under `prefix`, sorted.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// Keys whose name starts with the raw string `prefix` (not a directory
+    /// scope, so `packs/ab12.` matches `packs/ab12.pack`), with size and
+    /// last-modified time, sorted by key.
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
+    /// Remove `key`. Idempotent: an absent key is success.
+    fn delete(&self, key: &str) -> Result<()>;
 }
 
 /// Reject traversal and absolute keys before any backend touches them.
@@ -117,6 +133,32 @@ pub fn contract_suite(b: &dyn Bucket) {
         vec!["log/1".to_string(), "log/2".to_string()]
     );
     assert_eq!(b.list("packs/").unwrap(), Vec::<String>::new());
+    // list_meta: raw string prefix, sorted, with size and a sane mtime
+    assert!(b.put_new("packs/ab12.pack", b"12345").unwrap());
+    assert!(b.put_new("packs/ab12.idx", b"1").unwrap());
+    assert!(b.put_new("packs/ab34.pack", b"x").unwrap());
+    let metas = b.list_meta("packs/ab12.").unwrap();
+    assert_eq!(
+        metas.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(),
+        vec!["packs/ab12.idx", "packs/ab12.pack"]
+    );
+    assert_eq!(metas[1].size, 5);
+    let age = std::time::SystemTime::now()
+        .duration_since(metas[1].modified)
+        .unwrap_or_default();
+    assert!(age < std::time::Duration::from_secs(3600));
+    assert_eq!(b.list_meta("packs/").unwrap().len(), 3);
+    assert!(b.list_meta("nothing/").unwrap().is_empty());
+    // delete: removes, is idempotent, touches only its key
+    b.delete("packs/ab12.pack").unwrap();
+    b.delete("packs/ab12.pack").unwrap();
+    assert!(matches!(
+        b.get("packs/ab12.pack", None).unwrap(),
+        Fetched::Absent
+    ));
+    assert_eq!(b.list_meta("packs/").unwrap().len(), 2);
+    // a deleted key can be created again
+    assert!(b.put_new("packs/ab12.pack", b"again").unwrap());
 }
 
 #[cfg(test)]

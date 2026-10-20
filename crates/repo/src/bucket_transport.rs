@@ -1737,6 +1737,12 @@ mod tests {
         fn list(&self, prefix: &str) -> scl_objio::Result<Vec<String>> {
             self.0.list(prefix)
         }
+        fn list_meta(&self, prefix: &str) -> scl_objio::Result<Vec<scl_objio::ObjectMeta>> {
+            self.0.list_meta(prefix)
+        }
+        fn delete(&self, key: &str) -> scl_objio::Result<()> {
+            self.0.delete(key)
+        }
     }
 
     #[test]
