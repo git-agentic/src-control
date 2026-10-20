@@ -9,10 +9,35 @@ use scl_repo::{worktree, Repo};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-fn tmp(tag: &str) -> PathBuf {
+/// A scratch directory removed (and checked gone) when the test ends.
+struct Tmp(PathBuf);
+
+impl std::ops::Deref for Tmp {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Tmp {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        if !std::thread::panicking() {
+            assert!(!self.0.exists());
+        }
+    }
+}
+
+fn tmp(tag: &str) -> Tmp {
     let p = std::env::temp_dir().join(format!("scl-exec-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
-    p
+    Tmp(p)
 }
 
 fn put(root: &Path, rel: &str, body: &str, exec: bool) {
@@ -59,7 +84,7 @@ fn rand_tag(repo: &Repo) -> String {
     repo.head_tip().unwrap().unwrap().short().to_string()
 }
 
-fn base(tag: &str) -> (Repo, PathBuf) {
+fn base(tag: &str) -> (Repo, Tmp) {
     let root = tmp(tag);
     let repo = Repo::init(&root).unwrap();
     put(&root, "seed.txt", "seed", false);
