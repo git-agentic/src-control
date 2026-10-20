@@ -454,15 +454,20 @@ re-runs. Fix: a small local index plus re-evaluation.
 - `.sc/transcript-pending`: one tombstone object id per line, newest last.
   `index_incoming` appends a tombstone that is held, **has an indexed
   signature**, and failed `tombstone_honored`. Unsigned tombstones are never
-  remembered. A derived cache like `.sc/transcript-drops`: losing it only
+  remembered. A signature that arrives later, in a transfer without the
+  tombstone, is also a trigger: `index_incoming` looks up the tombstone it
+  covers. A derived cache like `.sc/transcript-drops`: losing it only
   loses the retry.
 - `reevaluate_pending` re-runs the unchanged `tombstone_honored` on each
   entry with the current `[signers] trusted` and signature index, records the
   ones that now pass as drops and removes them from the file, forgets entries
-  whose object is gone or no longer a tombstone, and leaves the rest. It is
+  whose object is gone or no longer a tombstone, and leaves the rest (an
+  object that fails to read stays, to be tried again). It is
   idempotent and does nothing (one failed file read) when no pending file
-  exists. It runs at `Repo::open` (holding the repo lock `open` takes) and at
-  the end of every ingest except a `--no-transcripts` one. Both are best
+  exists. It runs at `Repo::open` (holding the repo lock `open` takes), at
+  `LocalTransport::open` (what `sc serve` and a local-path remote use instead
+  of `Repo::open`; it takes the repo lock itself and skips if it is busy), and
+  at the end of every ingest except a `--no-transcripts` one. Both are best
   effort: a failure never fails an open or a transfer, and the next trigger
   retries. The open trigger covers `sc serve` (per connection), `sc gc`,
   `sc transcript list`, and every other command, so an operator who edits
@@ -470,8 +475,13 @@ re-runs. Fix: a small local index plus re-evaluation.
   long-lived server process.
 - **Bounded.** The file is a FIFO ring of 1024 ids. A peer that pushes many
   signed junk tombstones evicts older entries, so the work per trigger is at
-  most 1024 object reads and signature checks, and the file stays under
-  about 70 KiB. An evicted legitimate entry is lost only for a push-only
+  most 1024 tombstone reads and, per tombstone, its first 16 indexed
+  signatures (`MAX_PENDING_SIGS`; a peer can attach any number of junk
+  signature objects to a target, and this runs on every open), and the file
+  stays under about 70 KiB. The cap means 16 junk signatures indexed before
+  the real one keep that drop inert here; a fetch from the dropper still
+  evaluates it uncapped through `index_incoming`. A pack's batch is
+  deduplicated and cut to the newest 1024 before it touches the file. An evicted legitimate entry is lost only for a push-only
   remote; a fetching peer is re-sent every retained tombstone (part 1). A
   writer with push access can still push out a genuine pending entry; it
   cannot make one honored.

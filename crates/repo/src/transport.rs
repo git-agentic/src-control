@@ -156,7 +156,17 @@ impl LocalTransport {
         }
         // Match the repo's store budget so a single large object never fails to resolve
         // (a blob bigger than the whole budget would BudgetExceed).
-        let store = Store::open_persistent(layout.objects_dir(), crate::repo::default_budget())?;
+        let mut store =
+            Store::open_persistent(layout.objects_dir(), crate::repo::default_budget())?;
+        // A served or local-path remote never passes through `Repo::open`:
+        // honor held tombstones whose signer was trusted since (#230). Best
+        // effort under the repo lock; a busy lock means a `Repo` is open and
+        // ran it already.
+        if layout.transcript_pending_path().exists() {
+            if let Ok(_lock) = RepoLock::acquire(&layout) {
+                let _ = crate::transcripts::reevaluate_pending(&layout, &mut store);
+            }
+        }
         Ok(LocalTransport {
             layout,
             store: RefCell::new(store),

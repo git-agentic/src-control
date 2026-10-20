@@ -1402,6 +1402,39 @@ mod tests {
     }
 
     #[test]
+    fn served_remote_honors_a_held_tombstone_when_a_transport_opens_it() {
+        // A `sc serve` or local-path remote never goes through `Repo::open`.
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-tomb-serve-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-tomb-serve-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        let (a, snap, tid, identity) = origin_with_signed_transcript(&a_root);
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        drop(a);
+        b.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        std::fs::write(b_root.join("f2"), b"two").unwrap();
+        b.commit("t", "c2").unwrap();
+        b.push("origin").unwrap();
+
+        let a = Repo::open(&a_root).unwrap();
+        crate::transcripts::tests::trust_signer(&a, &identity);
+        drop(a);
+        let _served = crate::transport::LocalTransport::open(&a_root).unwrap();
+        assert!(!crate::layout::Layout::at(&a_root)
+            .transcript_pending_path()
+            .exists());
+        drop(_served);
+        let a = Repo::open(&a_root).unwrap();
+        assert!(a.transcripts_for(&snap).unwrap().is_empty());
+
+        drop((a, b));
+        for root in [&a_root, &b_root] {
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
     fn a_peer_that_never_trusts_the_signer_never_honors_the_tombstone() {
         let pid = std::process::id();
         let a_root = std::env::temp_dir().join(format!("scl-tomb-never-a-{pid}"));
