@@ -1,11 +1,11 @@
 //! Local-directory `Bucket` — the test/demo backend behind `sc+wal://`.
 
-use crate::{validate_key, Bucket, Error, Fetched, ObjectMeta, Result};
+use crate::{validate_key, Bucket, Fetched, ObjectMeta, Result};
 use std::path::{Path, PathBuf};
 
 /// A local filesystem bucket implementation using a directory as the backing
 /// store. Tags are blake3 hashes of content; compare-and-swap writes are
-/// serialized via a spin-lock file to simulate S3 precondition semantics.
+/// serialized via an advisory file lock to simulate S3 precondition semantics.
 pub struct DirBucket {
     root: PathBuf,
 }
@@ -27,27 +27,19 @@ impl DirBucket {
         Ok(self.root.join(key))
     }
 
-    /// Spin-acquire `<root>/.cas-lock`; bounded so a crashed holder surfaces
-    /// as a loud error, not a hang.
+    /// Take the bucket's exclusive CAS lock: an OS advisory lock on
+    /// `<root>/.cas-lock`. The OS queues waiters and drops the lock if its
+    /// holder dies, so there is no stale lock to detect and no waiter can be
+    /// starved by a rival that re-acquires in a loop (a create-exclusive spin
+    /// lock starved waiters for more than ten seconds under load).
     fn lock(&self) -> Result<CasLock> {
-        let path = self.root.join(".cas-lock");
-        for _ in 0..2000 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(CasLock { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(Error::Backend(format!(
-            "cas lock stuck (stale {} ?)",
-            path.display()
-        )))
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join(".cas-lock"))?;
+        file.lock()?;
+        Ok(CasLock { _file: file })
     }
 
     fn write_via_tmp(&self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -61,13 +53,9 @@ impl DirBucket {
     }
 }
 
+/// Holds the lock until dropped (closing the file releases it).
 struct CasLock {
-    path: PathBuf,
-}
-impl Drop for CasLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+    _file: std::fs::File,
 }
 
 impl Bucket for DirBucket {

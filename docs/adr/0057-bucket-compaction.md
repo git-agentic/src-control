@@ -47,6 +47,14 @@ into groups of at most `group_bytes` (default 64 MiB); a group needs at least
 two members. Each group is read, its objects are deduplicated by id, and one
 new content-addressed pack plus idx is uploaded. This bounds peak RAM to a few
 times `group_bytes`, and packs above the threshold are never rewritten.
+A group's decoded bytes are also bounded: past `4 x group_bytes` the objects read
+so far are uploaded as a pack and reading continues. A part built from fewer
+than two source packs is dropped, not uploaded, and its source stays where it
+is (#263): rewriting one pack into one reduces nothing, and without this two
+highly compressible packs that each decode past the limit cost one upload per
+source. A run where no part reaches two sources merges nothing and writes no log
+entry or checkpoint. `bytes_deleted` counts only objects the sweep actually
+removed: packs kept because the manifest moved mid-sweep are subtracted.
 
 The result is committed with one CAS, which is both the fence and the fold:
 
