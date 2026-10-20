@@ -289,8 +289,8 @@ transport-adjacent. The rest, imperatively:
   the view.
 - **A merge, switch, cherry-pick, rebase, undo or sparse-spec change refuses, before any write, to lay a file or
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
-  away and retry. On a sparse checkout the same holds for a path the result adds
-  outside the view (a later commit would take the user's file instead, #248).
+  away and retry. A directory holding only tracked files is not such a case: a file/directory change at one path crosses switch, undo, abort and `--continue`, and the emptied directories are cleared (#247). `materialize` checks every such directory before its first removal, so a refusal changes nothing and an abort stays retryable; a forward op also refuses a user's empty directory there (it cannot tell it from a husk), while `materialize` itself prunes empty ones. (On a case-insensitive checkout, replacing `foo/a` with a file `Foo` is refused: the check does not follow the case alias. Fail-closed.) On a sparse checkout the same holds for a path the result adds
+  outside the view (a later commit would take the user's file instead, #248); there any directory at the path refuses, tracked contents or not.
   Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded (except that a private stop refuses a `.theirs` sidecar that would land on an existing file).
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish

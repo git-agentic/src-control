@@ -412,6 +412,7 @@ impl Repo {
                 // envelope, decrypted via the inner snapshot's wraps.
                 match crate::protect::decrypt_with(&bytes, blob_id, &[protection], identity, path) {
                     Ok(pt) => {
+                        worktree::clear_dir_obstruction(&full, path)?;
                         if let Some(parent) = full.parent() {
                             std::fs::create_dir_all(parent)?;
                         }
@@ -421,6 +422,7 @@ impl Repo {
                         // KEK recipient without path access: skip, never
                         // leave stale plaintext behind (same rule as
                         // `worktree::materialize`).
+                        worktree::clear_dir_obstruction(&full, path)?;
                         match std::fs::remove_file(&full) {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -430,6 +432,7 @@ impl Repo {
                     }
                 }
             } else {
+                worktree::clear_dir_obstruction(&full, path)?;
                 if let Some(parent) = full.parent() {
                     std::fs::create_dir_all(parent)?;
                 }

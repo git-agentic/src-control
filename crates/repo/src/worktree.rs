@@ -888,6 +888,7 @@ pub(crate) fn lay_out_added_view(
             continue;
         };
         let full = safe_join(&layout.root, &path)?;
+        clear_dir_obstruction(&full, &path)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -895,6 +896,61 @@ pub(crate) fn lay_out_added_view(
         apply_file_mode(&full, mode)?;
     }
     Ok(protected)
+}
+
+/// Make room for a file at `full` (tracked path `path`) where a directory
+/// stands: the removal pass has deleted the tracked files under it, so what is
+/// left is a husk of empty directories, which goes. A directory that still
+/// holds anything (an untracked or ignored file of the user's) is never
+/// touched: the error names it, and the caller's state stays retryable (#247).
+pub(crate) fn clear_dir_obstruction(full: &Path, path: &str) -> Result<()> {
+    // Bottom-up `remove_dir`, never `remove_dir_all`: a file created after the
+    // check makes a directory non-empty and the removal fail, not vanish.
+    fn prune(dir: &Path) -> std::io::Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            // A child swapped for a symlink since the check is never followed.
+            if !e.file_type()?.is_dir() {
+                return Err(std::io::ErrorKind::DirectoryNotEmpty.into());
+            }
+            prune(&e.path())?;
+        }
+        std::fs::remove_dir(dir)
+    }
+    let is_dir = full.symlink_metadata().is_ok_and(|m| m.is_dir());
+    // Empty directories go whoever made them: they hold nothing to lose. (A
+    // forward op refuses a user's empty directory up front instead, because
+    // before its removal pass it cannot tell one from a husk.)
+    if is_dir && !(dir_clearable(full, path, &|_| false) && prune(full).is_ok()) {
+        return Err(Error::InvalidArgument(format!(
+            "cannot write {path}: a directory with untracked or ignored content stands there; \
+             move it away, then retry"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether the directory `dir` (tracked path `rel`) holds only directories and
+/// regular files that `removable` names, all the way down: no symlink, no
+/// other file, no unreadable subdirectory, no name that is not UTF-8. Reads
+/// only; `materialize` runs it for every directory a target file replaces
+/// before its first removal, so a refusal leaves the working tree untouched.
+fn dir_clearable(dir: &Path, rel: &str, removable: &dyn Fn(&str) -> bool) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().all(|e| {
+        let Ok(e) = e else { return false };
+        let Some(name) = e.file_name().to_str().map(str::to_owned) else {
+            return false;
+        };
+        let child = format!("{rel}/{name}");
+        match e.file_type() {
+            Ok(t) if t.is_dir() => dir_clearable(&e.path(), &child, removable),
+            Ok(t) if t.is_file() => removable(&child),
+            _ => false,
+        }
+    })
 }
 
 /// Materialize a snapshot's file tree into the working dir.
@@ -966,6 +1022,15 @@ pub(crate) fn materialize_with_old_view(
     // (partial clones only; ADR-0048). The check lives here so every caller
     // is covered and none can forget it.
     preflight_view(layout, store, target_root, sparse)?;
+    // With no old tree there is no removal pass, so an empty directory at a
+    // target path is the user's, not a husk: leave it, and let the write fail.
+    let clear = |full: &Path, path: &str| {
+        if old_root.is_some() {
+            clear_dir_obstruction(full, path)
+        } else {
+            Ok(())
+        }
+    };
     // Gap-tolerant when sparse is active (P27 Task 4): a promisor-filtered
     // clone never fetched out-of-filter subtrees at all, so an unfiltered
     // walk here would `NotFound` on them.
@@ -1003,8 +1068,24 @@ pub(crate) fn materialize_with_old_view(
         } else {
             tree_file_ids_sparse(store, old, &old_walk_bound)?
         };
+        let gone = |p: &str| !target.contains_key(p) || !sparse.matches(p);
+        // Before the first removal: a directory a target file must replace
+        // may hold only directories and files this pass is about to delete.
+        // Anything else is the user's, and refusing now (rather than at the
+        // write, after the pass and earlier writes) changes nothing (#247).
+        for path in target.keys().filter(|p| sparse.matches(p)) {
+            let full = safe_join(&layout.root, path)?;
+            if full.symlink_metadata().is_ok_and(|m| m.is_dir())
+                && !dir_clearable(&full, path, &|c| old_files.contains_key(c) && gone(c))
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "cannot write {path}: a directory with untracked or ignored content stands \
+                     there; move it away, then retry"
+                )));
+            }
+        }
         for p in old_files.keys() {
-            if !target.contains_key(p) || !sparse.matches(p) {
+            if gone(p) {
                 let full = safe_join(&layout.root, p)?;
                 let _ = std::fs::remove_file(full);
             }
@@ -1036,6 +1117,7 @@ pub(crate) fn materialize_with_old_view(
             })();
             match decrypted {
                 Some(pt) => {
+                    clear(&full, path)?;
                     if let Some(parent) = full.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -1061,6 +1143,7 @@ pub(crate) fn materialize_with_old_view(
                     // can't linger when a path becomes protected across a switch for
                     // a non-recipient (confidentiality). A failed removal must
                     // surface — swallowing it leaves plaintext on disk.
+                    clear(&full, path)?;
                     match std::fs::remove_file(&full) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1070,6 +1153,7 @@ pub(crate) fn materialize_with_old_view(
                 }
             }
         } else {
+            clear(&full, path)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
             }
