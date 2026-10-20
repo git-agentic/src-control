@@ -3,7 +3,8 @@
 # edit across separate `sc` process invocations, list, cumulative
 # auto-merge harvest (some workspaces land, a conflicting one falls back),
 # undo/redo of the landings, then manual conflict resolution of the
-# fallback branch. Ends with zero `.sc/ws` residue.
+# fallback branch, then two named sessions open at once (ADR-0055). Ends
+# with zero `.sc/ws*` residue.
 #
 # Self-checking: every claim is an assertion; any failure exits non-zero
 # before the RESULT line.
@@ -154,7 +155,58 @@ echo "=== 8: zero residue — .sc/ws does not exist ==="
 echo "no .sc/ws residue ✔"
 
 echo
+echo "=== 9: two named sessions open at once (ADR-0055) ==="
+fork_a=$("$SC" ws fork --agents 1 --name a --author demo)
+fork_b=$("$SC" ws fork --agents 1 --name b --author demo)
+dir_a=$(echo "$fork_a" | sed -n 2p | awk '{print $2}')
+dir_b=$(echo "$fork_b" | sed -n 2p | awk '{print $2}')
+[ -d "$dir_a" ] && [ -d "$dir_b" ] || fail "named session dirs missing: $dir_a $dir_b"
+case "$dir_a" in */.sc/ws-a/1) ;; *) fail "session a must live in .sc/ws-a: $dir_a" ;; esac
+printf 'from a\n' > "$dir_a/shared.txt"
+printf 'only a\n' > "$dir_a/only-a.txt"
+printf 'from b\n' > "$dir_b/shared.txt"
+printf 'only b\n' > "$dir_b/only-b.txt"
+
+list_all=$("$SC" ws list)
+case "$list_all" in *"session a base:"*"session b base:"*) ;; *) fail "list must show both sessions: $list_all" ;; esac
+echo "sc ws list shows both named sessions ✔"
+
+# With no unnamed session open, an unqualified command must not guess.
+if "$SC" ws harvest --author demo >/dev/null 2>"$work/err.txt"; then
+  fail "harvest without --session must fail when only named sessions are open"
+fi
+grep -q "pass --session" "$work/err.txt" || fail "error must point at --session: $(cat "$work/err.txt")"
+echo "an unqualified harvest refuses instead of guessing ✔"
+
+# sc ws run releases the repo lock: another sc process works while it runs.
+inner=$("$SC" ws run --session a 1 -- "$SC" ws list --session b)
+case "$inner" in *"session b base:"*) ;; *) fail "sc inside a running ws command must see session b: $inner" ;; esac
+label=$("$SC" ws run --session b 1 -- sh -c 'printf %s "$SC_WORKSPACE"')
+[ "$label" = "b-1" ] || fail "SC_WORKSPACE must be b-1, got $label"
+echo "another sc ran inside a running ws command; SC_WORKSPACE is b-1 ✔"
+
+# First harvest wins: b lands, a conflicts on shared.txt and falls back to a-1.
+"$SC" ws harvest --session b --author demo | grep -q "landed" || fail "session b must land"
+test -f only-b.txt || fail "b's file must be on main"
+[ "$(cat shared.txt)" = "from b" ] || fail "main must carry b's shared.txt"
+set +e
+a_out=$("$SC" ws harvest --session a --author demo)
+a_rc=$?
+set -e
+echo "$a_out"
+[ "$a_rc" -eq 1 ] || fail "conflicting second harvest must exit 1, got $a_rc"
+case "$a_out" in *"fallback: branch a-1"*) ;; *) fail "session a must fall back to a-1: $a_out" ;; esac
+[ "$(cat shared.txt)" = "from b" ] || fail "fallback must leave main untouched"
+test -f only-a.txt && fail "a's file must not be on main"
+echo "first harvest won, the second fell back to a-1 ✔"
+
+for d in .sc/ws .sc/ws-a .sc/ws-b; do
+  [ -d "$d" ] && fail "$d must not exist after both sessions ended"
+done
+echo "no .sc/ws* residue ✔"
+echo
 echo "RESULT: durable multi-invocation ws session — fork/edit/list across separate"
 echo "sc invocations, cumulative auto-merge harvest (2 landed, 1 fallback, exit 1),"
 echo "undo/redo of the landings, manual conflict resolution of the fallback branch,"
-echo "zero .sc/ws residue ✔"
+echo "zero .sc/ws residue ✔; then two named sessions open at once, first-wins"
+echo "harvest with a-1 fallback, ws run not holding the repo lock ✔"

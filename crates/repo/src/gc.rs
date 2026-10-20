@@ -72,7 +72,7 @@ fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     if let Some(st) = rebase_state::read(layout)? {
         set.insert(st.acc_tip);
     }
-    if let Some(s) = ws::read_manifest(layout)? {
+    for s in ws::list_sessions(layout)? {
         set.insert(s.base_snapshot);
     }
     for id in oplog::referenced_ids(layout)? {

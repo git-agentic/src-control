@@ -84,4 +84,4 @@ pub use sparse::Sparse;
 pub use stdio_transport::{open_transport, SshUrl, StdioTransport};
 pub use workspace::{HarvestResult, WorkOptions, WorkspaceOutcome};
 pub use worktree::Diff;
-pub use ws::{WsEntry, WsHarvestOutcome, WsSession};
+pub use ws::{WsEntry, WsHarvestOutcome, WsRunPlan, WsSession};
