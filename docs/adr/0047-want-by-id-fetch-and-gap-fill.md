@@ -1,6 +1,6 @@
 # ADR-0047: Want-by-id fetch and explicit gap fill for partial clones
 
-- **Status:** Accepted for 37a (built); 37b Proposed
+- **Status:** Accepted (built); the 37b work it left proposed is [ADR-0048](0048-presence-based-partial-clones.md)
 - **Date:** 2026-10-16
 - **Phase:** 37
 - **Builds on:** ADR-0037 (partial clone), ADR-0035 (streaming transfer), ADR-0039/0041 (size and listener limits), ADR-0040 (HTTP access control), ADR-0044 (private branches)

@@ -1,6 +1,6 @@
 # ADR-0043: Randomized protected-path encryption (dual-read, randomized-write)
 
-- **Status:** Accepted
+- **Status:** Accepted; its rotate-for-paths follow-on is built as [ADR-0051](0051-rotate-protected-paths.md)
 - **Date:** 2026-07-10
 - **Phase:** 33
 - **Builds on:** ADR-0014 (P7 convergent protected paths — superseded *for

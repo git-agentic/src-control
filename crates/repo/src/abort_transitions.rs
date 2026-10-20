@@ -129,24 +129,117 @@ fn rebase_abort_restores_a_file_dir_transition() {
     }
 }
 
-/// An untracked file inside the directory the abort must replace with a file
-/// is the user's: the abort fails loudly and keeps it, and the stopped op
-/// stays open to retry.
-#[test]
-fn merge_abort_keeps_untracked_content_in_the_obstructing_directory() {
-    let (root, repo) = fixture("merge-untracked", Shape::File, Shape::Dir);
+/// A stopped merge with `x` a directory the abort must turn back into a
+/// file. `add` puts something of the user's under `x/`; the abort must then
+/// refuse having changed nothing, and succeed once `remove` takes it away.
+fn refused_abort_changes_nothing(tag: &str, add: impl FnOnce(&Path), remove: impl FnOnce(&Path)) {
+    let (root, repo) = fixture(tag, Shape::File, Shape::Dir);
     assert!(matches!(
         repo.merge("other", "me").unwrap_err(),
         Error::MergeConflicts(_)
     ));
-    std::fs::write(root.join("x/mine.txt"), b"mine\n").unwrap();
+    let markers = std::fs::read(root.join("c.txt")).unwrap();
+    assert!(String::from_utf8_lossy(&markers).contains("<<<<<<<"));
+    add(&root.join("x"));
     assert!(repo.merge_abort().is_err());
-    assert_eq!(std::fs::read(root.join("x/mine.txt")).unwrap(), b"mine\n");
-    assert!(repo.merge_in_progress());
-    std::fs::remove_file(root.join("x/mine.txt")).unwrap();
+    assert!(repo.merge_in_progress(), "the merge is still open");
+    assert_eq!(std::fs::read(root.join("c.txt")).unwrap(), markers);
+    assert_eq!(std::fs::read(root.join("x/a")).unwrap(), b"a\n");
+    remove(&root.join("x"));
     repo.merge_abort().unwrap();
     assert_restored(&root, &repo, Shape::File);
     finish(&root, repo);
+}
+
+/// An untracked file inside the directory the abort must replace with a file
+/// is the user's: the abort refuses before the first write and stays retryable.
+#[test]
+fn merge_abort_keeps_untracked_content_in_the_obstructing_directory() {
+    refused_abort_changes_nothing(
+        "merge-untracked",
+        |x| std::fs::write(x.join("mine.txt"), b"mine\n").unwrap(),
+        |x| std::fs::remove_file(x.join("mine.txt")).unwrap(),
+    );
+}
+
+#[test]
+fn abort_refuses_an_ignored_file_and_a_dotfile_in_the_directory() {
+    refused_abort_changes_nothing(
+        "merge-ignored",
+        |x| {
+            std::fs::write(x.join("../.scignore"), b"*.tmp\n").unwrap();
+            std::fs::write(x.join("scratch.tmp"), b"t\n").unwrap();
+        },
+        |x| std::fs::remove_file(x.join("scratch.tmp")).unwrap(),
+    );
+    refused_abort_changes_nothing(
+        "merge-dotfile",
+        |x| std::fs::write(x.join(".hidden"), b"h\n").unwrap(),
+        |x| std::fs::remove_file(x.join(".hidden")).unwrap(),
+    );
+}
+
+/// A symlink to a directory outside the repository, directly or nested, is
+/// neither followed nor removed.
+#[cfg(unix)]
+#[test]
+fn abort_refuses_a_symlink_to_an_outside_directory() {
+    let outside = tmp_root("symlink-outside");
+    std::fs::create_dir(outside.join("keep")).unwrap();
+    for nested in [false, true] {
+        let target = outside.clone();
+        refused_abort_changes_nothing(
+            &format!("merge-symlink-{nested}"),
+            |x| {
+                let dir = if nested {
+                    std::fs::create_dir(x.join("sub")).unwrap();
+                    x.join("sub")
+                } else {
+                    x.to_path_buf()
+                };
+                std::os::unix::fs::symlink(&target, dir.join("link")).unwrap();
+            },
+            |x| {
+                let dir = if nested {
+                    x.join("sub")
+                } else {
+                    x.to_path_buf()
+                };
+                std::fs::remove_file(dir.join("link")).unwrap();
+            },
+        );
+        assert!(outside.join("keep").is_dir(), "the link was followed");
+    }
+    std::fs::remove_dir_all(&outside).unwrap();
+}
+
+/// A subdirectory that cannot be read is treated as holding the user's
+/// content (skipped when the process can read it anyway, as root does).
+#[cfg(unix)]
+#[test]
+fn abort_refuses_an_unreadable_subdirectory() {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = tmp_root("unreadable-probe");
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read_dir(&probe).is_ok();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(&probe).unwrap();
+    if readable {
+        return;
+    }
+    refused_abort_changes_nothing(
+        "merge-unreadable",
+        |x| {
+            std::fs::create_dir(x.join("locked")).unwrap();
+            std::fs::set_permissions(x.join("locked"), std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+        },
+        |x| {
+            std::fs::set_permissions(x.join("locked"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::fs::remove_dir(x.join("locked")).unwrap();
+        },
+    );
 }
 
 /// `switch` and `undo` across a file/directory change at one path.

@@ -140,8 +140,9 @@ fn tracked_under(tracked: &BTreeSet<String>, dir: &str) -> bool {
 /// the one place checkout-style writes go through so `read_worktree` (which
 /// reads the mode back from the filesystem) round-trips. EXEC adds an execute
 /// bit wherever the file already has a read bit (the umask-respecting default
-/// stays); FILE clears any execute bits an existing file had. A no-op off unix;
-/// a filesystem that refuses the chmod (no mode bits) is not an error.
+/// stays); FILE clears any execute bits an existing file had; setuid/setgid/
+/// sticky are always cleared. A no-op off unix; a filesystem that refuses the
+/// chmod (no mode bits) is not an error (see [`scl_vfs::apply_file_mode`]).
 pub(crate) fn write_file(path: &Path, bytes: &[u8], mode: FileMode) -> std::io::Result<()> {
     std::fs::write(path, bytes)?;
     apply_file_mode(path, mode)
@@ -149,32 +150,7 @@ pub(crate) fn write_file(path: &Path, bytes: &[u8], mode: FileMode) -> std::io::
 
 /// The mode half of [`write_file`], for a caller that wrote the bytes itself
 /// (the stopped-op widen writes atomically).
-pub(crate) fn apply_file_mode(path: &Path, mode: FileMode) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let cur = std::fs::metadata(path)?.permissions().mode();
-        let want = if mode.0 & 0o111 != 0 {
-            cur | ((cur & 0o444) >> 2)
-        } else {
-            cur & !0o111
-        };
-        if want != cur {
-            match std::fs::set_permissions(path, std::fs::Permissions::from_mode(want)) {
-                Err(e)
-                    if e.kind() != std::io::ErrorKind::Unsupported
-                        && e.kind() != std::io::ErrorKind::PermissionDenied =>
-                {
-                    return Err(e)
-                }
-                _ => {}
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    Ok(())
-}
+pub(crate) use scl_vfs::apply_file_mode;
 
 #[cfg(unix)]
 fn file_mode(path: &Path) -> FileMode {
@@ -928,19 +904,8 @@ pub(crate) fn lay_out_added_view(
 /// holds anything (an untracked or ignored file of the user's) is never
 /// touched: the error names it, and the caller's state stays retryable (#247).
 pub(crate) fn clear_dir_obstruction(full: &Path, path: &str) -> Result<()> {
-    // Only directories all the way down: one file (or symlink) anywhere keeps
-    // the whole tree, so a refusal never leaves it half pruned.
-    fn only_dirs(dir: &Path) -> std::io::Result<bool> {
-        for e in std::fs::read_dir(dir)? {
-            let e = e?;
-            if !e.file_type()?.is_dir() || !only_dirs(&e.path())? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
     // Bottom-up `remove_dir`, never `remove_dir_all`: a file created after the
-    // check above makes a directory non-empty and the removal fail, not vanish.
+    // check makes a directory non-empty and the removal fail, not vanish.
     fn prune(dir: &Path) -> std::io::Result<()> {
         for e in std::fs::read_dir(dir)? {
             let e = e?;
@@ -953,13 +918,39 @@ pub(crate) fn clear_dir_obstruction(full: &Path, path: &str) -> Result<()> {
         std::fs::remove_dir(dir)
     }
     let is_dir = full.symlink_metadata().is_ok_and(|m| m.is_dir());
-    if is_dir && !(only_dirs(full).unwrap_or(false) && prune(full).is_ok()) {
+    // Empty directories go whoever made them: they hold nothing to lose. (A
+    // forward op refuses a user's empty directory up front instead, because
+    // before its removal pass it cannot tell one from a husk.)
+    if is_dir && !(dir_clearable(full, path, &|_| false) && prune(full).is_ok()) {
         return Err(Error::InvalidArgument(format!(
             "cannot write {path}: a directory with untracked or ignored content stands there; \
              move it away, then retry"
         )));
     }
     Ok(())
+}
+
+/// Whether the directory `dir` (tracked path `rel`) holds only directories and
+/// regular files that `removable` names, all the way down: no symlink, no
+/// other file, no unreadable subdirectory, no name that is not UTF-8. Reads
+/// only; `materialize` runs it for every directory a target file replaces
+/// before its first removal, so a refusal leaves the working tree untouched.
+fn dir_clearable(dir: &Path, rel: &str, removable: &dyn Fn(&str) -> bool) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().all(|e| {
+        let Ok(e) = e else { return false };
+        let Some(name) = e.file_name().to_str().map(str::to_owned) else {
+            return false;
+        };
+        let child = format!("{rel}/{name}");
+        match e.file_type() {
+            Ok(t) if t.is_dir() => dir_clearable(&e.path(), &child, removable),
+            Ok(t) if t.is_file() => removable(&child),
+            _ => false,
+        }
+    })
 }
 
 /// Materialize a snapshot's file tree into the working dir.
@@ -1068,8 +1059,24 @@ pub(crate) fn materialize_with_old_view(
         } else {
             tree_file_ids_sparse(store, old, &old_walk_bound)?
         };
+        let gone = |p: &str| !target.contains_key(p) || !sparse.matches(p);
+        // Before the first removal: a directory a target file must replace
+        // may hold only directories and files this pass is about to delete.
+        // Anything else is the user's, and refusing now (rather than at the
+        // write, after the pass and earlier writes) changes nothing (#247).
+        for path in target.keys().filter(|p| sparse.matches(p)) {
+            let full = safe_join(&layout.root, path)?;
+            if full.symlink_metadata().is_ok_and(|m| m.is_dir())
+                && !dir_clearable(&full, path, &|c| old_files.contains_key(c) && gone(c))
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "cannot write {path}: a directory with untracked or ignored content stands \
+                     there; move it away, then retry"
+                )));
+            }
+        }
         for p in old_files.keys() {
-            if !target.contains_key(p) || !sparse.matches(p) {
+            if gone(p) {
                 let full = safe_join(&layout.root, p)?;
                 let _ = std::fs::remove_file(full);
             }
@@ -1570,5 +1577,29 @@ mod tests {
         assert!(!listed.contains(&"a/skip.tmp".to_string()));
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    /// setuid/setgid/sticky never survive a write (git recreates files and
+    /// carries none over): a pre-existing 02644 file must not become 02755.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_clears_special_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("scl-repo-wt-special-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        for (want, expect) in [(FileMode::EXEC, 0o755), (FileMode::FILE, 0o644)] {
+            std::fs::write(&f, b"x").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o2644)).unwrap();
+            if mode(&f) & 0o2000 == 0 {
+                continue; // filesystem drops the bit: nothing to test
+            }
+            write_file(&f, b"y", want).unwrap();
+            assert_eq!(mode(&f), expect);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
     }
 }

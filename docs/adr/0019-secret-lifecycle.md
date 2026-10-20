@@ -1,6 +1,6 @@
 # ADR-0019: Secret/permission lifecycle (rotation + escrow)
 
-- **Status:** Accepted
+- **Status:** Accepted; per-path rotation added by [ADR-0051](0051-rotate-protected-paths.md)
 - **Date:** 2026-07-04
 - **Phase:** 11
 

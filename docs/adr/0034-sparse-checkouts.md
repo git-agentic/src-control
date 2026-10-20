@@ -1,6 +1,6 @@
 # ADR-0034: Sparse checkouts / sub-tree sharing
 
-- **Status:** Accepted
+- **Status:** Accepted; private-branch merge-in under a sparse spec is decided in [ADR-0044](0044-per-branch-access-control.md) (#240)
 - **Date:** 2026-07-08
 - **Phase:** 24
 - **Builds on:** ADR-0011 (working tree), ADR-0025 (absent-entry carry discipline), ADR-0003 (snapshot model)

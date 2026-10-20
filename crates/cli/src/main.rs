@@ -153,7 +153,8 @@ enum Cmd {
         /// Branch to merge in.
         branch: Option<String>,
         /// Abandon an in-progress merge and restore the working tree. When given,
-        /// the BRANCH argument is ignored.
+        /// the BRANCH argument is ignored. On a private branch it needs
+        /// `--identity` (the tip is sealed).
         #[arg(long)]
         abort: bool,
         /// Author recorded on the merge snapshot (default: $SC_AUTHOR, then the
@@ -161,7 +162,8 @@ enum Cmd {
         #[arg(long)]
         author: Option<String>,
         /// Identity key to decrypt protected paths that diverged in content on
-        /// both sides (ciphertext-id fast paths need no identity at all).
+        /// both sides (ciphertext-id fast paths need no identity at all), and
+        /// to open a private branch.
         #[arg(long)]
         identity: Option<PathBuf>,
     },
@@ -294,7 +296,8 @@ enum Cmd {
         #[command(subcommand)]
         op: WsOp,
     },
-    /// Clone a repo (local path or `ssh://` URL) into a new directory.
+    /// Clone a repo (local path, `ssh://`, `sc+http(s)://`, `sc+wal://`/`sc+s3://`
+    /// or Git URL) into a new directory.
     Clone {
         src: String,
         dst: PathBuf,
@@ -441,12 +444,11 @@ enum Cmd {
         #[arg(long)]
         no_transcripts: bool,
     },
-    /// Protect a path prefix: files under it are convergently encrypted for the
-    /// named recipients on commit. With `--list` (or no prefix), list the rules.
-    /// Convergent encryption is equality-confirmable — an attacker who can
-    /// guess a candidate plaintext can confirm a match (see ADR-0014); for
-    /// low-entropy secrets (API keys, `.env` files, credentials), prefer
-    /// `sc secret` instead.
+    /// Protect a path prefix: files under it are encrypted for the named
+    /// recipients on commit (randomized sealing since P33, ADR-0043; ciphertext
+    /// from before P33 stays equality-confirmable, ADR-0014). With `--list` (or
+    /// no prefix), list the rules. For low-entropy secrets (API keys, `.env`
+    /// files, credentials), prefer `sc secret` instead.
     Protect {
         /// Path prefix to protect (e.g. `secret/`). Omit to list.
         prefix: Option<String>,
@@ -2179,7 +2181,13 @@ fn run_merge(
 ) -> Result<()> {
     let repo = open_repo()?;
     if abort {
-        let skipped = repo.merge_abort()?;
+        // Only a private branch needs the key to restore its checkout.
+        let sk = if repo.head_private()?.is_some() {
+            resolve_identity_opt(identity)?
+        } else {
+            None
+        };
+        let skipped = repo.merge_abort_with_identity(sk.as_ref())?;
         println!("merge aborted; working tree restored");
         for path in &skipped {
             eprintln!("skipped (no key): {path}");

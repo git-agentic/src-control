@@ -884,7 +884,7 @@ impl Repo {
 
     /// Snapshot the working tree into a new commit on the current branch. When a
     /// merge is in progress, records both parents and clears the merge state.
-    /// Files under a protected prefix are convergently encrypted (scanner-exempt);
+    /// Files under a protected prefix are sealed (randomized since P33; scanner-exempt);
     /// only plaintext files are scanned.
     pub fn commit(&self, author: &str, message: &str) -> Result<ObjectId> {
         if crate::rebase_state::in_progress(&self.layout) {
@@ -2266,6 +2266,27 @@ impl Repo {
     /// a restore that fails leaves the sidecars to retry. The record is retired
     /// once swept.
     pub(crate) fn remove_conflict_sidecars(&self, roots: &[ObjectId]) -> Result<()> {
+        if self.recorded_sidecars()?.is_empty() {
+            return Ok(());
+        }
+        let partial = self.promisor()?.is_some();
+        let store_arc = self.vfs.store();
+        let mut store = store_arc.lock().unwrap();
+        self.remove_conflict_sidecars_unless(&mut |sidecar| {
+            roots.iter().any(|root| {
+                worktree::tree_entry_at(&mut store, *root, sidecar, partial)
+                    .map_or(true, |e| e.is_some())
+            })
+        })
+    }
+
+    /// [`Repo::remove_conflict_sidecars`] with the "does the restored tree
+    /// track this path" question answered by `tracked`: a private branch asks
+    /// its sealed tree, which `tree_entry_at` cannot read.
+    pub(crate) fn remove_conflict_sidecars_unless(
+        &self,
+        tracked: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<()> {
         let sidecars = self.recorded_sidecars()?;
         if sidecars.is_empty() {
             return Ok(());
@@ -2275,16 +2296,9 @@ impl Repo {
         // user may recreate before the retry. A removal that fails puts the
         // failed and unprocessed paths back so the retry can finish the job.
         crate::conflict_plaintext::write_sidecars(&self.layout, &[])?;
-        let partial = self.promisor()?.is_some();
-        let store_arc = self.vfs.store();
-        let mut store = store_arc.lock().unwrap();
         let sidecars: Vec<String> = sidecars.into_iter().collect();
         for (i, sidecar) in sidecars.iter().enumerate() {
-            let tracked = roots.iter().any(|root| {
-                worktree::tree_entry_at(&mut store, *root, sidecar, partial)
-                    .map_or(true, |e| e.is_some())
-            });
-            if tracked {
+            if tracked(sidecar) {
                 continue;
             }
             let removed = worktree::safe_join(&self.layout.root, sidecar).and_then(|full| {
@@ -2309,10 +2323,26 @@ impl Repo {
     /// Returns the protected paths that could not be restored. No identity is
     /// available at abort time, so protected files are skipped (left absent)
     /// rather than decrypted — that's expected; re-supply an identity via a
-    /// `switch_with_identity` back to the branch to materialize them.
+    /// `switch_with_identity` back to the branch to materialize them. A merge
+    /// into a private branch cannot be aborted this way: it needs
+    /// [`Repo::merge_abort_with_identity`].
     pub fn merge_abort(&self) -> Result<Vec<String>> {
+        self.merge_abort_with_identity(None)
+    }
+
+    /// [`Repo::merge_abort`] with the caller's identity. A public branch
+    /// ignores it. On a private branch it is required (the tip is a sealed
+    /// manifest, and the checkout is restored from it): a caller who cannot
+    /// open the branch gets [`Error::PrivateNoAccess`] before anything changes.
+    pub fn merge_abort_with_identity(
+        &self,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<Vec<String>> {
         if !crate::merge_state::in_progress(&self.layout) {
             return Err(Error::InvalidArgument("no merge in progress".into()));
+        }
+        if self.head_private()?.is_some() {
+            return self.merge_abort_private(identity);
         }
         let theirs_id = crate::merge_state::read_merge_head(&self.layout)?
             .expect("in_progress is true but MERGE_HEAD is absent");
