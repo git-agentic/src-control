@@ -207,9 +207,25 @@ too, not just the src-control-side metadata.
   transcripts on every peer that trusts it and make those peers' gc reclaim the
   bodies. Drop is not erasure: peers without the tombstone keep the body,
   `GetObjects` serves it until gc sweeps it, and a peer that still holds it can
-  re-send it. A tombstone ignored on arrival stays ignored on a push-only or
-  served remote, so configure `[signers] trusted` there before the first drop
-  push. Trust is checked at ingest and is not retroactive.
+  re-send it. A tombstone held while its signer is untrusted is remembered
+  (`.sc/transcript-pending`, capped at 1024, FIFO) and judged again when the
+  trusted-signer set changes (on open, transport open and ingest), so trusting
+  the signer later is enough on a push-only or served remote. A retained signed
+  tombstone is also sent when its snapshot was collected by the sender's gc, so
+  a stale peer is told; this discloses the snapshot id, dropped transcript id
+  and signer public key of such drops to any peer the dropper transfers with,
+  including one that never had the snapshot (ids are hashes, bodies stay
+  sealed). Only signatures that verify for a held target are indexed, so
+  forged signatures stay in the object store (until gc sweeps them) but are
+  never indexed, so a `sc serve` or local sender never forwards them and gc
+  never keeps them (a bucket forwards what it holds; receivers filter). A writer to a shared remote
+  who signs with keys of their own can still crowd more than 256 valid
+  signatures ahead of the real one, which keeps the drop inert on every peer
+  that ingests them (a denial of the drop, never an honored one; #257). Writers
+  can also evict pending entries from a push-only remote (trust the signer
+  before the push). Trust is checked at evaluation and is not retroactive. A tombstone a remote already held before
+  upgrading to a build with the pending index is not remembered: trust the
+  signer before the drop is pushed, or have a fetching peer re-send it.
 
 ## Network transport (`sc serve --http` / `sc+http(s)://` / `ssh://`) — ADR-0022/0036/0040/0041/0042
 
