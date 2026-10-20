@@ -181,6 +181,17 @@ fn trusted_signers(layout: &Layout) -> std::collections::HashMap<[u8; 32], Strin
     out
 }
 
+/// The message a drop signature covers: a domain-separated digest of the
+/// tombstone id, NOT the bare id. A plain `sign_transcript` signature over the
+/// tombstone id (e.g. from an older binary's bulk `sc transcript sign`, which
+/// indexes tombstones as live transcripts) must never authorize a drop.
+fn drop_digest(tomb: &ObjectId) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(Transcript::DROP_AGENT.as_bytes());
+    h.update(tomb.as_bytes());
+    *h.finalize().as_bytes()
+}
+
 /// Whether an incoming tombstone may hide its transcript (ADR-0038 addendum,
 /// "Who may drop"). All of: the tombstone's snapshot exists locally; if the
 /// dropped transcript is held locally it is a real transcript on that same
@@ -206,7 +217,7 @@ fn tombstone_honored(
     for sid in crate::signatures::indexed_signature_ids_for(layout, &[tomb])? {
         if let Object::Signature(sig) = store.get(&sid)? {
             if trusted.contains_key(&sig.signer)
-                && scl_crypto::verify_transcript_sig(&sig.signer, tomb.as_bytes(), &sig.sig)
+                && scl_crypto::verify_transcript_sig(&sig.signer, &drop_digest(&tomb), &sig.sig)
             {
                 return Ok(true);
             }
@@ -335,7 +346,7 @@ pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<us
 }
 
 /// Sender-side seam (Task 3/4): the indexed transcript object ids (and drop
-/// tombstones) covering any of `snapshots`, deduped and sorted — the set a push/export needs to
+/// signed tombstones) covering any of `snapshots`, deduped and sorted — the set a push/export needs to
 /// carry alongside the snapshots themselves so the receiving repo's index
 /// stays complete.
 pub(crate) fn indexed_transcript_ids_for(
@@ -349,9 +360,13 @@ pub(crate) fn indexed_transcript_ids_for(
             out.insert(tid);
         }
     }
-    // Tombstones travel with their snapshot so a drop propagates.
+    // Signed tombstones travel with their snapshot so a drop propagates. An
+    // unsigned (local-only) drop is never sent: peers would ignore it, and an
+    // older peer would index it as a live transcript.
     for (snap, tomb, _) in read_drops(layout)? {
-        if wanted.contains(&snap) {
+        if wanted.contains(&snap)
+            && !crate::signatures::indexed_signature_ids_for(layout, &[tomb])?.is_empty()
+        {
             out.insert(tomb);
         }
     }
@@ -418,7 +433,7 @@ impl Repo {
     /// is reclaimed by `gc` after its grace window. Returns the dropped id.
     ///
     /// The local store always honors its own drop. With `signer`, the
-    /// tombstone is also signed (transcript domain) so peers whose
+    /// tombstone is also signed (over its drop digest) so peers whose
     /// `[signers] trusted` list names that key honor it too; without one the
     /// drop stays local-only (peers ignore an unsigned tombstone).
     pub fn drop_transcript(
@@ -426,6 +441,13 @@ impl Repo {
         id_prefix: &str,
         signer: Option<&scl_crypto::Identity>,
     ) -> Result<ObjectId> {
+        if signer.is_some_and(|i| i.signing.is_none()) {
+            return Err(Error::InvalidArgument(
+                "identity has no signing half (v1 identity); a signed drop requires a v2 \
+                 (scl-id-) identity"
+                    .into(),
+            ));
+        }
         let prefix = id_prefix.to_ascii_lowercase();
         let matches: BTreeSet<(ObjectId, ObjectId)> = read_index(self.layout())?
             .into_iter()
@@ -450,11 +472,27 @@ impl Repo {
             let mut store = arc.lock().unwrap();
             store.put(Object::Transcript(Transcript::drop_tombstone(snap, &tid)))?
         };
-        if let Some(identity) = signer {
-            self.sign_transcript(tomb, identity)?;
+        if let Some(signing) = signer.and_then(|i| i.signing.as_ref()) {
+            self.sign_drop(tomb, signing)?;
         }
         append_drop(self.layout(), (snap, tomb, tid))?;
         Ok(tid)
+    }
+
+    /// Sign `tomb`'s drop digest and index the signature under the tombstone id
+    /// (shared `.sc/signatures` index, so the signature rides with the tombstone).
+    pub(crate) fn sign_drop(&self, tomb: ObjectId, key: &scl_crypto::SigningKey) -> Result<()> {
+        let sig_obj = SignatureObj {
+            snapshot: tomb,
+            signer: key.public().to_bytes(),
+            sig: scl_crypto::sign_transcript_id(key, &drop_digest(&tomb)),
+        };
+        let id = {
+            let arc = self.store_arc();
+            let i = arc.lock().unwrap().put(Object::Signature(sig_obj))?;
+            i
+        };
+        crate::signatures::append_index(self.layout(), tomb, id)
     }
 
     /// All indexed transcripts for `snapshot`, loaded from the CAS (id +
@@ -748,7 +786,8 @@ pub(crate) mod tests {
         let ingest = |tomb: Transcript, signer: Option<&scl_crypto::Identity>| -> bool {
             let tomb_id = arc.lock().unwrap().put(Object::Transcript(tomb)).unwrap();
             if let Some(who) = signer {
-                repo.sign_transcript(tomb_id, who).unwrap();
+                repo.sign_drop(tomb_id, who.signing.as_ref().unwrap())
+                    .unwrap();
             }
             let mut store = arc.lock().unwrap();
             index_incoming(repo.layout(), &mut store, &[tomb_id]).unwrap();
@@ -776,6 +815,27 @@ pub(crate) mod tests {
         ));
         assert_eq!(repo.transcripts_for(&snap).unwrap().len(), 1);
 
+        // A plain transcript signature over the bare tombstone id (what an
+        // older binary's bulk `sc transcript sign` would produce) is not a drop.
+        let plain = {
+            let id = arc
+                .lock()
+                .unwrap()
+                .put(Object::Transcript(Transcript::drop_tombstone(
+                    snap, &victim,
+                )))
+                .unwrap();
+            repo.sign_transcript(id, &owner).unwrap();
+            let mut store = arc.lock().unwrap();
+            index_incoming(repo.layout(), &mut store, &[id]).unwrap();
+            id
+        };
+        assert!(read_drops(repo.layout())
+            .unwrap()
+            .iter()
+            .all(|d| d.1 != plain));
+        assert_eq!(repo.transcripts_for(&snap).unwrap().len(), 1);
+
         // A trusted signature on a matching tombstone is honored.
         assert!(ingest(good, Some(&owner)));
         assert!(repo.transcripts_for(&snap).unwrap().is_empty());
@@ -785,6 +845,137 @@ pub(crate) mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn tombstone_honored_before_the_body_arrives_hides_it_on_arrival() {
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        // Origin makes a real transcript and a signed drop for it.
+        let src_root = tmp_root("early-src");
+        let src = Repo::init(&src_root).unwrap();
+        std::fs::write(src_root.join("f"), b"x").unwrap();
+        let snap = src.commit("t", "c1").unwrap();
+        let body_id = src
+            .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+            .unwrap();
+        let body = src.store_arc().lock().unwrap().get(&body_id).unwrap();
+        src.drop_transcript(&body_id.to_hex(), Some(&owner))
+            .unwrap();
+        let (snap_, tomb, _) = read_drops(src.layout()).unwrap()[0];
+        assert_eq!(snap_, snap);
+
+        // Receiver already has the snapshot (same repo history) and trusts the signer.
+        let dst_root = tmp_root("early-dst");
+        let dst = Repo::clone_to(&src_root, &dst_root).unwrap();
+        trust_signer(&dst, &owner);
+        let arc = dst.store_arc();
+        let mut store = arc.lock().unwrap();
+        // Tombstone + its signature arrive first, body not held.
+        let tomb_obj = src.store_arc().lock().unwrap().get(&tomb).unwrap();
+        store.put(tomb_obj).unwrap();
+        for sid in crate::signatures::indexed_signature_ids_for(src.layout(), &[tomb]).unwrap() {
+            let o = src.store_arc().lock().unwrap().get(&sid).unwrap();
+            store.put(o).unwrap();
+            crate::signatures::index_incoming(dst.layout(), &mut store, &[sid]).unwrap();
+        }
+        index_incoming(dst.layout(), &mut store, &[tomb]).unwrap();
+        assert_eq!(read_drops(dst.layout()).unwrap().len(), 1, "honored early");
+        // Then the body arrives: it must not be indexed.
+        let id = store.put(body).unwrap();
+        assert_eq!(id, body_id);
+        index_incoming(dst.layout(), &mut store, &[id]).unwrap();
+        drop(store);
+        assert!(dst.transcripts_for(&snap).unwrap().is_empty());
+
+        drop(src);
+        drop(dst);
+        std::fs::remove_dir_all(&src_root).unwrap();
+        std::fs::remove_dir_all(&dst_root).unwrap();
+    }
+
+    #[test]
+    fn gc_prune_keeps_a_tombstone_whose_snapshot_died_and_never_roots_the_body() {
+        let root = tmp_root("gc-dead");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let body = repo
+            .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+            .unwrap();
+        repo.drop_transcript(&body.to_hex(), Some(&owner)).unwrap();
+        let tomb = read_drops(repo.layout()).unwrap()[0].1;
+
+        // The snapshot is no longer reachable.
+        let mut reachable = BTreeSet::new();
+        gc_prune(repo.layout(), &mut reachable).unwrap();
+        assert!(
+            reachable.contains(&tomb),
+            "tombstone rooted despite dead snapshot"
+        );
+        assert!(!reachable.contains(&body), "dropped body is never rooted");
+        assert_eq!(read_drops(repo.layout()).unwrap().len(), 1);
+        assert!(load(repo.layout()).unwrap().is_empty());
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn reindex_honors_a_signed_tombstone_only_for_a_trusted_signer() {
+        let root = tmp_root("reindex");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("f"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        let body = repo
+            .attach_transcript(snap, "a", "s", b"body", &[owner.enc.public()])
+            .unwrap();
+        repo.drop_transcript(&body.to_hex(), Some(&owner)).unwrap();
+        // Unsigned drops are local-only: never offered to a peer.
+        let keep = repo
+            .attach_transcript(snap, "a", "k", b"keep", &[owner.enc.public()])
+            .unwrap();
+        repo.drop_transcript(&keep.to_hex(), None).unwrap();
+        let sent = indexed_transcript_ids_for(repo.layout(), &[snap]).unwrap();
+        let drops = read_drops(repo.layout()).unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(drops.iter().any(|d| sent.contains(&d.1) && d.2 == body));
+
+        // Both bodies (and the tombstones) sit in the store; rebuild indexes.
+        let arc = repo.store_arc();
+        let mut store = arc.lock().unwrap();
+        crate::signatures::reindex(repo.layout(), &mut store).unwrap();
+        assert_eq!(
+            reindex(repo.layout(), &mut store).unwrap(),
+            2,
+            "no trust: both bodies are live again"
+        );
+        drop(store);
+        assert_eq!(
+            load(repo.layout()).unwrap().len(),
+            2,
+            "untrusted: both visible"
+        );
+        assert!(read_drops(repo.layout()).unwrap().is_empty());
+
+        trust_signer(&repo, &owner);
+        let mut store = arc.lock().unwrap();
+        reindex(repo.layout(), &mut store).unwrap();
+        drop(store);
+        let live: Vec<_> = load(repo.layout())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.1)
+            .collect();
+        assert_eq!(
+            live,
+            vec![keep],
+            "signed drop honored, unsigned drop is not"
         );
 
         drop(repo);

@@ -202,12 +202,14 @@ over-send, whatever order the lines landed in.
   A tombstone that fails the checks stays an inert object and is simply
   re-evaluated whenever it is sent again (for example after the operator
   adds the signer to the trust list and fetches).
-- **sender:** the over-send for a transfer set includes the tombstones (and
-  their signatures) of its snapshots, so fetching from the dropper (or a push that moves the ref)
-  propagates the drop. A peer that still holds the transcript object hides
-  it as soon as it ingests the tombstone. `push` still skips all I/O when
-  the remote tip already equals the local tip, so a drop alone does not push,
-  the same pre-existing behavior as a retroactive attach.
+- **sender:** the over-send for a transfer set includes the tombstones of its
+  snapshots that have an indexed signature, with those signatures. An
+  unsigned (local-only) drop is never sent. Fetching from the dropper (or a
+  push that moves the ref) propagates the drop. A peer that still holds the
+  transcript object hides it once it ingests an honored tombstone. `push`
+  still skips all I/O when the remote tip already equals the local tip, so a
+  drop alone does not push, the same pre-existing behavior as a retroactive
+  attach.
 - **merge, cherry-pick, rebase:** transcripts are not part of snapshots, so
   history operations neither carry nor restore them; only transfer can
   reintroduce one, and that path is covered above.
@@ -223,19 +225,36 @@ therefore does not carry over, and drops are authenticated with the P22
 machinery instead.
 
 - **Local drop:** always honored by the store that ran it.
-- **Signed drop:** `sc transcript drop <id> --identity <key>` also signs the
-  tombstone id with the transcript domain (`sign_transcript`), stored in the
-  shared `.sc/signatures` index and sent with the tombstone. No new crypto.
+- **Signed drop:** `sc transcript drop <id> --identity <key>` signs a
+  domain-separated digest, `BLAKE3("sc-transcript-drop-v1" || tombstone id)`,
+  with the existing transcript signing functions. The signature object is
+  keyed by the tombstone id in the shared `.sc/signatures` index so it rides
+  with the tombstone. A plain transcript signature over the bare tombstone id
+  does NOT authorize a drop. That matters because an older binary indexes a
+  tombstone as a live transcript, and its bulk `sc transcript sign <ref>`
+  would sign it by trusted signers who never meant to drop anything. No new
+  crypto primitives. A v1 identity is refused before anything is stored.
 - **Receiving a tombstone** (`index_incoming`, clone `reindex`) honors it
   only if all of these hold: the tombstone's snapshot exists locally; if the
   dropped transcript is held locally it is a real transcript on that same
-  snapshot; and a valid signature over the tombstone id comes from a key
+  snapshot; and a valid signature over the drop digest comes from a key
   under `[signers] trusted` in the receiver's `.sc/recipients.toml` (the set
   `sc verify` already uses). Missing or malformed trust config trusts nobody.
   If the dropped transcript is not held yet, the snapshot check is the only
   structural one, so a trusted signer can drop an id ahead of its arrival.
 - **Unsigned or untrusted tombstones are inert:** never recorded, so they
   cannot hide a transcript and gc never reclaims a body because of them.
+
+Operational consequences. A tombstone that arrives while its signer is
+untrusted is ignored and not recorded. On a fetching peer it is re-sent and
+re-evaluated next time. A push-only or served remote has no such retry: if it
+ignored the tombstone it stays ignored until the next push re-sends it, so
+configure `[signers] trusted` on a remote before the first drop is pushed to
+it. Any key under `[signers] trusted` can hide transcripts on every peer that
+trusts it, and make that peer's gc reclaim the bodies. `GetObjects` still
+serves a dropped body until gc sweeps it, and a peer that still holds the
+body re-sends it on a later transfer, which restarts its grace window. All of
+this follows from drop not being erasure.
 
 Trade-offs. Trust is local configuration, not repository content, so a fresh
 clone ignores tombstones until its operator trusts the signer and fetches
@@ -276,8 +295,12 @@ reported anywhere (it is pruned by gc, hidden before that).
 - **Drop is not erasure.** Peers that never receive the tombstone keep the
   sealed body, and a recipient who already decrypted it keeps the plaintext.
   Rotation is not erasure here either.
-- **Older peers** that predate this change see a tombstone as an unopenable
-  transcript and do not honor it. Upgrade before relying on drop across a
-  shared remote.
+- **Mixed versions.** A binary that predates this change indexes a tombstone
+  as a live transcript: it shows in `sc transcript list` and the `sc log`
+  marker, and `sc transcript show <ref>` fails on it with a not-a-recipient
+  error, because the empty envelope has no wraps. Upgrade every peer before
+  using drop on a shared remote. Such a peer's bulk `sc transcript sign` may
+  also sign the tombstone id; that signature is over the bare id, not the drop
+  digest, so it never authorizes a drop.
 - `sc export` still counts only transcripts that are not tombstones; a
   dropped body that gc has not swept yet is still counted as dropped history.

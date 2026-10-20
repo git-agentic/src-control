@@ -925,6 +925,42 @@ mod tests {
     }
 
     #[test]
+    fn signed_drop_propagates_over_push() {
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-transdrop-pa-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-transdrop-pb-{pid}"));
+        let _ = std::fs::remove_dir_all(&a_root);
+        let _ = std::fs::remove_dir_all(&b_root);
+        std::fs::create_dir_all(&a_root).unwrap();
+
+        let a = Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f1"), b"one").unwrap();
+        let snap = a.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let tid = a
+            .attach_transcript(snap, "claude-code", "s1", b"body", &[identity.enc.public()])
+            .unwrap();
+        crate::transcripts::tests::trust_signer(&a, &identity);
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        drop(a); // push takes the origin's repo lock
+
+        b.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        std::fs::write(b_root.join("f2"), b"two").unwrap();
+        b.commit("t", "c2").unwrap();
+        b.push("origin").unwrap();
+
+        let a = Repo::open(&a_root).unwrap();
+        assert!(
+            a.transcripts_for(&snap).unwrap().is_empty(),
+            "a push carries the signed tombstone"
+        );
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        std::fs::remove_dir_all(&b_root).unwrap();
+    }
+
+    #[test]
     fn signatures_ride_ssh_transport() {
         // The wire-protocol pipe harness `WireClient` <-> `wire::serve` IS
         // the ssh code path minus the ssh process spawn (StdioTransport
