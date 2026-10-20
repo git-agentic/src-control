@@ -1286,11 +1286,12 @@ fn serve_session(
                                 bucket_put_pack_from_file(bt, guard.path())
                             }
                         };
+                        // Charge before inspecting the result: an error after
+                        // pass 2 began (e.g. an index write) can leave records
+                        // stored, and the connection stays open.
+                        budget.used = budget.used.saturating_add(tally.seen);
                         match ingest_result {
-                            Ok(ids) => {
-                                budget.used = budget.used.saturating_add(tally.seen);
-                                write_ok(w, &ids_body(&ids))?
-                            }
+                            Ok(ids) => write_ok(w, &ids_body(&ids))?,
                             Err(Error::ConnectionBudgetExceeded(_)) => {
                                 let (code, msg) = err_to_wire(&budget.refusal());
                                 let _ = write_err(w, code, &msg);
@@ -2451,7 +2452,8 @@ mod tests {
         // The budget is per connection: a new session accepts the next object.
         let frames = run_budget_session(&root, policy, &[put_tree(4, 1_000_000)]);
         assert!(frames[0].is_ok(), "{frames:?}");
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     /// A legitimate single push under the default budget (one pack plus an
@@ -2474,7 +2476,8 @@ mod tests {
         let frames = run_budget_session(&root, policy, &reqs);
         assert_eq!(frames.len(), 4);
         assert!(frames.iter().all(|f| f.is_ok()), "{frames:?}");
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     /// `PutPack` bytes and `PutObject` bytes draw on one budget, and a pack
@@ -2528,7 +2531,8 @@ mod tests {
             Error::ConnectionBudgetExceeded(_)
         ));
         no_spool_residue(&root);
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     /// The budget is exact: a total equal to it is accepted, one byte more is
@@ -2558,7 +2562,8 @@ mod tests {
         ));
         let t = crate::transport::LocalTransport::open(&root).unwrap();
         assert!(!t.has_object(&big_tree(43, 1000).0).unwrap());
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     /// Structural records inside a pack are retained resident, so their
@@ -2582,7 +2587,8 @@ mod tests {
         let t = crate::transport::LocalTransport::open(&root).unwrap();
         assert!(!t.has_object(&id).unwrap());
         no_spool_residue(&root);
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     /// A read-only listener answers `ReadOnly` and never touches the budget:
@@ -2611,7 +2617,8 @@ mod tests {
             frames[2].as_ref().err(),
             Some(Error::ConnectionBudgetExceeded(_))
         ));
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 
     #[test]

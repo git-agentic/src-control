@@ -92,6 +92,7 @@ fn flag_is_parsed_and_bounds_checked_at_startup() {
         assert!(stderr(&o).contains(needle), "{args:?}: {}", stderr(&o));
     }
     std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists());
 }
 
 #[test]
@@ -99,7 +100,7 @@ fn a_push_over_the_budget_is_refused_and_one_under_it_works() {
     // Unlimited pack cap so the connection budget is the binding limit.
     let server_dir = tmp("srv");
     assert!(sc(&server_dir, &["init"]).status.success());
-    let (_server, addr) = spawn_http_server(
+    let (server, addr) = spawn_http_server(
         &server_dir,
         &[
             "--max-object-size",
@@ -154,7 +155,9 @@ fn a_push_over_the_budget_is_refused_and_one_under_it_works() {
         stderr(&o)
     );
 
+    drop(server); // stop the listener before deleting its root
     for d in [server_dir, client, small] {
-        std::fs::remove_dir_all(d).unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(!d.exists());
     }
 }
