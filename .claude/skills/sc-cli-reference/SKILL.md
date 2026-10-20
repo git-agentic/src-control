@@ -257,7 +257,11 @@ bash demo/run_merge_ergonomics_demo.sh        # sc conflicts/sc resolve proof (P
 cargo run --bin sc -- sparse set <prefix…> [--identity <key>]   # narrow the working tree to
                                               # these path prefixes; re-lays disk now (P24). Warns per
                                               # prefix that matches no tracked path; at least one
-                                              # prefix is required (`sparse disable` is the full view)
+                                              # prefix is required (`sparse disable` is the full view).
+                                              # While a merge/pick/rebase is stopped only a widen is
+                                              # accepted (new prefixes must cover the old ones): it
+                                              # lays out the newly in-view files, leaves protected
+                                              # ones absent, and `--continue` then proceeds (#224)
 cargo run --bin sc -- sparse show [--json]    # list the active sparse prefixes ("disabled" if
                                               # the spec is empty/absent) (P24)
 cargo run --bin sc -- sparse disable [--identity <key>]   # clear the spec and rematerialize

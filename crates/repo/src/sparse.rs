@@ -50,6 +50,19 @@ impl Sparse {
             })
     }
 
+    /// Whether every path `other` matches is also matched here: the widen-only
+    /// test for a spec change while an op is stopped. A prefix names its bare
+    /// path and everything under it, so `other`'s prefix is covered exactly
+    /// when this spec matches that bare path.
+    pub fn covers(&self, other: &Sparse) -> bool {
+        self.is_full()
+            || (!other.is_full()
+                && other
+                    .prefixes
+                    .iter()
+                    .all(|p| self.matches(p.trim_end_matches('/'))))
+    }
+
     /// The recorded prefixes, in the order they were set.
     pub fn prefixes(&self) -> &[String] {
         &self.prefixes
@@ -160,6 +173,60 @@ pub(crate) fn clear_prev(layout: &Layout) -> Result<()> {
     remove_if_exists(&layout.sparse_prev_path())
 }
 
+/// The paths an in-flight stopped-op widen recorded writing, if the record
+/// belongs to the stop whose decided root is `decided` (its header); a record
+/// from another stop is stale and reads as `None`. `Some` of an empty set is a
+/// header-only record: a widen that added no plain file, which still left a
+/// pending widen (its `sparse-prev` bound).
+pub(crate) fn load_widen(
+    layout: &Layout,
+    decided: scl_core::ObjectId,
+) -> Result<Option<std::collections::BTreeSet<String>>> {
+    match std::fs::read_to_string(layout.sparse_widen_path()) {
+        Ok(text) => {
+            let mut fields = widen_fields(&text);
+            if fields.next() != Some(decided.to_hex().as_str()) {
+                return Ok(None);
+            }
+            Ok(Some(fields.map(String::from).collect()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The record's fields: the decided-root id, then one path each. NUL-separated
+/// (a path can hold a newline or a carriage return, never a NUL), and the one
+/// splitter every reader and rewriter of the record uses.
+fn widen_fields(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\0').filter(|f| !f.is_empty())
+}
+
+/// Serialize a record: `decided`, then `paths`, each followed by a NUL.
+fn widen_record<'a>(
+    decided: scl_core::ObjectId,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut text = format!("{}\0", decided.to_hex());
+    for p in paths {
+        text.push_str(p);
+        text.push('\0');
+    }
+    text
+}
+
+/// Record `paths` as the files a widen over the stop with decided root
+/// `decided` is about to write.
+pub(crate) fn store_widen(
+    layout: &Layout,
+    decided: scl_core::ObjectId,
+    paths: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let text = widen_record(decided, paths.iter().map(String::as_str));
+    scl_core::fsutil::atomic_write_durable(&layout.sparse_widen_path(), text.as_bytes())?;
+    Ok(())
+}
+
 impl Sparse {
     /// A spec that matches whatever either input matches. A full (empty) spec
     /// is full in the union.
@@ -226,6 +293,11 @@ impl Repo {
     /// spec. An unborn HEAD has no working tree to re-lay; the spec is still
     /// persisted so it takes effect on the first commit/checkout.
     ///
+    /// While a merge, pick or rebase is stopped it refuses with that op's
+    /// `*InProgress` error unless `prefixes` cover the current spec (a strict
+    /// widen) and the stop recorded its decided root; a widen then lays out
+    /// only the files that come into view (see `widen_while_stopped`).
+    ///
     /// Refuses (same as [`Repo::switch_with_identity`]) when the working tree
     /// has uncommitted modifications or deletions: `materialize`'s write loop
     /// rewrites every in-sparse target entry from HEAD's blob unconditionally,
@@ -243,15 +315,20 @@ impl Repo {
         self.refuse_on_private("sc sparse set")?;
         // Before any side effect (the shared `store` checks again).
         validate_prefixes(prefixes)?;
-        if crate::merge_state::in_progress(&self.layout) {
-            return Err(Error::MergeInProgress);
-        }
-        if crate::pick_state::in_progress(&self.layout) {
-            return Err(Error::PickInProgress);
-        }
-        if crate::rebase_state::in_progress(&self.layout) {
-            return Err(Error::RebaseInProgress);
-        }
+        let spec = Sparse::new(prefixes.to_vec());
+        // The view in effect now, read before it is replaced: it bounds the
+        // removal walk in the re-lay below.
+        let old_spec = self.sparse_spec()?;
+        // A stopped merge, pick or rebase refuses a narrowing or sideways
+        // change (the re-lay would clobber its markers). A strict widen is
+        // allowed when the stop recorded its decided root: see
+        // `widen_while_stopped`.
+        let stopped = match self.stopped_op()? {
+            None => None,
+            // A full spec is `disable`, which stays refused.
+            Some((_, Some(decided))) if !spec.is_full() && spec.covers(&old_spec) => Some(decided),
+            Some((refusal, _)) => return Err(refusal),
+        };
         // Gap error on sparse-widen (P27 Task 5): a partial clone never
         // fetched anything outside its promisor filter, so narrowing the
         // sparse view to a prefix that isn't itself covered by the filter
@@ -281,6 +358,9 @@ impl Repo {
                 }
             }
         }
+        if let Some(decided) = stopped {
+            return self.widen_while_stopped(decided, &old_spec, &spec);
+        }
         let dirty = self.status()?;
         if !dirty.modified.is_empty() || !dirty.deleted.is_empty() {
             return Err(crate::error::Error::InvalidArgument(
@@ -288,10 +368,6 @@ impl Repo {
                     .into(),
             ));
         }
-        let spec = Sparse::new(prefixes.to_vec());
-        // The view in effect now, read before it is replaced: it bounds the
-        // removal walk in the re-lay below.
-        let old_spec = self.sparse_spec()?;
         let tip = self.head_tip()?;
         let snap = match tip {
             Some(tip) => Some(self.snapshot(&tip)?),
@@ -310,7 +386,14 @@ impl Repo {
             }
             // Widening lays tracked files onto disk: refuse before anything is
             // stored if one would replace a file the user owns.
-            self.refuse_untracked_for_view_change("sparse set", snap.root, &old_spec, &spec)?;
+            self.refuse_untracked_for_view_change(
+                "sparse set",
+                snap.root,
+                &old_spec,
+                &spec,
+                &Default::default(),
+                true,
+            )?;
         }
         // Crash safety: record the spec being replaced before the new one is
         // stored. If the process dies before the re-lay finishes, the marker
@@ -356,6 +439,260 @@ impl Repo {
             clear_prev(self.layout())?;
         }
         Ok(skipped)
+    }
+
+    /// The in-progress merge, pick or rebase, if any, as the refusal a
+    /// spec change gets and the decided root the stop recorded (the tree its
+    /// working tree was laid out from).
+    fn stopped_op(&self) -> Result<Option<(Error, Option<scl_core::ObjectId>)>> {
+        Ok(if crate::merge_state::in_progress(&self.layout) {
+            Some((
+                Error::MergeInProgress,
+                crate::merge_state::read_decided_root(&self.layout)?,
+            ))
+        } else if crate::pick_state::in_progress(&self.layout) {
+            Some((
+                Error::PickInProgress,
+                crate::pick_state::read_decided_root(&self.layout)?,
+            ))
+        } else if crate::rebase_state::in_progress(&self.layout) {
+            Some((
+                Error::RebaseInProgress,
+                crate::rebase_state::read_decided_root(&self.layout)?,
+            ))
+        } else {
+            None
+        })
+    }
+
+    /// Widen the view (`new` covers `old`) while a merge, pick or rebase is
+    /// stopped, laying out only the files that come into view, from the
+    /// stop's decided root. A normal `set_sparse` re-lays HEAD, which would
+    /// overwrite the conflict markers and the user's resolution, and its
+    /// dirty-tree check reads those as uncommitted edits.
+    ///
+    /// The decided root is right for every path the stop did not write: it is
+    /// what completion carries an out-of-view path from, so laying a path out
+    /// from it changes nothing the completion would compute, while leaving
+    /// it off disk would read as a deletion. Marker, plaintext and sidecar
+    /// paths are all in the old view (the stop gates them), so none is
+    /// touched. Protected entries are not decrypted here: they stay absent,
+    /// and completion carries them from the decided root as it does for any
+    /// absent protected file. Files are written before the spec, so a crash
+    /// leaves only extra out-of-view files, never a view with files missing.
+    fn widen_while_stopped(
+        &self,
+        decided: scl_core::ObjectId,
+        old: &Sparse,
+        new: &Sparse,
+    ) -> Result<Vec<String>> {
+        // Same view: nothing comes into view, so there is nothing to write.
+        if new.covers(old) && old.covers(new) {
+            return Ok(Vec::new());
+        }
+        let (skipped, prev) = self.lay_out_widened_view(decided, old, new)?;
+        self.finish_widen(new, prev)?;
+        Ok(skipped)
+    }
+
+    /// The first half of [`Repo::widen_while_stopped`]: every guard, the
+    /// `.sc/sparse-widen` record, and the writes, but not the spec. Returns
+    /// the protected paths left absent and the `sparse-prev` marker to
+    /// restore. A crash or error after this leaves exactly the state the
+    /// abort and completion cleanup (`remove_widen_residue`) handles.
+    pub(crate) fn lay_out_widened_view(
+        &self,
+        decided: scl_core::ObjectId,
+        old: &Sparse,
+        new: &Sparse,
+    ) -> Result<(Vec<String>, Option<Sparse>)> {
+        // Before any write, for every tree the stopped op still reads over
+        // the new view (the decided root; the tip, which `--abort` and the
+        // completion's `tracked_paths_at` read; a rebase's accumulator):
+        // fill the closure (lazy partial clones), check it is present, and
+        // refuse to lay a file over one the user owns.
+        let mut roots = vec![decided];
+        if let Some(tip) = self.head_tip()? {
+            roots.push(self.snapshot(&tip)?.root);
+        }
+        if let Some(st) = crate::rebase_state::read(&self.layout)? {
+            roots.push(self.snapshot(&st.acc_tip)?.root);
+        }
+        let store_arc = self.vfs().store();
+        for &root in &roots {
+            self.ensure_view(root, new)?;
+            let mut s = store_arc.lock().unwrap();
+            crate::worktree::preflight_view(self.layout(), &mut s, root, new)?;
+        }
+        // Files an interrupted run of this same widen already wrote (recorded
+        // in `.sc/sparse-widen`, bytes equal to the decided root's): a retry
+        // may rewrite them. Anything else at those paths is the user's.
+        let recorded = load_widen(self.layout(), decided)?.unwrap_or_default();
+        let already_laid = {
+            let mut s = store_arc.lock().unwrap();
+            crate::worktree::added_view_already_laid(
+                self.layout(),
+                &mut s,
+                decided,
+                old,
+                new,
+                &recorded,
+            )?
+        };
+        for root in roots {
+            self.refuse_untracked_for_view_change(
+                "sparse set",
+                root,
+                old,
+                new,
+                &already_laid,
+                false,
+            )?;
+        }
+        // Every guard passed, so each path below is the widen's to write:
+        // record them (keeping an earlier interrupted run's) before the first.
+        let mut written = recorded;
+        {
+            let mut s = store_arc.lock().unwrap();
+            let (plain, _) = crate::worktree::added_view_files(&mut s, decided, old, new)?;
+            written.extend(plain.into_iter().map(|(p, ..)| p));
+        }
+        store_widen(self.layout(), decided, &written)?;
+        // A partial clone's abort removes only what its removal walk can see,
+        // which is the spec's view plus this marker. The files are laid before
+        // the spec is stored, so record the new view first; a crash then
+        // leaves a bound that covers them. An earlier interrupted `sparse set`
+        // may have left its own marker: keep it.
+        let partial = self.promisor()?.is_some();
+        let prev = load_prev(self.layout())?;
+        if partial {
+            let bound = prev.as_ref().map_or_else(|| new.clone(), |p| p.union(new));
+            store_prev(self.layout(), &bound)?;
+        }
+        let skipped = {
+            let mut s = store_arc.lock().unwrap();
+            crate::worktree::lay_out_added_view(self.layout(), &mut s, decided, old, new)?
+        };
+        Ok((skipped, prev))
+    }
+
+    /// The second half: store the spec, drop the record, and put back any
+    /// `sparse-prev` marker an earlier interrupted `sparse set` left.
+    fn finish_widen(&self, new: &Sparse, prev: Option<Sparse>) -> Result<()> {
+        store(self.layout(), new)?;
+        // Paths an earlier interrupted widen (a different target) laid that
+        // the new view does not cover stay recorded, so abort and completion
+        // still clean them up.
+        let record = self.layout().sparse_widen_path();
+        match std::fs::read_to_string(&record) {
+            Ok(text) => {
+                let mut fields = widen_fields(&text);
+                let header = fields.next().unwrap_or_default();
+                let kept: Vec<&str> = fields.filter(|p| !new.matches(p)).collect();
+                if kept.is_empty() {
+                    remove_if_exists(&record)?;
+                } else {
+                    // The header is the decided root's hex; write it back as is.
+                    let mut out = format!("{header}\0");
+                    for p in kept {
+                        out.push_str(p);
+                        out.push('\0');
+                    }
+                    scl_core::fsutil::atomic_write_durable(&record, out.as_bytes())?;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        if self.promisor()?.is_some() {
+            match prev {
+                Some(p) => store_prev(self.layout(), &p)?,
+                None => clear_prev(self.layout())?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete the files an interrupted stopped-op widen wrote, when the stop
+    /// ends with the old view still in force. A path is removed only if the
+    /// record names `decided` (a stale record from another stop is ignored),
+    /// the path is outside the current view, and its bytes still equal the
+    /// decided tree's, so a file the user edited since is left. Call it before
+    /// the stopped op's state, which removes the record, is cleared.
+    ///
+    /// On completion this is what keeps the files out of the commit's input.
+    /// On abort it only covers what the abort's own walk cannot see (an
+    /// ours-only file, or a subtree never fetched for theirs): that walk
+    /// removes any out-of-view path theirs tracks regardless of bytes, by
+    /// design (abort restores ours). Returns whether a valid record existed.
+    pub(crate) fn remove_widen_residue(&self, decided: Option<scl_core::ObjectId>) -> Result<bool> {
+        Ok(self.remove_widen_residue_keeping(decided)?.is_some())
+    }
+
+    /// [`Repo::remove_widen_residue`], returning the recorded out-of-view
+    /// paths it kept (`None`: no valid record).
+    fn remove_widen_residue_keeping(
+        &self,
+        decided: Option<scl_core::ObjectId>,
+    ) -> Result<Option<Vec<String>>> {
+        let Some(decided) = decided else {
+            return Ok(None);
+        };
+        // A header-only record is a pending widen too.
+        let Some(recorded) = load_widen(self.layout(), decided)? else {
+            return Ok(None);
+        };
+        let view = self.sparse_spec()?;
+        let outside: std::collections::BTreeSet<String> =
+            recorded.into_iter().filter(|p| !view.matches(p)).collect();
+        let laid = {
+            let store_arc = self.vfs().store();
+            let mut s = store_arc.lock().unwrap();
+            crate::worktree::recorded_paths_laid(self.layout(), &mut s, decided, &outside)?
+        };
+        for path in &laid {
+            match std::fs::remove_file(crate::worktree::safe_join(&self.layout.root, path)?) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Some(
+            outside.into_iter().filter(|p| !laid.contains(p)).collect(),
+        ))
+    }
+
+    /// [`Repo::remove_widen_residue`] for the completion of a stopped op. A
+    /// partial clone's interrupted widen also left its wider bound in
+    /// `.sc/sparse-prev`; with the residue handled that bound is stale, and
+    /// the next `materialize` with an old root would delete tracked files
+    /// under it without a byte check (an edited kept residue file included),
+    /// so it goes too.
+    pub(crate) fn finish_widen_at_completion(
+        &self,
+        decided: Option<scl_core::ObjectId>,
+    ) -> Result<()> {
+        let Some(kept) = self.remove_widen_residue_keeping(decided)? else {
+            return Ok(());
+        };
+        let partial = self.promisor()?.is_some();
+        // On a full clone a kept (user-edited) file outside the view is read
+        // like any tracked file there and committed with the user's edit. A
+        // partial clone cannot graft it into the result, so say what to do.
+        if partial {
+            if let Some(p) = kept
+                .iter()
+                .find(|p| std::fs::symlink_metadata(self.layout.root.join(p)).is_ok())
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "{p} lies outside your sparse checkout and differs from what the merge \
+                     decided (an interrupted `sc sparse set` laid it out): move your copy \
+                     away or restore it, then retry"
+                )));
+            }
+            clear_prev(self.layout())?;
+        }
+        Ok(())
     }
 
     /// The prefixes in `prefixes` that match no tracked path at HEAD, so a
@@ -427,6 +764,8 @@ impl Repo {
                 root,
                 &self.sparse_spec()?,
                 &Sparse::default(),
+                &Default::default(),
+                true,
             )?;
         }
         clear(self.layout())?;
@@ -526,6 +865,20 @@ mod tests {
         clear(&layout).unwrap();
 
         std::fs::remove_dir_all(&layout.root).unwrap();
+    }
+
+    #[test]
+    fn covers_is_a_strict_superset_test_on_path_boundaries() {
+        let sp = |v: &[&str]| Sparse::new(v.iter().map(|s| s.to_string()).collect());
+        assert!(sp(&["src/", "docs/"]).covers(&sp(&["src"])));
+        assert!(sp(&["src"]).covers(&sp(&["src/a/", "src/b.txt"])));
+        assert!(sp(&["src"]).covers(&sp(&["src"])));
+        assert!(sp(&[]).covers(&sp(&["src"])), "full covers everything");
+        assert!(sp(&[]).covers(&sp(&[])));
+        assert!(!sp(&["src"]).covers(&sp(&[])), "full is wider than any set");
+        assert!(!sp(&["src/a.txt"]).covers(&sp(&["src"])), "narrower");
+        assert!(!sp(&["docs"]).covers(&sp(&["src"])), "sideways");
+        assert!(!sp(&["src"]).covers(&sp(&["srcfoo"])), "boundary, not text");
     }
 
     #[test]

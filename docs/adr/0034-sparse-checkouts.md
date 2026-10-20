@@ -63,12 +63,13 @@ review fix — see Consequences).
   (`sc sparse set`) before anything is written, exactly like an
   out-of-sparse conflicted path, so a stop, its completion and its abort
   leave nothing out of view on disk. From `rebase --continue` the hint
-  says to abort the rebase first, because `sparse set` is refused while a
-  rebase is stopped. Sidecars need no gate on a full clone: each is
-  `<conflicted path>.theirs` beside a conflicted path that already passed
-  the gate (so it is in view even under a file-exact spec such as
-  `src/a.bin`), and abort and completion remove it; a partial clone keeps
-  its stricter sidecar refusal (ADR-0049). The earlier build wrote that
+  says to widen with `sc sparse set` and rerun `--continue` (a widen is
+  allowed mid-stop since #224, see refinement 5). Sidecars need no gate on
+  a full clone: each is `<conflicted path>.theirs` beside a conflicted path
+  that already passed the gate (so it is in view even under a file-exact
+  spec such as `src/a.bin`), and abort and completion remove it; a partial
+  clone checks the sidecar by its base path (#224), so a file-exact spec no
+  longer refuses a valid in-view binary conflict (ADR-0049). The earlier build wrote that
   plaintext outside the view and left it there after completion (only
   abort removed it); this was never data loss or a new disclosure, only a
   view wider than advertised. The cost is that such a merge now needs the
@@ -161,13 +162,73 @@ every claim below is checked against the shipped code, not the plan.
    narrow view during harvest and silently revert an agent's genuine
    deletion of an out-of-sparse path, pinned by
    `sc_work_full_agent_deletion_survives_host_sparse`.
-5. **`set_sparse`/`disable_sparse` refuse mid-conflict.** Re-laying the
-   working tree while a merge/pick/rebase is in progress would either
-   destroy in-progress conflict markers or narrow away a path a
-   conflicted operation still needs on disk — both refuse with the same
-   `MergeInProgress`/`PickInProgress`/`RebaseInProgress` errors the P21
-   policy-op guards already use elsewhere, added in review before Task 4
-   landed rather than discovered after.
+5. **`set_sparse`/`disable_sparse` refuse mid-conflict, except a strict
+   widen.** Re-laying the working tree while a merge/pick/rebase is in
+   progress would either destroy in-progress conflict markers or narrow
+   away a path a conflicted operation still needs on disk — both refuse
+   with the same `MergeInProgress`/`PickInProgress`/`RebaseInProgress`
+   errors the P21 policy-op guards already use elsewhere, added in review
+   before Task 4 landed rather than discovered after. `disable_sparse`,
+   narrowing and sideways specs still refuse. Since #224 `set_sparse` accepts
+   a spec that `Sparse::covers` the current one (every old prefix is matched
+   by a new one) while the stop has a recorded decided root
+   (`MERGE`/`PICK`/`REBASE_DECIDED_ROOT`), so `rebase --continue`'s
+   out-of-view refusal can be fixed without losing the resolved commits.
+   `Repo::widen_while_stopped` (`crates/repo/src/sparse.rs`) does not
+   re-lay HEAD. For the decided root, the tip and (rebase) the accumulator
+   it fills the new view's closure (lazy partial clones), preflights the
+   view and runs `refuse_untracked_for_view_change`, then writes
+   only the files `old` did not match (`worktree::lay_out_added_view`) and
+   stores the spec last, so a crash leaves extra out-of-view files, never a
+   view with files missing. The paths are recorded in `.sc/sparse-widen` before
+   the first write (each file is written atomically) and the record is
+   removed with the spec write or with the stopped op. A retry treats a
+   recorded file already on disk with the decided root's bytes as its own
+   earlier write; an unrecorded file, even with equal bytes, or a changed one
+   still refuses (the file's executable bit is not compared, but
+   `lay_out_added_view` applies the recorded mode after each atomic write, #237). The record is NUL-separated (a path may hold a newline or a carriage
+   return, never a NUL), read and rewritten with one splitter, like
+   `CONFLICT_PLAINTEXT`. It starts with the stop's decided-root id and is ignored
+   when that does not match (a stale record). When the stop ends with the old
+   view still in force (abort of a merge, pick or rebase, or the completion
+   after an interrupted widen) `Repo::remove_widen_residue` deletes the
+   recorded files that lie outside the view and still have the decided tree's
+   bytes, before the op's state is cleared: the abort's own walk follows the
+   other side's tree and the restored view, so it cannot see an ours-only
+   file or a subtree never fetched for theirs. A file the user edited since is
+   left by this cleanup; the abort's own walk still removes any out-of-view path theirs
+   tracks, whatever its bytes (abort restores ours). At completion a kept edited
+   file outside the view is, on a full clone, read like any tracked file and committed
+   with the user's edit (intended: it is their change, and a sparse full clone reads
+   tracked files wherever they sit); on a partial clone the commit is refused naming
+   the file, because the result cannot graft it, until it is moved away. On a partial
+   clone, completion also drops the `.sc/sparse-prev` bound the interrupted widen
+   left, so a later materialize cannot delete tracked files under it unchecked. The cleanup runs before the working tree is read for completion, and a retry with a
+   different target keeps the earlier target's paths recorded. On a
+   partial clone the new view is recorded in `.sc/sparse-prev` before the
+   writes, so the abort's removal walk covers files an interrupted widen
+   laid; the marker is restored to its prior state once the spec is stored.
+   The untracked-file guard checks only paths the old view did not match
+   (those it laid out are not written, and a stopped op may have turned one
+   into a directory). Widening to the same spec is a quiet no-op. The guard does not count a case
+   alias of a laid-out path as tracked (`alias_ok = false`): on a case-insensitive
+   filesystem a decided `SRC/a.txt` would otherwise be written over the user's
+   resolution of `src/a.txt`. A crash between an atomic write's temp file
+   (`<name>.<pid>.<n>.tmp`) and its rename leaves that temp file beside the target;
+   it is not recorded, delete it. The
+   decided root is the right source: it is what completion carries an
+   out-of-view path from (refinement 6). For a resumed rebase (`resolved`) the accumulator
+   can differ from it outside the view, but the next `--continue` re-lays
+   the tree from the accumulator under the new spec, so what the widen laid
+   is overwritten there. A full spec is `disable` and stays refused. Markers, the resolution,
+   `CONFLICT_PLAINTEXT` and sidecars are all in the old view, so they are not
+   touched; the dirty-tree check is skipped (HEAD is stale mid-op). A
+   protected file that comes into view is not decrypted (the stop does not
+   persist its wrap map): it stays absent, is reported as skipped, and
+   completion carries it from the decided root as for any absent protected
+   path. Abort restores the original tip over the widened view and the spec
+   stays widened. No oplog record is written (the spec change moves no
+   ref); the repo lock is held by the CLI as for any mutation.
 6. **Completion carries from the decided root, not the parents (#238).**
    A stopped merge, cherry-pick or rebase on a public branch records a
    decided root (`MERGE`/`PICK`/`REBASE_DECIDED_ROOT`). A merge into a
@@ -187,6 +248,4 @@ every claim below is checked against the shipped code, not the plan.
    for state written without a decided root. Pinned by `sparse_completion.rs`
    (merge, pick, rebase: deletion kept, clean add and modify land, ours-side
    out-of-view changes kept, equal to the run without sparse; file to
-   directory; an out-of-view exec bit; a protected deletion). PR #236
-   owns refinement 5; its "not always true today ... #238" sentence goes away
-   once both land.
+   directory; an out-of-view exec bit; a protected deletion).

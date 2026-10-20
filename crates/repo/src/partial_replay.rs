@@ -381,6 +381,74 @@ fn a_rebase_stops_on_a_conflict_in_the_view_and_continues() {
     fx.cleanup();
 }
 
+/// A stopped rebase on a lazy clone can be widened past its filter: the
+/// subtree that comes into view is filled by id and laid out from the decided
+/// root, and the rebase ends at the tree the full rebase gives (#224).
+#[test]
+fn widening_a_stopped_partial_rebase_fills_the_carried_subtree() {
+    let fx = Fx::origin("rebase-widen", |_| {});
+    fx.origin_branch(
+        "b1",
+        &[
+            ("src/a.txt", SRC_ONE),
+            ("docs/api/guide.md", b"g changed\n"),
+        ],
+    );
+    let two = b"one\nTWO\nthree\n";
+    let local2 = b"uno\nTWO\nthree\n";
+    fx.origin.branch("loc").unwrap();
+    fx.origin.switch("loc").unwrap();
+    std::fs::write(fx.origin_root.join("src/a.txt"), two).unwrap();
+    fx.origin.commit("t", "local 1").unwrap();
+    std::fs::write(fx.origin_root.join("src/a.txt"), local2).unwrap();
+    fx.origin.commit("t", "local 2").unwrap();
+    assert!(matches!(
+        fx.origin.rebase("b1", "t", None).unwrap(),
+        RebaseResult::Stopped { .. }
+    ));
+    fx.origin
+        .resolve_path("src/a.txt", ResolveSide::Ours, None)
+        .unwrap();
+    let RebaseResult::Rebased { new_tip, .. } = fx.origin.rebase_continue("t", None).unwrap()
+    else {
+        panic!("expected a rebase");
+    };
+    let expect = root_of(&fx.origin, &new_tip);
+    fx.origin.switch("main").unwrap();
+
+    let clone = fx.clone(true);
+    std::fs::write(fx.clone_root.join("src/a.txt"), two).unwrap();
+    clone.commit("t", "local 1").unwrap();
+    std::fs::write(fx.clone_root.join("src/a.txt"), local2).unwrap();
+    clone.commit("t", "local 2").unwrap();
+    assert!(matches!(
+        clone.rebase("origin/b1", "t", None).unwrap(),
+        RebaseResult::Stopped { .. }
+    ));
+
+    clone
+        .set_sparse(&["src/".to_string(), "docs/".to_string()], None)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(fx.clone_root.join("docs/api/guide.md")).unwrap(),
+        b"g changed\n",
+        "the target's content, from the decided root"
+    );
+    assert!(std::fs::read_to_string(fx.clone_root.join("src/a.txt"))
+        .unwrap()
+        .contains("<<<<<<<"));
+    clone
+        .resolve_path("src/a.txt", ResolveSide::Ours, None)
+        .unwrap();
+    let RebaseResult::Rebased { new_tip, .. } = clone.rebase_continue("t", None).unwrap() else {
+        panic!("expected a rebase");
+    };
+    assert_eq!(root_of(&clone, &new_tip), expect);
+    assert!(clone.status().unwrap().modified.is_empty());
+    drop(clone);
+    fx.cleanup();
+}
+
 /// SRC_A is the first commit's content: a pick that changes nothing there is
 /// already applied.
 #[test]
