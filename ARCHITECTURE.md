@@ -974,12 +974,16 @@ without a new object tag or wire change: a drop is a **tombstone**, a
 dropped id, recorded in a local `.sc/transcript-drops` index and treated as a
 grow-only set (no undrop; re-attach to restore). Reads, `sc log` markers and
 the over-send filter through the drop set, and `sc gc` reclaims the body. A
-tombstone travels with fetch and push only when it is signed, and a receiving
-peer honors it only if the signature comes from a key in its `[signers]
+tombstone travels with fetch and push only when it is signed (a push that finds
+the remote already at the same branch tip sends nothing, so a drop made
+afterwards propagates once a push moves the branch or the remote fetches), and
+a receiving peer honors it only if the signature comes from a key in its `[signers]
 trusted` list; an unsigned drop is local-only, and an untrusted tombstone stays
 inert. Drop is not erasure: a peer that never receives an honored tombstone
 keeps the sealed body, and a remote that received a tombstone before trusting
-its signer keeps it inert (#230). See ADR-0038 and its addendum.
+its signer keeps it inert (#230). `sc clone|fetch|push --no-transcripts` leaves
+transcript objects out of one transfer (per command, not remembered; no effect
+on git or bucket remotes). See ADR-0038 and its addendum.
 
 ## Phase 31 — listener resource limits (built)
 
@@ -1136,9 +1140,10 @@ and its two backends (`DirBucket` for `sc+wal://<dir>`, `S3Bucket` for
 `sc+s3://<bucket>/<prefix>`), quarantining the S3 SDK the way `gix` and
 RustCrypto are quarantined.
 
-Reads treat the bucket as untrusted input: manifest, log entries and pack
-records are capped at `MAX_OBJECT_SIZE`, and every WAL record decodes strictly
-and fails closed. P36b adds **checkpoint folding**: once the log tail passes 64
+Reads treat the bucket as untrusted input: WAL metadata (manifest, log
+entries, checkpoints, idx) is capped at a fixed 256 MiB, pack records follow the
+live max object size (`scl_core::max_object_size()`), and every WAL record
+decodes strictly and fails closed. P36b adds **checkpoint folding**: once the log tail passes 64
 entries a push opportunistically writes `checkpoints/<seq>` (branch tips plus a
 cumulative pack list) and points the manifest at it, so a cold reader seeds from
 the checkpoint and walks only the tail. P36c adds `sc serve --store <url>`: an
@@ -1183,7 +1188,8 @@ top of `materialize`, plus `undo` and `sparse set`), and a partial clone fetches
 from its origin only. 37b-ii lets a lazy, online clone fill the view's closure
 by id (`ensure_view`) before switch, fast-forward, undo and `sparse set`;
 `sparse set` may widen past the filter; and a by-id reply is capped at
-`min(--max-pack-size, 512 MiB)` and split when refused. `sc export` and `sparse
+`min(--max-pack-size, 2 GiB)` (the 2 GiB ceiling is twice the largest settable
+object cap; the client reads at most 4 GiB) and split when refused. `sc export` and `sparse
 disable` stay refused on a partial clone. See ADR-0048.
 
 ## Phase 37c — merge, cherry-pick and rebase on a partial clone (built)

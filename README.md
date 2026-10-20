@@ -172,6 +172,6 @@ browser. All 36 phases and P37a-37d are implemented and tested; `demo/` holds
 follow-ons (signatures and transcripts not travelling through bucket remotes
 (#229), transcript drop delivery gaps, bucket
 compaction and gc, named concurrent `sc ws` sessions, size/count clone
-filters, an operator-configurable object-size cap, and similar hardening
+filters, and similar hardening
 items) are tracked in [ROADMAP.md](ROADMAP.md)'s Deferred section and as open
 GitHub issues rather than being open MVP scope.
