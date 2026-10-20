@@ -846,3 +846,71 @@ fn a_first_push_that_died_before_the_manifest_leaves_orphans_the_sweep_ages_out(
     assert!(keys(&mem, "packs/").is_empty());
     assert!(open(&mem).list_refs().unwrap().is_empty());
 }
+
+#[test]
+fn a_manifest_that_moves_during_pack_deletion_stops_the_deletes() {
+    // Wraps a bucket so the first pack delete is followed by a push by someone
+    // else: the sweep must notice at its next look and keep the rest.
+    struct PushOnFirstPackDelete {
+        inner: Shared,
+        fired: Mutex<bool>,
+    }
+    impl Bucket for PushOnFirstPackDelete {
+        fn get(&self, k: &str, t: Option<&str>) -> scl_objio::Result<Fetched> {
+            self.inner.get(k, t)
+        }
+        fn put_new(&self, k: &str, b: &[u8]) -> scl_objio::Result<bool> {
+            self.inner.put_new(k, b)
+        }
+        fn put_if_tag(
+            &self,
+            k: &str,
+            b: &[u8],
+            t: Option<&str>,
+        ) -> scl_objio::Result<Option<String>> {
+            self.inner.put_if_tag(k, b, t)
+        }
+        fn list(&self, p: &str) -> scl_objio::Result<Vec<String>> {
+            self.inner.list(p)
+        }
+        fn list_meta(&self, p: &str) -> scl_objio::Result<Vec<ObjectMeta>> {
+            self.inner.list_meta(p)
+        }
+        fn exists(&self, k: &str) -> scl_objio::Result<bool> {
+            self.inner.exists(k)
+        }
+        fn delete(&self, k: &str) -> scl_objio::Result<()> {
+            self.inner.delete(k)?;
+            let mut fired = self.fired.lock().unwrap();
+            if k.starts_with("packs/") && !*fired {
+                *fired = true;
+                drop(fired);
+                push_commits(&open(&self.inner.0), "late", 1);
+            }
+            Ok(())
+        }
+    }
+    let mem = Arc::new(MemBucket::default());
+    let refs = push_commits(&open(&mem), "w", 70);
+    let t = BucketTransport::from_bucket(Box::new(PushOnFirstPackDelete {
+        inner: Shared(mem.clone()),
+        fired: Mutex::new(false),
+    }))
+    .unwrap();
+    let rep = t.compact(&eager()).unwrap();
+    assert!(
+        rep.notes
+            .iter()
+            .any(|n| n.contains("moved during pack deletion")),
+        "{rep:?}"
+    );
+    assert!(rep.packs_deleted < 70, "{rep:?}");
+    // some old packs were kept, the bucket is readable, and a rerun finishes
+    assert!(keys(&mem, "packs/").len() > 4);
+    let mut all = refs;
+    all.push(("late-0".to_string(), commit("late-0").0));
+    assert_readable(&mem, &all);
+    open(&mem).compact(&eager()).unwrap();
+    assert_eq!(keys(&mem, "packs/").len(), 2);
+    assert_readable(&mem, &all);
+}

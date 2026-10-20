@@ -432,13 +432,14 @@ too, not just the src-control-side metadata.
   objects no current manifest chain names, and a writer who can already
   write to the bucket can do worse with raw access. What it does change for a
   hostile or mistaken writer: (a) a stalled push whose uploaded pack is older
-  than `--prune-expire` can lose it and fail on retry, or in a race narrower
-  than one bucket round trip commit an entry naming a deleted pack, which
+  than `--prune-expire` can lose it and fail on retry, or, if its pack is byte-identical to an old
+  orphan that a sweep is deleting at that moment, commit an entry naming a
+  deleted pack, which
   makes the remote unreadable until fixed (hence the 24h default, and
   leases as the real fix); (b) a hostile write that fills `log/` or
-  `checkpoints/` with junk is reclaimed once it falls behind the cutoff.
-  Compaction decodes the records it keeps strictly and stops deleting packs if
-  one is unreadable (fail closed). Use `--dry-run` first on a new bucket.
+  `checkpoints/` with junk is reclaimed once it falls behind the cutoff; junk
+  at a far-future seq never falls behind it, and an undecodable one stops pack
+  deletion (fail closed, the report names the key to remove by hand). Use `--dry-run` first on a new bucket.
 - **Sealed content stays end-to-end sealed, unchanged.** Protected-path
   ciphertext (ADR-0014/0043) and committed secrets travel through a bucket
   remote exactly as through any other transport: a bucket reader without the

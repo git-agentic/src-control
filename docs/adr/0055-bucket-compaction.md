@@ -67,7 +67,10 @@ CAS and must refresh.
 
 Old packs stay in place. After the CAS the superseded packs are named by no
 chain a new reader walks, but older checkpoints and log entries still name
-them. They are removed by phase 2, a grace period later.
+them. They are removed by phase 2 once the checkpoint that dropped them has
+aged past `grace`, normally a later run. (A leftover checkpoint from a lost
+CAS can set that cutoff earlier than the real one, which only costs a reader
+that read the manifest moments before a restart; see the reader protocol.)
 
 **Phase 2, sweep (deletes, behind a cutoff).** All deletions are of objects
 that the current manifest chain does not reference (and, outside the residual
@@ -127,7 +130,7 @@ scan, `refresh`), never in the middle of the bytes `get_pack` has already
 written.
 
 `grace` is therefore not what makes readers correct; it only makes restarts
-rare. A reader older than `grace` is the only one that can be restarted.
+rare; a reader straddling a sweep can be restarted.
 
 ### Writer protocol
 
@@ -147,7 +150,8 @@ store offers no atomic "delete if the manifest is unchanged". Two defenses:
 
 **Residual limit (documented, not closed).** A writer that stalls longer than
 `grace` between uploading a pack and its CAS, or re-pushes byte-identical
-content to an old orphan in the same instant a sweep selects it, can still
+content to an old orphan while a sweep that already selected it is still
+deleting (the manifest is looked at again every 16 packs), can still
 commit an entry naming a deleted pack. Closing that needs a lease or a
 conditional delete, which the `Bucket` trait lacks (ROADMAP "Leases"). The
 same staleness has a second, milder form: a writer paused longer than `grace`
@@ -186,6 +190,16 @@ the post-compaction pack list (the leaf cache is keyed by pack hash and trimmed
 to live packs on refresh). `a_clone_after_compaction_still_gets_signatures_transcripts_and_tombstones`
 covers a clone and a fetch across two compactions with a signed drop in between.
 
+### Rollout and permissions
+
+Upgrade pushers and `sc serve --store` instances before the first `sc remote
+compact`: a client without the pre-commit pack check can still lose a pack to
+the residual limit above. Pushers and readers need only get, put and head on
+objects, but the "absent object" cases (restart on a swept object, the pre-commit
+check) rely on a missing key answering 404. S3 answers 403 instead when the
+caller lacks `s3:ListBucket`, so grant pushers and readers list as well if you
+want the retry messages; without it they fail closed, with an opaque error.
+
 ### Command surface
 
 `sc remote compact <name> [--dry-run] [--prune-expire <dur>]` (default
@@ -205,7 +219,7 @@ operator action, not a side effect of an instance starting).
 
 ### objio
 
-The `Bucket` trait gains two methods, implemented by `DirBucket` and
+The `Bucket` trait gains three methods, implemented by `DirBucket` and
 `S3Bucket`:
 
 - `list_meta(prefix)`: keys with size and last-modified time, raw string

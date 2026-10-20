@@ -21,6 +21,9 @@ use std::time::{Duration, SystemTime};
 /// Replans after a lost manifest CAS or a concurrent compactor before giving up.
 const MAX_ATTEMPTS: u32 = 4;
 
+/// Unreferenced packs deleted between two looks at the manifest.
+const PACK_DELETE_BATCH: usize = 16;
+
 /// Decoded bytes one merge pack may hold, as a multiple of `group_bytes`
 /// (which counts compressed bytes).
 const DECODED_FACTOR: u64 = 4;
@@ -461,10 +464,29 @@ impl BucketTransport {
                     .sum::<u64>();
                 continue;
             }
-            for (hash, _) in &del_packs {
-                // idx first: a half-deleted pack is then plain debris.
-                self.bucket.delete(&format!("packs/{hash}.idx"))?;
-                self.bucket.delete(&pack_key(hash))?;
+            // The delete loop can run long (one request per object), so look at
+            // the manifest again between batches: a push that lands meanwhile
+            // may have re-used one of these old packs byte for byte.
+            for (i, batch) in del_packs.chunks(PACK_DELETE_BATCH).enumerate() {
+                if i > 0
+                    && !matches!(
+                        (&tag, self.bucket.get("manifest", tag.as_deref())?),
+                        (Some(_), Fetched::Unchanged) | (None, Fetched::Absent)
+                    )
+                {
+                    let left = del_packs.len() - i * PACK_DELETE_BATCH;
+                    rep.packs_deleted -= left;
+                    rep.notes.push(format!(
+                        "the manifest moved during pack deletion: {left} unreferenced pack(s) \
+                         kept, rerun"
+                    ));
+                    return Ok(());
+                }
+                for (hash, _) in batch {
+                    // idx first: a half-deleted pack is then plain debris.
+                    self.bucket.delete(&format!("packs/{hash}.idx"))?;
+                    self.bucket.delete(&pack_key(hash))?;
+                }
             }
             return Ok(());
         }
@@ -490,7 +512,11 @@ impl BucketTransport {
                 let Fetched::New { bytes, .. } = self.bucket.get(&m.key, None)? else {
                     continue; // deleted since the listing: no longer retained
                 };
-                named.extend(Checkpoint::decode(&capped("checkpoint", bytes)?)?.packs);
+                named.extend(
+                    Checkpoint::decode(&capped("checkpoint", bytes)?)
+                        .map_err(|e| Error::Wal(format!("{}: {e}", m.key)))?
+                        .packs,
+                );
             }
         }
         for (seq, m) in logs {
@@ -498,7 +524,11 @@ impl BucketTransport {
                 let Fetched::New { bytes, .. } = self.bucket.get(&m.key, None)? else {
                     continue;
                 };
-                named.extend(LogEntry::decode(&capped("log entry", bytes)?)?.packs);
+                named.extend(
+                    LogEntry::decode(&capped("log entry", bytes)?)
+                        .map_err(|e| Error::Wal(format!("{}: {e}", m.key)))?
+                        .packs,
+                );
             }
         }
         Ok(named)
