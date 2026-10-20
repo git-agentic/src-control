@@ -128,7 +128,10 @@ bash demo/run_demo.sh
 Run `sc --help` (and `sc <command> --help`) for the full command surface:
 merge, history editing, secrets lifecycle, sparse/partial clone, ssh/HTTP(S)/
 bucket remotes, session transcripts, and more. The annotated reference lives in
-the `sc-cli-reference` skill (`.claude/skills/sc-cli-reference/SKILL.md`).
+the `sc-cli-reference` skill (`.claude/skills/sc-cli-reference/SKILL.md`), which
+does not yet cover bucket remotes. Those take `sc remote add <name>
+sc+wal://<dir>` or `sc+s3://<bucket>/<prefix>` (see ADR-0046), and `sc serve
+--store <url>` serves a bucket from a disposable instance (`sc serve --help`).
 
 ## How Phase 1 works
 
