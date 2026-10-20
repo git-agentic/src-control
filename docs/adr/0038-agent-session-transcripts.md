@@ -199,9 +199,11 @@ over-send, whatever order the lines landed in.
   tombstone as a drop only after the checks in "Who may drop" pass, and never
   indexes a transcript whose id is already dropped, so a pack from a peer
   that still has the transcript cannot restore it, in either arrival order.
-  A tombstone that fails the checks stays an inert object and is simply
-  re-evaluated whenever it is sent again (for example after the operator
-  adds the signer to the trust list and fetches).
+  A tombstone that fails the checks stays an inert object. A fetching peer
+  re-evaluates it whenever it is sent again (for example after the operator
+  adds the signer to the trust list and fetches). `push` never re-sends an
+  object the remote already holds, so a remote that received the tombstone by
+  push before trusting the signer keeps it inert.
 - **sender:** the over-send for a transfer set includes the tombstones of its
   snapshots that have an indexed signature, with those signatures. An
   unsigned (local-only) drop is never sent. Fetching from the dropper (or a
@@ -246,11 +248,11 @@ machinery instead.
   cannot hide a transcript and gc never reclaims a body because of them.
 
 Operational consequences. A tombstone that arrives while its signer is
-untrusted is ignored and not recorded. On a fetching peer it is re-sent and
-re-evaluated next time. A push-only or served remote has no such retry: if it
-ignored the tombstone it stays ignored until the next push re-sends it, so
-configure `[signers] trusted` on a remote before the first drop is pushed to
-it. Any key under `[signers] trusted` can hide transcripts on every peer that
+untrusted is ignored and not recorded. A fetching peer retries it on its next
+fetch. A push-only or served remote has no retry: it already holds the object,
+so a later push does not send it again and nothing re-runs the check, and the
+drop stays inert there even after the signer is trusted. Configure
+`[signers] trusted` on a remote before the first drop is pushed to it. Any key under `[signers] trusted` can hide transcripts on every peer that
 trusts it, and make that peer's gc reclaim the bodies. `GetObjects` still
 serves a dropped body until gc sweeps it, and a peer that still holds the
 body re-sends it on a later transfer, which restarts its grace window. All of
