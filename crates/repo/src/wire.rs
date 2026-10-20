@@ -106,6 +106,10 @@ const EC_PROTOCOL: u8 = 4;
 /// mutating verb before any store write. See [`serve_with_policy`].
 const EC_READONLY: u8 = 5;
 pub(crate) const EC_TOO_LARGE: u8 = 6;
+/// #233: the connection's `--max-conn-bytes` write budget ran out. An
+/// older peer degrades an unknown code to `Error::Remote(msg)`, so no
+/// `PROTOCOL_VERSION` bump is needed.
+const EC_BUDGET: u8 = 7;
 const EC_OTHER: u8 = 255;
 
 /// A client request — the wire mirror of one [`crate::transport::Transport`]
@@ -616,10 +620,11 @@ pub fn err_to_wire(e: &Error) -> (u8, String) {
         Error::Protocol(_) => EC_PROTOCOL,
         Error::ReadOnly => EC_READONLY,
         Error::PackTooLarge(_) => EC_TOO_LARGE,
+        Error::ConnectionBudgetExceeded(_) => EC_BUDGET,
         _ => EC_OTHER,
     };
     let msg = match e {
-        Error::PackTooLarge(inner) => inner.clone(),
+        Error::PackTooLarge(inner) | Error::ConnectionBudgetExceeded(inner) => inner.clone(),
         _ => e.to_string(),
     };
     (code, msg)
@@ -634,6 +639,7 @@ pub fn wire_to_err(code: u8, msg: String) -> Error {
         EC_PROTOCOL => Error::Protocol(msg),
         EC_READONLY => Error::ReadOnly,
         EC_TOO_LARGE => Error::PackTooLarge(msg),
+        EC_BUDGET => Error::ConnectionBudgetExceeded(msg),
         _ => Error::Remote(msg), // EC_NOT_FOUND + EC_OTHER: typed enough as text
     }
 }
@@ -738,7 +744,7 @@ pub fn decode_refs_body(b: &[u8]) -> Result<Vec<(String, ObjectId)>> {
 }
 
 use crate::bucket_transport::BucketTransport;
-use crate::transport::{LocalTransport, TempPackGuard, Transport};
+use crate::transport::{scan_pack_tally, LocalTransport, PackTally, TempPackGuard, Transport};
 
 /// Default cap on an incoming `PutPack` spool when no operator override is
 /// configured (P31): 16 GiB. Threaded through [`WirePolicy::max_pack_size`];
@@ -752,6 +758,21 @@ pub const DEFAULT_MAX_PACK_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 /// unlike the normal `PutPack` arm, which must accept up to
 /// [`WirePolicy::max_pack_size`] because that pack might actually be used.
 pub const RO_DRAIN_CAP: u64 = 8 * 1024 * 1024;
+
+/// Default `--max-conn-bytes` for a server whose `--max-pack-size` is
+/// `max_pack_size` (#233): one maximal pack plus one maximal object
+/// ([`scl_core::max_object_size`]), so a legitimate push that fills the pack
+/// cap and adds a trailing object still fits on one connection, while the
+/// total a peer can make the server write stays finite. An unlimited
+/// (`0`) pack cap falls back to [`DEFAULT_MAX_PACK_SIZE`] for this sum.
+pub fn default_max_conn_bytes(max_pack_size: u64) -> u64 {
+    let pack = if max_pack_size == 0 {
+        DEFAULT_MAX_PACK_SIZE
+    } else {
+        max_pack_size
+    };
+    pack.saturating_add(scl_core::max_object_size() as u64)
+}
 
 /// Per-connection policy for [`serve_with_policy`] (P31): read-only gating
 /// (P29) plus the two spool caps above. `Default` matches every pre-P31
@@ -767,6 +788,14 @@ pub struct WirePolicy {
     /// Cap on how much of a read-only connection's rejected `PutPack` stream
     /// is drained before closing the connection, in bytes.
     pub ro_drain_cap: u64,
+    /// Per-connection budget over every object-write verb (`PutObject`'s
+    /// decoded length, structural objects included; per `PutPack` the larger of its
+    /// spooled bytes and the decoded bytes held: structural records on a local
+    /// store, every record on a bucket one), in bytes (#233). Exceeding it replies
+    /// [`Error::ConnectionBudgetExceeded`] and closes the connection. `0`
+    /// means unlimited (embedders and tests; `sc serve` refuses it). Reads
+    /// are not budgeted.
+    pub max_conn_bytes: u64,
 }
 
 impl Default for WirePolicy {
@@ -775,6 +804,81 @@ impl Default for WirePolicy {
             read_only: false,
             max_pack_size: DEFAULT_MAX_PACK_SIZE,
             ro_drain_cap: RO_DRAIN_CAP,
+            max_conn_bytes: default_max_conn_bytes(DEFAULT_MAX_PACK_SIZE),
+        }
+    }
+}
+
+/// Validate an operator-supplied `--max-conn-bytes`. Zero is refused (there
+/// is no unlimited setting from `sc serve`; `0` in [`WirePolicy`] or
+/// `ServeLimits` is for embedders and tests); a budget below the object cap could never admit one
+/// object, and one below a nonzero `max_pack_size` would silently lower the
+/// pack cap, so all three are refused at startup rather than clamped.
+pub fn validate_max_conn_bytes(budget: u64, max_pack_size: u64, object_cap: usize) -> Result<()> {
+    if budget == 0 {
+        return Err(Error::InvalidArgument(
+            "--max-conn-bytes must be greater than zero".into(),
+        ));
+    }
+    if budget < object_cap as u64 {
+        return Err(Error::InvalidArgument(format!(
+            "--max-conn-bytes {budget} is below the max object size ({object_cap}); a budget that cannot fit one object is a misconfiguration"
+        )));
+    }
+    if max_pack_size != 0 && budget < max_pack_size {
+        return Err(Error::InvalidArgument(format!(
+            "--max-conn-bytes {budget} is below --max-pack-size ({max_pack_size}); a budget below the pack cap is a misconfiguration (a pack is charged by its decoded size, which can still exceed the budget)"
+        )));
+    }
+    Ok(())
+}
+
+/// Admit a `PutObject` body of `len` bytes under object cap `cap`: `Err` is a
+/// budget refusal (close the connection), `Ok(Some(e))` an over-cap reply that
+/// keeps the session open, `Ok(None)` admitted. The bytes are charged first,
+/// so a frame that passes the frame limit but not the cap (it may exceed the
+/// cap by `FRAME_OVERHEAD - 37`) still uses up the budget.
+fn gate_put_object(budget: &mut ConnBudget, len: usize, cap: usize) -> Result<Option<Error>> {
+    budget.charge(len as u64)?;
+    Ok(check_object_len(len, cap).err())
+}
+
+/// Running count of bytes a connection has made the server write (#233).
+struct ConnBudget {
+    limit: u64,
+    used: u64,
+}
+
+impl ConnBudget {
+    fn refusal(&self) -> Error {
+        Error::ConnectionBudgetExceeded(format!(
+            "server cap is {} bytes of writes per connection; raise --max-conn-bytes on the server or split the push across connections",
+            self.limit
+        ))
+    }
+
+    /// Account `n` incoming bytes, refusing before they are written when the
+    /// budget would be exceeded. Attempts count, accepted or not.
+    fn charge(&mut self, n: u64) -> Result<()> {
+        self.used = self.used.saturating_add(n);
+        if self.limit != 0 && self.used > self.limit {
+            return Err(self.refusal());
+        }
+        Ok(())
+    }
+
+    /// Spool cap for the next pack: `max_pack_size` tightened to what is left
+    /// of the budget, and whether the budget is the binding one.
+    fn pack_cap(&self, max_pack_size: u64) -> (u64, bool) {
+        if self.limit == 0 {
+            return (max_pack_size, false);
+        }
+        // `max(1)`: a cap of 0 would mean unlimited to the spool reader.
+        let left = self.limit.saturating_sub(self.used).max(1);
+        if max_pack_size == 0 || left < max_pack_size {
+            (left, true)
+        } else {
+            (max_pack_size, false)
         }
     }
 }
@@ -1033,6 +1137,10 @@ fn serve_session(
     w: &mut impl Write,
     policy: WirePolicy,
 ) -> Result<()> {
+    let mut budget = ConnBudget {
+        limit: policy.max_conn_bytes,
+        used: 0,
+    };
     loop {
         let frame = match read_frame_opt(r)? {
             Some(f) => f,
@@ -1070,7 +1178,7 @@ fn serve_session(
                     // push is discarded regardless, so there's no reason to
                     // spool an attacker-sized pack just to reject it.
                     match spill_pack_stream(r, &transport.tmp_dir(), policy.ro_drain_cap) {
-                        Ok(guard) => {
+                        Ok((guard, _)) => {
                             drop(guard);
                             let (code, msg) = err_to_wire(&Error::ReadOnly);
                             write_err(w, code, &msg)?;
@@ -1162,16 +1270,46 @@ fn serve_session(
                 }
             }
             Request::PutPack => {
-                match spill_pack_stream(r, &transport.tmp_dir(), policy.max_pack_size) {
-                    Ok(guard) => {
+                let (cap, by_budget) = budget.pack_cap(policy.max_pack_size);
+                match spill_pack_stream(r, &transport.tmp_dir(), cap) {
+                    Ok((guard, spooled)) => {
+                        // A pack costs max(spool bytes, decoded bytes the
+                        // receiver holds), not their sum: the spool is the
+                        // compressed form of the same records. The decoded
+                        // tally (structural records on a local store, every
+                        // record on a bucket one) is checked against the
+                        // whole remaining budget before any store write.
+                        let left = budget.limit.saturating_sub(budget.used);
+                        if budget.limit != 0 && spooled > left {
+                            let (code, msg) = err_to_wire(&budget.refusal());
+                            let _ = write_err(w, code, &msg);
+                            return Ok(());
+                        }
+                        let mut tally = PackTally {
+                            limit: (budget.limit != 0).then_some(left),
+                            count_blobs: matches!(transport, ServeTransport::Bucket { .. }),
+                            seen: 0,
+                        };
                         let ingest_result = match &transport {
-                            ServeTransport::Local(t) => t.ingest_from(guard.path()),
+                            ServeTransport::Local(t) => {
+                                t.ingest_from_tallied(guard.path(), &mut tally)
+                            }
                             ServeTransport::Bucket { transport: bt, .. } => {
-                                bucket_put_pack_from_file(bt, guard.path())
+                                scan_pack_tally(guard.path(), &mut tally)
+                                    .and_then(|()| bucket_put_pack_from_file(bt, guard.path()))
                             }
                         };
+                        // Charge before inspecting the result: an error after
+                        // pass 2 began (e.g. an index write) can leave records
+                        // stored, and the connection stays open.
+                        budget.used = budget.used.saturating_add(spooled.max(tally.seen));
                         match ingest_result {
                             Ok(ids) => write_ok(w, &ids_body(&ids))?,
+                            Err(Error::ConnectionBudgetExceeded(_)) => {
+                                let (code, msg) = err_to_wire(&budget.refusal());
+                                let _ = write_err(w, code, &msg);
+                                return Ok(());
+                            }
                             Err(e) => {
                                 let (code, msg) = err_to_wire(&e);
                                 write_err(w, code, &msg)?;
@@ -1187,10 +1325,50 @@ fn serve_session(
                         // nor a subsequent request. A best-effort reply is
                         // the most we can do; then close the connection
                         // rather than serve further requests off a
-                        // desynced stream.
+                        // desynced stream. When the remaining connection
+                        // budget was the binding cap, say so (#233).
+                        let over_cap = matches!(e, Error::PackTooLarge(_));
+                        let e = match e {
+                            Error::PackTooLarge(_) if by_budget => budget.refusal(),
+                            e => e,
+                        };
+                        let (code, msg) = err_to_wire(&e);
+                        let _ = write_err(w, code, &msg);
+                        if over_cap {
+                            // The stream was well-formed, just too big. Closing
+                            // with unread bytes makes the OS reset the socket
+                            // and can destroy the reply above, so drain a
+                            // bounded amount first (best-effort). Reuses the
+                            // read-only drain cap: same job, same bound.
+                            let _ = read_pack_stream(r, &mut std::io::sink(), policy.ro_drain_cap);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            Request::PutObject { id, bytes } => {
+                // Distinct structural objects report `blob_size` 0, so the
+                // budget counts the encoded length every time (#233).
+                match gate_put_object(&mut budget, bytes.len(), scl_core::max_object_size()) {
+                    Err(e) => {
+                        // Refuse before the store write, then close: a peer
+                        // that exhausted its budget gets no further requests.
                         let (code, msg) = err_to_wire(&e);
                         let _ = write_err(w, code, &msg);
                         return Ok(());
+                    }
+                    Ok(Some(e)) => {
+                        let (code, msg) = err_to_wire(&e);
+                        write_err(w, code, &msg)?;
+                        continue;
+                    }
+                    Ok(None) => {}
+                }
+                match transport.as_transport().put_object(&id, &bytes) {
+                    Ok(()) => write_ok(w, &[])?,
+                    Err(e) => {
+                        let (code, msg) = err_to_wire(&e);
+                        write_err(w, code, &msg)?;
                     }
                 }
             }
@@ -1210,14 +1388,6 @@ fn serve_session(
                         transport.as_transport().has_object(&id).map(bool_body)
                     }
                     Request::GetObject(id) => transport.as_transport().get_object(&id),
-                    Request::PutObject { id, bytes } => {
-                        check_object_len(bytes.len(), scl_core::max_object_size()).and_then(|()| {
-                            transport
-                                .as_transport()
-                                .put_object(&id, &bytes)
-                                .map(|()| Vec::new())
-                        })
-                    }
                     Request::UpdateRef {
                         branch,
                         id,
@@ -1229,6 +1399,7 @@ fn serve_session(
                     Request::Bye
                     | Request::GetPack { .. }
                     | Request::PutPack
+                    | Request::PutObject { .. }
                     | Request::GetObjects { .. } => {
                         unreachable!("handled above")
                     }
@@ -1266,11 +1437,11 @@ fn spill_pack_stream(
     r: &mut impl Read,
     tmp_dir: &std::path::Path,
     max_bytes: u64,
-) -> Result<TempPackGuard> {
+) -> Result<(TempPackGuard, u64)> {
     let guard = TempPackGuard::new_in(tmp_dir)?;
     let mut f = std::fs::File::create(guard.path())?;
-    read_pack_stream(r, &mut f, max_bytes)?;
-    Ok(guard)
+    let n = read_pack_stream(r, &mut f, max_bytes)?;
+    Ok((guard, n))
 }
 
 #[cfg(test)]
@@ -1999,6 +2170,7 @@ mod tests {
             read_only: false,
             max_pack_size: 4096,
             ro_drain_cap: RO_DRAIN_CAP,
+            max_conn_bytes: 0,
         };
         serve_with_policy(&root, &mut reader, &mut output, policy).unwrap();
 
@@ -2084,6 +2256,7 @@ mod tests {
             read_only: true,
             max_pack_size: 0,
             ro_drain_cap: 4096,
+            max_conn_bytes: 0,
         };
         serve_with_policy(&root, &mut reader, &mut output, policy).unwrap();
 
@@ -2171,6 +2344,7 @@ mod tests {
                 read_only: true,
                 max_pack_size,
                 ro_drain_cap: 4096,
+                max_conn_bytes: 0,
             };
             serve_with_policy(&root, &mut std::io::Cursor::new(input), &mut output, policy)
                 .unwrap();
@@ -2194,6 +2368,505 @@ mod tests {
         let head = parse_response(read_frame_opt(&mut rest).unwrap().unwrap()).unwrap();
         assert_eq!(decode_str_body(&head).unwrap(), "main");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A distinct tree whose encoding is ~`len` bytes (one long entry name):
+    /// structural, so its `blob_size` is 0 and only its encoded length counts.
+    fn big_tree(seed: u8, len: usize) -> (ObjectId, Vec<u8>) {
+        use scl_core::object::{EntryKind, FileMode, Tree, TreeEntry};
+        let name = format!("{seed:03}{}", "n".repeat(len));
+        let obj = scl_core::Object::Tree(Tree::new(vec![TreeEntry {
+            name,
+            kind: EntryKind::Blob,
+            id: some_id(seed),
+            mode: FileMode::FILE,
+            perms: 0,
+        }]));
+        assert_eq!(obj.blob_size(), 0);
+        (obj.id(), obj.encode())
+    }
+
+    /// Run `reqs` (and any raw `PutPack` streams, keyed by request position)
+    /// through `serve_with_policy` after a HELLO; returns the reply frames
+    /// after the hello reply.
+    fn run_budget_session(
+        root: &std::path::Path,
+        policy: WirePolicy,
+        reqs: &[(Request, Option<Vec<u8>>)],
+    ) -> Vec<Result<Vec<u8>>> {
+        let mut input = Vec::new();
+        let hello = Request::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        write_frame(&mut input, &hello.encode()).unwrap();
+        for (req, pack) in reqs {
+            write_frame(&mut input, &req.encode()).unwrap();
+            if let Some(pack) = pack {
+                write_pack_stream(&mut input, &mut std::io::Cursor::new(pack), 1024).unwrap();
+            }
+        }
+        let mut output = Vec::new();
+        serve_with_policy(root, &mut std::io::Cursor::new(input), &mut output, policy).unwrap();
+        let mut r = std::io::Cursor::new(output);
+        let mut frames = Vec::new();
+        while let Some(f) = read_frame_opt(&mut r).unwrap() {
+            frames.push(parse_response(f));
+        }
+        assert!(frames.remove(0).is_ok(), "hello");
+        frames
+    }
+
+    fn put_tree(seed: u8, len: usize) -> (Request, Option<Vec<u8>>) {
+        let (id, bytes) = big_tree(seed, len);
+        (Request::PutObject { id, bytes }, None)
+    }
+
+    fn put_pack_of(seed: u8, len: usize) -> (Request, Option<Vec<u8>>) {
+        let (id, bytes) = big_tree(seed, len);
+        let (pack, _idx) = scl_core::pack::build_pack(&[(id, bytes)]).unwrap();
+        (Request::PutPack, Some(pack))
+    }
+
+    fn no_spool_residue(root: &std::path::Path) {
+        let tmp = root.join(".sc").join("tmp");
+        assert!(!tmp.exists() || std::fs::read_dir(&tmp).unwrap().next().is_none());
+    }
+
+    /// #233: repeated near-cap `PutObject` of distinct structural objects is
+    /// refused once the connection budget is spent, before the store write;
+    /// the connection then closes; a fresh connection starts at zero.
+    #[test]
+    fn put_object_budget_refuses_structural_floods_and_closes() {
+        let root = tmp_repo("budget-obj");
+        let policy = WirePolicy {
+            max_conn_bytes: 2_500_000,
+            ..Default::default()
+        };
+        let reqs = [
+            put_tree(1, 1_000_000),
+            put_tree(2, 1_000_000),
+            put_tree(3, 1_000_000),
+            (Request::HeadBranch, None), // must never be answered
+        ];
+        let frames = run_budget_session(&root, policy, &reqs);
+        assert_eq!(
+            frames.len(),
+            3,
+            "two ok, one refusal, then closed: {frames:?}"
+        );
+        assert!(frames[0].is_ok() && frames[1].is_ok());
+        assert!(matches!(
+            frames[2].as_ref().unwrap_err(),
+            Error::ConnectionBudgetExceeded(m) if m.contains("--max-conn-bytes")
+        ));
+        let t = crate::transport::LocalTransport::open(&root).unwrap();
+        assert!(t.has_object(&big_tree(2, 1_000_000).0).unwrap());
+        assert!(
+            !t.has_object(&big_tree(3, 1_000_000).0).unwrap(),
+            "the refused object never reached the store"
+        );
+
+        // The budget is per connection: a new session accepts the next object.
+        let frames = run_budget_session(&root, policy, &[put_tree(4, 1_000_000)]);
+        assert!(frames[0].is_ok(), "{frames:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// A legitimate single push under the default budget (one pack plus an
+    /// object) is untouched, and a policy of `0` (embedders only) is unlimited.
+    #[test]
+    fn legit_push_under_default_budget_and_zero_opt_out() {
+        let root = tmp_repo("budget-ok");
+        let frames = run_budget_session(
+            &root,
+            WirePolicy::default(),
+            &[put_pack_of(10, 1_500_000), put_tree(11, 1_500_000)],
+        );
+        assert!(frames.iter().all(|f| f.is_ok()), "{frames:?}");
+
+        let policy = WirePolicy {
+            max_conn_bytes: 0,
+            ..Default::default()
+        };
+        let reqs: Vec<_> = (20..24).map(|i| put_tree(i, 500_000)).collect();
+        let frames = run_budget_session(&root, policy, &reqs);
+        assert_eq!(frames.len(), 4);
+        assert!(frames.iter().all(|f| f.is_ok()), "{frames:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// Objects and packs draw on one budget. A pack of compressible structural
+    /// records is charged by its encoded size (the spool is tiny), so the
+    /// third request is refused by the structural tally, before ingest: the
+    /// connection closes, nothing from the refused pack lands, no spool
+    /// residue is left.
+    #[test]
+    fn put_pack_structural_bytes_share_the_budget() {
+        let root = tmp_repo("budget-pack");
+        let policy = WirePolicy {
+            max_pack_size: 0,
+            max_conn_bytes: 1_500_000,
+            ..Default::default()
+        };
+        // 500k (pack) + 500k (object) leaves 500k; the 800k pack does not fit.
+        let frames = run_budget_session(
+            &root,
+            policy,
+            &[
+                put_pack_of(30, 500_000),
+                put_tree(31, 500_000),
+                put_pack_of(32, 800_000),
+                (Request::HeadBranch, None), // must never be answered
+            ],
+        );
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert!(frames[0].is_ok() && frames[1].is_ok());
+        assert!(matches!(
+            frames[2].as_ref().unwrap_err(),
+            Error::ConnectionBudgetExceeded(_)
+        ));
+        let t = crate::transport::LocalTransport::open(&root).unwrap();
+        assert!(!t.has_object(&big_tree(32, 800_000).0).unwrap());
+        no_spool_residue(&root);
+
+        // Same for a pack after a large object: 3M + 2M > 4M.
+        let policy = WirePolicy {
+            max_pack_size: 4_000_000,
+            max_conn_bytes: 4_000_000,
+            ..Default::default()
+        };
+        let frames = run_budget_session(
+            &root,
+            policy,
+            &[put_tree(33, 3_000_000), put_pack_of(34, 2_000_000)],
+        );
+        assert!(frames[0].is_ok());
+        assert!(matches!(
+            frames[1].as_ref().unwrap_err(),
+            Error::ConnectionBudgetExceeded(_)
+        ));
+        no_spool_residue(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// Incompressible noise as one blob pack: the spool is the full size and
+    /// the structural tally sees nothing, so only the spool cutoff can trip.
+    fn put_blob_pack(seed: u8, len: usize) -> (Request, Option<Vec<u8>>) {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ u64::from(seed);
+        let noise: Vec<u8> = (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let obj = scl_core::Object::blob(noise);
+        let (pack, _) = scl_core::pack::build_pack(&[(obj.id(), obj.encode())]).unwrap();
+        (Request::PutPack, Some(pack))
+    }
+
+    /// The spool cutoff: a pack whose bytes outrun what is left of the budget
+    /// is stopped mid-stream and reported as a budget refusal (not a
+    /// pack-size one), leaves no spool residue and closes the connection. With
+    /// no remaining budget conflict a same-size pack passes.
+    #[test]
+    fn pack_spool_cutoff_is_a_budget_refusal() {
+        let root = tmp_repo("budget-spool");
+        let policy = WirePolicy {
+            max_pack_size: 0,
+            max_conn_bytes: 1_000_000,
+            ..Default::default()
+        };
+        let frames = run_budget_session(
+            &root,
+            policy,
+            &[
+                put_tree(35, 400_000),
+                put_blob_pack(36, 700_000), // 400k used, ~700k spool > 600k left
+                (Request::HeadBranch, None), // must never be answered
+            ],
+        );
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert!(frames[0].is_ok());
+        assert!(
+            matches!(
+                frames[1].as_ref().unwrap_err(),
+                Error::ConnectionBudgetExceeded(_)
+            ),
+            "a budget cutoff, not PackTooLarge: {frames:?}"
+        );
+        no_spool_residue(&root);
+
+        // The same blob pack alone fits.
+        let frames = run_budget_session(&root, policy, &[put_blob_pack(36, 700_000)]);
+        assert!(frames[0].is_ok(), "{frames:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// An over-cap `PutObject` body (the frame limit leaves it room) is
+    /// answered with a protocol error and the session stays open, but its bytes
+    /// are charged, so repeating it cannot run for free.
+    #[test]
+    fn oversized_put_object_attempts_are_charged() {
+        let mut budget = ConnBudget {
+            limit: 100,
+            used: 0,
+        };
+        for _ in 0..9 {
+            let e = gate_put_object(&mut budget, 11, 10).unwrap();
+            assert!(matches!(e, Some(Error::Protocol(_))));
+        }
+        assert_eq!(budget.used, 99);
+        assert!(matches!(
+            gate_put_object(&mut budget, 11, 10),
+            Err(Error::ConnectionBudgetExceeded(_))
+        ));
+        assert!(gate_put_object(
+            &mut ConnBudget {
+                limit: 100,
+                used: 0
+            },
+            10,
+            10
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// The spool half of the max charge: an incompressible blob pack has no
+    /// structural bytes, so only its spooled size can use up the budget for
+    /// the request that follows (charging the tally alone would pass this).
+    #[test]
+    fn spool_bytes_of_a_pack_count_toward_later_requests() {
+        let root = tmp_repo("budget-spool-count");
+        let policy = WirePolicy {
+            max_pack_size: 0,
+            max_conn_bytes: 1 << 20,
+            ..Default::default()
+        };
+        let frames = run_budget_session(
+            &root,
+            policy,
+            &[put_blob_pack(37, 600_000), put_tree(38, 500_000)],
+        );
+        assert!(frames[0].is_ok(), "{frames:?}");
+        assert!(
+            matches!(
+                frames[1].as_ref().unwrap_err(),
+                Error::ConnectionBudgetExceeded(_)
+            ),
+            "{frames:?}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// Trees of random ids and names: zstd barely shrinks them, so the pack's
+    /// spool size is close to its structural bytes.
+    fn noisy_tree_pack(seed: u64, entries: usize) -> (Vec<u8>, u64, ObjectId) {
+        use scl_core::object::{EntryKind, FileMode, Tree, TreeEntry};
+        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ seed;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let list = (0..entries)
+            .map(|_| {
+                let mut id = [0u8; 32];
+                id.chunks_mut(8)
+                    .for_each(|c| c.copy_from_slice(&next().to_le_bytes()));
+                TreeEntry {
+                    name: format!("{:016x}", next()),
+                    kind: EntryKind::Blob,
+                    id: ObjectId::from_bytes(id),
+                    mode: FileMode::FILE,
+                    perms: 0,
+                }
+            })
+            .collect();
+        let obj = scl_core::Object::Tree(Tree::new(list));
+        let encoded = obj.encode();
+        let structural = encoded.len() as u64;
+        let (pack, _) = scl_core::pack::build_pack(&[(obj.id(), encoded)]).unwrap();
+        (pack, structural, obj.id())
+    }
+
+    /// B1: a pack is charged max(spool, structural), not their sum. A pack of
+    /// near-incompressible structural records fits a budget equal to its
+    /// largest cost and to `--max-pack-size`; one byte less is refused. (The
+    /// sum would refuse the exact case: the startup bounds promise that one
+    /// maximal pack fits.)
+    #[test]
+    fn pack_cost_is_the_larger_of_spool_and_structural_bytes() {
+        let root = tmp_repo("budget-max");
+        let (pack, structural, id) = noisy_tree_pack(7, 20_000);
+        let cost = structural.max(pack.len() as u64);
+        assert!(
+            pack.len() as u64 * 10 > structural * 6,
+            "premise: records are not very compressible ({} vs {structural})",
+            pack.len()
+        );
+        let put = |cap: u64| {
+            run_budget_session(
+                &root,
+                WirePolicy {
+                    max_pack_size: cap,
+                    max_conn_bytes: cap,
+                    ..Default::default()
+                },
+                &[(Request::PutPack, Some(pack.clone()))],
+            )
+        };
+        let frames = put(cost);
+        assert!(frames[0].is_ok(), "exact cost fits: {frames:?}");
+        let t = crate::transport::LocalTransport::open(&root).unwrap();
+        assert!(t.has_object(&id).unwrap());
+
+        let (pack2, _, id2) = noisy_tree_pack(8, 20_000);
+        let frames = run_budget_session(
+            &root,
+            WirePolicy {
+                max_pack_size: cost - 1,
+                max_conn_bytes: cost - 1,
+                ..Default::default()
+            },
+            &[(Request::PutPack, Some(pack2.clone()))],
+        );
+        assert!(
+            matches!(
+                frames[0].as_ref().unwrap_err(),
+                Error::ConnectionBudgetExceeded(_)
+            ),
+            "{frames:?}"
+        );
+        assert!(!t.has_object(&id2).unwrap(), "refused before any write");
+        no_spool_residue(&root);
+
+        // The default policy admits it too.
+        let frames = run_budget_session(
+            &root,
+            WirePolicy::default(),
+            &[(Request::PutPack, Some(pack2))],
+        );
+        assert!(frames[0].is_ok(), "{frames:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// The budget is exact: a total equal to it is accepted, one byte more is
+    /// refused, and the refused object never lands.
+    #[test]
+    fn put_object_budget_boundary_is_exact() {
+        let root = tmp_repo("budget-edge");
+        let (_, a) = big_tree(40, 1000);
+        let (_, b) = big_tree(41, 1000);
+        let total = (a.len() + b.len()) as u64;
+        let at = WirePolicy {
+            max_conn_bytes: total,
+            ..Default::default()
+        };
+        let frames = run_budget_session(&root, at, &[put_tree(40, 1000), put_tree(41, 1000)]);
+        assert!(frames.iter().all(|f| f.is_ok()), "exact: {frames:?}");
+
+        let under = WirePolicy {
+            max_conn_bytes: total - 1,
+            ..Default::default()
+        };
+        let frames = run_budget_session(&root, under, &[put_tree(42, 1000), put_tree(43, 1000)]);
+        assert!(frames[0].is_ok());
+        assert!(matches!(
+            frames[1].as_ref().unwrap_err(),
+            Error::ConnectionBudgetExceeded(_)
+        ));
+        let t = crate::transport::LocalTransport::open(&root).unwrap();
+        assert!(!t.has_object(&big_tree(43, 1000).0).unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// Structural records inside a pack are retained resident, so their
+    /// encoded size is budgeted even when zstd makes the spooled pack tiny;
+    /// the over-budget pack is refused before any record lands.
+    #[test]
+    fn highly_compressible_structural_pack_is_budgeted_by_encoded_size() {
+        let root = tmp_repo("budget-zip");
+        let (id, _) = big_tree(50, 3_000_000);
+        let (pack, _) = scl_core::pack::build_pack(&[(id, big_tree(50, 3_000_000).1)]).unwrap();
+        assert!(pack.len() < 100_000, "premise: the pack compresses well");
+        let policy = WirePolicy {
+            max_conn_bytes: 2_000_000,
+            ..Default::default()
+        };
+        let frames = run_budget_session(&root, policy, &[(Request::PutPack, Some(pack))]);
+        assert!(matches!(
+            frames[0].as_ref().unwrap_err(),
+            Error::ConnectionBudgetExceeded(_)
+        ));
+        let t = crate::transport::LocalTransport::open(&root).unwrap();
+        assert!(!t.has_object(&id).unwrap());
+        no_spool_residue(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// A read-only listener answers `ReadOnly` and never touches the budget:
+    /// reads and rejected writes are unaffected even by a tiny one.
+    #[test]
+    fn read_only_listener_ignores_the_budget() {
+        let root = tmp_repo("budget-ro");
+        let policy = WirePolicy {
+            read_only: true,
+            max_conn_bytes: 1,
+            ..Default::default()
+        };
+        let frames = run_budget_session(
+            &root,
+            policy,
+            &[
+                put_tree(60, 1000),
+                put_tree(61, 1000),
+                (Request::HeadBranch, None),
+            ],
+        );
+        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert!(matches!(frames[0].as_ref().unwrap_err(), Error::ReadOnly));
+        assert!(matches!(frames[1].as_ref().unwrap_err(), Error::ReadOnly));
+        assert!(!matches!(
+            frames[2].as_ref().err(),
+            Some(Error::ConnectionBudgetExceeded(_))
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn connection_budget_error_round_trips_and_flag_bounds() {
+        let e = Error::ConnectionBudgetExceeded("cap is 7".into());
+        let (code, msg) = err_to_wire(&e);
+        assert_eq!(code, EC_BUDGET);
+        assert!(matches!(
+            wire_to_err(code, msg),
+            Error::ConnectionBudgetExceeded(m) if m == "cap is 7"
+        ));
+
+        let obj = 4 << 20;
+        assert!(validate_max_conn_bytes(0, 100, obj).is_err());
+        assert!(validate_max_conn_bytes(obj as u64 - 1, 0, obj).is_err());
+        assert!(validate_max_conn_bytes(obj as u64, 0, obj).is_ok());
+        assert!(validate_max_conn_bytes(10 << 20, 20 << 20, obj).is_err());
+        assert!(validate_max_conn_bytes(20 << 20, 20 << 20, obj).is_ok());
+        assert_eq!(
+            default_max_conn_bytes(0),
+            default_max_conn_bytes(DEFAULT_MAX_PACK_SIZE)
+        );
+        assert!(default_max_conn_bytes(1 << 30) > 1 << 30);
     }
 
     /// Mint a one-commit object set the same way
@@ -2310,6 +2983,48 @@ mod tests {
         std::fs::remove_dir_all(&broot).unwrap();
         std::fs::remove_dir_all(&home).unwrap();
         assert!(!broot.exists());
+    }
+
+    /// A bucket-backed receiver decodes every record (blobs too) into memory
+    /// before upload, so the budget counts all of them: a highly compressible
+    /// blob pack is cheap to spool but refused by decoded size (#233).
+    #[test]
+    fn bucket_serve_budgets_decoded_blob_bytes() {
+        let broot =
+            std::env::temp_dir().join(format!("scl-wire-bucket-bud-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broot);
+        let url = format!("sc+wal://{}", broot.display());
+        let home = tmp_repo("bucket-budget-home");
+        let (client_read, mut server_write) = std::io::pipe().unwrap();
+        let (mut server_read, client_write) = std::io::pipe().unwrap();
+        let (url2, home2) = (url.clone(), home.clone());
+        let srv = std::thread::spawn(move || {
+            serve_bucket_with_policy(
+                &url2,
+                &home2,
+                &mut server_read,
+                &mut server_write,
+                WirePolicy {
+                    max_conn_bytes: 2_000_000,
+                    ..Default::default()
+                },
+            )
+        });
+        let client =
+            crate::stdio_transport::WireClient::handshake(client_read, client_write).unwrap();
+        let blob = scl_core::Object::blob(vec![0u8; 3_000_000]);
+        let (pack, _) = scl_core::pack::build_pack(&[(blob.id(), blob.encode())]).unwrap();
+        assert!(pack.len() < 100_000, "premise: the pack compresses well");
+        let err = client
+            .put_pack(&mut std::io::Cursor::new(pack))
+            .unwrap_err();
+        assert!(matches!(err, Error::ConnectionBudgetExceeded(_)), "{err:?}");
+        drop(client);
+        srv.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&broot).unwrap();
+        assert!(!broot.exists());
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(!home.exists());
     }
 
     /// A bucket-backed serve session refuses `GetObjects` (by-id reads exist

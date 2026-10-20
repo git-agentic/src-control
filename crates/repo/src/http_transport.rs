@@ -836,6 +836,10 @@ pub struct ServeLimits {
     /// Forwarded to [`crate::wire::WirePolicy::max_pack_size`]. `0` =
     /// unlimited.
     pub max_pack_size: u64,
+    /// Forwarded to [`crate::wire::WirePolicy::max_conn_bytes`] (#233).
+    /// The CLI refuses `0`. The default is
+    /// [`crate::wire::default_max_conn_bytes`] of the default pack cap.
+    pub max_conn_bytes: u64,
 }
 impl Default for ServeLimits {
     fn default() -> Self {
@@ -843,6 +847,7 @@ impl Default for ServeLimits {
             max_connections: 32,
             timeout_secs: 300,
             max_pack_size: crate::wire::DEFAULT_MAX_PACK_SIZE,
+            max_conn_bytes: crate::wire::default_max_conn_bytes(crate::wire::DEFAULT_MAX_PACK_SIZE),
         }
     }
 }
@@ -872,6 +877,13 @@ fn is_loopback_host(host: &str) -> bool {
     }
 }
 
+/// Does the `host:port` listen address bind loopback only? (Used by the CLI's
+/// default-budget startup warning, #233.)
+pub fn addr_is_loopback(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    is_loopback_host(host.trim_start_matches('[').trim_end_matches(']'))
+}
+
 /// The fail-closed bind decision (P29, tightened by P32/ADR-0042): a
 /// non-loopback `addr` is allowed only if justified by `--read-only`,
 /// `--allow-public`, or — once TLS is available — `--tls` plus ≥1 configured
@@ -887,10 +899,7 @@ fn bind_is_allowed(
     allow_public: bool,
     tls: bool,
 ) -> Result<bool> {
-    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-    // Strip optional [..] brackets around an IPv6 literal.
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if is_loopback_host(host) {
+    if addr_is_loopback(addr) {
         return Ok(true);
     }
     if read_only || allow_public {
@@ -1019,6 +1028,14 @@ pub fn serve_http(
     store: Option<&str>,
 ) -> Result<()> {
     crate::wire::validate_max_pack_size(limits.max_pack_size, scl_core::max_object_size())?;
+    // `0` is the embedder opt-out (unlimited); the CLI refuses it before here.
+    if limits.max_conn_bytes != 0 {
+        crate::wire::validate_max_conn_bytes(
+            limits.max_conn_bytes,
+            limits.max_pack_size,
+            scl_core::max_object_size(),
+        )?;
+    }
     let tls_config = resolve_tls(root, &tls)?;
     if !bind_is_allowed(addr, root, read_only, allow_public, tls_config.is_some())? {
         return Err(Error::InvalidArgument(format!(
@@ -1350,6 +1367,7 @@ fn handle_http_connection(
         read_only,
         max_pack_size: limits.max_pack_size,
         ro_drain_cap: crate::wire::RO_DRAIN_CAP,
+        max_conn_bytes: limits.max_conn_bytes,
     };
     match store {
         Some(url) => {
