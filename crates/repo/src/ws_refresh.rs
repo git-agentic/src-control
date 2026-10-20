@@ -271,6 +271,9 @@ fn apply_plan(
     for (p, blob, perms) in &job.plan.removals {
         injected_failure()?;
         let full = safe_join(&job.dir, p)?;
+        if under_symlink(&job.dir, p) {
+            return Err(changed_since_read(p));
+        }
         check_prior(&full, p, Some((*blob, *perms)), None, &job.cache)?;
         *done += 1; // from here on the checkout may differ from the old state
         match std::fs::remove_file(&full) {
@@ -286,6 +289,11 @@ fn apply_plan(
             continue;
         };
         let protected = perms & PROTECTED != 0;
+        // A parent swapped for a symlink since the plan would send the write out
+        // of the workspace.
+        if under_symlink(&job.dir, p) {
+            return Err(changed_since_read(p));
+        }
         check_prior(&full, p, *prior, (!protected).then_some(*blob), &job.cache)?;
         *done += 1; // from here on the checkout may differ from the old state
         clear_dir_obstruction(&full, p)?;
@@ -1014,6 +1022,33 @@ mod tests {
             .unwrap()
             .pending_refresh
             .is_some());
+        cleanup(repo, &root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_swapped_for_a_symlink_after_the_plan_is_not_followed() {
+        let root = tmp_root("symlink");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/f"), "f\n").unwrap();
+        repo.commit("t", "base").unwrap();
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        let outside = tmp_root("symlink-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        host_commit(&repo, &root, &[("sub/new", Some("new\n"))]);
+        let (d, o) = (dir.clone(), outside.clone());
+        BEFORE_APPLY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_dir_all(d.join("sub")).unwrap();
+                std::os::unix::fs::symlink(&o, d.join("sub")).unwrap();
+            }))
+        });
+        let _reset = HookGuard;
+        repo.ws_refresh(None, None, None).unwrap_err();
+        assert!(!outside.join("new").exists(), "nothing written outside");
+        std::fs::remove_dir_all(&outside).unwrap();
         cleanup(repo, &root);
     }
 
