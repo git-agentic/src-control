@@ -361,7 +361,7 @@ enum Cmd {
         #[arg(long)]
         max_pack_size: Option<u64>,
         /// Largest single object accepted from a peer: bytes, or a number
-        /// with a KiB/MiB/GiB suffix. Default 256MiB, range 1MiB to 1GiB;
+        /// with a KiB/MiB/GiB suffix. Default 256MiB, range 2MiB to 1GiB;
         /// out-of-range values are refused at startup, never clamped. Clients
         /// set the same limit with `SC_MAX_OBJECT_SIZE`; both ends must
         /// agree, since a larger object fails at the receiver. (#213)
@@ -935,11 +935,14 @@ struct DemoArgs {
 }
 
 /// Fix the process-wide object cap before any command runs: `sc serve
-/// --max-object-size` wins over `SC_MAX_OBJECT_SIZE`, which wins over the
+/// --max-object-size` wins over `SC_MAX_OBJECT_SIZE` (empty = unset), which wins over the
 /// default. An out-of-range or unparsable value aborts startup (#213).
 fn init_max_object_size(flag: Option<&str>) -> Result<()> {
     let (src, raw) = match (flag, std::env::var("SC_MAX_OBJECT_SIZE")) {
         (Some(f), _) => ("--max-object-size", f.to_string()),
+        // An empty variable (`SC_MAX_OBJECT_SIZE=`) means unset, so exporting
+        // it blank in a profile does not abort every command.
+        (None, Ok(e)) if e.trim().is_empty() => return Ok(()),
         (None, Ok(e)) => ("SC_MAX_OBJECT_SIZE", e),
         (None, Err(std::env::VarError::NotPresent)) => return Ok(()),
         (None, Err(e)) => anyhow::bail!("SC_MAX_OBJECT_SIZE: {e}"),

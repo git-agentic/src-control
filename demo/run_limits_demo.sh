@@ -164,7 +164,7 @@ echo "clone through a floor-capped server: succeeds ✔"
 # The cap gates the PutPack spool (the server's receive path) — a clone's
 # GetPack never consults it. Exercise the actually-gated path: a small
 # commit pushed THROUGH the capped server must land (its pack is far under
-# the 256 MiB floor cap). If the cap's enforcement broke open-endedly or
+# the 256 MiB --max-pack-size floor, which is the default max object size). If the cap's enforcement broke open-endedly or
 # regressed to rejecting everything, this push is the step that notices.
 cd "$W/c-floor"
 printf 'v2 via capped push\n' > pushed.txt

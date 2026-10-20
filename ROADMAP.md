@@ -805,7 +805,7 @@ scale-&-reach horizon):
   `sc work --with-secrets`, and a stdin variant.
 - **`--max-object-size` operator knob — shipped (#213, ADR-0039 addendum).**
   `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE` set the per-object cap
-  (default 256 MiB, range 1 MiB to 1 GiB, out of range aborts startup). No wire
+  (default 256 MiB, range 2 MiB to 1 GiB, out of range aborts startup). No wire
   negotiation: both ends must agree.
 - **P28 review follow-ons — shipped.** `refs::write_head`/`delete_branch` run
   `validate_branch_name`; `SC_PACK_CHUNK` is clamped to the object cap minus one (a chunk frame carries a tag byte too; an

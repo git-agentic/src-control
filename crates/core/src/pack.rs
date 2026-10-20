@@ -251,7 +251,8 @@ fn record_bounds(pack: &[u8], offset: u64, max: Option<usize>) -> Result<(usize,
     if let Some(max) = max {
         if len > max {
             return Err(Error::PackCorrupt(format!(
-                "record compressed length {len} exceeds the {max}-byte object size limit"
+                "record compressed length {len} exceeds the {max}-byte object size limit ({})",
+                crate::OBJECT_SIZE_HINT
             )));
         }
     }
@@ -280,15 +281,12 @@ fn decompress_and_decode(payload: &[u8], id: &ObjectId, max: Option<usize>) -> R
         Some(max) => {
             let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(payload))
                 .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-            let mut canonical = Vec::new();
-            decoder
-                .by_ref()
-                .take(max as u64 + 1)
-                .read_to_end(&mut canonical)
+            let canonical = crate::read_limited(&mut decoder, max + 1, payload.len() * 4)
                 .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
             if canonical.len() > max {
                 return Err(Error::PackCorrupt(format!(
-                    "decompressed object exceeds the {max}-byte object size limit"
+                    "decompressed object exceeds the {max}-byte object size limit ({})",
+                    crate::OBJECT_SIZE_HINT
                 )));
             }
             canonical
@@ -417,7 +415,8 @@ pub fn parse_pack_reader_max<R: Read>(
         let len = u32::from_le_bytes(len_bytes) as usize;
         if len > max {
             return Err(Error::PackCorrupt(format!(
-                "record compressed length {len} exceeds the {max}-byte object size limit"
+                "record compressed length {len} exceeds the {max}-byte object size limit ({})",
+                crate::OBJECT_SIZE_HINT
             )));
         }
 
@@ -430,15 +429,12 @@ pub fn parse_pack_reader_max<R: Read>(
         // over-cap output without ever materializing it in full.
         let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(&payload))
             .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
-        let mut canonical = Vec::new();
-        decoder
-            .by_ref()
-            .take(max as u64 + 1)
-            .read_to_end(&mut canonical)
+        let canonical = crate::read_limited(&mut decoder, max + 1, payload.len() * 4)
             .map_err(|e| Error::PackCorrupt(format!("zstd decode failed: {e}")))?;
         if canonical.len() > max {
             return Err(Error::PackCorrupt(format!(
-                "decompressed object exceeds the {max}-byte object size limit"
+                "decompressed object exceeds the {max}-byte object size limit ({})",
+                crate::OBJECT_SIZE_HINT
             )));
         }
         let actual_id = ObjectId::of(&canonical);

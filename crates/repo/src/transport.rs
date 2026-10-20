@@ -83,24 +83,22 @@ pub trait Transport {
 }
 
 /// The most canonical object bytes one by-id reply carries (ADR-0048): twice
-/// the per-object cap (`object_cap`, the live [`scl_core::max_object_size`];
-/// 512 MiB at the default), so a reply always has room for one maximum-size
-/// object plus pack record headers and zstd framing, and scales with an
-/// operator-set cap.
-fn by_id_reply_ceiling(object_cap: usize) -> u64 {
-    (object_cap as u64) * 2
-}
+/// the largest object cap an operator can set, so a reply has room for a
+/// maximum-size object plus framing at any setting. A constant, not derived
+/// from the local object cap: it bounds a disk spool, not RAM, and ends with
+/// different caps must not disagree about whether a by-id batch fits. An
+/// object over a server's own cap is still refused individually.
+pub(crate) const BY_ID_REPLY_CEILING: u64 = 2 * scl_core::MAX_MAX_OBJECT_SIZE as u64;
 
 /// The by-id reply limit for a server whose `--max-pack-size` is
 /// `max_pack_size` (0 means unlimited): the smaller of that and
-/// [`by_id_reply_ceiling`]. Shared by the wire server and [`LocalTransport`],
+/// [`BY_ID_REPLY_CEILING`]. Shared by the wire server and [`LocalTransport`],
 /// so a lazy clone of a local path cannot spool an unbounded reply either.
-pub(crate) fn by_id_reply_cap(max_pack_size: u64, object_cap: usize) -> u64 {
-    let ceiling = by_id_reply_ceiling(object_cap);
+pub(crate) fn by_id_reply_cap(max_pack_size: u64) -> u64 {
     if max_pack_size == 0 {
-        ceiling
+        BY_ID_REPLY_CEILING
     } else {
-        max_pack_size.min(ceiling)
+        max_pack_size.min(BY_ID_REPLY_CEILING)
     }
 }
 
@@ -543,8 +541,7 @@ impl Transport for LocalTransport {
                 crate::wire::MAX_GET_OBJECTS_IDS
             )));
         }
-        let (not_sent, guard) =
-            self.build_objects_tempfile(ids, by_id_reply_cap(0, scl_core::max_object_size()))?;
+        let (not_sent, guard) = self.build_objects_tempfile(ids, by_id_reply_cap(0))?;
         let mut f = std::fs::File::open(guard.path())?;
         std::io::copy(&mut f, out)?;
         Ok(not_sent)
@@ -1124,20 +1121,13 @@ mod tests {
     }
 
     #[test]
-    fn by_id_reply_cap_is_the_smaller_of_max_pack_size_and_twice_the_object_cap() {
+    fn by_id_reply_cap_is_the_smaller_of_max_pack_size_and_a_fixed_ceiling() {
         const MIB: u64 = 1 << 20;
-        let default = scl_core::DEFAULT_MAX_OBJECT_SIZE;
         // 0 means "unlimited" for --max-pack-size, but a by-id reply is still
-        // bounded: 2 x the object cap, 512 MiB at the default.
-        assert_eq!(by_id_reply_cap(0, default), 512 * MIB);
-        assert_eq!(by_id_reply_cap(64 * MIB, default), 64 * MIB);
-        assert_eq!(by_id_reply_cap(16 << 30, default), 512 * MIB);
-        // The ceiling follows a lowered or raised object cap.
-        assert_eq!(by_id_reply_cap(0, scl_core::MIN_MAX_OBJECT_SIZE), 2 * MIB);
-        assert_eq!(
-            by_id_reply_cap(16 << 30, scl_core::MAX_MAX_OBJECT_SIZE),
-            2048 * MIB
-        );
+        // bounded, and the bound does not depend on the local object cap.
+        assert_eq!(by_id_reply_cap(0), 2048 * MIB);
+        assert_eq!(by_id_reply_cap(64 * MIB), 64 * MIB);
+        assert_eq!(by_id_reply_cap(16 << 30), 2048 * MIB);
     }
 
     /// A repo with a stopped merge, pick or rebase is completed against its

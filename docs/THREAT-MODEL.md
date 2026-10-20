@@ -419,28 +419,38 @@ too, not just the src-control-side metadata.
 
 - A single max object size caps every untrusted length: wire frames,
   pack-record compressed length, the zstd *decompressed* output (decompression-bomb
-  guard), bucket WAL metadata, by-id reply objects, the `SC_PACK_CHUNK` clamp,
+  guard), bucket pack bodies, by-id reply objects, the `SC_PACK_CHUNK` clamp,
   and object-decode collection counts. The default is 256 MiB. An operator can
   lower or raise it with `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE`
-  (#213), within a compile-time range of 1 MiB to 1 GiB; a value outside that
-  range aborts startup rather than being clamped. A guard checks the claimed
-  length before allocating, and frame bodies and pack records are then read
-  incrementally, so a hostile header cannot buy a cap-sized allocation without
-  sending the bytes. **Accepted boundaries:**
+  (#213), within a compile-time range of 2 MiB to 1 GiB; a value outside that
+  range aborts startup rather than being clamped; an empty `SC_MAX_OBJECT_SIZE`
+  counts as unset. A guard checks the claimed length before allocating, and
+  frame bodies, pack records and the zstd output are then read in steps of at
+  most 8 MiB as bytes arrive (no doubling), so a hostile header or compression
+  bomb cannot buy a cap-sized allocation without sending the bytes.
+  **Accepted boundaries:**
   - The cap is a *transfer-path* guard. A locally-committed blob above it
     commits fine but cannot be transferred.
   - **Both ends must agree.** There is no negotiation and no protocol bump. An
     object above the receiver's cap is refused there, loudly. A server raised
     to 1 GiB accepts a peer's gigabyte claim only if that peer sends the bytes,
-    but then holds that object in memory. Raising the cap raises per-connection
-    memory: a pack record is buffered compressed and then decompressed, and the
-    decoded object is a further copy, so budget a small multiple of the cap
-    (roughly 3x) per connection, times `--max-connections` (default 32). Size
-    `--max-connections` down when raising the cap. The repository's resident
-    blob budget rises with the cap (to twice the cap, never below 512 MiB) so one
-    maximum-size object can still be admitted. Lowering it below
-    a repository's largest object makes that repository unpushable until the
-    cap is restored.
+    but then holds that object in memory. Raising the cap raises
+    per-connection memory in two parts. Transient pack-decode memory: a
+    record is held compressed, then decompressed, then decoded, up to about
+    3 x cap. Plus the connection's own store budget, `max(512 MiB, 2 x cap)`,
+    because each served connection opens its own store. That is about
+    0.75 GiB + 0.5 GiB per connection at the default and about 3 GiB + 2 GiB
+    at the 1 GiB ceiling, times `--max-connections` (default 32); size
+    `--max-connections` down when raising the cap. Lowering the cap below a
+    repository's largest object makes that repository unpushable until it is
+    restored. `SC_MAX_OBJECT_SIZE` also sets the store budget of every local
+    command, not only transfers.
+  - **One length is checked after allocation:** bucket WAL metadata (manifest,
+    log entry, idx) is capped at a fixed 256 MiB after the bucket GET has
+    buffered it, so it bounds decode work, not the download. It is not tied to
+    the operator's cap, so lowering the cap cannot make a bucket unreadable.
+  - By-id reply spools (server ceiling 2 GiB, client read cap 4 GiB) are
+    constants independent of the cap: they bound disk, not RAM.
   - The ceiling (1 GiB) is compile-time, so no configuration can make a length
     claim unbounded.
 

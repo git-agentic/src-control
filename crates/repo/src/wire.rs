@@ -422,7 +422,8 @@ fn read_frame_max(r: &mut impl Read, max: usize) -> Result<Option<Vec<u8>>> {
     let len = u32::from_be_bytes(len_bytes) as usize;
     if len > max {
         return Err(Error::Protocol(format!(
-            "frame length {len} exceeds the {max}-byte object size limit"
+            "frame length {len} exceeds the {max}-byte object size limit ({})",
+            scl_core::OBJECT_SIZE_HINT
         )));
     }
     // The length is the peer's claim: grow with the bytes that actually
@@ -1101,10 +1102,7 @@ fn serve_session(
                 let result = match &transport {
                     ServeTransport::Local(t) => t.build_objects_tempfile(
                         &ids,
-                        crate::transport::by_id_reply_cap(
-                            policy.max_pack_size,
-                            scl_core::max_object_size(),
-                        ),
+                        crate::transport::by_id_reply_cap(policy.max_pack_size),
                     ),
                     ServeTransport::Bucket { .. } => Err(Error::InvalidArgument(
                         "bucket remotes do not support by-id object fetch".into(),
@@ -1141,8 +1139,8 @@ fn serve_session(
                         // `guard` drops here — temp pack file removed,
                         // whether ingestion succeeded or failed.
                     }
-                    Err(e @ Error::PackTooLarge(_)) => {
-                        // Over the cap: the stream is desynced (we stopped
+                    Err(e @ (Error::PackTooLarge(_) | Error::Protocol(_))) => {
+                        // Over the cap, or a malformed/over-cap frame: the stream is desynced (we stopped
                         // reading mid-pack, so any bytes still on the wire
                         // are neither read nor a subsequent request), so a
                         // best-effort reply is the most we can do — then
@@ -1438,10 +1436,11 @@ mod tests {
     }
 
     #[test]
-    fn frame_claiming_the_cap_without_a_body_fails_without_a_cap_sized_allocation() {
-        // At the ceiling, a 4-byte header can claim 1 GiB. The body is read
-        // incrementally, so a peer that sends nothing gets a short-read
-        // error, not a pre-allocated buffer.
+    fn frame_claiming_the_ceiling_without_a_body_is_a_short_read_error() {
+        // At the ceiling, a 4-byte header can claim 1 GiB and passes the
+        // length guard; with no body behind it the read fails as a short
+        // frame. (That no cap-sized buffer is allocated is pinned by
+        // `read_limited_never_over_allocates_by_more_than_one_step`.)
         let cap = scl_core::MAX_MAX_OBJECT_SIZE;
         let mut r = std::io::Cursor::new((cap as u32).to_be_bytes().to_vec());
         let err = read_frame_max(&mut r, cap).unwrap_err();
@@ -1946,10 +1945,13 @@ mod tests {
 
     #[test]
     fn chunk_clamp_follows_a_lowered_and_a_raised_cap() {
-        // Lowered: the 1 MiB default chunk (data) no longer fits with its tag
-        // byte, so it clamps to cap - 1 and the frame is exactly the cap.
+        // Lowered: an explicit chunk larger than the cap clamps to cap - 1,
+        // so the frame (tag byte + data) is exactly the cap. The default
+        // 1 MiB chunk still fits at the 2 MiB floor.
         let low = scl_core::MIN_MAX_OBJECT_SIZE;
-        let chunk = chunk_from(None, low);
+        assert_eq!(chunk_from(None, low), CHUNK_SIZE);
+        assert!(CHUNK_SIZE < low, "a default peer's frame fits the floor");
+        let chunk = chunk_from(Some(&(low * 2).to_string()), low);
         assert_eq!(chunk, low - 1);
         let mut frame = vec![ST_PACK_CHUNK];
         frame.extend(vec![0u8; chunk]);

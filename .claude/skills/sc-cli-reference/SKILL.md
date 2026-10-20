@@ -274,9 +274,9 @@ cargo run --bin sc -- serve --http <addr> <path> [--read-only] [--allow-public]
                                               # counted mid-stream abort -> EC_TOO_LARGE (P31)
                                               # --max-object-size <bytes|KiB|MiB|GiB>: largest
                                               # single object accepted from a peer, default
-                                              # 256MiB, range 1MiB..1GiB, out of range aborts
+                                              # 256MiB, range 2MiB..1GiB, out of range aborts
                                               # startup (never clamped). Clients use env
-                                              # SC_MAX_OBJECT_SIZE (same parse, any command);
+                                              # SC_MAX_OBJECT_SIZE (same parse, any command; empty = unset);
                                               # flag beats env. No negotiation: both ends must
                                               # agree, a larger object fails at the receiver (#213)
 cargo run --bin sc -- serve token add --label <name> --scope ro|rw   # mint an
