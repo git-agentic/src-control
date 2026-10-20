@@ -661,7 +661,10 @@ impl Repo {
         //    behavior), both parents on merge completion for paths the
         //    decided tree doesn't know (and as full fallback when the merge
         //    state predates the decided-root record, i.e. was written by an
-        //    older code path). Ours wins across parents. A pick's non-parent
+        //    older code path). Ours wins across parents. With a decided root
+        //    the parents supply only still-protected paths, never the
+        //    out-of-sparse carry: a plain path missing from the decided root
+        //    was decided deleted (#238). A pick's non-parent
         //    `pick_head` is NOT a source: any picked-side content the pick
         //    kept is in the decided tree — a protected path in the picked
         //    commit but absent from the decided tree was decided *deleted*
@@ -700,9 +703,10 @@ impl Repo {
 
             // Decided tree first (merge completion only), then the parents
             // restricted to paths outside the decided tree.
-            let mut sources: Vec<
-                std::collections::BTreeMap<String, (ObjectId, scl_core::FileMode, u8)>,
-            > = Vec::new();
+            // The flag marks a parent behind a decided root: it may still
+            // supply a protected path, but never an out-of-sparse carry (#238).
+            type Entries = std::collections::BTreeMap<String, (ObjectId, scl_core::FileMode, u8)>;
+            let mut sources: Vec<(Entries, bool)> = Vec::new();
             let mut decided_paths: std::collections::BTreeSet<String> = Default::default();
             if let Some(dr) = decided_root {
                 let decided = if partial {
@@ -711,7 +715,7 @@ impl Repo {
                     worktree::tree_file_entries_with_perms(&mut store, dr)?
                 };
                 decided_paths = decided.keys().cloned().collect();
-                sources.push(decided);
+                sources.push((decided, false));
             }
             for parent in tip.into_iter().chain(merge_head) {
                 let parent_root = store.get_snapshot(&parent)?.root;
@@ -728,7 +732,7 @@ impl Repo {
                     worktree::tree_file_entries_with_perms(&mut store, parent_root)?
                 };
                 entries.retain(|p, _| !decided_paths.contains(p));
-                sources.push(entries);
+                sources.push((entries, decided_root.is_some()));
             }
 
             // Paths the stopped operation wrote in plaintext. One of them that
@@ -740,14 +744,17 @@ impl Repo {
             } else {
                 Default::default()
             };
-            for entries in sources {
+            for (entries, behind_decided) in sources {
                 for (path, (blob_id, mode, perms)) in entries {
                     if on_disk.contains(&path) || conflict_plaintext.contains(&path) {
                         continue;
                     }
                     let still_protected = perms & scl_core::PROTECTED != 0
                         && crate::protect::matching_prefix(&protection, &path).is_some();
-                    let out_of_sparse = !sparse.matches(&path);
+                    // A path missing from the decided root was decided deleted
+                    // (the other side's clean deletion included): a parent must
+                    // not carry it back just because it is out of view.
+                    let out_of_sparse = !behind_decided && !sparse.matches(&path);
                     if !still_protected && !out_of_sparse {
                         continue;
                     }

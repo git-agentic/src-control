@@ -168,3 +168,14 @@ every claim below is checked against the shipped code, not the plan.
    `MergeInProgress`/`PickInProgress`/`RebaseInProgress` errors the P21
    policy-op guards already use elsewhere, added in review before Task 4
    landed rather than discovered after.
+6. **Completion carries out-of-view paths from the decided root, not the
+   parents (#238).** A stopped merge, cherry-pick or rebase on a full clone
+   records a decided root, and `snapshot_files` carries an absent out-of-view
+   path from it. Earlier builds also read the tip and merge head, so an
+   out-of-view file the other side had cleanly deleted came back from the
+   tip, silently losing the deletion. With a decided root the parents now
+   supply only still-protected paths; they remain the full fallback for
+   state written without a decided root. Pinned by
+   `sparse_completion.rs` (merge, pick, rebase: the deletion stays, a clean
+   add and modify land, ours-side-only out-of-view changes are kept, and the
+   tree equals the result without sparse).
