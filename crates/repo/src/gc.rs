@@ -102,6 +102,10 @@ fn walk_decided_root(
 pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStats> {
     let mut stats = GcStats::default();
 
+    // A pre-#257 signature index must be imported before it is pruned: an
+    // unread legacy file would otherwise root nothing and lose its objects.
+    signatures::migrate_legacy(layout, store)?;
+
     // Trim oplog records past the grace window BEFORE computing roots, so a
     // just-trimmed record's snapshot doesn't linger as a root this pass (it
     // always keeps the newest record regardless of cutoff).
@@ -164,18 +168,27 @@ pub fn run(layout: &Layout, store: &mut Store, grace: Duration) -> Result<GcStat
     // didn't survive are dropped from the index, and their now-unrooted
     // transcript object falls through to the ordinary loose-object
     // aging/pruning sweep below like any other unreachable object.
-    stats.transcripts_pruned = transcripts::gc_prune(layout, &mut reachable)?;
+    //
+    // Both prunes run under one index lock: a serve-path ingest indexing a
+    // transcript and its signature between them would have the signature
+    // dropped (its transcript was not rooted).
+    let (transcripts_pruned, signatures_pruned) = crate::lock::with_index_lock(layout, || {
+        let transcripts = transcripts::gc_prune(layout, &mut reachable)?;
 
-    // Signature index (P22): a SignatureObj is reachable from no tree/parent
-    // walk (it isn't referenced by any snapshot), so it needs its own root
-    // decision here, in the same window the merge/pick/rebase decided-root
-    // roots above use — after every other root source has contributed to
-    // `reachable`, but before packing. Entries whose snapshot survived above
-    // get their signature object rooted into `reachable`; entries whose
-    // snapshot didn't are dropped from the index, and their now-unrooted
-    // signature object falls through to the ordinary loose-object
-    // aging/pruning sweep below like any other unreachable object.
-    stats.signatures_pruned = signatures::gc_prune(layout, &mut reachable)?;
+        // Signature index (P22): a SignatureObj is reachable from no tree/parent
+        // walk (it isn't referenced by any snapshot), so it needs its own root
+        // decision here, in the same window the merge/pick/rebase decided-root
+        // roots above use — after every other root source has contributed to
+        // `reachable`, but before packing. Entries whose snapshot survived above
+        // get their signature object rooted into `reachable`; entries whose
+        // snapshot didn't are dropped from the index, and their now-unrooted
+        // signature object falls through to the ordinary loose-object
+        // aging/pruning sweep below like any other unreachable object.
+        let signatures = signatures::gc_prune(layout, &mut reachable)?;
+        Ok((transcripts, signatures))
+    })?;
+    stats.transcripts_pruned = transcripts_pruned;
+    stats.signatures_pruned = signatures_pruned;
 
     // 1. Repack the entire reachable set into one fresh pack (skip if empty).
     let new_hash = if reachable.is_empty() {

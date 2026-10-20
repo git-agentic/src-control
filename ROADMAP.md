@@ -494,7 +494,9 @@ across every phase.
   a stale peer is told), only verifying signatures enter the signature index,
   and a remote that held a tombstone before trusting the signer re-judges it
   from a capped `.sc/transcript-pending` index when the trusted-signer set
-  changes. Crowding by valid signatures from attacker keys is tracked in #257.
+  changes. Valid signatures from attacker keys cannot crowd out a drop (#257: the
+  signature index holds one slot per (target, signer)), and serve-path index
+  updates take a short index lock (#260).
 
 - **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
   (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"

@@ -99,6 +99,11 @@ impl Repo {
     fn open_layout(layout: Layout, budget_bytes: usize) -> Result<Repo> {
         let lock = RepoLock::acquire(&layout)?;
         let mut store = Store::open_persistent(layout.objects_dir(), budget_bytes)?;
+        // Import a pre-#257 signature index first (best effort; every writer
+        // and gc retry it and fail rather than start a v2 file without it): the
+        // re-evaluation below reads that index, and a pass that saw it empty
+        // would record the trust as judged.
+        let _ = crate::signatures::migrate_legacy(&layout, &mut store);
         // Honor held tombstones once the trusted-signer set changed (#230). Best
         // effort: a failure must not stop an open, and the next open retries.
         let _ = crate::transcripts::reevaluate_if_trust_changed(&layout, &mut store);

@@ -167,6 +167,7 @@ impl LocalTransport {
         // ran it already.
         // Only when the trusted-signer set changed since they were last
         // judged: serving must not take the exclusive lock per connection.
+        let _ = crate::signatures::migrate_legacy(&layout, &mut store);
         if crate::transcripts::trust_changed(&layout) {
             if let Ok(_lock) = RepoLock::acquire(&layout) {
                 let _ = crate::transcripts::reevaluate_if_trust_changed(&layout, &mut store);
@@ -630,12 +631,18 @@ fn ingest_pack_file_impl(
     if !skip_transcripts {
         let _ = crate::transcripts::reevaluate_if_trust_changed(layout, store);
     }
-    // Receiver seam (P22 Task 3): every id above was just written to this
-    // store, so `index_incoming`'s "ids just written" contract holds.
-    crate::signatures::index_incoming(layout, store, &ids)?;
-    // Receiver seam (P30 Task 4): same "ids just written" contract, for
-    // Transcript objects.
-    crate::transcripts::index_incoming(layout, store, &ids)?;
+    // Receiver seams (P22 Task 3 signatures, P30 Task 4 transcripts): every id
+    // above was just written to this store, so `index_incoming`'s "ids just
+    // written" contract holds. Both passes run under one index lock: gc prunes
+    // the transcript and signature indexes together, and between two separate
+    // locks it would drop a signature whose transcript was not yet indexed.
+    // The Ed25519 checks run before the lock is taken; it covers the file
+    // updates and the (bounded) tombstone judging only.
+    let accepted = crate::signatures::verify_incoming(store, &ids)?;
+    crate::lock::with_index_lock(layout, || {
+        crate::signatures::append_accepted(layout, store, &accepted)?;
+        crate::transcripts::index_incoming(layout, store, &ids)
+    })?;
     Ok(ids)
 }
 
