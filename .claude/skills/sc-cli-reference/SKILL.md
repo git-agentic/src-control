@@ -251,7 +251,11 @@ cargo run --bin sc -- transcript drop <id> [--identity <key>]   # drop a transcr
                                               # body (loose: after the grace window; already packed: next gc). Not erasure. --identity
                                               # signs the tombstone; peers honor it only if that key
                                               # is under [signers] trusted (unsigned = local-only).
-                                              # Propagates on the peer's next fetch (ADR-0038 addendum)
+                                              # Propagates on the peer's next fetch (ADR-0038 addendum);
+                                              # a signed tombstone also rides when the dropper's gc
+                                              # collected its snapshot, and a remote holding one from
+                                              # before it trusted the signer honors it once its
+                                              # trusted-signer set changes (#230)
 cargo run --bin sc -- ws harvest --transcript <path> [--sign] [--identity <key>]   # attach the
                                               # file to each harvested workspace's landed snapshot
                                               # (P30; landing status prints before the attach)

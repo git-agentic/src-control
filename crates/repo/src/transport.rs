@@ -156,7 +156,19 @@ impl LocalTransport {
         }
         // Match the repo's store budget so a single large object never fails to resolve
         // (a blob bigger than the whole budget would BudgetExceed).
-        let store = Store::open_persistent(layout.objects_dir(), crate::repo::default_budget())?;
+        let mut store =
+            Store::open_persistent(layout.objects_dir(), crate::repo::default_budget())?;
+        // A served or local-path remote never passes through `Repo::open`:
+        // honor held tombstones whose signer was trusted since (#230). Best
+        // effort under the repo lock; a busy lock means a `Repo` is open and
+        // ran it already.
+        // Only when the trusted-signer set changed since they were last
+        // judged: serving must not take the exclusive lock per connection.
+        if crate::transcripts::trust_changed(&layout) {
+            if let Ok(_lock) = RepoLock::acquire(&layout) {
+                let _ = crate::transcripts::reevaluate_if_trust_changed(&layout, &mut store);
+            }
+        }
         Ok(LocalTransport {
             layout,
             store: RefCell::new(store),
@@ -294,7 +306,9 @@ impl LocalTransport {
         // `sc transcript attach --sign` survived clone/fetch/push as an
         // object but landed `Unsigned` on the far side).
         let transcript_ids =
-            crate::transcripts::indexed_transcript_ids_for(&self.layout, &all_snaps)?;
+            crate::transcripts::indexed_transcript_ids_for(&self.layout, &all_snaps, &|id| {
+                store.contains(id)
+            })?;
         let sig_targets: Vec<ObjectId> = all_snaps
             .iter()
             .chain(transcript_ids.iter())
@@ -603,6 +617,14 @@ fn ingest_pack_file_impl(
         ids.push(id);
         Ok(())
     })?;
+    // Tombstones held from earlier transfers are judged again when the
+    // trusted-signer set changed (#230), before this pack's own tombstones are
+    // noted under the current set. A `--no-transcripts` transfer indexes no
+    // transcript state. Best effort: the pack is already stored, so a failure
+    // here must not fail it.
+    if !skip_transcripts {
+        let _ = crate::transcripts::reevaluate_if_trust_changed(layout, store);
+    }
     // Receiver seam (P22 Task 3): every id above was just written to this
     // store, so `index_incoming`'s "ids just written" contract holds.
     crate::signatures::index_incoming(layout, store, &ids)?;
