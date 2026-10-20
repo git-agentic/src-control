@@ -1974,12 +1974,12 @@ impl Repo {
             &self.layout,
             &sidecars.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
         )?;
-        for (path, bytes, _mode, _recipients) in to_encrypt {
+        for (path, bytes, mode, _recipients) in to_encrypt {
             let full = worktree::safe_join(&self.layout.root, path)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(full, bytes)?;
+            worktree::write_file(&full, bytes, *mode)?;
         }
         for (rel, bytes) in sidecars {
             let full = self.layout.root.join(rel);

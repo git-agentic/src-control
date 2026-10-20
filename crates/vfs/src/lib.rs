@@ -603,6 +603,36 @@ mod tests {
         assert!(!dest.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkout_restores_exec_bit_and_not_on_plain_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let r = repo();
+        let snap = r
+            .commit_files(
+                &[
+                    ("run.sh".into(), b"#!/bin/sh\n".to_vec(), FileMode::EXEC),
+                    ("plain.txt".into(), b"x".to_vec(), FileMode::FILE),
+                ],
+                "t",
+                "m",
+            )
+            .unwrap();
+        let wt = r.fork(snap, "a").unwrap();
+        let dest = std::env::temp_dir().join(format!("scl-co-exec-{}", std::process::id()));
+        wt.checkout(&dest).unwrap();
+        let mode = |p: &str| {
+            std::fs::metadata(dest.join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+        };
+        assert_ne!(mode("run.sh") & 0o111, 0);
+        assert_eq!(mode("plain.txt") & 0o111, 0);
+        std::fs::remove_dir_all(&dest).unwrap();
+        assert!(!dest.exists());
+    }
+
     #[test]
     fn commit_overlay_produces_new_snapshot() {
         let r = repo();
