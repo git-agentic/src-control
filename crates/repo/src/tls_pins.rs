@@ -339,14 +339,12 @@ fn parse_line(line: &str) -> Option<PinEntry> {
         return None;
     }
     let (key, value) = line.split_once(' ')?;
-    let (host, port) = key.rsplit_once(':')?;
-    let port = port.parse::<u16>().ok()?;
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    // Same authority grammar as a URL: brackets must hold an IPv6 literal, so
+    // a malformed key is skipped rather than read as a pin for another host.
+    let (host, port) = crate::http_transport::split_authority(key)?;
+    let port = port?.parse::<u16>().ok()?;
     Some(PinEntry {
-        host: host.to_string(),
+        host,
         port,
         pin: parse_fingerprint(value.trim()).ok()?,
     })
@@ -477,6 +475,22 @@ mod tests {
         assert_eq!(lookup(&file, "::1", 7777).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn pin_lines_follow_the_url_authority_grammar() {
+        let hex = "ab".repeat(32);
+        let line = |key: &str| parse_line(&format!("{key} sha256:{hex}"));
+        // Brackets hold only an IPv6 literal, read in canonical form.
+        assert_eq!(line("[::1]:7777").unwrap().host, "::1");
+        assert_eq!(line("[0:0:0:0:0:0:0:1]:7777").unwrap().host, "::1");
+        assert_eq!(line("example.com:8730").unwrap().host, "example.com");
+        // Malformed keys are skipped, never read as a pin for another host.
+        assert!(line("[example.com]:8730").is_none());
+        assert!(line("[::1:7777").is_none());
+        assert!(line("[::1]7777").is_none());
+        assert!(line("[::1]").is_none(), "a port is required");
+        assert!(line("::1:7777").is_none(), "unbracketed IPv6");
     }
 
     #[test]
