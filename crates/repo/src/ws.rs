@@ -617,7 +617,13 @@ impl Repo {
             .open(&marker)
         {
             Ok(mut f) => {
-                std::io::Write::write_all(&mut f, std::process::id().to_string().as_bytes())?
+                if let Err(e) =
+                    std::io::Write::write_all(&mut f, std::process::id().to_string().as_bytes())
+                {
+                    // An empty marker would read as busy forever.
+                    let _ = std::fs::remove_file(&marker);
+                    return Err(e.into());
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(Error::InvalidArgument(format!(
@@ -1139,10 +1145,15 @@ impl WsRunPlan {
         let mut child = command.spawn()?;
         // Record the child too: if `sc` is killed first, the orphan keeps the
         // workspace busy. Best effort; the parent pid is already in the file.
-        let _ = scl_core::fsutil::atomic_write_durable(
+        if let Err(e) = scl_core::fsutil::atomic_write_durable(
             &self.marker,
             format!("{} {}", std::process::id(), child.id()).as_bytes(),
-        );
+        ) {
+            eprintln!(
+                "warning: could not record the command's pid ({e}); the workspace is \
+                 protected from harvest and abandon only while `sc` itself runs"
+            );
+        }
         Ok(child.wait()?.code().unwrap_or(1))
     }
 }
