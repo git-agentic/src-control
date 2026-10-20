@@ -182,15 +182,35 @@ pub(crate) fn load_widen(
 ) -> Result<std::collections::BTreeSet<String>> {
     match std::fs::read_to_string(layout.sparse_widen_path()) {
         Ok(text) => {
-            let mut lines = text.lines();
-            if lines.next() != Some(decided.to_hex().as_str()) {
+            let mut fields = widen_fields(&text);
+            if fields.next() != Some(decided.to_hex().as_str()) {
                 return Ok(Default::default());
             }
-            Ok(lines.filter(|l| !l.is_empty()).map(String::from).collect())
+            Ok(fields.map(String::from).collect())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The record's fields: the decided-root id, then one path each. NUL-separated
+/// (a path can hold a newline or a carriage return, never a NUL), and the one
+/// splitter every reader and rewriter of the record uses.
+fn widen_fields(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\0').filter(|f| !f.is_empty())
+}
+
+/// Serialize a record: `decided`, then `paths`, each followed by a NUL.
+fn widen_record<'a>(
+    decided: scl_core::ObjectId,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut text = format!("{}\0", decided.to_hex());
+    for p in paths {
+        text.push_str(p);
+        text.push('\0');
+    }
+    text
 }
 
 /// Record `paths` as the files a widen over the stop with decided root
@@ -200,8 +220,7 @@ pub(crate) fn store_widen(
     decided: scl_core::ObjectId,
     paths: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
-    let mut text = format!("{}\n", decided.to_hex());
-    text.extend(paths.iter().map(|p| format!("{p}\n")));
+    let text = widen_record(decided, paths.iter().map(String::as_str));
     scl_core::fsutil::atomic_write_durable(&layout.sparse_widen_path(), text.as_bytes())?;
     Ok(())
 }
@@ -526,13 +545,6 @@ impl Repo {
         {
             let mut s = store_arc.lock().unwrap();
             let (plain, _) = crate::worktree::added_view_files(&mut s, decided, old, new)?;
-            // The record is one path per line.
-            if let Some((p, ..)) = plain.iter().find(|(p, ..)| p.contains('\n')) {
-                return Err(Error::InvalidArgument(format!(
-                    "cannot widen while an operation is stopped: {p:?} contains a newline; \
-                     finish or abort the operation first"
-                )));
-            }
             written.extend(plain.into_iter().map(|(p, ..)| p));
         }
         store_widen(self.layout(), decided, &written)?;
@@ -564,17 +576,19 @@ impl Repo {
         let record = self.layout().sparse_widen_path();
         match std::fs::read_to_string(&record) {
             Ok(text) => {
-                let mut lines = text.lines();
-                let header = lines.next().unwrap_or_default();
-                let kept: Vec<&str> = lines.filter(|p| !p.is_empty() && !new.matches(p)).collect();
+                let mut fields = widen_fields(&text);
+                let header = fields.next().unwrap_or_default();
+                let kept: Vec<&str> = fields.filter(|p| !new.matches(p)).collect();
                 if kept.is_empty() {
                     remove_if_exists(&record)?;
                 } else {
-                    let body: String = kept.iter().map(|p| format!("{p}\n")).collect();
-                    scl_core::fsutil::atomic_write_durable(
-                        &record,
-                        format!("{header}\n{body}").as_bytes(),
-                    )?;
+                    // The header is the decided root's hex; write it back as is.
+                    let mut out = format!("{header}\0");
+                    for p in kept {
+                        out.push_str(p);
+                        out.push('\0');
+                    }
+                    scl_core::fsutil::atomic_write_durable(&record, out.as_bytes())?;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

@@ -186,7 +186,9 @@ every claim below is checked against the shipped code, not the plan.
    recorded file already on disk with the decided root's bytes as its own
    earlier write; an unrecorded file, even with equal bytes, or a changed one
    still refuses (the file's executable bit is not compared, but
-   `lay_out_added_view` applies the recorded mode after each atomic write, #237). The record starts with the stop's decided-root id and is ignored
+   `lay_out_added_view` applies the recorded mode after each atomic write, #237). The record is NUL-separated (a path may hold a newline or a carriage
+   return, never a NUL), read and rewritten with one splitter, like
+   `CONFLICT_PLAINTEXT`. It starts with the stop's decided-root id and is ignored
    when that does not match (a stale record). When the stop ends with the old
    view still in force (abort of a merge, pick or rebase, or the completion
    after an interrupted widen) `Repo::remove_widen_residue` deletes the

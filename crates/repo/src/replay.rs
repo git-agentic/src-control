@@ -3588,12 +3588,14 @@ mod tests {
         remove_root(&root);
     }
 
-    /// The widen record is one path per line, so a path with a newline is
-    /// refused before anything is written.
+    /// The widen record is NUL-separated and read with the splitter that wrote
+    /// it: paths holding a newline, a carriage return, or ending in one
+    /// round-trip exactly, so the abort removes those files and never a
+    /// lookalike the user owns.
     #[cfg(unix)]
     #[test]
-    fn widening_a_stopped_merge_refuses_a_path_with_a_newline() {
-        let root = tmp_root("sparse-widen-newline");
+    fn the_widen_record_round_trips_paths_with_newlines_and_carriage_returns() {
+        let root = tmp_root("sparse-widen-odd-names");
         let repo = Repo::init(&root).unwrap();
         for d in ["src", "docs"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
@@ -3601,11 +3603,14 @@ mod tests {
         std::fs::write(root.join("src/a.txt"), b"l1\nl2\nl3\n").unwrap();
         repo.commit("me", "base").unwrap();
         repo.branch("work").unwrap();
+        let odd = ["docs/a\rb.txt", "docs/c\nd.txt", "docs/e\r", "docs/f\r\n"];
         std::fs::write(root.join("src/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        for p in odd {
+            std::fs::write(root.join(p), b"ours only\n").unwrap();
+        }
         repo.commit("me", "main").unwrap();
         repo.switch("work").unwrap();
         std::fs::write(root.join("src/a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
-        std::fs::write(root.join("docs/odd\nname.txt"), b"x\n").unwrap();
         repo.commit("me", "work").unwrap();
         repo.switch("main").unwrap();
         repo.set_sparse(&["src/".into()], None).unwrap();
@@ -3613,21 +3618,36 @@ mod tests {
             repo.merge("work", "me").unwrap_err(),
             Error::MergeConflicts(1)
         ));
-        let err = repo
-            .set_sparse(&["src/".into(), "docs/".into()], None)
-            .unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidArgument(m) if m.contains("newline")),
-            "{err:?}"
+        // The user's own files, named like the odd ones with the control
+        // characters cut off.
+        let mine = ["docs/e", "docs/f", "docs/c", "docs/a"];
+        for p in mine {
+            std::fs::write(root.join(p), b"mine\n").unwrap();
+        }
+        let decided = crate::merge_state::read_decided_root(repo.layout())
+            .unwrap()
+            .unwrap();
+        interrupt_a_widen(
+            &repo,
+            decided,
+            &Sparse::new(vec!["src/".into(), "docs/".into()]),
         );
-        assert_eq!(
-            repo.sparse_spec().unwrap().prefixes(),
-            &["src/".to_string()]
-        );
-        assert!(!repo.layout().sparse_widen_path().exists());
+        let recorded = crate::sparse::load_widen(repo.layout(), decided).unwrap();
+        let want: std::collections::BTreeSet<String> = odd.iter().map(|p| p.to_string()).collect();
+        assert_eq!(recorded, want, "exactly the laid paths, byte for byte");
+        for p in odd {
+            assert!(root.join(p).exists(), "{p:?} laid");
+        }
+
         repo.merge_abort().unwrap();
+        for p in odd {
+            assert!(!root.join(p).exists(), "{p:?} removed");
+        }
+        for p in mine {
+            assert_eq!(std::fs::read(root.join(p)).unwrap(), b"mine\n", "{p}");
+        }
         drop(repo);
-        remove_root(&root);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A merge that is stopped can be widened too: the files that come into
