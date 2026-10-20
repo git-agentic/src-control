@@ -3588,6 +3588,48 @@ mod tests {
         remove_root(&root);
     }
 
+    /// The widen record is one path per line, so a path with a newline is
+    /// refused before anything is written.
+    #[cfg(unix)]
+    #[test]
+    fn widening_a_stopped_merge_refuses_a_path_with_a_newline() {
+        let root = tmp_root("sparse-widen-newline");
+        let repo = Repo::init(&root).unwrap();
+        for d in ["src", "docs"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("src/a.txt"), b"l1\nl2\nl3\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"OURS\nl2\nl3\n").unwrap();
+        repo.commit("me", "main").unwrap();
+        repo.switch("work").unwrap();
+        std::fs::write(root.join("src/a.txt"), b"THEIRS\nl2\nl3\n").unwrap();
+        std::fs::write(root.join("docs/odd\nname.txt"), b"x\n").unwrap();
+        repo.commit("me", "work").unwrap();
+        repo.switch("main").unwrap();
+        repo.set_sparse(&["src/".into()], None).unwrap();
+        assert!(matches!(
+            repo.merge("work", "me").unwrap_err(),
+            Error::MergeConflicts(1)
+        ));
+        let err = repo
+            .set_sparse(&["src/".into(), "docs/".into()], None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("newline")),
+            "{err:?}"
+        );
+        assert_eq!(
+            repo.sparse_spec().unwrap().prefixes(),
+            &["src/".to_string()]
+        );
+        assert!(!repo.layout().sparse_widen_path().exists());
+        repo.merge_abort().unwrap();
+        drop(repo);
+        remove_root(&root);
+    }
+
     /// A merge that is stopped can be widened too: the files that come into
     /// view are the merge's decided content, and the completion keeps them.
     #[test]

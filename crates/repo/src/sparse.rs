@@ -526,6 +526,13 @@ impl Repo {
         {
             let mut s = store_arc.lock().unwrap();
             let (plain, _) = crate::worktree::added_view_files(&mut s, decided, old, new)?;
+            // The record is one path per line.
+            if let Some((p, ..)) = plain.iter().find(|(p, ..)| p.contains('\n')) {
+                return Err(Error::InvalidArgument(format!(
+                    "cannot widen while an operation is stopped: {p:?} contains a newline; \
+                     finish or abort the operation first"
+                )));
+            }
             written.extend(plain.into_iter().map(|(p, ..)| p));
         }
         store_widen(self.layout(), decided, &written)?;
