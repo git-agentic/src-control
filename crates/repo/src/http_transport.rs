@@ -1861,6 +1861,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(bare_dir.parent().unwrap());
     }
 
+    /// `--no-transcripts` (#211) over a real served remote: the server
+    /// over-sends transcripts on clone/fetch and the client drops them, and a
+    /// push leaves them out of the upload. Snapshots verify throughout.
+    #[test]
+    fn no_transcripts_clone_fetch_push_over_real_http() {
+        use crate::repo::Repo;
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let recipients = [identity.enc.public()];
+        let src_root = tmp_repo("notrans-src");
+        let (snap1, tid1) = {
+            let src = Repo::open(&src_root).unwrap();
+            std::fs::write(src_root.join("a.txt"), b"one").unwrap();
+            let snap = src.commit("t", "c1").unwrap();
+            src.sign_snapshot(snap, &identity).unwrap();
+            let tid = src
+                .attach_transcript(snap, "claude-code", "s1", b"body", &recipients)
+                .unwrap();
+            src.sign_transcript(tid, &identity).unwrap();
+            (snap, tid)
+        };
+        let port = spawn_real_http_server(src_root.clone());
+        let url = format!("sc+http://127.0.0.1:{port}/repo");
+
+        // No transcript object, index entry or signature for `tid` in `r`.
+        let absent = |r: &Repo, tid: ObjectId| {
+            let arc = r.store_arc();
+            assert!(!arc.lock().unwrap().contains(&tid));
+            assert!(crate::transcripts::load(r.layout()).unwrap().is_empty());
+            assert!(r.signatures_for(&tid).unwrap().is_empty());
+        };
+
+        // clone: snapshot and its signature arrive, the transcript does not.
+        let dst_root =
+            std::env::temp_dir().join(format!("scl-http-notrans-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst_root);
+        let dst = Repo::clone_url_opts(&url, &dst_root, None, true).unwrap();
+        assert_eq!(dst.head_tip().unwrap(), Some(snap1));
+        assert_eq!(dst.signatures_for(&snap1).unwrap().len(), 1);
+        absent(&dst, tid1);
+
+        // A second opted-out clone, to fetch with after the push below.
+        let dst2_root =
+            std::env::temp_dir().join(format!("scl-http-notrans-dst2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst2_root);
+        let dst2 = Repo::clone_url_opts(&url, &dst2_root, None, true).unwrap();
+        absent(&dst2, tid1);
+
+        // push: the snapshot lands on the server, its transcript does not.
+        std::fs::write(dst_root.join("b.txt"), b"two").unwrap();
+        let snap2 = dst.commit("t", "c2").unwrap();
+        dst.sign_snapshot(snap2, &identity).unwrap();
+        let tid2 = dst
+            .attach_transcript(snap2, "claude-code", "s2", b"body2", &recipients)
+            .unwrap();
+        dst.push_opts("origin", true).unwrap();
+        drop(dst);
+        {
+            let src = Repo::open(&src_root).unwrap();
+            assert_eq!(src.head_tip().unwrap(), Some(snap2));
+            assert_eq!(src.signatures_for(&snap2).unwrap().len(), 1);
+            let idx = crate::transcripts::load(src.layout()).unwrap();
+            assert!(idx.contains(&(snap1, tid1)) && !idx.iter().any(|(_, t)| *t == tid2));
+        }
+
+        // fetch: the new snapshot arrives; the server re-sends tid1 and the
+        // client drops it.
+        let fetched = dst2.fetch_opts("origin", true).unwrap();
+        assert!(fetched.iter().any(|(_, id)| *id == snap2));
+        absent(&dst2, tid1);
+
+        // Per command: a plain fetch brings it in.
+        dst2.fetch("origin").unwrap();
+        assert!(dst2
+            .transcripts_for(&snap1)
+            .unwrap()
+            .iter()
+            .any(|(t, _)| *t == tid1));
+
+        drop(dst2);
+        for root in [&src_root, &dst_root, &dst2_root] {
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
+        }
+    }
+
     // ── Task 4: loopback classifier + fail-closed bind gate + bearer auth
     // gate + read-only threading. ──
 

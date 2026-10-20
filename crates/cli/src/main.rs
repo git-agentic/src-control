@@ -317,6 +317,14 @@ enum Cmd {
         /// process. Requires `--filter`.
         #[arg(long, requires = "filter")]
         lazy: bool,
+        /// Leave transcript objects (P30) out of this transfer: the server
+        /// still sends them, the client hash-checks and discards them, so
+        /// this transfer writes none and indexes none. Per command, not
+        /// remembered by the clone; a later plain fetch brings them in.
+        /// Does nothing for git remotes and bucket remotes (sc+wal://,
+        /// sc+s3://), which carry no transcripts.
+        #[arg(long)]
+        no_transcripts: bool,
     },
     /// Serve a repo to a remote `sc` client, either over stdin/stdout
     /// (invoked by `ssh` for ssh:// remotes) or over TCP (`sc+http://`
@@ -393,6 +401,15 @@ enum Cmd {
     Fetch {
         #[arg(default_value = "origin")]
         remote: String,
+        /// Leave transcript objects (P30) out of this fetch: the server
+        /// still sends them, the client hash-checks and discards them, so
+        /// this fetch writes none and indexes none (a new signature over a
+        /// transcript you already hold is dropped too). Per command, not
+        /// remembered; a later plain fetch brings them in. Does nothing for
+        /// git remotes and bucket remotes (sc+wal://, sc+s3://), which
+        /// carry no transcripts.
+        #[arg(long)]
+        no_transcripts: bool,
     },
     /// Push the current branch to a remote (fast-forward-only).
     Push {
@@ -401,6 +418,13 @@ enum Cmd {
         /// For git remotes: allow pushing protected ciphertext and dropping secrets.
         #[arg(long)]
         include_encrypted: bool,
+        /// Do not send transcript objects (P30) or their signatures. Sealed
+        /// bodies stay sealed either way; snapshots still transfer. Does
+        /// nothing for git remotes, which never carry transcripts. A bucket
+        /// remote (sc+wal://, sc+s3://) is stored but never served them, so
+        /// there the flag only spares the upload.
+        #[arg(long)]
+        no_transcripts: bool,
     },
     /// Protect a path prefix: files under it are convergently encrypted for the
     /// named recipients on commit. With `--list` (or no prefix), list the rules.
@@ -1036,7 +1060,8 @@ fn main() -> Result<()> {
             git,
             filter,
             lazy,
-        } => run_clone(src, dst, git, filter, lazy),
+            no_transcripts,
+        } => run_clone(src, dst, git, filter, lazy, no_transcripts),
         Cmd::Cat { target } => run_cat(&target),
         Cmd::Serve {
             sub,
@@ -1085,11 +1110,15 @@ fn main() -> Result<()> {
             }
         },
         Cmd::Remote { op } => run_remote(op),
-        Cmd::Fetch { remote } => run_fetch(&remote),
+        Cmd::Fetch {
+            remote,
+            no_transcripts,
+        } => run_fetch(&remote, no_transcripts),
         Cmd::Push {
             remote,
             include_encrypted,
-        } => run_push(&remote, include_encrypted),
+            no_transcripts,
+        } => run_push(&remote, include_encrypted, no_transcripts),
         Cmd::Protect {
             prefix,
             to,
@@ -3624,7 +3653,14 @@ fn absolute_local_source(src: String) -> String {
         .unwrap_or(src)
 }
 
-fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>, lazy: bool) -> Result<()> {
+fn run_clone(
+    src: String,
+    dst: PathBuf,
+    git: bool,
+    filter: Vec<String>,
+    lazy: bool,
+    no_transcripts: bool,
+) -> Result<()> {
     // Auto-detect unambiguous git URL forms (https/http, scp-style, file://):
     // those can never be sc-native, so no flag is needed. Bare `ssh://` is
     // ambiguous — it means an sc-native remote (ADR-0022) unless `--git`
@@ -3638,7 +3674,7 @@ fn run_clone(src: String, dst: PathBuf, git: bool, filter: Vec<String>, lazy: bo
     }
     let src = absolute_local_source(src);
     let filter_opt = (!filter.is_empty()).then_some(filter.as_slice());
-    let repo = scl_repo::Repo::clone_url_filtered(&src, &dst, filter_opt)?;
+    let repo = scl_repo::Repo::clone_url_opts(&src, &dst, filter_opt, no_transcripts)?;
     if lazy {
         scl_repo::promisor::set_lazy(repo.layout(), true)?;
     }
@@ -4015,13 +4051,13 @@ fn run_remote(op: RemoteOp) -> Result<()> {
 /// remote gets a full-history import into a remote-tracking ref (see
 /// `run_fetch_git`); an `sc`-kind remote (or unconfigured, defaulting to `sc`)
 /// uses the existing object-transport fetch.
-fn run_fetch(remote: &str) -> Result<()> {
+fn run_fetch(remote: &str, no_transcripts: bool) -> Result<()> {
     let repo = open_repo()?;
     let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
     match cfg.kind(remote) {
         Some(scl_repo::RemoteKind::Git) => run_fetch_git(&repo, remote),
         _ => {
-            let remote_refs = repo.fetch(remote)?;
+            let remote_refs = repo.fetch_opts(remote, no_transcripts)?;
             println!("fetched {remote}: {} remote branch(es)", remote_refs.len());
             for (branch, tip) in remote_refs {
                 println!("  {remote}/{branch} -> {}", tip.short());
@@ -4082,7 +4118,7 @@ fn run_fetch_git(repo: &scl_repo::Repo, remote: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_push(remote: &str, include_encrypted: bool) -> Result<()> {
+fn run_push(remote: &str, include_encrypted: bool, no_transcripts: bool) -> Result<()> {
     let repo = open_repo()?;
     let cfg = scl_repo::RemoteConfig::load(repo.layout())?;
     match cfg.kind(remote) {
@@ -4110,7 +4146,7 @@ fn run_push(remote: &str, include_encrypted: bool) -> Result<()> {
             run_push_git(&repo, remote, include_encrypted)
         }
         _ => {
-            let tip = repo.push(remote)?;
+            let tip = repo.push_opts(remote, no_transcripts)?;
             println!("pushed to {remote}: {}", tip.short());
             Ok(())
         }
@@ -4905,6 +4941,7 @@ mod tests {
             false,
             Vec::new(),
             false,
+            false,
         )
         .unwrap();
         let repo = scl_repo::Repo::open(&dst).unwrap();
@@ -4954,6 +4991,7 @@ mod tests {
             root.join("cloned-ssh"),
             false,
             Vec::new(),
+            false,
             false,
         )
         .unwrap_err();
