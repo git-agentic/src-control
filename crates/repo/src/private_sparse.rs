@@ -92,6 +92,10 @@ fn run(f: &Fixture, view: bool) -> BTreeMap<String, String> {
     }
     put(&f.root, "src/lib.rs", "resolved\n");
     f.repo.commit_private("alice", "resolve", sk).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
+        "resolved\n"
+    );
     if view {
         assert!(docs(&f.root).is_empty(), "completion widened the view");
         f.repo.switch_with_identity("main", sk).unwrap();
@@ -144,11 +148,14 @@ fn an_out_of_view_conflict_is_refused_before_any_write() {
 #[test]
 fn replay_onto_a_private_branch_stays_refused_under_sparse() {
     let f = fixture("replay", true, false);
-    assert!(f
-        .repo
-        .cherry_pick("main", "alice", Some(&f.sk), None)
-        .is_err());
-    assert!(f.repo.rebase("main", "alice", Some(&f.sk)).is_err());
+    assert!(matches!(
+        f.repo.cherry_pick("main", "alice", Some(&f.sk), None),
+        Err(Error::PrivateUnsupported(_))
+    ));
+    assert!(matches!(
+        f.repo.rebase("main", "alice", Some(&f.sk)),
+        Err(Error::PrivateUnsupported(_))
+    ));
     assert!(docs(&f.root).is_empty());
     std::fs::remove_dir_all(&f.root).unwrap();
     assert!(!f.root.exists(), "test dir left behind");

@@ -361,11 +361,12 @@ protected and skipped). It used to carry them from the prior private tip, so
 a path the public side had cleanly deleted outside the view came back, and
 its clean adds and modifies there were lost. The public path fixed the same
 class in #238 by completing from a recorded decided root (ADR-0034
-refinement 6). **A private merge records none**, on purpose: a decided inner
-tree is plaintext about the private tree (paths, plaintext blob ids), and
-`.sc/MERGE_*` is unsealed. Sealing it under the branch KEK would need a
-second index outside the manifest, for a state that lives only until the
-next commit. Instead:
+refinement 6). **A private merge records none**, on purpose: the root would
+be only an id, but it names an inner tree, and that tree's objects (plaintext
+paths and blob ids about the private tree) would have to be stored unsealed
+next to the unsealed `.sc/MERGE_*`. Sealing them under the branch KEK would
+need a second index outside the manifest, for a state that lives only until
+the next commit. Instead:
 
 - The stop is a pure function of the ours inner tip, `MERGE_HEAD` and the
   merge base, none of which can move while the merge is stopped (every
@@ -377,8 +378,17 @@ next commit. Instead:
   It is not limited to sparse: on a full checkout a protected path the
   completer cannot read (skipped on disk) was carried from the prior tip too,
   silently reverting a clean public change to it. The re-derivation runs with
-  the completing identity, so a recipient without access to a protected path
-  both sides changed fails the completion rather than altering the outcome.
+  the completing identity. **Behavior change:** a recipient who cannot
+  decrypt a protected path both sides changed can no longer finish another
+  recipient's stopped merge; it errors before any scan, seal or ref move, and
+  the merge stays stopped for someone who can. Where the merged entry is
+  unreadable to the completer (for example the public side revoked them and
+  rotated the file), the stop removes the stale plaintext it would otherwise
+  leave behind, so completion carries the merged entry, not the old one.
+  Paths the merge decided are also read from disk regardless of the private
+  side's `.scignore` (as `with_decided_paths` does publicly, ADR-0049 q19).
+  The completion's scanner gate covers only files read from disk; re-derived
+  content comes from already-scanned commits, and `branch publish` rescans.
 - The stop honors the view like the public path (#220): it lays out only
   in-view files, and a conflict outside the view is refused before any write
   (no merge state, no ref move) with a hint to switch to a public branch and

@@ -698,7 +698,13 @@ impl Repo {
         };
 
         let prior = self.inner_tree_files(&mut store, &ctx, prev_snap.root)?;
-        let tracked: BTreeSet<String> = prior.keys().cloned().collect();
+        let mut tracked: BTreeSet<String> = prior.keys().cloned().collect();
+        // A path the merge decided is part of the outcome, so an ignore rule
+        // on the private side must not hide the stop's write of it (as
+        // `with_decided_paths` does on the public path, ADR-0049 q19).
+        if let Some(d) = &decided {
+            tracked.extend(d.keys().cloned());
+        }
         let files = worktree::read_worktree(&self.layout, &tracked)?;
 
         // Scanner gate on the plaintext partition (protected-prefix files are
@@ -1345,7 +1351,13 @@ impl Repo {
                     };
                     match crate::protect::decrypt_with(&f.bytes, &id, &[&prots], sk, &f.path) {
                         Ok(pt) => worktree::write_file(&full, &pt[..], f.mode)?,
-                        Err(_) => continue, // undecryptable: leave prior state
+                        Err(_) => {
+                            // Undecryptable by this recipient: drop the old
+                            // plaintext so completion carries the merged entry
+                            // instead of recommitting the stale one.
+                            let _ = std::fs::remove_file(&full);
+                            continue;
+                        }
                     }
                 } else {
                     worktree::write_file(&full, &f.bytes, f.mode)?;
@@ -2476,7 +2488,17 @@ mod tests {
     /// private side never touched it.
     #[test]
     fn merge_completion_takes_an_unreadable_protected_path_from_the_merge() {
-        let (root, repo, (alice_sk, _), (bob_sk, bob_pk)) = setup("protmerge");
+        unreadable_protected_path_case("protmerge", false);
+    }
+
+    /// Same, with the protected prefix outside a sparse view.
+    #[test]
+    fn sparse_merge_completion_takes_an_unreadable_protected_path_from_the_merge() {
+        unreadable_protected_path_case("protmerge-sparse", true);
+    }
+
+    fn unreadable_protected_path_case(tag: &str, sparse: bool) {
+        let (root, repo, (alice_sk, _), (bob_sk, bob_pk)) = setup(tag);
         repo.protect("vault/", std::slice::from_ref(&bob_pk), None)
             .unwrap();
         write(&root, "vault/key.pem", "PEM-V1\n");
@@ -2491,6 +2513,10 @@ mod tests {
         write(&root, "src/lib.rs", "public\n");
         write(&root, "vault/key.pem", "PEM-V2\n");
         repo.commit("tester", "main moves").unwrap();
+        if sparse {
+            repo.set_sparse(&["src/".to_string()], Some(&alice_sk))
+                .unwrap();
+        }
         repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
         assert!(matches!(
             repo.merge_into_private("main", "alice", Some(&alice_sk)),
@@ -2501,6 +2527,17 @@ mod tests {
             .unwrap();
         repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
         repo.switch_with_identity("fix", Some(&bob_sk)).unwrap();
+        if sparse {
+            // The view still applies to bob; widen it to see the vault.
+            repo.switch_with_identity("main", Some(&bob_sk)).unwrap();
+            repo.set_sparse(&["src/".to_string(), "vault/".to_string()], Some(&bob_sk))
+                .unwrap();
+            repo.switch_with_identity("fix", Some(&bob_sk)).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "resolved\n"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("vault/key.pem")).unwrap(),
             "PEM-V2\n",
@@ -2508,5 +2545,94 @@ mod tests {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The public side revokes the completer from a protected prefix and
+    /// rotates the file: the stop cannot decrypt the new ciphertext, so the
+    /// old plaintext must not survive on disk to be recommitted (#240 review).
+    #[test]
+    fn merge_completion_does_not_recommit_a_revoked_protected_file() {
+        let (root, repo, (alice_sk, alice_pk), (bob_sk, bob_pk)) = setup("protrevoke");
+        repo.protect("vault/", &[alice_pk.clone(), bob_pk.clone()], None)
+            .unwrap();
+        write(&root, "vault/key.pem", "PEM-V1\n");
+        repo.commit("tester", "add protected").unwrap();
+        repo.branch_private("fix", &alice_sk, std::slice::from_ref(&bob_pk), &[])
+            .unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        write(&root, "src/lib.rs", "private\n");
+        repo.commit_private("alice", "private work", Some(&alice_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        repo.revoke("vault/", &alice_pk.recipient_id()).unwrap();
+        write(&root, "vault/key.pem", "PEM-V2\n");
+        write(&root, "src/lib.rs", "public\n");
+        repo.commit("tester", "rotate").unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        assert!(matches!(
+            repo.merge_into_private("main", "alice", Some(&alice_sk)),
+            Err(Error::MergeConflicts(1))
+        ));
+        write(&root, "src/lib.rs", "resolved\n");
+        repo.commit_private("alice", "resolve", Some(&alice_sk))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "resolved\n"
+        );
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        repo.switch_with_identity("fix", Some(&bob_sk)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("vault/key.pem")).unwrap(),
+            "PEM-V2\n",
+            "the revoked key came back from the prior tip"
+        );
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    /// A path the public side adds in view must land even when the private
+    /// side's `.scignore` ignores it: completion reads the re-derived paths
+    /// regardless of ignore rules (#240 review, ADR-0049 q19).
+    #[test]
+    fn merge_completion_reads_a_decided_path_an_ignore_rule_hides() {
+        let (root, repo, (alice_sk, _), _bob) = setup("ignoredadd");
+        repo.branch_private("fix", &alice_sk, &[], &[]).unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        write(&root, "src/lib.rs", "private\n");
+        write(&root, ".scignore", "*.log\n");
+        repo.commit_private("alice", "private work", Some(&alice_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        write(&root, "src/lib.rs", "public\n");
+        write(&root, "src/build.log", "from-main\n");
+        repo.commit("tester", "main moves").unwrap();
+        repo.switch_with_identity("fix", Some(&alice_sk)).unwrap();
+        assert!(matches!(
+            repo.merge_into_private("main", "alice", Some(&alice_sk)),
+            Err(Error::MergeConflicts(1))
+        ));
+        write(&root, "src/lib.rs", "resolved\n");
+        repo.commit_private("alice", "resolve", Some(&alice_sk))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/build.log")).unwrap(),
+            "from-main\n"
+        );
+        let (_, mid, manifest) = repo.head_private().unwrap().unwrap();
+        let ctx = repo
+            .open_private("fix", mid, manifest, Some(&alice_sk))
+            .unwrap();
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let tip = ctx.inner_tip().unwrap();
+        let snap = repo.get_inner_snapshot(&mut store, &ctx, &tip).unwrap();
+        let files = repo.inner_tree_files(&mut store, &ctx, snap.root).unwrap();
+        assert!(files.contains_key("src/build.log"), "public add dropped");
+        drop(store);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
     }
 }
