@@ -236,6 +236,7 @@ fn a_tracked_theirs_file_refuses_the_stop() {
     assert_eq!(read(&root, "bin.dat.theirs"), "mine\n");
     drop(repo);
     std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists(), "test dir left behind");
 }
 
 #[test]
@@ -366,6 +367,7 @@ fn a_protected_conflict_is_recorded_aborted_and_honors_a_deletion() {
         assert!(!crate::merge_state::in_progress(repo.layout()));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test dir left behind");
     }
 }
 
@@ -419,4 +421,5 @@ fn a_decrypted_carried_protected_file_the_user_deletes_stays_deleted() {
     drop(store);
     drop(repo);
     std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists(), "test dir left behind");
 }

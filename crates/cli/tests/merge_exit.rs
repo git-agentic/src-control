@@ -111,4 +111,5 @@ fn abort_on_a_private_branch_needs_the_identity() {
 
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::remove_dir_all(&keys).unwrap();
+    assert!(!root.exists() && !keys.exists(), "test dir left behind");
 }
