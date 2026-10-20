@@ -441,9 +441,13 @@ sidecar into the tree and left it on disk. Now:
   delete a file the user owns.
 
 A failed removal of such a file is an error, not ignored (#255). Limits: the
-private stop keeps no decided root, so a conflicted path cannot be compared by
-content and counts as the stop's, and a user file at a tip path the stop
-removed is overwritten by the restore. Out-of-view paths are never removed by
+private stop keeps no decided root and no record of the bytes it laid, so a
+conflicted path cannot be compared by content and counts as the stop's, and the
+restore writes the tip over every path the tip tracks: a post-stop edit of one
+(or a user file at a tip path the stop removed) is lost, unlike the public
+abort. Closing that needs the stop to record what it laid without putting
+content ids in unsealed state. The stop's removal of a prior-tip path the
+merge deleted now runs before any conflict output and surfaces its error. Out-of-view paths are never removed by
 `materialize_private` (#256).
 
 Pinned by `private_abort.rs` and `crates/cli/tests/merge_exit.rs`.

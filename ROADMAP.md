@@ -763,9 +763,10 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
 - **User-file safety limits (ADR-0034 refinement 8, ADR-0044).** A file whose
   bytes equal the tracked or laid ones cannot be told from the stop's own
   write, so it is removed. `merge --abort` of a private-branch merge, which
-  keeps no decided root, still overwrites a user file at a path the stop
-  removed from the tip, and treats a conflicted path as the stop's whatever
-  its bytes. Private forward operations (switch, fast-forward, clean merge)
+  keeps no decided root, restores the tip over every path it tracks (a
+  post-stop edit of one, or a user file at a path the stop removed, is lost)
+  and treats a conflicted path as the stop's whatever its bytes. An abort with
+  no decided root (residue) removes nothing and does not say so. Private forward operations (switch, fast-forward, clean merge)
   remove in-view paths on the dirty check alone, without a byte comparison.
 - **Network-Git same-remote edge cases** (ADR-0018's re-synthesis
   limitation across different Git repos).

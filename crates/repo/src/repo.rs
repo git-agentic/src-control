@@ -2067,9 +2067,13 @@ impl Repo {
             };
             // A regular file only: the stop wrote one, so a symlink there is
             // the user's (a restore reports it as kept).
-            let is_file = worktree::safe_join(&self.layout.root, &path)?
-                .symlink_metadata()
-                .is_ok_and(|m| m.is_file());
+            let is_file = match worktree::safe_join(&self.layout.root, &path)?.symlink_metadata() {
+                Ok(m) => m.is_file(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                // Not knowing what stands there must stop the abort before
+                // its state is cleared, like a failed removal.
+                Err(e) => return Err(e.into()),
+            };
             if remove && is_file {
                 // Only an already-absent file is fine: any other failure must
                 // stop the abort before its state is cleared, or the decrypted

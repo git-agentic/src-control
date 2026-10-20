@@ -938,11 +938,13 @@ impl Repo {
                 continue;
             }
             let recorded = plaintext.contains(&p);
-            let ours = if perms & PROTECTED != 0 {
-                recorded
-            } else {
-                recorded || conflicted.contains(&p) || worktree::disk_is_blob(&full, &blob_id)
-            };
+            // The stop wrote regular files: a symlink there is the user's.
+            let ours = full.symlink_metadata().is_ok_and(|m| m.is_file())
+                && if perms & PROTECTED != 0 {
+                    recorded
+                } else {
+                    recorded || conflicted.contains(&p) || worktree::disk_is_blob(&full, &blob_id)
+                };
             if ours {
                 written.insert(p);
             } else {
@@ -1568,6 +1570,21 @@ impl Repo {
                     }
                 }
             }
+            // Drop the prior-tip paths the merge deleted, with the removals
+            // above and before any conflict output is written: a failure here
+            // then leaves no markers without a merge state, and is never
+            // swallowed (completion would resurrect the file from disk).
+            for p in prior_paths.difference(&merged_paths) {
+                if !sparse.matches(p) {
+                    continue;
+                }
+                let full = worktree::safe_join(&self.layout.root, p)?;
+                match std::fs::remove_file(full) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
             // Record what is about to land on disk in plaintext, and the
             // sidecars, before writing it: completion and abort need both
             // (see `conflict_plaintext`). Nothing here is sealed, and it names
@@ -1608,15 +1625,6 @@ impl Repo {
             for (name, bytes) in &fm.sidecars {
                 let full = worktree::safe_join(&self.layout.root, name)?;
                 std::fs::write(&full, bytes)?;
-            }
-            for p in prior_paths.difference(&merged_paths) {
-                if !sparse.matches(p) {
-                    continue;
-                }
-                let full = worktree::safe_join(&self.layout.root, p)?;
-                // Best effort, as before: an error here would leave the
-                // conflict files written above with no merge state to abort.
-                let _ = std::fs::remove_file(full);
             }
             crate::merge_state::write(&self.layout, &theirs, &fm.conflicts, None)?;
             return Err(Error::MergeConflicts(fm.conflicts.len()));
