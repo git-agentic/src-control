@@ -101,13 +101,20 @@ fn running_path(layout: &Layout, name: Option<&str>, i: u32) -> PathBuf {
     ws_dir(layout, name).join(format!("running-{i}"))
 }
 
-/// Refuse if a `sc ws run` command is still live in workspace `i`. A marker
-/// left by a process that is provably dead (killed before it could remove it)
-/// is cleared, using the same probe as the repo lock.
+/// Refuse if a `sc ws run` command is still live in workspace `i`. The marker
+/// names the `sc` process and, once spawned, its child (an orphaned child keeps
+/// the workspace busy after `sc` is killed). It is cleared only when every
+/// recorded pid is provably dead (the repo lock's probe); an unreadable or
+/// empty marker counts as busy.
 fn ensure_idle(layout: &Layout, name: Option<&str>, i: u32) -> Result<()> {
     let path = running_path(layout, name, i);
     if path.exists() {
-        if !crate::lock::holder_is_dead(&path) {
+        let pids: Vec<u32> = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        if pids.is_empty() || !pids.iter().all(|&p| crate::lock::pid_is_dead(p)) {
             return Err(Error::InvalidArgument(format!(
                 "workspace {i} has a `sc ws run` command still running ({}); \
                  wait for it to exit",
@@ -603,7 +610,24 @@ impl Repo {
         // CLI keeps running the command after dropping the lock.
         ensure_idle(self.layout(), name, index)?;
         let marker = running_path(self.layout(), name, index);
-        std::fs::write(&marker, std::process::id().to_string())?;
+        // Exclusive, so two plans for one workspace cannot both hold it.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(mut f) => {
+                std::io::Write::write_all(&mut f, std::process::id().to_string().as_bytes())?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Error::InvalidArgument(format!(
+                    "workspace {index} has a `sc ws run` command still running ({}); \
+                     wait for it to exit",
+                    marker.display()
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(WsRunPlan {
             marker,
             dir: entry.dir.clone(),
@@ -1112,7 +1136,14 @@ impl WsRunPlan {
         for (k, v) in &self.envs {
             command.env(k, v);
         }
-        Ok(command.status()?.code().unwrap_or(1))
+        let mut child = command.spawn()?;
+        // Record the child too: if `sc` is killed first, the orphan keeps the
+        // workspace busy. Best effort; the parent pid is already in the file.
+        let _ = scl_core::fsutil::atomic_write_durable(
+            &self.marker,
+            format!("{} {}", std::process::id(), child.id()).as_bytes(),
+        );
+        Ok(child.wait()?.code().unwrap_or(1))
     }
 }
 
@@ -2642,6 +2673,33 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         std::fs::write(running_path(repo.layout(), None, 1), pid.to_string()).unwrap();
+        assert_eq!(repo.ws_abandon(None, None).unwrap(), 0);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `sc` is killed but the command it started lives on: the workspace stays busy.
+    #[cfg(unix)]
+    #[test]
+    fn an_orphaned_child_keeps_its_workspace_busy() {
+        let root = tmp_root("named-busy-orphan");
+        let repo = init(&root);
+        repo.ws_fork(None, 1, "t", None).unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let mut orphan = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(
+            running_path(repo.layout(), None, 1),
+            format!("{dead_pid} {}", orphan.id()),
+        )
+        .unwrap();
+        assert!(repo.ws_abandon(None, None).is_err(), "child still runs");
+        orphan.kill().unwrap();
+        orphan.wait().unwrap();
         assert_eq!(repo.ws_abandon(None, None).unwrap(), 0);
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();

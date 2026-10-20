@@ -64,6 +64,11 @@ pub(crate) fn holder_is_dead(path: &std::path::Path) -> bool {
     let Ok(pid) = text.trim().parse::<u32>() else {
         return false;
     };
+    pid_is_dead(pid)
+}
+
+/// True only when `pid` is provably not running (see [`holder_is_dead`]).
+pub(crate) fn pid_is_dead(pid: u32) -> bool {
     if pid == std::process::id() {
         return false; // our own pid: definitely alive
     }
