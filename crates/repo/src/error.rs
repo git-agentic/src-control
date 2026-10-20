@@ -170,6 +170,12 @@ pub enum Error {
     /// human-readable limit text, carried verbatim across the wire.
     #[error("pack exceeds the server's --max-pack-size limit: {0}")]
     PackTooLarge(String),
+    /// The server closed the connection because the bytes it wrote for this
+    /// peer (`PutObject` + `PutPack`) exceeded the operator's
+    /// `--max-conn-bytes` budget (#233). Payload is the server's own
+    /// human-readable limit text, carried verbatim across the wire.
+    #[error("connection write budget exceeded: {0}")]
+    ConnectionBudgetExceeded(String),
     /// The server refused the connection at accept time because
     /// `--max-connections` was reached (P31). Retryable.
     #[error("server busy (connection limit reached); retry later")]

@@ -805,6 +805,12 @@ scale-&-reach horizon):
   `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE` set the per-object cap
   (default 256 MiB, range 2 MiB to 1 GiB, out of range aborts startup). No wire
   negotiation: each receiver applies its own cap.
+- **Per-connection write budget — shipped (#233, ADR-0039 second addendum).**
+  `sc serve --max-conn-bytes` bounds the sum of `PutObject` bytes and `PutPack`
+  bytes (per pack, the larger of spool bytes and decoded bytes held) one connection can
+  make the server retain; over it the server replies
+  `ConnectionBudgetExceeded` and closes. No `PROTOCOL_VERSION` bump. Not built:
+  a request-count or CPU budget, and a per-peer (cross-connection) budget.
 - **P28 review follow-ons — shipped.** `refs::write_head`/`delete_branch` run
   `validate_branch_name`; `SC_PACK_CHUNK` is clamped to the minimum configurable object cap minus one (2 MiB - 1, so every chunk frame fits any valid receiver) (a chunk frame carries a tag byte too; an
   oversized value used to make every transfer fail with a confusing receiver

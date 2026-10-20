@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-09
 - **Phase:** 28
-- **Amended:** #213 (addendum at the end) made the object cap configurable; the `MAX_OBJECT_SIZE` constant and 256 MiB figures in the sections before the addendum are the original design.
+- **Amended:** #213 (first addendum) made the object cap configurable; the `MAX_OBJECT_SIZE` constant and 256 MiB figures in the sections before the addendum are the original design. #233 (second addendum, at the end) added a per-connection write budget and closes the "known gap" paragraph in the #213 addendum.
 - **Builds on:** ADR-0021 (durability/concurrency hardening — the P21 sweep precedent), ADR-0022 (ssh wire protocol), ADR-0015 (packfiles), ADR-0014 (protected paths), ADR-0008/0009 (secrets)
 
 ## Context
@@ -213,13 +213,10 @@ connection's own store budget (each served connection opens its own store,
 the 1 GiB ceiling about 2 GiB + 2 GiB, per connection, times
 `--max-connections` (THREAT-MODEL.md).
 
-Known gaps, not addressed here. `Object::blob_size` is 0 for structural
-objects (trees, snapshots, secrets, transcripts), so a writable listener has no
-per-connection aggregate byte bound on repeated `PutObject` of distinct
-structural objects; each is capped, the sum is bounded only by
-`--max-connections` x connection lifetime. This predates #213 and a raised cap
-amplifies it: prefer read-only or token-gated listeners, keep the cap low.
-Tracked in #233. A local-path remote loads and encodes an object before the
+Known gap, since closed by #233 (second addendum): `Object::blob_size` is 0 for
+structural objects (trees, snapshots, secrets, transcripts), so a writable
+listener had no per-connection aggregate byte bound on repeated `PutObject` of
+distinct structural objects. A local-path remote loads and encodes an object before the
 receiver's cap refuses it (`TransportSource::get`), bounded by the store
 budget.
 
@@ -233,3 +230,100 @@ Unchanged: the cap is still a transfer-path guard, not a local-commit limit,
 so lowering it can leave a repository holding committed objects it cannot
 push; `read_object_at` (the trusted on-disk path) stays uncapped. The
 desktop app does not read the env var; it does no transfers.
+
+## Addendum (#233): per-connection write budget
+
+**Problem.** `Object::blob_size` is 0 for trees, snapshots, secrets and
+transcripts, so the store budget never sees them. A writable `sc serve`
+connection could `PutObject` distinct structural objects, each under the
+object cap, with no bound on the sum except `--max-connections` x
+connection lifetime (`--timeout` is an inactivity bound, not a total).
+Repeated `PutPack` frames had the same shape: `--max-pack-size` caps one
+pack, not the connection.
+
+**Decision.** `serve_session` keeps a running byte counter per connection
+(`ConnBudget`), set by `sc serve --max-conn-bytes <size>` (`--http` and
+`--stdio`; same parser and `KiB`/`MiB`/`GiB` suffixes as `--max-object-size`,
+`scl_core::parse_byte_size`). It counts, per request:
+
+- `PutObject`: the frame's decoded length, every time, structural or not.
+  An object the store already holds still counts: checking would cost a
+  lookup per request and a replaying peer gains nothing from it.
+- `PutPack`: the larger of the pack's spooled bytes and the decoded bytes
+  the receiver holds for it (below). It is `max`, not a sum, because the
+  spool is the compressed form of the same records: summing would refuse a
+  maximal pack of incompressible structure on a budget the startup bounds
+  say fits it.
+
+Reads (`GetObject`, `GetObjects`, `GetPack`, ref listing) are not budgeted.
+
+**What a pack holds (ingest-path finding).** Reading
+`ingest_pack_file_impl`: a pack is spooled to disk, verified in pass 1, then
+every record is `Store::put` in pass 2. The store keeps trees, snapshots,
+secrets and transcripts resident (CLAUDE.md: "small, not evicted") and only
+blobs and sealed payloads are budgeted, so a pack's structural records are
+retained exactly like `PutObject` ones. The spool size understates them by
+the zstd ratio (a 3 MB tree with one long name packs to a few KB). Pass 1
+therefore sums `Object::encode().len()` for every record whose `blob_size`
+is 0 (`PackTally`) and refuses before pass 2 if the sum exceeds the whole
+remaining budget. Blobs are not added on a local store: the store budget
+bounds them and the spool already covers their bytes. A bucket-backed
+`--store` is different: `BucketTransport::put_pack` decodes every record,
+blobs included, into a `Vec` until the upload, so there `scan_pack_tally`
+(one extra verify pass over the spool) counts every record before the
+upload starts.
+
+**Enforcement and state.** A `PutObject` that would exceed the budget is
+refused before the store write; a `PutPack` is cut off mid-stream at the
+smaller of `--max-pack-size` and what is left of the budget (the existing
+counted abort, reported as the budget error when the budget was the
+binding cap) and a pack whose structural bytes do not fit is refused
+before pass 2. Either way the server replies and closes the connection,
+the same path as the `PutPack` Protocol-error arm: the spool guard drops,
+no later request is served, and a retry on a fresh connection starts at
+zero. Bytes of the refused request are counted (the counter is not
+rolled back), which is moot because the connection ends. The comparison is
+`used > limit`, so a total exactly equal to the budget is accepted. A pack's
+cost is charged even when ingest then fails, since an error after pass 2
+began (an index write) can leave records stored on an open connection.
+
+**Delivery of the typed error.** After a mid-stream cap abort the server
+drains up to `ro_drain_cap` (8 MiB, reused: it is the same "keep the socket
+from being reset over unread bytes" job as the read-only path) before
+closing. A client therefore sees the typed error when it overshoots by less
+than that; past it the OS may reset the connection and the reply is lost.
+`WireClient::put_pack` also tries to read a reply after a write fails on a
+dead socket (broken pipe or reset), so a refusal that did get through is
+reported instead of the I/O error. ADR-0041 decision 3 (immediate teardown
+on `EC_TOO_LARGE`) is amended the same way: see its #233 note.
+
+**Wire.** New error code `EC_BUDGET = 7` mapped to
+`Error::ConnectionBudgetExceeded(String)` (payload is the server's own
+text, like `PackTooLarge`). `PROTOCOL_VERSION` is unchanged: an older client
+degrades an unknown code to `Error::Remote(msg)`, which still carries the
+message.
+
+**Bounds and default.** The flag must be greater than zero (`sc serve` has no
+unlimited setting), at least the max object size (a smaller
+budget could not admit one object) and at least a nonzero
+`--max-pack-size` (a smaller one would silently lower the pack cap);
+violations abort startup, never clamped. Default: `--max-pack-size`
+(16 GiB when unlimited) plus the max object size, so a legitimate push that
+fills the pack cap and adds one more object still fits one connection. That
+default bounds the sum at about 16.25 GiB per connection. It does **not**
+protect RAM or disk in any practical sense, and with `--max-connections`
+(default 32) the product is far larger. An operator who wants a real bound
+lowers `--max-pack-size` and `--max-conn-bytes` together; `sc serve --http`
+prints a startup warning for a writable, non-loopback listener left on the
+default.
+A pack is bounded by its *decoded* size, not just `--max-pack-size`: on a
+bucket `--store` a compressible pack's decoded size is usually 2-4x its spool
+and can exceed the default, and on a local store a tree-dominated pack can
+too. Refusing those is intended; they are the retention this budget exists to
+bound. A workload that legitimately pushes more than the budget over one
+connection must raise `--max-conn-bytes` or push over several connections.
+
+**Not covered.** The budget bounds bytes accepted, not request count or
+CPU. A budgeted peer can still use `--max-connections` x the budget, and
+`WirePolicy::max_conn_bytes` / `ServeLimits::max_conn_bytes` of 0 (embedders
+and tests) is unlimited; only the CLI refuses it.
