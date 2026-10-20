@@ -2250,10 +2250,16 @@ impl Repo {
         // Relies on `stop_write_blocker` treating whatever stands at `rel` (any
         // directory included) as the user's: nothing outside the view is laid
         // out, so no tracked file can be on disk there.
-        // Only a case alias of a path `old` laid out (a case-only rename on a
-        // case-insensitive filesystem) is the tracked file.
+        // Only a case alias of a path `old` laid out, so inside the view (a
+        // case-only rename on a case-insensitive filesystem), is the tracked
+        // file; an out-of-view old path was never on disk.
         let root = &self.layout.root;
-        let mut is_tracked = |p: &str| is_tracked_case_alias(root, old, p);
+        let laid_out = std::cell::OnceCell::new();
+        let mut is_tracked = |p: &str| {
+            let laid_out: &std::collections::BTreeSet<String> = laid_out
+                .get_or_init(|| old.iter().filter(|o| sparse.matches(o)).cloned().collect());
+            is_tracked_case_alias(root, laid_out, p)
+        };
         for rel in target
             .iter()
             .filter(|p| !sparse.matches(p) && !old.contains(*p))
