@@ -551,26 +551,65 @@ across every phase.
   remain opaque; the slice has no mutation, decryption, or general filesystem
   IPC. `@pierre/trees` remains exact-pinned to its current beta and should be
   reconsidered when its stable release is published. (ADR-0045.)
+- **Phase 36 — Bucket WAL remotes (`sc+wal://`, `sc+s3://`).** A remote that
+  is only a bucket: immutable packs, a log of versioned entries and one
+  compare-and-swap manifest, so no long-lived server is needed to push or
+  fetch. P36a added the `objio` leaf crate (`Bucket` trait, directory and S3
+  backends, the S3 SDK quarantined there) and `BucketTransport`; P36b added
+  checkpoints so a cold start reads the tail of the log, not all of it; P36c
+  added `sc serve --store <url>`, a bucket-backed serve whose instances are
+  disposable (tokens, TLS identity and scratch stay in a local serve home).
+  Public content is plaintext at rest (the bucket ACL is the perimeter);
+  `clone --filter` is refused. `get_pack` serves signatures, transcripts and
+  signed drop tombstones by decoding the on-chain packs (#229, no format
+  change). (ADR-0046.)
+- **Phase 37a — Want-by-id fetch.** A batched `GetObjects` verb (wire v5), an
+  opt-in `.sc/promisor-lazy` marker, and `sc cat <ref>:<path>`, which fills only
+  the absent trees and the blob on its path. `Store::get` stays network-free.
+  Proven by `demo/run_lazy_fetch_demo.sh`. (ADR-0047.)
+- **Phase 37b — Presence-based partial clones.** 37b-i: push, verify and gc walk
+  what the store holds, not the fetch filter; a view gap fails with `GapInView`
+  before any write. 37b-ii: on a lazy, online clone the view closure is filled
+  by id before switch, fast-forward, undo and `sparse set`, and `sparse set` may
+  widen past the filter. (ADR-0048.)
+- **Phase 37c — Merge, cherry-pick and rebase on a partial clone.** A
+  tree-recursive three-way engine carries a subtree by id where the sides agree
+  and no protection rule applies (a subtree identical on all three sides is
+  carried even under a rule); conflicts inside the view are marked and
+  resolved as on a full clone, conflicts outside it are refused before any
+  write. (ADR-0049.)
+- **Phase 37d — Agent sessions on a partial clone.** `sc ws` and `sc work` work
+  on a partial clone: a workspace sees the host's sparse view, and harvest lands
+  through the ADR-0049 merge. (ADR-0050.)
+- **Post-P37 additions (phase-less).**
+  - `sc rewrap --rotate` re-seals every protected blob at the tip under a fresh
+    DEK (ADR-0051).
+  - `sc run --secrets-fd N` hands secrets to the command on a descriptor instead
+    of its environment (ADR-0052).
+  - `sc tls list/forget/pin/path` manages the `sc+https://` pin file (ADR-0053);
+    `SC_HTTPS_CA_FILE` / `SC_HTTPS_CA=system` validate against a CA instead of
+    pinning (ADR-0054).
+  - `sc serve token add --expires` and `token rotate` (#209, ADR-0040).
+  - The four P32 TLS follow-ons: no minting outside a repo, a warning for
+    `SC_HTTPS_*` on a plaintext URL, bounded client connect/handshake, and
+    `remote add` validation of `sc+http(s)://` URLs (#208).
+  - `--max-object-size` / `SC_MAX_OBJECT_SIZE` (#213) and the per-connection
+    write budget `sc serve --max-conn-bytes` (#233); ADR-0039 addenda.
+  - `--no-transcripts` on clone, fetch and push (#211) and
+    `sc transcript drop` with signed tombstones (#212); ADR-0038 addendum.
+  - Sparse follow-ups: a partial clone checks a `.theirs` sidecar by its base
+    path, and `sc sparse set` may widen while a merge, pick or rebase is stopped
+    (#224, #236); a stopped completion no longer resurrects out-of-view
+    deletions (#239).
+  - Checkout restores the executable bit on the write-out paths (#242); `sc resolve`
+    after the user deleted a conflicted file still drops it (#243).
+  - A warning when the protected-cache key cannot be permission-restricted on a
+    non-unix target (#225; the owner-only ACL is #214).
 
 ## Active
 
-**P37b — presence-based walks and the lifted P27 refusals (37b-i, 37b-ii built).**
-P37a (built) added the batched `GetObjects` verb and `sc cat`. 37b-i (built)
-made push, verify and gc ask "is this object present?" instead of "is this
-path in the filter?", which also fixed gc and fast-forward failing after an
-ordinary fetch on a partial clone. 37b-ii (built) added sparse widen on a lazy
-clone: the view closure is filled by id before switch, fast-forward, undo and
-`sparse set`, and a by-id reply is capped and split on refusal. `export` and
-`sparse disable` stay refused. Design and open questions in
-[ADR-0048](docs/adr/0048-presence-based-partial-clones.md).
-
-**P37c — merge on partial clones (built; 37c-i engine, 37c-ii clean merge, 37c-iii conflicts and 37c-iv replay).** A tree-recursive three-way merge
-that carries a subtree by id where the three sides agree, checks protection
-rules before carrying, never drops wraps for subtrees it does not enumerate,
-and fills (lazy) or refuses (otherwise) the region where the sides differ,
-the region that intersects a protection rule, and the sparse view's closure. Merges are built (`sc merge` on a partial clone): a conflict inside the view is marked, resolved with `sc conflicts`/`sc resolve`, aborted or committed like on a full clone; a conflict outside the view, or one that needs sealing outside it, is refused before any write. Cherry-pick and rebase use the same engine and conflict contract (`sc cherry-pick`, `sc rebase` and their `--continue`/`--abort` work on a partial clone); sessions are built (P37d, [ADR-0050](docs/adr/0050-sessions-on-partial-clones.md)): workspaces and
-agents see the clone's view, and harvest lands through this merge. Design in
-[ADR-0049](docs/adr/0049-merge-on-partial-clones.md).
+No phase is in flight. Follow-up work is tracked as GitHub issues and listed
+under Deferred below.
 
 ## Completed phases (usability-first ordering)
 
@@ -599,7 +638,7 @@ agents see the clone's view, and harvest lands through this merge. Design in
 | **P24 — Sparse checkouts / sub-tree sharing** | Materialize one subtree of a large repo, leave the rest on the CAS | `sc sparse set <prefix…>`/`show`/`disable`; `commit`'s absent-path carry widens to out-of-sparse paths (byte-identical carried subtrees); `materialize` filters both its write and removal loops; proven by `demo/run_sparse_demo.sh` (narrow, edit, commit, then disable/clone restore byte-identical) | [0034](docs/adr/0034-sparse-checkouts.md) |
 | **P25 — Streaming pack transfer (bounded-RAM, >4 GiB)** | `push`/`fetch`/`clone` over ssh:// don't hold a whole pack in RAM anywhere — server, wire, or client | `PackWriter`/`parse_pack_reader` (bounded-RAM pack build/parse); `ST_PACK_CHUNK`/`ST_PACK_END` chunk framing (`SC_PACK_CHUNK`-tunable); `PROTOCOL_VERSION` 2, v1 dropped; two-pass atomic-after-verify ingest + `TempPackGuard`; the ssh client's own `sync.rs` fetch/push call sites route through the same `ingest_pack_file`/`write_ids_to_temp_pack` machinery (final-review fix); proven by `demo/run_streaming_demo.sh` (forced 4 KiB chunks, byte-for-byte clone, signature rides the stream, zero temp residue) | [0035](docs/adr/0035-streaming-transfer.md) |
 | **P26 — sc-native HTTP transport** | Reach a repo over plain TCP with no ssh account | `sc serve --http <addr> <path>`; `sc clone sc+http://host[:port]/repo`; thread-per-connection server, opening-status mapped before the wire handshake, P25 chunk stream + P22 signatures ride the raw socket with no HTTP framing; proven by `demo/run_http_remote_demo.sh` (real loopback TCP, no shim; clone/push/fetch byte-for-byte, signed commit verifies clean, zero `.sc/tmp` residue) | [0036](docs/adr/0036-http-transport.md) |
-| **P27 — Partial clone** | Bound network transfer to a subset of paths, not the whole repo | `sc clone --filter <prefix…> <src> <dst>` fetches only in-filter objects (`.sc/promisor` + filtered reachability walk); `sc backfill <prefix…>` widens on demand; `sc gc`/`sc verify` are gap-tolerant; merge/rebase/`ws harvest`/`sc work`/`sc export` refuse on a partial clone; proven by `demo/run_partial_clone_demo.sh` (fewer objects fetched, push composes after a partial-clone commit, backfill shrinks the gap count, gc preserves everything, run twice) | [0037](docs/adr/0037-partial-clone.md) |
+| **P27 — Partial clone** | Bound network transfer to a subset of paths, not the whole repo | `sc clone --filter <prefix…> <src> <dst>` fetches only in-filter objects (`.sc/promisor` + filtered reachability walk); `sc backfill <prefix…>` widens on demand; `sc gc`/`sc verify` are gap-tolerant; merge/rebase/`ws harvest`/`sc work`/`sc export` refused on a partial clone at the time (P37c and P37d later lifted the merge, replay and session refusals; `sc export` still refuses); proven by `demo/run_partial_clone_demo.sh` (fewer objects fetched, push composes after a partial-clone commit, backfill shrinks the gap count, gc preserves everything, run twice) | [0037](docs/adr/0037-partial-clone.md) |
 | **P28 — Security hardening sweep** | Close the audit's concrete-bug Highs + surface the accepted Mediums | strict ref-name validation at the write/read boundary (hostile wire `UpdateRef` + git-remote branch names rejected); `MAX_OBJECT_SIZE` caps every untrusted frame/pack-record/zstd-output length; `sc protect` nudges low-entropy secret filenames toward `sc secret`; secret env-var boundary documented as authorized-local-process-context + plaintext stays `Zeroizing`; every prior demo green + new pinned regression tests, no new dependency | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | **P29 — sc+http access control** | Close the audit's remaining unauthenticated-server High | fail-closed non-loopback bind; `sc serve token add/remove/list` + `SC_HTTP_TOKEN` bearer auth at the HTTP opening (constant-time `BLAKE3` compare, `401` before the wire handoff); `--read-only`/`ro`-scope tokens reject mutating verbs before any store write via `EC_READONLY`; proven by `demo/run_http_auth_demo.sh` | [0040](docs/adr/0040-sc-http-access-control.md) |
 | **P30 — Agent session transcripts** | Attach a sealed, provenance-checked agent-session record to a commit | `sc transcript attach <ref> <file> --agent claude --sign`; a keyless clone gets ciphertext only, the recipient's identity decrypts byte-exact; `sc log` shows a non-decrypting presence marker; `sc gc` prunes a transcript once its only snapshot is unreachable; proven by `demo/run_transcript_demo.sh` | [0038](docs/adr/0038-agent-session-transcripts.md) |
@@ -608,7 +647,11 @@ agents see the clone's view, and harvest lands through this merge. Design in
 | **P33 — Randomized protected encryption** | Close equality confirmation for new protected content | fresh DEK + nonce per seal, dual-read/randomized-write, keyed local stat cache, rewrap upgrade | [0043](docs/adr/0043-randomized-protected-encryption.md) |
 | **P34 — Private branches** | Keep an entire branch opaque before publication | sealed object closure behind a manifest; O(1) grant, KEK-rotating revoke, scanner-gated publish | [0044](docs/adr/0044-per-branch-access-control.md) |
 | **P35 — Native desktop browser** | Prove native `.sc` objects can power a polished visual tool | Tauri app opens a repository and browses refs, snapshot DAG/provenance, public trees, and first-parent diffs while locked/private states remain safe | [0045](docs/adr/0045-native-desktop-read-model.md) |
+| **P36 — Bucket WAL remotes** | Sync through an object store with no long-lived server | `sc remote add <name> sc+wal://<dir>` or `sc+s3://<bucket>/<prefix>`; immutable packs plus one CAS'd manifest, checkpoints for cold start (P36b), `sc serve --store <url>` for a disposable bucket-backed server (P36c); signatures, transcripts and drop tombstones travel (#229); covered by unit and integration tests, no demo script | [0046](docs/adr/0046-wal-bucket-remotes.md) |
 | **P37a — Want-by-id fetch (`sc cat`)** | Read outside a partial clone's filter without backfilling everything | `sc clone --filter src/ --lazy`; `sc cat main:docs/api/guide.bin` fetches exactly the absent trees and the blob by object id (`GetObjects`, wire v5), sibling untouched; `SC_OFFLINE=1` and non-lazy clones keep the gap error; proven by `demo/run_lazy_fetch_demo.sh` | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
+| **P37b — Presence-based partial clones** | Make push, verify, gc and the view agree on what a partial clone holds | `reachable_objects_partial` walks the store, not the filter; `GapInView` before any write; on a lazy, online clone the view closure is filled by id before switch, fast-forward, undo and `sparse set` (which may widen past the filter) | [0048](docs/adr/0048-presence-based-partial-clones.md) |
+| **P37c — Merge on partial clones** | `sc merge`, `sc cherry-pick` and `sc rebase` without a full clone | tree-recursive engine carries subtrees by id; conflicts in the view are marked and resolved with `sc conflicts`/`sc resolve`; conflicts outside the view are refused before any write | [0049](docs/adr/0049-merge-on-partial-clones.md) |
+| **P37d — Sessions on partial clones** | Agent workspaces on a partial clone | `sc ws fork/run/harvest/abandon` and `sc work` see the clone's sparse view; harvest lands through the ADR-0049 merge, conflicts fall back to `work-<i>` | [0050](docs/adr/0050-sessions-on-partial-clones.md) |
 
 > **Prior art.** Phases P5–P9 adapt decisions from the sibling project
 > [git.agentic](https://github.com/git-agentic/git.agentic) (same BLAKE3
@@ -695,189 +738,81 @@ These apply across phases rather than to one:
 
 ## Deferred
 
-Tracked but out of scope for this roadmap horizon (former entries have
-graduated twice over: revocation tombstones → P16, bulk re-wrap + escrow
-keys → P17, network Git remotes → P18, history-editing polish → P19,
-sessions + auto-merge → P20; and now policy-op guards + marks recovery +
-abort/status minors → P21, signed commits → P22, merge ergonomics → P23,
-sparse checkouts → P24, streaming (>4 GiB) wire frames → P25, sc-native
-HTTP transport → P26, and partial clone → P27 — this closes the P25–P27
-scale-&-reach horizon):
+Tracked but out of scope for this roadmap horizon. Entries that name an issue
+(`#NNN`) mirror the open GitHub issues; the rest have no issue yet. Shipped
+items were removed from this list: the larger ones are under Done above, the
+smaller ones (protected-cache hygiene, theirs-side resolve carry, sparse and
+P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
+`CLAUDE.md`, `ARCHITECTURE.md` and the ADRs.
 
-- **`sc serve --http` connection limits (P26) — shipped in P31
-  (ADR-0041).** The three gaps recorded here are closed: a connection cap
-  (`--max-connections`, default 32), a per-connection idle/session timeout
-  (`--timeout`, default 300 s, covering the transfer after the opening
-  read), and bounded accept-loop backoff on repeated accept errors.
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
-- **Named/multiple concurrent ws sessions** (P20 ships one unnamed
-  session per repo) and workspace re-fork/refresh from a newer tip.
+- **Named/multiple concurrent ws sessions (#215, P20).** P20 ships one unnamed
+  session per repo; named or concurrent sessions and workspace re-fork/refresh
+  from a newer tip need a design decision first.
+- **Transcript drop delivery gaps (#230, ADR-0038 addendum).** A tombstone is
+  not sent after the dropper's gc removed its snapshot, and a tombstone a
+  push-only remote received before trusting the signer is not re-evaluated
+  later; both are documented limits, not regressions.
+- **Sparse untracked-file guard edge cases.** #241: on a case-insensitive
+  filesystem the untracked-file guard can alias an old-view path with a newly
+  in-view one. #248: an untracked file at an out-of-view path that the other side adds wins
+  over the merge result at completion.
+- **Abort and private-merge stop bugs.** #246: `--abort` of a merge stopped on a
+  private branch fails with `WrongKind`, and a binary conflict's `.theirs`
+  sidecar is committed into the sealed tree. #247: `--abort` of a stopped
+  merge, pick or rebase fails with `IsADirectory` when the decided root replaced
+  a file with a directory.
+- **Exec-bit review follow-ups (#243, from #242).** Mask setuid/setgid/sticky in
+  `worktree::write_file`, tests for the protected and private write-out paths,
+  `sc resolve` after a deleted conflicted file loses the execute bit, and
+  `vfs::Worktree::checkout` should tolerate `Unsupported` like `write_file`.
 - **Network-Git same-remote edge cases** (ADR-0018's re-synthesis
   limitation across different Git repos).
-- **Richer trust models** beyond trusted-key lists (delegation, expiry) —
-  P22 ships the key-list model.
-- **Sidecar-cleanup footgun in `rebase_continue` — fixed.** A stop records the
-  `.theirs` sidecars it actually wrote in `.sc/CONFLICT_SIDECARS`; merge/pick/
-  rebase abort, `rebase --continue` and `sc resolve` unlink only those (and
-  never a path the restored tree tracks), so an untracked user `foo.txt.theirs`
-  survives whatever the conflict kind.
-- **Completion commits a leftover `.theirs` sidecar — fixed.** The completion
-  snapshot (`sc commit`, `rebase --continue`) leaves out the sidecars the stop
-  recorded in `.sc/CONFLICT_SIDECARS` unless a root tracks that path, and the
-  commit then removes them; resolving by hand-editing no longer commits the
-  scratch file.
-  Known limit: the sweep retires the record before it unlinks, so a crash
-  between the two leaves the scratch file on disk with no record, and a retried
-  `sc commit` would take it. The opposite order would risk deleting a file the
-  user recreated at that path; closing both needs a journal.
-- **In-progress guard for the RECEIVING repo on push — fixed.**
-  `LocalTransport::update_ref` (so `sc push` to a local path and the wire
-  `UpdateRef`) refuses to move the receiving repo's checked-out branch while a
-  merge, cherry-pick or rebase is stopped there (`MergeInProgress` & co.), so
-  the completing commit cannot silently drop a pushed commit. Other branches
-  are unaffected.
-- **Sparse ergonomics (P24 final-review Minors) — shipped.** `sc sparse set`
-  warns for each prefix that matches no tracked path at HEAD (the tree is still
-  laid out, empty, and `sc sparse disable` is named as the way back); a bare
-  `sc sparse set` on a full clone is refused with a pointer to `sc sparse
-  disable` (a partial clone keeps its `sc backfill` refusal); and `.sc/sparse`
-  parsing ignores blank lines.
-- **Sparse follow-ups from #210 — shipped (#224).** A partial clone treats a
-  binary conflict's `.theirs` sidecar as in view when its conflicted path is, so
-  a file-exact spec no longer refuses it. `sc sparse set` may widen (never
-  narrow) while a merge, cherry-pick or rebase is stopped: the files coming into
-  view are laid out from the stop's decided root, so `rebase --continue`'s
-  out-of-view refusal no longer needs an abort. Protected files that come into
-  view mid-stop are not decrypted: they stay absent from disk and completion
-  carries them. A rebase's final fold re-lays the tree and decrypts them with
-  `--identity`; a merge or cherry-pick finished with `sc commit` writes no
-  working tree, so they stay absent until the next operation that does (a
-  `switch`, or `sparse set` again).
-- **Transparent lazy-fetch for partial clones (P27).** `sc backfill` is
-  explicit-only by design (ADR-0037's "no network in read paths" choice);
-  the identical filtered-walk/gap infra could instead dial the promisor
-  origin automatically on any gap, matching git's promisor default. Real
-  scope/risk (offline breakage, surprise latency, fetch-during-gc), so it
-  stays deferred, not accidentally missing.
-  **Now scoped as P37 (ADR-0047):** an opt-in `.sc/promisor-lazy` marker over a
-  batched by-id `GetObjects` verb, keeping `Store::get` network-free. P37a
-  (`sc cat`) is built; the rest is P37b.
-- **Per-case gap-tolerant merge/rebase/ws-harvest/sc-work on a partial
-  clone (P27).** These are refused entirely today
-  (`Error::PartialCloneUnsupported`) rather than gap-tolerantly
-  reimplemented — a deliberate MVP coarsening, not a technical ceiling.
-  Threading gap-tolerance through `three_way`/replay/`ws::harvest`
-  individually is the follow-on if the "backfill to a full clone first"
-  workaround proves too coarse in practice.
-  **Now scoped as P37b (ADR-0048) and P37c (ADR-0049, Proposed):** push,
-  verify and gc are presence-based (built); merge is designed in ADR-0049,
-  with replay and sessions (ADR-0050) following it.
-- **Blob-size/object-count clone filters (P27).** `sc clone --filter` is
-  prefix-only, matching the sparse path-boundary machinery already built;
-  git's `--filter=blob:limit` size-based filtering is a separate axis,
-  deferred.
-- **Randomized protected mode — SHIPPED in P33 (ADR-0043).** `sc protect`
-  used to stay convergent (deterministic DEK/nonce per plaintext), so
-  ciphertext equality confirmed plaintext equality without decryption —
-  accepted by design in ADR-0014, surfaced by P28's filename nudge. P33 closes
-  it: all new protected content seals under a fresh random DEK + nonce
-  (dual-read for pre-P33 convergent history; `sc rewrap` upgrades a tip on
-  demand). Moved from deferred to Done above.
-- **Rotate-for-paths — shipped (ADR-0051).** `sc rewrap --rotate` re-seals every
-  protected blob at the tip under a fresh DEK (the path analogue of `sc secret
-  rotate`); history keeps the old ciphertext (rotation is not erasure).
+- **Richer signer trust models** beyond trusted-key lists (delegation, expiry)
+  — P22 ships the key-list model. (Unrelated to serve-token expiry, which
+  shipped.)
+- **Transparent lazy-fetch in read paths (P27, narrowed by P37).** `Store::get`
+  stays network-free by design (ADR-0037, ADR-0047). What shipped is opt-in: a
+  lazy, online clone's `sc cat`, view-filling operations (switch, fast-forward,
+  undo, `sparse set`) and merge, cherry-pick and rebase fetch by id, and
+  everything else reports a gap with the `sc backfill` repair. Dialing the promisor origin
+  from any read path is still deferred (offline breakage, surprise latency,
+  fetch-during-gc).
+- **Blob-size and object-count clone filters (#217, P27).** `sc clone --filter`
+  is prefix-only; git's `--filter=blob:limit` size axis needs a decision on the
+  repair path for a size gap, where the filter is evaluated, and protected
+  content first.
 - **`sc rewrap` on partial clones — refused (P37).** `Repo::rewrap` calls
   `refuse_on_partial`; a paths-only/streaming rebuild that would lift the
   refusal remains a possible follow-on.
-- **Protected-cache hygiene — shipped.** `ProtectedCache::save` skips entries
-  whose file is no longer on disk (deleted, renamed, outside the sparse view), so
-  `.sc/protected-cache` and `.sc/ws/cache-<i>` stay bounded by the protected
-  files actually present; a ws cache file is already removed with its session.
-  A dropped entry can only cost one re-seal if the path returns (randomized
-  sealing, so unchanged content gets a new blob id).
-- **Theirs-side resolve carry — shipped.** Completion's carry now also checks
-  the cache against the other parent's blob (merge head or picked commit), so a
-  `sc resolve --theirs` protected path keeps their ciphertext instead of
-  re-sealing; their wrap list must be in the unioned protection, and a lookup
-  gap on a partial clone just seals.
 - **Non-unix local-key permissions (#214, P33 follow-on).** `.sc/local-key` is
   minted 0600-from-first-byte on unix only. On a non-unix target it keeps default
-  permissions and `sc` warns once when a cache holds a protected entry (the
-  exposure is bounded; see THREAT-MODEL.md). Deferred: an owner-only Windows ACL
+  permissions and `sc` warns once when a cache holds a protected entry (#225; the
+  exposure is bounded, see THREAT-MODEL.md). Deferred: an owner-only Windows ACL
   (`windows-sys` is already in `Cargo.lock`) and a manual check on a real Windows
   host.
-- **fd secret injection — shipped (ADR-0052).** `sc run --secrets-fd N` hands the
-  secrets to the command on a descriptor (NUL-terminated `NAME=VALUE` records)
-  instead of its environment. Not built: the same mode for `sc ws run` and
+- **fd secret injection beyond `sc run` (ADR-0052 follow-on).** `sc run
+  --secrets-fd N` shipped. Not built: the same mode for `sc ws run` and
   `sc work --with-secrets`, and a stdin variant.
-- **`--max-object-size` operator knob — shipped (#213, ADR-0039 addendum).**
-  `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE` set the per-object cap
-  (default 256 MiB, range 2 MiB to 1 GiB, out of range aborts startup). No wire
-  negotiation: each receiver applies its own cap.
-- **Per-connection write budget — shipped (#233, ADR-0039 second addendum).**
-  `sc serve --max-conn-bytes` bounds the sum of `PutObject` bytes and `PutPack`
-  bytes (per pack, the larger of spool bytes and decoded bytes held) one connection can
-  make the server retain; over it the server replies
-  `ConnectionBudgetExceeded` and closes. No `PROTOCOL_VERSION` bump. Not built:
-  a request-count or CPU budget, and a per-peer (cross-connection) budget.
-- **P28 review follow-ons — shipped.** `refs::write_head`/`delete_branch` run
-  `validate_branch_name`; `SC_PACK_CHUNK` is clamped to the minimum configurable object cap minus one (2 MiB - 1, so every chunk frame fits any valid receiver) (a chunk frame carries a tag byte too; an
-  oversized value used to make every transfer fail with a confusing receiver
-  error); `Repo::worktree_paths` is a paths-only walk (`list_worktree_paths`,
-  the same ignore and tracked-path rules as `read_worktree`, no file read); and
-  the `/`-boundary rule is one shared `protect::path_under_prefix` used by rule
-  lookup and the `sc protect` low-entropy nudge.
+- **Completion can commit a leftover `.theirs` sidecar after a crash (known
+  limit).** A stopped merge/pick/rebase records the sidecars it wrote in
+  `.sc/CONFLICT_SIDECARS`, and the completing commit leaves them out of the tree
+  and unlinks them. The sweep retires the record before it unlinks, so a crash
+  between the two leaves the scratch file on disk with no record, and a retried
+  `sc commit` would commit it as ordinary content. The opposite order would
+  risk deleting a file the user recreated at that path; closing both needs a
+  journal.
+- **TLS session-resumption knobs (ADR-0042 follow-on).** Not evaluated; a later
+  throughput pass if repeated short-lived connections to one host show
+  handshake cost.
+- **Further serve budgets (ADR-0039 second addendum follow-on).** `--max-conn-bytes`
+  shipped (#233). Not built: a request-count or CPU budget, and a per-peer
+  (cross-connection) budget.
 - **Per-path/per-ref ACLs (P29).** `sc serve --http` access control is
   all-or-nothing per connection (`ro`/`rw`); scoping a token to specific
   path prefixes or refs is beyond the MVP. Deferred.
-- ~~**Token expiry/rotation metadata (P29).** `sct-` tokens have no expiry
-  field; rotation today is add-new + remove-old with no automation or
-  reminder.~~ **Done.** (#209) `sc serve token add --expires <30d|2030-01-31>`
-  stores an optional `expires_at` (Unix seconds); `verify` treats an expired
-  token like an unknown one (`401`); `list` shows and flags expiry; `sc serve
-  token rotate <label>` swaps the secret in one step. Expired entries stay in
-  the file. (ADR-0040.)
-- ~~**`sc+https://` / TLS (P29).** `sc serve --http` is plaintext-only; a
-  bearer token crosses the wire in cleartext, so a public deployment must
-  front with a TLS reverse proxy today. A first-party TLS dependency is
-  deferred, against the P25/P26 dep-free grain.~~ **Done.** Shipped in P32
-  (ADR-0042): `sc+https://` via in-binary rustls, accept-new TOFU pinning,
-  a narrowed non-loopback bind gate (`--tls` + token, not token alone). See
-  the Phase 32 entry above. Follow-ons this phase named rather than closed:
-  CA-path validation as an additive trust option for PEM-provisioned
-  deployments (shipped in ADR-0054: `SC_HTTPS_CA_FILE` / `SC_HTTPS_CA=system`,
-  with chain, validity and name checks; v1 was pin-only, names/validity
-  ignored); opt-in SNI/
-  certificate-name validation (covered by the CA mode); pin-management UX (shipped in ADR-0053 as `sc tls list/forget/pin/path`;
-  before it, only first-connect and `SC_HTTPS_FINGERPRINT` wrote pins and
-  nothing listed or removed one);
-  TLS session-resumption knobs (not evaluated this phase — a later
-  throughput pass if repeated short-lived connections to the same host prove
-  handshake cost material).
-- ~~**Full OS-assigned-port de-flake for the CLI http-serving tests
-  (launch prep).**~~ **Done.** `sc serve --http` now announces its bound
-  address on stdout (`listening on <addr>`) right after `TcpListener::bind`
-  — stdout is free in `--http` mode (the wire protocol rides the TCP
-  socket, unlike `--stdio`). `serve_http_cli_answers_on_socket` and
-  `serve_http_read_only_flag_flows_through` bind `127.0.0.1:0` and read the
-  OS-assigned port back from that line (which doubles as the readiness
-  signal), eliminating the pid-derived fixed port entirely. The launch-prep
-  investigation also surfaced the true root cause of the historical flake:
-  a lone `stream.read()` for the `HTTP/1.1 400` assertion returned as soon
-  as the first TCP segment arrived, so under load it split off just
-  `HTTP/1.1 ` before `400 Bad Request` — now read to EOF.
-- **Workspace clippy allow-list — tightened.** `type_complexity` (named aliases in
-  `protect.rs` for the seal inputs, sealed files and wrap map) and
-  `doc_lazy_continuation` are fixed at the source and no longer allowed;
-  `too_many_arguments` stays, for the eight commit/snapshot-assembly and replay
-  functions that take their inputs one by one (a parameter struct would only
-  move the list).
-- **CodeQL / SAST workflow (launch prep).** A CodeQL security-scanning
-  workflow (as the sibling `git.agentic` has) was left out of the initial
-  launch because CodeQL's Rust support is newer; add it once verified not to
-  red-X, so the security posture is scanned as well as documented.
 - **Coordinated RustCrypto-stack major-version migration (post-launch).** The
   crypto/RNG stack (`x25519-dalek`, `ed25519-dalek`, `chacha20poly1305`,
   `sha2`, `hkdf`, `rand_core`/`rand_chacha`) is tightly version-coupled — a
@@ -885,9 +820,6 @@ scale-&-reach horizon):
   skip majors on these (minor/patch security updates still flow). Migrating the
   whole stack to current majors is a deliberate, tested pass, not an automated
   bump; likewise `toml` 0.8 → 1.x and any pinned-toolchain bump.
-- **`404`-before-auth repo-presence oracle — closed.** `handle_http_connection`
-  now checks repo presence after the bearer-auth gate (ADR-0040), so behind
-  mandatory auth an unauthenticated probe sees `401` either way.
 - **`--transcript auto` probing (P30).** `sc ws harvest --transcript
   <path>` requires an explicit path today; auto-discovering a
   conventional transcript location (e.g. an agent-runner-written temp
@@ -896,16 +828,16 @@ scale-&-reach horizon):
   rewrap/grant/revoke surface — sealed once, to the recipient set at
   attach time, permanently. Extending P17's rewrap and P16's
   grant/revoke machinery to transcripts is deferred.
-- **Bucket leaf sidecar (#229 follow-on).** Bucket `get_pack` finds signatures,
+- **Bucket leaf sidecar (#229 follow-on, no issue).** Bucket `get_pack` finds signatures,
   transcripts and tombstones by decoding every on-chain pack (cached per pack
   hash within one transport). A per-pack sidecar object listing those leaves,
   written at push time and ignored by older readers, would remove the decode;
   deferred until fetch egress or CPU on a real bucket shows the scan (up to a
   second download of each pack per fetch) is too costly.
-- **Sender-side `--no-transcripts` for fetch/clone (P30).** The #211
-  opt-out is client-side: `fetch`/`clone` still receive transcripts and
-  discard them, so only `push` saves bandwidth. Having the server skip
-  them needs a `GetPack` request field and a `PROTOCOL_VERSION` bump.
+- **Sender-side `--no-transcripts` for fetch/clone (#211 follow-on, P30).** The
+  shipped opt-out is client-side: `fetch`/`clone` still receive transcripts and
+  discard them, so only `push` saves bandwidth. Having the server skip them
+  needs a `GetPack` request field and a `PROTOCOL_VERSION` bump.
 - **`sc export --transcripts=entire` (P30).** Git export unconditionally
   drops transcripts (reported via `transcripts_dropped`); an opt-in mode
   that carries them as detached Git notes or a sidecar format is
@@ -928,17 +860,6 @@ scale-&-reach horizon):
   today; and a one-line fix to `SignatureObj.snapshot`'s now-stale doc
   comment, which still describes the field as always a snapshot id even
   though signing a transcript stores a transcript id there instead.
-- **P32 follow-ons — shipped.** The four items the TLS work named: (1) `sc serve
-  fingerprint` and `--tls` auto-mint refuse a root with no `.sc/` instead of
-  minting there; (2) a stderr warning when an `SC_HTTPS_*` knob is set but the
-  URL is plaintext `sc+http://`; (3) the `sc+http(s)://` client bounds the connect, TLS handshake, opening and
-  status line (30 s inactivity) and the wire handshake (300 s, for a bucket
-  server's slow open), so a silent peer fails the connect as `ConnectionLost`,
-  and lifts both afterwards; (4) `sc remote add` parse-validates `sc+http(s)://` URLs
-  at add time like `ssh://` and the bucket schemes. The client bounds are not
-  configurable, and `read_frame_inner`'s frame-length allocation (covered by the
-  `MAX_OBJECT_SIZE` cap since P28) is unchanged.
-
 - **P34 follow-ons (private branches, ADR-0044).** Deferred rather than
   built: (1) `sc branch publish --squash` — collapse the sealed history into
   one public commit at release, hiding intermediate (embargoed) commit
@@ -954,8 +875,7 @@ scale-&-reach horizon):
   fetch-time freshness attestation so a hostile remote can't re-serve a
   stale pre-revoke manifest — the same gittuf-shaped signed-ref effort the
   P22 provenance boundary already defers.
-
-- **Bucket compaction/gc (P36a follow-on).** The WAL log (`log/<seq>` keys,
+- **Bucket compaction/gc (#216, P36a follow-on).** The WAL log (`log/<seq>` keys,
   each a hand-rolled versioned binary `walfmt` entry, not protobuf) grows
   unboundedly with no compaction — a cold-start reader now stops at the
   latest checkpoint (P36b) instead of walking to `0`, but no log entry,

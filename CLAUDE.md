@@ -21,7 +21,8 @@ recorded as an ADR in `docs/adr/`. Keep them in sync when the design changes.
 
 ## Stack & tooling
 
-- **Language:** Rust (stable). Rationale in ARCHITECTURE.md ("Why Rust").
+- **Language:** Rust, toolchain pinned to 1.96.1 (`rust-toolchain.toml`, `rust-version`,
+  and CI use the same tag; bump all three together). Rationale in ARCHITECTURE.md ("Why Rust").
 - **Desktop:** Tauri v2 + React/TypeScript under `apps/desktop/`; frontend
   dependencies are bundled and remain presentation-only.
 - **Edition:** 2021, inherited via `[workspace.package]`.
@@ -116,8 +117,8 @@ the code, those win.
 | Phase | Current state | ADR |
 |---|---|---|
 | P1 | In-RAM copy-on-write virtual worktrees; bounded blob budget + LRU eviction, optional spill; zero disk residue | [0005](docs/adr/0005-in-ram-vfs-over-fuse.md), [0006](docs/adr/0006-memory-budget-and-eviction.md) |
-| P2 | Committed secrets: per-secret DEK (XChaCha20-Poly1305) wrapped per X25519 recipient; secrets are env vars, never files — `checkout` never materializes them; `sc run` injects into a child env | [0008](docs/adr/0008-committed-secrets-envelope-encryption.md), [0009](docs/adr/0009-key-management-and-authorization.md), [0010](docs/adr/0010-secret-registry-and-opaque-wrapped-dek.md) |
-| P3 | Persistent `.sc/` repo: loose objects, branches, symbolic HEAD, single-writer lock, working tree | [0011](docs/adr/0011-persistent-store-and-working-tree.md) |
+| P2 | Committed secrets: per-secret DEK (XChaCha20-Poly1305) wrapped per X25519 recipient; secrets are env vars, never files — `checkout` never materializes them; `sc run` injects into a child env, or onto a descriptor with `--secrets-fd N` (unix) | [0008](docs/adr/0008-committed-secrets-envelope-encryption.md), [0009](docs/adr/0009-key-management-and-authorization.md), [0010](docs/adr/0010-secret-registry-and-opaque-wrapped-dek.md), [0052](docs/adr/0052-secret-injection-by-fd.md) |
+| P3 | Persistent `.sc/` repo: loose objects, branches, symbolic HEAD, single-writer lock, working tree; write-out paths restore the recorded executable bit (unix; #242; `sc resolve` after a deleted conflicted file still drops it, #243) | [0011](docs/adr/0011-persistent-store-and-working-tree.md) |
 | P4 | Snapshot-DAG three-way merge; ff when possible; conflict markers + `.theirs` sidecars | [0012](docs/adr/0012-three-way-merge.md) |
 | P5 | Commit-time secret scanner (pattern + entropy) hard-rejects plaintext secrets; `sc scan` preview; hash-scoped allowlist | [0017](docs/adr/0017-secret-scanner.md) |
 | P6 | Local-path remotes: `clone`/`fetch`/`push`, remote-tracking refs, `Transport` trait | [0013](docs/adr/0013-remote-sync-model.md) |
@@ -127,11 +128,11 @@ the code, those win.
 | P10 | Local Git repo as a first-class remote via a persisted `git_oid ↔ sc_id` marks map | [0018](docs/adr/0018-git-as-a-remote.md) |
 | P11 | `sc secret rotate` (fresh DEK) + escrow keys; rotation ≠ erasure (old ciphertext stays in history) | [0019](docs/adr/0019-secret-lifecycle.md) |
 | P12 | ssh:// transport: framed stdio wire protocol, `sc serve --stdio`, client spawns `ssh` (`SC_SSH` overrides) | [0022](docs/adr/0022-ssh-native-transport.md) |
-| P13 | `sc work --agents N`: one-shot in-RAM agent workspaces, harvested to flat `work-<i>` branches | [0023](docs/adr/0023-agent-workspaces.md) |
+| P13 | `sc work --agents N [--name <base>]`: one-shot in-RAM agent workspaces, harvested to flat `<base>-<i>` branches (default `work`) | [0023](docs/adr/0023-agent-workspaces.md) |
 | P14 | History editing: `cherry-pick`/`rebase` as replay; append-only `.sc/oplog`; `sc undo` (twice = redo) | [0024](docs/adr/0024-history-editing.md) |
 | P15 | Protected merge/replay: ciphertext-id fast paths; `--identity` only for content-divergent protected paths; rules merge by union; secret registry replays | [0025](docs/adr/0025-protected-merge-and-replay.md) |
 | P16 | Durable revocation: per-recipient epoch LWW tombstones; epoch tie resolves Revoked (fail-closed); snapshot tag 4 | [0026](docs/adr/0026-revocation-tombstones.md) |
-| P17 | `sc rewrap`: one-commit bulk cutover of secrets + protected wrap lists to current recipients/escrow; escrow is a managed list | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md) |
+| P17 | `sc rewrap`: one-commit bulk cutover of secrets + protected wrap lists to current recipients/escrow; escrow is a managed list; `--rotate` also re-seals every protected blob under a fresh key | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md), [0051](docs/adr/0051-rotate-protected-paths.md) |
 | P18 | Hosted Git (GitHub https/ssh) via system-git mirror bridge (`SC_GIT` overrides); auth delegated to git | [0028](docs/adr/0028-network-git-remotes.md) |
 | P19 | Resumable rebase (stop → resolve → `--continue`; one oplog record total), `cherry-pick --abort`/`--mainline <N>`, `sc amend` | [0029](docs/adr/0029-history-editing-polish.md) |
 | P20 | Durable multi-invocation agent sessions: `sc ws fork/list/run/harvest/abandon` under `.sc/ws/`; harvest auto-merges, conflicts fall back to `work-<i>` | [0030](docs/adr/0030-agent-sessions-and-automerge.md) |
@@ -143,10 +144,10 @@ the code, those win.
 | P26 | `sc+http://` transport: `sc serve --http`, thread-per-connection, status-line-before-handshake opening | [0036](docs/adr/0036-http-transport.md) |
 | P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3 | [0037](docs/adr/0037-partial-clone.md) |
 | P28 | Security hardening: a max object size (default 256 MiB; `--max-object-size` / `SC_MAX_OBJECT_SIZE`, 2 MiB to 1 GiB) caps every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
-| P29 | `sc serve --http` access control: bearer tokens (`sc serve token`), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
+| P29 | `sc serve --http` access control: bearer tokens (`sc serve token add [--expires]`/`rotate`/`remove`/`list`; an expired token gets the same 401 as an unknown one), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
 | P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex | [0038](docs/adr/0038-agent-session-transcripts.md) |
-| P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff | [0041](docs/adr/0041-listener-resource-limits.md) |
-| P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md) |
+| P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff; later `--max-conn-bytes` per-connection write budget (#233) | [0041](docs/adr/0041-listener-resource-limits.md) |
+| P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning (`sc tls list/forget/pin/path` manages the pin file); `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system` validate against a CA instead; client connect/handshake bounded; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md), [0053](docs/adr/0053-tls-pin-management.md), [0054](docs/adr/0054-tls-ca-validation.md) |
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
 | P34 | Private branches: ref points at a sealed-branch manifest; every commit/tree/blob individually sealed (copy-on-write) under a per-branch KEK wrapped per recipient + escrow; `sc branch --private/grant/revoke/publish`; opaque to non-recipients (content, paths, messages); grant O(1), revoke rotates the KEK; publish replays to public with a scanner gate; git bridge + private→public integration refused; `PROTOCOL_VERSION` 4 | [0044](docs/adr/0044-per-branch-access-control.md) |
 | P35 | Native Tauri desktop browser: opens `.sc` repositories through `scl-repo`, shows local/remote refs, all-parent snapshot DAG + provenance, public trees and first-parent diffs; protected content is locked and private branches remain opaque; no mutation or identity surface | [0045](docs/adr/0045-native-desktop-read-model.md) |
@@ -295,11 +296,11 @@ transport-adjacent. The rest, imperatively:
 ## Follow-ons
 
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
-truth — do not re-list items here). Notable standing entries: transparent
-lazy-fetch for partial clones, per-case gap-tolerant merge/replay on partial
-clones. `sc tls list/forget/pin/path` manages the `sc+https://` pin file
-(ADR-0053); `SC_HTTPS_CA_FILE=<pem>` / `SC_HTTPS_CA=system` switch a client to CA
-validation instead of pinning (ADR-0054).
+truth — do not re-list items here); entries that name an issue mirror the open
+GitHub issues. Standing entries: named/concurrent `sc ws` sessions (#215),
+blob-size clone filters (#217), bucket compaction and gc (#216), the non-unix
+`.sc/local-key` ACL (#214), transcript-drop delivery gaps (#230), and the open
+sparse, private-branch and abort edge cases (#241, #246, #247, #248, #243).
 
 ## Agent skills
 

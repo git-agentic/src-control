@@ -1,6 +1,6 @@
 # ADR-0049: Merge on partial clones (P37c)
 
-- **Status:** Proposed (37c-i engine, 37c-ii clean merge, 37c-iii conflicts and 37c-iv replay built; sessions are ADR-0050)
+- **Status:** Accepted (built; 37c-i engine, 37c-ii clean merge, 37c-iii conflicts and 37c-iv replay; sessions are ADR-0050)
 - **Date:** 2026-10-17
 - **Phase:** 37c
 - **Builds on:** ADR-0048 (presence-based partial clones), ADR-0047 (want-by-id fetch), ADR-0012 (three-way merge), ADR-0025 (protected merge and replay), ADR-0043 (randomized sealing)

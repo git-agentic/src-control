@@ -1,6 +1,6 @@
 # ADR-0036: sc-native HTTP transport
 
-- **Status:** Accepted
+- **Status:** Accepted; its open gaps (no auth, no limits, plaintext) are closed by [ADR-0040](0040-sc-http-access-control.md), [ADR-0041](0041-listener-resource-limits.md) and [ADR-0042](0042-in-binary-tls-sc-https.md)
 - **Date:** 2026-07-08
 - **Phase:** 26
 - **Builds on:** ADR-0022 (SSH stdio wire protocol), ADR-0035 (streaming pack transfer), ADR-0028 (network Git remotes — owns http(s):// routing)

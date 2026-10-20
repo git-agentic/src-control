@@ -1,6 +1,6 @@
 # ADR-0014: Per-file permissions as encrypted paths (convergent encryption)
 
-- **Status:** Accepted
+- **Status:** Accepted; sealing of new content superseded by [ADR-0043](0043-randomized-protected-encryption.md), per-path rotation added by [ADR-0051](0051-rotate-protected-paths.md)
 - **Date:** 2026-06-25
 - **Phase:** 7
 

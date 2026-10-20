@@ -22,7 +22,7 @@ impl Repo {
     ///
     /// The rule is persisted as a policy-only snapshot first (so the subsequent
     /// commit reads it from the tip), then a normal `commit` runs: matching
-    /// working-tree files are convergently encrypted and wrapped for each
+    /// working-tree files are sealed (randomized since P33) and wrapped for each
     /// recipient. If nothing matches yet, the rule is still recorded for future
     /// commits. The `identity` arg is reserved for future re-encrypt symmetry
     /// (e.g. re-protecting already-committed plaintext) and is unused today.
