@@ -76,6 +76,11 @@ fn assert_restored(root: &Path, repo: &Repo, ours: Shape) {
 fn finish(root: &Path, repo: Repo) {
     drop(repo);
     std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        !root.exists(),
+        "test root {} must be removed",
+        root.display()
+    );
 }
 
 const TRANSITIONS: [(&str, Shape, Shape); 2] = [
@@ -250,5 +255,57 @@ fn switch_refuses_a_file_over_a_directory_holding_untracked_content() {
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
     assert_eq!(std::fs::read(root.join("x/mine.txt")).unwrap(), b"mine\n");
     assert_eq!(std::fs::read(root.join("x/a")).unwrap(), b"a\n");
+    finish(&root, repo);
+}
+
+/// A user's empty directory is not evidence of tracked content: a forward
+/// `switch` onto a file at its path refuses and keeps it.
+#[test]
+fn switch_keeps_an_untracked_empty_directory_where_a_file_must_go() {
+    let root = tmp_root("switch-empty-dir");
+    let repo = Repo::init(&root).unwrap();
+    std::fs::write(root.join("c.txt"), b"c\n").unwrap();
+    repo.commit("me", "base").unwrap();
+    repo.branch("other").unwrap();
+    repo.switch("other").unwrap();
+    lay(&root, Shape::File);
+    repo.commit("me", "other").unwrap();
+    repo.switch("main").unwrap();
+    std::fs::create_dir(root.join("x")).unwrap();
+    assert!(repo.switch("other").is_err());
+    assert!(root.join("x").is_dir());
+    finish(&root, repo);
+}
+
+/// An abort that cannot replace a directory because of an untracked file
+/// leaves the user's empty subdirectories alone too.
+#[test]
+fn merge_abort_refusal_does_not_prune_empty_user_directories() {
+    let (root, repo) = fixture("merge-prune", Shape::File, Shape::Dir);
+    assert!(repo.merge("other", "me").is_err());
+    std::fs::write(root.join("x/mine.txt"), b"mine\n").unwrap();
+    std::fs::create_dir(root.join("x/empty")).unwrap();
+    assert!(repo.merge_abort().is_err());
+    assert!(root.join("x/empty").is_dir());
+    assert!(root.join("x/mine.txt").exists());
+    finish(&root, repo);
+}
+
+/// Switching onto a private branch across a directory-to-file change.
+#[test]
+fn private_switch_crosses_a_directory_to_file_transition() {
+    let root = tmp_root("private");
+    let repo = Repo::init(&root).unwrap();
+    let (sk, _pk) = scl_crypto::generate_keypair();
+    lay(&root, Shape::Dir);
+    repo.commit("me", "base").unwrap();
+    repo.branch_private("fix", &sk, &[], &[]).unwrap();
+    repo.switch_with_identity("fix", Some(&sk)).unwrap();
+    lay(&root, Shape::File);
+    repo.commit_private("me", "flip", Some(&sk)).unwrap();
+    repo.switch_with_identity("main", Some(&sk)).unwrap();
+    assert_shape(&root, Shape::Dir);
+    repo.switch_with_identity("fix", Some(&sk)).unwrap();
+    assert_shape(&root, Shape::File);
     finish(&root, repo);
 }

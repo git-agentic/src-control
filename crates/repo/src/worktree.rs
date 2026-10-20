@@ -912,6 +912,7 @@ pub(crate) fn lay_out_added_view(
             continue;
         };
         let full = safe_join(&layout.root, &path)?;
+        clear_dir_obstruction(&full, &path)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -927,16 +928,19 @@ pub(crate) fn lay_out_added_view(
 /// holds anything (an untracked or ignored file of the user's) is never
 /// touched: the error names it, and the caller's state stays retryable (#247).
 pub(crate) fn clear_dir_obstruction(full: &Path, path: &str) -> Result<()> {
-    fn prune(dir: &Path) -> std::io::Result<()> {
+    // Only directories all the way down: one file (or symlink) anywhere keeps
+    // the whole tree, so a refusal never leaves it half pruned.
+    fn only_dirs(dir: &Path) -> std::io::Result<bool> {
         for e in std::fs::read_dir(dir)? {
             let e = e?;
-            if e.file_type()?.is_dir() {
-                prune(&e.path())?;
+            if !e.file_type()?.is_dir() || !only_dirs(&e.path())? {
+                return Ok(false);
             }
         }
-        std::fs::remove_dir(dir)
+        Ok(true)
     }
-    if full.symlink_metadata().is_ok_and(|m| m.is_dir()) && prune(full).is_err() {
+    let is_dir = full.symlink_metadata().is_ok_and(|m| m.is_dir());
+    if is_dir && !(only_dirs(full).unwrap_or(false) && std::fs::remove_dir_all(full).is_ok()) {
         return Err(Error::InvalidArgument(format!(
             "cannot write {path}: a directory with untracked or ignored content stands there; \
              move it away, then retry"

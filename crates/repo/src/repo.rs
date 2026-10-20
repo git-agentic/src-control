@@ -1915,7 +1915,22 @@ impl Repo {
                 .iter()
                 .map(|(p, ..)| p.as_str())
                 .chain(sidecars.iter().map(|(r, _)| r.as_str()));
+            let sidecar_rels: std::collections::BTreeSet<&str> =
+                sidecars.iter().map(|(r, _)| r.as_str()).collect();
             for rel in targets {
+                // Only a plaintext target clears a tracked directory husk; a
+                // sidecar is written with a plain write, so any directory at
+                // its path blocks.
+                if sidecar_rels.contains(rel)
+                    && worktree::safe_join(&self.layout.root, rel)?
+                        .symlink_metadata()
+                        .is_ok_and(|m| m.is_dir())
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "{op} has conflicts, and its sidecar {rel} would land on a directory; \
+                         move it away, then retry"
+                    )));
+                }
                 // Every target is in the view (gated above; a sidecar is
                 // never tracked, checked above). A failed lookup counts as
                 // untracked.
@@ -2694,26 +2709,37 @@ fn is_tracked_case_alias(
     false
 }
 
-/// True when the directory `full` (path `rel`) holds nothing but tracked
-/// files and directories: no symlink, and no file `tracked` does not name. A
-/// read failure counts as not tracked.
+/// True when the directory `full` (path `rel`) holds at least one tracked file
+/// and nothing else of substance: no symlink, and no file `tracked` does not
+/// name. An empty directory has no tracked file to show it is the old tree's,
+/// and a read failure counts as not tracked.
 fn dir_holds_only_tracked(
     full: &std::path::Path,
     rel: &str,
     tracked: &mut impl FnMut(&str) -> bool,
 ) -> bool {
-    let Ok(entries) = std::fs::read_dir(full) else {
-        return false;
-    };
-    entries.into_iter().all(|e| {
-        let Ok(e) = e else { return false };
-        let child = format!("{rel}/{}", e.file_name().to_string_lossy());
-        match e.file_type() {
-            Ok(t) if t.is_dir() => dir_holds_only_tracked(&e.path(), &child, tracked),
-            Ok(t) if t.is_file() => tracked(&child),
-            _ => false,
+    // `Some(n)`: only tracked files, `n` of them.
+    fn count(
+        full: &std::path::Path,
+        rel: &str,
+        tracked: &mut impl FnMut(&str) -> bool,
+    ) -> Option<usize> {
+        let mut n = 0;
+        for e in std::fs::read_dir(full).ok()? {
+            let e = e.ok()?;
+            let child = format!("{rel}/{}", e.file_name().to_string_lossy());
+            let t = e.file_type().ok()?;
+            if t.is_dir() {
+                n += count(&e.path(), &child, tracked)?;
+            } else if t.is_file() && tracked(&child) {
+                n += 1;
+            } else {
+                return None;
+            }
         }
-    })
+        Some(n)
+    }
+    count(full, rel, tracked).is_some_and(|n| n > 0)
 }
 
 /// What stands in the way of a conflict stop's direct write to `rel`.
