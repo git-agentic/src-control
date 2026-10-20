@@ -220,6 +220,15 @@ cargo run --bin sc -- transcript show <ref> [--identity <key>]   # decrypt + pri
 cargo run --bin sc -- transcript list [<ref>] [--json]   # list transcripts (never decrypts)
 cargo run --bin sc -- transcript sign <ref> [--identity <key>]   # retroactively sign a tip's
                                               # transcript(s) (P30)
+cargo run --bin sc -- clone|fetch|push --no-transcripts ...   # leave transcripts (P30) out of one
+                                              # transfer (#211): clone/fetch verify then discard
+                                              # received transcripts + their signatures (sender
+                                              # still sends them, so no bandwidth saved); push
+                                              # does not send them. Per command, not remembered:
+                                              # a later plain fetch brings them in; a plain push
+                                              # carries them only once the branch moves again.
+                                              # Snapshots transfer and verify as usual; no-op for
+                                              # git remotes
 cargo run --bin sc -- ws harvest --transcript <path> [--sign] [--identity <key>]   # attach the
                                               # file to each harvested workspace's landed snapshot
                                               # (P30; landing status prints before the attach)

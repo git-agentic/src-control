@@ -99,9 +99,8 @@ pipe-safety discipline).
   with a wider audience is an explicit grant/rewrap act, not a
   repo-visibility accident.
 - New store growth axis: transcripts are KB–MB, not signature-sized.
-  Over-send-on-transfer is correct but potentially heavy; a
-  `--no-transcripts` fetch knob is anticipated as a fast-follow if
-  measurement warrants (logged, never silent).
+  Over-send-on-transfer is correct but potentially heavy; the
+  `--no-transcripts` opt-out (see the addendum below) is that knob.
 - Wraps living inside the object mean recipient cutover (P17 `sc rewrap`)
   cannot re-wrap in place — it must mint replacement transcript objects
   and re-point the index. Acceptable for the MVP (transcripts are
@@ -148,3 +147,33 @@ pipe-safety discipline).
   Also does not defend: secrets echoed into a transcript remaining readable to
   *authorized* transcript recipients (scan-and-warn mitigates, rotation
   remedies); content quality or truthfulness of the recorded session.
+
+## Addendum: `--no-transcripts` on fetch, clone and push (2026-10, #211)
+
+`sc fetch`, `sc clone` and `sc push` accept `--no-transcripts`. Decisions:
+
+1. **Client-side only, no `PROTOCOL_VERSION` bump.** `GetPack` has no field a
+   receiver could use to say "no transcripts", and the sender over-sends
+   indexed transcripts unconditionally. So the opt-out lives where the
+   client already has control:
+   - `push`: the client builds the outgoing set, so it leaves out indexed
+     transcripts and the signatures keyed by them. This saves bandwidth.
+   - `fetch` / `clone`: the server still sends them. The receiver verifies
+     every record in pass 1 of `ingest_pack_file` as usual, then pass 2 does
+     not write `Transcript` objects, nor a signature whose target is a
+     transcript dropped from the same pack. This saves disk and exposure
+     (no ciphertext, no index entry), **not** bandwidth. A server-side skip
+     would need a new `GetPack` field and a version bump; it is a deferred
+     follow-on in `ROADMAP.md`.
+2. **Per command, not persisted.** A clone made with `--no-transcripts`
+   records nothing; a later plain `sc fetch` brings every indexed transcript
+   in (the sender's over-send covers snapshots the receiver already has).
+   A plain `sc push` after a `--no-transcripts` push carries them only once
+   the branch moves again, because `push` returns early when the remote tip
+   already equals the local tip (the same limit a retroactive attach has).
+3. **Sealing and integrity unchanged.** Bodies stay sealed whether or not they
+   travel. Snapshots, trees, blobs and the snapshot's own signatures transfer
+   and verify exactly as before. Index entries are left out with the objects,
+   so no `.sc/transcripts` or `.sc/signatures` entry points at a transcript
+   the repo does not hold. Git remotes never carry transcripts, so the flag is
+   a no-op there.
