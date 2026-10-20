@@ -117,7 +117,9 @@ fn sparse_merge_into_private_equals_the_run_without_sparse() {
     assert_eq!(got["lines.txt"], "A\nb\nc\nd\nE\n");
     assert_eq!(got, want);
     std::fs::remove_dir_all(&full.root).unwrap();
+    assert!(!full.root.exists(), "test dir left behind");
     std::fs::remove_dir_all(&sparse.root).unwrap();
+    assert!(!sparse.root.exists(), "test dir left behind");
 }
 
 #[test]
@@ -136,6 +138,7 @@ fn an_out_of_view_conflict_is_refused_before_any_write() {
     assert!(docs(&f.root).is_empty());
     assert_eq!(f.repo.head_private().unwrap().unwrap().1, before);
     std::fs::remove_dir_all(&f.root).unwrap();
+    assert!(!f.root.exists(), "test dir left behind");
 }
 
 #[test]
@@ -148,4 +151,5 @@ fn replay_onto_a_private_branch_stays_refused_under_sparse() {
     assert!(f.repo.rebase("main", "alice", Some(&f.sk)).is_err());
     assert!(docs(&f.root).is_empty());
     std::fs::remove_dir_all(&f.root).unwrap();
+    assert!(!f.root.exists(), "test dir left behind");
 }
