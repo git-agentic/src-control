@@ -420,6 +420,7 @@ fn clone_no_transcripts_leaves_transcripts_out_and_plain_fetch_brings_them() {
     assert!(show.status.success());
     assert!(stdout(&show).contains("USER: fix"));
     std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists());
 }
 
 #[test]
@@ -459,6 +460,7 @@ fn fetch_no_transcripts_leaves_transcripts_out() {
     assert!(sc(&dst, &["fetch"]).status.success());
     assert_eq!(transcript_index_len(&dst), 1);
     std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists());
 }
 
 #[test]
@@ -508,4 +510,5 @@ fn push_no_transcripts_sends_snapshot_but_not_transcript() {
         .success());
     assert_eq!(transcript_index_len(&origin), before);
     std::fs::remove_dir_all(&root).unwrap();
+    assert!(!root.exists());
 }
