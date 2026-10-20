@@ -66,7 +66,10 @@ run on the same machine.
 - Protected/private plaintext cannot enter frontend state in this phase.
 - Oversized public blobs remain native objects but do not enter frontend state.
 - Opening a query briefly acquires the repository's existing single-writer
-  lock; a future long-lived read handle needs its own concurrency ADR.
+  lock; a future long-lived read handle needs its own concurrency ADR. That
+  open can also update the derived `.sc/transcript-drops` and
+  `.sc/transcript-pending` indexes (ADR-0038, #230), best effort; the app
+  still writes no refs, objects or working-tree files.
 - Mutation and authorized decryption remain future slices with separate threat
   modeling.
 

@@ -145,7 +145,7 @@ the code, those win.
 | P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3. Blob-size filter (#217): `--filter blob:limit=<size>` (combinable with prefixes; `blob:` is reserved) leaves out blobs of at least that size unless a ref tip reaches them, evaluated by the server (`GetPack.blob_limit`, wire v6); the gap is absence as in ADR-0048, `sc backfill <path>` or a lazy fill repairs it, `.sc/promisor-blob-limit` records limit and scope | [0037](docs/adr/0037-partial-clone.md), [0055](docs/adr/0055-blob-size-clone-filter.md) |
 | P28 | Security hardening: a max object size (default 256 MiB; `--max-object-size` / `SC_MAX_OBJECT_SIZE`, 2 MiB to 1 GiB) caps every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | P29 | `sc serve --http` access control: bearer tokens (`sc serve token add [--expires]`/`rotate`/`remove`/`list`; an expired token gets the same 401 as an unknown one), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
-| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex | [0038](docs/adr/0038-agent-session-transcripts.md) |
+| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex; retained signed tombstones ride a transfer when their snapshot is in it or was collected by the sender, only verifying signatures are indexed, and held-but-untrusted tombstones are re-judged from `.sc/transcript-pending` when the trusted-signer set changes (#230) | [0038](docs/adr/0038-agent-session-transcripts.md) |
 | P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff; later `--max-conn-bytes` per-connection write budget (#233) | [0041](docs/adr/0041-listener-resource-limits.md) |
 | P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning (`sc tls list/forget/pin/path` manages the pin file); `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system` validate against a CA instead; client connect/handshake bounded; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md), [0053](docs/adr/0053-tls-pin-management.md), [0054](docs/adr/0054-tls-ca-validation.md) |
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
@@ -184,7 +184,9 @@ transport-adjacent. The rest, imperatively:
 - **The P35 desktop app is a keyless, read-only top-level adapter.** Its
   renderer has five typed repository commands, no general filesystem/shell
   capability, and no DTO field capable of carrying protected ciphertext or
-  identity material.
+  identity material. Opening a repository can write the derived transcript-drop
+  indexes (`.sc/transcript-drops`, `.sc/transcript-pending`) when the trusted
+  signer set changed; no key material is involved (#230).
 - **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (and `sparse disable`; both are allowed on a size-only `AllPaths` clone, ADR-0055), on a non-lazy clone a `sparse set` outside the filter, `sc rewrap`,
   `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view (a `.theirs` sidecar sits beside its conflicted path, so it is in view whenever that path is; ADR-0049) (no ref, state or working-tree change; on every clone, a conflict stop that needs sealing outside the view is refused the same way), `sc push` to a git remote, and
   `sc fetch` from any native remote but the promisor origin.** `sc merge`, `sc cherry-pick` and `sc rebase` work, including conflicts inside the view (P37c). `sc ws` and `sc work` work too (ADR-0050): workspaces and agents see the clone's view only, and harvest lands through the same merge. `sc backfill --all`
@@ -316,7 +318,7 @@ Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here); entries that name an issue mirror the open
 GitHub issues. Standing entries: named/concurrent `sc ws` sessions (#215),
 a limit-aware `sc fetch` and an object-count clone limit (#217 remainder), bucket compaction and gc (#216), the non-unix
-`.sc/local-key` ACL (#214), transcript-drop delivery gaps (#230), and the open
+`.sc/local-key` ACL (#214), and the open
 sparse, private-branch and abort edge cases (#241, #246, #247, #248).
 
 ## Agent skills

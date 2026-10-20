@@ -145,11 +145,43 @@ pub(crate) fn index_incoming(
     let mut count = 0;
     for id in ids {
         if let Object::Signature(sig) = store.get(id)? {
-            append_index(layout, sig.snapshot, *id)?;
-            count += 1;
+            // Only a signature that checks out for a target this store holds
+            // is indexed (and so forwarded and kept by gc): nothing forged or
+            // dangling can crowd out a real one (#230, ADR-0038).
+            if acceptable(store, &sig)? {
+                append_index(layout, sig.snapshot, *id)?;
+                count += 1;
+            }
         }
     }
     Ok(count)
+}
+
+/// Whether `sig` may enter the index: its target is held, and the signature
+/// verifies under the key it names in the domain its target kind uses. A
+/// snapshot takes the snapshot domain; a transcript the transcript domain; a
+/// drop tombstone only the domain-separated drop digest (a plain signature
+/// over a tombstone id never authorizes a drop). Any other target kind is
+/// refused. Trust is not judged here: that is the reader's call.
+pub(crate) fn acceptable(store: &mut scl_core::Store, sig: &SignatureObj) -> Result<bool> {
+    if !store.contains(&sig.snapshot) {
+        return Ok(false);
+    }
+    let target = sig.snapshot;
+    Ok(match store.get(&target)? {
+        Object::Snapshot(_) => {
+            scl_crypto::verify_snapshot_sig(&sig.signer, target.as_bytes(), &sig.sig)
+        }
+        Object::Transcript(t) if t.dropped_id().is_some() => scl_crypto::verify_transcript_sig(
+            &sig.signer,
+            &crate::transcripts::drop_digest(&target),
+            &sig.sig,
+        ),
+        Object::Transcript(_) => {
+            scl_crypto::verify_transcript_sig(&sig.signer, target.as_bytes(), &sig.sig)
+        }
+        _ => false,
+    })
 }
 
 /// Full-store rebuild of the signature index (Task 3): scan every object the
@@ -171,7 +203,7 @@ pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<us
     let mut entries: Vec<(ObjectId, ObjectId)> = Vec::new();
     for id in store.all_ids()? {
         if let Object::Signature(sig) = store.get(&id)? {
-            if store.contains(&sig.snapshot) {
+            if acceptable(store, &sig)? {
                 entries.push((sig.snapshot, id));
             }
         }
@@ -191,6 +223,26 @@ pub(crate) fn index_by_target(
     let mut out: std::collections::HashMap<ObjectId, Vec<ObjectId>> = Default::default();
     for (target, sig_id) in read_index(layout)? {
         out.entry(target).or_default().push(sig_id);
+    }
+    Ok(out)
+}
+
+/// [`index_by_target`] restricted to `targets`, keeping at most `per_target`
+/// signature ids each (index order). Only the wanted entries are retained, so
+/// a large index costs a scan, not memory.
+pub(crate) fn index_for_targets(
+    layout: &Layout,
+    targets: &BTreeSet<ObjectId>,
+    per_target: usize,
+) -> Result<std::collections::HashMap<ObjectId, Vec<ObjectId>>> {
+    let mut out: std::collections::HashMap<ObjectId, Vec<ObjectId>> = Default::default();
+    for (target, sig_id) in read_index(layout)? {
+        if targets.contains(&target) {
+            let v = out.entry(target).or_default();
+            if v.len() < per_target {
+                v.push(sig_id);
+            }
+        }
     }
     Ok(out)
 }
@@ -670,5 +722,89 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Write `objs` as a pack under `repo` and ingest it like a transfer.
+    fn ingest(repo: &Repo, objs: &[Object]) {
+        let enc: Vec<(ObjectId, Vec<u8>)> = objs.iter().map(|o| (o.id(), o.encode())).collect();
+        let (pack, _idx) = scl_core::pack::build_pack(&enc).unwrap();
+        let path = repo.layout().dot_sc.join("incoming.pack");
+        std::fs::write(&path, pack).unwrap();
+        let arc = repo.store_arc();
+        let mut store = arc.lock().unwrap();
+        crate::transport::ingest_pack_file(repo.layout(), &mut store, &path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_signature_sorting_below_its_snapshot_in_the_pack_is_still_indexed() {
+        // The pack is ordered by id, so the signature can come first; every
+        // object is written before indexing, so its target is held anyway.
+        let a_root = tmp_root("order-a");
+        let b_root = tmp_root("order-b");
+        let a = Repo::init(&a_root).unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let key = identity.signing.as_ref().unwrap();
+        let (snap, snap_obj, sig_obj) = loop {
+            std::fs::write(a_root.join("f"), format!("{:?}", std::time::Instant::now())).unwrap();
+            let snap = a.commit("t", "c").unwrap();
+            let sig_obj = Object::Signature(SignatureObj {
+                snapshot: snap,
+                signer: key.public().to_bytes(),
+                sig: scl_crypto::sign_snapshot_id(key, snap.as_bytes()),
+            });
+            if sig_obj.id() < snap {
+                let snap_obj = a.store_arc().lock().unwrap().get(&snap).unwrap();
+                break (snap, snap_obj, sig_obj);
+            }
+        };
+        let b = Repo::init(&b_root).unwrap();
+        let mut objs = [snap_obj, sig_obj.clone()];
+        objs.sort_by_key(Object::id);
+        assert_eq!(objs[0].id(), sig_obj.id(), "the signature leads the pack");
+        ingest(&b, &objs);
+        let mut trust = HashMap::new();
+        trust.insert(key.public().to_bytes(), "alice".to_string());
+        assert_eq!(
+            b.sig_status(&snap, &trust).unwrap(),
+            SigStatus::Trusted("alice".to_string())
+        );
+        drop((a, b));
+        std::fs::remove_dir_all(&a_root).unwrap();
+        std::fs::remove_dir_all(&b_root).unwrap();
+        assert!(!a_root.exists() && !b_root.exists());
+    }
+
+    #[test]
+    fn a_forged_snapshot_signature_over_the_wire_leaves_the_snapshot_unsigned() {
+        // Pins the ingest filter: a received forgery is not indexed, so it
+        // cannot turn a snapshot Invalid (ADR-0038, #230).
+        let a_root = tmp_root("forge-a");
+        let b_root = tmp_root("forge-b");
+        let a = Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f"), b"x").unwrap();
+        let snap = a.commit("t", "c").unwrap();
+        let snap_obj = a.store_arc().lock().unwrap().get(&snap).unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let signer = identity.signing.as_ref().unwrap().public().to_bytes();
+        let forged = Object::Signature(SignatureObj {
+            snapshot: snap,
+            signer,
+            sig: [9u8; 64],
+        });
+        let b = Repo::init(&b_root).unwrap();
+        ingest(&b, &[snap_obj, forged.clone()]);
+        let mut trust = HashMap::new();
+        trust.insert(signer, "alice".to_string());
+        assert_eq!(b.sig_status(&snap, &trust).unwrap(), SigStatus::Unsigned);
+        assert!(b.signatures_for(&snap).unwrap().is_empty());
+        assert!(
+            b.store_arc().lock().unwrap().contains(&forged.id()),
+            "the object is stored, only the index refuses it"
+        );
+        drop((a, b));
+        std::fs::remove_dir_all(&a_root).unwrap();
+        std::fs::remove_dir_all(&b_root).unwrap();
+        assert!(!a_root.exists() && !b_root.exists());
     }
 }

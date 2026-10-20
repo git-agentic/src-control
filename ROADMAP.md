@@ -480,8 +480,13 @@ across every phase.
   grow-only drop tombstone (a bare `Transcript` object, so no wire change)
   hides the body from `list`/`show`, travels with fetch/clone, blocks
   resurrection in either arrival order, and is kept by gc while the dropped
-  body is swept at gc (after the grace window if loose). (ADR-0038 addendum;
-  delivery gaps tracked in #230.)
+  body is swept at gc (after the grace window if loose). (ADR-0038 addendum.)
+  Issue #230 closed the delivery gaps: a retained signed tombstone rides
+  a transfer when its snapshot is in it or was collected by the sender's gc (so
+  a stale peer is told), only verifying signatures enter the signature index,
+  and a remote that held a tombstone before trusting the signer re-judges it
+  from a capped `.sc/transcript-pending` index when the trusted-signer set
+  changes. Crowding by valid signatures from attacker keys is tracked in #257.
 
 - **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
   (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"
@@ -764,10 +769,6 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
 - **Named/multiple concurrent ws sessions (#215, P20).** P20 ships one unnamed
   session per repo; named or concurrent sessions and workspace re-fork/refresh
   from a newer tip need a design decision first.
-- **Transcript drop delivery gaps (#230, ADR-0038 addendum).** A tombstone is
-  not sent after the dropper's gc removed its snapshot, and a tombstone a
-  push-only remote received before trusting the signer is not re-evaluated
-  later; both are documented limits, not regressions.
 - **Sparse untracked-file guard edge cases.** #241: on a case-insensitive
   filesystem the untracked-file guard can alias an old-view path with a newly
   in-view one. #248: an untracked file at an out-of-view path that the other side adds wins
