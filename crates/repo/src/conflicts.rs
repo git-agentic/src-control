@@ -1241,6 +1241,245 @@ mod tests {
         assert!(!root.exists(), "test must leave no residue");
     }
 
+    /// The (blob id, perms) at `path` in `snapshot`'s tree.
+    fn protected_entry_at(repo: &Repo, snapshot: ObjectId, path: &str) -> (ObjectId, u8) {
+        let store_arc = repo.vfs().store();
+        let mut store = store_arc.lock().unwrap();
+        let root = store.get_snapshot(&snapshot).unwrap().root;
+        let (id, _mode, perms) = *tree_file_entries_with_perms(&mut store, root)
+            .unwrap()
+            .get(path)
+            .unwrap();
+        (id, perms)
+    }
+
+    /// A protected repo with `secret/a.txt` committed as `base\n` on `main`
+    /// and a `feature` branch forked from it.
+    fn protected_fork(tag: &str) -> (std::path::PathBuf, Repo, scl_crypto::SecretKey) {
+        let root = tmp_root(tag);
+        let repo = Repo::init(&root).unwrap();
+        let (alice_sk, alice_pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[alice_pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"base\n").unwrap();
+        repo.commit("me", "base").unwrap();
+        repo.branch("feature").unwrap();
+        (root, repo, alice_sk)
+    }
+
+    /// Commit `secret/a.txt` on the current branch as a pre-P33 CONVERGENT
+    /// blob (the CLI can no longer mint one), wrapped for `pk`. The file on
+    /// disk is set to `plaintext` first so the checkout stays clean.
+    fn commit_convergent_secret(
+        repo: &Repo,
+        plaintext: &[u8],
+        pk: &scl_crypto::PublicKey,
+    ) -> ObjectId {
+        std::fs::write(repo.layout().root.join("secret/a.txt"), plaintext).unwrap();
+        let tip = repo.head_tip().unwrap().unwrap();
+        let mut protection = repo.snapshot(&tip).unwrap().protection;
+        let (cipher, dek) = scl_crypto::encrypt_path(plaintext);
+        protection.wrapped.insert(
+            Object::blob(cipher.clone()).id(),
+            vec![scl_crypto::wrap_dek_for(&dek, pk)],
+        );
+        let root = repo
+            .vfs
+            .write_tree_with_perms(&[(
+                "secret/a.txt".to_string(),
+                cipher,
+                scl_core::FileMode::FILE,
+                PROTECTED,
+            )])
+            .unwrap();
+        repo.commit_snapshot(
+            root,
+            vec![tip],
+            Default::default(),
+            protection,
+            "me",
+            "convergent secret",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_theirs_on_a_protected_path_carries_their_ciphertext_on_rebase_continue() {
+        let (root, repo, alice_sk) = protected_fork("resolve-theirs-carry-rebase");
+        std::fs::write(root.join("secret/a.txt"), b"main-edit\n").unwrap();
+        repo.commit("me", "main edits secret").unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"feature-edit\n").unwrap();
+        let replayed = repo.commit("me", "feature edits secret").unwrap();
+
+        let stopped = repo.rebase("main", "me", Some(&alice_sk)).unwrap();
+        assert!(
+            matches!(stopped, crate::replay::RebaseResult::Stopped { .. }),
+            "got {stopped:?}"
+        );
+        repo.resolve_path("secret/a.txt", ResolveSide::Theirs, Some(&alice_sk))
+            .unwrap();
+        let crate::replay::RebaseResult::Rebased { new_tip, .. } =
+            repo.rebase_continue("me", Some(&alice_sk)).unwrap()
+        else {
+            panic!("expected Rebased");
+        };
+
+        assert_eq!(
+            protected_blob_at(&repo, new_tip, "secret/a.txt"),
+            protected_blob_at(&repo, replayed, "secret/a.txt"),
+            "a --theirs resolution keeps the replayed commit's ciphertext"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test must leave no residue");
+    }
+
+    #[test]
+    fn resolve_theirs_carries_a_convergent_blob_from_their_side() {
+        let (root, repo, alice_sk) = protected_fork("resolve-theirs-convergent");
+        let alice_pk = alice_sk.public();
+        std::fs::write(root.join("secret/a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours edits secret").unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        let theirs_tip = commit_convergent_secret(&repo, b"theirs\n", &alice_pk);
+        let (theirs_blob, theirs_perms) = protected_entry_at(&repo, theirs_tip, "secret/a.txt");
+        assert_eq!(theirs_perms & scl_core::RANDOMIZED, 0, "setup: convergent");
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        let err = repo
+            .merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
+        assert!(matches!(err, Error::MergeConflicts(1)), "got {err:?}");
+        repo.resolve_path("secret/a.txt", ResolveSide::Theirs, Some(&alice_sk))
+            .unwrap();
+        let merged = repo.commit("me", "take theirs").unwrap();
+
+        let (blob, perms) = protected_entry_at(&repo, merged, "secret/a.txt");
+        assert_eq!((blob, perms), (theirs_blob, theirs_perms));
+        // Still decryptable: a fresh checkout of the merge gets their plaintext.
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("secret/a.txt")).unwrap(),
+            b"theirs\n"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test must leave no residue");
+    }
+
+    /// The carry needs their wrap list in the merged protection. Repoint the
+    /// merge head at a copy of their snapshot without it (a state a real merge
+    /// never produces, since completion unions both parents' wraps) and the
+    /// path must seal fresh instead of carrying a blob nobody can open.
+    #[test]
+    fn resolve_theirs_seals_when_their_wrap_list_is_missing() {
+        let (root, repo, alice_sk) = protected_fork("resolve-theirs-no-wraps");
+        std::fs::write(root.join("secret/a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours edits secret").unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"theirs\n").unwrap();
+        let theirs_tip = repo.commit("me", "theirs edits secret").unwrap();
+        let theirs_blob = protected_blob_at(&repo, theirs_tip, "secret/a.txt");
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        repo.merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
+        repo.resolve_path("secret/a.txt", ResolveSide::Theirs, Some(&alice_sk))
+            .unwrap();
+        let theirs = repo.snapshot(&theirs_tip).unwrap();
+        let stripped = repo
+            .build_snapshot(
+                theirs.root,
+                theirs.parents.clone(),
+                theirs.secrets.clone(),
+                scl_core::Protection {
+                    prefixes: theirs.protection.prefixes.clone(),
+                    wrapped: Default::default(),
+                },
+                "me",
+                "theirs without wraps",
+            )
+            .unwrap();
+        crate::merge_state::write(repo.layout(), &stripped, &[], None).unwrap();
+        let merged = repo.commit("me", "take theirs").unwrap();
+
+        assert_ne!(
+            protected_blob_at(&repo, merged, "secret/a.txt"),
+            theirs_blob,
+            "without their wraps the path is re-sealed, not carried"
+        );
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("secret/a.txt")).unwrap(),
+            b"theirs\n",
+            "the re-sealed blob decrypts"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test must leave no residue");
+    }
+
+    /// Documented under-grant (ADR-0043): their blob keeps their wrap list, so
+    /// a recipient granted on our side after the fork is not applied to it.
+    #[test]
+    fn resolve_theirs_after_a_grant_on_our_side_under_grants_until_rewrap() {
+        let (root, repo, alice_sk) = protected_fork("resolve-theirs-under-grant");
+        let (_bob_sk, bob_pk) = scl_crypto::generate_keypair();
+        std::fs::write(root.join("secret/a.txt"), b"ours\n").unwrap();
+        repo.commit("me", "ours edits secret").unwrap();
+        repo.grant("secret/", &alice_sk, &bob_pk).unwrap();
+        repo.switch_with_identity("feature", Some(&alice_sk))
+            .unwrap();
+        std::fs::write(root.join("secret/a.txt"), b"theirs\n").unwrap();
+        let theirs_tip = repo.commit("me", "theirs edits secret").unwrap();
+        repo.switch_with_identity("main", Some(&alice_sk)).unwrap();
+
+        repo.merge_with_identity("feature", "me", Some(&alice_sk))
+            .unwrap_err();
+        repo.resolve_path("secret/a.txt", ResolveSide::Theirs, Some(&alice_sk))
+            .unwrap();
+        let merged = repo.commit("me", "take theirs").unwrap();
+
+        let blob = protected_blob_at(&repo, merged, "secret/a.txt");
+        assert_eq!(blob, protected_blob_at(&repo, theirs_tip, "secret/a.txt"));
+        let snap = repo.snapshot(&merged).unwrap();
+        let wrapped_for = |pk: &scl_crypto::PublicKey| {
+            snap.protection.wrapped[&blob]
+                .iter()
+                .any(|w| w.recipient_id == pk.recipient_id().to_string())
+        };
+        assert!(
+            wrapped_for(&alice_sk.public()),
+            "their recipient keeps access"
+        );
+        assert!(
+            !wrapped_for(&bob_pk),
+            "the grant made on our side is not applied to their blob"
+        );
+        assert!(
+            snap.protection.prefixes[0]
+                .recipients
+                .iter()
+                .any(|r| r.key == bob_pk.to_bytes()),
+            "the merged rule still lists the new recipient"
+        );
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test must leave no residue");
+    }
+
     #[test]
     fn resolved_merge_completes_via_commit() {
         let root = tmp_root("resolve-completes");

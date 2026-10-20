@@ -1352,7 +1352,7 @@ impl Repo {
     /// Like [`merge`][Repo::merge] but threads `identity` through the
     /// real-three-way path so protected paths that diverged in *content* on
     /// both sides can be decrypted, diff3'd, and re-encrypted (P15). Clean
-    /// ciphertext-id fast paths (ADR: [`crate::merge::three_way_files`]) still
+    /// ciphertext-id fast paths (ADR: `crate::merge::three_way_files`) still
     /// need no identity at all. A conflicted merge carrying protection writes
     /// plaintext markers to the working tree only (never through the CAS) and
     /// is completed by `sc commit`, which re-encrypts under the union of both
@@ -1360,7 +1360,7 @@ impl Repo {
     ///
     /// Returns the merged tip plus the protected paths that could not be
     /// materialized to disk for lack of a matching key (skipped, exactly like
-    /// [`switch_with_identity`][Repo::switch_with_identity]); [`merge`]
+    /// [`switch_with_identity`][Repo::switch_with_identity]); `merge`
     /// drops the list.
     pub fn merge_with_identity(
         &self,
