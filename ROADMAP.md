@@ -480,7 +480,8 @@ across every phase.
   grow-only drop tombstone (a bare `Transcript` object, so no wire change)
   hides the body from `list`/`show`, travels with fetch/clone, blocks
   resurrection in either arrival order, and is kept by gc while the dropped
-  body is swept after the grace window. (ADR-0038 addendum.)
+  body is swept at gc (after the grace window if loose). (ADR-0038 addendum;
+  delivery gaps tracked in #230.)
 
 - **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
   (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"

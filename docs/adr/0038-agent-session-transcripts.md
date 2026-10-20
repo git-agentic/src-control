@@ -251,7 +251,8 @@ Operational consequences. A tombstone that arrives while its signer is
 untrusted is ignored and not recorded. A fetching peer retries it on its next
 fetch. A push-only or served remote has no retry: it already holds the object,
 so a later push does not send it again and nothing re-runs the check, and the
-drop stays inert there even after the signer is trusted. Configure
+drop stays inert there even after the signer is trusted (tracked in #230).
+Configure
 `[signers] trusted` on a remote before the first drop is pushed to it. Any key under `[signers] trusted` can hide transcripts on every peer that
 trusts it, and make that peer's gc reclaim the bodies. `GetObjects` still
 serves a dropped body until gc sweeps it, and a peer that still holds the
@@ -270,10 +271,13 @@ signing keys. An unsigned local drop does not propagate.
 
 ### gc
 
-The dropped transcript is no longer rooted, so its object falls to the
-ordinary loose-object grace window and repack like any other unreachable
-object, and its own signature entry is pruned with it (`signatures::gc_prune`
-keys off the same `reachable` set). Tombstones are the opposite: gc roots
+The dropped transcript is no longer rooted, so a loose body falls to the
+ordinary loose-object grace window (`--prune-expire`) like any other
+unreachable object. A body an earlier gc already packed gets no grace: the
+repack leaves it out of the new pack and deletes the superseded packs, so the
+next gc reclaims it whatever `--prune-expire` says. Its own signature entry
+is pruned with it (`signatures::gc_prune` keys off the same `reachable` set).
+Tombstones are the opposite: gc roots
 every tombstone object and keeps every drop line, **even when its snapshot is
 dead**, as P16 keeps revocation tombstones forever. They are load-bearing
 against a later fetch of the same history from a stale peer, and cost about
@@ -284,7 +288,9 @@ snapshots of the transfer set, and a snapshot gc has removed is never in it,
 so a stale peer that still lists the body is not told about a drop whose
 snapshot the dropper has since collected. Sending every retained tombstone on
 every transfer would close that, at the cost of one object per drop per fetch
-for receivers that cannot use it; deferred.
+for receivers that cannot use it; deferred to #230, together with the
+push-only remote limit above (a tombstone rejected on arrival is never
+re-evaluated there).
 
 ### `sc verify`
 

@@ -223,7 +223,7 @@ cargo run --bin sc -- transcript sign <ref> [--identity <key>]   # retroactively
 cargo run --bin sc -- transcript drop <id> [--identity <key>]   # drop a transcript by id/hex prefix (see `list`): writes
                                               # a tombstone that travels with fetch/clone so a peer
                                               # that still has it cannot restore it; gc reclaims the
-                                              # body after the grace window. Not erasure. --identity
+                                              # body (loose: after the grace window; already packed: next gc). Not erasure. --identity
                                               # signs the tombstone; peers honor it only if that key
                                               # is under [signers] trusted (unsigned = local-only).
                                               # Propagates on the peer's next fetch (ADR-0038 addendum)

@@ -195,17 +195,18 @@ fn drop_digest(tomb: &ObjectId) -> [u8; 32] {
 /// Whether an incoming tombstone may hide its transcript (ADR-0038 addendum,
 /// "Who may drop"). All of: the tombstone's snapshot exists locally; if the
 /// dropped transcript is held locally it is a real transcript on that same
-/// snapshot; and a signature over the tombstone id verifies under a key in
+/// snapshot; and a signature over the drop digest verifies under a key in
 /// `trusted`. An unsigned or untrusted tombstone stays an inert object.
 fn tombstone_honored(
-    layout: &Layout,
     store: &mut scl_core::Store,
     trusted: &std::collections::HashMap<[u8; 32], String>,
+    sigs: &std::collections::HashMap<ObjectId, Vec<ObjectId>>,
     tomb: ObjectId,
     t: &Transcript,
     dropped: ObjectId,
 ) -> Result<bool> {
-    if !store.contains(&t.snapshot) {
+    // The claimed snapshot must be a real snapshot, not any object we hold.
+    if !store.contains(&t.snapshot) || !matches!(store.get(&t.snapshot)?, Object::Snapshot(_)) {
         return Ok(false);
     }
     if store.contains(&dropped) {
@@ -214,8 +215,8 @@ fn tombstone_honored(
             _ => return Ok(false),
         }
     }
-    for sid in crate::signatures::indexed_signature_ids_for(layout, &[tomb])? {
-        if let Object::Signature(sig) = store.get(&sid)? {
+    for sid in sigs.get(&tomb).map(Vec::as_slice).unwrap_or_default() {
+        if let Object::Signature(sig) = store.get(sid)? {
             if trusted.contains_key(&sig.signer)
                 && scl_crypto::verify_transcript_sig(&sig.signer, &drop_digest(&tomb), &sig.sig)
             {
@@ -291,11 +292,12 @@ pub(crate) fn index_incoming(
 ) -> Result<usize> {
     let mut count = 0;
     let trusted = trusted_signers(layout);
+    let sigs = crate::signatures::index_by_target(layout)?;
     for id in ids {
         if let Object::Transcript(t) = store.get(id)? {
             match t.dropped_id() {
                 Some(dropped) => {
-                    if !tombstone_honored(layout, store, &trusted, *id, &t, dropped)? {
+                    if !tombstone_honored(store, &trusted, &sigs, *id, &t, dropped)? {
                         continue;
                     }
                     append_drop(layout, (t.snapshot, *id, dropped))?
@@ -318,6 +320,7 @@ pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<us
     let mut entries: Vec<(ObjectId, ObjectId)> = Vec::new();
     let mut drops: Vec<DropEntry> = Vec::new();
     let trusted = trusted_signers(layout);
+    let sigs = crate::signatures::index_by_target(layout)?;
     for id in store.all_ids()? {
         if let Object::Transcript(t) = store.get(&id)? {
             if !store.contains(&t.snapshot) {
@@ -325,7 +328,7 @@ pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<us
             }
             match t.dropped_id() {
                 Some(dropped) => {
-                    if tombstone_honored(layout, store, &trusted, id, &t, dropped)? {
+                    if tombstone_honored(store, &trusted, &sigs, id, &t, dropped)? {
                         drops.push((t.snapshot, id, dropped));
                     }
                 }
@@ -805,6 +808,17 @@ pub(crate) mod tests {
         assert!(!ingest(good.clone(), Some(&attacker)));
         assert!(!ingest(
             Transcript::drop_tombstone(other_snap, &victim),
+            Some(&owner)
+        ));
+        // A tombstone whose "snapshot" is a blob we hold is ignored, even ahead
+        // of the body.
+        let blob = arc
+            .lock()
+            .unwrap()
+            .put(Object::Blob(std::sync::Arc::from(&b"not a snapshot"[..])))
+            .unwrap();
+        assert!(!ingest(
+            Transcript::drop_tombstone(blob, &ObjectId::of(b"future")),
             Some(&owner)
         ));
         // A tombstone for a snapshot this store has never seen is ignored too.

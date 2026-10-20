@@ -594,7 +594,8 @@ enum TranscriptOp {
     /// Drop a transcript by id (or unique id prefix) from `sc transcript
     /// list`. Records a tombstone that travels with fetch/push, so a peer
     /// that still has the transcript cannot bring it back; `sc gc` reclaims
-    /// the body after its grace window. Not erasure: peers that never
+    /// the body (a loose one after `--prune-expire`, but one already packed
+    /// by an earlier gc at the next gc). Not erasure: peers that never
     /// receive the tombstone keep the sealed body. Without `--identity` the
     /// drop is local-only: peers honor a tombstone only when it is signed by
     /// a key in their `[signers] trusted` list.
