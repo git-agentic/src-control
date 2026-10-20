@@ -86,6 +86,65 @@ fn bucket_clone_push_fetch_round_trip_and_url_validation() {
     }
 }
 
+/// #229: a signed snapshot pushed to a bucket keeps its signature on a fresh
+/// clone, so `sc verify --require` passes there once the signer is trusted
+/// (trust is local config, written into the clone).
+#[test]
+fn verify_require_passes_after_a_bucket_clone_of_a_signed_snapshot() {
+    let a = tmp("sign-a");
+    let bucket = tmp("sign-bucket");
+    let parent = tmp("sign-parent");
+    let url = format!("sc+wal://{}", bucket.display());
+
+    // Keys live outside the work tree (the scanner flags key material in one).
+    let id = parent.join("alice.id");
+    let out = sc(&parent, &["keygen", "--out", id.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let sig_pk = text
+        .lines()
+        .find_map(|l| l.split_whitespace().find(|w| w.starts_with("scl-sig-")))
+        .expect("keygen prints a signing public key")
+        .to_string();
+
+    assert!(sc(&a, &["init"]).status.success());
+    std::fs::write(a.join("f.txt"), b"signed").unwrap();
+    let out = sc(
+        &a,
+        &[
+            "commit",
+            "-m",
+            "c1",
+            "--sign",
+            "--identity",
+            id.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(sc(&a, &["remote", "add", "origin", &url]).status.success());
+    assert!(sc(&a, &["push", "origin"]).status.success());
+
+    let b = parent.join("b");
+    let out = sc(&parent, &["clone", &url, b.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    std::fs::write(
+        b.join(".sc/recipients.toml"),
+        format!("[signing]\nalice = \"{sig_pk}\"\n\n[signers]\ntrusted = [\"alice\"]\n"),
+    )
+    .unwrap();
+    let out = sc(&b, &["verify", "--require"]);
+    assert!(
+        out.status.success(),
+        "verify --require after a bucket clone: {out:?}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 trusted"));
+
+    for d in [&a, &bucket, &parent] {
+        std::fs::remove_dir_all(d).unwrap();
+        assert!(!d.exists());
+    }
+}
+
 /// `sc serve --http --store <sc+wal://…>` serves a bucket instead of the
 /// serve-home's own object store (P36c): a repo pushed straight to the
 /// bucket is clonable through the server, and a push through the server is

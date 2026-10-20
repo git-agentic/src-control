@@ -321,8 +321,7 @@ enum Cmd {
         /// still sends them, the client hash-checks and discards them, so
         /// this transfer writes none and indexes none. Per command, not
         /// remembered by the clone; a later plain fetch brings them in.
-        /// Does nothing for git remotes and bucket remotes (sc+wal://,
-        /// sc+s3://), which carry no transcripts.
+        /// Does nothing for git remotes, which carry no transcripts.
         #[arg(long)]
         no_transcripts: bool,
     },
@@ -414,8 +413,7 @@ enum Cmd {
         /// this fetch writes none and indexes none (a new signature over a
         /// transcript you already hold is dropped too). Per command, not
         /// remembered; a later plain fetch brings them in. Does nothing for
-        /// git remotes and bucket remotes (sc+wal://, sc+s3://), which
-        /// carry no transcripts.
+        /// git remotes, which carry no transcripts.
         #[arg(long)]
         no_transcripts: bool,
     },
@@ -428,9 +426,7 @@ enum Cmd {
         include_encrypted: bool,
         /// Do not send transcript objects (P30) or their signatures. Sealed
         /// bodies stay sealed either way; snapshots still transfer. Does
-        /// nothing for git remotes, which never carry transcripts. A bucket
-        /// remote (sc+wal://, sc+s3://) is stored but never served them, so
-        /// there the flag only spares the upload.
+        /// nothing for git remotes, which never carry transcripts.
         #[arg(long)]
         no_transcripts: bool,
     },
