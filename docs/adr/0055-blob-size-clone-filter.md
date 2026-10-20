@@ -250,6 +250,10 @@ the file's own path), and a workspace session on a size-limited clone.
 - **Push, verify, gc.** Presence-based (ADR-0048).
 - **Merge, pick, rebase, ws, work** (ADR-0049/0050). No new engine code; a size
   gap is "asked for" like any other (decision 7).
+  Named and concurrent sessions (ADR-0056) hold too: a session records the
+  host's view at fork, which for a size-only clone is the full view (`sparse`
+  empty), a fork starts at a ref tip so its base is complete, and each harvest
+  lands through the same merge. `named_sessions_on_a_size_limited_clone` pins it.
 - **Server cost and limits (D5).** The walk measures a blob with `Store::blob_size`
   (streamed through a fixed buffer, hash-verified, never admitted to the object
   cache) and caches each verdict by blob id, so a distinct blob is measured at

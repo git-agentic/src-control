@@ -874,10 +874,10 @@ fn replay_and_merge_with_a_size_gap_as_base() {
 #[test]
 fn workspace_session_on_a_size_limited_clone_lands() {
     use crate::ws::WsHarvestOutcome;
-    for lazy in [false, true] {
-        let sz = Sz::new(if lazy { "ws-lazy" } else { "ws" });
+    for (lazy, name) in [(false, None), (true, None), (false, Some("named"))] {
+        let sz = Sz::new(&format!("ws-{lazy}-{}", name.unwrap_or("default")));
         let clone = sz.clone(&[], LIMIT, lazy);
-        let session = clone.ws_fork(1, "t", None).unwrap();
+        let session = clone.ws_fork(name, 1, "t", None).unwrap();
         let ws = &session.workspaces[0].dir;
         assert_eq!(
             std::fs::read(ws.join("src/huge.bin")).unwrap(),
@@ -891,7 +891,7 @@ fn workspace_session_on_a_size_limited_clone_lands() {
         )
         .unwrap();
         clone.commit("t", "host edit").unwrap();
-        let outcomes = clone.ws_harvest(None, "t", None).unwrap();
+        let outcomes = clone.ws_harvest(name, None, "t", None).unwrap();
         assert!(
             matches!(outcomes.as_slice(), [WsHarvestOutcome::Landed { .. }]),
             "got {outcomes:?}"
@@ -1046,4 +1046,53 @@ fn undo_to_a_gapped_revision_fills_when_lazy_and_refuses_otherwise() {
         drop(clone);
         sz.cleanup();
     }
+}
+
+/// Named, concurrent sessions (ADR-0056) on a size-only clone: each records the
+/// host's full view at fork, lays out the large tip file, and lands on its own;
+/// the second harvest merges over the first. A fork always starts at a ref tip,
+/// which is complete, so a size gap cannot be in a new session's base.
+#[test]
+fn named_sessions_on_a_size_limited_clone() {
+    use crate::ws::WsHarvestOutcome;
+    let sz = Sz::new("named-ws");
+    let clone = sz.clone(&[], LIMIT, false);
+    let a = clone.ws_fork(Some("a"), 1, "t", None).unwrap();
+    let b = clone.ws_fork(Some("b"), 1, "t", None).unwrap();
+    assert!(
+        a.sparse.is_empty() && b.sparse.is_empty(),
+        "full view recorded"
+    );
+    for sess in [&a, &b] {
+        assert_eq!(
+            std::fs::read(sess.workspaces[0].dir.join("src/huge.bin")).unwrap(),
+            huge(2)
+        );
+    }
+    std::fs::write(
+        a.workspaces[0].dir.join("big.txt"),
+        text(&[(0, "ours"), (100, "from a")]),
+    )
+    .unwrap();
+    std::fs::write(
+        b.workspaces[0].dir.join("big.txt"),
+        text(&[(0, "ours"), (200, "from b")]),
+    )
+    .unwrap();
+    for name in ["a", "b"] {
+        let out = clone.ws_harvest(Some(name), None, "t", None).unwrap();
+        assert!(
+            matches!(out.as_slice(), [WsHarvestOutcome::Landed { .. }]),
+            "{name}: {out:?}"
+        );
+    }
+    let landed = String::from_utf8(std::fs::read(sz.clone_root.join("big.txt")).unwrap()).unwrap();
+    assert!(landed.contains("from a\n") && landed.contains("from b\n"));
+
+    assert!(
+        clone.ws_sessions().unwrap().is_empty(),
+        "both sessions ended"
+    );
+    drop(clone);
+    sz.cleanup();
 }
