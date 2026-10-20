@@ -255,7 +255,6 @@ pub(crate) fn gc_prune(layout: &Layout, reachable: &mut BTreeSet<ObjectId>) -> R
     let dropped: BTreeSet<ObjectId> = drops.iter().map(|(_, _, d)| *d).collect();
     let entries = read_raw(layout)?;
     let mut kept = Vec::with_capacity(entries.len());
-    let mut dead = 0;
     for (snap, tid) in &entries {
         if dropped.contains(tid) {
             continue;
@@ -263,14 +262,13 @@ pub(crate) fn gc_prune(layout: &Layout, reachable: &mut BTreeSet<ObjectId>) -> R
         if reachable.contains(snap) {
             reachable.insert(*tid);
             kept.push((*snap, *tid));
-        } else {
-            dead += 1;
         }
     }
-    if kept.len() != entries.len() {
+    let pruned = entries.len() - kept.len();
+    if pruned > 0 {
         write_index(layout, &kept)?;
     }
-    Ok(dead)
+    Ok(pruned)
 }
 
 /// Receiver-side seam (Task 3/4): given a batch of object ids just written

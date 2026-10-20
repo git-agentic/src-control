@@ -35,7 +35,8 @@ pub struct GcStats {
     /// to the ordinary loose-object prune, not counted here.
     pub signatures_pruned: usize,
     /// Transcript index entries dropped (P30) because their snapshot fell
-    /// out of the reachable set this pass; their transcript objects fall
+    /// out of the reachable set this pass, or because a drop tombstone hides
+    /// them; their transcript objects fall
     /// through to the ordinary loose-object prune, not counted here.
     pub transcripts_pruned: usize,
 }
@@ -804,7 +805,11 @@ mod tests {
         repo.drop_transcript(&gone.to_hex(), Some(&identity))
             .unwrap();
 
-        repo.gc(Duration::from_secs(0)).unwrap();
+        let stats = repo.gc(Duration::from_secs(0)).unwrap();
+        assert_eq!(
+            stats.transcripts_pruned, 1,
+            "the dropped entry purged from the index is counted"
+        );
 
         let tomb = {
             let drops = std::fs::read_to_string(repo.layout().transcript_drops_path()).unwrap();
