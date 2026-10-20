@@ -1204,7 +1204,8 @@ disable` stay refused on a partial clone. See ADR-0048.
 
 `merge_trees` is a tree-recursive three-way merge that carries a subtree **by
 id** when the sides agree and no protection rule applies, reads only where the
-sides differ or a rule intersects, and on a lazy, online clone fills what it
+sides differ or a rule intersects (a subtree with the same id on all three sides
+is carried unread even under a protection rule), and on a lazy, online clone fills what it
 asks for by id outside the store lock (a non-lazy clone gets the gap error with
 the `sc backfill <path>` hint). A carried protected subtree keeps the complete
 input wrap union. A conflict inside the view is marked and resolved like on a

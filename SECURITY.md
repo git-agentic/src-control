@@ -34,8 +34,8 @@ it are consolidated in [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md). In brief:
   honors the drop only for a signer in its `[signers] trusted` list.
 - Committed secrets injected by `sc run` live in an **authorized local process
   context, not strong isolation** — same-user processes can observe the child
-  environment. `sc run --secrets-fd N` keeps them out of the environment but
-  is still not isolation.
+  environment. `sc run --secrets-fd N` (unix only; other platforms refuse it) keeps them
+  out of the environment but is still not isolation.
 - **`sc transcript drop` is not erasure either.** A drop travels as a signed
   tombstone that a peer honors only when the signature comes from a key in its
   `[signers] trusted` list; an unsigned drop is local-only, and any trusted
