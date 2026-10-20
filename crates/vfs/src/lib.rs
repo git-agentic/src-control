@@ -68,9 +68,9 @@ fn warn_chmod_swallowed(path: &Path, err: &std::io::Error) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
-            "warning: could not set the file mode on {} ({err}); executable bits may not be \
-             preserved, and the next commit may record an executable file as non-executable \
-             (this warning is shown once)",
+            "warning: could not set the file mode on {} ({err}); the on-disk executable bit \
+             may differ from the recorded mode, and the next commit may record the file's \
+             on-disk mode instead (this warning is shown once)",
             path.display()
         );
     }
