@@ -205,3 +205,16 @@ separately-spawned `sc` **processes**).
 This supersedes the two now-stale Consequences bullets above about
 checkpoint folding and `sc serve` being unable to host a bucket as its
 backing store — both are built as of P36b/P36c.
+
+## As built (#229, 2026-10): signatures and transcripts on `get_pack`
+
+`BucketTransport::get_pack` now over-sends signatures, transcripts and signed
+drop tombstones the way `LocalTransport` does, so a bucket round trip no
+longer strips snapshot signatures (a signed snapshot used to clone as
+`Unsigned`). The bucket format is unchanged: pushes already upload these
+objects inside ordinary packs, and `get_pack` recovers which snapshot or
+transcript each one covers by decoding the on-chain packs (cached per pack
+hash). No manifest, log, checkpoint or idx change and no `PROTOCOL_VERSION`
+bump. The receiver's trust gate for tombstones and the `--no-transcripts`
+skip are unchanged. Rationale and cost in ADR-0038's #229 addendum.
+

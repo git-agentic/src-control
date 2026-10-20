@@ -966,7 +966,10 @@ a transfer-relevant snapshot, and the receiver reindexes idempotently. `sc
 gc` roots live transcript ids into reachability before signature pruning
 runs, so a signed transcript survives exactly as long as the transcript
 itself does. `sc export --to <git-repo>` drops transcripts (no Git-native
-form exists) and reports a count.
+form exists) and reports a count. A bucket remote (P36) has no index, so its
+`get_pack` rebuilds the same over-send from the packs the manifest chain names
+(no format change), at the cost of downloading and decoding every on-chain pack
+on each fresh fetch or clone.
 
 `sc transcript drop <id> [--identity <key>]` removes a transcript from view
 without a new object tag or wire change: a drop is a **tombstone**, a
@@ -983,7 +986,7 @@ inert. Drop is not erasure: a peer that never receives an honored tombstone
 keeps the sealed body, and a remote that received a tombstone before trusting
 its signer keeps it inert (#230). `sc clone|fetch|push --no-transcripts` leaves
 transcript objects out of one transfer (per command, not remembered; no effect
-on git or bucket remotes). See ADR-0038 and its addendum.
+on git remotes). See ADR-0038 and its addendum.
 
 ## Phase 31 — listener resource limits (built)
 
@@ -1152,12 +1155,14 @@ identity and scratch space while all served content lives in the bucket, so
 instances are disposable. Public content sits in the bucket as plaintext at
 rest (the bucket ACL is the perimeter; sealed content stays ciphertext), and
 `sc clone --filter` is refused against a bucket remote. Bucket compaction and gc
-are not built (open issue #216). A bucket's `get_pack` is reachability-only, so
-signatures and transcripts do not travel through it (open issue #229): a signed
-commit pushed to a bucket remote shows as unsigned after a later fetch or clone
-from that bucket (including through `sc serve --store`), and attached
-transcripts are stored but never served back. Verify signed history from a
-non-bucket remote until that is fixed. See ADR-0046 and `docs/research/walgit-evaluation.md`.
+are not built (open issue #216). A bucket keeps no signature or transcript
+index, so its `get_pack` rebuilds the over-send from the packs the manifest
+chain names; signatures, transcripts and signed drop tombstones therefore
+travel through a bucket like any other remote, but each fresh fetch or clone
+downloads and decodes every on-chain pack to do it. The bucket cannot judge a
+tombstone, so a receiver honors it only for a trusted signer, and until then
+may see a transcript the bucket still holds. See ADR-0038's bucket addendum,
+ADR-0046 and `docs/research/walgit-evaluation.md`.
 
 ## Phase 37a — want-by-id fetch (built)
 
