@@ -168,7 +168,9 @@ fn check_prior(
         (Some(m), _) if m.is_dir() => Ok(()), // judged by the directory rules
         (Some(_), Some(prior)) if still_read(full, p, prior, cache) => Ok(()),
         // Already the target bytes (a plain file): nothing of the user's to lose.
-        (Some(_), _) if target.is_some_and(|t| disk_is_blob(full, &t)) => Ok(()),
+        // Not for a path the candidate did not track: an ignored file with the
+        // same bytes is still the user's, and a rewrite would replace its inode.
+        (Some(_), Some(_)) if target.is_some_and(|t| disk_is_blob(full, &t)) => Ok(()),
         (Some(_), Some(_)) => Err(changed_since_read(p)),
         (Some(_), None) => Err(Error::InvalidArgument(format!(
             "cannot write {p}: a file of yours (untracked or ignored) stands there; move it \
@@ -229,7 +231,12 @@ fn plan_checkout(
         }
         let prior = prior.map(|(b, _, op)| (*b, *op));
         if meta.as_ref().is_some_and(|m| m.is_dir()) {
-            if !dir_clearable(&full, p, &|c| removable.contains(c)) {
+            // Only a directory the removals are about to empty is a husk: an
+            // empty one the refresh did not empty is the user's (as in any
+            // forward op), whose working directory a process may hold.
+            let under = format!("{p}/");
+            let emptied = removals.iter().any(|r| r.0.starts_with(&under));
+            if !emptied || !dir_clearable(&full, p, &|c| removable.contains(c)) {
                 return Err(Error::InvalidArgument(format!(
                     "cannot write {p}: a directory with untracked or ignored content \
                      stands there; move it away, then retry"
@@ -854,6 +861,34 @@ mod tests {
         assert_eq!(base_of(&repo, None), old);
         assert!(!dir.join("b.txt").exists(), "nothing was written");
         assert_eq!(read(&dir, "scratch/log"), "agent file\n");
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn an_ignored_file_with_the_target_bytes_and_an_empty_directory_still_refuse() {
+        let (repo, root) = init("in-the-way");
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        std::fs::write(dir.join(".scignore"), "scratch/\n").unwrap();
+        std::fs::create_dir_all(dir.join("scratch")).unwrap();
+        std::fs::write(dir.join("scratch/log"), "host\n").unwrap();
+        std::fs::create_dir_all(dir.join("mine")).unwrap();
+        host_commit(
+            &repo,
+            &root,
+            &[("scratch/log", Some("host\n")), ("mine", Some("a file\n"))],
+        );
+        // The empty directory first (it sorts first), then, once moved, the ignored file.
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("cannot write mine"), "{err}");
+        assert!(dir.join("mine").is_dir());
+        std::fs::remove_dir(dir.join("mine")).unwrap();
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(
+            err.contains("scratch/log") && err.contains("stands there"),
+            "{err}"
+        );
+        assert_eq!(read(&dir, "scratch/log"), "host\n");
         cleanup(repo, &root);
     }
 
