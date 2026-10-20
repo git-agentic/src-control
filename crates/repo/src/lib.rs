@@ -67,6 +67,7 @@ pub mod wire;
 pub mod workspace;
 pub mod worktree;
 pub(crate) mod ws;
+mod ws_refresh;
 
 pub use bucket_transport::{
     BucketScheme, BucketTransport, BucketUrl, CompactOptions, CompactReport,
@@ -91,3 +92,4 @@ pub use stdio_transport::{open_transport, SshUrl, StdioTransport};
 pub use workspace::{HarvestResult, WorkOptions, WorkspaceOutcome};
 pub use worktree::Diff;
 pub use ws::{WsEntry, WsHarvestOutcome, WsRunPlan, WsSession};
+pub use ws_refresh::{WsRefresh, WsRefreshEntry};

@@ -3,8 +3,9 @@
 # edit across separate `sc` process invocations, list, cumulative
 # auto-merge harvest (some workspaces land, a conflicting one falls back),
 # undo/redo of the landings, then manual conflict resolution of the
-# fallback branch, then two named sessions open at once (ADR-0056). Ends
-# with zero `.sc/ws*` residue.
+# fallback branch, then two named sessions open at once (ADR-0056), then
+# `sc ws refresh` (a live workspace moves onto a newer tip, keeping its edits).
+# Ends with zero `.sc/ws*` residue.
 #
 # Self-checking: every claim is an assertion; any failure exits non-zero
 # before the RESULT line.
@@ -205,8 +206,58 @@ for d in .sc/ws .sc/ws-a .sc/ws-b; do
 done
 echo "no .sc/ws* residue ✔"
 echo
+echo "=== 10: sc ws refresh moves a live session onto a newer tip (ADR-0056) ==="
+fork_r=$("$SC" ws fork --agents 2 --name r --author demo)
+dir_r1=$(echo "$fork_r" | sed -n 2p | awk '{print $2}')
+dir_r2=$(echo "$fork_r" | sed -n 3p | awk '{print $2}')
+printf 'agent notes\n' > "$dir_r1/notes.txt"
+printf 'edited by the agent\n' > "$dir_r1/alpha.txt"
+# An untracked file the agent keeps open must survive the refresh untouched.
+printf 'scratch\n' > "$dir_r2/scratch.tmp"
+printf 'moved on\n' > newer.txt
+"$SC" commit -m "host moves on" --author demo
+
+refresh_out=$("$SC" ws refresh --session r)
+echo "$refresh_out"
+case "$refresh_out" in *"refreshed 2 workspace(s)"*) ;; *) fail "refresh must report 2 workspaces: $refresh_out" ;; esac
+for d in "$dir_r1" "$dir_r2"; do
+  [ "$(cat "$d/newer.txt")" = "moved on" ] || fail "$d must have the host's newer file"
+done
+[ "$(cat "$dir_r1/notes.txt")" = "agent notes" ] || fail "the agent's new file must survive"
+[ "$(cat "$dir_r1/alpha.txt")" = "edited by the agent" ] || fail "the agent's edit must survive"
+[ "$(cat "$dir_r2/scratch.tmp")" = "scratch" ] || fail "an untouched file must survive"
+tip_short=$("$SC" log | head -1 | awk '{print $1}')
+list_r=$("$SC" ws list --session r)
+case "$list_r" in *"@ $tip_short"*) ;; *) fail "list must show the new base $tip_short: $list_r" ;; esac
+echo "both workspaces moved to the new tip, edits and extra files kept, list shows the base ✔"
+
+# A conflict refuses the whole refresh before any write.
+printf 'agent version\n' > "$dir_r2/shared.txt"
+printf 'host version\n' > shared.txt
+"$SC" commit -m "host edits shared.txt" --author demo
+if "$SC" ws refresh --session r >/dev/null 2>"$work/err.txt"; then
+  fail "refresh must refuse a conflict"
+fi
+grep -q "nothing was changed" "$work/err.txt" || fail "refusal must say nothing changed: $(cat "$work/err.txt")"
+[ "$(cat "$dir_r2/shared.txt")" = "agent version" ] || fail "a refused refresh must leave the checkout alone"
+echo "a conflicting refresh refused and changed nothing ✔"
+
+# Harvest after a refresh lands on the new tip.
+printf 'host version\n' > "$dir_r2/shared.txt"
+"$SC" ws refresh --session r >/dev/null
+set +e
+r_out=$("$SC" ws harvest --session r --author demo)
+set -e
+echo "$r_out"
+test -f notes.txt || fail "the refreshed agent's notes must land on main"
+[ "$(cat alpha.txt)" = "edited by the agent" ] || fail "the agent's edit must land on main"
+[ -d .sc/ws-r ] && fail ".sc/ws-r must not exist after harvest"
+echo "harvest after refresh landed the agent's work ✔"
+
+echo
 echo "RESULT: durable multi-invocation ws session — fork/edit/list across separate"
 echo "sc invocations, cumulative auto-merge harvest (2 landed, 1 fallback, exit 1),"
 echo "undo/redo of the landings, manual conflict resolution of the fallback branch,"
 echo "zero .sc/ws residue ✔; then two named sessions open at once, first-wins"
-echo "harvest with a-1 fallback, ws run not holding the repo lock ✔"
+echo "harvest with a-1 fallback, ws run not holding the repo lock ✔; then ws refresh"
+echo "moving a live session onto a newer tip, refusing a conflict, landing after ✔"

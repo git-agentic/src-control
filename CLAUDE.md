@@ -135,7 +135,7 @@ the code, those win.
 | P17 | `sc rewrap`: one-commit bulk cutover of secrets + protected wrap lists to current recipients/escrow; escrow is a managed list; `--rotate` also re-seals every protected blob under a fresh key | [0027](docs/adr/0027-bulk-rewrap-and-multi-escrow.md), [0051](docs/adr/0051-rotate-protected-paths.md) |
 | P18 | Hosted Git (GitHub https/ssh) via system-git mirror bridge (`SC_GIT` overrides); auth delegated to git | [0028](docs/adr/0028-network-git-remotes.md) |
 | P19 | Resumable rebase (stop → resolve → `--continue`; one oplog record total), `cherry-pick --abort`/`--mainline <N>`, `sc amend` | [0029](docs/adr/0029-history-editing-polish.md) |
-| P20 | Durable multi-invocation agent sessions: `sc ws fork/list/run/harvest/abandon` under `.sc/ws/`; harvest auto-merges, conflicts fall back to `work-<i>`. `fork --name <n>` opens a further named session in `.sc/ws-<n>/` (`--session <n>` on the other verbs; fallback branches and `SC_WORKSPACE` are `<n>-<i>`); sessions are harvested independently, first harvest wins; `ws run` releases the repo lock while the command runs; refresh is designed, not built (#215) | [0030](docs/adr/0030-agent-sessions-and-automerge.md), [0056](docs/adr/0056-named-concurrent-ws-sessions.md) |
+| P20 | Durable multi-invocation agent sessions: `sc ws fork/list/run/harvest/abandon` under `.sc/ws/`; harvest auto-merges, conflicts fall back to `work-<i>`. `fork --name <n>` opens a further named session in `.sc/ws-<n>/` (`--session <n>` on the other verbs; fallback branches and `SC_WORKSPACE` are `<n>-<i>`); sessions are harvested independently, first harvest wins; `ws run` releases the repo lock while the command runs; `sc ws refresh [--session <n>] [--onto <branch>] [--identity <key>]` replays every live workspace's state (committed to a throwaway candidate, dirty files included) onto the new tip with the ADR-0049 engine, refusing the whole refresh before any write on a conflict, a running command, a scanner hit, a view gap or a user file in the way, then re-lays only the differing files in place and moves the base last (#215) | [0030](docs/adr/0030-agent-sessions-and-automerge.md), [0056](docs/adr/0056-named-concurrent-ws-sessions.md) |
 | P21 | Hardening sweep: in-progress guards on all policy ops, git-marks self-heal, abort protected-skip parity, ws `"landed"` status | [0031](docs/adr/0031-hardening-consolidation.md) |
 | P22 | Signed commits: v2 identities (one seed → X25519 + Ed25519), signatures as CAS objects, `sc sign`/`sc verify [--require]` | [0032](docs/adr/0032-signed-commits-provenance.md) |
 | P23 | `sc conflicts`/`sc resolve --ours\|--theirs`: whole-file conflict resolution without hand-edited markers | [0033](docs/adr/0033-merge-ergonomics.md) |
@@ -341,8 +341,7 @@ transport-adjacent. The rest, imperatively:
 
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here); entries that name an issue mirror the open
-GitHub issues. Standing entries: `sc ws` workspace refresh (#215),
-a limit-aware `sc fetch` and an object-count clone limit (#217 remainder), the non-unix
+GitHub issues. Standing entries: a limit-aware `sc fetch` and an object-count clone limit (#217 remainder), the non-unix
 `.sc/local-key` ACL (#214), and the open
 sparse guard and user-file safety limits (#241, ADR-0034 refinement 8).
 

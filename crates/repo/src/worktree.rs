@@ -1029,7 +1029,7 @@ pub(crate) fn clear_dir_obstruction(full: &Path, path: &str) -> Result<()> {
 /// other file, no unreadable subdirectory, no name that is not UTF-8. Reads
 /// only; `materialize` runs it for every directory a target file replaces
 /// before its first removal, so a refusal leaves the working tree untouched.
-fn dir_clearable(dir: &Path, rel: &str, removable: &dyn Fn(&str) -> bool) -> bool {
+pub(crate) fn dir_clearable(dir: &Path, rel: &str, removable: &dyn Fn(&str) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
@@ -1045,6 +1045,25 @@ fn dir_clearable(dir: &Path, rel: &str, removable: &dyn Fn(&str) -> bool) -> boo
             _ => false,
         }
     })
+}
+
+/// The plaintext of the protected blob `blob_id` (`bytes`) if `identity` can
+/// unwrap one of its recorded DEKs, else `None` (no key, no wrap, or no match).
+pub(crate) fn decrypt_protected(
+    bytes: &[u8],
+    blob_id: &ObjectId,
+    protection: &Protection,
+    identity: Option<&scl_crypto::SecretKey>,
+) -> Option<scl_crypto::Zeroizing<Vec<u8>>> {
+    let sk = identity?;
+    for wk in protection.wrapped.get(blob_id)? {
+        if let Ok(dek) = scl_crypto::unwrap_dek_with(wk, sk) {
+            if let Ok(pt) = scl_crypto::decrypt_path(bytes, &dek) {
+                return Some(pt);
+            }
+        }
+    }
+    None
 }
 
 /// Materialize a snapshot's file tree into the working dir.
@@ -1334,18 +1353,7 @@ fn materialize_impl(
         };
         if perms & PROTECTED != 0 {
             // Protected: try to decrypt with the provided identity.
-            let decrypted: Option<_> = (|| {
-                let sk = identity?;
-                let wks = protection.wrapped.get(blob_id)?;
-                for wk in wks {
-                    if let Ok(dek) = scl_crypto::unwrap_dek_with(wk, sk) {
-                        if let Ok(pt) = scl_crypto::decrypt_path(&bytes, &dek) {
-                            return Some(pt);
-                        }
-                    }
-                }
-                None
-            })();
+            let decrypted = decrypt_protected(&bytes, blob_id, protection, identity);
             match decrypted {
                 Some(pt) => {
                     clear(&full, path)?;

@@ -152,3 +152,66 @@ fn a_running_session_does_not_block_the_others() {
     assert!(!root.join(".sc/ws-a").exists());
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// `sc ws refresh` through the binary: a workspace with an uncommitted edit
+/// moves onto the host's newer tip, `ws list` shows the new base, a conflict
+/// refuses with a non-zero exit and changes nothing, and a running command makes
+/// it refuse too.
+#[test]
+fn refresh_keeps_a_workspace_edit_and_refuses_a_conflict() {
+    let root = setup("refresh");
+    let a = forked_dir(&ok(&root, &["ws", "fork", "--agents", "1", "--name", "a"]));
+    std::fs::write(a.join("mine.txt"), "mine\n").unwrap();
+    std::fs::write(root.join("host.txt"), "host\n").unwrap();
+    ok(&root, &["commit", "-m", "host", "--author", "t"]);
+
+    let out = ok(&root, &["ws", "refresh", "--session", "a"]);
+    assert!(out.contains("refreshed 1 workspace(s)"), "{out}");
+    assert!(out.contains("1 written, 0 removed"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(a.join("host.txt")).unwrap(),
+        "host\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(a.join("mine.txt")).unwrap(),
+        "mine\n"
+    );
+    let list = ok(&root, &["ws", "list", "--session", "a"]);
+    let head = ok(&root, &["log"]);
+    let short = list
+        .split('@')
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert!(
+        head.contains(short),
+        "list shows the new base {short}: {list}\n{head}"
+    );
+    assert!(ok(&root, &["ws", "refresh", "--session", "a"]).contains("already based on"));
+
+    // A conflict with the host refuses, exits non-zero and writes nothing.
+    std::fs::write(a.join("shared.txt"), "from ws\n").unwrap();
+    std::fs::write(root.join("shared.txt"), "from host\n").unwrap();
+    ok(&root, &["commit", "-m", "host 2", "--author", "t"]);
+    let before = ok(&root, &["ws", "list", "--session", "a"]);
+    let bad = sc(&root, &["ws", "refresh", "--session", "a"]);
+    assert!(!bad.status.success());
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        err.contains("nothing was changed") && err.contains("shared.txt"),
+        "{err}"
+    );
+    assert_eq!(ok(&root, &["ws", "list", "--session", "a"]), before);
+    assert_eq!(
+        std::fs::read_to_string(a.join("shared.txt")).unwrap(),
+        "from ws\n"
+    );
+
+    // The unrefreshed workspace still harvests: its edit conflicts, so it falls back.
+    let h = sc(&root, &["ws", "harvest", "--session", "a", "--author", "t"]);
+    assert_eq!(h.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&h.stdout).contains("fallback: branch a-1"));
+    std::fs::remove_dir_all(&root).unwrap();
+}

@@ -793,7 +793,20 @@ invocation order: the first lands, a later one merges over it or falls back.
 `sc ws run` resolves its workspace and secret environment under the lock, then
 releases it before spawning the command (`WsRunPlan`), so other sessions stay
 usable while an agent runs. gc roots every open session's base snapshot.
-Workspace refresh is designed in the ADR and not built.
+
+Refresh (ADR-0056). `sc ws refresh` moves a session onto the checked-out
+branch's tip (or `--onto <branch>`). Each live workspace's checkout is committed
+to a throwaway candidate (harvest's pipeline without the branch write) whose
+parent is the session base, and the candidate is replayed onto the tip with
+`replay_commit`, the ADR-0049 engine, which touches neither the host's working
+tree nor a ref. A planner then compares the candidate's tree with the replayed
+one under the session's recorded view and decides every removal and write for
+every workspace; any conflict, running command, scanner hit, view gap, protected
+path it cannot decrypt, or user file in the way refuses the whole refresh before
+a write. Applying touches only differing paths, each written atomically and only
+over the bytes the candidate was read from; the manifest, which carries the new
+base, is written last, so a crash leaves the old base and a checkout that a
+harvest still lands without loss. Session-wide only.
 
 ## Phase 21 — hardening & consolidation sweep (built)
 

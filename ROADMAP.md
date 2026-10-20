@@ -198,7 +198,12 @@ across every phase.
   Harvests of different sessions are serialized by the repo lock and land in
   invocation order (first wins, a later conflict falls back); `sc ws run`
   releases the repo lock while its command runs, so other sessions stay usable.
-  Workspace refresh is designed in ADR-0056 and still deferred.
+  `sc ws refresh` (#215, ADR-0056) moves a live session onto a newer tip: each
+  workspace's state (dirty files included) is committed to a throwaway candidate
+  and replayed with the ADR-0049 engine; any conflict, running command, scanner
+  hit, view gap or user file in the way refuses the whole refresh before a
+  write; only the differing files are re-laid in place and the manifest base
+  moves last. Session-wide only; per-index refresh is not built.
 - **Phase 21 — Hardening & consolidation.** Closes the P16–P20 review
   tail with no new capability axis. Every commit-creating policy op
   (`protect`/`grant`/`revoke`/`secret add`/`secret rotate`/`secret
@@ -776,12 +781,6 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.
-- **`sc ws` workspace refresh (#215, P20).** Named and concurrent sessions
-  shipped (ADR-0056). Moving a live workspace onto a newer tip is designed there
-  (replay the workspace's commit with the ADR-0049 engine, refuse on any
-  conflict, re-materialize under the recorded view) but not built: it needs a
-  headless merge-into-tree entry point and a re-materialize that keeps files an
-  agent may have open. Abandon and re-fork covers it meanwhile.
 - **Sparse untracked-file guard edge cases.** #241: on a case-insensitive
   filesystem the untracked-file guard can alias an old-view path with a newly
   in-view one.

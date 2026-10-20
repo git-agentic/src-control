@@ -1,6 +1,6 @@
 # ADR-0056: Named and concurrent `sc ws` sessions (P20, #215)
 
-- **Status:** Accepted (built, except workspace refresh, which is designed here and deferred)
+- **Status:** Accepted (built, including workspace refresh)
 - **Date:** 2026-10-20
 - **Phase:** 20 (follow-on)
 - **Builds on:** ADR-0030 (agent sessions), ADR-0050 (sessions on partial clones), ADR-0023 (agent workspaces), ADR-0043 (per-checkout protected cache)
@@ -38,26 +38,34 @@ Reading the code turned up one fact that shapes the design. `Repo::open` takes t
 
 9. **`sc work` is unchanged.** It uses temporary directories and never touches `.sc/ws*`.
 
-## Workspace refresh (designed, not built)
+## Workspace refresh (built)
 
-`sc ws refresh <name>` would move a session onto the landing branch's newer tip while keeping the agents' work. The smaller design, recommended for a follow-up:
+`sc ws refresh [--session <n>] [--onto <branch>] [--identity <key>]` moves a live session onto a newer tip and keeps what the agents did. The first draft of this section (candidate commit, replay with the ADR-0049 engine, refuse on any conflict) held up; building it settled the two open points and added the rules below.
 
-- For each live workspace, commit its checkout to a temporary candidate with the same pipeline harvest uses (scanner gate, protected re-encryption), so a scanner rejection refuses the refresh.
-- Replay that candidate onto the new tip with the ADR-0049 tree engine (`tree_merge_filled`), in memory. Any conflict, in the view or not, refuses the whole refresh with the conflicting paths, and the session is untouched.
-- Only when every workspace replays cleanly: re-materialize each checkout from its replayed tree under the session's recorded view, rewrite the manifest base to the new tip, then drop the temporary candidates. Order the manifest write after the checkouts, and keep the old checkouts until the new ones are complete, so a crash leaves either the old or the new state.
+1. **No new merge entry point was needed.** `replay_commit` (the cherry-pick engine) already merges a snapshot onto a tree without touching the host's working tree or a ref, and on a partial clone it goes through `tree_merge_filled`. A workspace has no commits of its own, so its state is its checkout: refresh commits each checkout to a throwaway candidate with harvest's pipeline (`workspace_candidate`, harvest's body minus the branch write: scanner gate, protected re-encryption, the workspace cache), whose parent is the session's base. The candidate is replayed onto the new tip, which is base to tip on the host's side and base to checkout on the workspace's. The secret registry is not merged: a checkout cannot change it, so the candidate carries the base's.
 
-It is deferred, not rejected, for these reasons:
+2. **Uncommitted edits are part of the replay, and stay edits.** Refresh creates no commit and no ref. After it the workspace holds the merged tree, its recorded base is the new tip, and `sc ws list` shows `changed` for exactly what the agent added on top of that tip. A later harvest builds its candidate on the new tip and lands as a fast-forward of it (or a merge, if the branch moved again). An unchanged workspace is simply laid out at the new tip.
 
-- The merge path is head-centric (ADR-0030, as-shipped note), so refresh needs a headless "merge a candidate into a tree" entry point plus "re-materialize a checkout from a tree while keeping unrelated files". Neither exists, and the second one rewrites files an agent may have open.
-- Harvest already integrates work forked from an older base by three-way merge, so a stale base costs a possible fallback branch, not data. Abandon and re-fork covers the need to see newer code.
-- The acceptance criteria for this issue (independent sessions, deterministic outcomes) do not depend on it, and refresh deserves its own crash-safety tests.
+3. **Session-wide, not per workspace.** The manifest has one `base_snapshot` for the session. Refreshing a single workspace would need a per-entry base (a schema change touching `ws_changed_for`, harvest and gc roots), which this does not do. `sc ws refresh` therefore takes every live workspace of the session (`--session` picks the session). A per-index form is deferred.
+
+4. **The target is the checked-out branch's tip, or `--onto <branch>`.** Refresh reads the tip from the store and does not touch the host's working tree, so it needs neither a clean tree nor the branch checked out. The session's `base_branch` (harvest's default landing branch) becomes the target branch. It refuses on a private branch (as fork does) and during a stopped merge/pick/rebase (as harvest does). With the session already at the target, it does nothing.
+
+5. **Everything that can refuse refuses before the first write, for all workspaces.** A workspace running a command (the `running-<i>` marker, `ensure_idle`); a candidate rejected by the scanner; any conflict, in or out of the view, a protected path that needs an identity to merge (`ProtectedMergeNeedsIdentity`, `NotAuthorized`) or a file/directory collision; a gap in the new tree's view (the view is filled first on a lazy clone, else the gap error of ADR-0050); a protected path the new tip changed that the supplied identity cannot decrypt while the workspace holds a plaintext copy (`--identity` hint; a path the workspace never had, because it was forked without a key, is skipped and reported); a user's file or directory where the new tip adds one (`refuse_untracked_overwrite`'s rule, extended to ignored files); and a file that must be replaced no longer holding the bytes the candidate was read from (an edit that raced the refresh). The refusal lists every workspace and path. A scanner hit refuses the refresh, as the earlier draft proposed; the agent fixes the file and retries.
+
+6. **Re-materialize in place, only where the tracked content differs, using the ADR-0034 refinement 8 rule.** The planner compares the candidate's tree with the replayed tree under the session's recorded view (both walks bounded by it, so an out-of-view subtree a partial clone never fetched is not read; `materialize`'s own old-root walk is unbounded on a workspace layout, which is why it is not used). Only a path whose blob or mode differs is touched; an untouched file keeps its inode, mtime and any open handle, and untracked or ignored files are never looked at. A file is removed or overwritten only if the disk copy is a regular file with exactly the candidate's bytes (protected files cannot be byte-compared without the key and are replaced as regular files; the window is the few milliseconds between the candidate read and the write, under the repo lock). Each write is atomic (temp file, rename), so an interrupted refresh never leaves a half-written file. A protected file written is recorded in the workspace's `cache-<i>` as fork does, and the caches are saved after the manifest.
+
+7. **Crash behaviour, and what it is not.** Write order: every checkout, then the manifest with the new base. In-place re-materialization is not atomic across files, and no in-place scheme can be. A crash leaves the manifest naming the old base, and each checkout a mix of files at their pre-refresh state and at their merged state. Nothing is lost: a harvest diffs the checkout against the old base, so the merged files carry the new tip's own changes too, which the three-way merge sees on both sides and lands cleanly; where the workspace and the host edited the same lines of a file, the merged file differs from both and the harvest falls back to a `work-<i>` branch instead (never a silent revert). `sc ws refresh` can be run again; it re-reads the mixed checkout and normally converges, and may refuse with a conflict on such a file, in which case harvest or abandon applies. The alternative that does leave the old checkout whole (build the new one in a sibling directory and swap) was rejected: it drops untracked and ignored files, breaks any open handle or working directory, and is no more atomic in the face of a crash during the swap.
+
+Not built: refreshing one workspace by index.
+
+Tests: `ws_refresh.rs` (no edits; already at the tip; uncommitted edits and a same-file merge, then a harvest that lands as a fast-forward of the new tip; host and workspace deletions; a conflict refuses everything and harvest is unchanged; a running command; two named sessions refresh independently; `--onto`; an ignored file survives and a user file in the way refuses; the scanner; protected paths need `--identity`, the cache keeps an untouched workspace unchanged and an edited protected file changed; a narrow recorded view; two injected mid-apply failures, one followed by harvest and one by a second refresh), `partial_sessions.rs` (a partial clone: the view is refreshed and `docs/` is carried and never fetched; a gap refuses before any write), `crates/cli/tests/ws_sessions.rs` and `demo/run_ws_demo.sh` section 10.
 
 ## Consequences
 
 - Several named sessions can be open at once and used in parallel, including while an agent command runs, with deterministic first-harvest-wins outcomes.
 - Existing repos and scripts keep working untouched: the unnamed layout, command lines, output, `work-<i>` names and manifests are the same.
 - A harvest that finds the landing branch moved by another session's landing takes the ordinary merge path; conflicts end up as `<name>-<i>` branches for manual `sc merge`.
-- Not built: refresh, `harvest --all`, and a per-entry record of the branch a workspace landed on (the existing `sc ws list` caveat about `--into` stands).
+- Not built: `harvest --all`, per-index refresh, and a per-entry record of the branch a workspace landed on (the existing `sc ws list` caveat about `--into` stands).
 
 ## Alternatives considered
 

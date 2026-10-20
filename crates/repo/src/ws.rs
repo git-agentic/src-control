@@ -77,7 +77,7 @@ pub struct WsSession {
     pub workspaces: Vec<WsEntry>,
 }
 
-fn ws_dir(layout: &Layout, name: Option<&str>) -> PathBuf {
+pub(crate) fn ws_dir(layout: &Layout, name: Option<&str>) -> PathBuf {
     layout.ws_root(name)
 }
 
@@ -88,7 +88,7 @@ fn manifest_path(layout: &Layout, name: Option<&str>) -> PathBuf {
 /// The prefix of a session's fallback branches and `SC_WORKSPACE` label:
 /// `work` for the unnamed session (unchanged), the session name otherwise,
 /// matching `sc work --name`.
-fn label_prefix(name: Option<&str>) -> &str {
+pub(crate) fn label_prefix(name: Option<&str>) -> &str {
     name.unwrap_or("work")
 }
 
@@ -106,7 +106,7 @@ fn running_path(layout: &Layout, name: Option<&str>, i: u32) -> PathBuf {
 /// the workspace busy after `sc` is killed). It is cleared only when every
 /// recorded pid is provably dead (the repo lock's probe); an unreadable or
 /// empty marker counts as busy.
-fn ensure_idle(layout: &Layout, name: Option<&str>, i: u32) -> Result<()> {
+pub(crate) fn ensure_idle(layout: &Layout, name: Option<&str>, i: u32) -> Result<()> {
     let path = running_path(layout, name, i);
     if path.exists() {
         let pids: Vec<u32> = std::fs::read_to_string(&path)
@@ -258,7 +258,7 @@ pub(crate) fn list_sessions(layout: &Layout) -> Result<Vec<WsSession>> {
 }
 
 /// The open session called `name`, or an error naming what is open instead.
-fn open_session(layout: &Layout, name: Option<&str>) -> Result<WsSession> {
+pub(crate) fn open_session(layout: &Layout, name: Option<&str>) -> Result<WsSession> {
     if let Some(s) = read_manifest(layout, name)? {
         return Ok(s);
     }
@@ -281,7 +281,7 @@ fn open_session(layout: &Layout, name: Option<&str>) -> Result<WsSession> {
 
 /// Write the session manifest atomically. The parent dir must already exist
 /// (fork/abandon create it before the first write).
-fn write_manifest(layout: &Layout, session: &WsSession) -> Result<()> {
+pub(crate) fn write_manifest(layout: &Layout, session: &WsSession) -> Result<()> {
     let raw: SessionToml = session.into();
     let text = toml::to_string(&raw).map_err(|e| Error::BadConfig(e.to_string()))?;
     let path = manifest_path(layout, session.name.as_deref());

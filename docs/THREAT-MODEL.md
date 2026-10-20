@@ -560,6 +560,17 @@ too, not just the src-control-side metadata.
   no longer holds the repo lock (ADR-0056), so an `sc` it runs from inside the
   workspace finds the host repo and can change it, as a hand-started agent always
   could.
+- **`sc ws refresh` writes into a workspace the user or an agent may be using
+  (ADR-0056).** It overwrites or removes only a regular file whose bytes are
+  still the ones it read (a protected file, whose plaintext it cannot compare
+  without a key, is replaced as a regular file), never an untracked or ignored
+  file, and refuses before any write when one is in the way. It decrypts a
+  protected path only with the identity passed to it and refuses rather than
+  leave a stale plaintext copy; the throwaway candidate seals protected edits
+  like a harvest does and is left for gc. An agent writing the same file during
+  the refresh is not tracked unless it runs under `sc ws run` (the busy marker),
+  so refresh narrows that race to the planning-to-write window but does not
+  close it.
 - **A blob-size limit (`--filter blob:limit=<size>`, ADR-0055) is request scope
   like the prefix filter, and the server evaluates it.** It hides nothing: any
   client that can read the repository can fetch the left-out blobs (`sc

@@ -310,3 +310,94 @@ fn a_failing_probe_leaves_no_candidate_branch() {
     drop(clone);
     fx.cleanup();
 }
+
+/// Refresh on a partial clone (ADR-0056): the workspace moves onto a tip where
+/// the host edited another line of the same file and `docs/` changed outside the
+/// view. Its edit is kept, the view is laid out, and the out-of-view region is
+/// carried by id, never read or fetched; a harvest then lands on the new tip.
+#[test]
+fn refresh_moves_a_workspace_without_reading_the_rest() {
+    let fx = Fx::origin("ws-refresh", |_| {});
+    let b1 = fx.origin_branch(
+        "b1",
+        &[
+            ("docs/a.md", b"a changed\n"),
+            ("src/b.txt", b"new in view\n"),
+        ],
+    );
+    let new_docs = dir_id(&fx.origin, &b1, "docs");
+    let clone = fx.clone(false);
+    let session = clone.ws_fork(None, 1, "t", None).unwrap();
+    let dir = session.workspaces[0].dir.clone();
+    std::fs::write(dir.join("src/a.txt"), SRC_FIRST).unwrap();
+    std::fs::write(dir.join("src/mine.txt"), b"mine\n").unwrap();
+
+    clone.merge("origin/b1", "t").unwrap(); // fast-forward onto b1
+    let tip = refs::read_branch_tip(clone.layout(), "main")
+        .unwrap()
+        .unwrap();
+    assert_eq!(tip, b1);
+
+    let r = clone.ws_refresh(None, None, None).unwrap();
+    assert_eq!((r.to, r.workspaces.len()), (b1, 1));
+    assert_eq!(
+        std::fs::read(dir.join("src/b.txt")).unwrap(),
+        b"new in view\n"
+    );
+    assert_eq!(std::fs::read(dir.join("src/a.txt")).unwrap(), SRC_FIRST);
+    assert_eq!(std::fs::read(dir.join("src/mine.txt")).unwrap(), b"mine\n");
+    assert!(!dir.join("docs").exists(), "docs is outside the view");
+    assert!(!has(&clone, &new_docs), "and was never read or fetched");
+
+    let merged = match clone.ws_harvest(None, None, "t", None).unwrap().as_slice() {
+        [WsHarvestOutcome::Landed { merged_tip, .. }] => *merged_tip,
+        other => panic!("expected a landing, got {other:?}"),
+    };
+    assert_eq!(clone.snapshot(&merged).unwrap().parents, vec![b1]);
+    assert_eq!(dir_id(&clone, &merged, "docs"), new_docs, "carried by id");
+    assert!(!has(&clone, &new_docs));
+    drop(clone);
+    fx.cleanup();
+}
+
+/// A gap the new tip leaves in the view refuses the refresh with a gap error
+/// before anything is written (nothing moves: manifest, checkout).
+#[test]
+fn refresh_refuses_a_view_gap_before_writing_anything() {
+    let fx = Fx::origin("ws-refresh-gap", |_| {});
+    let clone = fx.clone(false);
+    let session = clone.ws_fork(None, 1, "t", None).unwrap();
+    let dir = session.workspaces[0].dir.clone();
+    std::fs::write(dir.join("src/a.txt"), SRC_FIRST).unwrap();
+    std::fs::write(fx.origin_root.join("src/copy.md"), b"a\n").unwrap();
+    fx.origin
+        .commit("t", "adds a src file sharing a docs blob")
+        .unwrap();
+    clone.fetch("origin").unwrap();
+    let tip = refs::resolve_tip(clone.layout(), "origin/main")
+        .unwrap()
+        .unwrap();
+    refs::write_branch_tip(clone.layout(), "main", &tip).unwrap();
+    assert!(
+        !has(&clone, &crate::partial_merge::blob_id(b"a\n")),
+        "premise: a gap"
+    );
+
+    let err = clone.ws_refresh(None, None, None).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::Error::GapInView { .. } | crate::error::Error::GapOutsideFilter(_)
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        clone.ws_session(None).unwrap().unwrap().base_snapshot,
+        session.base_snapshot
+    );
+    assert_eq!(std::fs::read(dir.join("src/a.txt")).unwrap(), SRC_FIRST);
+    assert!(!dir.join("src/copy.md").exists());
+    clone.ws_abandon(None, None).unwrap();
+    drop(clone);
+    fx.cleanup();
+}
