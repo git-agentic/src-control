@@ -76,25 +76,24 @@ pub const CHUNK_SIZE: usize = 1 << 20;
 /// sender, the client's `PutPack` sender) call this, so setting the var
 /// before either side starts affects the whole round trip.
 pub fn pack_chunk_size() -> usize {
-    chunk_from(
-        std::env::var("SC_PACK_CHUNK").ok().as_deref(),
-        scl_core::max_object_size(),
-    )
+    chunk_from(std::env::var("SC_PACK_CHUNK").ok().as_deref())
 }
 
 /// The `SC_PACK_CHUNK` decision, pure so it can be tested without touching the
 /// process environment: an unset, unparsable or zero value is the default, and
-/// anything larger than a frame can carry is clamped. A chunk frame is the
-/// `ST_PACK_CHUNK` tag byte plus the data, and the receiver refuses a frame
-/// above the object cap, so the data is capped one byte below it; an
-/// oversized setting would otherwise fail every large transfer with a
-/// confusing error.
-fn chunk_from(value: Option<&str>, object_cap: usize) -> usize {
+/// anything larger than the smallest valid receiver accepts is clamped. Caps
+/// are receiver-local and unnegotiated, and the smallest a receiver can be set
+/// to is [`scl_core::MIN_MAX_OBJECT_SIZE`], so the data is capped one byte
+/// below that (the `ST_PACK_CHUNK` tag byte makes the frame exactly that size).
+/// Every chunk frame therefore fits any valid receiver, and receivers built
+/// before the frame limit gained [`FRAME_OVERHEAD`]; an oversized setting would
+/// otherwise fail every large transfer with a confusing error.
+fn chunk_from(value: Option<&str>) -> usize {
     value
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(CHUNK_SIZE)
-        .min(object_cap - 1)
+        .min(scl_core::MIN_MAX_OBJECT_SIZE - 1)
 }
 
 // Wire error codes. Typed errors that sync logic relies on get their own code;
@@ -2025,45 +2024,26 @@ mod tests {
     }
 
     #[test]
-    fn chunk_from_defaults_and_clamps_to_the_object_cap() {
-        let max = scl_core::DEFAULT_MAX_OBJECT_SIZE;
-        assert_eq!(chunk_from(None, max), CHUNK_SIZE);
-        assert_eq!(chunk_from(Some(""), max), CHUNK_SIZE);
-        assert_eq!(chunk_from(Some("0"), max), CHUNK_SIZE);
-        assert_eq!(chunk_from(Some("junk"), max), CHUNK_SIZE);
-        assert_eq!(chunk_from(Some("4096"), max), 4096);
-        // A chunk frame carries a tag byte too: data at the cap would make a
-        // frame one byte over what the receiver accepts.
-        let cap = max - 1;
-        assert_eq!(
-            chunk_from(Some(&(max * 8).to_string()), max),
-            cap,
-            "an oversized setting is clamped, not passed through"
-        );
-        assert_eq!(chunk_from(Some(&max.to_string()), max), cap);
-        assert_eq!(chunk_from(Some(&cap.to_string()), max), cap);
-    }
-
-    #[test]
-    fn chunk_clamp_follows_a_lowered_and_a_raised_cap() {
-        // Lowered: an explicit chunk larger than the cap clamps to cap - 1,
-        // so the frame (tag byte + data) is exactly the cap. The default
-        // 1 MiB chunk still fits at the 2 MiB floor.
-        let low = scl_core::MIN_MAX_OBJECT_SIZE;
-        assert_eq!(chunk_from(None, low), CHUNK_SIZE);
-        assert!(CHUNK_SIZE < low, "a default peer's frame fits the floor");
-        let chunk = chunk_from(Some(&(low * 2).to_string()), low);
-        assert_eq!(chunk, low - 1);
+    fn chunk_from_defaults_and_clamps_to_the_smallest_valid_receiver_cap() {
+        let min = scl_core::MIN_MAX_OBJECT_SIZE;
+        assert_eq!(chunk_from(None), CHUNK_SIZE);
+        assert_eq!(chunk_from(Some("")), CHUNK_SIZE);
+        assert_eq!(chunk_from(Some("0")), CHUNK_SIZE);
+        assert_eq!(chunk_from(Some("junk")), CHUNK_SIZE);
+        assert_eq!(chunk_from(Some("4096")), 4096);
+        // Independent of this process's own cap: a sender raised to 1 GiB
+        // must still produce frames the smallest valid receiver accepts.
+        for v in [min, min * 8, scl_core::MAX_MAX_OBJECT_SIZE, usize::MAX] {
+            assert_eq!(chunk_from(Some(&v.to_string())), min - 1, "{v}");
+        }
+        // The resulting frame (tag byte + data) is exactly the minimum cap and
+        // is accepted by a receiver at that cap, even with no overhead slack.
         let mut frame = vec![ST_PACK_CHUNK];
-        frame.extend(vec![0u8; chunk]);
+        frame.extend(vec![0u8; min - 1]);
         let mut framed = Vec::new();
         write_frame(&mut framed, &frame).unwrap();
-        assert!(read_frame_max(&mut &framed[..], low).unwrap().is_some());
-        assert!(read_frame_max(&mut &framed[..], low - FRAME_OVERHEAD - 1).is_err());
-        // Raised: a big explicit chunk is honoured up to the new cap - 1.
-        let high = scl_core::MAX_MAX_OBJECT_SIZE;
-        assert_eq!(chunk_from(Some("536870912"), high), 536_870_912);
-        assert_eq!(chunk_from(Some(&high.to_string()), high), high - 1);
+        assert!(read_frame_max(&mut &framed[..], min).unwrap().is_some());
+        assert!(CHUNK_SIZE < min, "the default chunk fits every receiver");
     }
 
     #[test]

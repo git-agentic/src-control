@@ -805,7 +805,7 @@ scale-&-reach horizon):
   (default 256 MiB, range 2 MiB to 1 GiB, out of range aborts startup). No wire
   negotiation: each receiver applies its own cap.
 - **P28 review follow-ons — shipped.** `refs::write_head`/`delete_branch` run
-  `validate_branch_name`; `SC_PACK_CHUNK` is clamped to the object cap minus one (a chunk frame carries a tag byte too; an
+  `validate_branch_name`; `SC_PACK_CHUNK` is clamped to the minimum configurable object cap minus one (2 MiB - 1, so every chunk frame fits any valid receiver) (a chunk frame carries a tag byte too; an
   oversized value used to make every transfer fail with a confusing receiver
   error); `Repo::worktree_paths` is a paths-only walk (`list_worktree_paths`,
   the same ignore and tracked-path rules as `read_worktree`, no file read); and

@@ -446,7 +446,8 @@ too, not just the src-control-side metadata.
 
 - A single max object size caps every untrusted length: wire frames,
   pack-record compressed length, the zstd *decompressed* output (decompression-bomb
-  guard), bucket pack bodies, by-id reply objects, the `SC_PACK_CHUNK` clamp,
+  guard), bucket pack bodies, by-id reply objects, the `SC_PACK_CHUNK` clamp (fixed at the
+  2 MiB minimum cap minus one, since caps are receiver-local and unnegotiated),
   and object-decode collection counts. The default is 256 MiB. An operator can
   lower or raise it with `sc serve --max-object-size` and `SC_MAX_OBJECT_SIZE`
   (#213), within a compile-time range of 2 MiB to 1 GiB; a value outside that
@@ -491,6 +492,19 @@ too, not just the src-control-side metadata.
     `cap + 64` bytes (`PutObject` header 37 bytes, response status 1, chunk
     tag 1), so an object of exactly the cap fits; the object body itself is then
     checked against the cap exactly.
+  - **A local-path source loads before the receiver refuses.** A clone or
+    fetch from a local-path remote reads each object through
+    `LocalTransport::get_object` (load plus encode) before the receiver's cap
+    rejects it, bounded by the local store budget. Wire sources refuse in
+    `WireClient::get_object`, before decoding.
+  - **Structural objects have no per-connection aggregate budget (pre-existing,
+    amplified by a raised cap).** `Object::blob_size` is 0 for trees,
+    snapshots, secrets and transcripts, so repeated `PutObject` of distinct
+    structural objects on a writable listener is bounded per object (the cap)
+    but not in aggregate per connection: only by `--max-connections` times
+    connection lifetime (`--timeout`). Prefer read-only or token-gated
+    listeners, keep `--max-object-size` low, and size `--max-connections`
+    down. An aggregate per-connection byte budget is tracked in #233.
   - **One length is checked after allocation:** bucket WAL metadata (manifest,
     log entry, idx) is capped at a fixed 256 MiB after the bucket GET has
     buffered it, so it bounds decode work, not the download. It is not tied to

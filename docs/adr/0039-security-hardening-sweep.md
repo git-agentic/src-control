@@ -163,7 +163,9 @@ default of 256 MiB. Decisions:
    bodies (`bucket_transport::object_bytes`); server-side servable-size check
    (`check_servable_size`, against the largest configurable cap, not the
    server's own: the cap is receiver-only, so a server with a lower cap still
-   serves a larger local object by id, as `GetPack` does); the `SC_PACK_CHUNK` clamp (`cap - 1`, a chunk
+   serves a larger local object by id, as `GetPack` does); the `SC_PACK_CHUNK` clamp (fixed at `MIN_MAX_OBJECT_SIZE - 1`, not the local
+   cap: caps are receiver-local and unnegotiated, so every chunk frame must fit
+   the smallest valid receiver; a chunk
    frame carries a tag byte); the `--max-pack-size` floor
    (`validate_max_pack_size`). Two exceptions are deliberately fixed, not derived from the cap. Bucket
    WAL metadata (manifest, log entry, idx) stays capped at the default
@@ -210,6 +212,16 @@ connection's own store budget (each served connection opens its own store,
 `max(512 MiB, 2 x cap)`). At the default that is about 0.5 GiB + 0.5 GiB; at
 the 1 GiB ceiling about 2 GiB + 2 GiB, per connection, times
 `--max-connections` (THREAT-MODEL.md).
+
+Known gaps, not addressed here. `Object::blob_size` is 0 for structural
+objects (trees, snapshots, secrets, transcripts), so a writable listener has no
+per-connection aggregate byte bound on repeated `PutObject` of distinct
+structural objects; each is capped, the sum is bounded only by
+`--max-connections` x connection lifetime. This predates #213 and a raised cap
+amplifies it: prefer read-only or token-gated listeners, keep the cap low.
+Tracked in #233. A local-path remote loads and encodes an object before the
+receiver's cap refuses it (`TransportSource::get`), bounded by the store
+budget.
 
 For `ssh://` remotes the client builds the remote `sc serve --stdio` command
 itself and ssh does not forward the environment, so the server end of an ssh
