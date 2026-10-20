@@ -2063,8 +2063,8 @@ impl Repo {
     /// tree tracks as a plain file: that one is the user's own. Call it after
     /// the restore. A lookup that fails keeps the file: it would be a path the
     /// restored tree may track. Returns the recorded paths it left because
-    /// something other than a regular file (the user's symlink or directory)
-    /// stands there.
+    /// the user's symlink (or a symlinked parent)
+    /// stands there; a directory is reported by the restore itself.
     pub(crate) fn remove_conflict_plaintext(&self, restored_root: ObjectId) -> Result<Vec<String>> {
         let paths = crate::conflict_plaintext::read(&self.layout)?;
         let mut retained = Vec::new();

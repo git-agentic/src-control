@@ -1405,6 +1405,28 @@ mod tests {
         (layout, store)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn lstat_reads_a_file_parent_as_absent_and_under_symlink_stays_below_the_root() {
+        let root = std::env::temp_dir().join(format!("scl-repo-lstat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("file"), b"f").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        assert!(lstat(&root.join("file/child")).unwrap().is_none());
+        assert!(lstat(&root.join("missing")).unwrap().is_none());
+        assert!(lstat(&root.join("file")).unwrap().is_some());
+        assert!(under_symlink(&root, "link/a.txt"));
+        assert!(!under_symlink(&root, "real/a.txt"));
+        // The root itself being reached through a link does not count.
+        let alias = root.with_extension("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(!under_symlink(&alias, "real/a.txt"));
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
     #[test]
     fn read_worktree_respects_scignore_but_keeps_tracked() {
         let root = std::env::temp_dir().join(format!("scl-repo-wt-ignore-{}", std::process::id()));
