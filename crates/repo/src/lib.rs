@@ -44,6 +44,8 @@ pub mod secrets;
 pub mod serve_tokens;
 pub mod signatures;
 pub mod sparse;
+#[cfg(test)]
+mod sparse_completion;
 pub mod stdio_transport;
 pub mod sync;
 pub mod textdiff;

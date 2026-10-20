@@ -201,11 +201,8 @@ every claim below is checked against the shipped code, not the plan.
    The untracked-file guard checks only paths the old view did not match
    (those it laid out are not written, and a stopped op may have turned one
    into a directory). Widening to the same spec is a quiet no-op. The
-   decided root is the right source: it is what completion is meant to carry
-   an out-of-view path from (not always true today: a clean out-of-view
-   deletion by the other side can be resurrected from the tip on a full
-   clone, #238, which is why a widen *before* completing yields the right tree
-   and a narrow view does not). For a resumed rebase (`resolved`) the accumulator
+   decided root is the right source: it is what completion carries an
+   out-of-view path from (refinement 6). For a resumed rebase (`resolved`) the accumulator
    can differ from it outside the view, but the next `--continue` re-lays
    the tree from the accumulator under the new spec, so what the widen laid
    is overwritten there. A full spec is `disable` and stays refused. Markers, the resolution,
@@ -217,3 +214,20 @@ every claim below is checked against the shipped code, not the plan.
    path. Abort restores the original tip over the widened view and the spec
    stays widened. No oplog record is written (the spec change moves no
    ref); the repo lock is held by the CLI as for any mutation.
+6. **Completion carries from the decided root, not the parents (#238).**
+   A stopped merge, cherry-pick or rebase on a public branch records a
+   decided root (`MERGE`/`PICK`/`REBASE_DECIDED_ROOT`); a merge into a
+   private branch writes none and completes through `commit_private`, which
+   this refinement does not cover. `snapshot_files` carries an absent
+   out-of-view or still-protected path from the decided root. Earlier builds
+   also read the tip and merge head, so a path the other side had cleanly
+   deleted (an out-of-view file, or a protected file) came back from the tip
+   and the deletion was silently lost; a file the other side turned into a
+   directory was carried beside it, a corrupt tree. With a decided root the
+   parents are no longer consulted: on a full clone it holds every surviving
+   entry (protected ones as ciphertext), and conflicted paths and sealing
+   inputs are on disk or in `CONFLICT_PLAINTEXT`. They stay the full fallback
+   for state written without a decided root. Pinned by `sparse_completion.rs`
+   (merge, pick, rebase: deletion kept, clean add and modify land, ours-side
+   out-of-view changes kept, equal to the run without sparse; file to
+   directory; an out-of-view exec bit; a protected deletion).
