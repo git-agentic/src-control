@@ -123,7 +123,9 @@ impl<R: Read, W: Write> Transport for WireClient<R, W> {
         wire::decode_bool_body(&self.call(Request::HasObject(*id))?)
     }
     fn get_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        self.call(Request::GetObject(*id))
+        let body = self.call(Request::GetObject(*id))?;
+        wire::check_object_len(body.len(), scl_core::max_object_size())?;
+        Ok(body)
     }
     fn put_object(&self, id: &ObjectId, bytes: &[u8]) -> Result<()> {
         self.call(Request::PutObject {

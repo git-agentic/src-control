@@ -373,6 +373,23 @@ impl Request {
         c.done()?;
         Ok(req)
     }
+
+    /// [`Request::decode`] for a frame the caller owns. A `PutObject` object
+    /// body is moved out of the frame (the header is shifted off in place)
+    /// instead of copied, so a near-cap request holds one copy of the object,
+    /// not two. Anything malformed falls through to `decode` for its error.
+    pub fn decode_owned(mut frame: Vec<u8>) -> Result<Request> {
+        const HEADER: usize = 1 + 32 + 4;
+        if frame.len() >= HEADER && frame[0] == OP_PUT_OBJECT {
+            let n = u32::from_be_bytes(frame[33..HEADER].try_into().unwrap()) as usize;
+            if frame.len() - HEADER == n {
+                let id = ObjectId::from_bytes(frame[1..33].try_into().unwrap());
+                frame.drain(..HEADER);
+                return Ok(Request::PutObject { id, bytes: frame });
+            }
+        }
+        Request::decode(&frame)
+    }
 }
 
 // --- frame IO ---
@@ -404,8 +421,28 @@ fn read_frame_inner(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
     read_frame_max(r, scl_core::max_object_size())
 }
 
-/// [`read_frame_opt`] with an explicit frame-length cap `max` (the live
-/// [`scl_core::max_object_size`] in production).
+/// Room a frame has beyond the object it carries: the longest header is a
+/// `PutObject` request (opcode + 32-byte id + 4-byte length = 37 bytes); a
+/// response adds a status byte and a pack chunk a tag byte. Frames may be
+/// `cap + FRAME_OVERHEAD` long so an object of exactly `cap` bytes still
+/// fits; the object itself is checked against `cap` by [`check_object_len`].
+pub const FRAME_OVERHEAD: usize = 64;
+
+/// Reject an object body above the cap `max`. Frames carry [`FRAME_OVERHEAD`]
+/// extra bytes, so a single-object payload gets this separate exact check.
+pub(crate) fn check_object_len(len: usize, max: usize) -> Result<()> {
+    if len > max {
+        return Err(Error::Protocol(format!(
+            "object of {len} bytes exceeds the {max}-byte object size limit ({})",
+            scl_core::OBJECT_SIZE_HINT
+        )));
+    }
+    Ok(())
+}
+
+/// [`read_frame_opt`] with an explicit object cap `max` (the live
+/// [`scl_core::max_object_size`] in production); the frame limit is
+/// `max + FRAME_OVERHEAD`.
 fn read_frame_max(r: &mut impl Read, max: usize) -> Result<Option<Vec<u8>>> {
     let mut len_bytes = [0u8; 4];
     let mut filled = 0;
@@ -420,9 +457,9 @@ fn read_frame_max(r: &mut impl Read, max: usize) -> Result<Option<Vec<u8>>> {
         filled += n;
     }
     let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > max {
+    if len > max + FRAME_OVERHEAD {
         return Err(Error::Protocol(format!(
-            "frame length {len} exceeds the {max}-byte object size limit ({})",
+            "frame length {len} exceeds the {max}-byte object size limit plus framing ({})",
             scl_core::OBJECT_SIZE_HINT
         )));
     }
@@ -541,14 +578,18 @@ pub fn write_err(w: &mut impl Write, code: u8, msg: &str) -> Result<()> {
 }
 
 /// Split a response frame into its OK body, or reconstruct the typed error.
-pub fn parse_response(frame: Vec<u8>) -> Result<Vec<u8>> {
-    let (&status, rest) = frame
-        .split_first()
+pub fn parse_response(mut frame: Vec<u8>) -> Result<Vec<u8>> {
+    let status = *frame
+        .first()
         .ok_or_else(|| Error::Protocol("empty response frame".into()))?;
     match status {
-        ST_OK => Ok(rest.to_vec()),
+        ST_OK => {
+            // Strip the status byte in place: no second copy of a large body.
+            frame.remove(0);
+            Ok(frame)
+        }
         ST_ERR => {
-            let mut c = Cur::new(rest);
+            let mut c = Cur::new(&frame[1..]);
             let code = c.u8()?;
             let msg = c.str()?;
             c.done()?;
@@ -998,7 +1039,7 @@ fn serve_session(
             Some(f) => f,
             None => return Ok(()), // peer hung up between requests
         };
-        let req = match Request::decode(&frame) {
+        let req = match Request::decode_owned(frame) {
             Ok(req) => req,
             Err(e) => {
                 let (code, msg) = err_to_wire(&e);
@@ -1170,10 +1211,14 @@ fn serve_session(
                         transport.as_transport().has_object(&id).map(bool_body)
                     }
                     Request::GetObject(id) => transport.as_transport().get_object(&id),
-                    Request::PutObject { id, bytes } => transport
-                        .as_transport()
-                        .put_object(&id, &bytes)
-                        .map(|()| Vec::new()),
+                    Request::PutObject { id, bytes } => {
+                        check_object_len(bytes.len(), scl_core::max_object_size()).and_then(|()| {
+                            transport
+                                .as_transport()
+                                .put_object(&id, &bytes)
+                                .map(|()| Vec::new())
+                        })
+                    }
                     Request::UpdateRef {
                         branch,
                         id,
@@ -1395,12 +1440,12 @@ mod tests {
 
     #[test]
     fn frame_over_cap_rejected() {
-        // A frame header alone (no body) claiming a length past the cap must
-        // be rejected before the (fictitious) body is read or allocated:
-        // feeding only the 4-byte header proves this, since reading first
-        // would hit EOF and report a different error.
+        // A frame header alone (no body) claiming a length past the cap plus
+        // framing must be rejected before the (fictitious) body is read or
+        // allocated: feeding only the 4-byte header proves this, since
+        // reading first would hit EOF and report a different error.
         let cap = scl_core::MIN_MAX_OBJECT_SIZE;
-        let over = (cap + 1) as u32;
+        let over = (cap + FRAME_OVERHEAD + 1) as u32;
         let mut r = std::io::Cursor::new(over.to_be_bytes().to_vec());
         let err = read_frame_max(&mut r, cap).unwrap_err();
         assert!(
@@ -1408,7 +1453,7 @@ mod tests {
             "got {err:?}"
         );
         // The production entry point is the same guard at the live cap.
-        let over = (scl_core::max_object_size() + 1) as u32;
+        let over = (scl_core::max_object_size() + FRAME_OVERHEAD + 1) as u32;
         let mut r = std::io::Cursor::new(over.to_be_bytes().to_vec());
         assert!(matches!(
             read_frame_opt(&mut r),
@@ -1418,10 +1463,10 @@ mod tests {
 
     #[test]
     fn frame_cap_lowered_rejects_and_raised_accepts_the_same_frame() {
-        let body = vec![7u8; scl_core::MIN_MAX_OBJECT_SIZE + 1];
+        let low = scl_core::MIN_MAX_OBJECT_SIZE;
+        let body = vec![7u8; low + FRAME_OVERHEAD + 1];
         let mut framed = Vec::new();
         write_frame(&mut framed, &body).unwrap();
-        let low = scl_core::MIN_MAX_OBJECT_SIZE;
         assert!(read_frame_max(&mut &framed[..], low).is_err());
         assert_eq!(
             read_frame_max(&mut &framed[..], low + 1).unwrap().unwrap(),
@@ -1431,6 +1476,64 @@ mod tests {
             read_frame_max(&mut &framed[..], low * 4).unwrap().unwrap(),
             body
         );
+    }
+
+    /// An object of exactly the cap travels in `PutObject` (37 header bytes)
+    /// and `GetObject` (1 status byte) frames; one byte more is refused by
+    /// the exact object check even though the frame itself still fits.
+    #[test]
+    fn object_boundary_exactly_cap_accepted_cap_plus_one_rejected() {
+        let cap = scl_core::MIN_MAX_OBJECT_SIZE;
+        let id = some_id(7);
+        for (len, ok) in [(cap, true), (cap + 1, false)] {
+            let bytes = vec![5u8; len];
+            // PutObject request.
+            let mut framed = Vec::new();
+            write_frame(
+                &mut framed,
+                &Request::PutObject {
+                    id,
+                    bytes: bytes.clone(),
+                }
+                .encode(),
+            )
+            .unwrap();
+            let frame = read_frame_max(&mut &framed[..], cap).unwrap().unwrap();
+            let Request::PutObject { bytes: got, .. } = Request::decode_owned(frame).unwrap()
+            else {
+                panic!("not a PutObject");
+            };
+            assert_eq!(got, bytes);
+            assert_eq!(check_object_len(got.len(), cap).is_ok(), ok, "put {len}");
+            // GetObject response.
+            let mut framed = Vec::new();
+            write_ok(&mut framed, &bytes).unwrap();
+            let frame = read_frame_max(&mut &framed[..], cap).unwrap().unwrap();
+            let body = parse_response(frame).unwrap();
+            assert_eq!(body, bytes);
+            assert_eq!(check_object_len(body.len(), cap).is_ok(), ok, "get {len}");
+        }
+    }
+
+    #[test]
+    fn decode_owned_matches_decode_and_handles_malformed_put_object() {
+        let id = some_id(3);
+        let enc = Request::PutObject {
+            id,
+            bytes: b"hello".to_vec(),
+        }
+        .encode();
+        assert_eq!(
+            Request::decode_owned(enc.clone()).unwrap(),
+            Request::decode(&enc).unwrap()
+        );
+        // Declared length disagrees with the frame: same error as decode.
+        let mut bad = enc.clone();
+        bad.push(0);
+        assert!(Request::decode_owned(bad).is_err());
+        let mut short = enc;
+        short.truncate(10);
+        assert!(Request::decode_owned(short).is_err());
     }
 
     #[test]
@@ -1956,7 +2059,7 @@ mod tests {
         let mut framed = Vec::new();
         write_frame(&mut framed, &frame).unwrap();
         assert!(read_frame_max(&mut &framed[..], low).unwrap().is_some());
-        assert!(read_frame_max(&mut &framed[..], low - 1).is_err());
+        assert!(read_frame_max(&mut &framed[..], low - FRAME_OVERHEAD - 1).is_err());
         // Raised: a big explicit chunk is honoured up to the new cap - 1.
         let high = scl_core::MAX_MAX_OBJECT_SIZE;
         assert_eq!(chunk_from(Some("536870912"), high), 536_870_912);

@@ -460,7 +460,12 @@ too, not just the src-control-side metadata.
     holds its compressed payload plus the decompressed output (each up to the
     cap) while decompressing, then the decompressed output plus the decoded
     object while decoding (the compressed copy is released first), so the peak
-    is about 2 x cap. Plus the connection's own store budget,
+    is about 2 x cap. A single-object `PutObject` is also about 2 x cap: the
+    request frame is moved, not copied, into the object body, and storing it
+    decodes one more copy; a `GetObject` reply on the server holds the body and
+    its response frame. A read-only listener rejects a `PutObject` only after
+    reading the frame, so it can hold one cap-sized frame per connection to
+    refuse it. Plus the connection's own store budget,
     `max(512 MiB, 2 x cap)`, because each served connection opens its own
     store. That is about 0.5 GiB + 0.5 GiB per connection at the default and
     about 2 GiB + 2 GiB at the 1 GiB ceiling, and it multiplies by
@@ -472,6 +477,10 @@ too, not just the src-control-side metadata.
     An explicit budget overrides it: `sc work --budget-mb` and
     `Repo::open_with_budget` use exactly the size given, and one smaller than
     an object fails with `BudgetExceeded`.
+  - **Frames carry 64 bytes of framing beyond the cap.** A frame may be
+    `cap + 64` bytes (`PutObject` header 37 bytes, response status 1, chunk
+    tag 1), so an object of exactly the cap fits; the object body itself is then
+    checked against the cap exactly.
   - **One length is checked after allocation:** bucket WAL metadata (manifest,
     log entry, idx) is capped at a fixed 256 MiB after the bucket GET has
     buffered it, so it bounds decode work, not the download. It is not tied to
