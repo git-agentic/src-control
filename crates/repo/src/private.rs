@@ -2545,6 +2545,7 @@ mod tests {
         );
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists(), "test dir left behind");
     }
 
     /// The public side revokes the completer from a protected prefix and
