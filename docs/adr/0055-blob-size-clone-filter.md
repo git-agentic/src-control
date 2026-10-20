@@ -319,7 +319,9 @@ growth is bounded the way the clone was, and every fetched tip is complete
   lacks and a no-op fetch measures nothing (`the_limited_walk_does_not_measure_blobs_the_receiver_holds`
   counts `blob_size` calls). The haves' closure walk
   reads trees and snapshots only. Without that, every fetch would have
-  stream-hashed all of history. Otherwise as decision 8.
+  stream-hashed all of history. Otherwise as decision 8. A v6 server built before this change
+  accepts a limit-bearing fetch (no wire bump) and answers correctly, but
+  measures every history blob each time; upgrade servers with clients.
 
 Tests: `fetch_sends_the_recorded_limit_and_keeps_the_new_tip_complete`,
 `no_blob_limit_fetches_history_in_full_and_keeps_the_marker`,
