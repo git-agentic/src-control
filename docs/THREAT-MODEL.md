@@ -81,6 +81,19 @@ too, not just the src-control-side metadata.
   protected blob under a fresh key (ADR-0051), whereas a plain `sc rewrap` only
   replaces wrap lists and leaves the key a revoked holder already has. History
   keeps the old wraps and ciphertext regardless.
+- **Local cache key is owner-only on unix only (P33, #214):** the
+  unchanged-detection cache is keyed by `.sc/local-key`, created `0600` from its
+  first byte. Only unix can do that; on a non-unix target the key and the cache
+  files are written with inherited default permissions, and `sc` prints a
+  one-time stderr warning once a cache holds a protected entry. The exposure is
+  small: checkout already writes protected plaintext into the working tree with
+  default permissions on every platform, and the cache holds tags only for files
+  whose plaintext is on disk, so a reader of the key could read that plaintext
+  directly. What remains is the tags of the last-committed version of a file
+  edited since, and stale entries until the next save. The real fix is an
+  owner-only Windows ACL (`windows-sys` is already a transitive dependency); it is
+  unverified without a Windows host and tracked in ROADMAP.md. A unix filesystem
+  that ignores mode bits (vfat, exFAT, some network mounts) is not detected.
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 
@@ -187,6 +200,16 @@ too, not just the src-control-side metadata.
   transcript remaining readable to *authorized* transcript recipients (the P5
   scanner warns at attach time but never blocks; rotation of the underlying secret
   remedies).
+- **Drop tombstones (`sc transcript drop`, ADR-0038 addendum).** A drop is honored
+  by a peer only if it carries a signature over its drop digest from a key under
+  that peer's `[signers] trusted` list, and its snapshot checks out. An unsigned or
+  untrusted tombstone is inert. The new power: any trusted signer can hide
+  transcripts on every peer that trusts it and make those peers' gc reclaim the
+  bodies. Drop is not erasure: peers without the tombstone keep the body,
+  `GetObjects` serves it until gc sweeps it, and a peer that still holds it can
+  re-send it. A tombstone ignored on arrival stays ignored on a push-only or
+  served remote, so configure `[signers] trusted` there before the first drop
+  push. Trust is checked at ingest and is not retroactive.
 
 ## Network transport (`sc serve --http` / `sc+http(s)://` / `ssh://`) — ADR-0022/0036/0040/0041/0042
 

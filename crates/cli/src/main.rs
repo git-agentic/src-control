@@ -476,7 +476,7 @@ enum Cmd {
         /// Target Git repo path (created bare if absent).
         #[arg(long)]
         to: PathBuf,
-        /// Ref to update (default: refs/heads/<current-branch>).
+        /// Ref to update (default: `refs/heads/<current-branch>`).
         #[arg(long)]
         r#ref: Option<String>,
         /// Allow exporting protected ciphertext and dropping secrets.
@@ -615,6 +615,22 @@ enum TranscriptOp {
         #[arg(long)]
         json: bool,
     },
+    /// Drop a transcript by id (or unique id prefix) from `sc transcript
+    /// list`. Records a tombstone that travels with fetch/push, so a peer
+    /// that still has the transcript cannot bring it back; `sc gc` reclaims
+    /// the body (a loose one after `--prune-expire`, but one already packed
+    /// by an earlier gc at the next gc). Not erasure: peers that never
+    /// receive the tombstone keep the sealed body. Without `--identity` the
+    /// drop is local-only: peers honor a tombstone only when it is signed by
+    /// a key in their `[signers] trusted` list.
+    Drop {
+        /// Transcript id as shown by `sc transcript list` (hex prefix).
+        id: String,
+        /// Sign the tombstone with this v2 identity so trusting peers honor
+        /// it (default: unsigned, local-only).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
     /// Sign every transcript attached to a ref's tip snapshot.
     Sign {
         /// Branch or remote-tracking ref whose tip snapshot's transcripts
@@ -685,7 +701,7 @@ enum EscrowOp {
     Set { key_or_name: String },
     /// Append a key to the escrow list (deduped).
     Add { key_or_name: String },
-    /// Remove one escrow key by recipient id or [recipients] name.
+    /// Remove one escrow key by recipient id or `[recipients]` name.
     Remove { id_or_name: String },
     /// List the configured escrow keys.
     Show,
@@ -784,7 +800,7 @@ enum ServeSub {
         #[command(subcommand)]
         op: ServeTokenOp,
     },
-    /// Print this repo's serve-TLS fingerprint (sha256:<hex> of the SPKI),
+    /// Print this repo's serve-TLS fingerprint (`sha256:<hex>` of the SPKI),
     /// minting `.sc/serve-tls/` if absent — distribute this to clients as
     /// SC_HTTPS_FINGERPRINT or to verify a first-connect pin. (P32)
     Fingerprint { path: Option<PathBuf> },
@@ -800,10 +816,18 @@ enum ServeTokenOp {
         /// Access scope: `ro` (read-only) or `rw` (read-write).
         #[arg(long)]
         scope: String,
+        /// Expire the token after a duration (`30m`, `12h`, `7d`, `2w`) or at
+        /// 00:00 UTC on a date (`2030-01-31`). Default: never expires.
+        #[arg(long)]
+        expires: Option<String>,
     },
     /// Remove a token by label.
     Remove { label: String },
-    /// List token labels + scopes (never the token value itself).
+    /// Replace a token's secret in one step, keeping its label, scope and
+    /// expiry date; prints the new value ONCE. The old secret stops working
+    /// immediately. An expired token must be removed and re-added instead.
+    Rotate { label: String },
+    /// List token labels, scopes and expiry (never the token value itself).
     List {
         #[arg(long)]
         json: bool,
@@ -1162,9 +1186,8 @@ fn run_tls(op: TlsOp) -> Result<()> {
             } else {
                 for e in &entries {
                     print_line(&format!(
-                        "{}:{} {}",
-                        e.host,
-                        e.port,
+                        "{} {}",
+                        tls_pins::host_port(&e.host, e.port),
                         tls_pins::fingerprint(&e.pin)
                     ));
                 }
@@ -1178,11 +1201,16 @@ fn run_tls(op: TlsOp) -> Result<()> {
             let (host, port) = tls_pins::parse_host_port(&target)?;
             let n = tls_pins::forget(&file, &host, port)?;
             if n == 0 {
-                anyhow::bail!("no pin for {host}:{port} in {}", file.display());
+                anyhow::bail!(
+                    "no pin for {} in {}",
+                    tls_pins::host_port(&host, port),
+                    file.display()
+                );
             }
             println!(
-                "forgot {n} pin(s) for {host}:{port}; a later connection pins what it sees \
-                 unless SC_HTTPS_STRICT=1 or SC_HTTPS_FINGERPRINT is set (then use `sc tls pin`)"
+                "forgot {n} pin(s) for {}; a later connection pins what it sees \
+                 unless SC_HTTPS_STRICT=1 or SC_HTTPS_FINGERPRINT is set (then use `sc tls pin`)",
+                tls_pins::host_port(&host, port)
             );
             Ok(())
         }
@@ -1194,8 +1222,9 @@ fn run_tls(op: TlsOp) -> Result<()> {
             let pin = tls_pins::parse_fingerprint(&fingerprint)?;
             let replaced = tls_pins::set_pin(&file, &host, port, &pin)?;
             println!(
-                "{} {host}:{port} -> {}",
+                "{} {} -> {}",
                 if replaced { "re-pinned" } else { "pinned" },
+                tls_pins::host_port(&host, port),
                 tls_pins::fingerprint(&pin)
             );
             Ok(())
@@ -3032,6 +3061,15 @@ fn run_transcript(op: TranscriptOp) -> Result<()> {
             }
             Ok(())
         }
+        TranscriptOp::Drop { id, identity } => {
+            let signer = identity.map(|p| load_identity_full(Some(p))).transpose()?;
+            let tid = repo.drop_transcript(&id, signer.as_ref())?;
+            println!("dropped transcript {}", tid.short());
+            if signer.is_none() {
+                eprintln!("note: unsigned drop is local-only; pass --identity to let trusting peers honor it");
+            }
+            Ok(())
+        }
         TranscriptOp::Sign { r#ref, identity } => {
             let tip = resolve_ref_tip(&repo, &r#ref)?;
             let ident = load_identity_full(identity)?;
@@ -3778,7 +3816,9 @@ fn run_serve(
                 );
             }
             // `--http`'s `handle_http_connection` gates on `.sc/` presence
-            // unconditionally (404 before any dispatch, store mode included).
+            // before any dispatch, store mode included (the 404 follows the
+            // auth gate (#207); a listener that requires a token answers 401
+            // first).
             // `--stdio` has no such gate upstream — enforce it here, before
             // touching stdin, so a `--store` session never auto-vivifies
             // `<path>/.sc/tmp/` under an uninitialized directory (which
@@ -3860,13 +3900,20 @@ fn run_serve_token(op: ServeTokenOp) -> Result<()> {
     let repo = open_repo()?;
     let layout = repo.layout();
     match op {
-        ServeTokenOp::Add { label, scope } => {
+        ServeTokenOp::Add {
+            label,
+            scope,
+            expires,
+        } => {
             let scope = match scope.as_str() {
                 "ro" => scl_repo::serve_tokens::Scope::Ro,
                 "rw" => scl_repo::serve_tokens::Scope::Rw,
                 other => anyhow::bail!("scope must be 'ro' or 'rw', got {other}"),
             };
-            let raw = scl_repo::serve_tokens::add(layout, &label, scope)?;
+            let expires_at = expires
+                .map(|e| scl_repo::serve_tokens::parse_expiry(&e, scl_repo::serve_tokens::now()))
+                .transpose()?;
+            let raw = scl_repo::serve_tokens::add_expiring(layout, &label, scope, expires_at)?;
             println!("{raw}");
             eprintln!(
                 "token '{label}' ({scope:?}) added — store this value now; it is not recoverable"
@@ -3878,8 +3925,18 @@ fn run_serve_token(op: ServeTokenOp) -> Result<()> {
             eprintln!("removed serve token '{label}'");
             Ok(())
         }
+        ServeTokenOp::Rotate { label } => {
+            let raw =
+                scl_repo::serve_tokens::rotate(layout, &label, scl_repo::serve_tokens::now())?;
+            println!("{raw}");
+            eprintln!(
+                "token '{label}' rotated — store this value now; the old one no longer works"
+            );
+            Ok(())
+        }
         ServeTokenOp::List { json } => {
             let tokens = scl_repo::serve_tokens::load(layout)?;
+            let now = scl_repo::serve_tokens::now();
             if json {
                 let v: Vec<_> = tokens
                     .iter()
@@ -3887,13 +3944,27 @@ fn run_serve_token(op: ServeTokenOp) -> Result<()> {
                         serde_json::json!({
                             "label": t.label,
                             "scope": format!("{:?}", t.scope).to_lowercase(),
+                            "expires_at": t.expires_at,
+                            "expired": t.is_expired(now),
                         })
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 for t in tokens {
-                    println!("{}  {}", t.label, format!("{:?}", t.scope).to_lowercase());
+                    let expiry = match t.expires_at {
+                        None => String::new(),
+                        Some(e) => format!(
+                            "  expires {}{}",
+                            scl_repo::serve_tokens::format_time(e),
+                            if t.is_expired(now) { "  EXPIRED" } else { "" }
+                        ),
+                    };
+                    println!(
+                        "{}  {}{expiry}",
+                        t.label,
+                        format!("{:?}", t.scope).to_lowercase()
+                    );
                 }
             }
             Ok(())

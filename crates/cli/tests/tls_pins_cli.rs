@@ -159,3 +159,35 @@ fn list_json_survives_a_non_utf8_pin_file_path() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(!dir.exists());
 }
+
+#[test]
+fn ipv6_literal_pins_use_the_bracketed_form() {
+    let dir = tmp("v6");
+    let kh = dir.join("known_hosts");
+    let fp = format!("sha256:{}", "ab".repeat(32));
+
+    let o = sc(&kh, &["tls", "pin", "[0:0:0:0:0:0:0:1]:7777", &fp]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("pinned [::1]:7777"), "{}", out(&o));
+    assert_eq!(
+        out(&sc(&kh, &["tls", "list"])),
+        format!("[::1]:7777 {fp}\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&kh).unwrap(),
+        format!("[::1]:7777 {fp}\n")
+    );
+
+    let o = sc(&kh, &["tls", "forget", "[::1]:7777"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        out(&o).contains("forgot 1 pin(s) for [::1]:7777"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(out(&sc(&kh, &["tls", "list"])), "");
+    assert!(!sc(&kh, &["tls", "pin", "::1", &fp]).status.success());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(!dir.exists(), "test must leave no residue");
+}

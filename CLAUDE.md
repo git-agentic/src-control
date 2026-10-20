@@ -144,7 +144,7 @@ the code, those win.
 | P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3 | [0037](docs/adr/0037-partial-clone.md) |
 | P28 | Security hardening: `MAX_OBJECT_SIZE` (256 MiB) caps on every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | P29 | `sc serve --http` access control: bearer tokens (`sc serve token`), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
-| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command) | [0038](docs/adr/0038-agent-session-transcripts.md) |
+| P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex | [0038](docs/adr/0038-agent-session-transcripts.md) |
 | P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff | [0041](docs/adr/0041-listener-resource-limits.md) |
 | P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md) |
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
@@ -171,7 +171,7 @@ transport-adjacent. The rest, imperatively:
   capability, and no DTO field capable of carrying protected ciphertext or
   identity material.
 - **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (and, on a non-lazy clone, one outside the filter), `sc rewrap`,
-  `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view or needs sealing outside it (no ref, state or working-tree change), `sc push` to a git remote, and
+  `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view or whose `.theirs` sidecar would lie outside the view (partial clones only: on a full clone the sidecar is exempt as it sits beside an in-view file) (no ref, state or working-tree change; on every clone, a conflict stop that needs sealing outside the view is refused the same way), `sc push` to a git remote, and
   `sc fetch` from any native remote but the promisor origin.** `sc merge`, `sc cherry-pick` and `sc rebase` work, including conflicts inside the view (P37c). `sc ws` and `sc work` work too (ADR-0050): workspaces and agents see the clone's view only, and harvest lands through the same merge. `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what
   a clone *asked for*, not what is present: after a fetch an in-filter object
@@ -199,7 +199,9 @@ transport-adjacent. The rest, imperatively:
 - **`.sc/local-key` and the per-checkout protected caches
   (`.sc/protected-cache`, `.sc/ws/cache-<i>`) are never committed and never
   transferred.** Cache saves are best-effort and ordered after ref moves; a
-  cache failure may cause a spurious re-seal but never incorrectness.
+  cache failure may cause a spurious re-seal but never incorrectness. The key
+  is owner-only on unix only; non-unix keeps default permissions and warns once
+  (#214, ACL deferred).
 - **Revoke is standing-only.** A revoked recipient keeps decrypting ciphertext
   sealed before the revoke (they hold the old wraps); cryptographic cutover is
   `sc rewrap --rotate` at the tip (fresh key per protected blob; a plain
@@ -235,10 +237,13 @@ transport-adjacent. The rest, imperatively:
   environment (they arrive on fd N as NUL-terminated `NAME=VALUE` records,
   `SC_SECRETS_FD` names it): hygiene against env dumps and inheritance, still
   not isolation. `sc ws run` and `sc work --with-secrets` use the environment.
-- **Sparse is checkout-only** and has one disk-hygiene boundary: an in-sparse
-  conflict co-occurring with an out-of-sparse protected/plain clean change can
-  leave that out-of-sparse plaintext on disk until the next materializing
-  operation re-lays the tree (not data loss, not a new disclosure — ADR-0034).
+- **Sparse is checkout-only**, and a stopped merge/pick/rebase writes no
+  conflict marker or sealing-input plaintext outside the view: an out-of-sparse
+  conflicted path or sealing input refuses with a `sc sparse set` hint before
+  any write (ADR-0034, #210; from `rebase --continue` the hint says to abort
+  first, since `sparse set` is refused mid-rebase). A binary conflict's
+  `<path>.theirs` sidecar sits beside its in-view file and may not match a
+  file-exact spec; completion and abort remove it.
 - **`.sc/git-remotes/<name>/marks` carries `git_oid ↔ sc_id` identity —
   deleting it is destructive.** Deleting the sibling `mirror.git` is always
   safe (reconstructed on next use). Stale marks self-heal on push/export.

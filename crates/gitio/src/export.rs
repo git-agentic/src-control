@@ -439,7 +439,7 @@ fn count_transcripts(
     let mut count = 0;
     for id in store.all_ids()? {
         if let Object::Transcript(t) = store.get(&id)? {
-            if seen_snaps.contains(&t.snapshot) {
+            if seen_snaps.contains(&t.snapshot) && t.dropped_id().is_none() {
                 count += 1;
             }
         }

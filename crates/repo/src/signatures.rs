@@ -183,6 +183,18 @@ pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<us
     Ok(count)
 }
 
+/// The whole signature index as `signed target -> signature object ids`, read
+/// once so a caller checking many targets does not rescan the file per target.
+pub(crate) fn index_by_target(
+    layout: &Layout,
+) -> Result<std::collections::HashMap<ObjectId, Vec<ObjectId>>> {
+    let mut out: std::collections::HashMap<ObjectId, Vec<ObjectId>> = Default::default();
+    for (target, sig_id) in read_index(layout)? {
+        out.entry(target).or_default().push(sig_id);
+    }
+    Ok(out)
+}
+
 /// Sender-side seam (Task 3): the indexed signature object ids covering any
 /// of `snapshots`, deduped and sorted — the set a push/export needs to
 /// carry alongside the snapshots themselves so the receiving repo's index

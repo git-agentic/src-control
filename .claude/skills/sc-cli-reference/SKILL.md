@@ -230,6 +230,13 @@ cargo run --bin sc -- clone|fetch|push --no-transcripts ...   # leave transcript
                                               # Snapshots transfer and verify as usual; no-op for
                                               # git and bucket (sc+wal://, sc+s3://) remotes
                                               # (push to a bucket still skips the upload)
+cargo run --bin sc -- transcript drop <id> [--identity <key>]   # drop a transcript by id/hex prefix (see `list`): writes
+                                              # a tombstone that travels with fetch/clone so a peer
+                                              # that still has it cannot restore it; gc reclaims the
+                                              # body (loose: after the grace window; already packed: next gc). Not erasure. --identity
+                                              # signs the tombstone; peers honor it only if that key
+                                              # is under [signers] trusted (unsigned = local-only).
+                                              # Propagates on the peer's next fetch (ADR-0038 addendum)
 cargo run --bin sc -- ws harvest --transcript <path> [--sign] [--identity <key>]   # attach the
                                               # file to each harvested workspace's landed snapshot
                                               # (P30; landing status prints before the attach)
@@ -282,12 +289,17 @@ cargo run --bin sc -- serve --http <addr> <path> [--read-only] [--allow-public]
                                               # cap, both --http and --stdio, default 16 GiB,
                                               # 0=unlimited, floor 256 MiB (MAX_OBJECT_SIZE);
                                               # counted mid-stream abort -> EC_TOO_LARGE (P31)
-cargo run --bin sc -- serve token add --label <name> --scope ro|rw   # mint an
-                                              # sct-<hex> bearer token in .sc/serve-tokens.toml;
-                                              # raw value prints once on stdout (P29)
+cargo run --bin sc -- serve token add --label <name> --scope ro|rw [--expires <30m|12h|7d|2w|YYYY-MM-DD>]
+                                              # mint an sct-<hex> bearer token in
+                                              # .sc/serve-tokens.toml; raw value prints once on
+                                              # stdout; --expires: duration or 00:00 UTC date;
+                                              # value must be in the future; default never (P29, #209)
+cargo run --bin sc -- serve token rotate <label>   # new secret, same label/scope and the same
+                                              # ABSOLUTE expires_at (no renewed duration); old one
+                                              # dies at once; refused if expired (#209)
 cargo run --bin sc -- serve token remove <label>   # drop a token by label (P29)
-cargo run --bin sc -- serve token list [--json]    # list token labels + scopes, never the
-                                              # raw value (P29)
+cargo run --bin sc -- serve token list [--json]    # list labels, scopes, expiry (EXPIRED
+                                              # flagged), never the raw value (P29)
                                               # client: SC_HTTP_TOKEN=<raw> sc clone/fetch/push
                                               # sc+http://... presents the bearer on every
                                               # connection once any token is configured (P29)

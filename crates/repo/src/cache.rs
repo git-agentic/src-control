@@ -9,6 +9,9 @@
 //! nothing — it does not reintroduce the equality oracle this phase closes.
 //! A lost/stale/corrupt cache degrades to spurious re-seals, never
 //! incorrectness and never a hard error.
+//! Where the key file cannot be made owner-only (non-unix; #214) it is
+//! still written with default permissions and a one-time warning is printed
+//! once the cache holds a protected entry: see [`can_restrict_permissions`].
 //!
 //! **The keyed tag is the sole authority for a hit.** `mtime_ns`/`size` are
 //! recorded for documentation (when the entry was observed) and as a
@@ -30,6 +33,53 @@ use scl_core::ObjectId;
 
 use crate::error::{Error, Result};
 use crate::layout::Layout;
+
+/// Whether `.sc/local-key` can be created readable by its owner only. Only
+/// unix can (`mode(0o600)` from the first byte); there is no Windows ACL path
+/// yet (#214), so elsewhere the key keeps default permissions and a warning is
+/// printed. Tests force `false` via `force_unrestricted_for_test`.
+fn can_restrict_permissions() -> bool {
+    #[cfg(test)]
+    if FORCE_UNRESTRICTED.with(|f| f.get()) {
+        return false;
+    }
+    cfg!(unix)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_UNRESTRICTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam: make this thread behave like a non-unix target.
+#[cfg(test)]
+pub(crate) fn force_unrestricted_for_test(on: bool) {
+    FORCE_UNRESTRICTED.with(|f| f.set(on));
+}
+
+/// Print the unrestricted-key warning the first time `flag` is unset; `true`
+/// iff it printed. The flag is a parameter so a test can use a private one.
+fn warn_unrestricted_once(flag: &std::sync::atomic::AtomicBool) -> bool {
+    if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    eprintln!(
+        "warning: this platform cannot restrict .sc/local-key to its owner; other \
+         local users may be able to read it and test guesses against the \
+         protected-file cache tags (the protected plaintext checked out in the \
+         working tree is equally readable by default)"
+    );
+    true
+}
+
+/// Warn (once per process) when a cache that holds protected entries is
+/// backed by a key whose permissions could not be restricted.
+fn warn_if_unrestricted(has_entries: bool) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if has_entries && !can_restrict_permissions() {
+        warn_unrestricted_once(&WARNED);
+    }
+}
 
 /// Load (minting if absent) the per-repo random cache key. The key file is
 /// the only hard-error surface here: if it can't be created/read, the cache
@@ -77,6 +127,7 @@ fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
+/// Non-unix: default (inherited) permissions; see [`can_restrict_permissions`].
 #[cfg(not(unix))]
 fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -186,6 +237,9 @@ impl ProtectedCache {
                 }
             }
         }
+        if path.is_some() {
+            warn_if_unrestricted(!entries.is_empty());
+        }
         ProtectedCache {
             key,
             root,
@@ -253,6 +307,7 @@ impl ProtectedCache {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        warn_if_unrestricted(!self.entries.is_empty());
         let mut out = String::new();
         for (p, e) in &self.entries {
             if !is_plain_file(&self.root, p) {
@@ -320,6 +375,42 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "key file must be 0600");
         }
         cleanup(&layout);
+    }
+
+    #[test]
+    fn unrestricted_key_still_persists_and_hits() {
+        force_unrestricted_for_test(true);
+        let layout = tmp("unrestricted");
+        let key = local_key(&layout).unwrap();
+        assert_eq!(key, local_key(&layout).unwrap(), "key persisted");
+        assert!(layout.local_key_path().exists());
+
+        let abs = layout.root.join("secret.txt");
+        std::fs::write(&abs, b"v1").unwrap();
+        let id = ObjectId::of(b"cipher-of-v1");
+        let mut c = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
+        c.record("secret.txt", b"v1", id);
+        c.save().unwrap();
+        assert!(layout.protected_cache_path().exists(), "cache persisted");
+        let c = ProtectedCache::open(
+            key,
+            layout.root.clone(),
+            Some(layout.protected_cache_path()),
+        );
+        assert_eq!(c.unchanged("secret.txt", b"v1"), Some(id), "hit survives");
+        force_unrestricted_for_test(false);
+        cleanup(&layout);
+    }
+
+    #[test]
+    fn unrestricted_warning_prints_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(warn_unrestricted_once(&flag));
+        assert!(!warn_unrestricted_once(&flag));
     }
 
     #[test]

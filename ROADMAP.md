@@ -476,7 +476,12 @@ across every phase.
   failing closed on ciphertext while the right identity decrypts the exact
   body bytes, the `sc log` marker, and `sc gc` pruning a deleted branch's
   transcript while the still-reachable one survives — run twice, zero
-  residue. No new dependency. (ADR-0038.)
+  residue. No new dependency. Issue #212 added `sc transcript drop <id>`: a
+  grow-only drop tombstone (a bare `Transcript` object, so no wire change)
+  hides the body from `list`/`show`, travels with fetch/clone, blocks
+  resurrection in either arrival order, and is kept by gc while the dropped
+  body is swept at gc (after the grace window if loose). (ADR-0038 addendum;
+  delivery gaps tracked in #230.)
 
 - **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
   (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"
@@ -732,16 +737,6 @@ scale-&-reach horizon):
   merge, cherry-pick or rebase is stopped there (`MergeInProgress` & co.), so
   the completing commit cannot silently drop a pushed commit. Other branches
   are unaffected.
-- **Sparse-gate the conflict helper's non-marker writes (P24 boundary).**
-  `Repo::materialize_conflict_state` gates conflict *markers* against the
-  sparse spec but not its `to_encrypt`/sidecar write loops — so an
-  in-sparse conflict co-occurring with an out-of-sparse protected/I2 clean
-  change transiently writes that out-of-sparse plaintext to disk outside
-  the view, and it PERSISTS after completion until a later re-lay (only
-  abort cleans it). Not data loss (completion re-lands it in the CAS) and
-  not a disclosure (an authorized identity produced it), documented in
-  ADR-0034 — but the sparse view is briefly wider than advertised. Extend
-  the gate to those write loops.
 - **Sparse ergonomics (P24 final-review Minors) — shipped.** `sc sparse set`
   warns for each prefix that matches no tracked path at HEAD (the tree is still
   laid out, empty, and `sc sparse disable` is named as the way back); a bare
@@ -795,10 +790,12 @@ scale-&-reach horizon):
   `sc resolve --theirs` protected path keeps their ciphertext instead of
   re-sealing; their wrap list must be in the unioned protection, and a lookup
   gap on a partial clone just seals.
-- **Non-unix local-key fallback (P33 final-review follow-on).** `.sc/local-key`
-  is minted 0600-from-first-byte via a unix-only `OpenOptions::mode` call;
-  there is no non-unix fallback today, so the key file is left world-readable
-  on a non-unix target. A non-unix permission-hardening path is deferred.
+- **Non-unix local-key permissions (#214, P33 follow-on).** `.sc/local-key` is
+  minted 0600-from-first-byte on unix only. On a non-unix target it keeps default
+  permissions and `sc` warns once when a cache holds a protected entry (the
+  exposure is bounded; see THREAT-MODEL.md). Deferred: an owner-only Windows ACL
+  (`windows-sys` is already in `Cargo.lock`) and a manual check on a real Windows
+  host.
 - **fd secret injection — shipped (ADR-0052).** `sc run --secrets-fd N` hands the
   secrets to the command on a descriptor (NUL-terminated `NAME=VALUE` records)
   instead of its environment. Not built: the same mode for `sc ws run` and
@@ -816,9 +813,13 @@ scale-&-reach horizon):
 - **Per-path/per-ref ACLs (P29).** `sc serve --http` access control is
   all-or-nothing per connection (`ro`/`rw`); scoping a token to specific
   path prefixes or refs is beyond the MVP. Deferred.
-- **Token expiry/rotation metadata (P29).** `sct-` tokens have no expiry
+- ~~**Token expiry/rotation metadata (P29).** `sct-` tokens have no expiry
   field; rotation today is add-new + remove-old with no automation or
-  reminder. Deferred.
+  reminder.~~ **Done.** (#209) `sc serve token add --expires <30d|2030-01-31>`
+  stores an optional `expires_at` (Unix seconds); `verify` treats an expired
+  token like an unknown one (`401`); `list` shows and flags expiry; `sc serve
+  token rotate <label>` swaps the secret in one step. Expired entries stay in
+  the file. (ADR-0040.)
 - ~~**`sc+https://` / TLS (P29).** `sc serve --http` is plaintext-only; a
   bearer token crosses the wire in cleartext, so a public deployment must
   front with a TLS reverse proxy today. A first-party TLS dependency is
@@ -872,11 +873,6 @@ scale-&-reach horizon):
   <path>` requires an explicit path today; auto-discovering a
   conventional transcript location (e.g. an agent-runner-written temp
   file) per workspace is deferred.
-- **`sc transcript drop` + resurrection tombstone (P30).** There is no
-  command to remove an attached transcript short of gc-by-unreachability;
-  a first-class drop with a tombstone (so a later merge of a pre-drop
-  branch can't silently resurrect it, mirroring P16's revocation
-  tombstones) is deferred.
 - **Transcript access lifecycle (P30).** Transcripts have no
   rewrap/grant/revoke surface — sealed once, to the recipient set at
   attach time, permanently. Extending P17's rewrap and P16's

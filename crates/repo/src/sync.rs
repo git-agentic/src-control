@@ -1149,6 +1149,138 @@ mod tests {
     }
 
     #[test]
+    fn dropped_transcript_is_not_resurrected_by_fetch_and_the_drop_propagates() {
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-transdrop-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-transdrop-b-{pid}"));
+        let _ = std::fs::remove_dir_all(&a_root);
+        let _ = std::fs::remove_dir_all(&b_root);
+        std::fs::create_dir_all(&a_root).unwrap();
+
+        let a = Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f1"), b"one").unwrap();
+        let snap = a.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let tid = a
+            .attach_transcript(snap, "claude-code", "s1", b"body", &[identity.enc.public()])
+            .unwrap();
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        assert_eq!(b.transcripts_for(&snap).unwrap().len(), 1);
+        drop(a);
+
+        // B drops it; origin A still carries it. Fetching must not restore it.
+        crate::transcripts::tests::trust_signer(&b, &identity);
+        b.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        b.fetch("origin").unwrap();
+        assert!(b.transcripts_for(&snap).unwrap().is_empty());
+        drop(b);
+
+        // A fetching from B learns the drop and hides its own copy.
+        let a = Repo::open(&a_root).unwrap();
+        assert_eq!(a.transcripts_for(&snap).unwrap().len(), 1);
+        // The origin only honors tombstones from a signer it trusts.
+        a.remote_add("b", b_root.to_str().unwrap()).unwrap();
+        a.fetch("b").unwrap();
+        assert_eq!(
+            a.transcripts_for(&snap).unwrap().len(),
+            1,
+            "an untrusted signer's tombstone is ignored"
+        );
+        crate::transcripts::tests::trust_signer(&a, &identity);
+        a.fetch("b").unwrap();
+        assert!(a.transcripts_for(&snap).unwrap().is_empty());
+        drop(a);
+
+        // A fresh clone of A never receives the dropped body at all.
+        let c_root = std::env::temp_dir().join(format!("scl-transdrop-c-{pid}"));
+        let _ = std::fs::remove_dir_all(&c_root);
+        let c = Repo::clone_to(&a_root, &c_root).unwrap();
+        assert!(c.transcripts_for(&snap).unwrap().is_empty());
+
+        drop(c);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        std::fs::remove_dir_all(&b_root).unwrap();
+        std::fs::remove_dir_all(&c_root).unwrap();
+    }
+
+    #[test]
+    fn no_transcripts_fetch_drops_a_drop_tombstone_like_any_transcript() {
+        // #226 x #211 (ADR-0038 addendum): a drop tombstone is a `Transcript`
+        // object, so a `--no-transcripts` receive does not write it (nor its
+        // signature). A receiver that still holds the transcript keeps
+        // showing it until a plain fetch brings the tombstone in.
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-notrans-tomb-a-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-notrans-tomb-b-{pid}"));
+        let c_root = std::env::temp_dir().join(format!("scl-notrans-tomb-c-{pid}"));
+        let _ = std::fs::remove_dir_all(&b_root);
+        let _ = std::fs::remove_dir_all(&c_root);
+        let (a, snap, tid, identity) = origin_with_signed_transcript(&a_root);
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        assert_eq!(b.transcripts_for(&snap).unwrap().len(), 1);
+        crate::transcripts::tests::trust_signer(&b, &identity);
+        a.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        drop(a);
+
+        b.fetch_opts("origin", true).unwrap();
+        assert_eq!(
+            b.transcripts_for(&snap).unwrap().len(),
+            1,
+            "the tombstone was dropped with the transcripts, so the held one stays visible"
+        );
+        b.fetch("origin").unwrap();
+        assert!(b.transcripts_for(&snap).unwrap().is_empty());
+
+        // A clone made with the flag holds neither the transcript nor a drop.
+        let c = Repo::clone_url_opts(&a_root.display().to_string(), &c_root, None, true).unwrap();
+        assert!(c.transcripts_for(&snap).unwrap().is_empty());
+        assert!(crate::transcripts::load(c.layout()).unwrap().is_empty());
+
+        drop(b);
+        drop(c);
+        for root in [&a_root, &b_root, &c_root] {
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn signed_drop_propagates_over_push() {
+        let pid = std::process::id();
+        let a_root = std::env::temp_dir().join(format!("scl-transdrop-pa-{pid}"));
+        let b_root = std::env::temp_dir().join(format!("scl-transdrop-pb-{pid}"));
+        let _ = std::fs::remove_dir_all(&a_root);
+        let _ = std::fs::remove_dir_all(&b_root);
+        std::fs::create_dir_all(&a_root).unwrap();
+
+        let a = Repo::init(&a_root).unwrap();
+        std::fs::write(a_root.join("f1"), b"one").unwrap();
+        let snap = a.commit("t", "c1").unwrap();
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let tid = a
+            .attach_transcript(snap, "claude-code", "s1", b"body", &[identity.enc.public()])
+            .unwrap();
+        crate::transcripts::tests::trust_signer(&a, &identity);
+        let b = Repo::clone_to(&a_root, &b_root).unwrap();
+        drop(a); // push takes the origin's repo lock
+
+        b.drop_transcript(&tid.to_hex(), Some(&identity)).unwrap();
+        std::fs::write(b_root.join("f2"), b"two").unwrap();
+        b.commit("t", "c2").unwrap();
+        b.push("origin").unwrap();
+
+        let a = Repo::open(&a_root).unwrap();
+        assert!(
+            a.transcripts_for(&snap).unwrap().is_empty(),
+            "a push carries the signed tombstone"
+        );
+        drop(a);
+        drop(b);
+        std::fs::remove_dir_all(&a_root).unwrap();
+        std::fs::remove_dir_all(&b_root).unwrap();
+    }
+
+    #[test]
     fn signatures_ride_ssh_transport() {
         // The wire-protocol pipe harness `WireClient` <-> `wire::serve` IS
         // the ssh code path minus the ssh process spawn (StdioTransport
