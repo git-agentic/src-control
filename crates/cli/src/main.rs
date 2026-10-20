@@ -786,7 +786,8 @@ enum WsOp {
     /// Read-only conflict probe + cumulative auto-merge of every live
     /// workspace onto the landing branch (default: the session's base
     /// branch). Conflicted/rejected workspaces fall back to a `work-<i>`
-    /// branch for manual resolution and keep the session open.
+    /// branch (`<name>-<i>` for a named session) for manual resolution and
+    /// keep the session open.
     Harvest {
         /// Session to address: the name given to `sc ws fork --name`. Omit
         /// for the unnamed session.
@@ -3541,7 +3542,7 @@ fn run_ws(op: WsOp) -> Result<()> {
                     }
                     scl_repo::WsHarvestOutcome::Rejected { index, report } => {
                         failed = true;
-                        println!("{index:<3} REJECTED by secret scanner: {report} — fix and re-run `sc ws harvest`");
+                        println!("{index:<3} REJECTED by secret scanner: {report} — fix and re-run `sc ws harvest{}`", session.as_deref().map(|n| format!(" --session {n}")).unwrap_or_default());
                     }
                 }
             }

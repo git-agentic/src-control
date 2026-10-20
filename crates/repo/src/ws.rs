@@ -92,6 +92,33 @@ fn label_prefix(name: Option<&str>) -> &str {
     name.unwrap_or("work")
 }
 
+/// `<session root>/running-<i>`: written (with the pid of the `sc` process
+/// that owns the command) while a `sc ws run` command is live in workspace `i`,
+/// so harvest and abandon, which now work while the command runs, can refuse
+/// instead of landing a half-written checkout or deleting it under the agent.
+/// Beside the checkout dir, never inside it, like the stat cache.
+fn running_path(layout: &Layout, name: Option<&str>, i: u32) -> PathBuf {
+    ws_dir(layout, name).join(format!("running-{i}"))
+}
+
+/// Refuse if a `sc ws run` command is still live in workspace `i`. A marker
+/// left by a process that is provably dead (killed before it could remove it)
+/// is cleared, using the same probe as the repo lock.
+fn ensure_idle(layout: &Layout, name: Option<&str>, i: u32) -> Result<()> {
+    let path = running_path(layout, name, i);
+    if path.exists() {
+        if !crate::lock::holder_is_dead(&path) {
+            return Err(Error::InvalidArgument(format!(
+                "workspace {i} has a `sc ws run` command still running ({}); \
+                 wait for it to exit",
+                path.display()
+            )));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
 /// A session name is a branch-name component (its fallback branches are
 /// `<name>-<i>`) and a directory name under `.sc/`, so it takes the branch-name
 /// grammar.
@@ -185,6 +212,10 @@ impl SessionToml {
 
 /// Read one session's manifest (`None` = the unnamed session), if open.
 pub(crate) fn read_manifest(layout: &Layout, name: Option<&str>) -> Result<Option<WsSession>> {
+    if let Some(n) = name {
+        // `--session` reaches here unchecked; a `..` must not leave `.sc/`.
+        validate_session_name(n)?;
+    }
     match std::fs::read_to_string(manifest_path(layout, name)) {
         Ok(text) => {
             let raw: SessionToml =
@@ -203,9 +234,13 @@ pub(crate) fn list_sessions(layout: &Layout) -> Result<Vec<WsSession>> {
     let mut out: Vec<WsSession> = read_manifest(layout, None)?.into_iter().collect();
     let mut names = Vec::new();
     for e in std::fs::read_dir(&layout.dot_sc)? {
-        let file = e?.file_name();
+        let e = e?;
+        let file = e.file_name();
+        // A stray file or oddly named entry must not break gc or `ws list`.
         if let Some(n) = file.to_str().and_then(|f| f.strip_prefix("ws-")) {
-            names.push(n.to_string());
+            if e.path().is_dir() && validate_session_name(n).is_ok() {
+                names.push(n.to_string());
+            }
         }
     }
     names.sort();
@@ -479,6 +514,14 @@ impl Repo {
     /// remaining live count. No oplog record — fork never touched a ref.
     pub fn ws_abandon(&self, name: Option<&str>, index: Option<u32>) -> Result<usize> {
         let mut session = open_session(self.layout(), name)?;
+        // Refuse before removing anything if an agent command is live.
+        for e in session
+            .workspaces
+            .iter()
+            .filter(|e| e.live && index.is_none_or(|i| i == e.index))
+        {
+            ensure_idle(self.layout(), name, e.index)?;
+        }
         match index {
             Some(i) => {
                 let entry = session
@@ -555,7 +598,14 @@ impl Repo {
         } else {
             Vec::new()
         };
+        // Mark the workspace busy until the command ends (see `running_path`).
+        // The marker names this process, which outlives the repo handle: the
+        // CLI keeps running the command after dropping the lock.
+        ensure_idle(self.layout(), name, index)?;
+        let marker = running_path(self.layout(), name, index);
+        std::fs::write(&marker, std::process::id().to_string())?;
         Ok(WsRunPlan {
+            marker,
             dir: entry.dir.clone(),
             // Label matches the fallback-branch namespace a harvest would mint
             // (P13 parity: label == branch name).
@@ -753,6 +803,11 @@ impl Repo {
             .map(|e| e.index)
             .collect();
         live_indices.sort_unstable();
+        // A workspace whose `sc ws run` command is still live is mid-edit:
+        // refuse before reading or minting anything.
+        for &i in &live_indices {
+            ensure_idle(self.layout(), name, i)?;
+        }
 
         // Preflight: if any live workspace actually diverged, a candidate
         // branch is about to be minted for it and landed via
@@ -1034,6 +1089,8 @@ fn resolve_and_teardown(
 /// injected secrets. Holds no repo handle, so running it does not hold the
 /// repo lock.
 pub struct WsRunPlan {
+    /// The `running-<i>` marker; removed when the plan is dropped.
+    marker: PathBuf,
     dir: PathBuf,
     label: String,
     envs: Vec<(String, std::ffi::OsString)>,
@@ -1042,7 +1099,7 @@ pub struct WsRunPlan {
 impl WsRunPlan {
     /// Spawn `cmd` in the workspace dir with `SC_WORKSPACE` and
     /// `SC_WORKSPACE_DIR` set and return its exit code.
-    pub fn run(&self, cmd: &[String]) -> Result<i32> {
+    pub fn run(self, cmd: &[String]) -> Result<i32> {
         let (exe, args) = cmd
             .split_first()
             .ok_or_else(|| Error::InvalidArgument("empty command".into()))?;
@@ -1056,6 +1113,12 @@ impl WsRunPlan {
             command.env(k, v);
         }
         Ok(command.status()?.code().unwrap_or(1))
+    }
+}
+
+impl Drop for WsRunPlan {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.marker);
     }
 }
 
@@ -2522,6 +2585,91 @@ mod tests {
             assert_eq!(has(tip), *name != Some("a"), "{name:?}");
         }
 
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_running_command_blocks_harvest_and_abandon_of_its_workspace_only() {
+        let root = tmp_root("named-busy");
+        let repo = init(&root);
+        fork_and_edit(&repo, Some("a"), "file-a.txt", "A\n");
+        fork_and_edit(&repo, Some("b"), "file-b.txt", "B\n");
+
+        let plan = repo.ws_run_plan(Some("a"), 1, false, None).unwrap();
+        let busy = |e: Error| match e {
+            Error::InvalidArgument(m) => assert!(m.contains("still running"), "{m}"),
+            other => panic!("{other:?}"),
+        };
+        busy(repo.ws_harvest(Some("a"), None, "t", None).unwrap_err());
+        busy(repo.ws_abandon(Some("a"), None).unwrap_err());
+        busy(repo.ws_abandon(Some("a"), Some(1)).unwrap_err());
+        // A second run in the same workspace is refused too.
+        busy(repo.ws_run_plan(Some("a"), 1, false, None).err().unwrap());
+        // Nothing was touched, and the other session is unaffected.
+        assert!(repo.ws_session(Some("a")).unwrap().unwrap().workspaces[0].live);
+        let out = repo.ws_harvest(Some("b"), None, "t", None).unwrap();
+        assert!(matches!(out[..], [WsHarvestOutcome::Landed { .. }]));
+
+        // Once the command is over, the workspace harvests normally.
+        assert_eq!(plan.run(&["true".into()]).unwrap(), 0);
+        let out = repo.ws_harvest(Some("a"), None, "t", None).unwrap();
+        assert!(matches!(out[..], [WsHarvestOutcome::Landed { .. }]));
+
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn dropping_an_unused_run_plan_releases_the_workspace() {
+        let root = tmp_root("named-busy-drop");
+        let repo = init(&root);
+        repo.ws_fork(None, 1, "t", None).unwrap();
+        drop(repo.ws_run_plan(None, 1, false, None).unwrap());
+        assert_eq!(repo.ws_abandon(None, None).unwrap(), 0);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_marker_from_a_dead_process_is_cleared() {
+        let root = tmp_root("named-busy-stale");
+        let repo = init(&root);
+        repo.ws_fork(None, 1, "t", None).unwrap();
+        // The pid of a child that has already exited.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        std::fs::write(running_path(repo.layout(), None, 1), pid.to_string()).unwrap();
+        assert_eq!(repo.ws_abandon(None, None).unwrap(), 0);
+        drop(repo);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn session_names_from_the_command_line_cannot_leave_the_sc_dir() {
+        let root = tmp_root("named-escape");
+        let repo = init(&root);
+        repo.ws_fork(Some("a"), 1, "t", None).unwrap();
+        for bad in ["a/../../ws", "../x", ".."] {
+            assert!(matches!(
+                repo.ws_abandon(Some(bad), None),
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(repo.ws_session(Some(bad)).is_err());
+        }
+        // A stray file or oddly named entry does not hide the real sessions.
+        std::fs::write(repo.layout().dot_sc.join("ws-stray"), "x").unwrap();
+        std::fs::create_dir(repo.layout().dot_sc.join("ws-.hidden")).unwrap();
+        let names: Vec<_> = repo
+            .ws_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, [Some("a".to_string())]);
+        repo.gc(std::time::Duration::from_secs(0)).unwrap();
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }

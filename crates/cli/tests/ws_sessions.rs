@@ -138,7 +138,9 @@ fn a_running_session_does_not_block_the_others() {
         let argv = inside(args);
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let out = ok(&root, &argv);
-        assert!(!out.is_empty(), "{args:?}");
+        if args[1] == "list" {
+            assert!(out.contains("session b base:"), "{out}");
+        }
     }
     assert!(
         root.join("from-b.txt").exists(),

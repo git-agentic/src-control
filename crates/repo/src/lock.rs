@@ -57,7 +57,7 @@ impl RepoLock {
 /// True only when the lock file names a PID we can *prove* is not running.
 /// Unreadable file, no parseable PID, or an inconclusive probe all return
 /// false (respect the lock).
-fn holder_is_dead(path: &std::path::Path) -> bool {
+pub(crate) fn holder_is_dead(path: &std::path::Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
