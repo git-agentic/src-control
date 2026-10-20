@@ -349,7 +349,7 @@ too, not just the src-control-side metadata.
   (`walfmt.rs`): unknown versions, bad magic, and any length that would
   overrun the buffer are refused outright rather than best-effort parsed.
   Untrusted-length caps apply throughout: manifest/log/idx bytes are capped
-  at the max object size before decode, and pack bodies are read through
+  at a fixed 256 MiB (not the operator's cap) after download, before decode, and pack bodies are read through
   `scl_core::pack::read_object_at_bounded` (not the unbounded
   `read_object_at` the trusted local `Store` uses for its own already-
   verified on-disk packs, per ADR-0039's explicit trust split) — capping
@@ -406,11 +406,12 @@ too, not just the src-control-side metadata.
   nothing both sent and refused, nothing omitted) before any object is
   written. A hostile remote can at worst answer "not sent"; it cannot plant an
   object under another id or smuggle in extras. The reply stream a client will
-  read is capped at four times the max object size (1 GiB at the default,
-  up to 4 GiB with the cap raised to its 1 GiB ceiling).
+  read is capped at 4 GiB, a constant independent of the object cap (it
+  bounds a disk spool, not RAM).
 - **Server cost is bounded per request:** 1024 ids (checked while decoding,
   before any id is read), the server's `--max-pack-size` over the summed
-  encoded size, and the max object size per object.
+  encoded size, and the max object size per object. The server's reply ceiling is a constant
+  2 GiB, independent of the object cap.
 - **Laziness is a local opt-in.** `.sc/promisor-lazy` is never committed or
   transferred; without it a partial clone never dials the remote after clone,
   and `SC_OFFLINE=1` forces that per process.

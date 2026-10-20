@@ -65,7 +65,7 @@ fn check_object_size_bounds(n: usize) -> std::result::Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "max object size {n} bytes is outside the allowed range {MIN_MAX_OBJECT_SIZE} (1 MiB) to {MAX_MAX_OBJECT_SIZE} (1 GiB)"
+            "max object size {n} bytes is outside the allowed range {MIN_MAX_OBJECT_SIZE} (2 MiB) to {MAX_MAX_OBJECT_SIZE} (1 GiB)"
         ))
     }
 }

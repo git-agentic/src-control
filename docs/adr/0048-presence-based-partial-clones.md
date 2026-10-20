@@ -281,7 +281,8 @@ zstd framing). Decisions:
 - The server caps a `GetObjects` reply, measured in canonical size, at
   `min(--max-pack-size, 512 MiB)` where a `--max-pack-size` of 0 means
   unlimited. Headroom to the client's 1 GiB read cap covers framing and
-  incompressible data.
+  incompressible data. (#213 later made both constants independent of the
+  object cap: reply ceiling 2 GiB, client read cap 4 GiB. See ADR-0039.)
 - The cap applies to `LocalTransport::get_objects` as well, which today builds
   with no limit (`build_objects_tempfile(ids, 0)`). A lazy clone whose promisor
   is a local path would otherwise spool up to 1024 large blobs in one request.
