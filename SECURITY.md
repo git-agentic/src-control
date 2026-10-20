@@ -36,6 +36,11 @@ it are consolidated in [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md). In brief:
   context, not strong isolation** — same-user processes can observe the child
   environment. `sc run --secrets-fd N` keeps them out of the environment but
   is still not isolation.
+- **`sc transcript drop` is not erasure either.** A drop travels as a signed
+  tombstone that a peer honors only when the signature comes from a key in its
+  `[signers] trusted` list; an unsigned drop is local-only, and any trusted
+  signer can hide transcripts on every peer that trusts them. Peers without
+  the tombstone keep the sealed body.
 - **Rotation/revocation ≠ erasure.** They cut off *future* reads through the
   current registry but cannot erase ciphertext already in history and copied to
   other clones; real cutover of a leaked credential always means rotating the

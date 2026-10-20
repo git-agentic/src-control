@@ -335,6 +335,8 @@ phases but the shape is stable:
   so `sc undo`/redo can invert it (P14). Local-only, like a reflog.
 - `signatures` — snapshot→signature-object index (P22); `transcripts` —
   snapshot→transcript-object index, one-to-many (P30). Both gc-rooted, local-only.
+  `transcript-drops` — the derived set of dropped transcripts (`sc transcript
+  drop`), rebuilt from the store on clone.
 - `sparse` — the local, uncommitted sparse-checkout prefix spec (P24);
   `promisor` — a partial clone's fetch-filter + origin (P27).
 - `serve-tokens.toml` — bearer-token access control for `sc serve --http` (P29);
@@ -964,7 +966,20 @@ a transfer-relevant snapshot, and the receiver reindexes idempotently. `sc
 gc` roots live transcript ids into reachability before signature pruning
 runs, so a signed transcript survives exactly as long as the transcript
 itself does. `sc export --to <git-repo>` drops transcripts (no Git-native
-form exists) and reports a count. See ADR-0038.
+form exists) and reports a count.
+
+`sc transcript drop <id> [--identity <key>]` removes a transcript from view
+without a new object tag or wire change: a drop is a **tombstone**, a
+`Transcript` object with an empty ciphertext and wrap list that names the
+dropped id, recorded in a local `.sc/transcript-drops` index and treated as a
+grow-only set (no undrop; re-attach to restore). Reads, `sc log` markers and
+the over-send filter through the drop set, and `sc gc` reclaims the body. A
+tombstone travels with fetch and push only when it is signed, and a receiving
+peer honors it only if the signature comes from a key in its `[signers]
+trusted` list; an unsigned drop is local-only, and an untrusted tombstone stays
+inert. Drop is not erasure: a peer that never receives an honored tombstone
+keeps the sealed body, and a remote that received a tombstone before trusting
+its signer keeps it inert (#230). See ADR-0038 and its addendum.
 
 ## Phase 31 — listener resource limits (built)
 

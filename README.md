@@ -157,7 +157,7 @@ merge and history editing, durable multi-invocation agent sessions with
 auto-merge, a commit-time secret scanner, secret/permission lifecycle
 (rotation, escrow, revocation tombstones, bulk rewrap, `sc rewrap --rotate`
 for protected paths), signed commits with sealed session-transcript
-provenance, sparse and partial checkouts (lazy want-by-id fetch, merge,
+provenance (droppable through signed tombstones), sparse and partial checkouts (lazy want-by-id fetch, merge,
 cherry-pick, rebase and agent sessions on a partial clone), and local,
 ssh-native, sc-native HTTP/TLS (bearer tokens with expiry and rotation,
 listener resource limits, TOFU pinning managed by `sc tls`, or CA validation
