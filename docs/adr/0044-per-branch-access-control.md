@@ -404,6 +404,42 @@ Pinned by `private_sparse.rs`: the final tree equals the run without sparse
 writes nothing outside the view, and an out-of-view conflict refuses cleanly;
 and by `private.rs` tests for the full-checkout protected-path case.
 
+## Aborting and completing a stopped private merge (#246)
+
+`merge --abort` used to call `get_snapshot` on the branch tip, which for a
+private branch is a manifest, so it failed with `WrongKind` and left the merge
+state in place. The private stop also recorded neither `CONFLICT_PLAINTEXT` nor
+`CONFLICT_SIDECARS`, so completion sealed a binary conflict's `<path>.theirs`
+sidecar into the tree and left it on disk. Now:
+
+- **Abort** (`Repo::merge_abort_with_identity`; `merge_abort()` is the keyless
+  form) opens the branch first, so a caller with no key or a non-recipient key
+  gets `PrivateNoAccess` before any write and the stop stays for someone who
+  can finish it. It then restores the private tip through the same checkout
+  path as `switch` (decrypting protected files the identity can read, skipping
+  the rest), removes every in-view path theirs' tree holds that the tip does not (as
+  the public abort does with theirs' root, so an untracked user file at such a
+  path goes too), removes the recorded sidecars unless the tip tracks that name, and clears the merge
+  state. The ref never moved and nothing was stored outside the sealed
+  manifest, so there is nothing to undo at rest. It does not re-derive the
+  three-way (that can fail for a recipient who cannot read a protected path
+  both sides changed); it uses theirs' public tree to know which files the
+  stop wrote.
+- **The stop records** the in-view paths it wrote as plaintext
+  (`needs_encrypt` files and decrypted carried protected files) and its
+  sidecars, in the unsealed `.sc/` files the public stop already uses. They
+  name paths the checkout holds anyway, not content or ids, so the opacity
+  argument is unchanged.
+- **Completion** drops recorded sidecars from the scanner input and the sealed
+  tree (unless the merge's outcome tracks that name), removes them before the
+  ref moves, and treats a recorded plaintext path absent from disk as deleted
+  rather than carrying it back from the re-derived outcome.
+- **The stop refuses** a sidecar whose path either side tracks or that already
+  exists on disk, before any write, since abort and completion would otherwise
+  delete a file the user owns.
+
+Pinned by `private_abort.rs` and `crates/cli/tests/merge_exit.rs`.
+
 ## Deferred (to ROADMAP.md)
 
 - `sc branch publish --squash` (hide intermediate history at publish).

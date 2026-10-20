@@ -239,6 +239,11 @@ transport-adjacent. The rest, imperatively:
   disk (out of view, or protected and skipped) instead of carrying the prior
   tip, and under a sparse spec set on the public branch its conflict stop lays
   out in-view files only and refuses an out-of-view conflict before any write (#240; no decided root, it would be unsealed).
+  A stopped private merge records `.sc/CONFLICT_PLAINTEXT` and
+  `.sc/CONFLICT_SIDECARS` like the public stop (completion leaves sidecars out of
+  the sealed tree and removes them), and `merge --abort` needs `--identity` (a
+  keyless or non-recipient abort refuses, leaving the stop intact) and restores
+  the private tip's checkout (#246).
   `sc branch revoke` rotates the KEK but a recipient who already fetched keeps
   the old manifest (rotation ≠ erasure). **Keep identity files outside the
   working tree** — a key committed under a private branch is sealed in and
@@ -284,7 +289,7 @@ transport-adjacent. The rest, imperatively:
   the view.
 - **A merge, switch, cherry-pick, rebase, undo or sparse-spec change refuses, before any write, to lay a file or
   directory onto an untracked or ignored one** (`refuse_untracked_overwrite`); move it
-  away and retry. Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded.
+  away and retry. Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded (except that a private stop refuses a `.theirs` sidecar that would land on an existing file).
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first. A push into a repo with a stopped op is
