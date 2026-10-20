@@ -1108,7 +1108,9 @@ the local, ssh and http remotes on top of a flat key/value bucket, structured
 as a write-ahead log of **immutable, content-addressed packs** plus **one
 compare-and-swapped manifest**. A push uploads a pack, appends a parent-linked
 `log/<seq>` entry carrying its ref updates, then CASes the manifest's
-`head_seq` forward (`Bucket::put_if_tag`); losing the CAS is `NonFastForward`,
+`head_seq` forward (`Bucket::put_if_tag`). A lost CAS refreshes and retries (up
+to 16 times), so pushes to different branches both land; a push whose target
+branch no longer matches its expected old tip fails with `NonFastForward`,
 exactly as on any other transport, and a loser's orphaned log entry is invisible
 to readers because they walk `parent_seq` back from the manifest. There is no
 leader, lock file or lease. The new leaf crate `objio` holds the `Bucket` trait
