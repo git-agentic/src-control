@@ -217,8 +217,9 @@ The `Bucket` trait gains two methods, implemented by `DirBucket` and
 
 ## Consequences
 
-- Storage and cold-start cost are bounded by the live data plus one grace
-  window. A bucket past `MAX_LIST` on the pack axis regains folding after one run if
+- On a non-versioned bucket, storage and cold-start cost are bounded by the
+  live data plus one grace window (a versioned bucket keeps delete-marked
+  versions until a lifecycle rule expires them). A bucket past `MAX_LIST` on the pack axis regains folding after one run if
   its small packs merge to a list under the cap; packs above the merge
   threshold are never rewritten, and the ref axis is not relieved.
 - Compaction needs bucket `list` and `delete` rights, which an ordinary
