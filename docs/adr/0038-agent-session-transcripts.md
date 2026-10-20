@@ -190,9 +190,11 @@ full-store scan (`reindex`). The live index is read through the drop set, so
 a dropped id is invisible to `list`, `show`, `sc log` markers and the
 over-send, whatever order the lines landed in.
 
-- **drop:** write the tombstone object, append the drop line, then remove the
-  live entry. A crash between steps leaves the drop line present, so the
-  transcript is still hidden (fail-closed).
+- **drop:** write the tombstone object (and its signature, if signing), then
+  append the drop line. The live `.sc/transcripts` line is not rewritten:
+  every read filters it through the drop set and gc purges it. A crash before
+  the drop line leaves only an unrooted tombstone object and the transcript
+  stays visible until the drop is retried.
 - **fetch/clone/push receive:** `index_incoming` records an incoming
   tombstone as a drop only after the checks in "Who may drop" pass, and never
   indexes a transcript whose id is already dropped, so a pack from a peer
@@ -256,6 +258,12 @@ dead**, as P16 keeps revocation tombstones forever. They are load-bearing
 against a later fetch of the same history from a stale peer, and cost about
 100 bytes each. This is the one place the drop index outlives its snapshot;
 no transcript content does.
+Retention is local protection only. The sender selects tombstones through the
+snapshots of the transfer set, and a snapshot gc has removed is never in it,
+so a stale peer that still lists the body is not told about a drop whose
+snapshot the dropper has since collected. Sending every retained tombstone on
+every transfer would close that, at the cost of one object per drop per fetch
+for receivers that cannot use it; deferred.
 
 ### `sc verify`
 
