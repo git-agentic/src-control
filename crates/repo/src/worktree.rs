@@ -144,6 +144,12 @@ fn tracked_under(tracked: &BTreeSet<String>, dir: &str) -> bool {
 /// a filesystem that refuses the chmod (no mode bits) is not an error.
 pub(crate) fn write_file(path: &Path, bytes: &[u8], mode: FileMode) -> std::io::Result<()> {
     std::fs::write(path, bytes)?;
+    apply_file_mode(path, mode)
+}
+
+/// The mode half of [`write_file`], for a caller that wrote the bytes itself
+/// (the stopped-op widen writes atomically).
+pub(crate) fn apply_file_mode(path: &Path, mode: FileMode) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -808,11 +814,11 @@ pub(crate) fn preflight_view(
     Ok(())
 }
 
-/// `(plain files with their blob ids, protected paths)` a widened view adds.
-type AddedViewFiles = (Vec<(String, ObjectId)>, Vec<String>);
+/// `(plain files with blob id and mode, protected paths)` a widened view adds.
+type AddedViewFiles = (Vec<(String, ObjectId, FileMode)>, Vec<String>);
 
 /// The plain (unprotected) files a widened view (`new`, which covers `old`)
-/// brings in from `root`, with their blob ids: what [`lay_out_added_view`]
+/// brings in from `root`, with blob ids and modes: what [`lay_out_added_view`]
 /// writes. Protected entries are returned apart, as `(plain, protected)`.
 pub(crate) fn added_view_files(
     store: &mut Store,
@@ -821,14 +827,14 @@ pub(crate) fn added_view_files(
     new: &Sparse,
 ) -> Result<AddedViewFiles> {
     let (mut plain, mut protected) = (Vec::new(), Vec::new());
-    for (path, (blob_id, _mode, perms)) in tree_file_entries_with_perms_sparse(store, root, new)? {
+    for (path, (blob_id, mode, perms)) in tree_file_entries_with_perms_sparse(store, root, new)? {
         if old.matches(&path) {
             continue;
         }
         if perms & PROTECTED != 0 {
             protected.push(path);
         } else {
-            plain.push((path, blob_id));
+            plain.push((path, blob_id, mode));
         }
     }
     Ok((plain, protected))
@@ -881,7 +887,7 @@ pub(crate) fn added_view_already_laid(
     let added: std::collections::BTreeSet<String> = added_view_files(store, root, old, new)?
         .0
         .into_iter()
-        .map(|(p, _)| p)
+        .map(|(p, ..)| p)
         .filter(|p| recorded.contains(p))
         .collect();
     recorded_paths_laid(layout, store, root, &added)
@@ -901,7 +907,7 @@ pub(crate) fn lay_out_added_view(
     new: &Sparse,
 ) -> Result<Vec<String>> {
     let (plain, protected) = added_view_files(store, root, old, new)?;
-    for (path, blob_id) in plain {
+    for (path, blob_id, mode) in plain {
         let Object::Blob(bytes) = store.get(&blob_id)? else {
             continue;
         };
@@ -910,6 +916,7 @@ pub(crate) fn lay_out_added_view(
             std::fs::create_dir_all(parent)?;
         }
         scl_core::fsutil::atomic_write_durable(&full, &bytes[..])?;
+        apply_file_mode(&full, mode)?;
     }
     Ok(protected)
 }

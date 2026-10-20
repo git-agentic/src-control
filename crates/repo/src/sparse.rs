@@ -526,7 +526,7 @@ impl Repo {
         {
             let mut s = store_arc.lock().unwrap();
             let (plain, _) = crate::worktree::added_view_files(&mut s, decided, old, new)?;
-            written.extend(plain.into_iter().map(|(p, _)| p));
+            written.extend(plain.into_iter().map(|(p, ..)| p));
         }
         store_widen(self.layout(), decided, &written)?;
         // A partial clone's abort removes only what its removal walk can see,

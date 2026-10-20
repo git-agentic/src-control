@@ -163,6 +163,34 @@ fn sparse_set_lays_out_exec_files_with_their_bit() {
     assert_round_trips(&repo, &root, "a/run.sh", true, "b/x.txt");
 }
 
+/// A stopped merge widened mid-stop (#224): the executable that comes into
+/// view keeps its bit, and the completing commit still records EXEC.
+#[test]
+fn stopped_merge_widen_lays_out_exec_files_with_their_bit() {
+    let (repo, root) = base("widen");
+    put(&root, "seed.txt", "l1\nl2\nl3\n", false);
+    repo.commit("t", "base").unwrap();
+    repo.branch("feat").unwrap();
+    put(&root, "seed.txt", "MAIN\nl2\nl3\n", false);
+    repo.commit("t", "main").unwrap();
+    repo.switch("feat").unwrap();
+    put(&root, "seed.txt", "FEAT\nl2\nl3\n", false);
+    put(&root, "bin/run.sh", "#!/bin/sh\n", true);
+    repo.commit("t", "feat").unwrap();
+    repo.switch("main").unwrap();
+    repo.set_sparse(&["seed.txt".to_string()], None).unwrap();
+    assert!(repo.merge("feat", "t").is_err(), "conflict on seed.txt");
+    assert!(!root.join("bin/run.sh").exists());
+
+    repo.set_sparse(&["seed.txt".to_string(), "bin".to_string()], None)
+        .unwrap();
+    assert!(on_disk_exec(&root, "bin/run.sh"), "bit laid by the widen");
+    put(&root, "seed.txt", "MERGED\nl2\nl3\n", false);
+    repo.commit("t", "merge").unwrap();
+    assert_eq!(committed(&repo, "bin/run.sh"), FileMode::EXEC);
+    assert!(on_disk_exec(&root, "bin/run.sh"));
+}
+
 #[test]
 fn clone_keeps_exec_bit() {
     let (repo, root) = base("clone-src");
