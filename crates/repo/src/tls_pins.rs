@@ -21,7 +21,7 @@ pub struct TlsClientPolicy {
     /// `SC_HTTPS_STRICT`: refuse unknown hosts instead of accept-new.
     /// `=1` enables it; any non-empty value other than `0` is also treated
     /// as enabled (fails closed on typos like `=true`/`=yes` rather than
-    /// silently falling back to accept-new — see [`strict_from`]).
+    /// silently falling back to accept-new — see `strict_from`).
     pub strict: bool,
     /// `SC_HTTPS_CA_FILE` / `SC_HTTPS_CA=system` (ADR-0054): validate the
     /// server's certificate chain, validity and name against a CA instead of

@@ -667,7 +667,7 @@ impl Transport for HttpTransport {
 /// Applied only around the opening read — the opening timeout is REPLACED
 /// (not cleared) by `limits.timeout_secs`'s session read+write timeouts
 /// after the 200 status is written, before handing off to `wire::serve` —
-/// see [`handle_http_connection`] for the timeout sequencing.
+/// see `handle_http_connection` for the timeout sequencing.
 const OPENING_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the client allows the connect, TLS handshake, opening and wire
@@ -830,7 +830,7 @@ pub struct ServeLimits {
     pub max_connections: u32,
     /// Per-connection idle/session timeout in seconds, applied to both the
     /// read and write halves once the session begins (see
-    /// [`handle_http_connection`]). `0` = disabled.
+    /// `handle_http_connection`). `0` = disabled.
     pub timeout_secs: u64,
     /// Forwarded to [`crate::wire::WirePolicy::max_pack_size`]. `0` =
     /// unlimited.
@@ -1006,7 +1006,7 @@ pub fn serve_tls_fingerprint(root: &std::path::Path) -> Result<String> {
 ///
 /// Fail-closed bind gate (P29): a non-loopback `addr` is refused up front
 /// unless justified by `read_only`, `allow_public`, or ≥1 configured serve
-/// token (see [`bind_is_allowed`]) — an unauthenticated server must not
+/// token (see `bind_is_allowed`) — an unauthenticated server must not
 /// silently listen on a public interface.
 pub fn serve_http(
     addr: &str,
@@ -1083,7 +1083,7 @@ pub fn serve_http(
 /// P31 additions: a live-connection counter enforces `limits.max_connections`
 /// (shedding with `503` BEFORE spawning a thread or reading an opening, so a
 /// shed connection costs no fd beyond the accept itself); a per-`accept()`
-/// error is paced by [`AcceptBackoff`] instead of busy-looping.
+/// error is paced by `AcceptBackoff` instead of busy-looping.
 pub fn serve_http_listener(
     listener: TcpListener,
     root: &std::path::Path,

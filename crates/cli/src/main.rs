@@ -452,7 +452,7 @@ enum Cmd {
         /// Target Git repo path (created bare if absent).
         #[arg(long)]
         to: PathBuf,
-        /// Ref to update (default: refs/heads/<current-branch>).
+        /// Ref to update (default: `refs/heads/<current-branch>`).
         #[arg(long)]
         r#ref: Option<String>,
         /// Allow exporting protected ciphertext and dropping secrets.
@@ -661,7 +661,7 @@ enum EscrowOp {
     Set { key_or_name: String },
     /// Append a key to the escrow list (deduped).
     Add { key_or_name: String },
-    /// Remove one escrow key by recipient id or [recipients] name.
+    /// Remove one escrow key by recipient id or `[recipients]` name.
     Remove { id_or_name: String },
     /// List the configured escrow keys.
     Show,
@@ -760,7 +760,7 @@ enum ServeSub {
         #[command(subcommand)]
         op: ServeTokenOp,
     },
-    /// Print this repo's serve-TLS fingerprint (sha256:<hex> of the SPKI),
+    /// Print this repo's serve-TLS fingerprint (`sha256:<hex>` of the SPKI),
     /// minting `.sc/serve-tls/` if absent — distribute this to clients as
     /// SC_HTTPS_FINGERPRINT or to verify a first-connect pin. (P32)
     Fingerprint { path: Option<PathBuf> },
@@ -3747,7 +3747,8 @@ fn run_serve(
                 );
             }
             // `--http`'s `handle_http_connection` gates on `.sc/` presence
-            // unconditionally (404 before any dispatch, store mode included).
+            // before any dispatch, store mode included (a client without a
+            // valid token gets the 401 first, anyone else a 404).
             // `--stdio` has no such gate upstream — enforce it here, before
             // touching stdin, so a `--store` session never auto-vivifies
             // `<path>/.sc/tmp/` under an uninitialized directory (which
