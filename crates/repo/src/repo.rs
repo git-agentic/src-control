@@ -2516,10 +2516,21 @@ impl Repo {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread clock override for tests that need two commits to share a
+    /// timestamp without racing a wall-clock second boundary.
+    pub(crate) static TEST_NOW: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Current unix time in seconds, for snapshot timestamps. Snapshot ids
 /// legitimately depend on commit time (as in Git); nothing in the system
 /// requires two separate commits of identical content to share an id.
 pub(crate) fn unix_now() -> i64 {
+    #[cfg(test)]
+    if let Some(t) = TEST_NOW.with(std::cell::Cell::get) {
+        return t;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

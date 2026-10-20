@@ -2008,16 +2008,10 @@ mod tests {
         let dir = session.workspaces[0].dir.clone();
         std::fs::write(dir.join("a.txt"), "edited-a\n").unwrap();
 
-        // Reproduction requires the two `harvest_workspace` calls below to
-        // fall in the same `unix_now()` second (both mint a commit from the
-        // same parent/tree/author/message; only the timestamp can differ).
-        // Align to a fresh second boundary first so the whole sequence below
-        // — which takes low tens of milliseconds — has close to a full
-        // second of headroom, instead of racing an arbitrary boundary.
-        let start_second = crate::repo::unix_now();
-        while crate::repo::unix_now() == start_second {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // Both harvests mint a commit from the same parent/tree/author/message;
+        // only the timestamp can differ. Pin the clock (this thread only) so
+        // the re-minted candidate id matches regardless of load.
+        crate::repo::TEST_NOW.with(|c| c.set(Some(1_700_000_000)));
 
         let outcomes = repo.ws_harvest(None, "t", None).unwrap();
         let landed_tip = match &outcomes[0] {
@@ -2036,8 +2030,7 @@ mod tests {
         // manifest rewrite that would have resolved the entry: re-mark ws-1
         // live and restore its checkout dir with identical content, so a
         // re-harvest re-mints an identical candidate id (same parent, tree,
-        // author, and message; timestamp matches too as long as this test
-        // doesn't straddle a wall-clock second boundary).
+        // author, message, and the pinned timestamp).
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "edited-a\n").unwrap();
         let crashed = WsSession {
@@ -2078,6 +2071,7 @@ mod tests {
         );
         assert!(repo.ws_session().unwrap().is_none());
 
+        crate::repo::TEST_NOW.with(|c| c.set(None));
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
     }
