@@ -1,6 +1,6 @@
 //! Windows owner-only file creation for `.sc/local-key` (#214).
 //!
-//! The only `unsafe` in `scl-repo` lives here, behind one safe function:
+//! The only Windows `unsafe` in `scl-repo` lives here, behind one safe function:
 //! [`create_new_owner_only`]. It builds a *protected* DACL holding a single
 //! ACE (`GENERIC_ALL` for the current user's SID) and hands it to `CreateFileW`
 //! as the file's security descriptor, so the file is owner-only from its first
@@ -26,8 +26,8 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE,
+    CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -110,6 +110,8 @@ pub(crate) fn create_new_owner_only(path: &Path) -> io::Result<File> {
         .encode_utf16()
         .chain([0])
         .collect();
+    // shortcut: no `\\?\` prefix for paths of 260+ chars (std adds one), so those
+    // fail here and take the default-permissions fallback; upgrade if that bites.
     let wpath: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     if wpath[..wpath.len() - 1].contains(&0) {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -144,7 +146,8 @@ pub(crate) fn create_new_owner_only(path: &Path) -> io::Result<File> {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             &attrs,
             CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL,
+            // As std does for create_new: never follow a link planted at the path.
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             ptr::null_mut(),
         )
     };

@@ -86,7 +86,9 @@ too, not just the src-control-side metadata.
   its first byte: mode `0600` on unix, a protected DACL with a single
   `GENERIC_ALL` ACE for the current user on Windows (no inherited entries; the
   advisory `windows` CI job reads it back with `icacls`). Windows keys minted
-  before #214 keep their inherited DACL. On any other target, or if the Windows
+  before #214 keep their inherited DACL, and the warning no longer fires for
+  them; delete `.sc/local-key` to have the next run recreate it owner-only (the
+  cost is one round of spurious re-seals). On any other target, or if the Windows
   ACL call fails, the key and the cache files are written with inherited default
   permissions, and `sc` prints a one-time stderr warning once a cache holds a
   protected entry. The exposure then is small: checkout already writes protected
@@ -94,8 +96,8 @@ too, not just the src-control-side metadata.
   the cache holds tags only for files whose plaintext is on disk, so a reader of
   the key could read that plaintext directly. What remains is the tags of the
   last-committed version of a file edited since, and stale entries until the
-  next save. A unix filesystem that ignores mode bits (vfat, exFAT, some network
-  mounts) is not detected.
+  next save. A filesystem that ignores mode bits or ACLs (unix vfat, exFAT, some
+  network mounts; Windows FAT, exFAT, some SMB shares) is not detected.
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 

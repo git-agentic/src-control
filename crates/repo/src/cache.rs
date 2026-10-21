@@ -81,7 +81,7 @@ fn warn_unrestricted_once(flag: &std::sync::atomic::AtomicBool) -> bool {
         return false;
     }
     eprintln!(
-        "warning: this platform cannot restrict .sc/local-key to its owner; other \
+        "warning: this platform could not restrict .sc/local-key to its owner; other \
          local users may be able to read it and test guesses against the \
          protected-file cache tags (the protected plaintext checked out in the \
          working tree is equally readable by default)"
@@ -153,8 +153,9 @@ fn create_key_file(path: &Path) -> std::io::Result<std::fs::File> {
 fn create_key_file(path: &Path) -> std::io::Result<std::fs::File> {
     match crate::winacl::create_new_owner_only(path) {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            let f = create_key_file_default(path)?;
             ACL_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-            create_key_file_default(path)
+            Ok(f)
         }
         r => r,
     }
