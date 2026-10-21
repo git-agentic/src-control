@@ -1082,7 +1082,25 @@ fn init_max_object_size(flag: Option<&str>) -> Result<()> {
     scl_core::set_max_object_size(n).map_err(|e| anyhow::anyhow!("{src}: {e}"))
 }
 
+/// Windows gives the main thread a 1 MiB stack, which the clap parse and the
+/// large command dispatch overflow in a debug build (`sc.exe` died with a stack
+/// overflow before reaching any command). Run on a roomier thread there; other
+/// platforms keep the main thread untouched.
+#[cfg(windows)]
 fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(real_main)?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+#[cfg(not(windows))]
+fn main() -> Result<()> {
+    real_main()
+}
+
+fn real_main() -> Result<()> {
     let cli = Cli::parse();
     init_max_object_size(match &cli.cmd {
         Cmd::Serve {
