@@ -455,9 +455,11 @@ fn plan_checkout(
             // refuses anything else inside).
             let emptied = removals.iter().any(|r| r.0.starts_with(&under))
                 || (resuming
-                    && old
-                        .keys()
-                        .any(|o| o.starts_with(&under) && !new.contains_key(o)));
+                    && old.iter().any(|(o, e)| {
+                        // A protected file may never have been laid out (no key at
+                        // fork), so it proves nothing about what was on disk.
+                        o.starts_with(&under) && !new.contains_key(o) && e.2 & PROTECTED == 0
+                    }));
             if !emptied || !dir_clearable(&full, p, &|c| removable.contains(c)) {
                 return Err(Error::InvalidArgument(format!(
                     "cannot write {p}: a directory with untracked or ignored content \
@@ -1763,6 +1765,28 @@ mod tests {
         repo.ws_refresh(None, None, None).unwrap();
         assert_eq!(read(&dir, "dir"), "now a file\n");
         assert_eq!(base_of(&repo, None), tip);
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_retry_still_refuses_a_users_empty_directory_the_candidate_never_tracked() {
+        let (repo, root) = init("dir-users-empty");
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        host_commit(
+            &repo,
+            &root,
+            &[("b.txt", Some("b\n")), ("mine", Some("a file\n"))],
+        );
+        {
+            // b.txt is written, then the write of `mine` dies.
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        std::fs::create_dir(dir.join("mine")).unwrap();
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("cannot write mine"), "{err}");
+        assert!(dir.join("mine").is_dir());
         cleanup(repo, &root);
     }
 
