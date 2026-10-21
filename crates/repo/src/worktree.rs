@@ -53,6 +53,26 @@ pub fn list_worktree_paths(layout: &Layout, tracked: &BTreeSet<String>) -> Resul
     Ok(out)
 }
 
+/// [`list_worktree_paths`] under the given ignore rules instead of the ones on
+/// disk: what a walk would see if `ignore` were the checkout's `.scignore`.
+pub(crate) fn list_worktree_paths_with(
+    layout: &Layout,
+    ignore: &Ignore,
+    tracked: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    walk_disk_paths(
+        &layout.root,
+        &layout.root,
+        &layout.dot_sc,
+        ignore,
+        tracked,
+        &mut out,
+    )?;
+    out.sort();
+    Ok(out)
+}
+
 fn walk_disk_paths(
     base: &Path,
     dir: &Path,

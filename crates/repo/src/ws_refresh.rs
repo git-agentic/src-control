@@ -22,15 +22,16 @@ use scl_core::{FileMode, Object, ObjectId, Protection, Store, PROTECTED, RANDOMI
 
 use crate::cache::ProtectedCache;
 use crate::error::{Error, Result};
+use crate::layout::Layout;
 use crate::refs;
 use crate::replay::ReplayOutcome;
 use crate::repo::Repo;
 use crate::sparse::Sparse;
 use crate::workspace::HarvestResult;
 use crate::worktree::{
-    apply_file_mode, clear_dir_obstruction, decrypt_protected, dir_clearable, disk_is_blob, lstat,
-    preflight_view, refuse_blocked_parents, safe_join, tree_file_entries_with_perms_sparse,
-    under_symlink,
+    apply_file_mode, clear_dir_obstruction, decrypt_protected, dir_clearable, disk_is_blob,
+    list_worktree_paths_with, lstat, preflight_view, refuse_blocked_parents, safe_join,
+    tree_file_entries_with_perms_sparse, under_symlink,
 };
 use crate::ws::{
     ensure_idle, label_prefix, open_session, write_manifest, PendingRefresh, PendingWs, WsEntry,
@@ -65,6 +66,8 @@ pub struct WsRefresh {
 
 /// A write the plan decided on: path, new blob, mode and perms, and the
 /// candidate's entry at the path (`None` when the checkout does not track it).
+type Entries = std::collections::BTreeMap<String, (ObjectId, FileMode, u8)>;
+
 type PlannedWrite = (String, ObjectId, FileMode, u8, Option<(ObjectId, u8)>);
 
 /// The writes one workspace needs, decided before anything is touched. Each
@@ -228,47 +231,82 @@ fn check_prior(
 /// about to become the tip.
 fn hidden_additions(
     store: &mut Store,
-    result: &std::collections::BTreeMap<String, (ObjectId, FileMode, u8)>,
+    root: &std::path::Path,
+    old: &Entries,
+    result: &Entries,
+    cand_protection: &Protection,
     protection: &Protection,
     identity: Option<&scl_crypto::SecretKey>,
     tip_root: ObjectId,
     sparse: &Sparse,
 ) -> Result<()> {
-    let Some((rules, _, perms)) = result.get(".scignore") else {
+    let rules_of = |store: &mut Store,
+                    entries: &Entries,
+                    prot: &Protection|
+     -> Result<crate::ignore::Ignore> {
+        let Some((rules, _, perms)) = entries.get(".scignore") else {
+            return Ok(crate::ignore::Ignore::default());
+        };
+        let Object::Blob(stored) = store.get(rules)? else {
+            return Ok(crate::ignore::Ignore::default());
+        };
+        // A protected rule file is what the checkout holds decrypted.
+        let text =
+            if perms & PROTECTED != 0 {
+                match decrypt_protected(&stored, rules, prot, identity) {
+                    Some(pt) => pt.to_vec(),
+                    None => return Err(Error::InvalidArgument(
+                        ".scignore is protected and this key cannot read it, so refresh cannot \
+                         tell which of the workspace's files it would hide: pass --identity"
+                            .into(),
+                    )),
+                }
+            } else {
+                stored.to_vec()
+            };
+        Ok(crate::ignore::Ignore::parse(&String::from_utf8_lossy(
+            &text,
+        )))
+    };
+    let old_rules = old.get(".scignore").map(|e| e.0);
+    let new_rules = result.get(".scignore").map(|e| e.0);
+    if old_rules == new_rules {
         return Ok(());
-    };
-    let Object::Blob(stored) = store.get(rules)? else {
-        return Ok(());
-    };
-    // A protected rule file is what the checkout will hold decrypted.
-    let text = if perms & PROTECTED != 0 {
-        match decrypt_protected(&stored, rules, protection, identity) {
-            Some(pt) => pt.to_vec(),
-            None => {
-                return Err(Error::InvalidArgument(
-                    ".scignore is protected and this key cannot read it, so refresh cannot \
-                     tell which of the workspace's files it would hide: pass --identity"
-                        .into(),
-                ))
-            }
-        }
-    } else {
-        stored.to_vec()
-    };
-    let ignore = crate::ignore::Ignore::parse(&String::from_utf8_lossy(&text));
+    }
+    let new_ignore = rules_of(store, result, protection)?;
+    let old_ignore = rules_of(store, old, cand_protection)?;
     let tip = tree_file_entries_with_perms_sparse(store, tip_root, sparse)?;
     let hidden: Vec<&str> = result
         .keys()
-        .filter(|p| !tip.contains_key(*p) && ignore.matches(p))
+        .filter(|p| !tip.contains_key(*p) && new_ignore.matches(p))
         .map(String::as_str)
         .collect();
-    if hidden.is_empty() {
+    if !hidden.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "the new tip's .scignore would hide files this workspace added, so no harvest \
+             would ever land them: {}; remove or rename them, or adjust the rule",
+            hidden.join(", ")
+        )));
+    }
+    // The other way round: files on disk that the old rules hid (so the candidate
+    // never saw them) and the new rules no longer do would be committed by the
+    // next harvest, whatever they hold.
+    let layout = Layout::at(root);
+    let old_tracked: BTreeSet<String> = old.keys().cloned().collect();
+    let tip_tracked: BTreeSet<String> = tip.keys().cloned().collect();
+    let seen = list_worktree_paths_with(&layout, &old_ignore, &old_tracked)?;
+    let seen: BTreeSet<&str> = seen.iter().map(String::as_str).collect();
+    let newly: Vec<String> = list_worktree_paths_with(&layout, &new_ignore, &tip_tracked)?
+        .into_iter()
+        .filter(|p| !seen.contains(p.as_str()) && !result.contains_key(p))
+        .collect();
+    if newly.is_empty() {
         return Ok(());
     }
     Err(Error::InvalidArgument(format!(
-        "the new tip's .scignore would hide files this workspace added, so no harvest \
-         would ever land them: {}; remove or rename them, or adjust the rule",
-        hidden.join(", ")
+        "the new tip's .scignore no longer hides files in this workspace that the old rules \
+         did, so the next harvest would commit them: {}; move them out or keep a rule for them",
+        newly.join(", ")
     )))
 }
 
@@ -292,7 +330,17 @@ fn plan_checkout(
     // Bounded by the view on both sides: a partial clone does not hold the rest.
     let old = tree_file_entries_with_perms_sparse(store, old_root, sparse)?;
     let new = tree_file_entries_with_perms_sparse(store, new_root, sparse)?;
-    hidden_additions(store, &new, protection, identity, tip_root, sparse)?;
+    hidden_additions(
+        store,
+        root,
+        &old,
+        &new,
+        cand_protection,
+        protection,
+        identity,
+        tip_root,
+        sparse,
+    )?;
     let (mut removals, mut writes, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     for (p, (blob, _, perms)) in old.iter().filter(|(p, _)| !new.contains_key(*p)) {
         let full = safe_join(root, p)?;
@@ -2025,6 +2073,33 @@ mod tests {
         assert_eq!(base_of(&repo, None), s.base_snapshot);
         assert!(!dir.join("b.txt").exists() && !dir.join(".scignore").exists());
         assert_eq!(read(&dir, "build/out.txt"), "agent output\n");
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_tip_that_stops_hiding_an_untracked_file_is_refused() {
+        let root = tmp_root("unignore");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join(".scignore"), "*.env\n").unwrap();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        repo.commit("t", "base").unwrap();
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        std::fs::write(dir.join("secrets.env"), "token\n").unwrap();
+        // A rule change that keeps hiding it is fine.
+        host_commit(&repo, &root, &[(".scignore", Some("*.env\n*.log\n"))]);
+        repo.ws_refresh(None, None, None).unwrap();
+        assert_eq!(read(&dir, ".scignore"), "*.env\n*.log\n");
+        // One that drops the rule would have a harvest commit the file.
+        let before = base_of(&repo, None);
+        host_commit(&repo, &root, &[(".scignore", Some("*.log\n"))]);
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(
+            err.contains("secrets.env") && err.contains("no longer hides"),
+            "{err}"
+        );
+        assert_eq!(base_of(&repo, None), before);
+        assert_eq!(read(&dir, ".scignore"), "*.env\n*.log\n");
         cleanup(repo, &root);
     }
 
