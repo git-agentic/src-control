@@ -13,7 +13,7 @@ the ADRs under `docs/adr/` and the design in `ARCHITECTURE.md`.
 ```sh
 cd apps/desktop && npm run tauri dev         # native desktop development app
 cd apps/desktop && npm run tauri build -- --bundles app  # validated macOS production bundle
-cargo run --bin sc -- demo --agents 4        # parallel-agent demo
+cargo run --bin sc -- demo --agents 4        # parallel-agent demo (defaults: --agents 4, --budget-mb 8)
 cargo run --bin sc -- demo --agents 6 --budget-mb 4 --spill   # exercise eviction
 cargo run --bin sc -- demo --agents 4 --checkout   # also materialize each worktree to a session
                                              # temp dir (the one disk-writing path), then clean up
@@ -24,6 +24,8 @@ cargo run --bin sc -- keygen [--out <file>]  # (default ~/.sc/identity; 0600 on 
                                              # a pre-P22 v1 (scl-sk-) identity still parses and
                                              # still encrypts, but cannot sign
 cargo run --bin sc -- secret-demo            # committed-secrets authorize/deny/grant proof
+# Identity default everywhere a command takes --identity: the flag, then $SC_IDENTITY,
+# then ~/.sc/identity (a missing file just skips protected paths where decryption is optional).
 
 # Persistent repo commands (sc init creates .sc/ in the working directory):
 cargo run --bin sc -- init                   # initialize a new persistent repo
@@ -107,7 +109,7 @@ cargo run --bin sc -- run [--secrets-fd N] -- <cmd> [args…]   # inject decrypt
                                               # NUL-terminated NAME=VALUE records instead of env vars
                                               # (SC_SECRETS_FD names N); ADR-0052
 cargo run --bin sc -- gc                      # pack reachable objects + prune unreachable
-cargo run --bin sc -- gc --prune-expire 7d    # custom grace window
+cargo run --bin sc -- gc --prune-expire 7d    # custom grace window (default 24h)
 cargo run --bin sc -- export --to <git-repo>  # write current branch history to Git
 cargo run --bin sc -- export --to <git-repo> --ref <ref>  # update this Git ref instead of
                                              # refs/heads/<current-branch>
@@ -117,7 +119,7 @@ bash demo/run_remote_demo.sh                 # local-path remote round trip (P6)
                                              # fetch+merge and push between two local repos
 cargo run --bin sc -- remote list            # name, URL and kind ([sc] / [git]) of each remote
 cargo run --bin sc -- remote add <name> <git-path> --git   # register a git-backed remote
-cargo run --bin sc -- fetch <git-remote>                    # import git history -> remote-tracking ref
+cargo run --bin sc -- fetch [<git-remote>]                  # import git history -> remote-tracking ref (remote defaults to origin; same for push)
 cargo run --bin sc -- push <git-remote> [--include-encrypted]  # export sc history -> git ref (ff-only)
 bash demo/run_git_remote_demo.sh                            # git-as-a-remote round-trip proof
 cargo run --bin sc -- remote add <name> ssh://[user@]host[:port]/path   # ssh-native remote
@@ -153,13 +155,17 @@ bash demo/run_randomized_demo.sh                      # randomized protected-enc
                                               # rewrap UPGRADE and pre-P33 dual-read are unit-
                                               # test-pinned, since the current binary can no
                                               # longer write a convergent blob)
-cargo run --bin sc -- work --agents 3 [--name <base>] -- <cmd>   # fork agent workspaces, run
-                                                 # <cmd> in each, harvest changed ones to
-                                                 # <base>-<i> branches (default base `work`)
+cargo run --bin sc -- work --agents 3 [--name <base>] [--budget-mb <n>] -- <cmd>   # fork agent
+                                                 # workspaces (default 2), run <cmd> in each,
+                                                 # harvest changed ones to <base>-<i> branches
+                                                 # (default base `work`); --budget-mb bounds the
+                                                 # session's shared object cache
                                                  # (--with-secrets --identity <key> injects
                                                  # decrypted secrets into each agent env)
 bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
-cargo run --bin sc -- ws fork --agents N [--name <n>] [--identity <key>]  # durable multi-invocation
+cargo run --bin sc -- ws fork --agents N [--name <n>] [--identity <key>] [--author <a>]  # durable multi-invocation
+                                              # (--agents default 2; --author is recorded on any
+                                              # commit a later harvest makes)
                                               # session: materializes N checkouts under
                                               # .sc/ws/<i>/ and persists a manifest (P20).
                                               # --name opens a further named session in
@@ -168,7 +174,9 @@ cargo run --bin sc -- ws fork --agents N [--name <n>] [--identity <key>]  # dura
 cargo run --bin sc -- ws list [--session <n>] # every open session's workspaces, changed/unchanged
                                               # (or just session <n>'s)
 cargo run --bin sc -- ws run [--session <n>] <i> [--with-secrets --identity <key>] -- <cmd>   # run <cmd> in
-                                              # workspace i (SC_WORKSPACE/SC_WORKSPACE_DIR set)
+                                              # workspace i (SC_WORKSPACE/SC_WORKSPACE_DIR set);
+                                              # the repo lock is released while <cmd> runs
+                                              # (ADR-0056), so other sc commands stay usable
 cargo run --bin sc -- ws harvest [--session <n>] [--into <branch>] [--identity <key>]   # probe + auto-merge
                                               # every live workspace onto the landing branch
                                               # (default the session's base branch, which must
@@ -191,7 +199,12 @@ cargo run --bin sc -- ws refresh [--session <n>] [--onto <branch>] [--identity <
                                               # An interrupted refresh leaves a marker: harvest
                                               # refuses until `ws refresh` is run again to finish it
 cargo run --bin sc -- ws abandon [--session <n>] [<i>]  # drop one workspace or the whole session
-bash demo/run_ws_demo.sh                      # multi-invocation session + auto-merge + refresh proof (P20)
+bash demo/run_ws_demo.sh                      # durable-session proof (P20): fork, edit across separate
+                                              # invocations, cumulative auto-merge harvest with a
+                                              # conflicting fallback branch, undo/redo of landings,
+                                              # two named sessions at once (ADR-0056), `ws refresh`
+                                              # onto a newer tip keeping edits; ends with zero
+                                              # `.sc/ws*` residue
 cargo run --bin sc -- cherry-pick <ref> [--identity <key>]   # replay one commit onto the
                                               # current branch (--identity as above)
 cargo run --bin sc -- cherry-pick <ref> --mainline <N>       # replay a merge commit relative
@@ -372,7 +385,12 @@ cargo run --bin sc -- clone sc+http://host[:port]/repo <dst>   # clone over sc+h
                                               # accept the same sc+http:// URL form
 cargo run --bin sc -- remote add <name> sc+wal://<dir>          # bucket WAL remote on a local
                                               # directory (P36, ADR-0046); `clone` takes the URL
-                                              # directly, `fetch`/`push` use the remote's name
+                                              # directly, `fetch`/`push` use the remote's name.
+                                              # Local filesystem, one owner: the CAS is an OS file
+                                              # lock on <dir>/.cas-lock that waits without a
+                                              # timeout (not reliable on NFS; binaries from before
+                                              # #264 do not exclude new ones; use S3 for several
+                                              # machines)
 cargo run --bin sc -- remote add <name> sc+s3://<bucket>/<prefix>   # same, on an S3-compatible
                                               # store; a malformed URL (e.g. no bucket) is rejected
                                               # at `remote add` time. Public content is plaintext at
@@ -387,7 +405,8 @@ cargo run --bin sc -- remote compact <name> [--dry-run] [--prune-expire 24h] [--
                                               # are older than --prune-expire (same flag and default
                                               # as `sc gc`; keep it well above any push's duration).
                                               # Needs bucket list + delete rights. --dry-run prints
-                                              # the plan and writes nothing. Safe beside live
+                                              # the plan and writes nothing, but still downloads
+                                              # and decodes every candidate pack (S3 egress). Safe beside live
                                               # pushes/fetches within --prune-expire (a writer
                                               # stalled longer than that between uploading a pack
                                               # and committing it can lose the pack); run one at a time. A --prune-expire under 1h is refused
@@ -442,7 +461,8 @@ cargo run --bin sc -- clone --filter <prefix…> --lazy <src> <dst>
 cargo run --bin sc -- backfill --lazy [prefix…]
                                               # mark an existing partial clone lazy (P37); with
                                               # prefixes, also backfills them; conflicts --all
-cargo run --bin sc -- cat <ref>:<path>        # print one file as of a ref (P37). On a lazy
+cargo run --bin sc -- cat <ref>:<path>        # print one file as of a ref (P37; <ref> is a branch
+                                              # or remote-tracking ref like origin/main, not HEAD). On a lazy
                                               # partial clone fetches only the absent trees and
                                               # the blob on that path (one GetObjects round trip
                                               # per level). SC_OFFLINE=1 forces the gap error.
@@ -454,7 +474,8 @@ bash demo/run_lazy_fetch_demo.sh              # by-id fetch proof (P37a): cat of
                                               # GetObjects
 bash demo/run_blob_limit_demo.sh              # blob-size filter proof (ADR-0055): old large
                                               # blob left out, tip checkout whole, verify/gc/
-                                              # push fine, --lazy, prefix+limit, backfill repair
+                                              # push fine, --lazy, prefix+limit, backfill repair,
+                                              # a later fetch keeps the limit unless --no-blob-limit
 bash demo/run_partial_clone_demo.sh           # partial clone proof (P27): sc clone --filter
                                               # src/ fetches fewer objects than a full clone
                                               # (object-store count + sc verify's gap report);
@@ -488,6 +509,7 @@ cargo run --bin sc -- serve fingerprint [<path>]   # print (minting if absent) t
                                               # (.sc/) — found from the cwd, or <path>
 cargo run --bin sc -- clone sc+https://host[:port]/repo <dst>   # TLS clone (P32); accept-new
                                               # TOFU: first connect pins into
+                                              # $XDG_CONFIG_HOME/sc/known_hosts, else
                                               # ~/.config/sc/known_hosts (SC_HTTPS_KNOWN_HOSTS
                                               # overrides), mismatch always hard-fails;
                                               # SC_HTTPS_FINGERPRINT=<sha256:hex> pre-pins (CI),
@@ -497,7 +519,8 @@ cargo run --bin sc -- clone sc+https://host[:port]/repo <dst>   # TLS clone (P32
                                               # pinning (no pin file read/written; ADR-0054);
                                               # remote add/fetch/push accept the same URL form
 cargo run --bin sc -- tls list [--json]       # pins in the known_hosts file (ADR-0053)
-cargo run --bin sc -- tls forget <host[:port]>   # drop a host's pin (changed server key); a later
+cargo run --bin sc -- tls forget <host[:port]>   # drop every pin for a host (port defaults to 8730;
+                                              # changed server key); a later
                                               # accept-new connect (no SC_HTTPS_STRICT, no
                                               # SC_HTTPS_FINGERPRINT) re-pins; errors if nothing
                                               # was pinned

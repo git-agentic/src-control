@@ -73,8 +73,9 @@ across every phase.
   client spawns the user's `ssh` for `ssh://` remotes, overridable via
   `SC_SSH` (GIT_SSH pattern) so tests and `demo/run_ssh_remote_demo.sh`
   drive the full ssh:// code path with no sshd. Zero new dependencies.
-  Accepted limitations: 4 GiB frame cap, no repo paths with spaces over
-  real ssh, `sc` must be on the server's PATH. (ADR-0022.)
+  Accepted limitations: 4 GiB frame cap (since replaced by the configurable
+  object cap, P28 and #213), no repo paths with spaces over real ssh, `sc` must
+  be on the server's PATH. (ADR-0022.)
 - **Phase 13 — Agent workspaces (`sc work`).** Fused the two halves of the
   project: fork N in-RAM copy-on-write workspaces from a persistent repo's
   HEAD (the repo's budget-bounded store is the backing tier — eviction is
@@ -202,8 +203,19 @@ across every phase.
   workspace's state (dirty files included) is committed to a throwaway candidate
   and replayed with the ADR-0049 engine; any conflict, running command, scanner
   hit, view gap or user file in the way refuses the whole refresh before a
-  write; only the differing files are re-laid in place and the manifest base
-  moves last. Session-wide only; per-index refresh is not built.
+  write; only the differing files are re-laid in place (each re-checked against
+  what was read, right before it is touched) and the manifest base moves last.
+  It also refuses a tip that drops the protection of a path the workspace holds
+  as plaintext, and an `.scignore` change that would hide an added file or expose
+  an untracked one. A crash mid-refresh leaves a `pending_refresh` marker
+  (target and per-workspace candidate and result snapshots, all gc roots):
+  `harvest` and `ws run` refuse until `sc ws refresh` is run again and finishes
+  it from the recorded pair. While the marker is set the manifest's
+  `base_snapshot` reads `refresh-unfinished`, so an older binary fails to parse
+  the manifest (and its gc fails) instead of harvesting a half-refreshed
+  checkout. A binary from before ADR-0056 also does not root a named session's
+  base in `sc gc`; do not run one against a repo with named sessions open.
+  Session-wide only; per-index refresh and `harvest --all` are not built.
 - **Phase 21 — Hardening & consolidation.** Closes the P16–P20 review
   tail with no new capability axis. Every commit-creating policy op
   (`protect`/`grant`/`revoke`/`secret add`/`secret rotate`/`secret
@@ -376,11 +388,12 @@ across every phase.
   <prefix…>` widens the filter from the promisor origin on demand, offline
   everywhere else (explicit backfill, not transparent lazy-fetch — a
   deliberate MVP choice to keep network I/O out of every read path).
-  **Coarse but honest limitation:** merge, cherry-pick/rebase replay, `sc
-  ws harvest`, and `sc work` are refused entirely on a partial clone
-  (`Error::PartialCloneUnsupported`) — backfill to a full clone first, not
-  a per-case gap-tolerant reimplementation. `sc export` refuses too (Git
-  needs full trees). Proven by `demo/run_partial_clone_demo.sh`: a
+  **Coarse but honest limitation at the time:** merge, cherry-pick/rebase
+  replay, `sc ws harvest`, and `sc work` were refused entirely on a partial
+  clone (`Error::PartialCloneUnsupported`) — backfill to a full clone first,
+  not a per-case gap-tolerant reimplementation (P37c and P37d lifted the merge,
+  replay and session refusals). `sc export` still refuses (Git needs full
+  trees). Proven by `demo/run_partial_clone_demo.sh`: a
   `--filter src/` clone holds fewer objects than a full clone (both by
   object-store count and `sc verify`'s gap report), docs/lib/ are never
   fetched or materialized, a src/ edit committed and pushed from the
@@ -399,7 +412,8 @@ across every phase.
   undo, ws) — and `is_unsafe_ref_component` (the distinct, `/`-permitting
   remote-tracking validator) is upgraded to also reject whitespace/control,
   closing an oplog-corruption gap via a hostile git remote's branch name.
-  DoS caps: a single `MAX_OBJECT_SIZE` (256 MiB) in `crates/core` bounds
+  DoS caps: a single max object size (256 MiB by default; configurable from 2 MiB
+  to 1 GiB since #213) in `crates/core` bounds
   the wire frame length, the pack-record compressed length, AND the zstd
   decompressed output via a decode-WITH-LIMIT reader (never decode-then-
   check, so a decompression bomb never fully materializes); four
@@ -500,8 +514,15 @@ across every phase.
   and a remote that held a tombstone before trusting the signer re-judges it
   from a capped `.sc/transcript-pending` index when the trusted-signer set
   changes. Valid signatures from attacker keys cannot crowd out a drop (#257: the
-  signature index holds one slot per (target, signer)), and serve-path index
-  updates take a short index lock (#260).
+  signature index holds one slot per (target, signer), now in
+  `.sc/signatures.v2`; the old `.sc/signatures` is imported once, re-verified),
+  and serve-path index updates take a short `.sc/index.lock`, waited for at most
+  30 s (#260). Only signatures that verify for a held target are indexed, so a
+  forged one reads as `Unsigned`, never `Invalid`; an older binary's `sc gc`
+  sweeps signatures only the v2 file lists, so do not run one on such a repo
+  (#265). The migration retries on every ingest (#270, #273), and both
+  `signatures::reindex` and `transcripts::reindex` scan outside the index lock
+  and merge late arrivals under it (#273, #277).
 
 - **Phase 32 — In-binary TLS (`sc+https://`).** Closes the audit's High #1
   (plaintext bearer tokens/traffic on `sc+http://`) and ADR-0036's "no TLS"
@@ -586,7 +607,16 @@ across every phase.
   signed drop tombstones by decoding the on-chain packs (#229, no format
   change). `sc remote compact` (#216) merges small packs and deletes the log
   entries, checkpoints and unreferenced packs behind an aged cutoff; readers
-  restart on a moved manifest; no format change. (ADR-0046, ADR-0057.)
+  restart on a moved manifest; no format change; `--dry-run` writes nothing but
+  downloads and decodes the same candidate packs as a real run. A lost manifest
+  CAS is retried up to 16 times with jittered backoff (#272). The `DirBucket`
+  CAS lock is an OS advisory file lock on `<root>/.cas-lock` (#264): it queues
+  waiters and is dropped when its holder dies, but `lock()` waits without a
+  timeout, the file is never removed, binaries from before and after #264 do not
+  exclude each other on one directory (an old binary can also fail with "cas lock
+  stuck"), and `flock` on NFS is unreliable, so a directory bucket is a
+  single-host backend; use S3 when several machines write. (ADR-0046,
+  ADR-0057.)
 - **Phase 37a — Want-by-id fetch.** A batched `GetObjects` verb (wire v5), an
   opt-in `.sc/promisor-lazy` marker, and `sc cat <ref>:<path>`, which fills only
   the absent trees and the blob on its path. `Store::get` stays network-free.
@@ -639,8 +669,22 @@ across every phase.
     path, and `sc sparse set` may widen while a merge, pick or rebase is stopped
     (#224, #236); a stopped completion no longer resurrects out-of-view
     deletions (#239).
-  - Checkout restores the executable bit on the write-out paths (#242, #243);
-    `sc resolve` after a deleted conflicted file restores it too.
+  - Checkout restores the executable bit on the write-out paths (#242, #243,
+    #253); `sc resolve` after a deleted conflicted file restores it too.
+  - Working-tree safety (ADR-0034 refinement 8): a stop's `materialize` and every
+    abort delete or overwrite only what is provably the stop's own (a regular
+    file with exactly the tracked bytes, or a path the stop recorded); an abort
+    finishes and reports what it kept through `AbortReport` (#255, #256, #259).
+    A file/directory change at one path now crosses switch, undo, abort and
+    `--continue`, clearing emptied directories (#247, #250); an untracked file at
+    an out-of-view path that a result adds is refused (#248, #251); a stopped
+    merge into a private branch aborts and completes with `--identity` (#246,
+    #252); a sparse view change never counts a case alias of a laid-out path as
+    tracked (#241, #264).
+  - A snapshot that would hold a path as both a file and a directory (a
+    directory made where an absent protected or out-of-view file is carried back)
+    is refused by both tree builders before any tree is written (#278, #280;
+    ADR-0034 refinement 9, ADR-0025 refinement 8).
   - A warning when the protected-cache key cannot be permission-restricted on a
     non-unix target (#225), and an owner-only Windows ACL on `.sc/local-key`,
     verified by the advisory `windows` CI job (#214). Windows keys created
@@ -789,6 +833,12 @@ smaller ones (protected-cache hygiene, theirs-side resolve carry, sparse and
 P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
 `CLAUDE.md`, `ARCHITECTURE.md` and the ADRs.
 
+- **Windows owner-only protection for the `sc keygen` identity file and the TLS
+  serve key (#281, follow-on to #214).** `.sc/local-key` gets an owner-only DACL;
+  the identity file (`sc keygen --out`, `0600` on unix only) and the serve-home
+  TLS key still get default permissions on non-unix. The helper lives in
+  `scl-repo`, while `cli` and `tlsio` must not depend on it (leaf rule), so it
+  moves to `core` or arrives as a callback.
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.

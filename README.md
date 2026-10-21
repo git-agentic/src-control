@@ -74,7 +74,8 @@ apps/
   desktop/ read-only Tauri v2 + React/TypeScript repository browser (see
           apps/desktop/README.md); calls `repo` directly, never the `sc` binary
 demo/
-  27 end-to-end proof scripts covering everything below, e.g.:
+  28 end-to-end proof scripts covering most capabilities (bucket remotes are
+  covered by tests only), e.g.:
   run_demo.sh              independent before/after filesystem diff, zero residue
   run_repo_demo.sh         persistent repo end-to-end demo
   run_ssh_remote_demo.sh   ssh-native transport round trip
@@ -93,8 +94,9 @@ keeping the rest of the system Git-, crypto-, TLS- and object-store-agnostic.
 ## Quick start
 
 ```sh
-# Build and test the whole workspace
-cargo test
+# Build and test the whole workspace (on Linux the desktop crate needs the Tauri
+# system packages; see CONTRIBUTING.md)
+cargo test --workspace
 
 # Run the parallel-agent demo (4 agents, default 8 MiB blob budget)
 cargo run --bin sc -- demo --agents 4
@@ -128,11 +130,12 @@ bash demo/run_demo.sh
 Run `sc --help` (and `sc <command> --help`) for the full command surface:
 merge, history editing, secrets lifecycle, sparse/partial clone, ssh/HTTP(S)/
 bucket remotes, session transcripts, and more. The annotated reference lives in
-the `sc-cli-reference` skill (`.claude/skills/sc-cli-reference/SKILL.md`), which
-does not yet cover bucket remotes. Those take `sc remote add <name>
-sc+wal://<dir>` or `sc+s3://<bucket>/<prefix>` (see ADR-0046), and `sc serve
---http 127.0.0.1:8730 --store <url> <serve-home>` serves a bucket from a
-disposable instance (`--stdio` also works; `sc serve --help`).
+the `sc-cli-reference` skill (`.claude/skills/sc-cli-reference/SKILL.md`).
+Bucket remotes take `sc remote add <name> sc+wal://<dir>` or
+`sc+s3://<bucket>/<prefix>` (ADR-0046); `sc remote compact <name>` prunes them
+(ADR-0057), and `sc serve --http 127.0.0.1:8730 --store <url> <serve-home>`
+serves a bucket from a disposable instance (`--stdio` also works;
+`sc serve --help`).
 
 ## How Phase 1 works
 
@@ -169,8 +172,7 @@ via `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system`), bucket (`sc+wal://`, `sc+s3://`),
 and Git (including hosted GitHub) network transports, plus private branches
 sealed to a recipient set until publish and a read-only Tauri desktop
 browser. All 36 phases and P37a-37d are implemented and tested; `demo/` holds
-28 independent end-to-end proofs, one per major capability. Remaining
-follow-ons (transcript drop delivery gaps, `sc ws`
-workspace refresh and similar hardening
-items) are tracked in [ROADMAP.md](ROADMAP.md)'s Deferred section and as open
+28 independent end-to-end proofs covering most major capabilities. Remaining
+follow-ons (richer signer trust models, per-path token ACLs, transcript
+rewrap/grant/revoke and similar items) are tracked in [ROADMAP.md](ROADMAP.md)'s Deferred section and as open
 GitHub issues rather than being open MVP scope.

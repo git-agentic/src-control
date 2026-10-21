@@ -142,17 +142,17 @@ the code, those win.
 | P24 | Sparse checkouts: `.sc/sparse` local prefix spec; checkout-only (CAS keeps everything) | [0034](docs/adr/0034-sparse-checkouts.md) |
 | P25 | Streaming pack transfer: bounded RAM on both sides, `ST_PACK_CHUNK` frames (`SC_PACK_CHUNK` tunes), two-pass atomic-after-verify ingest | [0035](docs/adr/0035-streaming-transfer.md) |
 | P26 | `sc+http://` transport: `sc serve --http`, thread-per-connection, status-line-before-handshake opening | [0036](docs/adr/0036-http-transport.md) |
-| P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3. Blob-size filter (#217): `--filter blob:limit=<size>` (combinable with prefixes; `blob:` is reserved) leaves out blobs of at least that size unless a ref tip reaches them, evaluated by the server (`GetPack.blob_limit`, wire v6); the gap is absence as in ADR-0048, `sc backfill <path>` or a lazy fill repairs it, `.sc/promisor-blob-limit` records limit and scope; `sc fetch` from the promisor origin sends the recorded limit again (`--no-blob-limit` opts out for one fetch); no object-count limit (rejected) | [0037](docs/adr/0037-partial-clone.md), [0055](docs/adr/0055-blob-size-clone-filter.md) |
+| P27 | Partial clone: `sc clone --filter <prefix…>`, `.sc/promisor`, `sc backfill [--all]`; wire `PROTOCOL_VERSION` 3 when added (6 now). Blob-size filter (#217): `--filter blob:limit=<size>` (combinable with prefixes; `blob:` is reserved) leaves out blobs of at least that size unless a ref tip reaches them, evaluated by the server (`GetPack.blob_limit`, wire v6); the gap is absence as in ADR-0048, `sc backfill <path>` or a lazy fill repairs it, `.sc/promisor-blob-limit` records limit and scope; `sc fetch` from the promisor origin sends the recorded limit again (`--no-blob-limit` opts out for one fetch); no object-count limit (rejected) | [0037](docs/adr/0037-partial-clone.md), [0055](docs/adr/0055-blob-size-clone-filter.md) |
 | P28 | Security hardening: a max object size (default 256 MiB; `--max-object-size` / `SC_MAX_OBJECT_SIZE`, 2 MiB to 1 GiB) caps every untrusted transfer length; strict ref-name validation | [0039](docs/adr/0039-security-hardening-sweep.md) |
 | P29 | `sc serve --http` access control: bearer tokens (`sc serve token add [--expires]`/`rotate`/`remove`/`list`; an expired token gets the same 401 as an unknown one), `--read-only`, fail-closed non-loopback bind gate | [0040](docs/adr/0040-sc-http-access-control.md) |
 | P30 | Sealed agent-session transcripts: `sc transcript attach/show/list/sign/drop`, always-encrypted body, gc-coupled index; `--no-transcripts` on fetch/clone/push (client-side, per command); drop = grow-only tombstone (a bare `Transcript` object, no wire change), kept by gc, hides the body from fetch/reindex; retained signed tombstones ride a transfer when their snapshot is in it or was collected by the sender, only verifying signatures are indexed, and held-but-untrusted tombstones are re-judged from `.sc/transcript-pending` when the trusted-signer set changes (#230); the signature index (`.sc/signatures.v2`) holds one slot per (target, signer) so attacker-made keys cannot crowd out a drop (#257), and serve-path index updates take a short `.sc/index.lock` distinct from the repo lock (#260) | [0038](docs/adr/0038-agent-session-transcripts.md) |
 | P31 | Listener resource limits: `--max-connections`, `--timeout`, `--max-pack-size` (both transports), capped read-only drain, accept backoff; later `--max-conn-bytes` per-connection write budget (#233) | [0041](docs/adr/0041-listener-resource-limits.md) |
 | P32 | In-binary TLS: `sc+https://` via leaf crate `tlsio`; accept-new TOFU pinning (`sc tls list/forget/pin/path` manages the pin file); `SC_HTTPS_CA_FILE`/`SC_HTTPS_CA=system` validate against a CA instead; client connect/handshake bounded; public plaintext bind no longer justified by tokens alone | [0042](docs/adr/0042-in-binary-tls-sc-https.md), [0053](docs/adr/0053-tls-pin-management.md), [0054](docs/adr/0054-tls-ca-validation.md) |
 | P33 | Randomized protected sealing (fresh DEK + nonce; `RANDOMIZED` perms bit); dual-read of pre-P33 convergent ciphertext; per-checkout keyed stat cache; `sc rewrap` upgrades convergent blobs at the tip | [0043](docs/adr/0043-randomized-protected-encryption.md) |
-| P34 | Private branches: ref points at a sealed-branch manifest; every commit/tree/blob individually sealed (copy-on-write) under a per-branch KEK wrapped per recipient + escrow; `sc branch --private/grant/revoke/publish`; opaque to non-recipients (content, paths, messages); grant O(1), revoke rotates the KEK; publish replays to public with a scanner gate; git bridge + private→public integration refused; `PROTOCOL_VERSION` 4 | [0044](docs/adr/0044-per-branch-access-control.md) |
+| P34 | Private branches: ref points at a sealed-branch manifest; every commit/tree/blob individually sealed (copy-on-write) under a per-branch KEK wrapped per recipient + escrow; `sc branch --private/grant/revoke/publish`; opaque to non-recipients (content, paths, messages); grant O(1), revoke rotates the KEK; publish replays to public with a scanner gate; git bridge + private→public integration refused; `PROTOCOL_VERSION` 4 when added | [0044](docs/adr/0044-per-branch-access-control.md) |
 | P35 | Native Tauri desktop browser: opens `.sc` repositories through `scl-repo`, shows local/remote refs, all-parent snapshot DAG + provenance, public trees and first-parent diffs; protected content is locked and private branches remain opaque; no mutation or identity surface | [0045](docs/adr/0045-native-desktop-read-model.md) |
 | P36 | Bucket WAL remotes (sc+wal://, sc+s3://): immutable packs + CAS'd manifest, checkpoints + log-tail cold start, bucket-backed `sc serve --store` with disposable instances; `get_pack` serves signatures, transcripts and signed drop tombstones by decoding the on-chain packs (#229, no format change); `sc remote compact <name> [--dry-run] [--prune-expire 24h]` (#216) merges small packs behind one manifest CAS, then deletes log entries, checkpoints and unreferenced packs behind an aged-checkpoint cutoff, readers restart on a moved manifest, no format or wire change | [0046](docs/adr/0046-wal-bucket-remotes.md), [0057](docs/adr/0057-bucket-compaction.md) |
-| P37a | Want-by-id fetch: batched `GetObjects` verb (wire v5), opt-in `.sc/promisor-lazy`, `sc cat <ref>:<path>` fills only the absent trees and blob on its path; `Store::get` stays network-free; sealed objects refused by kind; sparse widen and the lifted P27 refusals are P37b | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
+| P37a | Want-by-id fetch: batched `GetObjects` verb (added in wire v5), opt-in `.sc/promisor-lazy`, `sc cat <ref>:<path>` fills only the absent trees and blob on its path; `Store::get` stays network-free; sealed objects refused by kind; sparse widen and the lifted P27 refusals are P37b | [0047](docs/adr/0047-want-by-id-fetch-and-gap-fill.md) |
 | P37b-i | Presence-based partial clones: push, verify and gc walk what the store holds (`reachable_objects_partial`), not the fetch filter; push checks every gap id against the destination before sending; a view gap fails with `GapInView` before any write (preflight at the top of `materialize`, plus `undo` and `sparse set`); a partial clone fetches from its origin only. 37b-ii: on a lazy, online clone `ensure_view` fills the view closure by id before switch, fast-forward, undo and `sparse set`, `sparse set` may widen past the filter, a by-id reply is capped at `min(--max-pack-size, 2 GiB)` (a constant since #213, independent of the object cap) and a refused batch is split. | [0048](docs/adr/0048-presence-based-partial-clones.md) |
 | P37c | Merge, cherry-pick and rebase on a partial clone: a tree-recursive engine (`merge_trees`) carries a subtree by id when the sides agree and no protection rule applies, reads only where they differ or a rule intersects, and on a lazy, online clone fills what it asks for by id outside the store lock (a non-lazy clone gets the gap error with `sc backfill <path>`); a carried protected subtree keeps the complete input wrap union; a conflict inside the view is marked and resolved like on a full clone (`sc conflicts`/`sc resolve`/`merge --abort`/`sc commit`; the out-of-view part is grafted from the decided root), while a conflict outside the view, or a result that must be sealed outside it, is refused before any ref, merge-state or working-tree change (fetched objects stay). A subtree identical on all three sides is carried even under a protection rule. Cherry-pick and rebase use the same engine (`replay_commit`): the fold's accumulator may hold absent subtrees, the view is filled before the final write, and a stopped pick or rebase keeps its carried subtrees in the decided root. Mode-only edits now merge and a file/directory collision fails before any write, on full clones too. | [0049](docs/adr/0049-merge-on-partial-clones.md) |
 | P37d | Agent sessions on a partial clone: `sc ws fork`/`run`/`harvest`/`abandon` and `sc work` work; a workspace or agent sees the host's sparse view only (`sc work` no longer gets a complete tree there), the view closure is filled (lazy, online) or refused with the gap error before anything is written, a workspace commit grafts the out-of-view subtrees from the base without reading them, and harvest lands through the ADR-0049 merge (any conflict falls back to a `work-<i>` branch as on a full clone) | [0050](docs/adr/0050-sessions-on-partial-clones.md) |
@@ -187,7 +187,7 @@ transport-adjacent. The rest, imperatively:
   identity material. Opening a repository can write the derived transcript-drop
   indexes (`.sc/transcript-drops`, `.sc/transcript-pending`) when the trusted
   signer set changed; no key material is involved (#230).
-- **Partial clones refuse `sc export`, `sparse disable`, an empty `sparse set` (and `sparse disable`; both are allowed on a size-only `AllPaths` clone, ADR-0055), on a non-lazy clone a `sparse set` outside the filter, `sc rewrap`,
+- **Partial clones refuse `sc export`, `sparse disable` and an empty `sparse set` (both are allowed on a size-only `AllPaths` clone, ADR-0055), on a non-lazy clone a `sparse set` outside the filter, `sc rewrap`,
   `sc grant`/`revoke`, creating, switching to or leaving a private branch, a merge, cherry-pick or rebase whose conflict lies outside the view (a `.theirs` sidecar sits beside its conflicted path, so it is in view whenever that path is; ADR-0049) (no ref, state or working-tree change; on every clone, a conflict stop that needs sealing outside the view is refused the same way), `sc push` to a git remote, and
   `sc fetch` from any native remote but the promisor origin.** `sc merge`, `sc cherry-pick` and `sc rebase` work, including conflicts inside the view (P37c). `sc ws` and `sc work` work too (ADR-0050): workspaces and agents see the clone's view only, and harvest lands through the same merge. `sc backfill --all`
   converts to a genuine full clone and re-enables them. The filter records what
@@ -212,12 +212,25 @@ transport-adjacent. The rest, imperatively:
 - **Bucket remotes hold public content plaintext at rest** — bucket ACL is
   the perimeter (sealed content stays ciphertext, unchanged); partial-clone
   `filter` against bucket remotes is refused.
+- **`DirBucket` (`sc+wal://<dir>`) is a single-host, single-owner backend (#264).**
+  Its CAS takes an OS advisory file lock (`File::lock`: `flock` on unix,
+  `LockFileEx` on Windows) on `<root>/.cas-lock`, a file that is never removed and
+  is opened for writing. `lock()` waits without a timeout, so a holder that
+  stalls (a suspended process, a hung filesystem) blocks every writer of that
+  directory until it lets go; the OS drops the lock if the holder dies. Do not
+  run binaries from before and after #264 against one directory at once: the old
+  create-exclusive lock and the new lock do not exclude each other (an update can
+  be lost, and an old binary can fail with "cas lock stuck"). `flock` on NFS and
+  similar is unreliable, so keep it on a local filesystem; use `sc+s3://` when
+  several machines write (ADR-0046, THREAT-MODEL).
 - **`sc remote compact` deletes bucket objects** (ADR-0057): it needs bucket
   list and delete rights, which pushers and `sc serve --store` instances should
   not hold. It advances the manifest only through the normal CAS (one no-op
   entry plus a checkpoint) and never deletes what the current chain names. Keep `--prune-expire` well above any push's duration (default
   24h): a writer stalled longer than that between uploading a pack and its
   commit can still lose the pack (the leases follow-on closes it).
+  `--dry-run` writes and deletes nothing but still downloads and decodes every
+  candidate pack, so on S3 it costs the same egress and requests as a real run.
 - **`sc serve --store` still requires a local serve home with `.sc/`** —
   tokens, TLS identity, and pack spills live there; the bucket holds all
   served content.
@@ -245,7 +258,8 @@ transport-adjacent. The rest, imperatively:
   `sc rewrap` only replaces wrap lists) plus rotating the underlying credential.
   History keeps the old ciphertext (rotation is not erasure).
 - **The signature index is `.sc/signatures.v2` (#257).** `.sc/signatures` is the
-  pre-#257 file, kept only for the one-time import. Do not run an older binary's
+  pre-#257 file, kept only for the one-time import (an import that failed is retried on later
+  ingests). Do not run an older binary's
   `sc gc` on a repo this build has signed in or ingested into: it roots only the
   legacy file and sweeps the signatures v2 lists (ADR-0038).
 - **The oplog is local-only** (like a reflog) — it never travels over
@@ -298,7 +312,12 @@ transport-adjacent. The rest, imperatively:
   `rebase --continue` refusal is fixed by widening and rerunning it (#224). A
   binary conflict's `<path>.theirs` sidecar sits beside its in-view file and
   may not match a file-exact spec (partial clones check it by its base path);
-  completion and abort remove it.
+  completion and abort remove it. With a decided root recorded (public branches),
+  completion carries out-of-view and still-protected paths from it alone, never
+  from a parent, so a path the other side deleted cleanly stays deleted (#238,
+  #239). A spec change never counts a case alias of a laid-out path as tracked
+  (#241): on a case-insensitive filesystem the newly visible alias would be the
+  laid-out file and writing it would replace that file's bytes.
 - **`.sc/git-remotes/<name>/marks` carries `git_oid ↔ sc_id` identity —
   deleting it is destructive.** Deleting the sibling `mirror.git` is always
   safe (reconstructed on next use). Stale marks self-heal on push/export.
@@ -352,6 +371,22 @@ transport-adjacent. The rest, imperatively:
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first. A push into a repo with a stopped op is
   refused for that repo's checked-out branch (other branches still accept it).
+- **`sc ws run` releases the repo lock while the agent command runs
+  (ADR-0056).** It resolves the workspace and secret environment under the lock,
+  then spawns the command without it, so other sessions and `sc` commands stay
+  usable; an `sc` the command runs from inside the workspace finds the host repo
+  and can change it. `sc work` keeps the lock for its whole session.
+- **Downgrade hazards (an older binary on a repo or peer this build has
+  touched):** (1) a binary from before ADR-0056 does not root a named session's
+  base (`.sc/ws-<n>`) in `sc gc`; (2) while a `sc ws refresh` is unfinished the
+  manifest's `base_snapshot` holds the placeholder `refresh-unfinished`, so an
+  older binary fails to parse the manifest (and its gc fails) instead of
+  harvesting a half-refreshed checkout; finish the refresh with this build; (3)
+  an older `sc gc` roots only the legacy `.sc/signatures` and sweeps what
+  `.sc/signatures.v2` alone lists; (4) wire v6 is matched exactly, so every
+  mixed client/server pair, ssh remotes included, fails at the handshake; (5)
+  `DirBucket` binaries from before and after #264 do not exclude each other (see
+  above). Upgrade every user of a repo, serve home or bucket directory together.
 - **A `sc work`/`ws` session is the only sanctioned ephemeral+persistent mix:**
   temp checkouts are removed on teardown; durable writes go only through the
   normal commit path.
