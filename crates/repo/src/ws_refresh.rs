@@ -206,14 +206,31 @@ fn check_prior(
 fn hidden_additions(
     store: &mut Store,
     result: &std::collections::BTreeMap<String, (ObjectId, FileMode, u8)>,
+    protection: &Protection,
+    identity: Option<&scl_crypto::SecretKey>,
     tip_root: ObjectId,
     sparse: &Sparse,
 ) -> Result<()> {
-    let Some((rules, ..)) = result.get(".scignore") else {
+    let Some((rules, _, perms)) = result.get(".scignore") else {
         return Ok(());
     };
-    let Object::Blob(text) = store.get(rules)? else {
+    let Object::Blob(stored) = store.get(rules)? else {
         return Ok(());
+    };
+    // A protected rule file is what the checkout will hold decrypted.
+    let text = if perms & PROTECTED != 0 {
+        match decrypt_protected(&stored, rules, protection, identity) {
+            Some(pt) => pt.to_vec(),
+            None => {
+                return Err(Error::InvalidArgument(
+                    ".scignore is protected and this key cannot read it, so refresh cannot \
+                     tell which of the workspace's files it would hide: pass --identity"
+                        .into(),
+                ))
+            }
+        }
+    } else {
+        stored.to_vec()
     };
     let ignore = crate::ignore::Ignore::parse(&String::from_utf8_lossy(&text));
     let tip = tree_file_entries_with_perms_sparse(store, tip_root, sparse)?;
@@ -245,13 +262,13 @@ fn plan_checkout(
     tip_root: ObjectId,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
-    cache: &ProtectedCache,
+    cache: &mut ProtectedCache,
     resuming: bool,
 ) -> Result<Plan> {
     // Bounded by the view on both sides: a partial clone does not hold the rest.
     let old = tree_file_entries_with_perms_sparse(store, old_root, sparse)?;
     let new = tree_file_entries_with_perms_sparse(store, new_root, sparse)?;
-    hidden_additions(store, &new, tip_root, sparse)?;
+    hidden_additions(store, &new, protection, identity, tip_root, sparse)?;
     let (mut removals, mut writes, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     for (p, (blob, _, perms)) in old.iter().filter(|(p, _)| !new.contains_key(*p)) {
         let full = safe_join(root, p)?;
@@ -310,6 +327,11 @@ fn plan_checkout(
                 target_plain.as_deref().map(|v| &v[..]),
             )
         {
+            // Verified by plaintext: make sure the cache says so too, or the
+            // next diff would read this untouched file as an edit.
+            if let (Some(pt), true) = (&target_plain, perms & RANDOMIZED != 0) {
+                cache.record(p, &pt[..], *blob);
+            }
             continue;
         }
         if protected && target_plain.is_none() {
@@ -757,7 +779,7 @@ impl Repo {
         let tip = self.snapshot(&to)?;
         let (to_protection, tip_root) = (tip.protection, tip.root);
         let mut jobs: Vec<Job> = Vec::new();
-        for prep in preps {
+        for mut prep in preps {
             let old_root = self.snapshot(&prep.candidate)?.root;
             let result = self.snapshot(&prep.result)?;
             // The result's view, filled (lazy clone) or reported as a gap.
@@ -776,7 +798,7 @@ impl Repo {
                     tip_root,
                     identity,
                     &sparse,
-                    &prep.cache,
+                    &mut prep.cache,
                     prior_pending.is_some(),
                 )
             };
@@ -1806,6 +1828,11 @@ mod tests {
         for d in [&d1, &d2] {
             assert_eq!(read(d, "secret/x"), "secret x v2\n");
         }
+        // The accepted file was put back in the cache, so it is not an edit.
+        let session = repo.ws_session(None).unwrap().unwrap();
+        for e in &session.workspaces {
+            assert!(!repo.ws_changed(None, e).unwrap(), "workspace {}", e.index);
+        }
         cleanup(repo, &root);
     }
 
@@ -1932,6 +1959,27 @@ mod tests {
             tree_has(&repo, *merged_tip, "logs/a.log").unwrap(),
             b"agent log edit\n"
         );
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_protected_scignore_is_read_with_the_key() {
+        let (repo, root) = init("protected-ignore");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        let s = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/out.txt"), "agent output\n").unwrap();
+        repo.protect(".scignore", &[pk], None).unwrap();
+        host_commit(&repo, &root, &[(".scignore", Some("build/\n"))]);
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("--identity"), "{err}");
+        let err = repo
+            .ws_refresh(None, None, Some(&sk))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("build/out.txt"), "{err}");
+        assert_eq!(base_of(&repo, None), s.base_snapshot);
         cleanup(repo, &root);
     }
 
