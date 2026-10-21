@@ -387,7 +387,9 @@ plain file, and setuid/setgid/sticky are always cleared (#242, #243). `sc
 resolve` applies the chosen side's mode after rewriting a deleted conflicted
 file. A chmod the filesystem refuses is tolerated with a one-time warning.
 
-`materialize` treats the disk as the user's wherever it cannot prove otherwise.
+`materialize` treats the disk as the user's wherever it cannot prove otherwise
+(on public branches; private-branch merges, forward operations and aborts have
+weaker guards, listed in THREAT-MODEL).
 A forward operation (merge, switch, cherry-pick, rebase, undo, sparse-spec change)
 refuses, before any write, to lay a file or directory onto an untracked or ignored
 one. A tracked path is deleted or overwritten only when the disk copy is a regular
