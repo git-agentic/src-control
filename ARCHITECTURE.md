@@ -92,7 +92,7 @@ src-control/
 │                 reference is the sc-cli-reference skill)
 ├── apps/desktop/ Tauri v2 top-level adapter (`scl-desktop`) + bundled React/TypeScript
 │                 renderer; native read model only, with no UI dependency in domain crates
-├── demo/         27 end-to-end proof scripts (`run_*.sh`)
+├── demo/         28 end-to-end proof scripts (`run_*.sh`)
 ├── fuzz/         cargo-fuzz target for the wire decoder (`wire_decode`)
 └── ARCHITECTURE.md
 ```
@@ -333,10 +333,16 @@ phases but the shape is stable:
   scanner (P5).
 - `oplog` — append-only operation log; every ref-moving op records before/after
   so `sc undo`/redo can invert it (P14). Local-only, like a reflog.
-- `signatures` — snapshot→signature-object index (P22); `transcripts` —
-  snapshot→transcript-object index, one-to-many (P30). Both gc-rooted, local-only.
-  `transcript-drops` — the derived set of dropped transcripts (`sc transcript
-  drop`), rebuilt from the store on clone.
+- `signatures.v2` — the signature index, one slot per (snapshot, signer) (P22,
+  #257); `signatures` is the pre-#257 file, read only by the one-time import
+  (retried on later ingests if it failed) and left alone so an older binary keeps
+  a file it understands. `transcripts` — snapshot→transcript-object index,
+  one-to-many (P30). All gc-rooted, local-only. `transcript-drops` — the derived
+  set of dropped transcripts (`sc transcript drop`), rebuilt from the store on
+  clone; `transcript-pending` (+ `transcript-pending-trust`) — signed tombstones
+  held but not yet honored, re-judged when the trusted-signer set changes (#230).
+- `index.lock` — advisory lock around one update of these derived indexes, taken
+  by serve-path ingests and local commands; distinct from `lock` (#260).
 - `sparse` — the local, uncommitted sparse-checkout prefix spec (P24);
   `promisor` — a partial clone's fetch-filter + origin (P27);
   `promisor-blob-limit` — its blob-size limit and whole-tree-or-prefix scope (ADR-0055).
@@ -351,7 +357,9 @@ phases but the shape is stable:
   for protected paths; never committed, never transferred.
 - `tmp/` — guard-cleaned scratch for streaming pack transfer (P25).
 - `ws/` — durable agent-session workspaces: `session.toml` manifest + per-agent
-  checkouts (P20); `ws-<name>/` — the same for a named session (ADR-0056). `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
+  checkouts (P20); `ws-<name>/` — the same for a named session (ADR-0056); the
+  manifest also carries the `pending_refresh` marker of an unfinished `sc ws
+  refresh`. `git-remotes/<name>/` — the `git_oid ↔ sc_id` marks map and a
   lazily-built bare `mirror.git` for network Git (P10/P18).
 - Transient in-progress state (removed on completion/abort): `MERGE_HEAD`,
   `PICK_HEAD`, `REBASE_STATE`, and their `*_DECIDED_ROOT` records, plus
@@ -379,6 +387,23 @@ plain file, and setuid/setgid/sticky are always cleared (#242, #243). `sc
 resolve` applies the chosen side's mode after rewriting a deleted conflicted
 file. A chmod the filesystem refuses is tolerated with a one-time warning.
 
+`materialize` treats the disk as the user's wherever it cannot prove otherwise
+(on public branches; private-branch merges, forward operations and aborts have
+weaker guards, listed in THREAT-MODEL).
+A forward operation (merge, switch, cherry-pick, rebase, undo, sparse-spec change)
+refuses, before any write, to lay a file or directory onto an untracked or ignored
+one. A tracked path is deleted or overwritten only when the disk copy is a regular
+file with exactly the tracked bytes, so an edit, a replacement or a symlink
+survives (where bytes can be compared: a protected path without a usable identity
+and a private-branch forward operation cannot, see THREAT-MODEL); an emptied directory is cleared so a file and a directory can swap at one
+path, and every such directory is checked before the first removal, so a refusal
+changes nothing. An abort (`merge_abort`, `cherry_pick_abort`, `rebase_abort`)
+completes past a kept edit (a directory holding untracked content or a blocked
+parent still refuses) and returns an `AbortReport`: it removes what the stop laid,
+overwrites a file only if it is still the stopped tree's bytes or the stop owns it
+(recorded plaintext, a conflicted path), and lists what it left in `kept` (`sc`
+prints `left in place (changed since the stop)`). See ADR-0034 refinement 8.
+
 ### Mode-scoped disk invariant
 
 **Ephemeral mode** (Phase 1 agents, `sc demo`, `sc secret-demo`) keeps the
@@ -402,7 +427,11 @@ Remote ref updates are compare-and-swap: `Transport::update_ref` revalidates
 the expected old tip under the remote's own lock, so two racing pushes cannot
 silently clobber each other. The single-writer lock file records the holder's
 PID and is broken automatically when that process is provably dead, so a
-SIGKILLed `sc` doesn't brick the repo. See ADR-0021.
+SIGKILLed `sc` doesn't brick the repo. The derived indexes (signatures,
+transcripts and their drop state) take a separate, short `index.lock`, held only
+around one update and never while waiting on the repo lock, so a serve-path ingest
+and a clone's reindex cannot lose each other's appended lines (#260, #273, #277).
+See ADR-0021.
 
 ## Phase 1 deliverable and proof
 
@@ -566,8 +595,10 @@ requires rotating the underlying external credential too. See ADR-0019.
 ## Phase 12 — Network transport over SSH (built)
 
 `sc clone / fetch / push` work against `ssh://[user@]host[:port]/path`
-remotes. The wire protocol mirrors the 8 `Transport` verbs over length-
-prefixed frames with a version handshake; the server (`sc serve --stdio`) is
+remotes. The wire protocol mirrors the `Transport` verbs (eight here; the batched
+`GetObjects` joined in wire v5) over length-prefixed frames with a version
+handshake (`PROTOCOL_VERSION` is 6 today; each bump is noted in the phase that
+made it, and a mismatched pair fails closed at the handshake); the server (`sc serve --stdio`) is
 a dispatch loop around `LocalTransport`, so CAS ref updates and pack
 verification apply verbatim server-side. The client spawns the user's `ssh`
 (overridable via `SC_SSH`, Git's `GIT_SSH` pattern — the demo and tests drive
@@ -586,8 +617,8 @@ blob cache and eviction never needs a spill backend — `.sc/objects` is the
 reconstruction source. Checkout reuses the P7-aware `materialize`; harvest
 reuses the commit pipeline (`snapshot_files`, extracted from `commit`), so
 the P5 scanner and `.scignore` gate agent output exactly like a human
-commit. Each changed workspace becomes a flat `work-<i>` branch (the ref
-grammar reserves `/` for remote-tracking refs); merge is the ordinary P4
+commit. Each changed workspace becomes a flat `work-<i>` branch (`<base>-<i>` with
+`sc work --name <base>`; the ref grammar reserves `/` for remote-tracking refs); merge is the ordinary P4
 path. The session holds the single-writer lock end to end, and teardown is
 Drop-guarded: zero residue outside `.sc/` on success, error, or panic.
 
@@ -807,8 +838,11 @@ a write. Applying touches only differing paths, each written atomically and
 re-checked against what the candidate read right before it is touched; a
 `pending_refresh` marker (target, its branch and, per workspace, the candidate
 and result snapshots) is written to the manifest before the first file, and the
-manifest with the new base and no marker last. A crash leaves the marker:
-harvest and run refuse, and `sc ws refresh` resumes from the recorded pairs
+manifest with the new base and no marker last. While the marker is set the
+manifest's `base_snapshot` holds the placeholder `refresh-unfinished` (the real
+base is inside the marker), so a binary that predates refresh cannot read the base
+and fails closed instead of harvesting a half-moved session. A crash leaves the
+marker: harvest and run refuse, and `sc ws refresh` resumes from the recorded pairs
 (accepting at each path the candidate's bytes or the result's, never re-reading
 the half-written checkouts) before moving to the requested tip. Session-wide
 only.
@@ -893,7 +927,12 @@ newly in-view files from the stop's decided root, leaves protected ones absent,
 and the interrupted write is journaled in `.sc/sparse-widen` (#224). Sparse is CHECKOUT-only — every object
 stays in the CAS regardless of the spec, so `sc gc`'s reachability walk is
 unaffected; not fetching out-of-prefix objects at all is deferred to P27.
-See ADR-0034.
+A stopped operation records a decided root (public branches), and completion
+carries an out-of-view or still-protected path from it alone, so a path the other
+side deleted cleanly is not resurrected from a parent (#238/#239). A spec change
+never counts a case alias of a laid-out path as tracked, since on a
+case-insensitive filesystem the newly visible alias would be the laid-out file
+itself (#241). See ADR-0034.
 
 ## Phase 25 — streaming pack transfer (built)
 
@@ -1190,12 +1229,13 @@ as a write-ahead log of **immutable, content-addressed packs** plus **one
 compare-and-swapped manifest**. A push uploads a pack, appends a parent-linked
 `log/<seq>` entry carrying its ref updates, then CASes the manifest's
 `head_seq` forward (`Bucket::put_if_tag`). A lost CAS refreshes and retries (up
-to 16 times), so pushes to different branches both land; a push whose target
+to 16 attempts, with jittered exponential backoff between them, a ceiling that
+starts at 4 ms and doubles to a 250 ms cap), so pushes to different branches both land; a push whose target
 branch no longer matches its expected old tip fails with `NonFastForward`,
 exactly as on any other transport, and a loser's orphaned log entry is invisible
 to readers because they walk `parent_seq` back from the manifest. There is no
 leader, lock file or lease. The new leaf crate `objio` holds the `Bucket` trait
-and its two backends (`DirBucket` for `sc+wal://<dir>`, `S3Bucket` for
+and its two backends (`DirBucket` for `sc+wal://<dir>`, whose CAS takes an OS advisory file lock (single host, local filesystem; see THREAT-MODEL), `S3Bucket` for
 `sc+s3://<bucket>/<prefix>`), quarantining the S3 SDK the way `gix` and
 RustCrypto are quarantined.
 

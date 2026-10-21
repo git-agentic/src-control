@@ -50,15 +50,15 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0037](0037-partial-clone.md) | Partial clone (promisor store + prefix-scoped fetch) | Accepted; refusals lifted by 0048, 0049, 0050 | 27 |
 | [0038](0038-agent-session-transcripts.md) | Agent session transcripts as CAS objects | Accepted | 30 |
 | [0039](0039-security-hardening-sweep.md) | Security hardening sweep (audit fix-now items) | Accepted | 28 |
-| [0040](0040-sc-http-access-control.md) | sc+http access control (read-only, fail-closed bind, bearer tokens) | Accepted; bind gate narrowed by 0042 | 29 |
+| [0040](0040-sc-http-access-control.md) | sc+http access control (read-only, fail-closed bind, bearer tokens) | Accepted; bind gate narrowed by 0042, token expiry and rotation in its addendum | 29 |
 | [0041](0041-listener-resource-limits.md) | Listener resource limits (connection cap, session timeout, spool cap, accept backoff) | Accepted | 31 |
 | [0042](0042-in-binary-tls-sc-https.md) | In-binary TLS — `sc+https://` via rustls | Accepted; CA validation 0054, pin management 0053 | 32 |
 | [0043](0043-randomized-protected-encryption.md) | Randomized protected-path encryption (dual-read, randomized-write) | Accepted; rotate-for-paths built as 0051 | 33 |
 | [0044](0044-per-branch-access-control.md) | Per-branch access control with opaque private branches | Accepted; sparse merge-in section (#240) | 34 |
 | [0045](0045-native-desktop-read-model.md) | Native desktop adapter and keyless read model | Accepted | 35 |
-| [0046](0046-wal-bucket-remotes.md) | Bucket remotes via an immutable-pack WAL + one CAS'd manifest | Accepted; compaction 0057 | 36 |
+| [0046](0046-wal-bucket-remotes.md) | Bucket remotes via an immutable-pack WAL + one CAS'd manifest | Accepted; compaction built as 0057 | 36 |
 | [0047](0047-want-by-id-fetch-and-gap-fill.md) | Want-by-id fetch and explicit gap fill for partial clones | Accepted (built) | 37 |
-| [0048](0048-presence-based-partial-clones.md) | Presence-based walks for partial clones | Accepted (built) | 37b |
+| [0048](0048-presence-based-partial-clones.md) | Presence-based walks for partial clones | Accepted (built); 0055 adds a second kind of gap | 37b |
 | [0049](0049-merge-on-partial-clones.md) | Merge on partial clones | Accepted (built) | 37c |
 | [0050](0050-sessions-on-partial-clones.md) | Agent sessions on partial clones | Accepted (built) | 37d |
 | [0051](0051-rotate-protected-paths.md) | Rotating protected paths (`sc rewrap --rotate`) | Accepted (built) | — |
@@ -66,8 +66,8 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0053](0053-tls-pin-management.md) | TLS pin management (`sc tls`) | Accepted (built) | — |
 | [0054](0054-tls-ca-validation.md) | CA-path validation for `sc+https://` | Accepted (built) | — |
 | [0055](0055-blob-size-clone-filter.md) | Blob-size clone filter (`--filter blob:limit=<size>`) | Accepted (built) | 27 |
-| [0056](0056-named-concurrent-ws-sessions.md) | Named and concurrent `sc ws` sessions | Accepted (built; refresh designed, deferred) | 20 |
-| [0057](0057-bucket-compaction.md) | Bucket remote compaction and gc (`sc remote compact`) | Accepted (built) | 36 |
+| [0056](0056-named-concurrent-ws-sessions.md) | Named and concurrent `sc ws` sessions and `sc ws refresh` | Accepted (built, including `sc ws refresh`) | 20 |
+| [0057](0057-bucket-compaction.md) | Bucket remote compaction and gc (`sc remote compact`) | Accepted | 36 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
