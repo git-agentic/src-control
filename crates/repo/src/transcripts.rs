@@ -630,38 +630,154 @@ fn reevaluate_inner(
 /// that are `Object::Transcript` whose `snapshot` also resolves locally,
 /// and atomically rewrite the index to exactly that set (not an append —
 /// stale entries from a half-written prior index are dropped too).
+///
+/// The scan and the tombstone signature checks run without the index lock. A
+/// serve-path ingest into the same store stores its objects before it appends
+/// (under the lock), so under the lock the rebuild lists the store again,
+/// after a few unlocked catch-up passes, and judges only what appeared since,
+/// plus the transcripts whose snapshot was missing and the tombstones that
+/// were not honored yet (their signature or trust may have landed since) (#274):
+/// an append made during the scan is covered, and one made after the rewrite
+/// lands on top of it. The locked listing also reloads the pack index, so
+/// packs another handle wrote since this store opened count too.
 pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
-    let mut entries: Vec<(ObjectId, ObjectId)> = Vec::new();
-    let mut drops: Vec<DropEntry> = Vec::new();
-    let trusted = trusted_signers(layout);
-    let sigs = crate::signatures::load_sig_index(layout, None, &trusted)?;
-    for id in store.all_ids()? {
-        if let Object::Transcript(t) = store.get(&id)? {
-            if !store.contains(&t.snapshot) {
-                continue;
-            }
-            match t.dropped_id() {
-                Some(dropped) => {
-                    if tombstone_honored(store, &trusted, &sigs, id, &t, dropped)? {
-                        drops.push((t.snapshot, id, dropped));
-                    }
-                }
-                None => entries.push((t.snapshot, id)),
-            }
+    reindex_with(layout, store, || {}, || {})
+}
+
+/// [`reindex`] with hooks so a test can interleave an ingest deterministically:
+/// `after_scan` runs after the first scan, `before_lock` after the unlocked
+/// catch-up passes, so only the locked pass can absorb what it does.
+fn reindex_with(
+    layout: &Layout,
+    store: &mut scl_core::Store,
+    after_scan: impl FnOnce(),
+    before_lock: impl FnOnce(),
+) -> Result<usize> {
+    let mut scan = Scan::default();
+    scan.pass(layout, store)?;
+    after_scan();
+    // Catch up on what arrived meanwhile without the lock, so the locked pass
+    // has little left to judge however large a concurrent push was. Bounded: a
+    // writer that keeps adding objects cannot postpone the write.
+    for _ in 0..CATCH_UP_PASSES {
+        if !scan.pass(layout, store)? {
+            break;
         }
     }
-    drops.sort();
-    drops.dedup();
-    let dropped: BTreeSet<ObjectId> = drops.iter().map(|(_, _, d)| *d).collect();
-    entries.retain(|(_, tid)| !dropped.contains(tid));
-    entries.sort();
-    entries.dedup();
-    let count = entries.len();
+    before_lock();
     with_index_lock(layout, || {
+        store.reload_packs()?;
+        scan.pass(layout, store)?;
+        let drops: Vec<DropEntry> = scan
+            .honored
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let dropped: BTreeSet<ObjectId> = drops.iter().map(|(_, _, d)| *d).collect();
+        let entries: Vec<(ObjectId, ObjectId)> = scan
+            .bodies
+            .iter()
+            .filter(|(id, _)| !dropped.contains(id))
+            .map(|(id, snap)| (*snap, *id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         write_index(layout, &entries)?;
-        write_drops(layout, &drops)
-    })?;
-    Ok(count)
+        write_drops(layout, &drops)?;
+        Ok(entries.len())
+    })
+}
+
+/// Unlocked catch-up passes `reindex` makes before taking the lock.
+const CATCH_UP_PASSES: usize = 4;
+
+/// What [`reindex`] has learned about the store so far, across passes.
+#[derive(Default)]
+struct Scan {
+    seen: BTreeSet<ObjectId>,
+    /// Transcripts (and tombstones) listed before their snapshot landed:
+    /// `(id, snapshot)`, retried each pass (an ingest stores a pack's objects
+    /// one by one).
+    waiting: Vec<(ObjectId, ObjectId)>,
+    /// Live-index candidates: transcript id to snapshot.
+    bodies: std::collections::BTreeMap<ObjectId, ObjectId>,
+    /// Every tombstone with a held snapshot, honored or not: tombstone id to
+    /// the tombstone and the id it drops.
+    tombs: std::collections::BTreeMap<ObjectId, (Transcript, ObjectId)>,
+    /// The tombstones honored so far, as the drop line each would write.
+    honored: std::collections::BTreeMap<ObjectId, DropEntry>,
+    /// Fingerprint of the trusted set `honored` was judged under.
+    fp: String,
+}
+
+impl Scan {
+    /// One pass: decode the objects not seen yet, plus the waiting ones whose
+    /// snapshot is now held, then judge the tombstones again under the current
+    /// trusted set and signature index. Returns whether any new object was
+    /// listed.
+    fn pass(&mut self, layout: &Layout, store: &mut scl_core::Store) -> Result<bool> {
+        let new: Vec<ObjectId> = store
+            .all_ids()?
+            .into_iter()
+            .filter(|id| self.seen.insert(*id))
+            .collect();
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .partition(|(_, snap)| store.contains(snap));
+        self.waiting = waiting;
+        let retry = ready.into_iter().map(|(id, _)| id);
+        for id in new.iter().copied().chain(retry) {
+            let Object::Transcript(t) = store.get(&id)? else {
+                continue;
+            };
+            if !store.contains(&t.snapshot) {
+                self.waiting.push((id, t.snapshot));
+            } else if let Some(dropped) = t.dropped_id() {
+                self.tombs.insert(id, (t, dropped));
+            } else {
+                self.bodies.insert(id, t.snapshot);
+            }
+        }
+        let any_new = !new.is_empty();
+        self.judge(layout, store, &new.into_iter().collect())?;
+        Ok(any_new)
+    }
+
+    /// Judge the tombstones not honored yet (their signature or the signer's
+    /// trust may have landed since), and again any whose dropped transcript is
+    /// among the `new` objects, under the trusted set and signature index as
+    /// they are now. A changed trusted set invalidates every earlier verdict.
+    fn judge(
+        &mut self,
+        layout: &Layout,
+        store: &mut scl_core::Store,
+        new: &BTreeSet<ObjectId>,
+    ) -> Result<()> {
+        if self.tombs.is_empty() {
+            return Ok(());
+        }
+        let trusted = trusted_signers(layout);
+        let fp = fp_of(&trusted);
+        if fp != self.fp {
+            self.honored.clear();
+            self.fp = fp;
+        }
+        let wanted: BTreeSet<ObjectId> = self.tombs.keys().copied().collect();
+        let sigs = crate::signatures::load_sig_index(layout, Some(&wanted), &trusted)?;
+        for (id, (t, dropped)) in &self.tombs {
+            if self.honored.contains_key(id) && !new.contains(dropped) {
+                continue;
+            }
+            if tombstone_honored(store, &trusted, &sigs, *id, t, *dropped)? {
+                self.honored.insert(*id, (t.snapshot, *id, *dropped));
+            } else {
+                self.honored.remove(id);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Sender-side seam (Task 3/4): the indexed transcript object ids (and drop
@@ -2070,5 +2186,187 @@ pub(crate) mod tests {
     #[test]
     fn concurrent_serve_ingests_lose_no_index_entry_and_do_not_deadlock_with_update_ref() {
         concurrent_ingests_lose_nothing("conc-ref", false);
+    }
+
+    /// A pack of `objs`, as a serve-path ingest receives it.
+    fn pack_of(objs: &[Object]) -> Vec<u8> {
+        let enc: Vec<(ObjectId, Vec<u8>)> = objs.iter().map(|o| (o.id(), o.encode())).collect();
+        scl_core::pack::build_pack(&enc).unwrap().0
+    }
+
+    /// A signature by `who` over the drop digest of `tomb`.
+    fn drop_sig(who: &scl_crypto::Identity, tomb: ObjectId) -> Object {
+        let k = who.signing.as_ref().unwrap();
+        Object::Signature(SignatureObj {
+            snapshot: tomb,
+            signer: k.public().to_bytes(),
+            sig: scl_crypto::sign_transcript_id(k, &drop_digest(&tomb)),
+        })
+    }
+
+    fn put_pack_into(root: &std::path::Path, pack: &[u8]) {
+        use crate::transport::Transport;
+        crate::transport::LocalTransport::open(root)
+            .unwrap()
+            .put_pack(&mut &pack[..])
+            .unwrap();
+    }
+
+    /// Run `reindex_with` on `dest`, calling `ingest` once, after the first
+    /// scan or (`just_before_lock`) only after the unlocked catch-up passes.
+    fn reindex_racing(dest: &Repo, just_before_lock: bool, ingest: impl FnOnce()) -> usize {
+        let ingest = std::cell::RefCell::new(Some(ingest));
+        let arc = dest.store_arc();
+        let mut store = arc.lock().unwrap();
+        reindex_with(
+            dest.layout(),
+            &mut store,
+            || {
+                if !just_before_lock {
+                    (ingest.borrow_mut().take().unwrap())();
+                }
+            },
+            || {
+                if just_before_lock {
+                    (ingest.borrow_mut().take().unwrap())();
+                }
+            },
+        )
+        .unwrap()
+    }
+
+    /// A source repo with `snap`, a trusting `dest` that holds it, and the
+    /// identity `dest` trusts.
+    fn race_fixture(tag: &str) -> (Repo, ObjectId, Repo, scl_crypto::Identity) {
+        let src = Repo::init(tmp_root(&format!("{tag}-src"))).unwrap();
+        std::fs::write(src.layout().root.join("f"), b"x").unwrap();
+        let snap = src.commit("t", "c1").unwrap();
+        let dest = Repo::init(tmp_root(&format!("{tag}-dst"))).unwrap();
+        dest.store_arc()
+            .lock()
+            .unwrap()
+            .put(src.store_arc().lock().unwrap().get(&snap).unwrap())
+            .unwrap();
+        let (_s, owner) = scl_crypto::generate_identity_v2();
+        trust_signer(&dest, &owner);
+        (src, snap, dest, owner)
+    }
+
+    fn body_of(src: &Repo, snap: ObjectId, label: &str, who: &scl_crypto::Identity) -> Object {
+        let id = src
+            .attach_transcript(snap, "a", label, label.as_bytes(), &[who.enc.public()])
+            .unwrap();
+        src.store_arc().lock().unwrap().get(&id).unwrap()
+    }
+
+    fn clean_up(repos: &[Repo]) {
+        let roots: Vec<_> = repos.iter().map(|r| r.layout().root.clone()).collect();
+        for r in roots {
+            std::fs::remove_dir_all(&r).unwrap();
+            assert!(!r.exists());
+        }
+    }
+
+    #[test]
+    fn reindex_keeps_an_ingest_that_lands_during_its_scan() {
+        // The ingest lands after the first scan, or only after the unlocked
+        // catch-up passes (so just the locked pass can absorb it). Without the
+        // locked relisting the rewrite replaces the index it appended to.
+        for just_before_lock in [false, true] {
+            let (src, snap, dest, owner) = race_fixture(&format!("race-{just_before_lock}"));
+            let base = body_of(&src, snap, "base", &owner);
+            let keep = body_of(&src, snap, "keep", &owner);
+            let doomed = body_of(&src, snap, "doomed", &owner);
+            let tomb = Object::Transcript(Transcript::drop_tombstone(snap, &doomed.id()));
+            dest.store_arc().lock().unwrap().put(base.clone()).unwrap();
+            let pack = pack_of(&[
+                keep.clone(),
+                doomed.clone(),
+                tomb.clone(),
+                drop_sig(&owner, tomb.id()),
+            ]);
+            let root = dest.layout().root.clone();
+            let count = reindex_racing(&dest, just_before_lock, || put_pack_into(&root, &pack));
+            assert_eq!(count, 2);
+            let mut live: Vec<_> = load(dest.layout())
+                .unwrap()
+                .into_iter()
+                .map(|e| e.1)
+                .collect();
+            live.sort();
+            let mut want = vec![base.id(), keep.id()];
+            want.sort();
+            assert_eq!(live, want, "a transcript index line was lost");
+            assert_eq!(
+                read_drops(dest.layout()).unwrap(),
+                vec![(snap, tomb.id(), doomed.id())],
+                "the tombstone was lost"
+            );
+            clean_up(&[src, dest]);
+        }
+    }
+
+    #[test]
+    fn reindex_judges_again_what_lands_after_the_first_scan() {
+        // A transcript listed before its snapshot, and a tombstone listed
+        // before its signature: both are settled by what arrives later, and
+        // a late signature by a key that is not trusted still honors nothing.
+        for (just_before_lock, trusted_signer) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let (src, snap, dest, owner) =
+                race_fixture(&format!("late-{just_before_lock}-{trusted_signer}"));
+            let (_s, stranger) = scl_crypto::generate_identity_v2();
+            let signer = if trusted_signer { &owner } else { &stranger };
+            std::fs::write(src.layout().root.join("f"), b"y").unwrap();
+            let snap2 = src.commit("t", "c2").unwrap();
+            let snap2_obj = src.store_arc().lock().unwrap().get(&snap2).unwrap();
+            let orphan = body_of(&src, snap2, "orphan", &owner);
+            let doomed = body_of(&src, snap, "doomed", &owner);
+            let tomb = Object::Transcript(Transcript::drop_tombstone(snap, &doomed.id()));
+            for o in [&orphan, &doomed, &tomb] {
+                dest.store_arc().lock().unwrap().put(o.clone()).unwrap();
+            }
+            let pack = pack_of(&[snap2_obj, drop_sig(signer, tomb.id())]);
+            let root = dest.layout().root.clone();
+            let count = reindex_racing(&dest, just_before_lock, || put_pack_into(&root, &pack));
+            let mut live: Vec<_> = load(dest.layout())
+                .unwrap()
+                .into_iter()
+                .map(|e| e.1)
+                .collect();
+            live.sort();
+            let (mut want, drops) = if trusted_signer {
+                (vec![orphan.id()], vec![(snap, tomb.id(), doomed.id())])
+            } else {
+                (vec![orphan.id(), doomed.id()], vec![])
+            };
+            want.sort();
+            assert_eq!(count, want.len());
+            assert_eq!(live, want, "the late snapshot or signature is mishandled");
+            assert_eq!(read_drops(dest.layout()).unwrap(), drops);
+            clean_up(&[src, dest]);
+        }
+    }
+
+    #[test]
+    fn reindex_sees_a_pack_another_handle_wrote_since_the_store_opened() {
+        for just_before_lock in [false, true] {
+            let (src, snap, dest, owner) = race_fixture(&format!("pack-{just_before_lock}"));
+            let late = body_of(&src, snap, "late", &owner);
+            let late_id = late.id();
+            let objects = dest.layout().objects_dir();
+            let count = reindex_racing(&dest, just_before_lock, || {
+                let mut s2 =
+                    scl_core::Store::open_persistent(objects, crate::repo::default_budget())
+                        .unwrap();
+                s2.put(late).unwrap();
+                s2.write_pack(&[late_id]).unwrap();
+                s2.delete(&late_id).unwrap();
+            });
+            assert_eq!(count, 1);
+            assert_eq!(load(dest.layout()).unwrap(), vec![(snap, late_id)]);
+            clean_up(&[src, dest]);
+        }
     }
 }

@@ -662,6 +662,22 @@ scan in `tombstone_honored` never reached it. Now:
   append is lost, and the lock is never held across the bulk of the
   verification. The relisting sees loose objects (what ingest writes), not
   packs another handle wrote since the store opened.
+- **`transcripts::reindex` and a concurrent ingest (#274).** The same shape
+  for the transcript index and the drops file. The scan, and every tombstone
+  signature check, run without the index lock, followed by up to four
+  unlocked catch-up passes. Under the lock it lists the store once more and
+  judges only what is new: transcripts whose snapshot was not held when they
+  were listed, tombstones not honored yet (their signature or the signer's
+  trust may have landed since) and tombstones whose dropped body is new. Each
+  pass re-reads the trusted set and the signature index, and a changed set
+  discards the earlier verdicts, so only trusted signers are ever honored.
+  The rewrite of `.sc/transcripts` and `.sc/transcript-drops` then happens
+  under the lock, so an ingest that landed during the scan is relisted and one
+  that lands after appends on top; the pending ring is untouched. Unlike the
+  signature rebuild, the locked listing first reloads the pack index
+  (`Store::reload_packs`), so objects another handle packed since this store
+  opened count as well; it costs one read of the `.idx` files, once, under the
+  lock. (`signatures::reindex` still relists loose objects only.)
 
 ### 2. The index lock (#260)
 
