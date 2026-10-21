@@ -56,6 +56,8 @@ pub mod sparse;
 mod sparse_completion;
 pub mod stdio_transport;
 pub mod sync;
+#[cfg(test)]
+mod test_support;
 pub mod textdiff;
 pub mod tls_pins;
 pub mod transcripts;
