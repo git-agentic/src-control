@@ -623,6 +623,11 @@ fn ingest_pack_file_impl(
         ids.push(id);
         Ok(())
     })?;
+    // Retry a legacy signature-index import that failed earlier (#270), even
+    // for a pack with no signature in it: two stats when there is nothing to
+    // import. Best effort here; the signature writers and gc fail instead of
+    // starting a v2 file without it.
+    let _ = crate::signatures::migrate_legacy(layout, store);
     // Tombstones held from earlier transfers are judged again when the
     // trusted-signer set changed (#230), before this pack's own tombstones are
     // noted under the current set. A `--no-transcripts` transfer indexes no
