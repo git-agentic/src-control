@@ -400,11 +400,11 @@ pub(crate) fn acceptable(store: &mut scl_core::Store, sig: &SignatureObj) -> Res
 /// The slow scan and its Ed25519 checks run without the index lock. A
 /// serve-path ingest into the same store stores its objects before it
 /// appends (under the lock), so under the lock the rebuild lists the store
-/// again and verifies only the objects that appeared since the first scan, plus
-/// the signatures it saw before their target landed (#270): an append made
-/// during the scan is covered, and one made after the rewrite lands on top of
-/// it. The second listing sees loose objects (what ingest writes), not packs
-/// another handle wrote since this store opened.
+/// again, after a few unlocked catch-up passes, and verifies only the objects
+/// that appeared since, plus the signatures it saw before their target landed
+/// (#270): an append made during the scan is covered, and one made after the
+/// rewrite lands on top of it. The relisting sees loose objects (what ingest
+/// writes), not packs another handle wrote since this store opened.
 pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
     reindex_with(layout, store, || {})
 }
@@ -418,20 +418,19 @@ fn reindex_with(
 ) -> Result<usize> {
     let mut entries: Vec<Entry> = Vec::new();
     let mut waiting: Vec<ObjectId> = Vec::new();
-    let scanned: BTreeSet<ObjectId> = store.all_ids()?.into_iter().collect();
-    scan_signatures(store, scanned.iter(), &mut entries, &mut waiting)?;
+    let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
+    scan_new(store, &mut seen, &mut waiting, &mut entries)?;
     after_scan();
+    // Catch up on what arrived meanwhile without the lock, so the locked pass
+    // below has little left to verify however large a concurrent push was.
+    // Bounded: a writer that keeps adding objects cannot postpone the write.
+    for _ in 0..CATCH_UP_PASSES {
+        if !scan_new(store, &mut seen, &mut waiting, &mut entries)? {
+            break;
+        }
+    }
     with_index_lock(layout, || {
-        // Objects that appeared since the scan, and signatures the scan saw
-        // before their target landed (an ingest writes a pack's objects one by
-        // one, so the signature can be listed first): both are judged again.
-        let late: Vec<ObjectId> = store
-            .all_ids()?
-            .into_iter()
-            .filter(|id| !scanned.contains(id))
-            .chain(waiting)
-            .collect();
-        scan_signatures(store, late.iter(), &mut entries, &mut Vec::new())?;
+        scan_new(store, &mut seen, &mut waiting, &mut entries)?;
         // One slot per (target, signer): the lowest signature id keeps it, so
         // the rebuild is deterministic. (Sorted by slot first: equal slots
         // must be adjacent for `dedup_by_key`.)
@@ -440,6 +439,29 @@ fn reindex_with(
         write_index(layout, &entries)?;
         Ok(entries.len())
     })
+}
+
+/// Unlocked catch-up passes `reindex` makes before taking the lock.
+const CATCH_UP_PASSES: usize = 4;
+
+/// One pass of [`reindex`]'s scan: judge the objects not in `seen` yet, plus
+/// the signatures an earlier pass saw before their target landed (an ingest
+/// stores a pack's objects one by one, so a signature can be listed first).
+/// Returns whether any new object was listed.
+fn scan_new(
+    store: &mut scl_core::Store,
+    seen: &mut BTreeSet<ObjectId>,
+    waiting: &mut Vec<ObjectId>,
+    entries: &mut Vec<Entry>,
+) -> Result<bool> {
+    let new: Vec<ObjectId> = store
+        .all_ids()?
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect();
+    let retry = std::mem::take(waiting);
+    scan_signatures(store, new.iter().chain(retry.iter()), entries, waiting)?;
+    Ok(!new.is_empty())
 }
 
 /// Push an entry for each acceptable signature object among `ids`, and note in
