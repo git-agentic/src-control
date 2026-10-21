@@ -81,19 +81,28 @@ too, not just the src-control-side metadata.
   protected blob under a fresh key (ADR-0051), whereas a plain `sc rewrap` only
   replaces wrap lists and leaves the key a revoked holder already has. History
   keeps the old wraps and ciphertext regardless.
-- **Local cache key is owner-only on unix only (P33, #214):** the
-  unchanged-detection cache is keyed by `.sc/local-key`, created `0600` from its
-  first byte. Only unix can do that; on a non-unix target the key and the cache
-  files are written with inherited default permissions, and `sc` prints a
-  one-time stderr warning once a cache holds a protected entry. The exposure is
-  small: checkout already writes protected plaintext into the working tree with
-  default permissions on every platform, and the cache holds tags only for files
-  whose plaintext is on disk, so a reader of the key could read that plaintext
-  directly. What remains is the tags of the last-committed version of a file
-  edited since, and stale entries until the next save. The real fix is an
-  owner-only Windows ACL (`windows-sys` is already a transitive dependency); it is
-  unverified without a Windows host and tracked in ROADMAP.md. A unix filesystem
-  that ignores mode bits (vfat, exFAT, some network mounts) is not detected.
+- **Local cache key is owner-only on unix and Windows (P33, #214):** the
+  unchanged-detection cache is keyed by `.sc/local-key`, created owner-only from
+  its first byte: mode `0600` on unix, a protected DACL with a single
+  `GENERIC_ALL` ACE for the current user on Windows (no inherited entries; the
+  advisory `windows` CI job reads it back with `icacls`). Windows keys minted
+  before #214 keep their inherited DACL, and the warning no longer fires for
+  them; delete `.sc/local-key` to have the next run recreate it owner-only (the
+  cost is one round of spurious re-seals). The Windows DACL grants no explicit
+  access to SYSTEM or Administrators, so backup and admin tooling can still take
+  ownership of the file, as root can read a `0600` file on unix. The `sc keygen`
+  identity file and the TLS serve key still have no Windows owner-only
+  protection (tracked in #281); keygen now refuses to overwrite an existing
+  identity on every platform. On any other target, or if the Windows
+  ACL call fails, the key and the cache files are written with inherited default
+  permissions, and `sc` prints a one-time stderr warning once a cache holds a
+  protected entry. The exposure then is small: checkout already writes protected
+  plaintext into the working tree with default permissions on every platform, and
+  the cache holds tags only for files whose plaintext is on disk, so a reader of
+  the key could read that plaintext directly. What remains is the tags of the
+  last-committed version of a file edited since, and stale entries until the
+  next save. A filesystem that ignores mode bits or ACLs (unix vfat, exFAT, some
+  network mounts; Windows FAT, exFAT, some SMB shares) is not detected.
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 

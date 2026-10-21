@@ -9,9 +9,10 @@
 //! nothing — it does not reintroduce the equality oracle this phase closes.
 //! A lost/stale/corrupt cache degrades to spurious re-seals, never
 //! incorrectness and never a hard error.
-//! Where the key file cannot be made owner-only (non-unix; #214) it is
-//! still written with default permissions and a one-time warning is printed
-//! once the cache holds a protected entry: see [`can_restrict_permissions`].
+//! Where the key file cannot be made owner-only (neither unix nor Windows, or
+//! the Windows ACL call failed; #214) it is still written with default
+//! permissions and a one-time warning is printed once the cache holds a
+//! protected entry: see [`can_restrict_permissions`].
 //!
 //! **The keyed tag is the sole authority for a hit.** `mtime_ns`/`size` are
 //! recorded for documentation (when the entry was observed) and as a
@@ -34,17 +35,33 @@ use scl_core::ObjectId;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 
-/// Whether `.sc/local-key` can be created readable by its owner only. Only
-/// unix can (`mode(0o600)` from the first byte); there is no Windows ACL path
-/// yet (#214), so elsewhere the key keeps default permissions and a warning is
-/// printed. Tests force `false` via `force_unrestricted_for_test`.
+/// Whether `.sc/local-key` can be created readable by its owner only: unix
+/// (`mode(0o600)`) and Windows (owner-only DACL, `winacl`), both from the first
+/// byte. Elsewhere, or after a Windows ACL failure, the key keeps default
+/// permissions and a warning is printed. Tests force `false` via
+/// `force_unrestricted_for_test`.
 fn can_restrict_permissions() -> bool {
     #[cfg(test)]
     if FORCE_UNRESTRICTED.with(|f| f.get()) {
         return false;
     }
+    platform_can_restrict()
+}
+
+#[cfg(windows)]
+fn platform_can_restrict() -> bool {
+    !ACL_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(windows))]
+fn platform_can_restrict() -> bool {
     cfg!(unix)
 }
+
+/// Set once a Windows owner-only create failed and the key fell back to default
+/// permissions, so the unrestricted warning fires.
+#[cfg(windows)]
+static ACL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 thread_local! {
@@ -64,7 +81,7 @@ fn warn_unrestricted_once(flag: &std::sync::atomic::AtomicBool) -> bool {
         return false;
     }
     eprintln!(
-        "warning: this platform cannot restrict .sc/local-key to its owner; other \
+        "warning: this platform could not restrict .sc/local-key to its owner; other \
          local users may be able to read it and test guesses against the \
          protected-file cache tags (the protected plaintext checked out in the \
          working tree is equally readable by default)"
@@ -72,10 +89,13 @@ fn warn_unrestricted_once(flag: &std::sync::atomic::AtomicBool) -> bool {
     true
 }
 
+/// Once-per-process guard for the unrestricted-key warning, shared by the
+/// cache-save path and the key-creation fallback.
+static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Warn (once per process) when a cache that holds protected entries is
 /// backed by a key whose permissions could not be restricted.
 fn warn_if_unrestricted(has_entries: bool) {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if has_entries && !can_restrict_permissions() {
         warn_unrestricted_once(&WARNED);
     }
@@ -115,28 +135,70 @@ pub(crate) fn local_key(layout: &Layout) -> Result<[u8; 32]> {
         .map_err(|_| Error::InvalidArgument("malformed .sc/local-key".into()))
 }
 
-#[cfg(unix)]
 fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    create_key_file(path)?.write_all(bytes)
+}
+
+#[cfg(unix)]
+fn create_key_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)
+        .open(path)
 }
 
-/// Non-unix: default (inherited) permissions; see [`can_restrict_permissions`].
+/// Windows: owner-only DACL from the first byte; if that cannot be applied,
+/// fall back to default (inherited) permissions plus the warning, never fail.
+#[cfg(windows)]
+fn create_key_file(path: &Path) -> std::io::Result<std::fs::File> {
+    key_file_or_fallback(
+        crate::winacl::create_new_owner_only(path),
+        || create_key_file_default(path),
+        &ACL_FAILED,
+        &WARNED,
+    )
+}
+
+/// The Windows fallback decision, platform-independent so unix tests can drive
+/// it with an injected `restricted` result. `AlreadyExists` and success pass
+/// through; any other error means the owner-only create failed, so create with
+/// default permissions, record the failure in `failed`, and warn right here
+/// (once per process via `warned`): a later process never sees `failed`, so
+/// the failure must not depend on a cache save to be reported.
+#[cfg(any(windows, test))]
+fn key_file_or_fallback(
+    restricted: std::io::Result<std::fs::File>,
+    default: impl FnOnce() -> std::io::Result<std::fs::File>,
+    failed: &std::sync::atomic::AtomicBool,
+    warned: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<std::fs::File> {
+    match restricted {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            let f = default()?;
+            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            if warn_unrestricted_once(warned) {
+                eprintln!("  (the owner-only ACL could not be applied: {e})");
+            }
+            Ok(f)
+        }
+        r => r,
+    }
+}
+
+/// Default (inherited) permissions; see [`can_restrict_permissions`].
 #[cfg(not(unix))]
-fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
+fn create_key_file_default(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)?;
-    f.write_all(bytes)
+        .open(path)
 }
+
+#[cfg(not(any(unix, windows)))]
+use create_key_file_default as create_key_file;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CacheEntry {
@@ -374,6 +436,97 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "key file must be 0600");
         }
+        cleanup(&layout);
+    }
+
+    /// Windows: the production create path leaves a DACL with exactly one ACE,
+    /// the current user's, and nothing inherited (read back with `icacls`).
+    #[cfg(windows)]
+    #[test]
+    fn local_key_dacl_is_owner_only_on_windows() {
+        let layout = tmp("acl");
+        let key = local_key(&layout).unwrap();
+        assert_eq!(key, local_key(&layout).unwrap(), "owner can still read it");
+        assert!(
+            can_restrict_permissions(),
+            "ACL path must not have fallen back"
+        );
+
+        let path = layout.local_key_path();
+        let out = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "icacls failed: {out:?}");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let acl = text.replace(path.to_str().unwrap(), "");
+        let aces: Vec<&str> = acl.lines().filter(|l| l.contains(":(")).collect();
+        let user = std::env::var("USERNAME").unwrap().to_lowercase();
+        assert_eq!(aces.len(), 1, "exactly one ACE expected:\n{text}");
+        let ace = aces[0].trim().to_lowercase();
+        assert!(
+            ace.contains(&format!("\\{user}:(")) && ace.contains("(f)") && !ace.contains("(i)"),
+            "ACE must be an explicit full-control grant to {user}:\n{text}"
+        );
+        cleanup(&layout);
+    }
+
+    /// Windows: a key path past MAX_PATH still takes the ACL path, not the
+    /// default-permissions fallback.
+    #[cfg(windows)]
+    #[test]
+    fn local_key_acl_applies_to_a_path_over_260_chars() {
+        let mut root = std::env::temp_dir().join(format!("scl-cache-long-{}", std::process::id()));
+        let top = root.clone();
+        let _ = std::fs::remove_dir_all(&top);
+        while root.as_os_str().len() < 280 {
+            root.push("d".repeat(40));
+        }
+        let dot_sc = root.join(".sc");
+        std::fs::create_dir_all(&dot_sc).unwrap();
+        let layout = Layout::at(&root);
+        assert!(layout.local_key_path().as_os_str().len() > 260);
+        local_key(&layout).unwrap();
+        assert!(layout.local_key_path().exists());
+        assert!(
+            can_restrict_permissions(),
+            "long path fell back to default perms"
+        );
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn failed_owner_only_create_falls_back_and_warns_without_a_cache() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let layout = tmp("fallback");
+        let (failed, warned) = (AtomicBool::new(false), AtomicBool::new(false));
+        let path = layout.local_key_path();
+        let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let default = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+        };
+        key_file_or_fallback(denied(), default, &failed, &warned).unwrap();
+        assert!(path.exists(), "fallback must still create the key");
+        assert!(failed.load(Relaxed), "failure recorded");
+        assert!(
+            warned.load(Relaxed),
+            "warned at creation, no cache involved"
+        );
+
+        // A concurrent minter's AlreadyExists is not an ACL failure.
+        let (failed, warned) = (AtomicBool::new(false), AtomicBool::new(false));
+        let exists = Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+        let r = key_file_or_fallback(exists, || unreachable!("no fallback"), &failed, &warned);
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!failed.load(Relaxed) && !warned.load(Relaxed));
+
+        // If the default create fails too, the error surfaces and nothing is flagged.
+        let r = key_file_or_fallback(denied(), default, &failed, &warned);
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!failed.load(Relaxed) && !warned.load(Relaxed));
         cleanup(&layout);
     }
 

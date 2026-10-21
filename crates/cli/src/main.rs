@@ -1683,6 +1683,7 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
         // Only tighten a directory we create ourselves: chmod-ing a pre-existing
         // parent (e.g. $HOME for `--out ~/identity`, or CWD for `--out ./key`)
         // would retroactively narrow the user's own dir — a footgun.
+        #[cfg(unix)]
         let parent_preexisted = parent.as_os_str().is_empty() || parent.exists();
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -1700,29 +1701,27 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
     let sig_pk = signing.public();
     // Create the key file 0600 *atomically* so the private key is never visible
     // group/world-readable through the umask window between write and chmod.
-    // `create_new(true)` refuses to clobber an existing identity.
-    #[cfg(unix)]
+    // `create_new(true)` refuses to clobber an existing identity, on every
+    // platform. Windows has no owner-only protection for this file (#281).
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| {
-                format!(
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut f = opts.open(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::anyhow!(
                     "identity already exists at {} (refusing to overwrite)",
                     path.display()
                 )
-            })?;
+            } else {
+                anyhow::Error::from(e).context(format!("cannot create {}", path.display()))
+            }
+        })?;
         f.write_all(seed_line.as_bytes())?;
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, &seed_line)?;
-    }
-    println!("wrote identity: {} (0600)", path.display());
+    println!("wrote identity: {}", path.display());
     println!("public key:   {}", enc_pk.to_key_string());
     println!("signing key:    {}", sig_pk.to_key_string());
     println!("recipient id: {}", enc_pk.recipient_id());
