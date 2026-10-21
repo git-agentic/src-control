@@ -639,7 +639,7 @@ scan in `tombstone_honored` never reached it. Now:
   An object that is gone or will not decode is dropped from the import like
   any entry that does not verify, so one bad object does not block it; only a
   transient I/O error fails it. Every pack ingest retries the import too
-  (best effort, two stats when nothing is pending), including a pack with no
+  (best effort, at most two stats when nothing is pending), including a pack with no
   signature in it, so a served repo does not leave legacy entries unread until
   its next open (#270).
 - **Forwarding.** `indexed_signature_ids_for` (sender seam for fetch, clone,

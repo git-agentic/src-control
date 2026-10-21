@@ -406,15 +406,17 @@ pub(crate) fn acceptable(store: &mut scl_core::Store, sig: &SignatureObj) -> Res
 /// rewrite lands on top of it. The relisting sees loose objects (what ingest
 /// writes), not packs another handle wrote since this store opened.
 pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
-    reindex_with(layout, store, || {})
+    reindex_with(layout, store, || {}, || {})
 }
 
-/// [`reindex`] with `after_scan` run between the unlocked scan and the locked
-/// write phase, so a test can interleave an ingest there deterministically.
+/// [`reindex`] with hooks so a test can interleave an ingest deterministically:
+/// `after_scan` runs after the first scan, `before_lock` after the unlocked
+/// catch-up passes, so only the locked pass can absorb what it does.
 fn reindex_with(
     layout: &Layout,
     store: &mut scl_core::Store,
     after_scan: impl FnOnce(),
+    before_lock: impl FnOnce(),
 ) -> Result<usize> {
     let mut entries: Vec<Entry> = Vec::new();
     let mut waiting: Vec<ObjectId> = Vec::new();
@@ -429,6 +431,7 @@ fn reindex_with(
             break;
         }
     }
+    before_lock();
     with_index_lock(layout, || {
         scan_new(store, &mut seen, &mut waiting, &mut entries)?;
         // One slot per (target, signer): the lowest signature id keeps it, so
@@ -1346,42 +1349,60 @@ mod tests {
     #[test]
     fn reindex_keeps_an_ingest_that_lands_during_its_scan() {
         use crate::transport::{LocalTransport, Transport};
-        let root = tmp_root("reindex-race");
-        let repo = Repo::init(&root).unwrap();
-        std::fs::write(root.join("a.txt"), b"x").unwrap();
-        let snap = repo.commit("t", "c1").unwrap();
-        let (_s, identity) = scl_crypto::generate_identity_v2();
-        repo.sign_snapshot(snap, &identity).unwrap();
-        let (pack, late_sig, late_signer) = sig_pack(snap);
+        // The ingest lands after the first scan, or only after the unlocked
+        // catch-up passes (so just the locked pass can absorb it).
+        for just_before_lock in [false, true] {
+            let root = tmp_root(&format!("reindex-race-{just_before_lock}"));
+            let repo = Repo::init(&root).unwrap();
+            std::fs::write(root.join("a.txt"), b"x").unwrap();
+            let snap = repo.commit("t", "c1").unwrap();
+            let (_s, identity) = scl_crypto::generate_identity_v2();
+            repo.sign_snapshot(snap, &identity).unwrap();
+            let (pack, late_sig, late_signer) = sig_pack(snap);
 
-        // The ingest runs on its own thread and store handle, as a serve
-        // connection would, while the rebuild is between scan and write.
-        let count = {
-            let arc = repo.store();
-            let mut s = arc.lock().unwrap();
+            // The ingest runs on its own thread and store handle, as a serve
+            // connection would.
             let ingest_root = root.clone();
-            reindex_with(repo.layout(), &mut s, || {
+            let ingest = std::cell::RefCell::new(Some(move || {
                 std::thread::spawn(move || {
                     let t = LocalTransport::open(&ingest_root).unwrap();
                     t.put_pack(&mut &pack[..]).unwrap();
                 })
                 .join()
                 .unwrap();
-            })
-            .unwrap()
-        };
-        assert_eq!(count, 2, "the signature stored during the scan is indexed");
-        let text = std::fs::read_to_string(repo.layout().signatures_path()).unwrap();
-        assert!(text.contains(&format!(
-            "{} {} {}",
-            snap.to_hex(),
-            late_sig.to_hex(),
-            hex::encode(late_signer)
-        )));
-        assert_eq!(text.lines().count(), 2);
-        drop(repo);
-        std::fs::remove_dir_all(&root).unwrap();
-        assert!(!root.exists());
+            }));
+            let count = {
+                let arc = repo.store();
+                let mut s = arc.lock().unwrap();
+                reindex_with(
+                    repo.layout(),
+                    &mut s,
+                    || {
+                        if !just_before_lock {
+                            (ingest.borrow_mut().take().unwrap())();
+                        }
+                    },
+                    || {
+                        if just_before_lock {
+                            (ingest.borrow_mut().take().unwrap())();
+                        }
+                    },
+                )
+                .unwrap()
+            };
+            assert_eq!(count, 2, "the signature stored during the scan is indexed");
+            let text = std::fs::read_to_string(repo.layout().signatures_path()).unwrap();
+            assert!(text.contains(&format!(
+                "{} {} {}",
+                snap.to_hex(),
+                late_sig.to_hex(),
+                hex::encode(late_signer)
+            )));
+            assert_eq!(text.lines().count(), 2);
+            drop(repo);
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(!root.exists());
+        }
     }
 
     #[test]
@@ -1404,18 +1425,24 @@ mod tests {
         let count = {
             let arc = dest.store();
             let mut s = arc.lock().unwrap();
-            reindex_with(dest.layout(), &mut s, || {
-                // The target lands, and the ingest indexes the signature.
-                let t = LocalTransport::open(&dest_root).unwrap();
-                let (pack, _) = scl_core::pack::build_pack(&[(snap, snap_obj.encode())]).unwrap();
-                t.put_pack(&mut &pack[..]).unwrap();
-                let mut s2 = scl_core::Store::open_persistent(
-                    dest.layout().objects_dir(),
-                    crate::repo::default_budget(),
-                )
-                .unwrap();
-                append_entries(dest.layout(), &mut s2, &[(snap, sig, signer)]).unwrap();
-            })
+            reindex_with(
+                dest.layout(),
+                &mut s,
+                || {
+                    // The target lands, and the ingest indexes the signature.
+                    let t = LocalTransport::open(&dest_root).unwrap();
+                    let (pack, _) =
+                        scl_core::pack::build_pack(&[(snap, snap_obj.encode())]).unwrap();
+                    t.put_pack(&mut &pack[..]).unwrap();
+                    let mut s2 = scl_core::Store::open_persistent(
+                        dest.layout().objects_dir(),
+                        crate::repo::default_budget(),
+                    )
+                    .unwrap();
+                    append_entries(dest.layout(), &mut s2, &[(snap, sig, signer)]).unwrap();
+                },
+                || {},
+            )
             .unwrap()
         };
         assert_eq!(
@@ -1425,5 +1452,6 @@ mod tests {
         drop((repo, dest));
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&dest_root).unwrap();
+        assert!(!root.exists() && !dest_root.exists());
     }
 }
