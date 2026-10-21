@@ -908,7 +908,7 @@ fn workspace_session_on_a_size_limited_clone_lands() {
         )
         .unwrap();
         clone.commit("t", "host edit").unwrap();
-        let outcomes = clone.ws_harvest(name, None, "t", None).unwrap();
+        let outcomes = clone.ws_harvest(name, None, Some("t"), None).unwrap();
         assert!(
             matches!(outcomes.as_slice(), [WsHarvestOutcome::Landed { .. }]),
             "got {outcomes:?}"
@@ -1097,7 +1097,7 @@ fn named_sessions_on_a_size_limited_clone() {
     )
     .unwrap();
     for name in ["a", "b"] {
-        let out = clone.ws_harvest(Some(name), None, "t", None).unwrap();
+        let out = clone.ws_harvest(Some(name), None, Some("t"), None).unwrap();
         assert!(
             matches!(out.as_slice(), [WsHarvestOutcome::Landed { .. }]),
             "{name}: {out:?}"

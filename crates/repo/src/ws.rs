@@ -922,7 +922,7 @@ impl Repo {
         &self,
         name: Option<&str>,
         into: Option<&str>,
-        author: &str,
+        author: Option<&str>,
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<Vec<WsHarvestOutcome>> {
         if crate::merge_state::in_progress(&self.layout) {
@@ -943,6 +943,9 @@ impl Repo {
             )));
         }
 
+        // An explicit author wins; otherwise the one recorded at fork.
+        let author = author.unwrap_or(&session.author).to_string();
+        let author = author.as_str();
         let landing = into.unwrap_or(&session.base_branch).to_string();
         let current = refs::current_branch(self.layout())?;
         if current != landing {
@@ -1381,7 +1384,7 @@ mod tests {
 
         // Harvest carries the untouched out-of-sparse subtree verbatim.
         std::fs::write(entry.dir.join("src/a.txt"), b"a v2").unwrap();
-        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -1454,7 +1457,7 @@ mod tests {
         // 4. Harvest. The workspace's absent docs/x.txt must be carried
         // (never materialized, not a user deletion), not committed as a
         // deletion.
-        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -1540,7 +1543,7 @@ mod tests {
         // Harvesting the untouched workspaces lands nothing and leaves the
         // base branch tip unchanged.
         let base_before = repo.head_tip().unwrap().unwrap();
-        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert!(outcomes
             .iter()
             .all(|o| matches!(o, WsHarvestOutcome::Unchanged { .. })));
@@ -1688,7 +1691,7 @@ mod tests {
         std::fs::write(dir1.join("p1.txt"), "one edited\n").unwrap();
         std::fs::write(dir2.join("p2.txt"), "two edited\n").unwrap();
 
-        let outcomes = repo.ws_harvest(None, None, "t", Some(&sk)).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), Some(&sk)).unwrap();
         assert_eq!(outcomes.len(), 2);
         for o in &outcomes {
             let merged_tip = match o {
@@ -1739,7 +1742,7 @@ mod tests {
         std::fs::remove_file(dir.join("secret/gone")).unwrap();
         // An AWS-style key id trips the P5 scanner, so the workspace stays live.
         std::fs::write(dir.join("leak.txt"), "AKIAIOSFODNN7EXAMPLE\n").unwrap();
-        let outcomes = repo.ws_harvest(None, None, "t", Some(&sk)).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), Some(&sk)).unwrap();
         assert!(
             matches!(outcomes[0], WsHarvestOutcome::Rejected { index: 1, .. }),
             "got {outcomes:?}"
@@ -1974,7 +1977,7 @@ mod tests {
         std::fs::write(session.workspaces[1].dir.join("b.txt"), "new-b\n").unwrap();
 
         let oplog_before = repo.oplog().unwrap().len();
-        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert_eq!(outcomes.len(), 2);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -2040,7 +2043,7 @@ mod tests {
         std::fs::create_dir_all(session.workspaces[1].dir.join("n")).unwrap();
         std::fs::write(session.workspaces[1].dir.join("n/child"), "nested\n").unwrap();
 
-        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert_eq!(outcomes.len(), 2);
         assert!(
             matches!(&outcomes[0], WsHarvestOutcome::Landed { index: 1, .. }),
@@ -2072,7 +2075,7 @@ mod tests {
         std::fs::write(root.join("x.txt"), "main-x\n").unwrap();
         repo.commit("t", "conflict x on main").unwrap();
 
-        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert_eq!(outcomes.len(), 2);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -2130,7 +2133,7 @@ mod tests {
         let session = repo.ws_fork(None, 1, "t", None).unwrap();
         repo.switch("other").unwrap();
 
-        let err = repo.ws_harvest(None, None, "t", None).unwrap_err();
+        let err = repo.ws_harvest(None, None, Some("t"), None).unwrap_err();
         match err {
             Error::InvalidArgument(msg) => {
                 assert!(
@@ -2174,7 +2177,9 @@ mod tests {
         repo.branch("work-2").unwrap();
 
         // --into with the checked-out branch name behaves as default.
-        let outcomes = repo.ws_harvest(None, Some("main"), "t", None).unwrap();
+        let outcomes = repo
+            .ws_harvest(None, Some("main"), Some("t"), None)
+            .unwrap();
         match &outcomes[1] {
             WsHarvestOutcome::FallbackBranch { index: 2, branch } => {
                 assert_eq!(branch, "work-2-2");
@@ -2185,7 +2190,7 @@ mod tests {
         // --into a non-checked-out branch errors.
         let _session2 = repo.ws_fork(None, 1, "t", None).unwrap();
         let err = repo
-            .ws_harvest(None, Some("nonexistent-branch"), "t", None)
+            .ws_harvest(None, Some("nonexistent-branch"), Some("t"), None)
             .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
 
@@ -2202,14 +2207,14 @@ mod tests {
         // (a) merge/pick/rebase in progress -> typed errors.
         crate::merge_state::write(repo.layout(), &ObjectId::of(b"theirs"), &[], None).unwrap();
         assert!(matches!(
-            repo.ws_harvest(None, None, "t", None),
+            repo.ws_harvest(None, None, Some("t"), None),
             Err(Error::MergeInProgress)
         ));
         crate::merge_state::clear(repo.layout()).unwrap();
 
         crate::pick_state::write(repo.layout(), &ObjectId::of(b"picked"), &[], None, None).unwrap();
         assert!(matches!(
-            repo.ws_harvest(None, None, "t", None),
+            repo.ws_harvest(None, None, Some("t"), None),
             Err(Error::PickInProgress)
         ));
         crate::pick_state::clear(repo.layout()).unwrap();
@@ -2229,7 +2234,7 @@ mod tests {
         };
         crate::rebase_state::write(repo.layout(), &st).unwrap();
         assert!(matches!(
-            repo.ws_harvest(None, None, "t", None),
+            repo.ws_harvest(None, None, Some("t"), None),
             Err(Error::RebaseInProgress)
         ));
         crate::rebase_state::clear(repo.layout()).unwrap();
@@ -2240,7 +2245,7 @@ mod tests {
         // Session intact.
         std::fs::write(session.workspaces[0].dir.join("a.txt"), "ws-edit\n").unwrap();
         std::fs::write(root.join("a.txt"), "dirty-uncommitted\n").unwrap();
-        let err = repo.ws_harvest(None, None, "t", None).unwrap_err();
+        let err = repo.ws_harvest(None, None, Some("t"), None).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
 
         let after = repo
@@ -2278,7 +2283,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert_eq!(outcomes.len(), 2);
         match &outcomes[0] {
             WsHarvestOutcome::Landed { index: 1, .. } => {}
@@ -2331,7 +2336,7 @@ mod tests {
 
         // Fixing the file then re-harvesting completes and ends the session.
         std::fs::remove_file(e2.dir.join("leak.txt")).unwrap();
-        let outcomes2 = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes2 = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert_eq!(outcomes2.len(), 1);
         match &outcomes2[0] {
             WsHarvestOutcome::Unchanged { index: 2 } => {}
@@ -2356,7 +2361,7 @@ mod tests {
         // the re-minted candidate id matches regardless of load.
         crate::repo::TEST_NOW.with(|c| c.set(Some(1_700_000_000)));
 
-        let outcomes = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         let landed_tip = match &outcomes[0] {
             WsHarvestOutcome::Landed {
                 index: 1,
@@ -2394,7 +2399,7 @@ mod tests {
 
         // Re-harvest: no error, resolves as a no-op Landed at the existing
         // tip, and leaves no stray branch behind.
-        let outcomes2 = repo.ws_harvest(None, None, "t", None).unwrap();
+        let outcomes2 = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert_eq!(outcomes2.len(), 1);
         match &outcomes2[0] {
             WsHarvestOutcome::Landed {
@@ -2516,7 +2521,7 @@ mod tests {
         repo.ws_fork(Some("a"), 1, "t", None).unwrap();
         // No unnamed session: the default does not silently pick a named one.
         for err in [
-            repo.ws_harvest(None, None, "t", None).unwrap_err(),
+            repo.ws_harvest(None, None, Some("t"), None).unwrap_err(),
             repo.ws_abandon(None, None).unwrap_err(),
             repo.ws_run(None, 1, &["true".into()], false, None)
                 .unwrap_err(),
@@ -2526,7 +2531,10 @@ mod tests {
             };
             assert!(m.contains("open: a") && m.contains("--session"), "{m}");
         }
-        match repo.ws_harvest(Some("nope"), None, "t", None).unwrap_err() {
+        match repo
+            .ws_harvest(Some("nope"), None, Some("t"), None)
+            .unwrap_err()
+        {
             Error::InvalidArgument(m) => assert!(m.contains("named 'nope'"), "{m}"),
             other => panic!("{other:?}"),
         }
@@ -2546,12 +2554,14 @@ mod tests {
             fork_and_edit(&repo, Some("b"), "a.txt", "from b\n");
             let base = repo.head_tip().unwrap().unwrap();
 
-            let out = repo.ws_harvest(Some(first), None, "t", None).unwrap();
+            let out = repo.ws_harvest(Some(first), None, Some("t"), None).unwrap();
             assert!(matches!(
                 out[..],
                 [WsHarvestOutcome::Landed { index: 1, .. }]
             ));
-            let out = repo.ws_harvest(Some(second), None, "t", None).unwrap();
+            let out = repo
+                .ws_harvest(Some(second), None, Some("t"), None)
+                .unwrap();
             match &out[..] {
                 [WsHarvestOutcome::FallbackBranch { index: 1, branch }] => {
                     assert_eq!(*branch, format!("{second}-1"));
@@ -2588,12 +2598,14 @@ mod tests {
             fork_and_edit(&repo, Some("a"), "file-a.txt", "A\n");
             fork_and_edit(&repo, Some("b"), "file-b.txt", "B\n");
 
-            repo.ws_harvest(Some(first), None, "t", None).unwrap();
+            repo.ws_harvest(Some(first), None, Some("t"), None).unwrap();
             let one = repo.head_tip().unwrap().unwrap();
             // The other session is untouched by the first landing.
             assert!(repo.ws_session(Some(second)).unwrap().unwrap().workspaces[0].live);
 
-            let out = repo.ws_harvest(Some(second), None, "t", None).unwrap();
+            let out = repo
+                .ws_harvest(Some(second), None, Some("t"), None)
+                .unwrap();
             let tip = match out[..] {
                 [WsHarvestOutcome::Landed { merged_tip, .. }] => merged_tip,
                 ref other => panic!("expected a landing, got {other:?}"),
@@ -2647,7 +2659,7 @@ mod tests {
             .is_err());
 
         // ...and still harvests.
-        let out = repo.ws_harvest(Some("b"), None, "t", None).unwrap();
+        let out = repo.ws_harvest(Some("b"), None, Some("t"), None).unwrap();
         assert!(matches!(
             out[..],
             [WsHarvestOutcome::Landed { index: 1, .. }]
@@ -2658,6 +2670,35 @@ mod tests {
 
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn harvest_defaults_to_the_fork_author_and_an_explicit_one_wins() {
+        // #286: the author recorded at fork is the harvest default, for the
+        // unnamed and for a named session alike; `--author` at harvest wins.
+        for name in [None, Some("feat")] {
+            for (harvest_author, want) in [(None, "alice"), (Some("bob"), "bob")] {
+                let root = tmp_root(&format!(
+                    "author-{}-{}",
+                    name.unwrap_or("unnamed"),
+                    harvest_author.unwrap_or("default")
+                ));
+                let repo = init(&root);
+                let s = repo.ws_fork(name, 1, "alice", None).unwrap();
+                assert_eq!(s.author, "alice");
+                std::fs::write(s.workspaces[0].dir.join("a.txt"), "edited\n").unwrap();
+                let out = repo.ws_harvest(name, None, harvest_author, None).unwrap();
+                assert!(matches!(
+                    out[..],
+                    [WsHarvestOutcome::Landed { index: 1, .. }]
+                ));
+                let tip = repo.head_tip().unwrap().unwrap();
+                assert_eq!(repo.snapshot(&tip).unwrap().author, want);
+                drop(repo);
+                std::fs::remove_dir_all(&root).unwrap();
+                assert!(!root.exists(), "test must leave no residue");
+            }
+        }
     }
 
     #[test]
@@ -2699,7 +2740,9 @@ mod tests {
         std::fs::write(root.join("a.txt"), "host\n").unwrap();
         repo.commit("t", "host edit").unwrap();
         repo.branch("feat-1").unwrap();
-        let out = repo.ws_harvest(Some("feat"), None, "t", None).unwrap();
+        let out = repo
+            .ws_harvest(Some("feat"), None, Some("t"), None)
+            .unwrap();
         match &out[..] {
             [WsHarvestOutcome::FallbackBranch { branch, .. }] => assert_eq!(branch, "feat-1-2"),
             other => panic!("{other:?}"),
@@ -2769,19 +2812,22 @@ mod tests {
             Error::InvalidArgument(m) => assert!(m.contains("still running"), "{m}"),
             other => panic!("{other:?}"),
         };
-        busy(repo.ws_harvest(Some("a"), None, "t", None).unwrap_err());
+        busy(
+            repo.ws_harvest(Some("a"), None, Some("t"), None)
+                .unwrap_err(),
+        );
         busy(repo.ws_abandon(Some("a"), None).unwrap_err());
         busy(repo.ws_abandon(Some("a"), Some(1)).unwrap_err());
         // A second run in the same workspace is refused too.
         busy(repo.ws_run_plan(Some("a"), 1, false, None).err().unwrap());
         // Nothing was touched, and the other session is unaffected.
         assert!(repo.ws_session(Some("a")).unwrap().unwrap().workspaces[0].live);
-        let out = repo.ws_harvest(Some("b"), None, "t", None).unwrap();
+        let out = repo.ws_harvest(Some("b"), None, Some("t"), None).unwrap();
         assert!(matches!(out[..], [WsHarvestOutcome::Landed { .. }]));
 
         // Once the command is over, the workspace harvests normally.
         assert_eq!(plan.run(&["true".into()]).unwrap(), 0);
-        let out = repo.ws_harvest(Some("a"), None, "t", None).unwrap();
+        let out = repo.ws_harvest(Some("a"), None, Some("t"), None).unwrap();
         assert!(matches!(out[..], [WsHarvestOutcome::Landed { .. }]));
 
         drop(repo);

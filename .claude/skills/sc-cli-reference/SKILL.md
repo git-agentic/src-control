@@ -167,8 +167,8 @@ cargo run --bin sc -- work --agents 3 [--name <base>] [--budget-mb <n>] -- <cmd>
 bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
 cargo run --bin sc -- ws fork --agents N [--name <n>] [--identity <key>] [--author <a>]  # durable multi-invocation
                                               # (--agents default 2; --author is stored in the
-                                              # manifest, but harvest takes its own --author,
-                                              # then $SC_AUTHOR, then the OS user)
+                                              # manifest and is the harvest default; an explicit
+                                              # harvest --author wins)
                                               # session: materializes N checkouts under
                                               # .sc/ws/<i>/ and persists a manifest (P20).
                                               # --name opens a further named session in

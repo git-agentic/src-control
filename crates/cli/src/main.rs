@@ -832,8 +832,8 @@ enum WsOp {
         /// on both sides (ciphertext-id fast paths need no identity at all).
         #[arg(long)]
         identity: Option<PathBuf>,
-        /// Author recorded on any landing commit (default $SC_AUTHOR, then
-        /// the OS username).
+        /// Author recorded on any landing commit (default: the author given to
+        /// `sc ws fork` for this session).
         #[arg(long)]
         author: Option<String>,
         /// Attach this transcript file to each workspace's landed snapshot
@@ -3620,7 +3620,7 @@ fn run_ws(op: WsOp) -> Result<()> {
             let outcomes = repo.ws_harvest(
                 session.as_deref(),
                 into.as_deref(),
-                &resolve_author(author),
+                author.as_deref(),
                 sk.as_ref(),
             )?;
 
