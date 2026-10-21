@@ -291,6 +291,8 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // The shim is a /bin/sh script made executable with a mode bit: unix only.
+    #[cfg(unix)]
     #[test]
     fn sc_git_override_and_missing_binary_error() {
         let _g = GIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());

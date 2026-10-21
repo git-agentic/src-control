@@ -1683,6 +1683,7 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
         // Only tighten a directory we create ourselves: chmod-ing a pre-existing
         // parent (e.g. $HOME for `--out ~/identity`, or CWD for `--out ./key`)
         // would retroactively narrow the user's own dir — a footgun.
+        #[cfg(unix)]
         let parent_preexisted = parent.as_os_str().is_empty() || parent.exists();
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]

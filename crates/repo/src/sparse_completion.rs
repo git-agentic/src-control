@@ -23,6 +23,7 @@ enum Op {
 /// A working-tree edit applied before a commit.
 enum Edit<'a> {
     Write(&'a str, &'a [u8]),
+    #[cfg_attr(not(unix), allow(dead_code))] // only unix tests build an executable file
     Exec(&'a str, &'a [u8]),
     Remove(&'a str),
 }
