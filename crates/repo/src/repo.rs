@@ -3160,7 +3160,7 @@ mod tests {
                 let id = store.put(scl_core::Object::blob(body)).unwrap();
                 entries.insert(path.to_string(), (id, scl_core::FileMode(0o644), 0));
             }
-            let (tree, objs) = crate::private::build_tree_objects(&entries);
+            let (tree, objs) = crate::private::build_tree_objects(&entries).unwrap();
             for o in objs {
                 store.put(o).unwrap();
             }

@@ -998,7 +998,7 @@ impl Repo {
         let reachable: BTreeSet<ObjectId> = entries.values().map(|(id, _, _)| *id).collect();
         protection.wrapped.retain(|id, _| reachable.contains(id));
 
-        let (root, trees) = build_tree_objects(&entries);
+        let (root, trees) = build_tree_objects(&entries)?;
         let snapshot = Object::Snapshot(Snapshot {
             root,
             parents,
@@ -1098,12 +1098,17 @@ impl Repo {
 /// touching any store: returns the root tree id plus every tree object built
 /// (the sealing loop decides which of them are new). Pure — the inner world's
 /// analogue of `vfs::write_tree_with_perms`.
+///
+/// Refuses a path that is both a file and the parent of another (#278), like
+/// the public builder: a private commit carries absent protected and
+/// out-of-view paths too.
 pub(crate) fn build_tree_objects(
     entries: &BTreeMap<String, (ObjectId, FileMode, u8)>,
-) -> (ObjectId, Vec<Object>) {
+) -> Result<(ObjectId, Vec<Object>)> {
+    scl_vfs::check_file_dir_collisions(entries.keys().map(String::as_str))?;
     let mut trees = Vec::new();
     let root = build_subtree(entries, "", &mut trees);
-    (root, trees)
+    Ok((root, trees))
 }
 
 fn build_subtree(
@@ -1889,7 +1894,7 @@ impl Repo {
                 published.insert(path.clone(), (blob.id(), *mode, 0));
                 to_put.push(blob);
             }
-            let (root, trees) = build_tree_objects(&published);
+            let (root, trees) = build_tree_objects(&published)?;
             to_put.extend(trees);
             let parents: Vec<ObjectId> = snap
                 .parents

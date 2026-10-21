@@ -25,7 +25,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
     /// A snapshot would hold `file` as a file and also `child` beneath it as a
     /// directory (#278). Raised before any tree object is written.
-    #[error("{file} would be both a file and a directory in one snapshot (it is also the parent of {child}); a protected or out-of-view file that is absent from this checkout cannot be replaced by a directory of the same name, so remove the directory or restore the file")]
+    #[error("{file} would be both a file and a directory in one snapshot (it is also the parent of {child}); a protected or out-of-view path that is absent from this checkout cannot be swapped between file and directory, so remove the conflicting path or restore the missing one")]
     FileDirCollision { file: String, child: String },
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -168,7 +168,7 @@ impl Repo {
     /// `path` with its id, mode and perms untouched and nothing below it read.
     /// Ancestor directories are built from `files` and the carried paths
     /// together. A carried path that is also a file, or the ancestor of one, is
-    /// the caller's collision to reject first (`merge::check_path_collisions`).
+    /// a collision `build_root` refuses with [`Error::FileDirCollision`].
     pub fn write_tree_with_carried(
         &self,
         files: &[(String, Vec<u8>, FileMode, u8)],
@@ -225,12 +225,12 @@ impl Repo {
         files: &BTreeMap<String, (ObjectId, FileMode, u8)>,
         carried: &BTreeMap<String, TreeEntry>,
     ) -> Result<ObjectId> {
-        let paths: Vec<&str> = files
-            .keys()
-            .map(String::as_str)
-            .chain(carried.keys().map(String::as_str))
-            .collect();
-        check_file_dir_collisions(&paths)?;
+        check_file_dir_collisions(
+            files
+                .keys()
+                .map(String::as_str)
+                .chain(carried.keys().map(String::as_str)),
+        )?;
         self.build_subtree_inner(files, carried, "")
     }
 
@@ -300,10 +300,12 @@ impl Repo {
 
 /// Error if any path is a proper ancestor directory of another path in the set
 /// (a name that would be a blob and a tree at once). Sorted order puts every
-/// descendant of `p` right after it, so checking neighbours is not enough
-/// (`a`, `a-b`, `a/c`); look each ancestor up instead.
-fn check_file_dir_collisions(paths: &[&str]) -> Result<()> {
-    let set: std::collections::BTreeSet<&str> = paths.iter().copied().collect();
+/// descendant of `p` after other names (`a`, `a-b`, `a/c`), so checking
+/// neighbours is not enough; look each ancestor up instead. Public so the
+/// private-branch tree builder, which assembles sealed trees itself, applies
+/// the same rule (#278).
+pub fn check_file_dir_collisions<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let set: std::collections::BTreeSet<&str> = paths.into_iter().collect();
     for p in &set {
         for (i, _) in p.match_indices('/') {
             if set.contains(&p[..i]) {

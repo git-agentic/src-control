@@ -207,3 +207,28 @@ fn ws_refresh_refuses_before_any_write() {
     assert!(after.pending_refresh.is_none());
     cleanup(repo, &root);
 }
+
+#[test]
+fn private_commit_refuses_a_directory_over_an_out_of_sparse_file() {
+    // A private commit carries out-of-view paths through its own tree builder.
+    let root = tmp_root("private");
+    let repo = Repo::init(&root).unwrap();
+    put(&root, "src/a.txt", "a");
+    put(&root, "docs", "a file\n");
+    repo.commit("me", "base").unwrap();
+    let (sk, _) = scl_crypto::generate_keypair();
+    repo.set_sparse(&["src/".to_string()], Some(&sk)).unwrap();
+    repo.branch_private("fix", &sk, &[], &[]).unwrap();
+    repo.switch_with_identity("fix", Some(&sk)).unwrap();
+    assert!(!root.join("docs").exists());
+    let before = crate::refs::resolve_tip(repo.layout(), "fix").unwrap();
+    put(&root, "docs/x.txt", "x\n");
+    let err = repo.commit_private("me", "dir", Some(&sk)).unwrap_err();
+    assert_collision(&err, "docs", "docs/x.txt");
+    assert_eq!(
+        crate::refs::resolve_tip(repo.layout(), "fix").unwrap(),
+        before,
+        "private ref did not move"
+    );
+    cleanup(repo, &root);
+}
