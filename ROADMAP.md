@@ -609,7 +609,7 @@ across every phase.
   entries, checkpoints and unreferenced packs behind an aged cutoff; readers
   restart on a moved manifest; no format change; `--dry-run` writes nothing but
   downloads and decodes the same candidate packs as a real run. A lost manifest
-  CAS is retried up to 16 times with jittered backoff (#272). The `DirBucket`
+  CAS is attempted up to 16 times with jittered backoff (#272). The `DirBucket`
   CAS lock is an OS advisory file lock on `<root>/.cas-lock` (#264): it queues
   waiters and is dropped when its holder dies, but `lock()` waits without a
   timeout, the file is never removed, binaries from before and after #264 do not
@@ -837,8 +837,8 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
   serve key (#281, follow-on to #214).** `.sc/local-key` gets an owner-only DACL;
   the identity file (`sc keygen --out`, `0600` on unix only) and the serve-home
   TLS key still get default permissions on non-unix. The helper lives in
-  `scl-repo`, while `cli` and `tlsio` must not depend on it (leaf rule), so it
-  moves to `core` or arrives as a callback.
+  `scl-repo` (`pub(crate)`), and `tlsio` is a leaf that must not depend on it, so
+  it moves to `core` or reaches `tlsio` as a callback.
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.

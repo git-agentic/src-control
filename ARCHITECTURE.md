@@ -392,10 +392,12 @@ A forward operation (merge, switch, cherry-pick, rebase, undo, sparse-spec chang
 refuses, before any write, to lay a file or directory onto an untracked or ignored
 one. A tracked path is deleted or overwritten only when the disk copy is a regular
 file with exactly the tracked bytes, so an edit, a replacement or a symlink
-survives; an emptied directory is cleared so a file and a directory can swap at one
+survives (where bytes can be compared: a protected path without a usable identity
+and a private-branch forward operation cannot, see THREAT-MODEL); an emptied directory is cleared so a file and a directory can swap at one
 path, and every such directory is checked before the first removal, so a refusal
 changes nothing. An abort (`merge_abort`, `cherry_pick_abort`, `rebase_abort`)
-always completes and returns an `AbortReport`: it removes what the stop laid,
+completes past a kept edit (a directory holding untracked content or a blocked
+parent still refuses) and returns an `AbortReport`: it removes what the stop laid,
 overwrites a file only if it is still the stopped tree's bytes or the stop owns it
 (recorded plaintext, a conflicted path), and lists what it left in `kept` (`sc`
 prints `left in place (changed since the stop)`). See ADR-0034 refinement 8.
@@ -1225,8 +1227,8 @@ as a write-ahead log of **immutable, content-addressed packs** plus **one
 compare-and-swapped manifest**. A push uploads a pack, appends a parent-linked
 `log/<seq>` entry carrying its ref updates, then CASes the manifest's
 `head_seq` forward (`Bucket::put_if_tag`). A lost CAS refreshes and retries (up
-to 16 times, with jittered exponential backoff between attempts, 2 ms doubling to
-a 250 ms cap), so pushes to different branches both land; a push whose target
+to 16 attempts, with jittered exponential backoff between them, a ceiling that
+starts at 4 ms and doubles to a 250 ms cap), so pushes to different branches both land; a push whose target
 branch no longer matches its expected old tip fails with `NonFastForward`,
 exactly as on any other transport, and a loser's orphaned log entry is invisible
 to readers because they walk `parent_seq` back from the manifest. There is no

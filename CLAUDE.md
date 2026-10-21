@@ -230,7 +230,8 @@ transport-adjacent. The rest, imperatively:
   24h): a writer stalled longer than that between uploading a pack and its
   commit can still lose the pack (the leases follow-on closes it).
   `--dry-run` writes and deletes nothing but still downloads and decodes every
-  candidate pack, so on S3 it costs the same egress and requests as a real run.
+  candidate pack, so on S3 its download egress and read requests match a real run (the uploads,
+  CAS and deletes it skips are the rest).
 - **`sc serve --store` still requires a local serve home with `.sc/`** —
   tokens, TLS identity, and pack spills live there; the bucket holds all
   served content.
@@ -374,7 +375,7 @@ transport-adjacent. The rest, imperatively:
 - **`sc ws run` releases the repo lock while the agent command runs
   (ADR-0056).** It resolves the workspace and secret environment under the lock,
   then spawns the command without it, so other sessions and `sc` commands stay
-  usable; an `sc` the command runs from inside the workspace finds the host repo
+  usable; an `sc` command run from inside the workspace finds the host repo
   and can change it. `sc work` keeps the lock for its whole session.
 - **Downgrade hazards (an older binary on a repo or peer this build has
   touched):** (1) a binary from before ADR-0056 does not root a named session's

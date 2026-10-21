@@ -254,8 +254,9 @@ too, not just the src-control-side metadata.
   (resolved, #260). The lock is an advisory `flock` on a file that is never
   removed, held only for single index updates, and waited for at most 30
   seconds; past that the ingest fails with `IndexBusy` after its objects are
-  stored, and they stay unindexed on that remote until a reindex (`sc clone` of
-  it). Advisory locking is only as reliable as the filesystem's `flock` (not
+  stored, and the signatures stay unindexed on that remote: they are not served
+  and its gc sweeps them after the grace window (no reindex of a remote is built,
+  and a re-push skips objects the remote already holds). Advisory locking is only as reliable as the filesystem's `flock` (not
   guaranteed on NFS). Writers
   can also evict pending entries from a push-only remote (trust the signer
   before the push). Trust is checked at evaluation and is not retroactive. A tombstone a remote already held before
@@ -487,7 +488,7 @@ too, not just the src-control-side metadata.
   unless `--allow-short-grace` is given, which is only safe while nothing
   pushes to or fetches from the bucket.
 - **Manifest CAS retries are bounded, and contention is a denial of service,
-  not a bypass.** `update_ref` retries a lost compare-and-swap up to 16 times
+  not a bypass.** `update_ref` retries a lost compare-and-swap up to 16 attempts
   with a jittered, capped exponential backoff (about 2.5 s in total at worst),
   then fails with "manifest cas contention". A busy fleet or a hostile writer
   can starve a pusher this way and force a rerun; it cannot move a ref the
@@ -703,8 +704,9 @@ protected paths, plaintext.
     tracked bytes, or the stop itself recorded the path (`.sc/CONFLICT_PLAINTEXT`,
     `.sc/CONFLICT_SIDECARS`, `.sc/sparse-widen`) and it still matches what was
     laid. An edit, a replacement or a symlink survives (#255, #256, #259).
-  - `merge --abort`, `cherry-pick --abort` and `rebase --abort` finish rather
-    than refuse, so a kept resolution edit cannot trap the user in the stop:
+  - `merge --abort`, `cherry-pick --abort` and `rebase --abort` finish past a
+    kept resolution edit instead of refusing, so it cannot trap the user in the
+    stop (a directory holding untracked content, or a blocked parent, still refuses):
     they restore the tip, drop the stop's state and return an `AbortReport`
     whose `kept` paths (changed since the stop) and `skipped` protected paths
     `sc` prints. Recorded plaintext and sidecars are removed whatever their

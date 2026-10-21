@@ -30,8 +30,9 @@ it are consolidated in [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md). In brief:
   perimeter.** Public content sits in the bucket as plaintext at rest and a
   writer with raw bucket access can move refs outside the `sc` client; sealed
   content stays ciphertext. `sc remote compact` deletes bucket objects, so it
-  needs list and delete rights that ordinary pushers and `sc serve --store`
-  instances should not hold. A bucket cannot judge a transcript drop tombstone, so
+  needs list and delete rights, which belong to a dedicated compaction identity;
+  ordinary pushers and `sc serve --store` instances should not hold delete
+  rights. A bucket cannot judge a transcript drop tombstone, so
   it serves a dropped transcript's body next to the tombstone; the receiver
   honors the drop only for a signer in its `[signers] trusted` list.
 - Committed secrets injected by `sc run` live in an **authorized local process

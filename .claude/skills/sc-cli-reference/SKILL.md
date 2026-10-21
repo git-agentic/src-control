@@ -26,6 +26,8 @@ cargo run --bin sc -- keygen [--out <file>]  # (default ~/.sc/identity; 0600 on 
 cargo run --bin sc -- secret-demo            # committed-secrets authorize/deny/grant proof
 # Identity default everywhere a command takes --identity: the flag, then $SC_IDENTITY,
 # then ~/.sc/identity (a missing file just skips protected paths where decryption is optional).
+# Exception: `transcript drop` signs only with an explicit --identity (otherwise the tombstone
+# is unsigned and local-only).
 
 # Persistent repo commands (sc init creates .sc/ in the working directory):
 cargo run --bin sc -- init                   # initialize a new persistent repo
@@ -164,8 +166,9 @@ cargo run --bin sc -- work --agents 3 [--name <base>] [--budget-mb <n>] -- <cmd>
                                                  # decrypted secrets into each agent env)
 bash demo/run_work_demo.sh                       # parallel-agents round-trip proof
 cargo run --bin sc -- ws fork --agents N [--name <n>] [--identity <key>] [--author <a>]  # durable multi-invocation
-                                              # (--agents default 2; --author is recorded on any
-                                              # commit a later harvest makes)
+                                              # (--agents default 2; --author is stored in the
+                                              # manifest, but harvest takes its own --author,
+                                              # then $SC_AUTHOR, then the OS user)
                                               # session: materializes N checkouts under
                                               # .sc/ws/<i>/ and persists a manifest (P20).
                                               # --name opens a further named session in
@@ -519,7 +522,7 @@ cargo run --bin sc -- clone sc+https://host[:port]/repo <dst>   # TLS clone (P32
                                               # pinning (no pin file read/written; ADR-0054);
                                               # remote add/fetch/push accept the same URL form
 cargo run --bin sc -- tls list [--json]       # pins in the known_hosts file (ADR-0053)
-cargo run --bin sc -- tls forget <host[:port]>   # drop every pin for a host (port defaults to 8730;
+cargo run --bin sc -- tls forget <host[:port]>   # drop the pins for a host and port (port defaults to 8730;
                                               # changed server key); a later
                                               # accept-new connect (no SC_HTTPS_STRICT, no
                                               # SC_HTTPS_FINGERPRINT) re-pins; errors if nothing
