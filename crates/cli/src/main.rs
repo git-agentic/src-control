@@ -3521,10 +3521,10 @@ fn run_ws(op: WsOp) -> Result<()> {
                     Some(n) => print!("session {n} base:"),
                 }
                 println!(" branch {} @ {}", s.base_branch, s.base_snapshot.short());
-                if let Some(t) = s.pending_refresh {
+                if let Some(p) = &s.pending_refresh {
                     println!(
                         "refresh to {} did not finish: run `sc ws refresh{}` to complete it",
-                        t.short(),
+                        p.target.short(),
                         s.name
                             .as_deref()
                             .map(|n| format!(" --session {n}"))

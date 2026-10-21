@@ -91,5 +91,5 @@ pub use sparse::Sparse;
 pub use stdio_transport::{open_transport, SshUrl, StdioTransport};
 pub use workspace::{HarvestResult, WorkOptions, WorkspaceOutcome};
 pub use worktree::Diff;
-pub use ws::{WsEntry, WsHarvestOutcome, WsRunPlan, WsSession};
+pub use ws::{PendingRefresh, PendingWs, WsEntry, WsHarvestOutcome, WsRunPlan, WsSession};
 pub use ws_refresh::{WsRefresh, WsRefreshEntry};

@@ -32,7 +32,10 @@ use crate::worktree::{
     preflight_view, refuse_blocked_parents, safe_join, tree_file_entries_with_perms_sparse,
     under_symlink,
 };
-use crate::ws::{ensure_idle, label_prefix, open_session, write_manifest, WsEntry};
+use crate::ws::{
+    ensure_idle, label_prefix, open_session, write_manifest, PendingRefresh, PendingWs, WsEntry,
+    WsSession,
+};
 
 /// What refresh did to one workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,18 +125,13 @@ fn changed_since_read(p: &str) -> Error {
     ))
 }
 
-/// Whether the file at `full` is still exactly what the candidate recorded at
-/// `p` (`prior` = blob and perms). A plain file is compared by bytes. A
-/// protected file's plaintext is proved the same way commit proves it: a
-/// randomized one by the workspace cache, a convergent one by re-encrypting.
-/// Anything that is not a regular file reads as changed.
-fn still_read(
-    full: &std::path::Path,
-    p: &str,
-    prior: (ObjectId, u8),
-    cache: &ProtectedCache,
-) -> bool {
-    let (blob, perms) = prior;
+/// Whether the file at `full` is exactly the content recorded as `rec` (blob and
+/// perms) at `p`. A plain file is compared by bytes. A protected file's plaintext
+/// is proved the way commit proves it: a randomized one by the workspace cache, a
+/// convergent one by re-encrypting. Anything that is not a regular file reads as
+/// not matching.
+fn holds(full: &std::path::Path, p: &str, rec: (ObjectId, u8), cache: &ProtectedCache) -> bool {
+    let (blob, perms) = rec;
     if perms & PROTECTED == 0 {
         return disk_is_blob(full, &blob);
     }
@@ -150,15 +148,19 @@ fn still_read(
     }
 }
 
-/// The disk state of path `p` against the candidate's record of it: fine to
-/// replace or remove (`Ok(())`), or changed since it was read. A tracked plain
-/// file that is gone was deleted after the read; a protected one may never have
-/// been laid out (no key at fork), which is not a change.
+/// The disk state of path `p` against the candidate's record of it (`prior`) and,
+/// for a write, the content it is about to get (`target`): fine to replace or
+/// remove (`Ok(())`), or changed since it was read. A file that already holds the
+/// target is fine too (a retry after an interruption finds its own earlier
+/// writes), but only for a path the candidate tracked: an ignored file with the
+/// same bytes is still the user's. A tracked plain file that is gone was deleted
+/// after the read; a protected one may never have been laid out (no key at fork),
+/// which is not a change.
 fn check_prior(
     full: &std::path::Path,
     p: &str,
     prior: Option<(ObjectId, u8)>,
-    target: Option<ObjectId>,
+    target: Option<(ObjectId, u8)>,
     cache: &ProtectedCache,
 ) -> Result<()> {
     let meta = lstat(full)?;
@@ -168,11 +170,11 @@ fn check_prior(
         // A directory where a tracked file was is never ours to remove.
         (Some(m), Some(_)) if m.is_dir() && target.is_none() => Err(changed_since_read(p)),
         (Some(m), _) if m.is_dir() => Ok(()), // a write: judged by the directory rules
-        (Some(_), Some(prior)) if still_read(full, p, prior, cache) => Ok(()),
-        // Already the target bytes (a plain file): nothing of the user's to lose.
-        // Not for a path the candidate did not track: an ignored file with the
-        // same bytes is still the user's, and a rewrite would replace its inode.
-        (Some(_), Some(_)) if target.is_some_and(|t| disk_is_blob(full, &t)) => Ok(()),
+        (Some(_), Some(prior))
+            if holds(full, p, prior, cache) || target.is_some_and(|t| holds(full, p, t, cache)) =>
+        {
+            Ok(())
+        }
         (Some(_), Some(_)) => Err(changed_since_read(p)),
         (Some(_), None) => Err(Error::InvalidArgument(format!(
             "cannot write {p}: a file of yours (untracked or ignored) stands there; move it \
@@ -193,6 +195,7 @@ fn plan_checkout(
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
     cache: &ProtectedCache,
+    resuming: bool,
 ) -> Result<Plan> {
     // Bounded by the view on both sides: a partial clone does not hold the rest.
     let old = tree_file_entries_with_perms_sparse(store, old_root, sparse)?;
@@ -214,6 +217,16 @@ fn plan_checkout(
         }
         let full = safe_join(root, p)?;
         let meta = lstat(&full)?;
+        // Already the result's content, written by an earlier attempt that was
+        // interrupted (a path the candidate tracked, and a content change).
+        // On a retry that includes a file the first attempt added, which the
+        // candidate does not track.
+        if (prior.is_some_and(|(b, ..)| b != blob) || (resuming && prior.is_none()))
+            && meta.as_ref().is_some_and(|m| m.is_file())
+            && holds(&full, p, (*blob, *perms), cache)
+        {
+            continue;
+        }
         let protected = perms & PROTECTED != 0;
         if protected {
             let Object::Blob(bytes) = store.get(blob)? else {
@@ -245,7 +258,7 @@ fn plan_checkout(
                 )));
             }
         } else {
-            check_prior(&full, p, prior, (!protected).then_some(*blob), cache)?;
+            check_prior(&full, p, prior, Some((*blob, *perms)), cache)?;
         }
         writes.push((p.clone(), *blob, *mode, *perms, prior));
     }
@@ -296,7 +309,7 @@ fn apply_plan(
         if under_symlink(&job.dir, p) {
             return Err(changed_since_read(p));
         }
-        check_prior(&full, p, *prior, (!protected).then_some(*blob), &job.cache)?;
+        check_prior(&full, p, *prior, Some((*blob, *perms)), &job.cache)?;
         *done += 1; // from here on the checkout may differ from the old state
         clear_dir_obstruction(&full, p)?;
         if let Some(parent) = full.parent() {
@@ -325,6 +338,51 @@ fn apply_plan(
     Ok(())
 }
 
+/// A workspace's refresh, before it is planned: the checkout as the refresh read
+/// it (`candidate`) and what it becomes (`result`), both snapshots (the pair a
+/// pending marker records).
+struct Prep {
+    index: u32,
+    dir: PathBuf,
+    candidate: ObjectId,
+    result: ObjectId,
+    cache: ProtectedCache,
+}
+
+/// Remove the `<stem>.<pid>.<n>.tmp` staging files `atomic_write_durable` leaves
+/// beside `full` when its writer was killed: one may hold protected plaintext,
+/// and a harvest would take it for the agent's own file. Only that exact name
+/// with a pid that is provably dead.
+fn sweep_stale_temps(full: &std::path::Path) {
+    let (Some(parent), Some(stem)) = (full.parent(), full.file_stem().and_then(|s| s.to_str()))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(mid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(stem))
+            .and_then(|n| n.strip_prefix('.'))
+            .and_then(|n| n.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        let mut parts = mid.split('.');
+        let (Some(pid), Some(n), None) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if let (Ok(pid), Ok(_)) = (pid.parse::<u32>(), n.parse::<u64>()) {
+            if crate::lock::pid_is_dead(pid) && e.file_type().is_ok_and(|t| t.is_file()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 impl Repo {
     /// Move session `name` onto the tip of `onto` (default the checked-out
     /// branch), keeping every live workspace's edits.
@@ -341,12 +399,14 @@ impl Repo {
     /// (in or out of the view), needs a protected path decrypted without
     /// `identity`, has a file or directory of the user's where the new tip puts
     /// one, or the view of the new tip cannot be filled (the gap error,
-    /// ADR-0050). The write order is a `pending_refresh` marker in the manifest,
+    /// ADR-0050). The write order is a `pending_refresh` marker in the manifest
+    /// (target, branch and, per workspace, the candidate and result snapshots),
     /// each checkout, then the manifest with the new base and no marker. A crash
     /// in between leaves checkouts holding a mix of old and merged files and a
-    /// marker that makes harvest refuse until `sc ws refresh` is run again
-    /// (abandon still works). Nothing is lost: every file is replaced
-    /// atomically, only over the bytes the candidate read.
+    /// marker that makes harvest and run refuse; running this again resumes from
+    /// the recorded snapshots (not from the half-written checkouts), accepting a
+    /// file that is either what the candidate read or what the result holds, and
+    /// then moves on to the requested tip.
     pub fn ws_refresh(
         &self,
         name: Option<&str>,
@@ -375,36 +435,21 @@ impl Repo {
         if self.manifest_at(&to)?.is_some() {
             return Err(Error::PrivateUnsupported("sc ws refresh".into()));
         }
-        // An unfinished refresh left files at the state of its own target. Finish
-        // it onto that exact tip first: replayed onto a tip the branch has since
-        // moved to, those files would read as the agent's own changes (and would
-        // survive a host revert).
-        if let Some(pending) = session.pending_refresh.filter(|p| *p != to) {
-            self.refresh_onto(name, &session.base_branch, pending, identity)?;
-        }
-        self.refresh_onto(name, &branch, to, identity)
+        // An unfinished refresh is finished first, onto its own tip and branch.
+        let resumed = if session.pending_refresh.is_some() {
+            Some(self.resume_refresh(name, identity)?)
+        } else {
+            None
+        };
+        let r = self.refresh_onto(name, &branch, to, identity)?;
+        Ok(match resumed {
+            Some(done) if r.workspaces.is_empty() => done,
+            _ => r,
+        })
     }
 
-    /// [`Self::ws_refresh`] onto the snapshot `to`, labelled as `branch`.
-    fn refresh_onto(
-        &self,
-        name: Option<&str>,
-        branch: &str,
-        to: ObjectId,
-        identity: Option<&scl_crypto::SecretKey>,
-    ) -> Result<WsRefresh> {
-        let branch = branch.to_string();
-        let mut session = open_session(self.layout(), name)?;
-        let prior_pending = session.pending_refresh;
-        let from = session.base_snapshot;
-        if to == from && branch == session.base_branch && session.pending_refresh.is_none() {
-            return Ok(WsRefresh {
-                branch,
-                from,
-                to,
-                workspaces: Vec::new(),
-            });
-        }
+    /// Live workspaces of `session`, ascending, none running a command.
+    fn idle_live(&self, name: Option<&str>, session: &WsSession) -> Result<Vec<WsEntry>> {
         let mut live: Vec<WsEntry> = session
             .workspaces
             .iter()
@@ -415,22 +460,90 @@ impl Repo {
         for e in &live {
             ensure_idle(self.layout(), name, e.index)?;
         }
+        Ok(live)
+    }
+
+    fn ws_cache(&self, name: Option<&str>, e: &WsEntry) -> Result<ProtectedCache> {
+        Ok(ProtectedCache::open(
+            crate::cache::local_key(self.layout())?,
+            e.dir.clone(),
+            Some(self.layout().ws_cache_path(name, e.index as usize)),
+        ))
+    }
+
+    /// Finish an interrupted refresh from the pairs its marker recorded.
+    fn resume_refresh(
+        &self,
+        name: Option<&str>,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<WsRefresh> {
+        let session = open_session(self.layout(), name)?;
+        let pending = session
+            .pending_refresh
+            .clone()
+            .expect("the caller checked for a marker");
+        let mut preps = Vec::new();
+        for e in self.idle_live(name, &session)? {
+            let rec = pending
+                .workspaces
+                .iter()
+                .find(|w| w.index == e.index)
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "the unfinished refresh has no record of workspace {}; abandon it \
+                         (`sc ws abandon{} {}`) and run `sc ws refresh` again",
+                        e.index,
+                        name.map(|n| format!(" --session {n}")).unwrap_or_default(),
+                        e.index
+                    ))
+                })?;
+            preps.push(Prep {
+                index: e.index,
+                cache: self.ws_cache(name, &e)?,
+                dir: e.dir,
+                candidate: rec.candidate,
+                result: rec.result,
+            });
+        }
+        self.drive_refresh(
+            session,
+            &pending.branch,
+            pending.target,
+            preps,
+            Vec::new(),
+            identity,
+        )
+    }
+
+    /// [`Self::ws_refresh`] onto the snapshot `to`, labelled as `branch`.
+    fn refresh_onto(
+        &self,
+        name: Option<&str>,
+        branch: &str,
+        to: ObjectId,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<WsRefresh> {
+        let session = open_session(self.layout(), name)?;
+        let from = session.base_snapshot;
+        if to == from && branch == session.base_branch {
+            return Ok(WsRefresh {
+                branch: branch.to_string(),
+                from,
+                to,
+                workspaces: Vec::new(),
+            });
+        }
+        let live = self.idle_live(name, &session)?;
 
         // The session's own fork-time view, as harvest uses (ADR-0056, 7).
         let sparse = Sparse::new(session.sparse.clone());
         let tip = self.snapshot(&to)?;
         self.ensure_view(tip.root, &sparse)?;
-        let base_root = self.snapshot(&from)?.root;
-        let key = crate::cache::local_key(self.layout())?;
 
         let mut refusals: Vec<String> = Vec::new();
-        let mut jobs: Vec<Job> = Vec::new();
+        let mut preps: Vec<Prep> = Vec::new();
         for e in &live {
-            let mut cache = ProtectedCache::open(
-                key,
-                e.dir.clone(),
-                Some(self.layout().ws_cache_path(name, e.index as usize)),
-            );
+            let mut cache = self.ws_cache(name, e)?;
             let msg = format!("ws {}-{} refresh", label_prefix(name), e.index);
             // A checkout cannot change the secret registry, so the candidate
             // carries the base's and no registry merge is needed.
@@ -443,7 +556,7 @@ impl Repo {
                 &sparse,
                 Some(&mut cache),
             )?;
-            let (old_root, new_root, protection) = match candidate {
+            let (candidate, result) = match candidate {
                 HarvestResult::Rejected(report) => {
                     refusals.push(format!(
                         "workspace {}: the secret scanner rejected it ({report}); fix it first",
@@ -451,13 +564,25 @@ impl Repo {
                     ));
                     continue;
                 }
-                HarvestResult::Unchanged => (base_root, tip.root, tip.protection.clone()),
+                // Untouched: the base becomes the tip.
+                HarvestResult::Unchanged => (from, to),
                 HarvestResult::Committed(c) => {
-                    let c_root = self.snapshot(&c)?.root;
                     let onto_tip = (tip.root, &tip.protection);
                     match crate::replay::replay_commit(self, c, onto_tip, identity, None) {
-                        Ok(ReplayOutcome::Clean { root, protection }) => (c_root, root, protection),
-                        Ok(ReplayOutcome::Empty) => (c_root, tip.root, tip.protection.clone()),
+                        // The result is a snapshot so it can be recorded, rooted
+                        // and, on a retry, read back with its wrap lists.
+                        Ok(ReplayOutcome::Clean { root, protection }) => (
+                            c,
+                            self.build_snapshot(
+                                root,
+                                vec![to],
+                                tip.secrets.clone(),
+                                protection,
+                                &session.author,
+                                &msg,
+                            )?,
+                        ),
+                        Ok(ReplayOutcome::Empty) => (c, to),
                         Ok(ReplayOutcome::Conflicts { paths, .. }) => {
                             refusals.push(format!(
                                 "workspace {}: conflicts with {branch} in {}",
@@ -478,38 +603,76 @@ impl Repo {
                     }
                 }
             };
-            // The replayed tree's view, filled (lazy clone) or reported as a gap.
-            self.ensure_view(new_root, &sparse)?;
+            preps.push(Prep {
+                index: e.index,
+                dir: e.dir.clone(),
+                candidate,
+                result,
+                cache,
+            });
+        }
+        self.drive_refresh(session, branch, to, preps, refusals, identity)
+    }
+
+    /// Plan every workspace, mark the session, apply, and move the base. The
+    /// shared tail of a fresh refresh and a resumed one (`session` then already
+    /// holds the marker). `refusals` are what the caller collected so far.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_refresh(
+        &self,
+        mut session: WsSession,
+        branch: &str,
+        to: ObjectId,
+        preps: Vec<Prep>,
+        mut refusals: Vec<String>,
+        identity: Option<&scl_crypto::SecretKey>,
+    ) -> Result<WsRefresh> {
+        let sparse = Sparse::new(session.sparse.clone());
+        let from = session.base_snapshot;
+        let prior_pending = session.pending_refresh.clone();
+        let recorded: Vec<PendingWs> = preps
+            .iter()
+            .map(|p| PendingWs {
+                index: p.index,
+                candidate: p.candidate,
+                result: p.result,
+            })
+            .collect();
+        let mut jobs: Vec<Job> = Vec::new();
+        for prep in preps {
+            let old_root = self.snapshot(&prep.candidate)?.root;
+            let result = self.snapshot(&prep.result)?;
+            // The result's view, filled (lazy clone) or reported as a gap.
+            self.ensure_view(result.root, &sparse)?;
             let plan = {
                 let store_arc = self.vfs().store();
                 let mut store = store_arc.lock().unwrap();
-                preflight_view(self.layout(), &mut store, new_root, &sparse)?;
-                let planned = plan_checkout(
-                    &e.dir,
+                preflight_view(self.layout(), &mut store, result.root, &sparse)?;
+                plan_checkout(
+                    &prep.dir,
                     &mut store,
                     old_root,
-                    new_root,
-                    &protection,
+                    result.root,
+                    &result.protection,
                     identity,
                     &sparse,
-                    &cache,
-                );
-                match planned {
-                    Ok(plan) => plan,
-                    Err(Error::InvalidArgument(msg)) => {
-                        refusals.push(format!("workspace {}: {msg}", e.index));
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                }
+                    &prep.cache,
+                    prior_pending.is_some(),
+                )
             };
-            jobs.push(Job {
-                index: e.index,
-                dir: e.dir.clone(),
-                protection,
-                plan,
-                cache,
-            });
+            match plan {
+                Ok(plan) => jobs.push(Job {
+                    index: prep.index,
+                    dir: prep.dir,
+                    protection: result.protection,
+                    plan,
+                    cache: prep.cache,
+                }),
+                Err(Error::InvalidArgument(msg)) => {
+                    refusals.push(format!("workspace {}: {msg}", prep.index));
+                }
+                Err(err) => return Err(err),
+            }
         }
         if !refusals.is_empty() {
             return Err(Error::InvalidArgument(format!(
@@ -520,9 +683,23 @@ impl Repo {
 
         // From here the checkouts may hold a mix of old and refreshed files, and
         // harvest would read the refreshed ones as the agent's own: mark the
-        // session, durably, before the first write (cleared with the new base).
-        session.pending_refresh = Some(to);
-        write_manifest(self.layout(), &session)?;
+        // session, durably, before the first write, with what the retry needs
+        // (cleared with the new base).
+        if prior_pending.is_none() {
+            session.pending_refresh = Some(PendingRefresh {
+                target: to,
+                branch: branch.to_string(),
+                workspaces: recorded,
+            });
+            write_manifest(self.layout(), &session)?;
+        } else {
+            // A killed writer may have left staging files with protected plaintext.
+            for job in &jobs {
+                for (p, ..) in &job.plan.writes {
+                    sweep_stale_temps(&safe_join(&job.dir, p)?);
+                }
+            }
+        }
         before_apply_hook();
         let mut report = Vec::with_capacity(jobs.len());
         let mut done = 0;
@@ -530,7 +707,11 @@ impl Repo {
             let store_arc = self.vfs().store();
             let mut store = store_arc.lock().unwrap();
             jobs.iter_mut().try_for_each(|job| {
-                apply_plan(&mut store, job, identity, &mut done)?;
+                let r = apply_plan(&mut store, job, identity, &mut done);
+                // What was written is recorded either way, so a retry can tell
+                // an already-written protected file from an edit.
+                job.cache.save_best_effort();
+                r?;
                 report.push(WsRefreshEntry {
                     index: job.index,
                     written: job.plan.writes.len(),
@@ -552,13 +733,10 @@ impl Repo {
         // The new base last: until it lands, the old one is still the truth.
         session.pending_refresh = None;
         session.base_snapshot = to;
-        session.base_branch = branch.clone();
+        session.base_branch = branch.to_string();
         write_manifest(self.layout(), &session)?;
-        for job in &jobs {
-            job.cache.save_best_effort();
-        }
         Ok(WsRefresh {
-            branch,
+            branch: branch.to_string(),
             from,
             to,
             workspaces: report,
@@ -1080,6 +1258,231 @@ mod tests {
         cleanup(repo, &root);
     }
 
+    /// Agent edits line 4, the host edits the adjacent line 5 of one file: the
+    /// merged file is written before the failure.
+    fn adjacent_fixture(tag: &str) -> (Repo, PathBuf, Vec<PathBuf>, ObjectId) {
+        let (repo, root) = init(tag);
+        let s = repo.ws_fork(None, 2, "t", None).unwrap();
+        let dirs: Vec<PathBuf> = s.workspaces.iter().map(|e| e.dir.clone()).collect();
+        std::fs::write(dirs[0].join("a.txt"), "one\ntwo\nthree\nFOUR\nfive\n").unwrap();
+        let tip = host_commit(
+            &repo,
+            &root,
+            &[
+                ("a.txt", Some("one\ntwo\nthree\nfour\nFIVE\n")),
+                ("b.txt", Some("b\n")),
+            ],
+        );
+        (repo, root, dirs, tip)
+    }
+
+    #[test]
+    fn a_retry_after_a_merged_file_was_written_succeeds_and_harvest_lands_the_merge() {
+        let (repo, root, dirs, tip) = adjacent_fixture("retry-merged");
+        {
+            // a.txt (the merged file) is written, then the next operation dies.
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        assert_eq!(read(&dirs[0], "a.txt"), "one\ntwo\nthree\nFOUR\nFIVE\n");
+        let r = repo.ws_refresh(None, None, None).unwrap();
+        assert_eq!(r.to, tip);
+        assert_eq!(base_of(&repo, None), tip);
+        for d in &dirs {
+            assert_eq!(read(d, "b.txt"), "b\n");
+        }
+        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        assert!(matches!(out[0], WsHarvestOutcome::Landed { .. }), "{out:?}");
+        let head = repo.head_tip().unwrap().unwrap();
+        assert_eq!(
+            tree_has(&repo, head, "a.txt").unwrap(),
+            b"one\ntwo\nthree\nFOUR\nFIVE\n"
+        );
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_host_revert_after_a_crash_with_a_merged_file_written_is_honoured() {
+        let (repo, root, dirs, _tip) = adjacent_fixture("revert-merged");
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        assert_eq!(read(&dirs[0], "a.txt"), "one\ntwo\nthree\nFOUR\nFIVE\n");
+        // The host takes the whole change back.
+        host_commit(&repo, &root, &[("a.txt", Some(LINES)), ("b.txt", None)]);
+        repo.ws_refresh(None, None, None).unwrap();
+        assert_eq!(read(&dirs[0], "a.txt"), "one\ntwo\nthree\nFOUR\nfive\n");
+        assert!(!dirs[0].join("b.txt").exists());
+        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        assert!(matches!(out[0], WsHarvestOutcome::Landed { .. }), "{out:?}");
+        let head = repo.head_tip().unwrap().unwrap();
+        assert_eq!(
+            tree_has(&repo, head, "a.txt").unwrap(),
+            b"one\ntwo\nthree\nFOUR\nfive\n",
+            "the host's reverted line is not re-applied"
+        );
+        assert!(tree_has(&repo, head, "b.txt").is_none());
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_retry_still_refuses_an_edit_made_after_the_crash() {
+        let (repo, root, dirs, _tip) = adjacent_fixture("edit-after-crash");
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        // The agent edits the file the first attempt wrote.
+        std::fs::write(dirs[0].join("a.txt"), "mine\n").unwrap();
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("a.txt changed in the workspace"), "{err}");
+        assert_eq!(read(&dirs[0], "a.txt"), "mine\n");
+        assert!(repo
+            .ws_session(None)
+            .unwrap()
+            .unwrap()
+            .pending_refresh
+            .is_some());
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn the_marker_keeps_the_target_branch_for_the_retry() {
+        let (repo, root) = init("marker-branch");
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        repo.branch("feature").unwrap();
+        repo.switch("feature").unwrap();
+        let feat = host_commit(
+            &repo,
+            &root,
+            &[("f.txt", Some("f\n")), ("g.txt", Some("g\n"))],
+        );
+        repo.switch("main").unwrap();
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, Some("feature"), None).unwrap_err();
+        }
+        let p = repo
+            .ws_session(None)
+            .unwrap()
+            .unwrap()
+            .pending_refresh
+            .unwrap();
+        assert_eq!((p.branch.as_str(), p.target), ("feature", feat));
+        // A plain retry (the checked-out branch is main) finishes onto feature
+        // first, labelled feature, then moves on to main's tip, which is the old base.
+        let r = repo.ws_refresh(None, None, None).unwrap();
+        assert_eq!((r.branch.as_str(), r.to), ("main", s.base_snapshot));
+        assert!(!s.workspaces[0].dir.join("f.txt").exists());
+        // And retrying with the same target finishes it as that branch.
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, Some("feature"), None).unwrap_err();
+        }
+        let r = repo.ws_refresh(None, Some("feature"), None).unwrap();
+        assert_eq!((r.branch.as_str(), r.to), ("feature", feat));
+        assert_eq!(
+            repo.ws_session(None).unwrap().unwrap().base_branch,
+            "feature"
+        );
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn stale_staging_files_of_a_dead_writer_are_swept_on_retry() {
+        let (repo, root, dirs, _tip) = adjacent_fixture("stale-tmp");
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        // b.txt was about to be written: a killed writer left its staging file.
+        let stale = dirs[0].join("b.4000000.7.tmp");
+        let alive = dirs[0].join(format!("b.{}.7.tmp", std::process::id()));
+        let user = dirs[0].join("b.keep.tmp");
+        for f in [&stale, &alive, &user] {
+            std::fs::write(f, "plaintext\n").unwrap();
+        }
+        // The first attempt had written a.txt then died; the staging files are
+        // beside b.txt, which the retry writes.
+        let err = repo.ws_refresh(None, None, None);
+        // Untracked files in the workspace would be read as the agent's own by a
+        // fresh candidate, but a retry plans from the record and only sweeps.
+        err.unwrap();
+        assert!(!stale.exists(), "a dead writer's staging file is removed");
+        assert!(alive.exists() && user.exists(), "anything else stays");
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_convergent_protected_file_edited_after_the_plan_is_not_overwritten() {
+        let (repo, root) = init("late-convergent");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        // A pre-P33 snapshot: the protected blob is sealed convergently.
+        let seed = |pt: &[u8], parent: ObjectId| {
+            let tip = repo.snapshot(&parent).unwrap();
+            let mut protection = tip.protection.clone();
+            if protection.prefixes.is_empty() {
+                protection.prefixes.push(scl_core::ProtectPrefix {
+                    prefix: "secret/".into(),
+                    recipients: vec![scl_core::RecipientEntry {
+                        key: pk.to_bytes(),
+                        epoch: 1,
+                        state: scl_core::RecipientState::Granted,
+                    }],
+                });
+            }
+            let (cipher, dek) = scl_crypto::encrypt_path(pt);
+            protection.wrapped.insert(
+                Object::blob(cipher.clone()).id(),
+                vec![scl_crypto::wrap_dek_for(&dek, &pk)],
+            );
+            let root = repo
+                .vfs()
+                .write_tree_with_perms(&[
+                    (
+                        "a.txt".to_string(),
+                        LINES.as_bytes().to_vec(),
+                        FileMode::FILE,
+                        0,
+                    ),
+                    ("secret/x".to_string(), cipher, FileMode::FILE, PROTECTED),
+                ])
+                .unwrap();
+            repo.commit_snapshot(
+                root,
+                vec![parent],
+                Default::default(),
+                protection,
+                "t",
+                "seed",
+            )
+            .unwrap()
+        };
+        let base = repo.head_tip().unwrap().unwrap();
+        seed(b"secret x\n", base);
+        repo.switch("main").unwrap();
+        let s = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        assert_eq!(read(&dir, "secret/x"), "secret x\n");
+        let tip = repo.head_tip().unwrap().unwrap();
+        seed(b"secret x v2\n", tip);
+        let d = dir.clone();
+        BEFORE_APPLY.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(d.join("secret/x"), "agent edit\n").unwrap();
+            }))
+        });
+        let _reset = HookGuard;
+        let err = repo
+            .ws_refresh(None, None, Some(&sk))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret/x changed in the workspace"), "{err}");
+        assert_eq!(read(&dir, "secret/x"), "agent edit\n");
+        cleanup(repo, &root);
+    }
+
     #[test]
     fn an_interrupted_refresh_can_be_abandoned() {
         let (repo, root, _dirs, ..) = crash_fixture("crash-abandon");
@@ -1146,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn a_crash_after_a_protected_rewrite_needs_the_key_to_finish() {
+    fn a_crash_after_a_protected_rewrite_is_recognised_and_finishes_with_the_key() {
         let (repo, root) = init("crash-protected");
         let (sk, pk) = scl_crypto::generate_keypair();
         repo.protect("secret/", &[pk], None).unwrap();
@@ -1163,10 +1566,14 @@ mod tests {
         }
         assert_eq!(read(&d1, "secret/x"), "secret x v2\n");
         assert_eq!(read(&d2, "secret/x"), "secret x\n");
-        // The rewritten file no longer matches the old base, so finishing needs
-        // the key to merge it; without one it refuses and changes nothing.
+        // Workspace 1's file is recognised as already written, but workspace 2
+        // still needs the key to be decrypted: without one the retry refuses
+        // and changes nothing.
         let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
-        assert!(err.contains("nothing was changed"), "{err}");
+        assert!(
+            err.contains("nothing was changed") && err.contains("workspace 2"),
+            "{err}"
+        );
         repo.ws_refresh(None, None, Some(&sk)).unwrap();
         for d in [&d1, &d2] {
             assert_eq!(read(d, "secret/x"), "secret x v2\n");

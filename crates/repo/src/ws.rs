@@ -50,6 +50,28 @@ pub struct WsEntry {
     pub landed_tip: Option<ObjectId>,
 }
 
+/// An unfinished `sc ws refresh` (ADR-0056): where it was moving the session and,
+/// per workspace, the two snapshots it was turning one into the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRefresh {
+    /// The tip the session is being moved to.
+    pub target: ObjectId,
+    /// The branch `target` is the tip of (becomes `base_branch` on completion).
+    pub branch: String,
+    /// One entry per workspace that was live when the refresh began.
+    pub workspaces: Vec<PendingWs>,
+}
+
+/// One workspace of a [`PendingRefresh`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWs {
+    pub index: u32,
+    /// The checkout as the refresh read it (parent: the old base).
+    pub candidate: ObjectId,
+    /// What the checkout becomes: the candidate replayed onto `target`.
+    pub result: ObjectId,
+}
+
 /// The session manifest (`.sc/ws/session.toml`). Never stores key material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsSession {
@@ -75,10 +97,11 @@ pub struct WsSession {
     /// manifest's actual behavior (sparse checkouts didn't exist yet).
     pub sparse: Vec<String>,
     /// Set while a `sc ws refresh` is writing its checkouts, cleared when it
-    /// completes: the tip it is moving to. A set marker means the checkouts may
-    /// hold a mix of old and refreshed files, so harvest refuses until refresh
-    /// is run again (ADR-0056). Absent from older manifests.
-    pub pending_refresh: Option<ObjectId>,
+    /// completes. A set marker means the checkouts may hold a mix of old and
+    /// refreshed files, so harvest and run refuse until refresh is run again
+    /// (ADR-0056); it records what the refresh was writing, so the retry can
+    /// finish it. Absent from older manifests.
+    pub pending_refresh: Option<PendingRefresh>,
     pub workspaces: Vec<WsEntry>,
 }
 
@@ -165,9 +188,24 @@ struct SessionToml {
     #[serde(default)]
     sparse: Vec<String>,
     #[serde(default)]
-    pending_refresh: Option<String>,
+    pending_refresh: Option<PendingToml>,
     #[serde(default)]
     workspace: Vec<EntryToml>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingToml {
+    target: String,
+    branch: String,
+    #[serde(default)]
+    workspace: Vec<PendingWsToml>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingWsToml {
+    index: u32,
+    candidate: String,
+    result: String,
 }
 
 impl From<&WsSession> for SessionToml {
@@ -177,7 +215,19 @@ impl From<&WsSession> for SessionToml {
             base_branch: s.base_branch.clone(),
             author: s.author.clone(),
             sparse: s.sparse.clone(),
-            pending_refresh: s.pending_refresh.map(|t| t.to_hex()),
+            pending_refresh: s.pending_refresh.as_ref().map(|p| PendingToml {
+                target: p.target.to_hex(),
+                branch: p.branch.clone(),
+                workspace: p
+                    .workspaces
+                    .iter()
+                    .map(|w| PendingWsToml {
+                        index: w.index,
+                        candidate: w.candidate.to_hex(),
+                        result: w.result.to_hex(),
+                    })
+                    .collect(),
+            }),
             workspace: s
                 .workspaces
                 .iter()
@@ -214,9 +264,28 @@ impl SessionToml {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let id = |what: &str, t: &str| {
+            ObjectId::from_str(t).map_err(|_| bad(format!("bad pending_refresh {what}: {t}")))
+        };
         let pending_refresh = raw
             .pending_refresh
-            .map(|t| ObjectId::from_str(&t).map_err(|_| bad(format!("bad pending_refresh: {t}"))))
+            .map(|p| -> Result<PendingRefresh> {
+                Ok(PendingRefresh {
+                    target: id("target", &p.target)?,
+                    branch: p.branch,
+                    workspaces: p
+                        .workspace
+                        .iter()
+                        .map(|w| {
+                            Ok(PendingWs {
+                                index: w.index,
+                                candidate: id("candidate", &w.candidate)?,
+                                result: id("result", &w.result)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                })
+            })
             .transpose()?;
         Ok(WsSession {
             name: name.map(str::to_string),

@@ -805,10 +805,13 @@ every workspace; any conflict, running command, scanner hit, view gap, protected
 path it cannot decrypt, or user file in the way refuses the whole refresh before
 a write. Applying touches only differing paths, each written atomically and
 re-checked against what the candidate read right before it is touched; a
-`pending_refresh` marker is written to the manifest before the first file, and
-the manifest with the new base and no marker last. A crash leaves the marker:
-harvest refuses and `sc ws refresh` finishes onto the marked tip first.
-Session-wide only.
+`pending_refresh` marker (target, its branch and, per workspace, the candidate
+and result snapshots) is written to the manifest before the first file, and the
+manifest with the new base and no marker last. A crash leaves the marker:
+harvest and run refuse, and `sc ws refresh` resumes from the recorded pairs
+(accepting at each path the candidate's bytes or the result's, never re-reading
+the half-written checkouts) before moving to the requested tip. Session-wide
+only.
 
 ## Phase 21 — hardening & consolidation sweep (built)
 
