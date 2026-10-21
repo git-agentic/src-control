@@ -5,6 +5,7 @@
 use super::super::CHECKPOINT_INTERVAL;
 use super::*;
 use crate::error::Error;
+use crate::test_support::{note, watchdog, Status, Stop};
 use crate::transport::Transport;
 use crate::walfmt::{idx_key, RefUpdate};
 use scl_core::Object;
@@ -485,45 +486,6 @@ fn a_failure_at_every_operation_boundary_leaves_a_readable_bucket() {
     assert!(n > 20, "the loop should cross many boundaries, got {n}");
 }
 
-/// Stops a concurrency test from hanging: a worker that panics raises the flag
-/// (and the main thread always does, on exit), so one failure releases every
-/// loop instead of leaving the scope waiting on workers that never see `done`.
-struct Stop<'a>(&'a AtomicBool, bool);
-impl Drop for Stop<'_> {
-    fn drop(&mut self) {
-        if self.1 || std::thread::panicking() {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-}
-
-/// Aborts the process with each worker's last-known step if the test is still
-/// running at `limit`: a worker stuck inside a call (a lock, a bucket op) can
-/// not be unwound, so the hang becomes a diagnosed failure. Written straight to
-/// stderr because the harness captures `eprintln!` until the test ends.
-fn watchdog<'a>(
-    s: &'a std::thread::Scope<'a, '_>,
-    finished: &'a AtomicBool,
-    status: &'a Mutex<BTreeMap<String, String>>,
-    limit: Duration,
-) {
-    s.spawn(move || {
-        let start = std::time::Instant::now();
-        while !finished.load(Ordering::SeqCst) {
-            if start.elapsed() > limit {
-                use std::io::Write;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "WATCHDOG: test still running after {limit:?}; last steps: {:#?}",
-                    status.lock().map(|m| m.clone()).unwrap_or_default()
-                );
-                std::process::abort();
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    });
-}
-
 #[test]
 fn readers_and_writers_stay_consistent_while_compaction_runs() {
     let root = scratch("concurrent");
@@ -542,10 +504,8 @@ fn readers_and_writers_stay_consistent_while_compaction_runs() {
     let landed = Mutex::new(Vec::new());
     let deleted = std::sync::atomic::AtomicUsize::new(0);
     let finished = AtomicBool::new(false);
-    let status = Mutex::new(BTreeMap::new());
-    let note = |who: String, what: String| {
-        status.lock().unwrap().insert(who, what);
-    };
+    let status = Status::default();
+    let note = |who: String, what: String| note(&status, who, what);
     std::thread::scope(|s| {
         let _finish = Stop(&finished, true);
         let _stop = Stop(&done, false);
