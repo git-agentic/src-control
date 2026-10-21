@@ -638,7 +638,10 @@ scan in `tombstone_honored` never reached it. Now:
   gc retry the import and fail rather than proceed.
   An object that is gone or will not decode is dropped from the import like
   any entry that does not verify, so one bad object does not block it; only a
-  transient I/O error fails it.
+  transient I/O error fails it. Every pack ingest retries the import too
+  (best effort, at most two stats when nothing is pending), including a pack with no
+  signature in it, so a served repo does not leave legacy entries unread until
+  its next open (#270).
 - **Forwarding.** `indexed_signature_ids_for` (sender seam for fetch, clone,
   serve and push) returns the indexed signatures, which are now one per
   (target, signer), so a sender forwards at most one signature per signer per
@@ -648,6 +651,17 @@ scan in `tombstone_honored` never reached it. Now:
   line, one object and one Ed25519 check per key at ingest (as in #230); they
   can no longer stop a drop from being honored, because honoring never reads
   them.
+- **`reindex` and a concurrent ingest (#270).** The clone's post-clone
+  `signatures::reindex` scans and verifies without the index lock and makes a
+  few unlocked catch-up passes. It then takes the lock, lists the store once
+  more and verifies only what appeared since, plus the signatures it refused
+  only because their target was not held yet (an ingest stores a pack's
+  objects one by one), before it rewrites the file. An ingest stores its
+  objects before it appends, so one that lands during the scan is picked up by
+  a later pass and one that lands after the rewrite appends on top of it. No
+  append is lost, and the lock is never held across the bulk of the
+  verification. The relisting sees loose objects (what ingest writes), not
+  packs another handle wrote since the store opened.
 
 ### 2. The index lock (#260)
 
