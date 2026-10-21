@@ -102,13 +102,16 @@ too, not just the src-control-side metadata.
   `--tls-key` PEM supplied by the operator is theirs to protect. On any other
   target, or if the Windows ACL call fails, the file is written with inherited
   default permissions and `sc` prints a one-time stderr warning naming it
-  (for `.sc/local-key`, once a cache holds a protected entry). The exposure then is small: checkout already writes protected
-  plaintext into the working tree with default permissions on every platform, and
+  (for `.sc/local-key`, once a cache holds a protected entry). For `.sc/local-key` the exposure is small: checkout already
+  writes protected plaintext into the working tree with default permissions on every platform, and
   the cache holds tags only for files whose plaintext is on disk, so a reader of
   the key could read that plaintext directly. What remains is the tags of the
   last-committed version of a file edited since, and stale entries until the
   next save. A filesystem that ignores mode bits or ACLs (unix vfat, exFAT, some
-  network mounts; Windows FAT, exFAT, some SMB shares) is not detected.
+  network mounts; Windows FAT, exFAT, some SMB shares) is not detected. For an
+  identity file or TLS serve key the fallback is not small: it leaves the
+  unencrypted private key under inherited permissions, so other local users may
+  be able to read it.
 
 ## Private branches (`sc branch --private` / `sc branch publish`) — ADR-0044
 
