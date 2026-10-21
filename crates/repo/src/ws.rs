@@ -60,6 +60,10 @@ pub struct PendingRefresh {
     pub branch: String,
     /// One entry per workspace that was live when the refresh began.
     pub workspaces: Vec<PendingWs>,
+    /// Pids of the `sc` processes that have written for this refresh (the first
+    /// attempt and each retry). A killed writer's staging files are removed only
+    /// under one of these pids.
+    pub writers: Vec<u32>,
 }
 
 /// One workspace of a [`PendingRefresh`].
@@ -198,6 +202,8 @@ struct PendingToml {
     target: String,
     branch: String,
     #[serde(default)]
+    writers: Vec<u32>,
+    #[serde(default)]
     workspace: Vec<PendingWsToml>,
 }
 
@@ -218,6 +224,7 @@ impl From<&WsSession> for SessionToml {
             pending_refresh: s.pending_refresh.as_ref().map(|p| PendingToml {
                 target: p.target.to_hex(),
                 branch: p.branch.clone(),
+                writers: p.writers.clone(),
                 workspace: p
                     .workspaces
                     .iter()
@@ -273,6 +280,7 @@ impl SessionToml {
                 Ok(PendingRefresh {
                     target: id("target", &p.target)?,
                     branch: p.branch,
+                    writers: p.writers,
                     workspaces: p
                         .workspace
                         .iter()

@@ -212,8 +212,19 @@ fn plan_checkout(
     let removable: BTreeSet<&str> = removals.iter().map(|r| r.0.as_str()).collect();
     for (p, (blob, mode, perms)) in &new {
         let prior = old.get(p);
-        if prior.is_some_and(|(b, m, _)| b == blob && m == mode) {
+        if prior.is_some_and(|(b, m, pp)| b == blob && m == mode && *pp == *perms) {
             continue;
+        }
+        // The workspace holds this path's plaintext. A tip that keeps the
+        // ciphertext but drops the protection flag or the rule would have a
+        // harvest commit that plaintext publicly: refuse.
+        if prior.is_some_and(|(.., pp)| pp & PROTECTED != 0)
+            && (perms & PROTECTED == 0 || crate::protect::matching_prefix(protection, p).is_none())
+        {
+            return Err(Error::InvalidArgument(format!(
+                "{p} is no longer protected on the new tip; refusing to refresh a checkout \
+                 that holds its plaintext"
+            )));
         }
         let full = safe_join(root, p)?;
         let meta = lstat(&full)?;
@@ -351,9 +362,9 @@ struct Prep {
 
 /// Remove the `<stem>.<pid>.<n>.tmp` staging files `atomic_write_durable` leaves
 /// beside `full` when its writer was killed: one may hold protected plaintext,
-/// and a harvest would take it for the agent's own file. Only that exact name
-/// with a pid that is provably dead.
-fn sweep_stale_temps(full: &std::path::Path) {
+/// and a harvest would take it for the agent's own file. Only that exact name,
+/// under the pid of a process that wrote for this refresh and is provably dead.
+fn sweep_stale_temps(full: &std::path::Path, writers: &[u32]) {
     let (Some(parent), Some(stem)) = (full.parent(), full.file_stem().and_then(|s| s.to_str()))
     else {
         return;
@@ -376,7 +387,10 @@ fn sweep_stale_temps(full: &std::path::Path) {
             continue;
         };
         if let (Ok(pid), Ok(_)) = (pid.parse::<u32>(), n.parse::<u64>()) {
-            if crate::lock::pid_is_dead(pid) && e.file_type().is_ok_and(|t| t.is_file()) {
+            if writers.contains(&pid)
+                && crate::lock::pid_is_dead(pid)
+                && e.file_type().is_ok_and(|t| t.is_file())
+            {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -413,7 +427,10 @@ impl Repo {
         onto: Option<&str>,
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<WsRefresh> {
-        self.refuse_on_private("sc ws refresh")?;
+        // The default target is HEAD's branch; an explicit one is checked below.
+        if onto.is_none() {
+            self.refuse_on_private("sc ws refresh")?;
+        }
         if crate::merge_state::in_progress(&self.layout) {
             return Err(Error::MergeInProgress);
         }
@@ -685,21 +702,30 @@ impl Repo {
         // harvest would read the refreshed ones as the agent's own: mark the
         // session, durably, before the first write, with what the retry needs
         // (cleared with the new base).
-        if prior_pending.is_none() {
-            session.pending_refresh = Some(PendingRefresh {
-                target: to,
-                branch: branch.to_string(),
-                workspaces: recorded,
-            });
-            write_manifest(self.layout(), &session)?;
-        } else {
-            // A killed writer may have left staging files with protected plaintext.
-            for job in &jobs {
-                for (p, ..) in &job.plan.writes {
-                    sweep_stale_temps(&safe_join(&job.dir, p)?);
+        let me = std::process::id();
+        match session.pending_refresh.as_mut() {
+            None => {
+                session.pending_refresh = Some(PendingRefresh {
+                    target: to,
+                    branch: branch.to_string(),
+                    workspaces: recorded,
+                    writers: vec![me],
+                });
+            }
+            Some(p) => {
+                // A killed writer may have left staging files with protected
+                // plaintext: remove those of the pids that wrote before.
+                for job in &jobs {
+                    for (path, ..) in &job.plan.writes {
+                        sweep_stale_temps(&safe_join(&job.dir, path)?, &p.writers);
+                    }
+                }
+                if !p.writers.contains(&me) {
+                    p.writers.push(me);
                 }
             }
         }
+        write_manifest(self.layout(), &session)?;
         before_apply_hook();
         let mut report = Vec::with_capacity(jobs.len());
         let mut done = 0;
@@ -1403,6 +1429,18 @@ mod tests {
         for f in [&stale, &alive, &user] {
             std::fs::write(f, "plaintext\n").unwrap();
         }
+        // Only pids that wrote for this refresh are swept: the killed writer's,
+        // not any other process's.
+        let other = dirs[0].join("b.4000001.7.tmp");
+        std::fs::write(&other, "someone else's\n").unwrap();
+        let mut session = repo.ws_session(None).unwrap().unwrap();
+        session
+            .pending_refresh
+            .as_mut()
+            .unwrap()
+            .writers
+            .push(4_000_000);
+        write_manifest(repo.layout(), &session).unwrap();
         // The first attempt had written a.txt then died; the staging files are
         // beside b.txt, which the retry writes.
         let err = repo.ws_refresh(None, None, None);
@@ -1410,7 +1448,10 @@ mod tests {
         // fresh candidate, but a retry plans from the record and only sweeps.
         err.unwrap();
         assert!(!stale.exists(), "a dead writer's staging file is removed");
-        assert!(alive.exists() && user.exists(), "anything else stays");
+        assert!(
+            alive.exists() && user.exists() && other.exists(),
+            "anything else stays"
+        );
         cleanup(repo, &root);
     }
 
@@ -1480,6 +1521,75 @@ mod tests {
             .to_string();
         assert!(err.contains("secret/x changed in the workspace"), "{err}");
         assert_eq!(read(&dir, "secret/x"), "agent edit\n");
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_tip_that_drops_protection_but_keeps_the_ciphertext_is_refused() {
+        let (repo, root) = init("downgrade");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "secret x\n").unwrap();
+        let base = repo.commit("t", "protected").unwrap();
+        let s = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        // A tip with the same ciphertext blob, listed as an ordinary file.
+        let snap = repo.snapshot(&base).unwrap();
+        let cipher = {
+            let a = repo.vfs().store();
+            let mut st = a.lock().unwrap();
+            let entries = worktree::tree_file_entries_with_perms(&mut st, snap.root).unwrap();
+            match st.get(&entries["secret/x"].0).unwrap() {
+                Object::Blob(b) => b.to_vec(),
+                _ => panic!("not a blob"),
+            }
+        };
+        let tree = repo
+            .vfs()
+            .write_tree_with_perms(&[
+                ("a.txt".into(), LINES.as_bytes().to_vec(), FileMode::FILE, 0),
+                ("secret/x".into(), cipher, FileMode::FILE, 0),
+            ])
+            .unwrap();
+        repo.commit_snapshot(
+            tree,
+            vec![base],
+            Default::default(),
+            Default::default(),
+            "t",
+            "drop",
+        )
+        .unwrap();
+        let err = repo
+            .ws_refresh(None, None, Some(&sk))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no longer protected"), "{err}");
+        assert_eq!(read(&dir, "secret/x"), "secret x\n");
+        assert_eq!(base_of(&repo, None), s.base_snapshot);
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn an_explicit_public_target_works_while_head_is_private() {
+        let (repo, root) = init("private-head");
+        let (sk, _pk) = scl_crypto::generate_keypair();
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let tip = host_commit(&repo, &root, &[("b.txt", Some("b\n"))]);
+        repo.branch_private("secret-work", &sk, &[], &[]).unwrap();
+        repo.switch_with_identity("secret-work", Some(&sk)).unwrap();
+        assert!(matches!(
+            repo.ws_refresh(None, None, None),
+            Err(Error::PrivateUnsupported(_))
+        ));
+        let r = repo.ws_refresh(None, Some("main"), None).unwrap();
+        assert_eq!(r.to, tip);
+        assert_eq!(read(&s.workspaces[0].dir, "b.txt"), "b\n");
+        assert!(matches!(
+            repo.ws_refresh(None, Some("secret-work"), None),
+            Err(Error::PrivateUnsupported(_))
+        ));
         cleanup(repo, &root);
     }
 
