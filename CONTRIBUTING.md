@@ -40,7 +40,10 @@ integration tests — if you touch a subsystem, run the relevant `demo/run_*.sh`
 CI (`ci.yml`) runs `fmt --check`, `clippy -D warnings`, `cargo test --workspace
 --all-targets` (Linux and macOS) and `cargo doc` for the Rust workspace, plus a
 `desktop` job (`npm ci`, `npm audit --audit-level=high`, typecheck, test).
-Your PR must be green on all of them. Dependency changes also run the RustSec
+An advisory `windows` job (`cargo check` and `clippy` for the workspace, plus
+the `scl-repo` `cache::` tests, which verify the owner-only ACL on
+`.sc/local-key`) is not a required check; keep it green when you touch
+Windows-specific code. Your PR must be green on all required jobs. Dependency changes also run the RustSec
 `audit` workflow, and CodeQL, Scorecard, the SBOM generation, the
 `vendor-provenance` check and a nightly `wire_decode` fuzz run live in their own
 workflows. In addition:

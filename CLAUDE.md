@@ -236,8 +236,9 @@ transport-adjacent. The rest, imperatively:
   (`.sc/protected-cache`, `<ws session root>/cache-<i>`) are never committed and never
   transferred.** Cache saves are best-effort and ordered after ref moves; a
   cache failure may cause a spurious re-seal but never incorrectness. The key
-  is owner-only on unix only; non-unix keeps default permissions and warns once
-  (#214, ACL deferred).
+  is owner-only on unix (`0600`) and Windows (single-ACE protected DACL, from the first byte;
+  `crates/repo/src/winacl.rs`); other targets, or a failed Windows ACL call, keep default
+  permissions and warn once (#214).
 - **Revoke is standing-only.** A revoked recipient keeps decrypting ciphertext
   sealed before the revoke (they hold the old wraps); cryptographic cutover is
   `sc rewrap --rotate` at the tip (fresh key per protected blob; a plain
@@ -351,8 +352,7 @@ transport-adjacent. The rest, imperatively:
 
 Deferred work is tracked in **`ROADMAP.md` → Deferred** (single source of
 truth — do not re-list items here); entries that name an issue mirror the open
-GitHub issues. Standing entries: the non-unix
-`.sc/local-key` ACL (#214), and the open
+GitHub issues. Standing entry: the open
 user-file safety limits of the sparse guard (ADR-0034 refinement 8).
 
 ## Agent skills

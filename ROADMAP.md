@@ -642,7 +642,8 @@ across every phase.
   - Checkout restores the executable bit on the write-out paths (#242, #243);
     `sc resolve` after a deleted conflicted file restores it too.
   - A warning when the protected-cache key cannot be permission-restricted on a
-    non-unix target (#225; the owner-only ACL is #214).
+    non-unix target (#225), and an owner-only Windows ACL on `.sc/local-key`,
+    verified by the advisory `windows` CI job (#214).
 
 ## Active
 
@@ -810,12 +811,6 @@ P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
 - **`sc rewrap` on partial clones — refused (P37).** `Repo::rewrap` calls
   `refuse_on_partial`; a paths-only/streaming rebuild that would lift the
   refusal remains a possible follow-on.
-- **Non-unix local-key permissions (#214, P33 follow-on).** `.sc/local-key` is
-  minted 0600-from-first-byte on unix only. On a non-unix target it keeps default
-  permissions and `sc` warns once when a cache holds a protected entry (#225; the
-  exposure is bounded, see THREAT-MODEL.md). Deferred: an owner-only Windows ACL
-  (`windows-sys` is already in `Cargo.lock`) and a manual check on a real Windows
-  host.
 - **fd secret injection beyond `sc run` (ADR-0052 follow-on).** `sc run
   --secrets-fd N` shipped. Not built: the same mode for `sc ws run` and
   `sc work --with-secrets`, and a stdin variant.
