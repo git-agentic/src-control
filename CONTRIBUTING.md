@@ -44,10 +44,11 @@ An advisory `windows` job (`cargo check` and `clippy` for the workspace, plus
 the `owner_only`, `cache::`, serve-key, `tlsio` identity and keygen tests, which
 verify the owner-only ACL on `.sc/local-key`, the `sc keygen` identity and the TLS
 serve key) is not a required check; keep it green when you touch
-Windows-specific code. Your PR must be green on all required jobs. Dependency changes also run the RustSec
-`audit` workflow, and CodeQL, Scorecard, the SBOM generation, the
-`vendor-provenance` check and a nightly `wire_decode` fuzz run live in their own
-workflows. In addition:
+Windows-specific code. Your PR must be green on all required jobs. Changes to
+`Cargo.toml` or `Cargo.lock` also run the RustSec `audit` workflow (it runs daily
+as well). CodeQL, Scorecard, the SBOM generation, the `vendor-provenance` check
+(vendored glib only) and a nightly `wire_decode` fuzz run (also on PRs that touch
+`fuzz/`) live in their own workflows. In addition:
 
 1. **Every new behavior ships with a test.** Tests live in `#[cfg(test)] mod
    tests` next to the code. A test that materializes to disk must clean up after

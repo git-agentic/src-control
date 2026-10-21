@@ -4,7 +4,7 @@ This document consolidates, in one place, the **deliberate security boundaries**
 of src-control's cryptographic features — the things it does *not* defend against
 by design. They are drawn from the per-phase ADRs (linked below); this page
 exists so a newcomer evaluating whether to trust real data to the system does not
-have to read 54 ADRs to find the caveats.
+have to read 57 ADRs to find the caveats.
 
 > **Status: pre-1.0, not independently audited.** These are MVP implementations
 > reviewed by the project's own process only. Do not commit production secrets to
@@ -181,6 +181,11 @@ too, not just the src-control-side metadata.
   structure); or plaintext copied elsewhere by another authorized local tool.
   Phase 35 has no identity import or decryption path, so adding either requires
   a new threat-model review rather than widening these commands in place.
+- **"Read-only" means no refs, objects or working-tree files.** Each query
+  briefly takes the repository's single-writer lock, and opening the repository
+  can update derived indexes (`.sc/transcript-drops`, `.sc/transcript-pending`
+  when the trusted-signer set changed, and the one-time import into
+  `.sc/signatures.v2`), best effort; no key material is involved.
 
 ## Signed commits & provenance (`sc commit --sign` / `sc verify`) — ADR-0032
 
@@ -206,6 +211,19 @@ too, not just the src-control-side metadata.
   verified at fetch/clone) is its own trust-model effort, not a corner of an
   unrelated map. Revisit triggers: the first real multi-writer or hosted `sc
   serve` deployment, or hosting sc repos on untrusted infrastructure.
+- **Received signatures are verified before they are indexed (ADR-0038 addenda,
+  #230/#257).** The index (`.sc/signatures.v2`) takes a signature only when its
+  target is held and it verifies under the key it names, in the signing domain of
+  its target kind. A forged or dangling signature that arrives in a pack stays in
+  the object store until gc but is never indexed, so ingest cannot turn a
+  snapshot `Invalid`: it reads `Unsigned`, which `sc verify --require` also
+  rejects. Trust fails closed, but a forgery attempt is reported as an absent
+  signature, not as an invalid one. A bucket
+  remote forwards the signatures it holds without checking them; the receiver
+  filters. The index keeps one slot per (target, signer). **Downgrade:** an
+  older binary's `sc gc` roots only the legacy `.sc/signatures` file and sweeps
+  signatures that only the v2 file lists, so do not run one on a repo this build
+  has signed in or ingested into.
 
 ## Agent session transcripts (`sc transcript`) — ADR-0038
 
@@ -242,7 +260,13 @@ too, not just the src-control-side metadata.
   cannot crowd out the real one (resolved, #257); they cost a line and a
   check each. Index updates on the serve path take a short `.sc/index.lock`, so
   concurrent pushes and local commands do not lose index or pending entries
-  (resolved, #260). Writers
+  (resolved, #260). The lock is an advisory `flock` on a file that is never
+  removed, held only for single index updates, and waited for at most 30
+  seconds; past that the ingest fails with `IndexBusy` after its objects are
+  stored, and the signatures stay unindexed on that remote: they are not served
+  and its gc sweeps them after the grace window (no reindex of a remote is built,
+  and a re-push skips objects the remote already holds). Advisory locking is only as reliable as the filesystem's `flock` (not
+  guaranteed on NFS). Writers
   can also evict pending entries from a push-only remote (trust the signer
   before the push). Trust is checked at evaluation and is not retroactive. A tombstone a remote already held before
   upgrading to a build with the pending index is not remembered: trust the
@@ -399,8 +423,14 @@ too, not just the src-control-side metadata.
   `--max-pack-size`, `--max-conn-bytes` and `--max-object-size` are the bounds
   that also apply to `--stdio` (the connection, timeout and TLS knobs are
   `--http` only).
+- **The wire protocol is version 6, matched exactly.** Each side refuses a peer
+  of another version at the handshake, in both directions, so a stale client or
+  server cannot be talked into an older, weaker framing. This is compatibility,
+  not authentication: any peer that speaks version 6 and passes the access gates
+  is served. An `ssh://` remote runs the remote host's own `sc`, so that binary
+  must match too.
 
-## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046
+## Bucket remotes (`sc+wal://` / `sc+s3://`) — ADR-0046/0057
 
 - **The bucket is untrusted storage with cooperative writers, not a trusted
   peer.** Unlike `sc serve`, no process authenticates a push or enforces
@@ -460,7 +490,34 @@ too, not just the src-control-side metadata.
   leases as the real fix); (b) a hostile write that fills `log/` or
   `checkpoints/` with junk is reclaimed once it falls behind the cutoff; junk
   at a far-future seq never falls behind it, and an undecodable one stops pack
-  deletion (fail closed, the report names the key to remove by hand). Use `--dry-run` first on a new bucket.
+  deletion (fail closed, the report names the key to remove by hand). Use
+  `--dry-run` first on a new bucket: it deletes and uploads nothing, but it
+  downloads and decodes the same candidate packs a real run would, so on S3 it
+  costs the same egress and requests. A `--prune-expire` under 1h is refused
+  unless `--allow-short-grace` is given, which is only safe while nothing
+  pushes to or fetches from the bucket.
+- **Manifest CAS retries are bounded, and contention is a denial of service,
+  not a bypass.** `update_ref` retries a lost compare-and-swap up to 16 attempts
+  with a jittered, capped exponential backoff (about 2.5 s in total at worst),
+  then fails with "manifest cas contention". A busy fleet or a hostile writer
+  can starve a pusher this way and force a rerun; it cannot move a ref the
+  pusher did not ask for, and every retry re-reads the manifest it races.
+- **`DirBucket` (`sc+wal://<dir>`) is a single-host, local-filesystem backend,
+  and its CAS lock has limits (#264).** The lock is an OS advisory file lock
+  (`File::lock`, `flock` on unix) on `<root>/.cas-lock`; it replaced a
+  create-exclusive spin file. (a) The file is never removed, and `list` skips
+  it. (b) `lock()` blocks without a timeout: a holder that stalls while holding
+  it (a suspended process, a hung filesystem) blocks every writer of that
+  directory until it is released; the OS drops the lock when the holder dies.
+  (c) Binaries from before and after #264 do not exclude each other: the old
+  one does not take the OS lock and the new one ignores its create-exclusive
+  file, so running both against one bucket directory at the same time can lose
+  an update, and an old binary that finds a `.cas-lock` left by a new one fails
+  with "cas lock stuck". Upgrade every user of a directory bucket together. (d)
+  Advisory locks are only as reliable as the filesystem: `flock` on NFS and
+  some other network filesystems is not dependable, so do not share a
+  `DirBucket` across hosts. Use S3, whose CAS is a server-side precondition and
+  is not affected, when more than one machine writes.
 - **Sealed content stays end-to-end sealed, unchanged.** Protected-path
   ciphertext (ADR-0014/0043) and committed secrets travel through a bucket
   remote exactly as through any other transport: a bucket reader without the
@@ -526,17 +583,18 @@ too, not just the src-control-side metadata.
   read is capped at 4 GiB, a constant independent of the object cap (it
   bounds a disk spool, not RAM).
 - **Server cost is bounded per request:** 1024 ids (checked while decoding,
-  before any id is read), the server's `--max-pack-size` over the summed
-  encoded size, and 1 GiB (the largest configurable object cap) per object. The
-  server's own object cap is not applied to replies, since the cap is
-  receiver-only: a lower-cap server serves a larger local object to a client
-  whose cap admits it, as `GetPack` does. The reply ceiling is a constant
-  2 GiB.
+  before any id is read), a ceiling on the summed encoded size of
+  `min(--max-pack-size, 2 GiB)` (the 2 GiB is a constant, independent of the
+  object cap; `--max-pack-size 0` leaves only the 2 GiB), and 1 GiB (the largest
+  configurable object cap) per object. A batch over the ceiling is refused and
+  the client splits it. The server's own object cap is not applied to replies,
+  since the cap is receiver-only: a lower-cap server serves a larger local
+  object to a client whose cap admits it, as `GetPack` does.
 - **Laziness is a local opt-in.** `.sc/promisor-lazy` is never committed or
   transferred; without it a partial clone never dials the remote after clone,
   and `SC_OFFLINE=1` forces that per process.
 
-## Partial clones (`--filter`, `--lazy`, merge and sessions on a clone) — ADR-0037/0047/0048/0049/0050
+## Partial clones (`--filter`, `--lazy`, merge and sessions on a clone) — ADR-0037/0047/0048/0049/0050/0055/0056
 
 - **A partial clone is a store plus one promise, and the promise is about the
   origin (ADR-0048).** Every id referenced by an object the clone holds, that
@@ -580,7 +638,12 @@ too, not just the src-control-side metadata.
   injection). A command run by `sc ws run`
   no longer holds the repo lock (ADR-0056), so an `sc` it runs from inside the
   workspace finds the host repo and can change it, as a hand-started agent always
-  could.
+  could. Several sessions can be open at once (the unnamed one in `.sc/ws/`,
+  named ones in `.sc/ws-<name>/`); their harvests are serialized by the repo
+  lock and the first to land wins, a later conflicting one falls back to a
+  `<name>-<i>` branch. Do not run a binary from before ADR-0056 against a repo
+  with a named session open: its `sc gc` does not root that session's base
+  snapshot.
 - **`sc ws refresh` writes into a workspace the user or an agent may be using
   (ADR-0056).** It overwrites or removes a file only if it still holds what the
   refresh read, checked again right before each write (plain files by bytes,
@@ -589,9 +652,21 @@ too, not just the src-control-side metadata.
   one is in the way. An edit in the instant between that check and the write
   can still be lost. It decrypts a protected path only with the identity passed
   to it and refuses rather than leave a stale plaintext copy; the throwaway
-  candidate seals protected edits like a harvest does and is left for gc. An
-  interrupted refresh leaves a `pending_refresh` marker so harvest cannot treat
-  half-refreshed files as the agent's own work.
+  candidate seals protected edits like a harvest does and is left for gc. It
+  also refuses, before any write, a tip that drops the protection of a path the
+  workspace holds as plaintext (a later harvest would otherwise publish it), and
+  an `.scignore` change that would hide a file the agent added or expose an
+  untracked one a harvest would then commit. An interrupted refresh leaves a
+  `pending_refresh` marker, kept with the target and the per-workspace
+  candidate and result snapshots as gc roots, so harvest and `sc ws run` refuse
+  and a rerun of `sc ws refresh` finishes it; a retry needs `--identity` to
+  resume a protected file it cannot otherwise verify. While the marker is set
+  the manifest's `base_snapshot` reads `refresh-unfinished`, so a binary from
+  before this change fails to parse the manifest, and so does its gc.
+  Known limits: the marker records no per-file progress, so a file
+  the interrupted refresh added and the agent then deleted comes back on the
+  retry, and a power loss (not a process crash) can leave a mode or a deletion
+  to redo.
 - **A blob-size limit (`--filter blob:limit=<size>`, ADR-0055) is request scope
   like the prefix filter, and the server evaluates it.** It hides nothing: any
   client that can read the repository can fetch the left-out blobs (`sc
@@ -619,6 +694,66 @@ too, not just the src-control-side metadata.
   `sc push` to a git remote. They refuse rather than run on partial data.
 - **Laziness is a local opt-in** (see By-id object reads above), and bucket
   remotes refuse `--filter` (see Bucket remotes).
+
+## Working-tree writes (merge, switch, abort, sparse) — ADR-0034 refinements 6-8, ADR-0044
+
+This is data safety for the user's own files, not confidentiality. The checkout
+is user-owned disk that `sc` rewrites during merge, switch, undo, rebase, abort
+and `sparse set`; a stopped operation also writes conflict markers and, for
+protected paths, plaintext.
+
+- **Enforced:**
+  - A merge, switch, cherry-pick, rebase, undo or sparse-spec change refuses,
+    before any write, to lay a file or directory onto an untracked or ignored
+    one (`refuse_untracked_overwrite`), including a path outside the sparse
+    view that the result adds (#248, #251). A refusal changes nothing; move the
+    file away and retry. Not guarded: merging into an unborn branch, and the
+    conflict stop of a merge into a private branch (it checks only out-of-view
+    paths, and refuses a `.theirs` sidecar onto an existing file).
+  - A stop's `materialize` deletes or overwrites a path only if the tree it
+    replaces tracks it and the disk copy is a regular file with exactly the
+    tracked bytes, or the stop itself recorded the path (`.sc/CONFLICT_PLAINTEXT`,
+    `.sc/CONFLICT_SIDECARS`, `.sc/sparse-widen`) and it still matches what was
+    laid. An edit, a replacement or a symlink survives (#255, #256, #259).
+  - `merge --abort`, `cherry-pick --abort` and `rebase --abort` finish past a
+    kept resolution edit instead of refusing, so it cannot trap the user in the
+    stop (a directory holding untracked content, or a blocked parent, still refuses):
+    they restore the tip, drop the stop's state and return an `AbortReport`
+    whose `kept` paths (changed since the stop) and `skipped` protected paths
+    `sc` prints. Recorded plaintext and sidecars are removed whatever their
+    bytes, since an edit of them is the resolution the abort discards.
+  - A file/directory change at one path crosses switch, undo, abort and
+    `--continue` (#247, #250). Emptied directories are cleared, but every
+    directory is checked before the first removal, so a directory that holds a
+    user file refuses and an abort stays retryable.
+  - A sparse view change never counts a case alias of a laid-out path as tracked
+    (#241); where the guard cannot tell, it refuses.
+  - A snapshot never holds one path as both a file and a directory (#278, #280,
+    ADR-0034 refinement 9). An absent protected or out-of-view file is carried
+    back verbatim, so a directory made at its path would otherwise yield a tree
+    with a blob and a tree under one name; both tree builders (public and
+    private-branch) refuse it with `FileDirCollision` before any tree is written,
+    for commit, merge completion, `sc ws harvest` and `sc ws refresh`. Remove the
+    directory and retry.
+- **Not enforced (known limits):**
+  - A user file whose bytes equal the tracked or laid ones cannot be told from
+    the stop's own write, so it is removed.
+  - The private-branch stop keeps no decided root and no record of the bytes it
+    laid, so its `merge --abort` (which needs `--identity`) restores the tip over
+    every path the tip tracks: a post-stop edit of one, or a user file at a path
+    the stop removed, is lost, and a conflicted path counts as the stop's. Private
+    forward operations remove in-view paths on the dirty check alone, without a
+    byte comparison.
+  - Protected old paths are plaintext on disk and cannot be compared without a
+    key: a forward operation still removes a user's plaintext copy, and an abort
+    restores one only if the stop recorded it. A stop recorded by a build before
+    #259 lacks the decrypted entries, so its abort keeps such a file.
+  - A crash after the sidecar record is retired and before the sidecar is
+    unlinked leaves the `.theirs` file unrecorded, and a retried `sc commit`
+    would commit it as ordinary content (ROADMAP.md, Deferred).
+  - On a partial clone the out-of-view check sees only the subtrees the store
+    holds; an addition inside an absent subtree fails the later commit with
+    `GappedPathContent` instead.
 
 ## Untrusted-input hardening (DoS) — ADR-0039
 
@@ -696,8 +831,9 @@ too, not just the src-control-side metadata.
     log entry, idx) is capped at a fixed 256 MiB after the bucket GET has
     buffered it, so it bounds decode work, not the download. It is not tied to
     the operator's cap, so lowering the cap cannot make a bucket unreadable.
-  - By-id reply spools (server ceiling 2 GiB, client read cap 4 GiB) are
-    constants independent of the cap: they bound disk, not RAM.
+  - By-id reply spools (server ceiling `min(--max-pack-size, 2 GiB)`, client
+    read cap 4 GiB) do not depend on the object cap: the 2 GiB and 4 GiB are
+    constants, and the spools bound disk, not RAM.
   - The ceiling (1 GiB) is compile-time, so no configuration can make a length
     claim unbounded.
 
