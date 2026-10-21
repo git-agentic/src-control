@@ -64,6 +64,7 @@ fn keyless_checkout(tag: &str) -> (Repo, PathBuf, scl_core::ObjectId) {
 fn cleanup(repo: Repo, root: &Path) {
     drop(repo);
     std::fs::remove_dir_all(root).unwrap();
+    assert!(!root.exists(), "test root must be removed");
 }
 
 #[test]

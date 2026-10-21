@@ -305,7 +305,17 @@ impl Repo {
 /// private-branch tree builder, which assembles sealed trees itself, applies
 /// the same rule (#278).
 pub fn check_file_dir_collisions<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
-    let set: std::collections::BTreeSet<&str> = paths.into_iter().collect();
+    let mut set = std::collections::BTreeSet::new();
+    for p in paths {
+        // The same path twice (a built file and a carried entry): the tree
+        // would hold two entries of one name. Reported with `file == child`.
+        if !set.insert(p) {
+            return Err(Error::FileDirCollision {
+                file: p.to_string(),
+                child: p.to_string(),
+            });
+        }
+    }
     for p in &set {
         for (i, _) in p.match_indices('/') {
             if set.contains(&p[..i]) {
@@ -615,7 +625,11 @@ mod tests {
             perms: scl_core::PROTECTED,
         };
         assert!(r
-            .write_tree_with_carried(&[f("s/x")], &[("s".into(), carried)])
+            .write_tree_with_carried(&[f("s/x")], &[("s".into(), carried.clone())])
+            .is_err());
+        // The same path as a built file and a carried entry is a collision too.
+        assert!(r
+            .write_tree_with_carried(&[f("s")], &[("s".into(), carried)])
             .is_err());
         // Siblings that merely share a name prefix are fine.
         assert!(r
