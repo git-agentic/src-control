@@ -1380,7 +1380,8 @@ mod tests {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            let joined: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
+            joined.into_iter().map(|r| r.unwrap()).collect()
         });
         let wins = results.iter().filter(|r| r.is_ok()).count();
         let nffs = results
@@ -1400,8 +1401,8 @@ mod tests {
     /// external coordinator. Contention is at the manifest-CAS level only
     /// (every push races the same `manifest` key even though the branches
     /// don't conflict), so every push must land via the retry loop. A
-    /// watchdog turns a stuck worker into a diagnosed abort, and a panicking
-    /// worker releases the others.
+    /// watchdog turns a worker stuck at the gate (a peer panicked before it)
+    /// into a diagnosed abort.
     fn fleet_lands(tag: &str, n: usize) {
         use crate::test_support::{note, watchdog, Status, Stop};
         use std::sync::atomic::AtomicBool;
@@ -1418,22 +1419,32 @@ mod tests {
         std::thread::scope(|s| {
             let _finish = Stop(&finished, true);
             watchdog(s, &finished, &status, std::time::Duration::from_secs(120));
-            for i in 0..n {
-                let (broot, gate, status) = (broot.clone(), &gate, &status);
-                s.spawn(move || {
-                    note(status, format!("writer-{i:03}"), "setup".into());
-                    let t =
-                        BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap()))
-                            .unwrap();
-                    let obj = Object::blob(format!("agent-{i}").into_bytes());
-                    t.put_object(&obj.id(), &obj.encode()).unwrap();
-                    note(status, format!("writer-{i:03}"), "at the gate".into());
-                    gate.wait();
-                    note(status, format!("writer-{i:03}"), "update_ref".into());
-                    t.update_ref(&format!("work-{i}"), &obj.id(), None)
-                        .unwrap_or_else(|e| panic!("writer {i} of {n}: {e}"));
-                    note(status, format!("writer-{i:03}"), "landed".into());
-                });
+            let workers: Vec<_> = (0..n)
+                .map(|i| {
+                    let (broot, gate, status) = (broot.clone(), &gate, &status);
+                    s.spawn(move || {
+                        note(status, format!("writer-{i:03}"), "setup".into());
+                        let t = BucketTransport::from_bucket(Box::new(
+                            DirBucket::open(&broot).unwrap(),
+                        ))
+                        .unwrap();
+                        let obj = Object::blob(format!("agent-{i}").into_bytes());
+                        t.put_object(&obj.id(), &obj.encode()).unwrap();
+                        note(status, format!("writer-{i:03}"), "at the gate".into());
+                        gate.wait();
+                        note(status, format!("writer-{i:03}"), "update_ref".into());
+                        t.update_ref(&format!("work-{i}"), &obj.id(), None)
+                            .unwrap_or_else(|e| panic!("writer {i} of {n}: {e}"));
+                        note(status, format!("writer-{i:03}"), "landed".into());
+                    })
+                })
+                .collect();
+            // Join every worker before `_finish` drops: the watchdog must keep
+            // running until the last one is done, or a worker stuck at the gate
+            // (its peer panicked) hangs the scope with no diagnostic.
+            let results: Vec<_> = workers.into_iter().map(|h| h.join()).collect();
+            for r in results {
+                r.unwrap();
             }
         });
         let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
@@ -1448,6 +1459,16 @@ mod tests {
     #[test]
     fn fleet_hammer_distinct_branches_all_land_without_coordinator() {
         fleet_lands("fleet", 8);
+    }
+
+    /// The #271 measurement: 48 simultaneous pushers, more than the 16-attempt
+    /// budget. Passes on an idle machine; heavy load can still exhaust the
+    /// budget (documented in ADR-0046), so it is not part of the default run.
+    /// `cargo test -p scl-repo wide_fleet -- --ignored`
+    #[test]
+    #[ignore = "stress: load-dependent by design"]
+    fn wide_fleet_of_48_pushers_lands_on_an_idle_machine() {
+        fleet_lands("fleet-wide", 48);
     }
 
     /// A bucket whose manifest CAS loses the first `lose` attempts (as if a
@@ -1535,6 +1556,7 @@ mod tests {
                 .unwrap()
         };
         assert!(max_us(1) < 4_000);
+        assert!(max_us(8) > 4_000, "the ceiling must grow with the attempt");
         assert!(max_us(3) < 16_000);
         assert!(max_us(15) < 250_000);
         let total: std::time::Duration = (1..MAX_CAS_RETRIES).map(|_| cas_backoff(15)).sum();

@@ -251,14 +251,18 @@ exhausting them is still the documented outcome ("manifest cas contention:
 gave up after 16 attempts"; the push is safe to rerun). Two things changed:
 
 - **Jittered exponential backoff between attempts.** Attempt `n > 0` first
-  sleeps a uniform random time in `[0, min(2 ms << n, 250 ms))`, so one push
-  waits at most about 3.75 s in total (average about half). A lost CAS always
+  sleeps a uniform random time in `[0, min(2 ms << n, 250 ms))`, the ceilings
+  are 4, 8, 16, 32, 64, 128 ms and then 250 ms, so one push sleeps about 2.5 s
+  in the worst case (about 1.25 s on average). A lost CAS always
   means a rival landed, so a fleet retrying in lockstep keeps colliding and an
   unlucky writer can burn all 16 attempts while every rival succeeds. Measured
   with 48 simultaneous pushers to distinct branches on an idle machine: 0 of 20
   runs landed everyone without backoff, 40 of 40 with it. The budget stays
-  finite; there is no queue, so a very large fleet on a heavily loaded host can
-  still exhaust it and must rerun the push.
+  finite; there is no queue, so a large fleet on a heavily loaded host can
+  still exhaust it and must rerun the push (48 pushers at load average ~20: 5
+  of 6 runs still hit the budget). The `--ignored` test
+  `wide_fleet_of_48_pushers_lands_on_an_idle_machine` reproduces the idle-host
+  measurement.
 - **The `DirBucket` CAS lock is an OS advisory lock** (#264), not a
   create-exclusive spin file. The spin lock gave up after 2000 tries with
   "cas lock stuck" under load; that, not the retry budget, was what failed
