@@ -110,9 +110,17 @@ pub(crate) fn create_new_owner_only(path: &Path) -> io::Result<File> {
         .encode_utf16()
         .chain([0])
         .collect();
-    // shortcut: no `\\?\` prefix for paths of 260+ chars (std adds one), so those
-    // fail here and take the default-permissions fallback; upgrade if that bites.
-    let wpath: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // Canonicalizing the parent yields a `\\?\` path, so worktrees whose key path
+    // is 260+ chars still get the ACL (CreateFileW has no implicit long-path
+    // support). The file itself does not exist yet, so only the parent can be
+    // canonicalized.
+    let full = match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => {
+            std::fs::canonicalize(dir)?.join(name)
+        }
+        _ => path.to_path_buf(),
+    };
+    let wpath: Vec<u16> = full.as_os_str().encode_wide().chain([0]).collect();
     if wpath[..wpath.len() - 1].contains(&0) {
         return Err(io::ErrorKind::InvalidInput.into());
     }

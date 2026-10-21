@@ -106,7 +106,9 @@ file changed. Detection is a per-checkout stat cache (`crates/repo/src/cache.rs`
   the current user, also from the first byte (`crates/repo/src/winacl.rs`). Other
   targets, or a failed ACL call, keep default permissions with a one-time
   warning, because checkout already writes the same plaintext to the working
-  tree with default permissions (see THREAT-MODEL.md). The per-checkout cache file itself
+  tree with default permissions (see THREAT-MODEL.md). Windows keys created
+  before #214 keep their inherited DACL and no longer warn; delete
+  `.sc/local-key` to recreate it owner-only. The per-checkout cache file itself
   (below) is written via `atomic_write_durable`.
 - Per-checkout cache files: `.sc/protected-cache` for the main working tree;
   `.sc/ws/cache-<i>` per ws workspace (see below). Each entry is

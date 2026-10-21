@@ -88,7 +88,12 @@ too, not just the src-control-side metadata.
   advisory `windows` CI job reads it back with `icacls`). Windows keys minted
   before #214 keep their inherited DACL, and the warning no longer fires for
   them; delete `.sc/local-key` to have the next run recreate it owner-only (the
-  cost is one round of spurious re-seals). On any other target, or if the Windows
+  cost is one round of spurious re-seals). The Windows DACL grants no explicit
+  access to SYSTEM or Administrators, so backup and admin tooling can still take
+  ownership of the file, as root can read a `0600` file on unix. The `sc keygen`
+  identity file and the TLS serve key still have no Windows owner-only
+  protection (tracked in #281); keygen now refuses to overwrite an existing
+  identity on every platform. On any other target, or if the Windows
   ACL call fails, the key and the cache files are written with inherited default
   permissions, and `sc` prints a one-time stderr warning once a cache holds a
   protected entry. The exposure then is small: checkout already writes protected
