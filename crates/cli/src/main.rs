@@ -1669,8 +1669,8 @@ fn resolve_identity_path(flag: Option<PathBuf>) -> PathBuf {
 /// `sc keygen`: generate a v2 identity — a single random seed from which both
 /// the X25519 encryption key and the Ed25519 signing key are deterministically
 /// derived (`scl_crypto::generate_identity_v2`). Only the seed (the `scl-id-`
-/// line) is written to disk, 0600, and never echoed to stdout — it is the
-/// whole private identity, encryption *and* signing, so it gets the same
+/// line) is written to disk, owner-only (0600 / Windows DACL), and never
+/// echoed to stdout — it is the whole private identity, encryption *and* signing, so it gets the same
 /// discipline the v1 private key always had (see the P5-scanner memory: an
 /// identity file is scanner-bait and must stay outside any working tree).
 /// Both PUBLIC halves are printed, with registration hints for both
@@ -1699,17 +1699,14 @@ fn run_keygen(out: Option<PathBuf>) -> Result<()> {
         .expect("generate_identity_v2 always derives a signing half");
     let enc_pk = identity.enc.public();
     let sig_pk = signing.public();
-    // Create the key file 0600 *atomically* so the private key is never visible
-    // group/world-readable through the umask window between write and chmod.
-    // `create_new(true)` refuses to clobber an existing identity, on every
-    // platform. Windows has no owner-only protection for this file (#281).
+    // Create the key file owner-only *atomically* (unix 0600, Windows protected
+    // DACL) so the private key is never visible to other users through a
+    // window between write and chmod/ACL. `create_new` semantics refuse to
+    // clobber an existing identity, on every platform. If Windows cannot apply
+    // the ACL, the file gets default permissions and a one-time warning.
     {
         use std::io::Write;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-        let mut f = opts.open(&path).map_err(|e| {
+        let mut f = scl_core::owner_only::create_new_owner_only_or_warn(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 anyhow::anyhow!(
                     "identity already exists at {} (refusing to overwrite)",

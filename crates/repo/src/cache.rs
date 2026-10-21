@@ -36,7 +36,7 @@ use crate::error::{Error, Result};
 use crate::layout::Layout;
 
 /// Whether `.sc/local-key` can be created readable by its owner only: unix
-/// (`mode(0o600)`) and Windows (owner-only DACL, `winacl`), both from the first
+/// (`mode(0o600)`) and Windows (owner-only DACL, `scl_core::owner_only`), both from the first
 /// byte. Elsewhere, or after a Windows ACL failure, the key keeps default
 /// permissions and a warning is printed. Tests force `false` via
 /// `force_unrestricted_for_test`.
@@ -142,12 +142,7 @@ fn write_key_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn create_key_file(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+    scl_core::owner_only::create_new_owner_only(path)
 }
 
 /// Windows: owner-only DACL from the first byte; if that cannot be applied,
@@ -155,7 +150,7 @@ fn create_key_file(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(windows)]
 fn create_key_file(path: &Path) -> std::io::Result<std::fs::File> {
     key_file_or_fallback(
-        crate::winacl::create_new_owner_only(path),
+        scl_core::owner_only::create_new_owner_only(path),
         || create_key_file_default(path),
         &ACL_FAILED,
         &WARNED,
@@ -452,22 +447,7 @@ mod tests {
             "ACL path must not have fallen back"
         );
 
-        let path = layout.local_key_path();
-        let out = std::process::Command::new("icacls")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "icacls failed: {out:?}");
-        let text = String::from_utf8_lossy(&out.stdout).to_string();
-        let acl = text.replace(path.to_str().unwrap(), "");
-        let aces: Vec<&str> = acl.lines().filter(|l| l.contains(":(")).collect();
-        let user = std::env::var("USERNAME").unwrap().to_lowercase();
-        assert_eq!(aces.len(), 1, "exactly one ACE expected:\n{text}");
-        let ace = aces[0].trim().to_lowercase();
-        assert!(
-            ace.contains(&format!("\\{user}:(")) && ace.contains("(f)") && !ace.contains("(i)"),
-            "ACE must be an explicit full-control grant to {user}:\n{text}"
-        );
+        crate::test_support::assert_owner_only_dacl(&layout.local_key_path());
         cleanup(&layout);
     }
 

@@ -3,6 +3,8 @@
 //! regenerate only when missing; the cert carries a far-future not_after so
 //! renewal never bites a pinned deployment (pins are on the SPKI anyway).
 
+use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
@@ -17,11 +19,18 @@ pub struct ServerIdentity {
     pub spki_sha256: [u8; 32],
 }
 
-/// Load `dir/cert.pem` + `dir/key.pem`, minting both (key mode 0600) when
-/// the CERT is absent. A dir with a cert but no key (or vice versa) is an
+/// Load `dir/cert.pem` + `dir/key.pem`, minting both when the CERT is absent.
+/// The private key is created through `create_key`, which must create a NEW
+/// file (failing with `AlreadyExists` if present) readable by its owner only
+/// from the first byte. This crate is a leaf that may not depend on a
+/// workspace crate, so the owner-only primitive (unix `0600`, Windows DACL;
+/// `scl_core::owner_only`) is injected by the caller rather than duplicated here. A dir with a cert but no key (or vice versa) is an
 /// error, not a silent re-mint — regenerating over half an identity would
 /// invalidate every client pin without the operator asking for it.
-pub fn load_or_mint(dir: &Path) -> Result<ServerIdentity> {
+pub fn load_or_mint(
+    dir: &Path,
+    create_key: &dyn Fn(&Path) -> std::io::Result<File>,
+) -> Result<ServerIdentity> {
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     match (cert_path.exists(), key_path.exists()) {
@@ -36,7 +45,7 @@ pub fn load_or_mint(dir: &Path) -> Result<ServerIdentity> {
                 .self_signed(&key)
                 .map_err(|e| Error::Mint(e.to_string()))?;
             std::fs::write(&cert_path, cert.pem())?;
-            write_key_0600(&key_path, key.serialize_pem().as_bytes())?;
+            create_key(&key_path)?.write_all(key.serialize_pem().as_bytes())?;
             load_pem(&cert_path, &key_path)
         }
         _ => Err(Error::Mint(format!(
@@ -65,27 +74,8 @@ pub fn load_pem(cert: &Path, key: &Path) -> Result<ServerIdentity> {
     })
 }
 
-#[cfg(unix)]
-fn write_key_0600(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_key_0600(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes)?;
-    Ok(())
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
@@ -94,33 +84,49 @@ mod tests {
         d
     }
 
+    /// Stand-in for the caller's owner-only creator: this leaf crate only
+    /// checks that the key goes through it; the real one is tested in
+    /// `scl_core::owner_only` and via `scl-repo`'s serve identity.
+    pub(crate) fn plain_create(path: &Path) -> std::io::Result<File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+
     #[test]
-    fn mint_then_load_is_idempotent_and_key_is_0600() {
+    fn mint_then_load_is_idempotent_and_key_goes_through_the_creator() {
         let dir = tmp("mint");
-        let a = load_or_mint(&dir).unwrap();
-        let b = load_or_mint(&dir).unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let spy = |p: &Path| {
+            calls.borrow_mut().push(p.to_path_buf());
+            plain_create(p)
+        };
+        let a = load_or_mint(&dir, &spy).unwrap();
+        let b = load_or_mint(&dir, &spy).unwrap();
         // Second call LOADS (same identity), never re-mints.
         assert_eq!(a.spki_sha256, b.spki_sha256);
         assert_eq!(a.certs, b.certs);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join("key.pem"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "key.pem must be 0600");
-        }
+        assert_eq!(*calls.borrow(), vec![dir.join("key.pem")], "key only, once");
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!dir.exists());
     }
 
     #[test]
+    fn a_failing_creator_aborts_the_mint() {
+        let dir = tmp("deny");
+        let deny = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(load_or_mint(&dir, &deny).is_err());
+        assert!(!dir.join("key.pem").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn half_an_identity_errors_instead_of_silently_reminting() {
         let dir = tmp("half");
-        load_or_mint(&dir).unwrap();
+        load_or_mint(&dir, &plain_create).unwrap();
         std::fs::remove_file(dir.join("key.pem")).unwrap();
-        let err = load_or_mint(&dir).unwrap_err();
+        let err = load_or_mint(&dir, &plain_create).unwrap_err();
         assert!(
             err.to_string().contains("half a TLS identity"),
             "got: {err}"
@@ -132,7 +138,7 @@ mod tests {
     #[test]
     fn load_pem_reads_a_minted_pair() {
         let dir = tmp("pem");
-        let minted = load_or_mint(&dir).unwrap();
+        let minted = load_or_mint(&dir, &plain_create).unwrap();
         let loaded = load_pem(&dir.join("cert.pem"), &dir.join("key.pem")).unwrap();
         assert_eq!(minted.spki_sha256, loaded.spki_sha256);
         std::fs::remove_dir_all(&dir).unwrap();
