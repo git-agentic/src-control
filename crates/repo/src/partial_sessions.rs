@@ -48,7 +48,7 @@ fn harvest_lands_a_clean_merge_and_carries_the_out_of_view_subtrees() {
     std::fs::write(fx.clone_root.join("src/a.txt"), SRC_LAST).unwrap();
     let host_tip = clone.commit("t", "host edit").unwrap();
 
-    let outcomes = clone.ws_harvest(None, None, "t", None).unwrap();
+    let outcomes = clone.ws_harvest(None, None, Some("t"), None).unwrap();
     let merged = match outcomes.as_slice() {
         [WsHarvestOutcome::Landed { merged_tip, .. }] => *merged_tip,
         other => panic!("expected a clean landing, got {other:?}"),
@@ -82,7 +82,7 @@ fn harvest_conflict_falls_back_to_a_branch() {
     std::fs::write(fx.clone_root.join("src/a.txt"), b"uno\ntwo\nthree\n").unwrap();
     let host_tip = clone.commit("t", "host edit").unwrap();
 
-    let outcomes = clone.ws_harvest(None, None, "t", None).unwrap();
+    let outcomes = clone.ws_harvest(None, None, Some("t"), None).unwrap();
     match outcomes.as_slice() {
         [WsHarvestOutcome::FallbackBranch { branch, .. }] => {
             assert_eq!(branch, "work-1");
@@ -125,7 +125,7 @@ fn two_named_sessions_land_independently_under_the_view() {
     std::fs::write(b.workspaces[0].dir.join("src/a.txt"), SRC_LAST).unwrap();
 
     let first = match clone
-        .ws_harvest(Some("a"), None, "t", None)
+        .ws_harvest(Some("a"), None, Some("t"), None)
         .unwrap()
         .as_slice()
     {
@@ -137,7 +137,7 @@ fn two_named_sessions_land_independently_under_the_view() {
         "b is still open"
     );
     let merged = match clone
-        .ws_harvest(Some("b"), None, "t", None)
+        .ws_harvest(Some("b"), None, Some("t"), None)
         .unwrap()
         .as_slice()
     {
@@ -162,7 +162,7 @@ fn harvest_of_an_untouched_workspace_is_unchanged() {
     let fx = Fx::origin("ws-unchanged", |_| {});
     let clone = fx.clone(false);
     clone.ws_fork(None, 1, "t", None).unwrap();
-    let outcomes = clone.ws_harvest(None, None, "t", None).unwrap();
+    let outcomes = clone.ws_harvest(None, None, Some("t"), None).unwrap();
     assert!(matches!(
         outcomes.as_slice(),
         [WsHarvestOutcome::Unchanged { .. }]
@@ -290,7 +290,7 @@ fn a_failing_probe_leaves_no_candidate_branch() {
         Some(b1)
     );
 
-    let err = clone.ws_harvest(None, None, "t", None).unwrap_err();
+    let err = clone.ws_harvest(None, None, Some("t"), None).unwrap_err();
     eprintln!("probe error: {err:?}");
     assert!(
         refs::read_branch_tip(clone.layout(), "work-1")
@@ -349,7 +349,11 @@ fn refresh_moves_a_workspace_without_reading_the_rest() {
     assert!(!dir.join("docs").exists(), "docs is outside the view");
     assert!(!has(&clone, &new_docs), "and was never read or fetched");
 
-    let merged = match clone.ws_harvest(None, None, "t", None).unwrap().as_slice() {
+    let merged = match clone
+        .ws_harvest(None, None, Some("t"), None)
+        .unwrap()
+        .as_slice()
+    {
         [WsHarvestOutcome::Landed { merged_tip, .. }] => *merged_tip,
         other => panic!("expected a landing, got {other:?}"),
     };

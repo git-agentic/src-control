@@ -172,7 +172,7 @@ fn ws_harvest_refuses_a_directory_over_an_absent_protected_file() {
     let dir = s.workspaces[0].dir.clone();
     assert!(!dir.join("secret").exists());
     put(&dir, "secret/agent.txt", "agent\n");
-    let err = repo.ws_harvest(None, None, "t", None).unwrap_err();
+    let err = repo.ws_harvest(None, None, Some("t"), None).unwrap_err();
     assert_collision(&err, "secret", "secret/agent.txt");
     assert_eq!(repo.head_tip().unwrap(), Some(c1), "no ref moved");
     assert!(
@@ -184,7 +184,7 @@ fn ws_harvest_refuses_a_directory_over_an_absent_protected_file() {
     // The session is still open: removing the directory lets it harvest.
     std::fs::remove_dir_all(dir.join("secret")).unwrap();
     put(&dir, "other.txt", "ok\n");
-    let out = repo.ws_harvest(None, None, "t", None).unwrap();
+    let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
     assert_eq!(out.len(), 1);
     cleanup(repo, &root);
 }

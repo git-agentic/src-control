@@ -1122,7 +1122,7 @@ mod tests {
         // The listing now shows the new base.
         let s = repo.ws_session(None).unwrap().unwrap();
         assert_eq!((s.base_branch.as_str(), s.base_snapshot), ("main", tip));
-        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert!(out
             .iter()
             .all(|o| matches!(o, WsHarvestOutcome::Unchanged { .. })));
@@ -1170,7 +1170,7 @@ mod tests {
             "the edits are still edits"
         );
 
-        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         let merged = match out.as_slice() {
             [WsHarvestOutcome::Landed { merged_tip, .. }] => *merged_tip,
             other => panic!("expected a landing, got {other:?}"),
@@ -1206,7 +1206,7 @@ mod tests {
             "the workspace's deletion stays"
         );
         assert!(dir.join("stay.txt").exists());
-        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         let [WsHarvestOutcome::Landed { merged_tip, .. }] = out.as_slice() else {
             panic!("expected a landing, got {out:?}")
         };
@@ -1246,7 +1246,7 @@ mod tests {
         assert!(!d1.join("b.txt").exists() && !d2.join("b.txt").exists());
         assert_eq!(read(&d2, "other.txt"), "two\n");
         // Harvest still works exactly as before: one falls back, one lands.
-        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert!(
             matches!(out[0], WsHarvestOutcome::FallbackBranch { .. }),
             "{out:?}"
@@ -1411,7 +1411,7 @@ mod tests {
         // Harvest would read the refreshed b.txt as the agent's own change, and
         // re-apply it even after the host reverts it: it refuses instead.
         let err = repo
-            .ws_harvest(None, None, "t", None)
+            .ws_harvest(None, None, Some("t"), None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1432,7 +1432,7 @@ mod tests {
             !dirs[0].join("b.txt").exists(),
             "the host's revert is honoured"
         );
-        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert!(
             out.iter()
                 .all(|o| matches!(o, WsHarvestOutcome::Landed { .. })),
@@ -1561,7 +1561,7 @@ mod tests {
         for d in &dirs {
             assert_eq!(read(d, "b.txt"), "b\n");
         }
-        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert!(matches!(out[0], WsHarvestOutcome::Landed { .. }), "{out:?}");
         let head = repo.head_tip().unwrap().unwrap();
         assert_eq!(
@@ -1584,7 +1584,7 @@ mod tests {
         repo.ws_refresh(None, None, None).unwrap();
         assert_eq!(read(&dirs[0], "a.txt"), "one\ntwo\nthree\nFOUR\nfive\n");
         assert!(!dirs[0].join("b.txt").exists());
-        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         assert!(matches!(out[0], WsHarvestOutcome::Landed { .. }), "{out:?}");
         let head = repo.head_tip().unwrap().unwrap();
         assert_eq!(
@@ -2213,7 +2213,7 @@ mod tests {
         // logs/ is tracked on the tip, so a harvest still reads it.
         repo.ws_refresh(None, None, None).unwrap();
         assert_eq!(read(&dir, "logs/a.log"), "agent log edit\n");
-        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         let [WsHarvestOutcome::Landed { merged_tip, .. }] = out.as_slice() else {
             panic!("expected a landing, got {out:?}")
         };
@@ -2483,7 +2483,7 @@ mod tests {
         // untouched workspace is not spuriously changed; the protected edit is.
         assert!(!repo.ws_changed(None, &session.workspaces[0]).unwrap());
         assert!(repo.ws_changed(None, &session.workspaces[1]).unwrap());
-        let out = repo.ws_harvest(None, None, "t", Some(&sk)).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), Some(&sk)).unwrap();
         assert!(
             matches!(out[0], WsHarvestOutcome::Unchanged { .. }),
             "{out:?}"
@@ -2516,7 +2516,7 @@ mod tests {
         repo.ws_refresh(None, None, None).unwrap();
         assert_eq!(read(&dir, "src/b.txt"), "b\n");
         assert!(!dir.join("docs").exists(), "outside the session's view");
-        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let out = repo.ws_harvest(None, None, Some("t"), None).unwrap();
         let [WsHarvestOutcome::Landed { merged_tip, .. }] = out.as_slice() else {
             panic!("expected a landing, got {out:?}")
         };
