@@ -373,7 +373,9 @@ every claim below is checked against the shipped code, not the plan.
    the out-of-view graft (`graft_out_of_sparse`) runs after the builder and
    resolves such a collision by itself; it is not covered by this check.
    Snapshots written before this check may already hold the collision; they
-   still read, but a commit or replay that rebuilds their tree is refused.
+   still read, but a commit or replay that rebuilds their tree is refused, and
+   `sc branch publish` (which rebuilds every inner snapshot) refuses a private
+   branch whose history holds one.
    Pinned for plain commit, merge completion, `ws harvest`, `ws refresh` and a
    private commit by `crates/repo/src/file_dir_collision.rs`; amend, pick and
    rebase completion share `snapshot_files` and are covered by construction.

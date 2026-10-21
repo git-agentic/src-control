@@ -340,7 +340,7 @@ transport-adjacent. The rest, imperatively:
   outside the view (a later commit would take the user's file instead, #248); there any directory at the path refuses, tracked contents or not.
   Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded (except that a private stop refuses a `.theirs` sidecar that would land on an existing file).
 - **A snapshot never holds a path as both a file and a directory (#278).** The
-  one tree builder (`scl_vfs::Repo::build_root`, and `private::build_tree_objects` for private branches) refuses it with
+  tree builders (`scl_vfs::Repo::build_root`, and `private::build_tree_objects` for private branches) refuse it with
   `FileDirCollision { file, child }` before writing any tree. It matters because
   an absent protected or out-of-view file is carried back verbatim: creating a
   directory of that name in a checkout without the key (or outside the view)
