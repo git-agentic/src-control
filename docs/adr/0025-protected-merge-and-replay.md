@@ -136,3 +136,11 @@ deferred.
    `crypto`" rule), `crates/crypto` re-exports `zeroize::Zeroizing` as a
    type alias — the dependency itself stays quarantined; only the type name
    crosses the boundary.
+8. **A carried protected path and a directory at the same path are refused
+   (#278).** Completion carries an absent still-protected path from the decided
+   root (refinement in ADR-0034 and #238). If the user then created a directory
+   with that name, or a file where the decided tree has a protected directory,
+   the snapshot would hold both. The commit fails with a typed
+   `FileDirCollision` naming both paths and moves nothing; the protected
+   ciphertext is never dropped and never replaced by plaintext. See ADR-0034
+   refinement 9.

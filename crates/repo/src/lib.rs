@@ -9,6 +9,8 @@ pub(crate) mod conflict_plaintext;
 pub(crate) mod conflicts;
 pub mod diff3;
 pub mod error;
+#[cfg(test)]
+mod file_dir_collision;
 pub mod fill;
 pub mod gc;
 pub mod git_marks;

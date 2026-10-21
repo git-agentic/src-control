@@ -343,3 +343,26 @@ every claim below is checked against the shipped code, not the plan.
    indistinguishable from the stop's own write and goes; a failed unlink other
    than "not found" is now an error instead of being swallowed. Pinned by
    `user_file_safety.rs` (merge, pick, rebase) and `private_abort.rs`.
+9. **A carried absent path never sits beside a directory of the same name
+   (#278).** The absent-path carry (a still-protected path the committer has
+   no key for, a path outside the sparse view) cannot tell "absent because
+   skipped" from "absent because replaced", so it brings the tip's file back
+   even when the checkout now holds a directory at that path (or a file where
+   the tip had a protected directory). Before, the commit wrote a tree with a
+   blob and a tree under one name. Every snapshot now goes through one tree
+   builder (`scl_vfs::Vfs::build_root`) that refuses a path that is both a file
+   and the parent of another path in the same snapshot, with
+   `scl_vfs::Error::FileDirCollision { file, child }` naming both, before any
+   tree object is written; the ref does not move. We refuse instead of letting
+   the directory win: dropping the carry would destroy ciphertext the committer
+   cannot read (the rule that makes absent protected paths carry at all), and
+   the same holds for an out-of-view file. The fix is the user's: remove the
+   directory, or restore the file (`sc switch` with a key, `sparse set`
+   widening). The check sees one snapshot only, so a file-to-directory change
+   across commits (#247) is untouched. It covers plain commit,
+   amend, merge/pick/rebase completion (`snapshot_files` ends in it), `sc ws
+   harvest` (the error surfaces with no candidate branch and the session still
+   open), `sc ws refresh` (an error before any write) and `sc work` (that
+   agent's harvest result is the error). Private branches build their sealed
+   trees separately and do not carry absent paths, so they are not affected.
+   Pinned by `crates/repo/src/file_dir_collision.rs`.
