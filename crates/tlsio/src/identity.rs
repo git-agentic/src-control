@@ -44,8 +44,11 @@ pub fn load_or_mint(
             let cert = params
                 .self_signed(&key)
                 .map_err(|e| Error::Mint(e.to_string()))?;
-            std::fs::write(&cert_path, cert.pem())?;
+            // Key first: its create-new is the arbiter between two racing
+            // minters, so the loser fails here before it can overwrite the
+            // winner's cert.pem with a cert for a key that lost the race.
             create_key(&key_path)?.write_all(key.serialize_pem().as_bytes())?;
+            std::fs::write(&cert_path, cert.pem())?;
             load_pem(&cert_path, &key_path)
         }
         _ => Err(Error::Mint(format!(
@@ -118,6 +121,10 @@ pub(crate) mod tests {
         let deny = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert!(load_or_mint(&dir, &deny).is_err());
         assert!(!dir.join("key.pem").exists());
+        assert!(
+            !dir.join("cert.pem").exists(),
+            "no half identity left behind"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
