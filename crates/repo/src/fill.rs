@@ -108,7 +108,20 @@ impl Repo {
         ids: &[ObjectId],
         stats: &mut FillStats,
     ) -> Result<()> {
-        for chunk in ids.chunks(crate::wire::MAX_GET_OBJECTS_IDS) {
+        self.fetch_ids_chunked(transport, ids, crate::wire::MAX_GET_OBJECTS_IDS, stats)
+    }
+
+    /// [`Self::fetch_ids_batched`] with the per-request id count as a
+    /// parameter, so a test can cross a chunk boundary without ingesting
+    /// thousands of loose objects (two fsyncs each).
+    fn fetch_ids_chunked(
+        &self,
+        transport: &dyn Transport,
+        ids: &[ObjectId],
+        max_ids: usize,
+        stats: &mut FillStats,
+    ) -> Result<()> {
+        for chunk in ids.chunks(max_ids) {
             self.fetch_ids_split(transport, chunk, stats)?;
         }
         Ok(())
@@ -972,11 +985,15 @@ mod tests {
         }
     }
 
+    /// Cost is deterministic: every ingested object is a durable loose write
+    /// (two fsyncs, F_FULLFSYNC on macOS), so this crosses the chunk boundary
+    /// with 20 ids at 8 per request instead of 2500 at 1024 (that took 25 s
+    /// unloaded and minutes under load, #271).
     #[test]
     fn a_wide_level_is_chunked_by_count_before_anything_is_split_by_size() {
         let fx = Fixture::new("chunks");
         let dst = fx.clone(true);
-        let objs: std::collections::HashMap<ObjectId, Object> = (0..2500u32)
+        let objs: std::collections::HashMap<ObjectId, Object> = (0..20u32)
             .map(|i| {
                 let o = Object::blob(i.to_le_bytes().to_vec());
                 (o.id(), o)
@@ -988,14 +1005,14 @@ mod tests {
             sizes: Default::default(),
         };
         let mut stats = FillStats::default();
-        dst.fetch_ids_batched(&t, &ids, &mut stats).unwrap();
-        // 2500 ids: two full 1024-id requests and one of 452, never split.
-        assert_eq!(*t.sizes.borrow(), vec![1024, 1024, 452]);
+        dst.fetch_ids_chunked(&t, &ids, 8, &mut stats).unwrap();
+        // 20 ids: two full 8-id requests and one of 4, never split.
+        assert_eq!(*t.sizes.borrow(), vec![8, 8, 4]);
         assert_eq!(
             stats,
             FillStats {
                 requests: 3,
-                objects: 2500
+                objects: 20
             }
         );
         fx.cleanup();

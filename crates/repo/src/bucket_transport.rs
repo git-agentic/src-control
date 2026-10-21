@@ -675,6 +675,23 @@ impl crate::reachable::ObjectSource for BucketSource<'_> {
     }
 }
 
+/// Attempts `update_ref` makes at the manifest CAS before it gives up (the
+/// documented "rerun the push" outcome).
+const MAX_CAS_RETRIES: u32 = 16;
+
+/// Pause before CAS attempt number `attempt` (1-based after the first try):
+/// "full jitter" exponential backoff, uniform in `[0, min(2ms << attempt, 250ms))`.
+/// Every lost CAS means a rival landed, so a fleet that retries in lockstep
+/// keeps colliding and an unlucky writer burns its whole budget while all its
+/// rivals succeed (#271). Randomness comes from `RandomState`'s per-instance
+/// keys: no RNG dependency, and the writers' draws differ.
+fn cas_backoff(attempt: u32) -> std::time::Duration {
+    use std::hash::BuildHasher;
+    let ceiling_us = (2_000u64 << attempt.min(16)).min(250_000);
+    let draw = std::collections::hash_map::RandomState::new().hash_one(attempt);
+    std::time::Duration::from_micros(draw % ceiling_us)
+}
+
 impl Transport for BucketTransport {
     fn list_refs(&self) -> Result<Vec<(String, ObjectId)>> {
         self.refresh()?;
@@ -804,8 +821,10 @@ impl Transport for BucketTransport {
         // the bucket regardless (content-addressed, inert orphan garbage if
         // never referenced — correct per spec; `compact` sweeps it later, ADR-0057).
         let pending: Vec<String> = std::mem::take(&mut *self.pending_packs.borrow_mut());
-        const MAX_CAS_RETRIES: u32 = 16;
-        for _ in 0..MAX_CAS_RETRIES {
+        for attempt in 0..MAX_CAS_RETRIES {
+            if attempt > 0 {
+                std::thread::sleep(cas_backoff(attempt));
+            }
             self.refresh()?;
             let (current, prev_tag, head_seq, checkpoint_seq, head_branch) = {
                 let view = self.view.borrow();
@@ -885,9 +904,9 @@ impl Transport for BucketTransport {
             // under the new parent — `pending` (this call's local copy)
             // still lists our packs, so nothing is re-uploaded.
         }
-        Err(Error::Remote(
-            "manifest cas contention: gave up after 16 attempts".into(),
-        ))
+        Err(Error::Remote(format!(
+            "manifest cas contention: gave up after {MAX_CAS_RETRIES} attempts"
+        )))
     }
 }
 
@@ -1333,7 +1352,17 @@ mod tests {
             (obj.id(), obj.encode())
         };
         let gate = std::sync::Barrier::new(2);
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        let status = crate::test_support::Status::default();
         let results: Vec<Result<()>> = std::thread::scope(|s| {
+            // A racer that panics before the gate would leave its peer waiting.
+            let _finish = crate::test_support::Stop(&finished, true);
+            crate::test_support::watchdog(
+                s,
+                &finished,
+                &status,
+                std::time::Duration::from_secs(120),
+            );
             let handles: Vec<_> = [b"racer-a".as_slice(), b"racer-b".as_slice()]
                 .into_iter()
                 .map(|tag| {
@@ -1367,46 +1396,151 @@ mod tests {
         assert!(!broot.exists());
     }
 
-    /// P36a acceptance proof #2: 8 threads push to 8 *distinct* branches
-    /// concurrently with no external coordinator. Contention is at the
-    /// manifest-CAS level only (every push races the same `manifest` key even
-    /// though the branches don't conflict), so every push must eventually
-    /// land via the retry loop.
-    #[test]
-    fn fleet_hammer_distinct_branches_all_land_without_coordinator() {
-        let pid = std::process::id();
-        let broot = std::env::temp_dir().join(format!("scl-bt-fleet-{pid}"));
+    /// `n` threads push to `n` distinct branches at the same instant with no
+    /// external coordinator. Contention is at the manifest-CAS level only
+    /// (every push races the same `manifest` key even though the branches
+    /// don't conflict), so every push must land via the retry loop. A
+    /// watchdog turns a stuck worker into a diagnosed abort, and a panicking
+    /// worker releases the others.
+    fn fleet_lands(tag: &str, n: usize) {
+        use crate::test_support::{note, watchdog, Status, Stop};
+        use std::sync::atomic::AtomicBool;
+        let broot = std::env::temp_dir().join(format!("scl-bt-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&broot);
-        const N: usize = 8;
-        // A barrier forces all N threads to call `update_ref` at essentially
+        // A barrier forces all threads to call `update_ref` at essentially
         // the same instant — without it, short-lived threads could finish
         // one at a time with the OS never actually overlapping them, and
-        // "all N land" would hold even against a broken retry loop that was
+        // "all land" would hold even against a broken retry loop that was
         // never exercised under real contention.
-        let gate = std::sync::Barrier::new(N);
+        let gate = std::sync::Barrier::new(n);
+        let finished = AtomicBool::new(false);
+        let status = Status::default();
         std::thread::scope(|s| {
-            for i in 0..N {
-                let broot = broot.clone();
-                let gate = &gate;
+            let _finish = Stop(&finished, true);
+            watchdog(s, &finished, &status, std::time::Duration::from_secs(120));
+            for i in 0..n {
+                let (broot, gate, status) = (broot.clone(), &gate, &status);
                 s.spawn(move || {
+                    note(status, format!("writer-{i:03}"), "setup".into());
                     let t =
                         BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap()))
                             .unwrap();
                     let obj = Object::blob(format!("agent-{i}").into_bytes());
                     t.put_object(&obj.id(), &obj.encode()).unwrap();
+                    note(status, format!("writer-{i:03}"), "at the gate".into());
                     gate.wait();
-                    // distinct branches: contention is manifest-level only, so
-                    // every one must eventually land via CAS retry.
-                    t.update_ref(&format!("work-{i}"), &obj.id(), None).unwrap();
+                    note(status, format!("writer-{i:03}"), "update_ref".into());
+                    t.update_ref(&format!("work-{i}"), &obj.id(), None)
+                        .unwrap_or_else(|e| panic!("writer {i} of {n}: {e}"));
+                    note(status, format!("writer-{i:03}"), "landed".into());
                 });
             }
         });
         let t = BucketTransport::from_bucket(Box::new(DirBucket::open(&broot).unwrap())).unwrap();
         let refs = t.list_refs().unwrap();
-        assert_eq!(refs.len(), N, "all {N} agent branches present: {refs:?}");
+        assert_eq!(refs.len(), n, "all {n} agent branches present: {refs:?}");
         drop(t);
         std::fs::remove_dir_all(&broot).unwrap();
         assert!(!broot.exists());
+    }
+
+    /// P36a acceptance proof #2: 8 threads, 8 distinct branches.
+    #[test]
+    fn fleet_hammer_distinct_branches_all_land_without_coordinator() {
+        fleet_lands("fleet", 8);
+    }
+
+    /// A bucket whose manifest CAS loses the first `lose` attempts (as if a
+    /// rival landed each time) and then behaves like the real thing.
+    struct LoseCas {
+        inner: DirBucket,
+        lose: std::sync::atomic::AtomicU32,
+        lost: std::sync::atomic::AtomicU32,
+    }
+    impl Bucket for LoseCas {
+        fn get(&self, key: &str, cached: Option<&str>) -> scl_objio::Result<scl_objio::Fetched> {
+            self.inner.get(key, cached)
+        }
+        fn put_new(&self, key: &str, bytes: &[u8]) -> scl_objio::Result<bool> {
+            self.inner.put_new(key, bytes)
+        }
+        fn put_if_tag(
+            &self,
+            key: &str,
+            bytes: &[u8],
+            expected: Option<&str>,
+        ) -> scl_objio::Result<Option<String>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if key == "manifest" && self.lost.load(SeqCst) < self.lose.load(SeqCst) {
+                self.lost.fetch_add(1, SeqCst);
+                return Ok(None);
+            }
+            self.inner.put_if_tag(key, bytes, expected)
+        }
+        fn list(&self, prefix: &str) -> scl_objio::Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+        fn list_meta(&self, prefix: &str) -> scl_objio::Result<Vec<scl_objio::ObjectMeta>> {
+            self.inner.list_meta(prefix)
+        }
+        fn exists(&self, key: &str) -> scl_objio::Result<bool> {
+            self.inner.exists(key)
+        }
+        fn delete(&self, key: &str) -> scl_objio::Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// The CAS retry budget is exact and bounded (#271): losing 15 manifest
+    /// CASes in a row still lands on the 16th attempt, and losing all 16
+    /// gives the documented "rerun the push" error, never a further try.
+    /// Deterministic: the losses are injected, so machine load cannot move
+    /// the outcome (a real fleet's losses depend on scheduling).
+    #[test]
+    fn the_cas_retry_budget_is_exactly_sixteen_attempts() {
+        use std::sync::atomic::AtomicU32;
+        for (lose, lands) in [(15u32, true), (16, false)] {
+            let broot =
+                std::env::temp_dir().join(format!("scl-bt-budget-{lose}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&broot);
+            let t = BucketTransport::from_bucket(Box::new(LoseCas {
+                inner: DirBucket::open(&broot).unwrap(),
+                lose: AtomicU32::new(lose),
+                lost: AtomicU32::new(0),
+            }))
+            .unwrap();
+            let obj = Object::blob(b"budget".to_vec());
+            t.put_object(&obj.id(), &obj.encode()).unwrap();
+            let res = t.update_ref("main", &obj.id(), None);
+            if lands {
+                res.unwrap();
+                assert_eq!(t.list_refs().unwrap().len(), 1, "lose {lose}");
+            } else {
+                let e = res.unwrap_err().to_string();
+                assert!(e.contains("gave up after 16 attempts"), "lose {lose}: {e}");
+            }
+            drop(t);
+            std::fs::remove_dir_all(&broot).unwrap();
+        }
+    }
+
+    /// The pause between CAS attempts is jittered, grows with the attempt, and
+    /// stays under its cap, so total backoff for one push is bounded.
+    #[test]
+    fn cas_backoff_is_bounded_and_grows_to_its_cap() {
+        let max_us = |attempt| {
+            (0..200)
+                .map(|_| cas_backoff(attempt).as_micros())
+                .max()
+                .unwrap()
+        };
+        assert!(max_us(1) < 4_000);
+        assert!(max_us(3) < 16_000);
+        assert!(max_us(15) < 250_000);
+        let total: std::time::Duration = (1..MAX_CAS_RETRIES).map(|_| cas_backoff(15)).sum();
+        assert!(total < std::time::Duration::from_secs(4), "{total:?}");
+        let draws: std::collections::HashSet<_> = (0..50).map(|_| cas_backoff(8)).collect();
+        assert!(draws.len() > 1, "backoff must be jittered");
     }
 
     /// P36a acceptance proof #3: a pusher that died after writing its pack +
