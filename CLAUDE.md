@@ -340,6 +340,14 @@ transport-adjacent. The rest, imperatively:
   away and retry. A directory holding only tracked files is not such a case: a file/directory change at one path crosses switch, undo, abort and `--continue`, and the emptied directories are cleared (#247). `materialize` checks every such directory before its first removal, so a refusal changes nothing and an abort stays retryable; a forward op also refuses a user's empty directory there (it cannot tell it from a husk), while `materialize` itself prunes empty ones. (On a case-insensitive checkout, replacing `foo/a` with a file `Foo` is refused: the check does not follow the case alias. Fail-closed.) On a sparse checkout the same holds for a path the result adds
   outside the view (a later commit would take the user's file instead, #248); there any directory at the path refuses, tracked contents or not.
   Merging into an unborn branch and the conflict stop of a merge into a private branch are not guarded (except that a private stop refuses a `.theirs` sidecar that would land on an existing file).
+- **A snapshot never holds a path as both a file and a directory (#278).** The
+  tree builders (`scl_vfs::Repo::build_root`, and `private::build_tree_objects` for private branches) refuse it with
+  `FileDirCollision { file, child }` before writing any tree. It matters because
+  an absent protected or out-of-view file is carried back verbatim: creating a
+  directory of that name in a checkout without the key (or outside the view)
+  makes the commit, merge completion, `sc ws harvest` or `sc ws refresh` fail
+  until the directory is removed (ADR-0034 refinement 9). Across commits a path
+  may still change kind (#247).
 - **Every ref-moving or commit-creating op (including all secret/protect
   policy ops) is guarded against an in-progress merge/pick/rebase** — finish
   or abort the in-progress op first. A push into a repo with a stopped op is

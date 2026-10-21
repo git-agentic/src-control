@@ -343,3 +343,39 @@ every claim below is checked against the shipped code, not the plan.
    indistinguishable from the stop's own write and goes; a failed unlink other
    than "not found" is now an error instead of being swallowed. Pinned by
    `user_file_safety.rs` (merge, pick, rebase) and `private_abort.rs`.
+9. **A carried absent path never sits beside a directory of the same name
+   (#278).** The absent-path carry (a still-protected path the committer has
+   no key for, a path outside the sparse view) cannot tell "absent because
+   skipped" from "absent because replaced", so it brings the tip's file back
+   even when the checkout now holds a directory at that path (or a file where
+   the tip had a protected directory). Before, the commit wrote a tree with a
+   blob and a tree under one name. Every snapshot now goes through one tree
+   builder (`scl_vfs::Repo::build_root`) that refuses a path that is both a file
+   and the parent of another path in the same snapshot, with
+   `scl_vfs::Error::FileDirCollision { file, child }` naming both, before any
+   tree object is written; the ref does not move. We refuse instead of letting
+   the directory win: dropping the carry would destroy ciphertext the committer
+   cannot read (the rule that makes absent protected paths carry at all), and
+   the same holds for an out-of-view file. The fix is the user's: remove the
+   directory, or restore the file (`sc switch` with a key, `sparse set`
+   widening). The check sees one snapshot only, so a file-to-directory change
+   across commits (#247) is untouched. It covers plain commit,
+   amend, merge/pick/rebase completion (`snapshot_files` ends in it), `sc ws
+   harvest` (the error surfaces with no candidate branch and the session still
+   open), `sc ws refresh` (an error before any write) and `sc work` (that
+   agent's harvest result is the error). Private branches carry absent
+   out-of-view and protected paths too and assemble sealed trees in
+   `private::build_tree_objects`, which runs the same check
+   (`scl_vfs::check_file_dir_collisions`) before building. A workspace that
+   collides stops `sc ws harvest` with the error (workspaces already landed
+   stay landed; the failing one stays live and can be fixed in place), unlike a
+   scanner hit, which is a per-workspace outcome. Limit: on a partial clone
+   the out-of-view graft (`graft_out_of_sparse`) runs after the builder and
+   resolves such a collision by itself; it is not covered by this check.
+   Snapshots written before this check may already hold the collision; they
+   still read, but a commit or replay that rebuilds their tree is refused, and
+   `sc branch publish` (which rebuilds every inner snapshot) refuses a private
+   branch whose history holds one.
+   Pinned for plain commit, merge completion, `ws harvest`, `ws refresh` and a
+   private commit by `crates/repo/src/file_dir_collision.rs`; amend, pick and
+   rebase completion share `snapshot_files` and are covered by construction.

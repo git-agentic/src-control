@@ -23,6 +23,10 @@ pub enum Error {
     NotFound(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A snapshot would hold `file` as a file and also `child` beneath it as a
+    /// directory (#278). Raised before any tree object is written.
+    #[error("{file} would be both a file and a directory in one snapshot (it is also the parent of {child}); a protected or out-of-view path that is absent from this checkout cannot be swapped between file and directory, so remove the conflicting path or restore the missing one")]
+    FileDirCollision { file: String, child: String },
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -156,7 +160,7 @@ impl Repo {
                 map.insert(normalize(path), (id, *mode, *perms));
             }
         }
-        self.build_subtree_inner(&map, &BTreeMap::new(), "")
+        self.build_root(&map, &BTreeMap::new())
     }
 
     /// Like [`write_tree_with_perms`][Self::write_tree_with_perms], and also
@@ -164,7 +168,7 @@ impl Repo {
     /// `path` with its id, mode and perms untouched and nothing below it read.
     /// Ancestor directories are built from `files` and the carried paths
     /// together. A carried path that is also a file, or the ancestor of one, is
-    /// the caller's collision to reject first (`merge::check_path_collisions`).
+    /// a collision `build_root` refuses with [`Error::FileDirCollision`].
     pub fn write_tree_with_carried(
         &self,
         files: &[(String, Vec<u8>, FileMode, u8)],
@@ -182,7 +186,7 @@ impl Repo {
             .iter()
             .map(|(p, e)| (normalize(p), e.clone()))
             .collect();
-        self.build_subtree_inner(&map, &carried, "")
+        self.build_root(&map, &carried)
     }
 
     /// Fork an in-memory worktree from a base snapshot. Cheap: allocates only an
@@ -209,7 +213,25 @@ impl Repo {
             .iter()
             .map(|(p, (id, mode))| (p.clone(), (*id, *mode, 0u8)))
             .collect();
-        self.build_subtree_inner(&with_perms, &BTreeMap::new(), "")
+        self.build_root(&with_perms, &BTreeMap::new())
+    }
+
+    /// The one entry to tree assembly: refuses a path that is both a file and
+    /// the parent directory of another (#278) before any tree object is
+    /// written, then builds the root. Within ONE snapshot only; a path may
+    /// change kind between commits.
+    fn build_root(
+        &self,
+        files: &BTreeMap<String, (ObjectId, FileMode, u8)>,
+        carried: &BTreeMap<String, TreeEntry>,
+    ) -> Result<ObjectId> {
+        check_file_dir_collisions(
+            files
+                .keys()
+                .map(String::as_str)
+                .chain(carried.keys().map(String::as_str)),
+        )?;
+        self.build_subtree_inner(files, carried, "")
     }
 
     /// The single tree builder: reads each blob entry's `perms` byte from the map
@@ -274,6 +296,37 @@ impl Repo {
         let tree = Object::Tree(Tree::new(entries));
         Ok(self.store.lock().unwrap().put(tree)?)
     }
+}
+
+/// Error if any path is a proper ancestor directory of another path in the set
+/// (a name that would be a blob and a tree at once). Sorted order puts every
+/// descendant of `p` after other names (`a`, `a-b`, `a/c`), so checking
+/// neighbours is not enough; look each ancestor up instead. Public so the
+/// private-branch tree builder, which assembles sealed trees itself, applies
+/// the same rule (#278).
+pub fn check_file_dir_collisions<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut set = std::collections::BTreeSet::new();
+    for p in paths {
+        // The same path twice (a built file and a carried entry): the tree
+        // would hold two entries of one name. Reported with `file == child`.
+        if !set.insert(p) {
+            return Err(Error::FileDirCollision {
+                file: p.to_string(),
+                child: p.to_string(),
+            });
+        }
+    }
+    for p in &set {
+        for (i, _) in p.match_indices('/') {
+            if set.contains(&p[..i]) {
+                return Err(Error::FileDirCollision {
+                    file: p[..i].to_string(),
+                    child: (*p).to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A copy-on-write overlay entry.
@@ -543,6 +596,45 @@ mod tests {
 
     fn repo() -> Repo {
         Repo::new(Store::new(StoreConfig::default()))
+    }
+
+    #[test]
+    fn a_path_cannot_be_both_file_and_directory_in_one_snapshot() {
+        let r = repo();
+        let f = |p: &str| (p.to_string(), b"x".to_vec(), FileMode::FILE, 0u8);
+        // Not adjacent in sorted order: `a`, `a-b`, `a/c`.
+        let err = r
+            .write_tree_with_perms(&[f("a"), f("a-b"), f("a/c")])
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::FileDirCollision { file, child } if file == "a" && child == "a/c"),
+            "{err:?}"
+        );
+        assert!(r
+            .write_tree(&[
+                ("x/y".into(), vec![], FileMode::FILE),
+                ("x".into(), vec![], FileMode::FILE)
+            ])
+            .is_err());
+        // A carried entry collides with a built file the same way.
+        let carried = TreeEntry {
+            name: String::new(),
+            kind: EntryKind::Blob,
+            id: Object::blob(b"c".to_vec()).id(),
+            mode: FileMode::FILE,
+            perms: scl_core::PROTECTED,
+        };
+        assert!(r
+            .write_tree_with_carried(&[f("s/x")], &[("s".into(), carried.clone())])
+            .is_err());
+        // The same path as a built file and a carried entry is a collision too.
+        assert!(r
+            .write_tree_with_carried(&[f("s")], &[("s".into(), carried)])
+            .is_err());
+        // Siblings that merely share a name prefix are fine.
+        assert!(r
+            .write_tree_with_perms(&[f("a"), f("a-b"), f("a.b/c"), f("ab/c")])
+            .is_ok());
     }
 
     #[test]
