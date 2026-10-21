@@ -65,7 +65,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: check
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --keep-going
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: key ACL and cache tests
