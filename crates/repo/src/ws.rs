@@ -2678,7 +2678,11 @@ mod tests {
         // unnamed and for a named session alike; `--author` at harvest wins.
         for name in [None, Some("feat")] {
             for (harvest_author, want) in [(None, "alice"), (Some("bob"), "bob")] {
-                let root = tmp_root(&format!("author-{name:?}-{harvest_author:?}"));
+                let root = tmp_root(&format!(
+                    "author-{}-{}",
+                    name.unwrap_or("unnamed"),
+                    harvest_author.unwrap_or("default")
+                ));
                 let repo = init(&root);
                 let s = repo.ws_fork(name, 1, "alice", None).unwrap();
                 assert_eq!(s.author, "alice");
@@ -2692,6 +2696,7 @@ mod tests {
                 assert_eq!(repo.snapshot(&tip).unwrap().author, want);
                 drop(repo);
                 std::fs::remove_dir_all(&root).unwrap();
+                assert!(!root.exists(), "test must leave no residue");
             }
         }
     }
