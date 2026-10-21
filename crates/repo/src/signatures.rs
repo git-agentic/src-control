@@ -400,9 +400,11 @@ pub(crate) fn acceptable(store: &mut scl_core::Store, sig: &SignatureObj) -> Res
 /// The slow scan and its Ed25519 checks run without the index lock. A
 /// serve-path ingest into the same store stores its objects before it
 /// appends (under the lock), so under the lock the rebuild lists the store
-/// again and verifies only the objects that appeared since the first scan
-/// (#270): an append made during the scan is covered by the second listing,
-/// and one made after the rewrite lands on top of it.
+/// again and verifies only the objects that appeared since the first scan, plus
+/// the signatures it saw before their target landed (#270): an append made
+/// during the scan is covered, and one made after the rewrite lands on top of
+/// it. The second listing sees loose objects (what ingest writes), not packs
+/// another handle wrote since this store opened.
 pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
     reindex_with(layout, store, || {})
 }
@@ -415,16 +417,21 @@ fn reindex_with(
     after_scan: impl FnOnce(),
 ) -> Result<usize> {
     let mut entries: Vec<Entry> = Vec::new();
+    let mut waiting: Vec<ObjectId> = Vec::new();
     let scanned: BTreeSet<ObjectId> = store.all_ids()?.into_iter().collect();
-    scan_signatures(store, scanned.iter(), &mut entries)?;
+    scan_signatures(store, scanned.iter(), &mut entries, &mut waiting)?;
     after_scan();
     with_index_lock(layout, || {
+        // Objects that appeared since the scan, and signatures the scan saw
+        // before their target landed (an ingest writes a pack's objects one by
+        // one, so the signature can be listed first): both are judged again.
         let late: Vec<ObjectId> = store
             .all_ids()?
             .into_iter()
             .filter(|id| !scanned.contains(id))
+            .chain(waiting)
             .collect();
-        scan_signatures(store, late.iter(), &mut entries)?;
+        scan_signatures(store, late.iter(), &mut entries, &mut Vec::new())?;
         // One slot per (target, signer): the lowest signature id keeps it, so
         // the rebuild is deterministic. (Sorted by slot first: equal slots
         // must be adjacent for `dedup_by_key`.)
@@ -435,15 +442,19 @@ fn reindex_with(
     })
 }
 
-/// Push an entry for each acceptable signature object among `ids`.
+/// Push an entry for each acceptable signature object among `ids`, and note in
+/// `waiting` the ones refused only because their target is not held yet.
 fn scan_signatures<'a>(
     store: &mut scl_core::Store,
     ids: impl Iterator<Item = &'a ObjectId>,
     entries: &mut Vec<Entry>,
+    waiting: &mut Vec<ObjectId>,
 ) -> Result<()> {
     for id in ids {
         if let Object::Signature(sig) = store.get(id)? {
-            if acceptable(store, &sig)? {
+            if !store.contains(&sig.snapshot) {
+                waiting.push(*id);
+            } else if acceptable(store, &sig)? {
                 entries.push((sig.snapshot, *id, sig.signer));
             }
         }
@@ -1349,5 +1360,48 @@ mod tests {
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn reindex_keeps_a_signature_whose_target_lands_after_the_scan() {
+        use crate::transport::{LocalTransport, Transport};
+        let root = tmp_root("reindex-late-target");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (sig, signer) = put_sig(&repo, snap, false);
+        // The destination holds the signature but not its target yet: an
+        // ingest stores a pack's objects one by one.
+        let snap_obj = repo.store().lock().unwrap().get(&snap).unwrap();
+        let dest_root = tmp_root("reindex-late-target-dest");
+        let dest = Repo::init(&dest_root).unwrap();
+        {
+            let sig_obj = repo.store().lock().unwrap().get(&sig).unwrap();
+            dest.store().lock().unwrap().put(sig_obj).unwrap();
+        }
+        let count = {
+            let arc = dest.store();
+            let mut s = arc.lock().unwrap();
+            reindex_with(dest.layout(), &mut s, || {
+                // The target lands, and the ingest indexes the signature.
+                let t = LocalTransport::open(&dest_root).unwrap();
+                let (pack, _) = scl_core::pack::build_pack(&[(snap, snap_obj.encode())]).unwrap();
+                t.put_pack(&mut &pack[..]).unwrap();
+                let mut s2 = scl_core::Store::open_persistent(
+                    dest.layout().objects_dir(),
+                    crate::repo::default_budget(),
+                )
+                .unwrap();
+                append_entries(dest.layout(), &mut s2, &[(snap, sig, signer)]).unwrap();
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            count, 1,
+            "the signature is judged again once its target is held"
+        );
+        drop((repo, dest));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&dest_root).unwrap();
     }
 }

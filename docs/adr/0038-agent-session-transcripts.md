@@ -654,10 +654,13 @@ scan in `tombstone_honored` never reached it. Now:
 - **`reindex` and a concurrent ingest (#270).** The clone's post-clone
   `signatures::reindex` scans and verifies without the index lock, then under
   the lock lists the store again and verifies only the objects that appeared
-  since the first scan before it rewrites the file. An ingest stores its
-  objects before it appends, so one that lands during the scan is picked up by
-  the second listing and one that lands later appends after the rewrite. No
-  append is lost, and the lock is never held across the full scan.
+  since the first scan, plus the signatures the scan refused only because
+  their target was not held yet (an ingest stores a pack's objects one by one),
+  before it rewrites the file. An ingest stores its objects before it appends,
+  so one that lands during the scan is picked up by the second pass and one
+  that lands later appends after the rewrite. No append is lost, and the lock
+  is never held across the full scan. The second listing sees loose objects
+  (what ingest writes), not packs another handle wrote since the store opened.
 
 ### 2. The index lock (#260)
 
