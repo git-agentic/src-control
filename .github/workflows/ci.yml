@@ -69,7 +69,7 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: key ACL and cache tests
-        run: cargo test -p scl-repo --lib cache::
+        run: cargo test -p scl-repo --lib "cache::"
 
   desktop:
     name: desktop (typecheck + test + audit)
