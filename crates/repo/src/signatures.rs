@@ -396,23 +396,95 @@ pub(crate) fn acceptable(store: &mut scl_core::Store, sig: &SignatureObj) -> Res
 /// through to `index_incoming` — it doesn't depend on the transfer call site
 /// bookkeeping the right ids, only on the objects actually landing on disk.
 /// O(store), which is fine for a one-shot clone of a store that size.
+///
+/// The slow scan and its Ed25519 checks run without the index lock. A
+/// serve-path ingest into the same store stores its objects before it
+/// appends (under the lock), so under the lock the rebuild lists the store
+/// again, after a few unlocked catch-up passes, and verifies only the objects
+/// that appeared since, plus the signatures it saw before their target landed
+/// (#270): an append made during the scan is covered, and one made after the
+/// rewrite lands on top of it. The relisting sees loose objects (what ingest
+/// writes), not packs another handle wrote since this store opened.
 pub(crate) fn reindex(layout: &Layout, store: &mut scl_core::Store) -> Result<usize> {
+    reindex_with(layout, store, || {}, || {})
+}
+
+/// [`reindex`] with hooks so a test can interleave an ingest deterministically:
+/// `after_scan` runs after the first scan, `before_lock` after the unlocked
+/// catch-up passes, so only the locked pass can absorb what it does.
+fn reindex_with(
+    layout: &Layout,
+    store: &mut scl_core::Store,
+    after_scan: impl FnOnce(),
+    before_lock: impl FnOnce(),
+) -> Result<usize> {
     let mut entries: Vec<Entry> = Vec::new();
-    for id in store.all_ids()? {
-        if let Object::Signature(sig) = store.get(&id)? {
-            if acceptable(store, &sig)? {
-                entries.push((sig.snapshot, id, sig.signer));
+    let mut waiting: Vec<ObjectId> = Vec::new();
+    let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
+    scan_new(store, &mut seen, &mut waiting, &mut entries)?;
+    after_scan();
+    // Catch up on what arrived meanwhile without the lock, so the locked pass
+    // below has little left to verify however large a concurrent push was.
+    // Bounded: a writer that keeps adding objects cannot postpone the write.
+    for _ in 0..CATCH_UP_PASSES {
+        if !scan_new(store, &mut seen, &mut waiting, &mut entries)? {
+            break;
+        }
+    }
+    before_lock();
+    with_index_lock(layout, || {
+        scan_new(store, &mut seen, &mut waiting, &mut entries)?;
+        // One slot per (target, signer): the lowest signature id keeps it, so
+        // the rebuild is deterministic. (Sorted by slot first: equal slots
+        // must be adjacent for `dedup_by_key`.)
+        entries.sort_by_key(|e| (e.0, e.2, e.1));
+        entries.dedup_by_key(|e| (e.0, e.2));
+        write_index(layout, &entries)?;
+        Ok(entries.len())
+    })
+}
+
+/// Unlocked catch-up passes `reindex` makes before taking the lock.
+const CATCH_UP_PASSES: usize = 4;
+
+/// One pass of [`reindex`]'s scan: judge the objects not in `seen` yet, plus
+/// the signatures an earlier pass saw before their target landed (an ingest
+/// stores a pack's objects one by one, so a signature can be listed first).
+/// Returns whether any new object was listed.
+fn scan_new(
+    store: &mut scl_core::Store,
+    seen: &mut BTreeSet<ObjectId>,
+    waiting: &mut Vec<ObjectId>,
+    entries: &mut Vec<Entry>,
+) -> Result<bool> {
+    let new: Vec<ObjectId> = store
+        .all_ids()?
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect();
+    let retry = std::mem::take(waiting);
+    scan_signatures(store, new.iter().chain(retry.iter()), entries, waiting)?;
+    Ok(!new.is_empty())
+}
+
+/// Push an entry for each acceptable signature object among `ids`, and note in
+/// `waiting` the ones refused only because their target is not held yet.
+fn scan_signatures<'a>(
+    store: &mut scl_core::Store,
+    ids: impl Iterator<Item = &'a ObjectId>,
+    entries: &mut Vec<Entry>,
+    waiting: &mut Vec<ObjectId>,
+) -> Result<()> {
+    for id in ids {
+        if let Object::Signature(sig) = store.get(id)? {
+            if !store.contains(&sig.snapshot) {
+                waiting.push(*id);
+            } else if acceptable(store, &sig)? {
+                entries.push((sig.snapshot, *id, sig.signer));
             }
         }
     }
-    // One slot per (target, signer): the lowest signature id keeps it, so the
-    // rebuild is deterministic. (Sorted by slot first: equal slots must be
-    // adjacent for `dedup_by_key`.)
-    entries.sort_by_key(|e| (e.0, e.2, e.1));
-    entries.dedup_by_key(|e| (e.0, e.2));
-    let count = entries.len();
-    with_index_lock(layout, || write_index(layout, &entries))?;
-    Ok(count)
+    Ok(())
 }
 
 /// What honoring a drop needs from the index (#257): which targets carry any
@@ -1218,5 +1290,168 @@ mod tests {
         drop(repo);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    /// A pack holding one verifying signature by a fresh key over `target`.
+    fn sig_pack(target: ObjectId) -> (Vec<u8>, ObjectId, [u8; 32]) {
+        let (_s, identity) = scl_crypto::generate_identity_v2();
+        let key = identity.signing.as_ref().unwrap();
+        let obj = Object::Signature(SignatureObj {
+            snapshot: target,
+            signer: key.public().to_bytes(),
+            sig: scl_crypto::sign_snapshot_id(key, target.as_bytes()),
+        });
+        let (pack, _) = scl_core::pack::build_pack(&[(obj.id(), obj.encode())]).unwrap();
+        (pack, obj.id(), key.public().to_bytes())
+    }
+
+    #[test]
+    fn a_signature_free_ingest_retries_a_failed_legacy_import() {
+        use crate::transport::{LocalTransport, Transport};
+        let root = tmp_root("legacy-retry");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (old, signer) = put_sig(&repo, snap, false);
+        let layout = repo.layout().clone();
+        drop(repo);
+
+        // A legacy path that cannot be read (a directory) fails the import at
+        // open, which ignores it.
+        std::fs::create_dir(layout.signatures_legacy_path()).unwrap();
+        let t = LocalTransport::open(&root).unwrap();
+        assert!(!layout.signatures_path().exists());
+        std::fs::remove_dir(layout.signatures_legacy_path()).unwrap();
+        std::fs::write(
+            layout.signatures_legacy_path(),
+            format!("{} {}\n", snap.to_hex(), old.to_hex()),
+        )
+        .unwrap();
+
+        // A pack with no signature in it still retries the import.
+        let blob = Object::blob(b"no signature here".to_vec());
+        let (pack, _) = scl_core::pack::build_pack(&[(blob.id(), blob.encode())]).unwrap();
+        t.put_pack(&mut &pack[..]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(layout.signatures_path()).unwrap(),
+            format!(
+                "{} {} {}\n",
+                snap.to_hex(),
+                old.to_hex(),
+                hex::encode(signer)
+            )
+        );
+        drop(t);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn reindex_keeps_an_ingest_that_lands_during_its_scan() {
+        use crate::transport::{LocalTransport, Transport};
+        // The ingest lands after the first scan, or only after the unlocked
+        // catch-up passes (so just the locked pass can absorb it).
+        for just_before_lock in [false, true] {
+            let root = tmp_root(&format!("reindex-race-{just_before_lock}"));
+            let repo = Repo::init(&root).unwrap();
+            std::fs::write(root.join("a.txt"), b"x").unwrap();
+            let snap = repo.commit("t", "c1").unwrap();
+            let (_s, identity) = scl_crypto::generate_identity_v2();
+            repo.sign_snapshot(snap, &identity).unwrap();
+            let (pack, late_sig, late_signer) = sig_pack(snap);
+
+            // The ingest runs on its own thread and store handle, as a serve
+            // connection would.
+            let ingest_root = root.clone();
+            let ingest = std::cell::RefCell::new(Some(move || {
+                std::thread::spawn(move || {
+                    let t = LocalTransport::open(&ingest_root).unwrap();
+                    t.put_pack(&mut &pack[..]).unwrap();
+                })
+                .join()
+                .unwrap();
+            }));
+            let count = {
+                let arc = repo.store();
+                let mut s = arc.lock().unwrap();
+                reindex_with(
+                    repo.layout(),
+                    &mut s,
+                    || {
+                        if !just_before_lock {
+                            (ingest.borrow_mut().take().unwrap())();
+                        }
+                    },
+                    || {
+                        if just_before_lock {
+                            (ingest.borrow_mut().take().unwrap())();
+                        }
+                    },
+                )
+                .unwrap()
+            };
+            assert_eq!(count, 2, "the signature stored during the scan is indexed");
+            let text = std::fs::read_to_string(repo.layout().signatures_path()).unwrap();
+            assert!(text.contains(&format!(
+                "{} {} {}",
+                snap.to_hex(),
+                late_sig.to_hex(),
+                hex::encode(late_signer)
+            )));
+            assert_eq!(text.lines().count(), 2);
+            drop(repo);
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn reindex_keeps_a_signature_whose_target_lands_after_the_scan() {
+        use crate::transport::{LocalTransport, Transport};
+        let root = tmp_root("reindex-late-target");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        let snap = repo.commit("t", "c1").unwrap();
+        let (sig, signer) = put_sig(&repo, snap, false);
+        // The destination holds the signature but not its target yet: an
+        // ingest stores a pack's objects one by one.
+        let snap_obj = repo.store().lock().unwrap().get(&snap).unwrap();
+        let dest_root = tmp_root("reindex-late-target-dest");
+        let dest = Repo::init(&dest_root).unwrap();
+        {
+            let sig_obj = repo.store().lock().unwrap().get(&sig).unwrap();
+            dest.store().lock().unwrap().put(sig_obj).unwrap();
+        }
+        let count = {
+            let arc = dest.store();
+            let mut s = arc.lock().unwrap();
+            reindex_with(
+                dest.layout(),
+                &mut s,
+                || {
+                    // The target lands, and the ingest indexes the signature.
+                    let t = LocalTransport::open(&dest_root).unwrap();
+                    let (pack, _) =
+                        scl_core::pack::build_pack(&[(snap, snap_obj.encode())]).unwrap();
+                    t.put_pack(&mut &pack[..]).unwrap();
+                    let mut s2 = scl_core::Store::open_persistent(
+                        dest.layout().objects_dir(),
+                        crate::repo::default_budget(),
+                    )
+                    .unwrap();
+                    append_entries(dest.layout(), &mut s2, &[(snap, sig, signer)]).unwrap();
+                },
+                || {},
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            count, 1,
+            "the signature is judged again once its target is held"
+        );
+        drop((repo, dest));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&dest_root).unwrap();
+        assert!(!root.exists() && !dest_root.exists());
     }
 }
