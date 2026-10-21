@@ -197,12 +197,17 @@ struct SessionToml {
     workspace: Vec<EntryToml>,
 }
 
+/// What `base_snapshot` holds in the manifest while a refresh is unfinished.
+const PENDING_BASE: &str = "refresh-unfinished";
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PendingToml {
     target: String,
     branch: String,
     #[serde(default)]
     writers: Vec<u32>,
+    /// The session's real base while the top-level field holds [`PENDING_BASE`].
+    base: String,
     #[serde(default)]
     workspace: Vec<PendingWsToml>,
 }
@@ -217,7 +222,15 @@ struct PendingWsToml {
 impl From<&WsSession> for SessionToml {
     fn from(s: &WsSession) -> Self {
         SessionToml {
-            base_snapshot: s.base_snapshot.to_hex(),
+            // While a refresh is unfinished the real base lives in the marker and
+            // this field is not an object id, so a binary that does not know the
+            // marker fails to parse the manifest instead of harvesting a
+            // half-refreshed checkout as clean.
+            base_snapshot: if s.pending_refresh.is_some() {
+                PENDING_BASE.to_string()
+            } else {
+                s.base_snapshot.to_hex()
+            },
             base_branch: s.base_branch.clone(),
             author: s.author.clone(),
             sparse: s.sparse.clone(),
@@ -225,6 +238,7 @@ impl From<&WsSession> for SessionToml {
                 target: p.target.to_hex(),
                 branch: p.branch.clone(),
                 writers: p.writers.clone(),
+                base: s.base_snapshot.to_hex(),
                 workspace: p
                     .workspaces
                     .iter()
@@ -251,8 +265,12 @@ impl From<&WsSession> for SessionToml {
 
 impl SessionToml {
     fn into_session(raw: SessionToml, name: Option<&str>) -> Result<WsSession> {
-        let base_snapshot = ObjectId::from_str(&raw.base_snapshot)
-            .map_err(|_| bad(format!("bad base_snapshot: {}", raw.base_snapshot)))?;
+        let base_hex = match (&raw.pending_refresh, raw.base_snapshot.as_str()) {
+            (Some(p), PENDING_BASE) => p.base.as_str(),
+            (_, b) => b,
+        };
+        let base_snapshot = ObjectId::from_str(base_hex)
+            .map_err(|_| bad(format!("bad base_snapshot: {base_hex}")))?;
         let workspaces = raw
             .workspace
             .into_iter()

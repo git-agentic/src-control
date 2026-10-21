@@ -128,9 +128,16 @@ fn changed_since_read(p: &str) -> Error {
 /// Whether the file at `full` is exactly the content recorded as `rec` (blob and
 /// perms) at `p`. A plain file is compared by bytes. A protected file's plaintext
 /// is proved the way commit proves it: a randomized one by the workspace cache, a
-/// convergent one by re-encrypting. Anything that is not a regular file reads as
-/// not matching.
-fn holds(full: &std::path::Path, p: &str, rec: (ObjectId, u8), cache: &ProtectedCache) -> bool {
+/// convergent one by re-encrypting, or against the plaintext itself when the
+/// caller holds it (`plain`). Anything that is not a regular file reads as not
+/// matching.
+fn holds(
+    full: &std::path::Path,
+    p: &str,
+    rec: (ObjectId, u8),
+    cache: &ProtectedCache,
+    plain: Option<&[u8]>,
+) -> bool {
     let (blob, perms) = rec;
     if perms & PROTECTED == 0 {
         return disk_is_blob(full, &blob);
@@ -141,6 +148,12 @@ fn holds(full: &std::path::Path, p: &str, rec: (ObjectId, u8), cache: &Protected
     let Ok(bytes) = std::fs::read(full).map(scl_crypto::Zeroizing::new) else {
         return false;
     };
+    // The plaintext of the blob, when the caller could decrypt it, is the
+    // airtight test; the cache is only a record of an earlier write and may not
+    // have been saved before a kill.
+    if let Some(pt) = plain {
+        return bytes[..] == *pt;
+    }
     if perms & RANDOMIZED != 0 {
         cache.unchanged(p, &bytes) == Some(blob)
     } else {
@@ -161,6 +174,7 @@ fn check_prior(
     p: &str,
     prior: Option<(ObjectId, u8)>,
     target: Option<(ObjectId, u8)>,
+    target_plain: Option<&[u8]>,
     cache: &ProtectedCache,
 ) -> Result<()> {
     let meta = lstat(full)?;
@@ -171,7 +185,8 @@ fn check_prior(
         (Some(m), Some(_)) if m.is_dir() && target.is_none() => Err(changed_since_read(p)),
         (Some(m), _) if m.is_dir() => Ok(()), // a write: judged by the directory rules
         (Some(_), Some(prior))
-            if holds(full, p, prior, cache) || target.is_some_and(|t| holds(full, p, t, cache)) =>
+            if holds(full, p, prior, cache, None)
+                || target.is_some_and(|t| holds(full, p, t, cache, target_plain)) =>
         {
             Ok(())
         }
@@ -192,6 +207,7 @@ fn plan_checkout(
     old_root: ObjectId,
     new_root: ObjectId,
     protection: &Protection,
+    base_protection: &Protection,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
     cache: &ProtectedCache,
@@ -206,55 +222,75 @@ fn plan_checkout(
         if lstat(&full)?.is_none() || under_symlink(root, p) {
             continue;
         }
-        check_prior(&full, p, Some((*blob, *perms)), None, cache)?;
+        check_prior(&full, p, Some((*blob, *perms)), None, None, cache)?;
         removals.push((p.clone(), *blob, *perms));
     }
     let removable: BTreeSet<&str> = removals.iter().map(|r| r.0.as_str()).collect();
     for (p, (blob, mode, perms)) in &new {
         let prior = old.get(p);
+        let full = safe_join(root, p)?;
+        let meta = lstat(&full)?;
         // The workspace holds this path's plaintext. A tip that keeps the
         // ciphertext but drops the protection flag or the rule would have a
         // harvest commit that plaintext publicly: refuse, even when the entry
-        // itself is unchanged.
+        // itself is unchanged. The rule is looked up in the result's protection
+        // (the union of both sides, which can still hold an old rule) and in the
+        // tip's own, which is what the session is based on afterwards.
         if prior.is_some_and(|(.., pp)| pp & PROTECTED != 0)
-            && (perms & PROTECTED == 0 || crate::protect::matching_prefix(protection, p).is_none())
+            && meta.as_ref().is_some_and(|m| !m.is_dir())
+            && (perms & PROTECTED == 0
+                || crate::protect::matching_prefix(protection, p).is_none()
+                || crate::protect::matching_prefix(base_protection, p).is_none())
         {
             return Err(Error::InvalidArgument(format!(
                 "{p} is no longer protected on the new tip; refusing to refresh a checkout \
-                 that holds its plaintext"
+                 that holds its plaintext (a harvest would publish it)"
             )));
         }
         if prior.is_some_and(|(b, m, pp)| b == blob && m == mode && *pp == *perms) {
             continue;
         }
-        let full = safe_join(root, p)?;
-        let meta = lstat(&full)?;
+        let protected = perms & PROTECTED != 0;
+        // The result's plaintext, when this key opens it.
+        let target_plain = if protected {
+            match store.get(blob)? {
+                Object::Blob(bytes) => decrypt_protected(&bytes, blob, protection, identity),
+                _ => continue,
+            }
+        } else {
+            None
+        };
         // Already the result's content, written by an earlier attempt that was
-        // interrupted (a path the candidate tracked, and a content change).
-        // On a retry that includes a file the first attempt added, which the
+        // interrupted (a path the candidate tracked, and a content change). On a
+        // retry that includes a file the first attempt added, which the
         // candidate does not track.
         if (prior.is_some_and(|(b, ..)| b != blob) || (resuming && prior.is_none()))
             && meta.as_ref().is_some_and(|m| m.is_file())
-            && holds(&full, p, (*blob, *perms), cache)
+            && holds(
+                &full,
+                p,
+                (*blob, *perms),
+                cache,
+                target_plain.as_deref().map(|v| &v[..]),
+            )
         {
             continue;
         }
-        let protected = perms & PROTECTED != 0;
-        if protected {
-            let Object::Blob(bytes) = store.get(blob)? else {
-                continue;
-            };
-            if decrypt_protected(&bytes, blob, protection, identity).is_none() {
-                // Leaving the old plaintext would pass it off as the new content.
-                if meta.is_some() {
-                    return Err(Error::InvalidArgument(format!(
-                        "{p} is protected and changed on the new tip: pass --identity so \
-                         refresh can decrypt it"
-                    )));
-                }
-                skipped.push(p.clone());
-                continue;
+        if protected && target_plain.is_none() {
+            // Leaving the old plaintext would pass it off as the new content.
+            if meta.is_some() {
+                return Err(Error::InvalidArgument(format!(
+                    "{p} is protected and changed on the new tip: pass --identity so refresh \
+                     can decrypt it{}",
+                    if resuming {
+                        " (an unfinished refresh needs the key to be resumed)"
+                    } else {
+                        ""
+                    }
+                )));
             }
+            skipped.push(p.clone());
+            continue;
         }
         let prior = prior.map(|(b, _, op)| (*b, *op));
         if meta.as_ref().is_some_and(|m| m.is_dir()) {
@@ -270,7 +306,14 @@ fn plan_checkout(
                 )));
             }
         } else {
-            check_prior(&full, p, prior, Some((*blob, *perms)), cache)?;
+            check_prior(
+                &full,
+                p,
+                prior,
+                Some((*blob, *perms)),
+                target_plain.as_deref().map(|v| &v[..]),
+                cache,
+            )?;
         }
         writes.push((p.clone(), *blob, *mode, *perms, prior));
     }
@@ -301,7 +344,7 @@ fn apply_plan(
         if under_symlink(&job.dir, p) {
             return Err(changed_since_read(p));
         }
-        check_prior(&full, p, Some((*blob, *perms)), None, &job.cache)?;
+        check_prior(&full, p, Some((*blob, *perms)), None, None, &job.cache)?;
         *done += 1; // from here on the checkout may differ from the old state
         match std::fs::remove_file(&full) {
             Ok(()) => {}
@@ -321,21 +364,36 @@ fn apply_plan(
         if under_symlink(&job.dir, p) {
             return Err(changed_since_read(p));
         }
-        check_prior(&full, p, *prior, Some((*blob, *perms)), &job.cache)?;
+        let pt = if protected {
+            Some(
+                decrypt_protected(&bytes, blob, &job.protection, identity).ok_or_else(|| {
+                    Error::InvalidArgument(format!("{p}: the key stopped opening it mid-refresh"))
+                })?,
+            )
+        } else {
+            None
+        };
+        check_prior(
+            &full,
+            p,
+            *prior,
+            Some((*blob, *perms)),
+            pt.as_deref().map(|v| &v[..]),
+            &job.cache,
+        )?;
         *done += 1; // from here on the checkout may differ from the old state
         clear_dir_obstruction(&full, p)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if protected {
-            let pt =
-                decrypt_protected(&bytes, blob, &job.protection, identity).ok_or_else(|| {
-                    Error::InvalidArgument(format!("{p}: the key stopped opening it mid-refresh"))
-                })?;
+        if let Some(pt) = pt {
             scl_core::fsutil::atomic_write_durable(&full, &pt[..])?;
             apply_file_mode(&full, *mode)?;
             if perms & RANDOMIZED != 0 {
+                // Saved at once: a kill before the end of this workspace must
+                // still leave the record that tells this write from an edit.
                 job.cache.record(p, &pt[..], *blob);
+                job.cache.save_best_effort();
             }
         } else {
             scl_core::fsutil::atomic_write_durable(&full, &bytes[..])?;
@@ -370,6 +428,10 @@ fn sweep_stale_temps(full: &std::path::Path, writers: &[u32]) {
     else {
         return;
     };
+    // Never list through a symlinked directory.
+    if parent.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
@@ -656,6 +718,7 @@ impl Repo {
                 result: p.result,
             })
             .collect();
+        let to_protection = self.snapshot(&to)?.protection;
         let mut jobs: Vec<Job> = Vec::new();
         for prep in preps {
             let old_root = self.snapshot(&prep.candidate)?.root;
@@ -672,6 +735,7 @@ impl Repo {
                     old_root,
                     result.root,
                     &result.protection,
+                    &to_protection,
                     identity,
                     &sparse,
                     &prep.cache,
@@ -717,8 +781,18 @@ impl Repo {
                 // A killed writer may have left staging files with protected
                 // plaintext: remove those of the pids that wrote before.
                 for job in &jobs {
-                    for (path, ..) in &job.plan.writes {
-                        sweep_stale_temps(&safe_join(&job.dir, path)?, &p.writers);
+                    // Paths skipped for lack of a key included: the first attempt
+                    // may have had one.
+                    let paths = job
+                        .plan
+                        .writes
+                        .iter()
+                        .map(|w| &w.0)
+                        .chain(&job.plan.skipped);
+                    for path in paths {
+                        if !under_symlink(&job.dir, path) {
+                            sweep_stale_temps(&safe_join(&job.dir, path)?, &p.writers);
+                        }
                     }
                 }
                 if !p.writers.contains(&me) {
@@ -1435,12 +1509,14 @@ mod tests {
         let other = dirs[0].join("b.4000001.7.tmp");
         std::fs::write(&other, "someone else's\n").unwrap();
         let mut session = repo.ws_session(None).unwrap().unwrap();
+        // The alive pid is a recorded writer too (pid reuse, or a retry of ours):
+        // a live process's file is never swept.
         session
             .pending_refresh
             .as_mut()
             .unwrap()
             .writers
-            .push(4_000_000);
+            .extend([4_000_000, std::process::id()]);
         write_manifest(repo.layout(), &session).unwrap();
         // The first attempt had written a.txt then died; the staging files are
         // beside b.txt, which the retry writes.
@@ -1634,6 +1710,139 @@ mod tests {
         let r = repo.ws_refresh(None, None, None).unwrap();
         assert_eq!(r.workspaces.len(), 1);
         assert_eq!(read(&dir, "secret/x"), "plain x\n");
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_rule_dropped_by_the_tip_is_refused_for_an_edited_workspace_too() {
+        // The replay result merges both sides' rules, so it can still hold the old
+        // one; the session is based on the tip, which does not.
+        let (repo, root) = init("rule-removed-edited");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "secret x\n").unwrap();
+        let base = repo.commit("t", "protected").unwrap();
+        let s = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        std::fs::write(dir.join("other.txt"), "unrelated edit\n").unwrap();
+        let mut dropped = repo.snapshot(&base).unwrap().protection;
+        dropped.prefixes.clear();
+        recommit_with(&repo, base, dropped);
+        let err = repo
+            .ws_refresh(None, None, Some(&sk))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no longer protected"), "{err}");
+        assert_eq!(base_of(&repo, None), s.base_snapshot);
+        assert_eq!(read(&dir, "secret/x"), "secret x\n");
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_retry_after_a_kill_that_lost_the_cache_resumes_with_the_key() {
+        let (repo, root) = init("kill-cache");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "secret x\n").unwrap();
+        repo.commit("t", "protected").unwrap();
+        let s = repo.ws_fork(None, 2, "t", Some(&sk)).unwrap();
+        let (d1, d2) = (s.workspaces[0].dir.clone(), s.workspaces[1].dir.clone());
+        let cache_path = repo.layout().ws_cache_path(None, 1);
+        let before = std::fs::read(&cache_path).unwrap();
+        host_commit(&repo, &root, &[("secret/x", Some("secret x v2\n"))]);
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, Some(&sk)).unwrap_err();
+        }
+        assert_eq!(read(&d1, "secret/x"), "secret x v2\n");
+        // A real kill never reaches the cache save: put the old file back.
+        std::fs::write(&cache_path, &before).unwrap();
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(
+            err.contains("--identity") && err.contains("resumed"),
+            "{err}"
+        );
+        repo.ws_refresh(None, None, Some(&sk)).unwrap();
+        for d in [&d1, &d2] {
+            assert_eq!(read(d, "secret/x"), "secret x v2\n");
+        }
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn the_manifest_of_an_unfinished_refresh_does_not_parse_as_a_plain_session() {
+        let (repo, root, ..) = crash_fixture("old-binary");
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        let text = std::fs::read_to_string(root.join(".sc/ws/session.toml")).unwrap();
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        let base = v["base_snapshot"].as_str().unwrap();
+        assert!(
+            <ObjectId as std::str::FromStr>::from_str(base).is_err(),
+            "a binary that ignores the marker must fail on the base, got {base}"
+        );
+        // This binary still reads it, with the real base.
+        let s = repo.ws_session(None).unwrap().unwrap();
+        assert!(s.pending_refresh.is_some());
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_convergent_protected_file_survives_a_crash_and_retry() {
+        let (repo, root) = init("crash-convergent");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        let seed = |pt: &[u8], parent: ObjectId| {
+            let mut protection = repo.snapshot(&parent).unwrap().protection;
+            if protection.prefixes.is_empty() {
+                protection.prefixes.push(scl_core::ProtectPrefix {
+                    prefix: "secret/".into(),
+                    recipients: vec![scl_core::RecipientEntry {
+                        key: pk.to_bytes(),
+                        epoch: 1,
+                        state: scl_core::RecipientState::Granted,
+                    }],
+                });
+            }
+            let (cipher, dek) = scl_crypto::encrypt_path(pt);
+            protection.wrapped.insert(
+                Object::blob(cipher.clone()).id(),
+                vec![scl_crypto::wrap_dek_for(&dek, &pk)],
+            );
+            let tree = repo
+                .vfs()
+                .write_tree_with_perms(&[
+                    ("a.txt".into(), LINES.as_bytes().to_vec(), FileMode::FILE, 0),
+                    ("secret/x".into(), cipher, FileMode::FILE, PROTECTED),
+                ])
+                .unwrap();
+            repo.commit_snapshot(
+                tree,
+                vec![parent],
+                Default::default(),
+                protection,
+                "t",
+                "seed",
+            )
+            .unwrap()
+        };
+        let base = repo.head_tip().unwrap().unwrap();
+        let v1 = seed(b"secret x\n", base);
+        let s = repo.ws_fork(None, 2, "t", Some(&sk)).unwrap();
+        let (d1, d2) = (s.workspaces[0].dir.clone(), s.workspaces[1].dir.clone());
+        seed(b"secret x v2\n", v1);
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, Some(&sk)).unwrap_err();
+        }
+        assert_eq!(read(&d1, "secret/x"), "secret x v2\n");
+        repo.ws_refresh(None, None, Some(&sk)).unwrap();
+        for d in [&d1, &d2] {
+            assert_eq!(read(d, "secret/x"), "secret x v2\n");
+        }
         cleanup(repo, &root);
     }
 
