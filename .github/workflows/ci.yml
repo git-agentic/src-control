@@ -53,8 +53,9 @@ jobs:
         run: cargo doc --workspace --no-deps
 
   # Advisory (not a required context): proves the Windows build and the owner-only
-  # ACL on .sc/local-key, the `sc keygen` identity and the TLS serve key (#214, #281). Deliberately not `cargo test --workspace`; the
-  # wider suite still has unix-only assumptions.
+  # ACL on .sc/local-key, the `sc keygen` identity and the TLS serve key (#214,
+  # #281). Deliberately not `cargo test --workspace`; the wider suite still has
+  # unix-only assumptions.
   windows:
     name: windows (check + secret-file ACL tests)
     runs-on: windows-latest

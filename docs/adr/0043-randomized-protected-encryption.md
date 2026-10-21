@@ -103,7 +103,8 @@ file changed. Detection is a per-checkout stat cache (`crates/repo/src/cache.rs`
   world-readable between creation and permission-setting), created lazily,
   **never committed, never transferred**. On Windows (#214) it is created
   through `CreateFileW` with a protected DACL holding one `GENERIC_ALL` ACE for
-  the current user, also from the first byte (`crates/repo/src/winacl.rs`). Other
+  the current user, also from the first byte (`crates/core/src/winacl.rs`, behind `scl_core::owner_only`, which since #281 also
+  creates the `sc keygen` identity and the TLS serve key). Other
   targets, or a failed ACL call, keep default permissions with a one-time
   warning, because checkout already writes the same plaintext to the working
   tree with default permissions (see THREAT-MODEL.md). Windows keys created

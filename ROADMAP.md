@@ -646,8 +646,9 @@ across every phase.
     verified by the advisory `windows` CI job (#214). Windows keys created
     before that keep their inherited DACL and no longer warn; delete
     `.sc/local-key` to recreate it owner-only. `sc keygen` now refuses to
-    overwrite an existing identity on Windows too (#281 tracks owner-only
-    protection for the identity file and the TLS serve key).
+    overwrite an existing identity on Windows too. The `sc keygen` identity
+    file and the auto-minted TLS serve key get the same owner-only DACL through
+    one shared primitive, `scl_core::owner_only` (#281).
 
 ## Active
 

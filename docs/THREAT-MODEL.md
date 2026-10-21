@@ -81,7 +81,8 @@ too, not just the src-control-side metadata.
   protected blob under a fresh key (ADR-0051), whereas a plain `sc rewrap` only
   replaces wrap lists and leaves the key a revoked holder already has. History
   keeps the old wraps and ciphertext regardless.
-- **Local cache key is owner-only on unix and Windows (P33, #214):** the
+- **Local cache key, `sc keygen` identity and TLS serve key are owner-only on
+  unix and Windows (P33, #214, #281):** the
   unchanged-detection cache is keyed by `.sc/local-key`, created owner-only from
   its first byte: mode `0600` on unix, a protected DACL with a single
   `GENERIC_ALL` ACE for the current user on Windows (no inherited entries; the
@@ -90,13 +91,18 @@ too, not just the src-control-side metadata.
   them; delete `.sc/local-key` to have the next run recreate it owner-only (the
   cost is one round of spurious re-seals). The Windows DACL grants no explicit
   access to SYSTEM or Administrators, so backup and admin tooling can still take
-  ownership of the file, as root can read a `0600` file on unix. The `sc keygen`
-  identity file and the TLS serve key still have no Windows owner-only
-  protection (tracked in #281); keygen now refuses to overwrite an existing
-  identity on every platform. On any other target, or if the Windows
-  ACL call fails, the key and the cache files are written with inherited default
-  permissions, and `sc` prints a one-time stderr warning once a cache holds a
-  protected entry. The exposure then is small: checkout already writes protected
+  ownership of the file, as root can read a `0600` file on unix. The same
+  creation primitive (`scl_core::owner_only`) makes the `sc keygen --out`
+  identity file and the auto-minted TLS serve key (`.sc/serve-tls/key.pem`)
+  owner-only from their first byte on both platforms (the `windows` CI job
+  reads each back with `icacls`); keygen refuses to overwrite an existing
+  identity on every platform. Windows identity files and serve keys created
+  before #281 keep their inherited DACL; restrict them yourself or regenerate
+  (a regenerated serve key changes the pinned fingerprint). A
+  `--tls-key` PEM supplied by the operator is theirs to protect. On any other
+  target, or if the Windows ACL call fails, the file is written with inherited
+  default permissions and `sc` prints a one-time stderr warning naming it
+  (for `.sc/local-key`, once a cache holds a protected entry). The exposure then is small: checkout already writes protected
   plaintext into the working tree with default permissions on every platform, and
   the cache holds tags only for files whose plaintext is on disk, so a reader of
   the key could read that plaintext directly. What remains is the tags of the
