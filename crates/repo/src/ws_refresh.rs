@@ -198,6 +198,40 @@ fn check_prior(
     }
 }
 
+/// Refuse a result that would leave a workspace addition outside later harvests:
+/// a file the result adds to the tip's tree (a change of the workspace's) that the
+/// result's own `.scignore` hides. A harvest reads the workspace under the
+/// ignore rules on disk, exempting only what the base tracks, and the base is
+/// about to become the tip.
+fn hidden_additions(
+    store: &mut Store,
+    result: &std::collections::BTreeMap<String, (ObjectId, FileMode, u8)>,
+    tip_root: ObjectId,
+    sparse: &Sparse,
+) -> Result<()> {
+    let Some((rules, ..)) = result.get(".scignore") else {
+        return Ok(());
+    };
+    let Object::Blob(text) = store.get(rules)? else {
+        return Ok(());
+    };
+    let ignore = crate::ignore::Ignore::parse(&String::from_utf8_lossy(&text));
+    let tip = tree_file_entries_with_perms_sparse(store, tip_root, sparse)?;
+    let hidden: Vec<&str> = result
+        .keys()
+        .filter(|p| !tip.contains_key(*p) && ignore.matches(p))
+        .map(String::as_str)
+        .collect();
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "the new tip's .scignore would hide files this workspace added, so no harvest \
+         would ever land them: {}; remove or rename them, or adjust the rule",
+        hidden.join(", ")
+    )))
+}
+
 /// Decide, without writing, how to turn the checkout (laid out from `old_root`)
 /// into `new_root` under `sparse`. Refuses if a file it must replace is no longer
 /// the tracked bytes, or a user's file stands where one must go.
@@ -208,6 +242,7 @@ fn plan_checkout(
     new_root: ObjectId,
     protection: &Protection,
     base_protection: &Protection,
+    tip_root: ObjectId,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
     cache: &ProtectedCache,
@@ -216,6 +251,7 @@ fn plan_checkout(
     // Bounded by the view on both sides: a partial clone does not hold the rest.
     let old = tree_file_entries_with_perms_sparse(store, old_root, sparse)?;
     let new = tree_file_entries_with_perms_sparse(store, new_root, sparse)?;
+    hidden_additions(store, &new, tip_root, sparse)?;
     let (mut removals, mut writes, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     for (p, (blob, _, perms)) in old.iter().filter(|(p, _)| !new.contains_key(*p)) {
         let full = safe_join(root, p)?;
@@ -718,7 +754,8 @@ impl Repo {
                 result: p.result,
             })
             .collect();
-        let to_protection = self.snapshot(&to)?.protection;
+        let tip = self.snapshot(&to)?;
+        let (to_protection, tip_root) = (tip.protection, tip.root);
         let mut jobs: Vec<Job> = Vec::new();
         for prep in preps {
             let old_root = self.snapshot(&prep.candidate)?.root;
@@ -736,6 +773,7 @@ impl Repo {
                     result.root,
                     &result.protection,
                     &to_protection,
+                    tip_root,
                     identity,
                     &sparse,
                     &prep.cache,
@@ -1843,6 +1881,57 @@ mod tests {
         for d in [&d1, &d2] {
             assert_eq!(read(d, "secret/x"), "secret x v2\n");
         }
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_tip_ignore_rule_over_an_added_file_is_refused_before_any_write() {
+        let (repo, root) = init("ignore-added");
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/out.txt"), "agent output\n").unwrap();
+        std::fs::write(dir.join("kept.txt"), "kept\n").unwrap();
+        host_commit(
+            &repo,
+            &root,
+            &[(".scignore", Some("build/\n")), ("b.txt", Some("b\n"))],
+        );
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(
+            err.contains(".scignore") && err.contains("build/out.txt") && !err.contains("kept.txt"),
+            "{err}"
+        );
+        assert_eq!(base_of(&repo, None), s.base_snapshot);
+        assert!(!dir.join("b.txt").exists() && !dir.join(".scignore").exists());
+        assert_eq!(read(&dir, "build/out.txt"), "agent output\n");
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_tip_ignore_rule_over_tracked_files_only_is_fine() {
+        let root = tmp_root("ignore-tracked");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        std::fs::write(root.join("logs/a.log"), "log\n").unwrap();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        repo.commit("t", "base").unwrap();
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        std::fs::write(dir.join("a.txt"), "agent edit\n").unwrap();
+        std::fs::write(dir.join("logs/a.log"), "agent log edit\n").unwrap();
+        host_commit(&repo, &root, &[(".scignore", Some("logs/\n"))]);
+        // logs/ is tracked on the tip, so a harvest still reads it.
+        repo.ws_refresh(None, None, None).unwrap();
+        assert_eq!(read(&dir, "logs/a.log"), "agent log edit\n");
+        let out = repo.ws_harvest(None, None, "t", None).unwrap();
+        let [WsHarvestOutcome::Landed { merged_tip, .. }] = out.as_slice() else {
+            panic!("expected a landing, got {out:?}")
+        };
+        assert_eq!(
+            tree_has(&repo, *merged_tip, "logs/a.log").unwrap(),
+            b"agent log edit\n"
+        );
         cleanup(repo, &root);
     }
 
