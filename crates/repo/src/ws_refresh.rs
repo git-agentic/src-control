@@ -212,12 +212,10 @@ fn plan_checkout(
     let removable: BTreeSet<&str> = removals.iter().map(|r| r.0.as_str()).collect();
     for (p, (blob, mode, perms)) in &new {
         let prior = old.get(p);
-        if prior.is_some_and(|(b, m, pp)| b == blob && m == mode && *pp == *perms) {
-            continue;
-        }
         // The workspace holds this path's plaintext. A tip that keeps the
         // ciphertext but drops the protection flag or the rule would have a
-        // harvest commit that plaintext publicly: refuse.
+        // harvest commit that plaintext publicly: refuse, even when the entry
+        // itself is unchanged.
         if prior.is_some_and(|(.., pp)| pp & PROTECTED != 0)
             && (perms & PROTECTED == 0 || crate::protect::matching_prefix(protection, p).is_none())
         {
@@ -225,6 +223,9 @@ fn plan_checkout(
                 "{p} is no longer protected on the new tip; refusing to refresh a checkout \
                  that holds its plaintext"
             )));
+        }
+        if prior.is_some_and(|(b, m, pp)| b == blob && m == mode && *pp == *perms) {
+            continue;
         }
         let full = safe_join(root, p)?;
         let meta = lstat(&full)?;
@@ -1568,6 +1569,71 @@ mod tests {
         assert!(err.contains("no longer protected"), "{err}");
         assert_eq!(read(&dir, "secret/x"), "secret x\n");
         assert_eq!(base_of(&repo, None), s.base_snapshot);
+        cleanup(repo, &root);
+    }
+
+    /// A snapshot on `main` with the base's tree, so every entry is unchanged,
+    /// and `protection` as given.
+    fn recommit_with(repo: &Repo, base: ObjectId, protection: scl_core::Protection) {
+        let root = repo.snapshot(&base).unwrap().root;
+        repo.commit_snapshot(
+            root,
+            vec![base],
+            Default::default(),
+            protection,
+            "t",
+            "policy",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_rule_removed_on_the_tip_with_the_entry_unchanged_is_refused() {
+        let (repo, root) = init("rule-removed");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "secret x\n").unwrap();
+        let base = repo.commit("t", "protected").unwrap();
+        let s = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        let mut dropped = repo.snapshot(&base).unwrap().protection;
+        dropped.prefixes.clear();
+        recommit_with(&repo, base, dropped);
+        let err = repo
+            .ws_refresh(None, None, Some(&sk))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no longer protected"), "{err}");
+        assert_eq!(read(&dir, "secret/x"), "secret x\n");
+        assert_eq!(base_of(&repo, None), s.base_snapshot);
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_rule_added_on_the_tip_for_a_plain_path_is_left_to_the_commit_pipeline() {
+        // The entry stays a plain file in the tree; any later commit seals it
+        // under the new rule (ADR-0025), so nothing is published by refreshing.
+        let (repo, root) = init("rule-added");
+        let (_sk, pk) = scl_crypto::generate_keypair();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "plain x\n").unwrap();
+        let base = repo.commit("t", "plain").unwrap();
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        let mut added = repo.snapshot(&base).unwrap().protection;
+        added.prefixes.push(scl_core::ProtectPrefix {
+            prefix: "secret/".into(),
+            recipients: vec![scl_core::RecipientEntry {
+                key: pk.to_bytes(),
+                epoch: 1,
+                state: scl_core::RecipientState::Granted,
+            }],
+        });
+        recommit_with(&repo, base, added);
+        let r = repo.ws_refresh(None, None, None).unwrap();
+        assert_eq!(r.workspaces.len(), 1);
+        assert_eq!(read(&dir, "secret/x"), "plain x\n");
         cleanup(repo, &root);
     }
 
