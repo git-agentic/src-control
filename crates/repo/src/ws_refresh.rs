@@ -325,11 +325,23 @@ fn plan_checkout(
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
     cache: &mut ProtectedCache,
-    resuming: bool,
+    prior_writers: Option<&[u32]>,
 ) -> Result<Plan> {
+    let resuming = prior_writers.is_some();
     // Bounded by the view on both sides: a partial clone does not hold the rest.
     let old = tree_file_entries_with_perms_sparse(store, old_root, sparse)?;
     let new = tree_file_entries_with_perms_sparse(store, new_root, sparse)?;
+    // A killed writer may have left staging files with protected plaintext beside
+    // the paths it was writing (any path the result changes, skipped ones
+    // included: the first attempt may have had a key). They go first: the ignore
+    // comparison below would count one as a file the agent added.
+    if let Some(writers) = prior_writers {
+        for (p, _) in new.iter().filter(|(p, e)| old.get(*p) != Some(e)) {
+            if !under_symlink(root, p) {
+                sweep_stale_temps(&safe_join(root, p)?, writers);
+            }
+        }
+    }
     hidden_additions(
         store,
         root,
@@ -437,7 +449,17 @@ fn plan_checkout(
             // empty one the refresh did not empty is the user's (as in any
             // forward op), whose working directory a process may hold.
             let under = format!("{p}/");
-            let emptied = removals.iter().any(|r| r.0.starts_with(&under));
+            // On a retry the husk may be the work of the first attempt: the
+            // candidate tracked files under it, the result drops them all and
+            // none is left on disk to remove (`dir_clearable` below still
+            // refuses anything else inside).
+            let emptied = removals.iter().any(|r| r.0.starts_with(&under))
+                || (resuming
+                    && old.iter().any(|(o, e)| {
+                        // A protected file may never have been laid out (no key at
+                        // fork), so it proves nothing about what was on disk.
+                        o.starts_with(&under) && !new.contains_key(o) && e.2 & PROTECTED == 0
+                    }));
             if !emptied || !dir_clearable(&full, p, &|c| removable.contains(c)) {
                 return Err(Error::InvalidArgument(format!(
                     "cannot write {p}: a directory with untracked or ignored content \
@@ -897,7 +919,7 @@ impl Repo {
                     identity,
                     &sparse,
                     &mut prep.cache,
-                    prior_pending.is_some(),
+                    prior_pending.as_ref().map(|p| &p.writers[..]),
                 )
             };
             match plan {
@@ -942,23 +964,6 @@ impl Repo {
                 });
             }
             Some(p) => {
-                // A killed writer may have left staging files with protected
-                // plaintext: remove those of the pids that wrote before.
-                for job in &jobs {
-                    // Paths skipped for lack of a key included: the first attempt
-                    // may have had one.
-                    let paths = job
-                        .plan
-                        .writes
-                        .iter()
-                        .map(|w| &w.0)
-                        .chain(&job.plan.skipped);
-                    for path in paths {
-                        if !under_symlink(&job.dir, path) {
-                            sweep_stale_temps(&safe_join(&job.dir, path)?, &p.writers);
-                        }
-                    }
-                }
                 if !p.writers.contains(&me) {
                     p.writers.push(me);
                 }
@@ -1693,6 +1698,95 @@ mod tests {
             alive.exists() && user.exists() && other.exists(),
             "anything else stays"
         );
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_stale_staging_file_the_new_ignore_rules_expose_is_swept_before_they_are_compared() {
+        let root = tmp_root("stale-tmp-scignore");
+        let repo = Repo::init(&root).unwrap();
+        std::fs::write(root.join(".scignore"), "*.tmp\n").unwrap();
+        std::fs::write(root.join("a.txt"), LINES).unwrap();
+        repo.commit("t", "base").unwrap();
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        // The tip stops hiding `*.tmp` and adds b.txt; the apply phase dies after
+        // .scignore, in the middle of b.txt's write.
+        host_commit(
+            &repo,
+            &root,
+            &[(".scignore", Some("other\n")), ("b.txt", Some("b\n"))],
+        );
+        {
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        assert_eq!(read(&dir, ".scignore"), "other\n");
+        // The killed writer's staging file: hidden by the rules the checkout was
+        // read under, visible under the new ones.
+        let stale = dir.join("b.4000000.7.tmp");
+        std::fs::write(&stale, "half\n").unwrap();
+        let mut session = repo.ws_session(None).unwrap().unwrap();
+        session
+            .pending_refresh
+            .as_mut()
+            .unwrap()
+            .writers
+            .push(4_000_000);
+        write_manifest(repo.layout(), &session).unwrap();
+        repo.ws_refresh(None, None, None).unwrap();
+        assert!(!stale.exists());
+        assert_eq!(read(&dir, "b.txt"), "b\n");
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_retry_replaces_the_empty_directory_its_own_removals_left() {
+        let (repo, root) = init("dir-replaced");
+        host_commit(&repo, &root, &[("dir/file", Some("f\n"))]);
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        // The host replaces the directory with a file.
+        std::fs::remove_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir"), "now a file\n").unwrap();
+        let tip = repo.commit("t", "host").unwrap();
+        {
+            // dir/file is removed, then the write of `dir` dies.
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        assert!(dir.join("dir").is_dir() && !dir.join("dir/file").exists());
+        // Something of the user's in the husk is not ours to clear.
+        std::fs::write(dir.join("dir/mine"), "mine\n").unwrap();
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("cannot write dir"), "{err}");
+        assert_eq!(read(&dir, "dir/mine"), "mine\n");
+        std::fs::remove_file(dir.join("dir/mine")).unwrap();
+        repo.ws_refresh(None, None, None).unwrap();
+        assert_eq!(read(&dir, "dir"), "now a file\n");
+        assert_eq!(base_of(&repo, None), tip);
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_retry_still_refuses_a_users_empty_directory_the_candidate_never_tracked() {
+        let (repo, root) = init("dir-users-empty");
+        let s = repo.ws_fork(None, 1, "t", None).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        host_commit(
+            &repo,
+            &root,
+            &[("b.txt", Some("b\n")), ("mine", Some("a file\n"))],
+        );
+        {
+            // b.txt is written, then the write of `mine` dies.
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, None).unwrap_err();
+        }
+        std::fs::create_dir(dir.join("mine")).unwrap();
+        let err = repo.ws_refresh(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("cannot write mine"), "{err}");
+        assert!(dir.join("mine").is_dir());
         cleanup(repo, &root);
     }
 
