@@ -764,16 +764,30 @@ impl Scan {
             self.honored.clear();
             self.fp = fp;
         }
-        let wanted: BTreeSet<ObjectId> = self.tombs.keys().copied().collect();
+        // Nothing is honorable without a trusted signer, and only the tombstones
+        // not honored yet (or whose dropped body just arrived) need a verdict:
+        // skip the signature index read when there are none.
+        let todo: Vec<ObjectId> = self
+            .tombs
+            .iter()
+            .filter(|(id, (_, dropped))| !self.honored.contains_key(*id) || new.contains(dropped))
+            .map(|(id, _)| *id)
+            .collect();
+        if trusted.is_empty() || todo.is_empty() {
+            return Ok(());
+        }
+        let wanted: BTreeSet<ObjectId> = todo.iter().copied().collect();
         let sigs = crate::signatures::load_sig_index(layout, Some(&wanted), &trusted)?;
-        for (id, (t, dropped)) in &self.tombs {
-            if self.honored.contains_key(id) && !new.contains(dropped) {
-                continue;
-            }
-            if tombstone_honored(store, &trusted, &sigs, *id, t, *dropped)? {
-                self.honored.insert(*id, (t.snapshot, *id, *dropped));
+        for id in todo {
+            let (t, dropped) = &self.tombs[&id];
+            // Cheap refusal first: no trusted signer has signed it, so the
+            // store reads in `tombstone_honored` cannot change the verdict.
+            if trusted.keys().all(|k| sigs.by(&id, k).is_none())
+                || !tombstone_honored(store, &trusted, &sigs, id, t, *dropped)?
+            {
+                self.honored.remove(&id);
             } else {
-                self.honored.remove(id);
+                self.honored.insert(id, (t.snapshot, id, *dropped));
             }
         }
         Ok(())
@@ -2366,6 +2380,60 @@ pub(crate) mod tests {
             });
             assert_eq!(count, 1);
             assert_eq!(load(dest.layout()).unwrap(), vec![(snap, late_id)]);
+            clean_up(&[src, dest]);
+        }
+    }
+
+    #[test]
+    fn reindex_drops_a_verdict_when_trust_is_withdrawn_between_passes() {
+        for just_before_lock in [false, true] {
+            let (src, snap, dest, owner) = race_fixture(&format!("untrust-{just_before_lock}"));
+            let doomed = body_of(&src, snap, "doomed", &owner);
+            let tomb = Object::Transcript(Transcript::drop_tombstone(snap, &doomed.id()));
+            let root = dest.layout().root.clone();
+            put_pack_into(
+                &root,
+                &pack_of(&[doomed.clone(), tomb.clone(), drop_sig(&owner, tomb.id())]),
+            );
+            assert_eq!(read_drops(dest.layout()).unwrap().len(), 1);
+            let recipients = dest.layout().dot_sc.join("recipients.toml");
+            let count = reindex_racing(&dest, just_before_lock, || {
+                std::fs::write(recipients, "").unwrap();
+            });
+            assert_eq!(count, 1, "the signer is no longer trusted");
+            assert!(read_drops(dest.layout()).unwrap().is_empty());
+            clean_up(&[src, dest]);
+        }
+    }
+
+    #[test]
+    fn reindex_refuses_a_drop_once_its_body_turns_out_to_be_on_another_snapshot() {
+        for just_before_lock in [false, true] {
+            let (src, snap, dest, owner) = race_fixture(&format!("mismatch-{just_before_lock}"));
+            std::fs::write(src.layout().root.join("f"), b"y").unwrap();
+            let snap2 = src.commit("t", "c2").unwrap();
+            let snap2_obj = src.store_arc().lock().unwrap().get(&snap2).unwrap();
+            dest.store_arc().lock().unwrap().put(snap2_obj).unwrap();
+            // The tombstone claims `snap`, but the body it names sits on `snap2`.
+            let body = body_of(&src, snap2, "elsewhere", &owner);
+            let tomb = Object::Transcript(Transcript::drop_tombstone(snap, &body.id()));
+            let root = dest.layout().root.clone();
+            put_pack_into(
+                &root,
+                &pack_of(&[tomb.clone(), drop_sig(&owner, tomb.id())]),
+            );
+            assert_eq!(read_drops(dest.layout()).unwrap().len(), 1, "held for now");
+            let objects = dest.layout().objects_dir();
+            let body_id = body.id();
+            let count = reindex_racing(&dest, just_before_lock, || {
+                let mut s2 =
+                    scl_core::Store::open_persistent(objects, crate::repo::default_budget())
+                        .unwrap();
+                s2.put(body).unwrap();
+            });
+            assert_eq!(count, 1);
+            assert_eq!(load(dest.layout()).unwrap(), vec![(snap2, body_id)]);
+            assert!(read_drops(dest.layout()).unwrap().is_empty());
             clean_up(&[src, dest]);
         }
     }

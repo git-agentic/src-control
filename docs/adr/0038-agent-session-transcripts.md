@@ -677,7 +677,11 @@ scan in `tombstone_honored` never reached it. Now:
   signature rebuild, the locked listing first reloads the pack index
   (`Store::reload_packs`), so objects another handle packed since this store
   opened count as well; it costs one read of the `.idx` files, once, under the
-  lock. (`signatures::reindex` still relists loose objects only.)
+  lock. This is defensive: today only `gc` writes packs, and it needs the
+  repo lock the cloning `Repo` holds. (`signatures::reindex` still relists
+  loose objects only.) The locked pass reads the signature index only when a
+  trusted signer exists and some tombstone needs a verdict, and refuses a
+  tombstone no trusted signer has signed before any object read.
 
 ### 2. The index lock (#260)
 
