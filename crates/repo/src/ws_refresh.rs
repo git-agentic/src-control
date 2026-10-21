@@ -82,6 +82,8 @@ struct Job {
     dir: PathBuf,
     /// Wrap lists of the tree being laid out, to decrypt protected paths.
     protection: Protection,
+    /// Wrap lists of the candidate (the checkout as read), to open its blobs.
+    cand_protection: Protection,
     plan: Plan,
     cache: ProtectedCache,
 }
@@ -121,8 +123,28 @@ fn before_apply_hook() {
 
 fn changed_since_read(p: &str) -> Error {
     Error::InvalidArgument(format!(
-        "{p} changed in the workspace while it was being read; run `sc ws refresh` again"
+        "{p} changed in the workspace after the refresh read it; restore it and run \
+         `sc ws refresh` again (for an unfinished refresh, abandon the session if it cannot \
+         be restored)"
     ))
+}
+
+/// The plaintext of protected blob `blob` (`perms`) under `protection`, if this
+/// key opens it. `None` for a plain blob or no key.
+fn plain_of(
+    store: &mut Store,
+    blob: &ObjectId,
+    perms: u8,
+    protection: &Protection,
+    identity: Option<&scl_crypto::SecretKey>,
+) -> Option<scl_crypto::Zeroizing<Vec<u8>>> {
+    if perms & PROTECTED == 0 {
+        return None;
+    }
+    match store.get(blob) {
+        Ok(Object::Blob(bytes)) => decrypt_protected(&bytes, blob, protection, identity),
+        _ => None,
+    }
 }
 
 /// Whether the file at `full` is exactly the content recorded as `rec` (blob and
@@ -174,6 +196,7 @@ fn check_prior(
     p: &str,
     prior: Option<(ObjectId, u8)>,
     target: Option<(ObjectId, u8)>,
+    prior_plain: Option<&[u8]>,
     target_plain: Option<&[u8]>,
     cache: &ProtectedCache,
 ) -> Result<()> {
@@ -185,7 +208,7 @@ fn check_prior(
         (Some(m), Some(_)) if m.is_dir() && target.is_none() => Err(changed_since_read(p)),
         (Some(m), _) if m.is_dir() => Ok(()), // a write: judged by the directory rules
         (Some(_), Some(prior))
-            if holds(full, p, prior, cache, None)
+            if holds(full, p, prior, cache, prior_plain)
                 || target.is_some_and(|t| holds(full, p, t, cache, target_plain)) =>
         {
             Ok(())
@@ -258,7 +281,8 @@ fn plan_checkout(
     old_root: ObjectId,
     new_root: ObjectId,
     protection: &Protection,
-    base_protection: &Protection,
+    cand_protection: &Protection,
+    tip_protection: &Protection,
     tip_root: ObjectId,
     identity: Option<&scl_crypto::SecretKey>,
     sparse: &Sparse,
@@ -275,7 +299,16 @@ fn plan_checkout(
         if lstat(&full)?.is_none() || under_symlink(root, p) {
             continue;
         }
-        check_prior(&full, p, Some((*blob, *perms)), None, None, cache)?;
+        let prior_plain = plain_of(store, blob, *perms, cand_protection, identity);
+        check_prior(
+            &full,
+            p,
+            Some((*blob, *perms)),
+            None,
+            prior_plain.as_deref().map(|v| &v[..]),
+            None,
+            cache,
+        )?;
         removals.push((p.clone(), *blob, *perms));
     }
     let removable: BTreeSet<&str> = removals.iter().map(|r| r.0.as_str()).collect();
@@ -293,7 +326,7 @@ fn plan_checkout(
             && meta.as_ref().is_some_and(|m| !m.is_dir())
             && (perms & PROTECTED == 0
                 || crate::protect::matching_prefix(protection, p).is_none()
-                || crate::protect::matching_prefix(base_protection, p).is_none())
+                || crate::protect::matching_prefix(tip_protection, p).is_none())
         {
             return Err(Error::InvalidArgument(format!(
                 "{p} is no longer protected on the new tip; refusing to refresh a checkout \
@@ -364,11 +397,14 @@ fn plan_checkout(
                 )));
             }
         } else {
+            let prior_plain =
+                prior.and_then(|(b, pp)| plain_of(store, &b, pp, cand_protection, identity));
             check_prior(
                 &full,
                 p,
                 prior,
                 Some((*blob, *perms)),
+                prior_plain.as_deref().map(|v| &v[..]),
                 target_plain.as_deref().map(|v| &v[..]),
                 cache,
             )?;
@@ -402,7 +438,16 @@ fn apply_plan(
         if under_symlink(&job.dir, p) {
             return Err(changed_since_read(p));
         }
-        check_prior(&full, p, Some((*blob, *perms)), None, None, &job.cache)?;
+        let prior_plain = plain_of(store, blob, *perms, &job.cand_protection, identity);
+        check_prior(
+            &full,
+            p,
+            Some((*blob, *perms)),
+            None,
+            prior_plain.as_deref().map(|v| &v[..]),
+            None,
+            &job.cache,
+        )?;
         *done += 1; // from here on the checkout may differ from the old state
         match std::fs::remove_file(&full) {
             Ok(()) => {}
@@ -431,11 +476,14 @@ fn apply_plan(
         } else {
             None
         };
+        let prior_plain =
+            prior.and_then(|(b, pp)| plain_of(store, &b, pp, &job.cand_protection, identity));
         check_prior(
             &full,
             p,
             *prior,
             Some((*blob, *perms)),
+            prior_plain.as_deref().map(|v| &v[..]),
             pt.as_deref().map(|v| &v[..]),
             &job.cache,
         )?;
@@ -780,7 +828,8 @@ impl Repo {
         let (to_protection, tip_root) = (tip.protection, tip.root);
         let mut jobs: Vec<Job> = Vec::new();
         for mut prep in preps {
-            let old_root = self.snapshot(&prep.candidate)?.root;
+            let cand = self.snapshot(&prep.candidate)?;
+            let old_root = cand.root;
             let result = self.snapshot(&prep.result)?;
             // The result's view, filled (lazy clone) or reported as a gap.
             self.ensure_view(result.root, &sparse)?;
@@ -794,6 +843,7 @@ impl Repo {
                     old_root,
                     result.root,
                     &result.protection,
+                    &cand.protection,
                     &to_protection,
                     tip_root,
                     identity,
@@ -807,6 +857,7 @@ impl Repo {
                     index: prep.index,
                     dir: prep.dir,
                     protection: result.protection,
+                    cand_protection: cand.protection,
                     plan,
                     cache: prep.cache,
                 }),
@@ -827,6 +878,11 @@ impl Repo {
         // harvest would read the refreshed ones as the agent's own: mark the
         // session, durably, before the first write, with what the retry needs
         // (cleared with the new base).
+        // The candidate's seals of the agent's protected edits are in the caches,
+        // in memory only; the retry's check of what the agent left needs them.
+        for job in &jobs {
+            job.cache.save_best_effort();
+        }
         let me = std::process::id();
         match session.pending_refresh.as_mut() {
             None => {
@@ -1833,6 +1889,43 @@ mod tests {
         for e in &session.workspaces {
             assert!(!repo.ws_changed(None, e).unwrap(), "workspace {}", e.index);
         }
+        cleanup(repo, &root);
+    }
+
+    #[test]
+    fn a_kill_before_the_merged_write_of_an_edited_protected_file_is_resumable() {
+        // The agent edited line 1 of a protected file and the host line 5 (and
+        // a.txt): the candidate re-sealed the agent's text, and a kill before
+        // that file's write leaves only the pre-refresh cache on disk.
+        let (repo, root) = init("kill-edited-protected");
+        let (sk, pk) = scl_crypto::generate_keypair();
+        repo.protect("secret/", &[pk], None).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("secret/x"), "s1\ns2\ns3\ns4\ns5\n").unwrap();
+        repo.commit("t", "protected").unwrap();
+        let s = repo.ws_fork(None, 1, "t", Some(&sk)).unwrap();
+        let dir = s.workspaces[0].dir.clone();
+        let cache_path = repo.layout().ws_cache_path(None, 1);
+        let before = std::fs::read(&cache_path).unwrap();
+        std::fs::write(dir.join("secret/x"), "AGENT\ns2\ns3\ns4\ns5\n").unwrap();
+        host_commit(
+            &repo,
+            &root,
+            &[
+                ("secret/x", Some("s1\ns2\ns3\ns4\nHOST\n")),
+                ("a.txt", Some("a host edit\n")),
+            ],
+        );
+        {
+            // a.txt is written, then the merged secret/x is not.
+            let _g = FailGuard::after(1);
+            repo.ws_refresh(None, None, Some(&sk)).unwrap_err();
+        }
+        assert_eq!(read(&dir, "secret/x"), "AGENT\ns2\ns3\ns4\ns5\n");
+        std::fs::write(&cache_path, &before).unwrap();
+        repo.ws_refresh(None, None, Some(&sk)).unwrap();
+        assert_eq!(read(&dir, "secret/x"), "AGENT\ns2\ns3\ns4\nHOST\n");
+        assert_eq!(read(&dir, "a.txt"), "a host edit\n");
         cleanup(repo, &root);
     }
 

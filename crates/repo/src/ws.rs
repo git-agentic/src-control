@@ -207,6 +207,7 @@ struct PendingToml {
     #[serde(default)]
     writers: Vec<u32>,
     /// The session's real base while the top-level field holds [`PENDING_BASE`].
+    #[serde(default)]
     base: String,
     #[serde(default)]
     workspace: Vec<PendingWsToml>,
