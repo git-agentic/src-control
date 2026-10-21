@@ -796,6 +796,24 @@ enum WsOp {
         /// Workspace index to abandon. Omit to abandon the whole session.
         index: Option<u32>,
     },
+    /// Move a session onto a newer tip, keeping every live workspace's edits
+    /// (committed to nothing: the checkout is the state). Refuses, before
+    /// changing anything, if any workspace conflicts with the new tip, is
+    /// running a command, or cannot be laid out.
+    Refresh {
+        /// Session to address: the name given to `sc ws fork --name`. Omit
+        /// for the unnamed session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Branch to move onto (default: the checked-out branch). The session's
+        /// base branch, and so harvest's default landing branch, becomes it.
+        #[arg(long)]
+        onto: Option<String>,
+        /// Identity key to decrypt protected paths the new tip changed (default
+        /// ~/.sc/identity or $SC_IDENTITY).
+        #[arg(long)]
+        identity: Option<PathBuf>,
+    },
     /// Read-only conflict probe + cumulative auto-merge of every live
     /// workspace onto the landing branch (default: the session's base
     /// branch). Conflicted/rejected workspaces fall back to a `work-<i>`
@@ -3503,6 +3521,16 @@ fn run_ws(op: WsOp) -> Result<()> {
                     Some(n) => print!("session {n} base:"),
                 }
                 println!(" branch {} @ {}", s.base_branch, s.base_snapshot.short());
+                if let Some(p) = &s.pending_refresh {
+                    println!(
+                        "refresh to {} did not finish: run `sc ws refresh{}` to complete it",
+                        p.target.short(),
+                        s.name
+                            .as_deref()
+                            .map(|n| format!(" --session {n}"))
+                            .unwrap_or_default()
+                    );
+                }
                 println!("index  status                       dir");
                 for entry in &s.workspaces {
                     let status = repo.ws_status_label(s, entry)?;
@@ -3536,6 +3564,34 @@ fn run_ws(op: WsOp) -> Result<()> {
             match index {
                 Some(i) => println!("abandoned workspace {i}; {remaining} still live"),
                 None => println!("abandoned the session ({remaining} workspace(s) remain)"),
+            }
+        }
+        WsOp::Refresh {
+            session,
+            onto,
+            identity,
+        } => {
+            let sk = resolve_identity_opt(identity)?;
+            let r = repo.ws_refresh(session.as_deref(), onto.as_deref(), sk.as_ref())?;
+            if r.workspaces.is_empty() {
+                println!("already based on branch {} @ {}", r.branch, r.to.short());
+            } else {
+                println!(
+                    "refreshed {} workspace(s) from {} to branch {} @ {}",
+                    r.workspaces.len(),
+                    r.from.short(),
+                    r.branch,
+                    r.to.short()
+                );
+                for w in &r.workspaces {
+                    println!(
+                        "  {:<3} {} written, {} removed",
+                        w.index, w.written, w.removed
+                    );
+                    for p in &w.skipped {
+                        println!("      skipped (no key): {p}");
+                    }
+                }
             }
         }
         WsOp::Harvest {

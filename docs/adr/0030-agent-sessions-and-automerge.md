@@ -1,6 +1,6 @@
 # ADR-0030: Agent sessions and auto-merge of clean results
 
-- **Status:** Accepted; the one-session-per-repo rule is superseded by ADR-0056 (named and concurrent sessions)
+- **Status:** Accepted; the one-session-per-repo rule is superseded by ADR-0056 (named and concurrent sessions), which also adds `sc ws refresh` (moving a live session onto a newer tip)
 - **Date:** 2026-07-07
 - **Phase:** 20
 - **Builds on:** ADR-0023 (agent workspaces), ADR-0012 (three-way merge), ADR-0024 (oplog)

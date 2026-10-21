@@ -178,8 +178,20 @@ cargo run --bin sc -- ws harvest [--session <n>] [--into <branch>] [--identity <
                                               # harvest wins, a later conflicting one falls back.
                                               # Omitting --session means the unnamed session,
                                               # never a guessed named one
+cargo run --bin sc -- ws refresh [--session <n>] [--onto <branch>] [--identity <key>]   # move every live
+                                              # workspace of the session onto the checked-out
+                                              # branch's tip (or <branch>), keeping its edits
+                                              # (dirty files included; no commit is made) and
+                                              # untracked files; the session's base branch becomes
+                                              # that branch. Refuses before any write on a conflict
+                                              # (lists workspace + paths), a running `ws run`, a
+                                              # scanner hit, a view gap, a user file in the way,
+                                              # or a protected path it needs --identity to
+                                              # decrypt. Whole session only (no per-index form).
+                                              # An interrupted refresh leaves a marker: harvest
+                                              # refuses until `ws refresh` is run again to finish it
 cargo run --bin sc -- ws abandon [--session <n>] [<i>]  # drop one workspace or the whole session
-bash demo/run_ws_demo.sh                      # multi-invocation session + auto-merge proof (P20)
+bash demo/run_ws_demo.sh                      # multi-invocation session + auto-merge + refresh proof (P20)
 cargo run --bin sc -- cherry-pick <ref> [--identity <key>]   # replay one commit onto the
                                               # current branch (--identity as above)
 cargo run --bin sc -- cherry-pick <ref> --mainline <N>       # replay a merge commit relative

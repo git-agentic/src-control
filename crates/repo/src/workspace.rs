@@ -83,6 +83,25 @@ pub(crate) fn harvest_workspace(
     sparse: &crate::sparse::Sparse,
     cache: Option<&mut crate::cache::ProtectedCache>,
 ) -> Result<HarvestResult> {
+    let res = workspace_candidate(repo, tip, dir, author, message, sparse, cache)?;
+    if let HarvestResult::Committed(id) = &res {
+        refs::write_branch_tip(repo.layout(), branch, id)?;
+    }
+    Ok(res)
+}
+
+/// The commit half of [`harvest_workspace`]: the checkout at `dir` as a
+/// snapshot whose parent is `tip`, with no ref written (`sc ws refresh` replays
+/// it and drops it).
+pub(crate) fn workspace_candidate(
+    repo: &Repo,
+    tip: ObjectId,
+    dir: &Path,
+    author: &str,
+    message: &str,
+    sparse: &crate::sparse::Sparse,
+    cache: Option<&mut crate::cache::ProtectedCache>,
+) -> Result<HarvestResult> {
     let snap = repo.snapshot(&tip)?;
     let ws = Layout::at(dir);
     let (tracked, changed) = {
@@ -145,10 +164,7 @@ pub(crate) fn harvest_workspace(
         author,
         message,
     ) {
-        Ok(id) => {
-            refs::write_branch_tip(repo.layout(), branch, &id)?;
-            Ok(HarvestResult::Committed(id))
-        }
+        Ok(id) => Ok(HarvestResult::Committed(id)),
         Err(Error::SecretDetected(report)) => Ok(HarvestResult::Rejected(report)),
         Err(e) => Err(e),
     }

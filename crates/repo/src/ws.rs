@@ -50,6 +50,32 @@ pub struct WsEntry {
     pub landed_tip: Option<ObjectId>,
 }
 
+/// An unfinished `sc ws refresh` (ADR-0056): where it was moving the session and,
+/// per workspace, the two snapshots it was turning one into the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRefresh {
+    /// The tip the session is being moved to.
+    pub target: ObjectId,
+    /// The branch `target` is the tip of (becomes `base_branch` on completion).
+    pub branch: String,
+    /// One entry per workspace that was live when the refresh began.
+    pub workspaces: Vec<PendingWs>,
+    /// Pids of the `sc` processes that have written for this refresh (the first
+    /// attempt and each retry). A killed writer's staging files are removed only
+    /// under one of these pids.
+    pub writers: Vec<u32>,
+}
+
+/// One workspace of a [`PendingRefresh`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWs {
+    pub index: u32,
+    /// The checkout as the refresh read it (parent: the old base).
+    pub candidate: ObjectId,
+    /// What the checkout becomes: the candidate replayed onto `target`.
+    pub result: ObjectId,
+}
+
 /// The session manifest (`.sc/ws/session.toml`). Never stores key material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsSession {
@@ -74,10 +100,16 @@ pub struct WsSession {
     /// manifest (no `sparse` key) parse as empty/full, matching that
     /// manifest's actual behavior (sparse checkouts didn't exist yet).
     pub sparse: Vec<String>,
+    /// Set while a `sc ws refresh` is writing its checkouts, cleared when it
+    /// completes. A set marker means the checkouts may hold a mix of old and
+    /// refreshed files, so harvest and run refuse until refresh is run again
+    /// (ADR-0056); it records what the refresh was writing, so the retry can
+    /// finish it. Absent from older manifests.
+    pub pending_refresh: Option<PendingRefresh>,
     pub workspaces: Vec<WsEntry>,
 }
 
-fn ws_dir(layout: &Layout, name: Option<&str>) -> PathBuf {
+pub(crate) fn ws_dir(layout: &Layout, name: Option<&str>) -> PathBuf {
     layout.ws_root(name)
 }
 
@@ -88,7 +120,7 @@ fn manifest_path(layout: &Layout, name: Option<&str>) -> PathBuf {
 /// The prefix of a session's fallback branches and `SC_WORKSPACE` label:
 /// `work` for the unnamed session (unchanged), the session name otherwise,
 /// matching `sc work --name`.
-fn label_prefix(name: Option<&str>) -> &str {
+pub(crate) fn label_prefix(name: Option<&str>) -> &str {
     name.unwrap_or("work")
 }
 
@@ -106,7 +138,7 @@ fn running_path(layout: &Layout, name: Option<&str>, i: u32) -> PathBuf {
 /// the workspace busy after `sc` is killed). It is cleared only when every
 /// recorded pid is provably dead (the repo lock's probe); an unreadable or
 /// empty marker counts as busy.
-fn ensure_idle(layout: &Layout, name: Option<&str>, i: u32) -> Result<()> {
+pub(crate) fn ensure_idle(layout: &Layout, name: Option<&str>, i: u32) -> Result<()> {
     let path = running_path(layout, name, i);
     if path.exists() {
         let pids: Vec<u32> = std::fs::read_to_string(&path)
@@ -160,16 +192,64 @@ struct SessionToml {
     #[serde(default)]
     sparse: Vec<String>,
     #[serde(default)]
+    pending_refresh: Option<PendingToml>,
+    #[serde(default)]
     workspace: Vec<EntryToml>,
+}
+
+/// What `base_snapshot` holds in the manifest while a refresh is unfinished.
+const PENDING_BASE: &str = "refresh-unfinished";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingToml {
+    target: String,
+    branch: String,
+    #[serde(default)]
+    writers: Vec<u32>,
+    /// The session's real base while the top-level field holds [`PENDING_BASE`].
+    #[serde(default)]
+    base: String,
+    #[serde(default)]
+    workspace: Vec<PendingWsToml>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingWsToml {
+    index: u32,
+    candidate: String,
+    result: String,
 }
 
 impl From<&WsSession> for SessionToml {
     fn from(s: &WsSession) -> Self {
         SessionToml {
-            base_snapshot: s.base_snapshot.to_hex(),
+            // While a refresh is unfinished the real base lives in the marker and
+            // this field is not an object id, so a binary that does not know the
+            // marker fails to parse the manifest instead of harvesting a
+            // half-refreshed checkout as clean.
+            base_snapshot: if s.pending_refresh.is_some() {
+                PENDING_BASE.to_string()
+            } else {
+                s.base_snapshot.to_hex()
+            },
             base_branch: s.base_branch.clone(),
             author: s.author.clone(),
             sparse: s.sparse.clone(),
+            pending_refresh: s.pending_refresh.as_ref().map(|p| PendingToml {
+                target: p.target.to_hex(),
+                branch: p.branch.clone(),
+                writers: p.writers.clone(),
+                base: s.base_snapshot.to_hex(),
+                workspace: p
+                    .workspaces
+                    .iter()
+                    .map(|w| PendingWsToml {
+                        index: w.index,
+                        candidate: w.candidate.to_hex(),
+                        result: w.result.to_hex(),
+                    })
+                    .collect(),
+            }),
             workspace: s
                 .workspaces
                 .iter()
@@ -186,8 +266,12 @@ impl From<&WsSession> for SessionToml {
 
 impl SessionToml {
     fn into_session(raw: SessionToml, name: Option<&str>) -> Result<WsSession> {
-        let base_snapshot = ObjectId::from_str(&raw.base_snapshot)
-            .map_err(|_| bad(format!("bad base_snapshot: {}", raw.base_snapshot)))?;
+        let base_hex = match (&raw.pending_refresh, raw.base_snapshot.as_str()) {
+            (Some(p), PENDING_BASE) => p.base.as_str(),
+            (_, b) => b,
+        };
+        let base_snapshot = ObjectId::from_str(base_hex)
+            .map_err(|_| bad(format!("bad base_snapshot: {base_hex}")))?;
         let workspaces = raw
             .workspace
             .into_iter()
@@ -206,12 +290,37 @@ impl SessionToml {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let id = |what: &str, t: &str| {
+            ObjectId::from_str(t).map_err(|_| bad(format!("bad pending_refresh {what}: {t}")))
+        };
+        let pending_refresh = raw
+            .pending_refresh
+            .map(|p| -> Result<PendingRefresh> {
+                Ok(PendingRefresh {
+                    target: id("target", &p.target)?,
+                    branch: p.branch,
+                    writers: p.writers,
+                    workspaces: p
+                        .workspace
+                        .iter()
+                        .map(|w| {
+                            Ok(PendingWs {
+                                index: w.index,
+                                candidate: id("candidate", &w.candidate)?,
+                                result: id("result", &w.result)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                })
+            })
+            .transpose()?;
         Ok(WsSession {
             name: name.map(str::to_string),
             base_snapshot,
             base_branch: raw.base_branch,
             author: raw.author,
             sparse: raw.sparse,
+            pending_refresh,
             workspaces,
         })
     }
@@ -258,7 +367,7 @@ pub(crate) fn list_sessions(layout: &Layout) -> Result<Vec<WsSession>> {
 }
 
 /// The open session called `name`, or an error naming what is open instead.
-fn open_session(layout: &Layout, name: Option<&str>) -> Result<WsSession> {
+pub(crate) fn open_session(layout: &Layout, name: Option<&str>) -> Result<WsSession> {
     if let Some(s) = read_manifest(layout, name)? {
         return Ok(s);
     }
@@ -281,7 +390,7 @@ fn open_session(layout: &Layout, name: Option<&str>) -> Result<WsSession> {
 
 /// Write the session manifest atomically. The parent dir must already exist
 /// (fork/abandon create it before the first write).
-fn write_manifest(layout: &Layout, session: &WsSession) -> Result<()> {
+pub(crate) fn write_manifest(layout: &Layout, session: &WsSession) -> Result<()> {
     let raw: SessionToml = session.into();
     let text = toml::to_string(&raw).map_err(|e| Error::BadConfig(e.to_string()))?;
     let path = manifest_path(layout, session.name.as_deref());
@@ -394,6 +503,7 @@ impl Repo {
             base_branch: branch,
             author: author.to_string(),
             sparse: sparse.prefixes().to_vec(),
+            pending_refresh: None,
             workspaces,
         };
         write_manifest(self.layout(), &session)?;
@@ -590,6 +700,14 @@ impl Repo {
         identity: Option<&scl_crypto::SecretKey>,
     ) -> Result<WsRunPlan> {
         let session = open_session(self.layout(), name)?;
+        // A command could delete a file the unfinished refresh wrote, a deletion
+        // its retry could not see against the old base.
+        if session.pending_refresh.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "a `sc ws refresh` did not finish; run `sc ws refresh{}` before `sc ws run`",
+                name.map(|n| format!(" --session {n}")).unwrap_or_default()
+            )));
+        }
         let entry = session
             .workspaces
             .iter()
@@ -817,6 +935,13 @@ impl Repo {
             return Err(Error::RebaseInProgress);
         }
         let mut session = open_session(self.layout(), name)?;
+        if session.pending_refresh.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "a `sc ws refresh` did not finish and the checkouts may hold a mix of old and \
+                 refreshed files; run `sc ws refresh{}` to finish it (or abandon the session)",
+                name.map(|n| format!(" --session {n}")).unwrap_or_default()
+            )));
+        }
 
         let landing = into.unwrap_or(&session.base_branch).to_string();
         let current = refs::current_branch(self.layout())?;
@@ -2257,6 +2382,7 @@ mod tests {
             base_branch: session.base_branch.clone(),
             author: session.author.clone(),
             sparse: session.sparse.clone(),
+            pending_refresh: None,
             workspaces: vec![WsEntry {
                 index: 1,
                 dir: dir.clone(),

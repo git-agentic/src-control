@@ -74,6 +74,13 @@ fn roots(layout: &Layout) -> Result<Vec<ObjectId>> {
     }
     for s in ws::list_sessions(layout)? {
         set.insert(s.base_snapshot);
+        // An unfinished refresh must be able to finish onto its own target.
+        if let Some(p) = &s.pending_refresh {
+            set.insert(p.target);
+            for w in &p.workspaces {
+                set.extend([w.candidate, w.result]);
+            }
+        }
     }
     for id in oplog::referenced_ids(layout)? {
         set.insert(id);
