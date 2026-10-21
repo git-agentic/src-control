@@ -1081,7 +1081,7 @@ Trust is accept-new TOFU, the SSH `known_hosts` shape: the client pins
 `SC_HTTPS_FINGERPRINT` pre-pins for CI;
 `SC_HTTPS_STRICT=1` refuses unknown hosts). A pin mismatch always
 hard-fails. The server auto-mints a self-signed identity into
-`.sc/serve-tls/` (key `0600`) unless PEM is supplied; `sc serve fingerprint`
+`.sc/serve-tls/` (key `0600`; owner-only DACL on Windows, #281) unless PEM is supplied; `sc serve fingerprint`
 prints the pin an operator distributes out-of-band. Follow-ons: `sc tls
 list/forget/pin/path` manages the pin file (ADR-0053), and a client can opt into
 CA validation instead of pinning with `SC_HTTPS_CA_FILE=<pem>` or
