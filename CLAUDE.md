@@ -251,8 +251,11 @@ transport-adjacent. The rest, imperatively:
   transferred.** Cache saves are best-effort and ordered after ref moves; a
   cache failure may cause a spurious re-seal but never incorrectness. The key
   is owner-only on unix (`0600`) and Windows (single-ACE protected DACL, from the first byte;
-  `crates/repo/src/winacl.rs`); other targets, or a failed Windows ACL call, keep default
-  permissions and warn once (#214).
+  `crates/core/src/winacl.rs` behind `scl_core::owner_only`, the one creation primitive); other
+  targets, or a failed Windows ACL call, keep default permissions and warn once (#214). The
+  `sc keygen` identity and the TLS serve key use the same primitive (#281); `tlsio` is a leaf, so
+  `load_or_mint` takes the creator from `repo` (`load_or_mint_serve_identity`) and never calls
+  core. `windows-sys` and the sole Windows `unsafe` live in `scl-core` only.
 - **Revoke is standing-only.** A revoked recipient keeps decrypting ciphertext
   sealed before the revoke (they hold the old wraps); cryptographic cutover is
   `sc rewrap --rotate` at the tip (fresh key per protected blob; a plain

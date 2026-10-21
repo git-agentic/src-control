@@ -978,11 +978,21 @@ fn resolve_tls(
         TlsMode::Off => return Ok(None),
         TlsMode::AutoMint => {
             require_repo_for_tls_identity(root)?;
-            scl_tlsio::load_or_mint(&crate::layout::Layout::at(root).serve_tls_dir())?
+            load_or_mint_serve_identity(&crate::layout::Layout::at(root).serve_tls_dir())?
         }
         TlsMode::Pem { cert, key } => scl_tlsio::load_pem(cert, key)?,
     };
     Ok(Some(scl_tlsio::server_config(identity)?))
+}
+
+/// Load or mint the serve-TLS identity with its private key created owner-only
+/// from the first byte (`scl_core::owner_only`; Windows DACL since #281). The
+/// leaf `scl-tlsio` crate cannot depend on `scl-core`, so the creator is
+/// injected here, the single place the key's permissions are decided.
+pub(crate) fn load_or_mint_serve_identity(
+    dir: &std::path::Path,
+) -> scl_tlsio::Result<scl_tlsio::ServerIdentity> {
+    scl_tlsio::load_or_mint(dir, &scl_core::owner_only::create_new_owner_only_or_warn)
 }
 
 /// The serve-TLS identity lives in `<root>/.sc/serve-tls/`, so minting one
@@ -1005,7 +1015,7 @@ fn require_repo_for_tls_identity(root: &std::path::Path) -> Result<()> {
 /// server uses; no drift possible.
 pub fn serve_tls_fingerprint(root: &std::path::Path) -> Result<String> {
     require_repo_for_tls_identity(root)?;
-    let id = scl_tlsio::load_or_mint(&crate::layout::Layout::at(root).serve_tls_dir())?;
+    let id = load_or_mint_serve_identity(&crate::layout::Layout::at(root).serve_tls_dir())?;
     Ok(scl_tlsio::fingerprint_hex(&id.spki_sha256))
 }
 
@@ -2845,9 +2855,32 @@ mod tests {
 
     // ── Task 4: TLS-wrapped server seam. ──
 
+    /// The auto-minted serve key is owner-only from its first byte: `0600` on
+    /// unix, a single explicit DACL ACE on Windows (#281).
+    #[test]
+    fn minted_serve_tls_key_is_owner_only() {
+        let root = std::env::temp_dir().join(format!("scl-serve-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join(".sc").join("serve-tls");
+        let a = load_or_mint_serve_identity(&dir).unwrap();
+        let b = load_or_mint_serve_identity(&dir).unwrap();
+        assert_eq!(a.spki_sha256, b.spki_sha256, "second call loads");
+        let key = dir.join("key.pem");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "key.pem must be 0600");
+        }
+        #[cfg(windows)]
+        crate::test_support::assert_owner_only_dacl(&key);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
     /// Bind a TLS listener over a fresh repo; returns (addr, spki, join guard).
     fn spawn_tls_server(root: &std::path::Path) -> (String, [u8; 32]) {
-        let id = scl_tlsio::load_or_mint(&root.join(".sc").join("serve-tls")).unwrap();
+        let id = load_or_mint_serve_identity(&root.join(".sc").join("serve-tls")).unwrap();
         let spki = id.spki_sha256;
         let cfg = scl_tlsio::server_config(id).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -8,8 +8,11 @@ pub mod error;
 pub mod fsutil;
 pub mod id;
 pub mod object;
+pub mod owner_only;
 pub mod pack;
 pub mod store;
+#[cfg(windows)]
+mod winacl;
 
 /// Default for the largest single object (decoded/decompressed canonical
 /// bytes) this system accepts from an untrusted source. The live value is

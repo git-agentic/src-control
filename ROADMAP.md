@@ -690,8 +690,9 @@ across every phase.
     verified by the advisory `windows` CI job (#214). Windows keys created
     before that keep their inherited DACL and no longer warn; delete
     `.sc/local-key` to recreate it owner-only. `sc keygen` now refuses to
-    overwrite an existing identity on Windows too (#281 tracks owner-only
-    protection for the identity file and the TLS serve key).
+    overwrite an existing identity on Windows too. The `sc keygen` identity
+    file and the auto-minted TLS serve key get the same owner-only DACL through
+    one shared primitive, `scl_core::owner_only` (#281).
 
 ## Active
 
@@ -833,12 +834,6 @@ smaller ones (protected-cache hygiene, theirs-side resolve carry, sparse and
 P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
 `CLAUDE.md`, `ARCHITECTURE.md` and the ADRs.
 
-- **Windows owner-only protection for the `sc keygen` identity file and the TLS
-  serve key (#281, follow-on to #214).** `.sc/local-key` gets an owner-only DACL;
-  the identity file (`sc keygen --out`, `0600` on unix only) and the serve-home
-  TLS key still get default permissions on non-unix. The helper lives in
-  `scl-repo` (`pub(crate)`), and `tlsio` is a leaf that must not depend on it, so
-  it moves to `core` or reaches `tlsio` as a callback.
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.

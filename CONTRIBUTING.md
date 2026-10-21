@@ -41,8 +41,9 @@ CI (`ci.yml`) runs `fmt --check`, `clippy -D warnings`, `cargo test --workspace
 --all-targets` (Linux and macOS) and `cargo doc` for the Rust workspace, plus a
 `desktop` job (`npm ci`, `npm audit --audit-level=high`, typecheck, test).
 An advisory `windows` job (`cargo check` and `clippy` for the workspace, plus
-the `scl-repo` `cache::` tests, which verify the owner-only ACL on
-`.sc/local-key`) is not a required check; keep it green when you touch
+the `owner_only`, `cache::`, serve-key, `tlsio` identity and keygen tests, which
+verify the owner-only ACL on `.sc/local-key`, the `sc keygen` identity and the TLS
+serve key) is not a required check; keep it green when you touch
 Windows-specific code. Your PR must be green on all required jobs. Changes to
 `Cargo.toml` or `Cargo.lock` also run the RustSec `audit` workflow (it runs daily
 as well). CodeQL, Scorecard, the SBOM generation, the `vendor-provenance` check

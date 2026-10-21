@@ -53,10 +53,11 @@ jobs:
         run: cargo doc --workspace --no-deps
 
   # Advisory (not a required context): proves the Windows build and the owner-only
-  # ACL on .sc/local-key (#214). Deliberately not `cargo test --workspace`; the
-  # wider suite still has unix-only assumptions.
+  # ACL on .sc/local-key, the `sc keygen` identity and the TLS serve key (#214,
+  # #281). Deliberately not `cargo test --workspace`; the wider suite still has
+  # unix-only assumptions.
   windows:
-    name: windows (check + key ACL tests)
+    name: windows (check + secret-file ACL tests)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,8 +69,16 @@ jobs:
         run: cargo check --workspace --all-targets --keep-going
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: key ACL and cache tests
+      - name: owner-only helper tests (scl-core)
+        run: cargo test -p scl-core --lib "owner_only::"
+      - name: local-key ACL and cache tests
         run: cargo test -p scl-repo --lib "cache::"
+      - name: TLS serve key ACL test
+        run: cargo test -p scl-repo --lib "minted_serve_tls_key"
+      - name: TLS identity injection tests (scl-tlsio)
+        run: cargo test -p scl-tlsio --lib "identity::"
+      - name: keygen identity ACL test
+        run: cargo test -p scl-cli --test keygen_overwrite
 
   desktop:
     name: desktop (typecheck + test + audit)

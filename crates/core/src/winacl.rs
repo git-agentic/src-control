@@ -1,6 +1,7 @@
-//! Windows owner-only file creation for `.sc/local-key` (#214).
+//! Windows owner-only file creation (#214, #281): the `.sc/local-key`, the
+//! `sc keygen` identity file and the TLS serve key.
 //!
-//! The only Windows `unsafe` in `scl-repo` lives here, behind one safe function:
+//! The only Windows `unsafe` in the workspace lives here, behind one safe function:
 //! [`create_new_owner_only`]. It builds a *protected* DACL holding a single
 //! ACE (`GENERIC_ALL` for the current user's SID) and hands it to `CreateFileW`
 //! as the file's security descriptor, so the file is owner-only from its first

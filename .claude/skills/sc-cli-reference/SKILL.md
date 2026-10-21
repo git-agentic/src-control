@@ -19,7 +19,7 @@ cargo run --bin sc -- demo --agents 4 --checkout   # also materialize each workt
                                              # temp dir (the one disk-writing path), then clean up
 cargo run --bin sc -- import --repo <path>   # import a Git repo's HEAD
 bash demo/run_demo.sh                         # independent zero-residue proof
-cargo run --bin sc -- keygen [--out <file>]  # (default ~/.sc/identity; 0600 on unix only) v2 identity: one seed derives BOTH an X25519
+cargo run --bin sc -- keygen [--out <file>]  # (default ~/.sc/identity; 0600 on unix, owner-only DACL on Windows) v2 identity: one seed derives BOTH an X25519
                                              # encryption key and an Ed25519 signing key (P22);
                                              # a pre-P22 v1 (scl-sk-) identity still parses and
                                              # still encrypts, but cannot sign

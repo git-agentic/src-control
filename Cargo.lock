@@ -5369,6 +5369,7 @@ dependencies = [
  "hex",
  "proptest",
  "thiserror 2.0.21",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -5443,7 +5444,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "toml 1.1.6+spec-1.1.0",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -67,8 +67,6 @@ pub mod transport;
 #[cfg(test)]
 mod user_file_safety;
 pub mod walfmt;
-#[cfg(windows)]
-mod winacl;
 pub mod wire;
 pub mod workspace;
 pub mod worktree;

@@ -299,7 +299,7 @@ mod tests {
     /// Loopback server: accept one connection, TLS-wrap it, echo one
     /// length-prefixed message back. Returns (addr, join handle, spki).
     fn echo_server(dir: &std::path::Path) -> (String, std::thread::JoinHandle<()>, [u8; 32]) {
-        let id = crate::load_or_mint(dir).unwrap();
+        let id = crate::load_or_mint(dir, &crate::identity::tests::plain_create).unwrap();
         let spki = id.spki_sha256;
         let cfg = server_config(id).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

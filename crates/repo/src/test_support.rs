@@ -55,3 +55,24 @@ pub(crate) fn watchdog<'a>(
         }
     });
 }
+
+/// Windows: assert `path` carries exactly one explicit, non-inherited
+/// full-control ACE for the current user, read back with `icacls`.
+#[cfg(windows)]
+pub(crate) fn assert_owner_only_dacl(path: &std::path::Path) {
+    let out = std::process::Command::new("icacls")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "icacls failed: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let acl = text.replace(path.to_str().unwrap(), "");
+    let aces: Vec<&str> = acl.lines().filter(|l| l.contains(":(")).collect();
+    let user = std::env::var("USERNAME").unwrap().to_lowercase();
+    assert_eq!(aces.len(), 1, "exactly one ACE expected:\n{text}");
+    let ace = aces[0].trim().to_lowercase();
+    assert!(
+        ace.contains(&format!("\\{user}:(")) && ace.contains("(f)") && !ace.contains("(i)"),
+        "ACE must be an explicit full-control grant to {user}:\n{text}"
+    );
+}

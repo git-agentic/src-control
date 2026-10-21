@@ -107,9 +107,13 @@ Storage and knobs:
 
 `sc serve --http <addr> <path> --tls [--tls-cert <pem> --tls-key <pem>]`.
 Without PEM flags, the server auto-mints a self-signed identity into
-`.sc/serve-tls/` (`cert.pem` + `key.pem`, key file `0600` — the key file IS
-the server's identity, so its permissions matter the same way an SSH host key
-does), regenerating only when the material is missing, `not_after` set to
+`.sc/serve-tls/` (`cert.pem` + `key.pem`, key file `0600`, or a single-ACE
+protected DACL on Windows since #281 — the key file IS the server's identity, so
+its permissions matter the same way an SSH host key does; `tlsio` is a leaf and
+receives the owner-only creator from `scl-repo` rather than depending on
+`scl-core`; the key is created first, with `create_new` on every platform, so a race
+between two first starts fails the loser before it writes a cert, instead of
+pairing one process's cert with the other's key), regenerating only when the material is missing, `not_after` set to
 2126 (a century out — self-signed + TOFU pinning makes expiry-driven rotation
 meaningless without a CA, so the cert's own validity window is not the trust
 mechanism; the pin is). `--tls` is refused together with `--stdio` (ssh
