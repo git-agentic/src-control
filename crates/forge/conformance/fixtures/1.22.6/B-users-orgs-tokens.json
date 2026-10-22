@@ -1,0 +1,915 @@
+{
+  "scenario": "B",
+  "title": "users-orgs-tokens",
+  "error": null,
+  "exchanges": [
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "username": "alice",
+        "email": "alice@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "login": "alice",
+        "login_name": "",
+        "source_id": "<id:source_id#1>",
+        "full_name": "",
+        "email": "alice@example.invalid",
+        "avatar_url": "<base>/avatars/43fcab1f4245d31e85b194dc2836a67d",
+        "html_url": "<base>/alice",
+        "language": "",
+        "is_admin": false,
+        "last_login": "<ts>",
+        "created": "<ts>",
+        "restricted": false,
+        "active": true,
+        "prohibit_login": false,
+        "location": "",
+        "website": "",
+        "description": "",
+        "visibility": "public",
+        "followers_count": 0,
+        "following_count": 0,
+        "starred_repos_count": 0,
+        "username": "alice"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "alice",
+        "email": "alice@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user already exists [name: alice]",
+        "url": "<base>/api/swagger"
+      },
+      "must_contain": [
+        "already exists"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "username": "bot",
+        "email": "bot@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "login": "bot",
+        "login_name": "",
+        "source_id": "<id:source_id#1>",
+        "full_name": "",
+        "email": "bot@example.invalid",
+        "avatar_url": "<base>/avatars/588cf1ed573d796ba072435cf9899ab3",
+        "html_url": "<base>/bot",
+        "language": "",
+        "is_admin": false,
+        "last_login": "<ts>",
+        "created": "<ts>",
+        "restricted": false,
+        "active": true,
+        "prohibit_login": false,
+        "location": "",
+        "website": "",
+        "description": "",
+        "visibility": "public",
+        "followers_count": 0,
+        "following_count": 0,
+        "starred_repos_count": 0,
+        "username": "bot"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PATCH",
+      "path": "/api/v1/admin/users/alice",
+      "auth": "admin",
+      "status": 200,
+      "request": {
+        "login_name": "alice",
+        "source_id": "<id:source_id#1>",
+        "password": "<token>",
+        "visibility": "private",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "login": "alice",
+        "login_name": "alice",
+        "source_id": "<id:source_id#1>",
+        "full_name": "",
+        "email": "alice@example.invalid",
+        "avatar_url": "<base>/avatars/43fcab1f4245d31e85b194dc2836a67d",
+        "html_url": "<base>/alice",
+        "language": "",
+        "is_admin": false,
+        "last_login": "<ts>",
+        "created": "<ts>",
+        "restricted": false,
+        "active": true,
+        "prohibit_login": false,
+        "location": "",
+        "website": "",
+        "description": "",
+        "visibility": "private",
+        "followers_count": 0,
+        "following_count": 0,
+        "starred_repos_count": 0,
+        "username": "alice"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/users/alice",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "login": "alice",
+        "login_name": "alice",
+        "source_id": "<id:source_id#1>",
+        "full_name": "",
+        "email": "alice@example.invalid",
+        "avatar_url": "<base>/avatars/43fcab1f4245d31e85b194dc2836a67d",
+        "html_url": "<base>/alice",
+        "language": "",
+        "is_admin": false,
+        "last_login": "<ts>",
+        "created": "<ts>",
+        "restricted": false,
+        "active": true,
+        "prohibit_login": false,
+        "location": "",
+        "website": "",
+        "description": "",
+        "visibility": "private",
+        "followers_count": 0,
+        "following_count": 0,
+        "starred_repos_count": 0,
+        "username": "alice"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/users/alice",
+      "auth": "none",
+      "status": 403,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "Only signed in user is allowed to call APIs."
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/users/nobody-here",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user redirect does not exist [name: nobody-here]",
+        "url": "<base>/api/swagger"
+      },
+      "must_contain": [
+        "not exist"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "username": "acme",
+        "full_name": "Acme",
+        "visibility": "private"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "name": "acme",
+        "full_name": "Acme",
+        "email": "",
+        "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+        "description": "",
+        "website": "",
+        "location": "",
+        "visibility": "private",
+        "repo_admin_change_team_access": false,
+        "username": "acme"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "acme",
+        "full_name": "Acme",
+        "visibility": "private"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user already exists [name: acme]",
+        "url": "<base>/api/swagger"
+      },
+      "must_contain": [
+        "already exists"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/orgs/acme",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "name": "acme",
+        "full_name": "Acme",
+        "email": "",
+        "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+        "description": "",
+        "website": "",
+        "location": "",
+        "visibility": "private",
+        "repo_admin_change_team_access": false,
+        "username": "acme"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/orgs/nobody-org",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": [
+          "user redirect does not exist [name: nobody-org]"
+        ],
+        "message": "GetOrgByName",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/users/<admin>/orgs/acme/permissions",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "is_owner": true,
+        "is_admin": true,
+        "can_write": true,
+        "can_read": true,
+        "can_create_repository": true
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/users/alice/orgs/acme/permissions",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "HasOrgOrUserVisible",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/teams",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "devs",
+        "permission": "read",
+        "includes_all_repositories": false,
+        "units": [
+          "repo.code",
+          "repo.pulls"
+        ]
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "name": "devs",
+        "description": "",
+        "organization": {
+          "id": "<id:organization.id#1>",
+          "name": "acme",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "description": "",
+          "website": "",
+          "location": "",
+          "visibility": "private",
+          "repo_admin_change_team_access": false,
+          "username": "acme"
+        },
+        "includes_all_repositories": false,
+        "permission": "read",
+        "units": [
+          "repo.code",
+          "repo.pulls"
+        ],
+        "units_map": {
+          "repo.code": "read",
+          "repo.pulls": "read"
+        },
+        "can_create_org_repo": false
+      },
+      "tags": [
+        "team"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "PUT",
+      "path": "/api/v1/teams/<id:path:teams#1>/members/carol",
+      "auth": "admin",
+      "status": 204,
+      "headers": {},
+      "body_text": "",
+      "tags": [
+        "team"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/users/carol/orgs/acme/permissions",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "is_owner": false,
+        "is_admin": false,
+        "can_write": false,
+        "can_read": true,
+        "can_create_repository": false
+      },
+      "tags": [
+        "team"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/users/alice/tokens",
+      "auth": "alice-basic",
+      "status": 201,
+      "request": {
+        "name": "ci",
+        "scopes": [
+          "read:repository"
+        ]
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "name": "ci",
+        "sha1": "<token>",
+        "token_last_eight": "<token>",
+        "scopes": [
+          "read:repository"
+        ]
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/users/alice/tokens",
+      "auth": "alice-basic",
+      "status": 201,
+      "request": {
+        "name": "tmp",
+        "scopes": [
+          "read:repository",
+          "write:repository"
+        ]
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "name": "tmp",
+        "sha1": "<token>",
+        "token_last_eight": "<token>",
+        "scopes": [
+          "write:repository"
+        ]
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/users/alice/tokens",
+      "auth": "alice-basic",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "2"
+      },
+      "body": [
+        {
+          "id": "<id:id#1>",
+          "name": "ci",
+          "sha1": "<token>",
+          "token_last_eight": "<token>",
+          "scopes": [
+            "read:repository"
+          ]
+        },
+        {
+          "id": "<id:id#2>",
+          "name": "tmp",
+          "sha1": "<token>",
+          "token_last_eight": "<token>",
+          "scopes": [
+            "write:repository"
+          ]
+        }
+      ],
+      "volatile": [
+        "id",
+        "name",
+        "scopes"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/users/alice/tokens",
+      "auth": "alice-ro",
+      "status": 403,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "token does not have at least one of required scope(s): [read:user]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "DELETE",
+      "path": "/api/v1/users/alice/tokens/<id:path:tokens#1>",
+      "auth": "alice-basic",
+      "status": 204,
+      "headers": {},
+      "body_text": ""
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/users/alice/tokens",
+      "auth": "alice-basic",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "1"
+      },
+      "body": [
+        {
+          "id": "<id:id#1>",
+          "name": "ci",
+          "sha1": "<token>",
+          "token_last_eight": "<token>",
+          "scopes": [
+            "read:repository"
+          ]
+        }
+      ],
+      "volatile": [
+        "id",
+        "name",
+        "scopes"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/users/alice/tokens",
+      "auth": "alice-basic",
+      "status": 400,
+      "request": {
+        "name": "ci",
+        "scopes": [
+          "all"
+        ]
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "access token name has been used already",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/users/bot/tokens",
+      "auth": "bot-basic",
+      "status": 201,
+      "request": {
+        "name": "scoped",
+        "scopes": [
+          "read:user",
+          "read:organization",
+          "write:repository"
+        ]
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "name": "scoped",
+        "sha1": "<token>",
+        "token_last_eight": "<token>",
+        "scopes": [
+          "read:organization",
+          "write:repository",
+          "read:user"
+        ]
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "alice-ro",
+      "status": 403,
+      "request": {
+        "name": "nope"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "token does not have at least one of required scope(s): [write:organization]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/alice/scoped",
+      "auth": "alice-ro",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "alice",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "",
+          "email": "alice@example.invalid",
+          "avatar_url": "<base>/avatars/43fcab1f4245d31e85b194dc2836a67d",
+          "html_url": "<base>/alice",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "alice"
+        },
+        "name": "scoped",
+        "full_name": "alice/scoped",
+        "description": "",
+        "empty": false,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "parent": null,
+        "mirror": false,
+        "size": 23,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/alice/scoped/languages",
+        "html_url": "<base>/alice/scoped",
+        "url": "<base>/api/v1/repos/alice/scoped",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/alice/scoped.git",
+        "clone_url": "<base>/alice/scoped.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": false,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "repo_transfer": null
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/user/repos",
+      "auth": "alice-ro",
+      "status": 403,
+      "request": {
+        "name": "nope"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "token does not have at least one of required scope(s): [write:user]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/alice/scoped/contents/new.txt",
+      "auth": "alice-ro",
+      "status": 403,
+      "request": {
+        "content": "aGk=",
+        "message": "m"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "token does not have at least one of required scope(s): [write:repository]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PUT",
+      "path": "/api/v1/repos/alice/scoped/contents/README.md",
+      "auth": "alice-ro",
+      "status": 403,
+      "request": {
+        "content": "aGk=",
+        "message": "m",
+        "sha": "<sha#1>"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "token does not have at least one of required scope(s): [write:repository]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PUT",
+      "path": "/api/v1/repos/alice/scoped/collaborators/carol",
+      "auth": "alice-ro",
+      "status": 403,
+      "request": {
+        "permission": "write"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "token does not have at least one of required scope(s): [write:repository]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/alice/scoped/statuses/<sha#2>",
+      "auth": "alice-ro",
+      "status": 403,
+      "request": {
+        "state": "success",
+        "context": "x"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "token does not have at least one of required scope(s): [write:repository]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/user",
+      "auth": "bot-scoped",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "login": "bot",
+        "login_name": "",
+        "source_id": "<id:source_id#1>",
+        "full_name": "",
+        "email": "bot@example.invalid",
+        "avatar_url": "<base>/avatars/588cf1ed573d796ba072435cf9899ab3",
+        "html_url": "<base>/bot",
+        "language": "",
+        "is_admin": false,
+        "last_login": "<ts>",
+        "created": "<ts>",
+        "restricted": false,
+        "active": true,
+        "prohibit_login": false,
+        "location": "",
+        "website": "",
+        "description": "",
+        "visibility": "public",
+        "followers_count": 0,
+        "following_count": 0,
+        "starred_repos_count": 0,
+        "username": "bot"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/orgs/acme",
+      "auth": "bot-scoped",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "HasOrgOrUserVisible",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/admin/users",
+      "auth": "bot-scoped",
+      "status": 403,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "token does not have at least one of required scope(s): [read:admin]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/user/repos",
+      "auth": "bot-scoped",
+      "status": 403,
+      "request": {
+        "name": "botrepo",
+        "private": true
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "token does not have at least one of required scope(s): [write:user]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/alice/scoped",
+      "auth": "bot-scoped",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "The target couldn't be found.",
+        "url": "<base>/api/swagger"
+      }
+    }
+  ]
+}

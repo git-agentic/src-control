@@ -1,0 +1,2306 @@
+{
+  "scenario": "E",
+  "title": "history-reads",
+  "error": null,
+  "exchanges": [
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "hist",
+        "full_name": "acme/hist",
+        "description": "",
+        "empty": false,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "parent": null,
+        "mirror": false,
+        "size": 25,
+        "language": "Rust",
+        "languages_url": "<base>/api/v1/repos/acme/hist/languages",
+        "html_url": "<base>/acme/hist",
+        "url": "<base>/api/v1/repos/acme/hist",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/hist.git",
+        "clone_url": "<base>/acme/hist.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": false,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "repo_transfer": null
+      }
+    },
+    {
+      "kind": "note",
+      "key": "hist_first_read",
+      "value": {
+        "empty": false,
+        "default_branch": "main"
+      },
+      "strict": false
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/branches",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "2"
+      },
+      "body": [
+        {
+          "name": "feat/x",
+          "commit": {
+            "id": "<sha#1>",
+            "message": "feat two\n",
+            "url": "<base>/acme/hist/commit/<sha#1>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "verification": {
+              "verified": false,
+              "reason": "gpg.error.not_signed_commit",
+              "signature": "",
+              "signer": null,
+              "payload": ""
+            },
+            "timestamp": "<ts>",
+            "added": null,
+            "removed": null,
+            "modified": null
+          },
+          "protected": false,
+          "required_approvals": 0,
+          "enable_status_check": false,
+          "status_check_contexts": [],
+          "user_can_push": true,
+          "user_can_merge": true,
+          "effective_branch_protection_name": ""
+        },
+        {
+          "name": "main",
+          "commit": {
+            "id": "<sha#2>",
+            "message": "third\n",
+            "url": "<base>/acme/hist/commit/<sha#2>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "verification": {
+              "verified": false,
+              "reason": "gpg.error.not_signed_commit",
+              "signature": "",
+              "signer": null,
+              "payload": ""
+            },
+            "timestamp": "<ts>",
+            "added": null,
+            "removed": null,
+            "modified": null
+          },
+          "protected": false,
+          "required_approvals": 0,
+          "enable_status_check": false,
+          "status_check_contexts": [],
+          "user_can_push": true,
+          "user_can_merge": true,
+          "effective_branch_protection_name": ""
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/branches?limit=1&page=2",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "2",
+        "link": "<<base>/api/v1/repos/acme/hist/branches?limit=1&page=1>; rel=\"first\",<<base>/api/v1/repos/acme/hist/branches?limit=1&page=1>; rel=\"prev\""
+      },
+      "body": [
+        {
+          "name": "main",
+          "commit": {
+            "id": "<sha#2>",
+            "message": "third\n",
+            "url": "<base>/acme/hist/commit/<sha#2>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "verification": {
+              "verified": false,
+              "reason": "gpg.error.not_signed_commit",
+              "signature": "",
+              "signer": null,
+              "payload": ""
+            },
+            "timestamp": "<ts>",
+            "added": null,
+            "removed": null,
+            "modified": null
+          },
+          "protected": false,
+          "required_approvals": 0,
+          "enable_status_check": false,
+          "status_check_contexts": [],
+          "user_can_push": true,
+          "user_can_merge": true,
+          "effective_branch_protection_name": ""
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/branches/main",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "name": "main",
+        "commit": {
+          "id": "<sha#2>",
+          "message": "third\n",
+          "url": "<base>/acme/hist/commit/<sha#2>",
+          "author": {
+            "name": "Conf",
+            "email": "conf@example.invalid",
+            "username": ""
+          },
+          "committer": {
+            "name": "Conf",
+            "email": "conf@example.invalid",
+            "username": ""
+          },
+          "verification": {
+            "verified": false,
+            "reason": "gpg.error.not_signed_commit",
+            "signature": "",
+            "signer": null,
+            "payload": ""
+          },
+          "timestamp": "<ts>",
+          "added": null,
+          "removed": null,
+          "modified": null
+        },
+        "protected": false,
+        "required_approvals": 0,
+        "enable_status_check": false,
+        "status_check_contexts": [],
+        "user_can_push": true,
+        "user_can_merge": true,
+        "effective_branch_protection_name": ""
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/branches/feat/x",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "name": "feat/x",
+        "commit": {
+          "id": "<sha#1>",
+          "message": "feat two\n",
+          "url": "<base>/acme/hist/commit/<sha#1>",
+          "author": {
+            "name": "Conf",
+            "email": "conf@example.invalid",
+            "username": ""
+          },
+          "committer": {
+            "name": "Conf",
+            "email": "conf@example.invalid",
+            "username": ""
+          },
+          "verification": {
+            "verified": false,
+            "reason": "gpg.error.not_signed_commit",
+            "signature": "",
+            "signer": null,
+            "payload": ""
+          },
+          "timestamp": "<ts>",
+          "added": null,
+          "removed": null,
+          "modified": null
+        },
+        "protected": false,
+        "required_approvals": 0,
+        "enable_status_check": false,
+        "status_check_contexts": [],
+        "user_can_push": true,
+        "user_can_merge": true,
+        "effective_branch_protection_name": ""
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/branches/nope",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": [
+          "branch does not exist [name: nope]"
+        ],
+        "message": "The target couldn't be found.",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/refs/heads",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": [
+        {
+          "ref": "refs/heads/feat/x",
+          "url": "<base>/api/v1/repos/acme/hist/git/refs/heads/feat/x",
+          "object": {
+            "type": "commit",
+            "sha": "<sha#1>",
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#1>"
+          }
+        },
+        {
+          "ref": "refs/heads/main",
+          "url": "<base>/api/v1/repos/acme/hist/git/refs/heads/main",
+          "object": {
+            "type": "commit",
+            "sha": "<sha#2>",
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/refs/heads/main",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": [
+        {
+          "ref": "refs/heads/main",
+          "url": "<base>/api/v1/repos/acme/hist/git/refs/heads/main",
+          "object": {
+            "type": "commit",
+            "sha": "<sha#2>",
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/refs/heads/feat/x",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": [
+        {
+          "ref": "refs/heads/feat/x",
+          "url": "<base>/api/v1/repos/acme/hist/git/refs/heads/feat/x",
+          "object": {
+            "type": "commit",
+            "sha": "<sha#1>",
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#1>"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/refs/heads/nope",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "The target couldn't be found.",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/refs",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": [
+        {
+          "ref": "refs/heads/feat/x",
+          "url": "<base>/api/v1/repos/acme/hist/git/refs/heads/feat/x",
+          "object": {
+            "type": "commit",
+            "sha": "<sha#1>",
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#1>"
+          }
+        },
+        {
+          "ref": "refs/heads/main",
+          "url": "<base>/api/v1/repos/acme/hist/git/refs/heads/main",
+          "object": {
+            "type": "commit",
+            "sha": "<sha#2>",
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/commits?sha=main&limit=50&stat=false&files=false&verification=false",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "3"
+      },
+      "body": [
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>",
+          "sha": "<sha#2>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#2>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "third\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#2>",
+              "sha": "<sha#2>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        },
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+          "sha": "<sha#3>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#3>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "second\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+              "sha": "<sha#4>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        },
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+          "sha": "<sha#4>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#4>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "first\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#4>",
+              "sha": "<sha#4>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [],
+          "files": null,
+          "stats": null
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/commits?sha=main&limit=2&page=1&stat=false&files=false&verification=false",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "3",
+        "link": "<<base>/api/v1/repos/acme/hist/commits?files=false&limit=2&page=2&sha=main&stat=false&verification=false>; rel=\"next\",<<base>/api/v1/repos/acme/hist/commits?files=false&limit=2&page=2&sha=main&stat=false&verification=false>; rel=\"last\""
+      },
+      "body": [
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>",
+          "sha": "<sha#2>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#2>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "third\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#2>",
+              "sha": "<sha#2>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        },
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+          "sha": "<sha#3>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#3>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "second\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+              "sha": "<sha#4>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/commits?sha=main&limit=2&page=2&stat=false&files=false&verification=false",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "3",
+        "link": "<<base>/api/v1/repos/acme/hist/commits?files=false&limit=2&page=1&sha=main&stat=false&verification=false>; rel=\"first\",<<base>/api/v1/repos/acme/hist/commits?files=false&limit=2&page=1&sha=main&stat=false&verification=false>; rel=\"prev\""
+      },
+      "body": [
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+          "sha": "<sha#4>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#4>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "first\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#4>",
+              "sha": "<sha#4>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [],
+          "files": null,
+          "stats": null
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/commits?sha=main&limit=2&page=3&stat=false&files=false&verification=false",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "3",
+        "link": "<<base>/api/v1/repos/acme/hist/commits?files=false&limit=2&page=1&sha=main&stat=false&verification=false>; rel=\"first\",<<base>/api/v1/repos/acme/hist/commits?files=false&limit=2&page=1&sha=main&stat=false&verification=false>; rel=\"prev\""
+      },
+      "body": []
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/commits?sha=feat/x&limit=50&stat=false&files=false&verification=false",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "4"
+      },
+      "body": [
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#1>",
+          "sha": "<sha#1>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#1>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#1>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "feat two\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#1>",
+              "sha": "<sha#1>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#5>",
+              "sha": "<sha#5>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        },
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#5>",
+          "sha": "<sha#5>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#5>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#5>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "feat one\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#5>",
+              "sha": "<sha#5>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        },
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+          "sha": "<sha#3>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#3>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "second\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+              "sha": "<sha#4>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        },
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+          "sha": "<sha#4>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#4>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "first\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#4>",
+              "sha": "<sha#4>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [],
+          "files": null,
+          "stats": null
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/commits?sha=<sha#1>&limit=50&stat=false&files=false&verification=false",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "4"
+      },
+      "body": [
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#1>",
+          "sha": "<sha#1>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#1>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#1>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "feat two\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#1>",
+              "sha": "<sha#1>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#5>",
+              "sha": "<sha#5>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        },
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#5>",
+          "sha": "<sha#5>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#5>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#5>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "feat one\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#5>",
+              "sha": "<sha#5>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        },
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+          "sha": "<sha#3>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#3>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "second\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+              "sha": "<sha#4>",
+              "created": "<ts>"
+            }
+          ],
+          "files": null,
+          "stats": null
+        },
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+          "sha": "<sha#4>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#4>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#4>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "first\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#4>",
+              "sha": "<sha#4>",
+              "created": "<ts>"
+            },
+            "verification": null
+          },
+          "author": null,
+          "committer": null,
+          "parents": [],
+          "files": null,
+          "stats": null
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/commits?sha=main&limit=1",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "3",
+        "link": "<<base>/api/v1/repos/acme/hist/commits?limit=1&page=2&sha=main>; rel=\"next\",<<base>/api/v1/repos/acme/hist/commits?limit=1&page=3&sha=main>; rel=\"last\""
+      },
+      "body": [
+        {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>",
+          "sha": "<sha#2>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#2>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "date": "<ts>"
+            },
+            "message": "third\n",
+            "tree": {
+              "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#2>",
+              "sha": "<sha#2>",
+              "created": "<ts>"
+            },
+            "verification": {
+              "verified": false,
+              "reason": "gpg.error.not_signed_commit",
+              "signature": "",
+              "signer": null,
+              "payload": ""
+            }
+          },
+          "author": null,
+          "committer": null,
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            }
+          ],
+          "files": [
+            {
+              "filename": "README.md",
+              "status": "modified"
+            }
+          ],
+          "stats": {
+            "total": 1,
+            "additions": 1,
+            "deletions": 0
+          }
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/commits?sha=nope&limit=50&stat=false&files=false&verification=false",
+      "auth": "admin",
+      "status": 500,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "object does not exist [id: nope, rel_path: ]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/commits/<sha#2>",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>",
+        "sha": "<sha#2>",
+        "created": "<ts>",
+        "html_url": "<base>/acme/hist/commit/<sha#2>",
+        "commit": {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>",
+          "author": {
+            "name": "Conf",
+            "email": "conf@example.invalid",
+            "date": "<ts>"
+          },
+          "committer": {
+            "name": "Conf",
+            "email": "conf@example.invalid",
+            "date": "<ts>"
+          },
+          "message": "third\n",
+          "tree": {
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#2>",
+            "sha": "<sha#2>",
+            "created": "<ts>"
+          },
+          "verification": {
+            "verified": false,
+            "reason": "gpg.error.not_signed_commit",
+            "signature": "",
+            "signer": null,
+            "payload": ""
+          }
+        },
+        "author": null,
+        "committer": null,
+        "parents": [
+          {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#3>",
+            "sha": "<sha#3>",
+            "created": "<ts>"
+          }
+        ],
+        "files": [
+          {
+            "filename": "README.md",
+            "status": "modified"
+          }
+        ],
+        "stats": {
+          "total": 1,
+          "additions": 1,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/commits/<sha#1>",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#1>",
+        "sha": "<sha#1>",
+        "created": "<ts>",
+        "html_url": "<base>/acme/hist/commit/<sha#1>",
+        "commit": {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#1>",
+          "author": {
+            "name": "Conf",
+            "email": "conf@example.invalid",
+            "date": "<ts>"
+          },
+          "committer": {
+            "name": "Conf",
+            "email": "conf@example.invalid",
+            "date": "<ts>"
+          },
+          "message": "feat two\n",
+          "tree": {
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#1>",
+            "sha": "<sha#1>",
+            "created": "<ts>"
+          },
+          "verification": {
+            "verified": false,
+            "reason": "gpg.error.not_signed_commit",
+            "signature": "",
+            "signer": null,
+            "payload": ""
+          }
+        },
+        "author": null,
+        "committer": null,
+        "parents": [
+          {
+            "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#5>",
+            "sha": "<sha#5>",
+            "created": "<ts>"
+          }
+        ],
+        "files": [
+          {
+            "filename": "feat2.txt",
+            "status": "added"
+          }
+        ],
+        "stats": {
+          "total": 1,
+          "additions": 1,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/commits/<sha#2>.diff",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "text/plain;charset=utf-8"
+      },
+      "body_text": "diff --git a/README.md b/README.md\nindex <short>..<short> 100644\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # hist\n+edited\n",
+      "must_contain": [
+        "diff --git"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/commits/<sha#2>.patch",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "text/plain;charset=utf-8"
+      },
+      "body_text": "From <sha#2> Mon Sep 17 00:00:00 2001\nFrom: Conf <conf@example.invalid>\nDate: <ts>\nSubject: [PATCH] third\n\n---\n README.md | 1 +\n 1 file changed, 1 insertion(+)\n\ndiff --git a/README.md b/README.md\nindex <short>..<short> 100644\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # hist\n+edited\n",
+      "must_contain": [
+        "From "
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/commits/<sha#6>",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "<sha#6>",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/trees/<sha#2>?recursive=true",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "5"
+      },
+      "body": {
+        "sha": "<sha#2>",
+        "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#2>",
+        "tree": [
+          {
+            "path": "README.md",
+            "mode": "100644",
+            "type": "blob",
+            "size": 14,
+            "sha": "<sha#7>",
+            "url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#7>"
+          },
+          {
+            "path": "docs",
+            "mode": "040000",
+            "type": "tree",
+            "size": 0,
+            "sha": "<sha#8>",
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#8>"
+          },
+          {
+            "path": "docs/guide.md",
+            "mode": "100644",
+            "type": "blob",
+            "size": 6,
+            "sha": "<sha#9>",
+            "url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#9>"
+          },
+          {
+            "path": "src",
+            "mode": "040000",
+            "type": "tree",
+            "size": 0,
+            "sha": "<sha#10>",
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#10>"
+          },
+          {
+            "path": "src/lib.rs",
+            "mode": "100644",
+            "type": "blob",
+            "size": 13,
+            "sha": "<sha#11>",
+            "url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#11>"
+          }
+        ],
+        "truncated": false,
+        "page": 1,
+        "total_count": 5
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/trees/<sha#2>",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "3"
+      },
+      "body": {
+        "sha": "<sha#2>",
+        "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#2>",
+        "tree": [
+          {
+            "path": "README.md",
+            "mode": "100644",
+            "type": "blob",
+            "size": 14,
+            "sha": "<sha#7>",
+            "url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#7>"
+          },
+          {
+            "path": "docs",
+            "mode": "040000",
+            "type": "tree",
+            "size": 0,
+            "sha": "<sha#8>",
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#8>"
+          },
+          {
+            "path": "src",
+            "mode": "040000",
+            "type": "tree",
+            "size": 0,
+            "sha": "<sha#10>",
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#10>"
+          }
+        ],
+        "truncated": false,
+        "page": 1,
+        "total_count": 3
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/git/trees/main?recursive=true&per_page=2&page=1",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "5"
+      },
+      "body": {
+        "sha": "<sha#2>",
+        "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#2>",
+        "tree": [
+          {
+            "path": "README.md",
+            "mode": "100644",
+            "type": "blob",
+            "size": 14,
+            "sha": "<sha#7>",
+            "url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#7>"
+          },
+          {
+            "path": "docs",
+            "mode": "040000",
+            "type": "tree",
+            "size": 0,
+            "sha": "<sha#8>",
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#8>"
+          }
+        ],
+        "truncated": true,
+        "page": 1,
+        "total_count": 5
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/contents",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": [
+        {
+          "name": "README.md",
+          "path": "README.md",
+          "sha": "<sha#7>",
+          "last_commit_sha": "<sha#2>",
+          "type": "file",
+          "size": 14,
+          "encoding": null,
+          "content": null,
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=main",
+          "html_url": "<base>/acme/hist/src/branch/main/README.md",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#7>",
+          "download_url": "<base>/acme/hist/raw/branch/main/README.md",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=main",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#7>",
+            "html": "<base>/acme/hist/src/branch/main/README.md"
+          }
+        },
+        {
+          "name": "docs",
+          "path": "docs",
+          "sha": "<sha#8>",
+          "last_commit_sha": "<sha#3>",
+          "type": "dir",
+          "size": 0,
+          "encoding": null,
+          "content": null,
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/docs?ref=main",
+          "html_url": "<base>/acme/hist/src/branch/main/docs",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#8>",
+          "download_url": null,
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/docs?ref=main",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#8>",
+            "html": "<base>/acme/hist/src/branch/main/docs"
+          }
+        },
+        {
+          "name": "src",
+          "path": "src",
+          "sha": "<sha#10>",
+          "last_commit_sha": "<sha#3>",
+          "type": "dir",
+          "size": 0,
+          "encoding": null,
+          "content": null,
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/src?ref=main",
+          "html_url": "<base>/acme/hist/src/branch/main/src",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#10>",
+          "download_url": null,
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/src?ref=main",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#10>",
+            "html": "<base>/acme/hist/src/branch/main/src"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/contents?ref=feat/x",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": [
+        {
+          "name": "README.md",
+          "path": "README.md",
+          "sha": "<sha#12>",
+          "last_commit_sha": "<sha#4>",
+          "type": "file",
+          "size": 7,
+          "encoding": null,
+          "content": null,
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=feat%2Fx",
+          "html_url": "<base>/acme/hist/src/branch/feat/x/README.md",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#12>",
+          "download_url": "<base>/acme/hist/raw/branch/feat/x/README.md",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=feat%2Fx",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#12>",
+            "html": "<base>/acme/hist/src/branch/feat/x/README.md"
+          }
+        },
+        {
+          "name": "docs",
+          "path": "docs",
+          "sha": "<sha#8>",
+          "last_commit_sha": "<sha#3>",
+          "type": "dir",
+          "size": 0,
+          "encoding": null,
+          "content": null,
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/docs?ref=feat%2Fx",
+          "html_url": "<base>/acme/hist/src/branch/feat/x/docs",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#8>",
+          "download_url": null,
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/docs?ref=feat%2Fx",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#8>",
+            "html": "<base>/acme/hist/src/branch/feat/x/docs"
+          }
+        },
+        {
+          "name": "feat1.txt",
+          "path": "feat1.txt",
+          "sha": "<sha#13>",
+          "last_commit_sha": "<sha#5>",
+          "type": "file",
+          "size": 3,
+          "encoding": null,
+          "content": null,
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/feat1.txt?ref=feat%2Fx",
+          "html_url": "<base>/acme/hist/src/branch/feat/x/feat1.txt",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#13>",
+          "download_url": "<base>/acme/hist/raw/branch/feat/x/feat1.txt",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/feat1.txt?ref=feat%2Fx",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#13>",
+            "html": "<base>/acme/hist/src/branch/feat/x/feat1.txt"
+          }
+        },
+        {
+          "name": "feat2.txt",
+          "path": "feat2.txt",
+          "sha": "<sha#14>",
+          "last_commit_sha": "<sha#1>",
+          "type": "file",
+          "size": 3,
+          "encoding": null,
+          "content": null,
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/feat2.txt?ref=feat%2Fx",
+          "html_url": "<base>/acme/hist/src/branch/feat/x/feat2.txt",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#14>",
+          "download_url": "<base>/acme/hist/raw/branch/feat/x/feat2.txt",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/feat2.txt?ref=feat%2Fx",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#14>",
+            "html": "<base>/acme/hist/src/branch/feat/x/feat2.txt"
+          }
+        },
+        {
+          "name": "src",
+          "path": "src",
+          "sha": "<sha#10>",
+          "last_commit_sha": "<sha#3>",
+          "type": "dir",
+          "size": 0,
+          "encoding": null,
+          "content": null,
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/src?ref=feat%2Fx",
+          "html_url": "<base>/acme/hist/src/branch/feat/x/src",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#10>",
+          "download_url": null,
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/src?ref=feat%2Fx",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#10>",
+            "html": "<base>/acme/hist/src/branch/feat/x/src"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/contents/docs",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": [
+        {
+          "name": "guide.md",
+          "path": "docs/guide.md",
+          "sha": "<sha#9>",
+          "last_commit_sha": "<sha#3>",
+          "type": "file",
+          "size": 6,
+          "encoding": null,
+          "content": null,
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/docs/guide.md?ref=main",
+          "html_url": "<base>/acme/hist/src/branch/main/docs/guide.md",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#9>",
+          "download_url": "<base>/acme/hist/raw/branch/main/docs/guide.md",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/docs/guide.md?ref=main",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#9>",
+            "html": "<base>/acme/hist/src/branch/main/docs/guide.md"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/contents/README.md?ref=main",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "name": "README.md",
+        "path": "README.md",
+        "sha": "<sha#7>",
+        "last_commit_sha": "<sha#2>",
+        "type": "file",
+        "size": 14,
+        "encoding": "base64",
+        "content": "IyBoaXN0CmVkaXRlZAo=",
+        "target": null,
+        "url": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=main",
+        "html_url": "<base>/acme/hist/src/branch/main/README.md",
+        "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#7>",
+        "download_url": "<base>/acme/hist/raw/branch/main/README.md",
+        "submodule_git_url": null,
+        "_links": {
+          "self": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=main",
+          "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#7>",
+          "html": "<base>/acme/hist/src/branch/main/README.md"
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/contents/README.md?ref=<sha#4>",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "name": "README.md",
+        "path": "README.md",
+        "sha": "<sha#12>",
+        "last_commit_sha": "<sha#4>",
+        "type": "file",
+        "size": 7,
+        "encoding": "base64",
+        "content": "IyBoaXN0Cg==",
+        "target": null,
+        "url": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=<sha#4>",
+        "html_url": "<base>/acme/hist/src/commit/<sha#4>/README.md",
+        "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#12>",
+        "download_url": "<base>/acme/hist/raw/commit/<sha#4>/README.md",
+        "submodule_git_url": null,
+        "_links": {
+          "self": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=<sha#4>",
+          "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#12>",
+          "html": "<base>/acme/hist/src/commit/<sha#4>/README.md"
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/contents/src/lib.rs",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "name": "lib.rs",
+        "path": "src/lib.rs",
+        "sha": "<sha#11>",
+        "last_commit_sha": "<sha#3>",
+        "type": "file",
+        "size": 13,
+        "encoding": "base64",
+        "content": "Zm4gbWFpbigpIHt9Cg==",
+        "target": null,
+        "url": "<base>/api/v1/repos/acme/hist/contents/src/lib.rs?ref=main",
+        "html_url": "<base>/acme/hist/src/branch/main/src/lib.rs",
+        "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#11>",
+        "download_url": "<base>/acme/hist/raw/branch/main/src/lib.rs",
+        "submodule_git_url": null,
+        "_links": {
+          "self": "<base>/api/v1/repos/acme/hist/contents/src/lib.rs?ref=main",
+          "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#11>",
+          "html": "<base>/acme/hist/src/branch/main/src/lib.rs"
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/contents/nope.txt",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": [
+          "object does not exist [id: , rel_path: nope.txt]"
+        ],
+        "message": "GetContentsOrList",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/contents/README.md?ref=nope",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": [
+          "object does not exist [id: nope, rel_path: ]"
+        ],
+        "message": "GetContentsOrList",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/acme/hist/contents/new.txt",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "content": "bmV3Cg==",
+        "message": "add new.txt",
+        "branch": "main"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "content": {
+          "name": "new.txt",
+          "path": "new.txt",
+          "sha": "<sha#17>",
+          "last_commit_sha": "<sha#15>",
+          "type": "file",
+          "size": 4,
+          "encoding": "base64",
+          "content": "bmV3Cg==",
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/new.txt?ref=main",
+          "html_url": "<base>/acme/hist/src/branch/main/new.txt",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#17>",
+          "download_url": "<base>/acme/hist/raw/branch/main/new.txt",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/new.txt?ref=main",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#17>",
+            "html": "<base>/acme/hist/src/branch/main/new.txt"
+          }
+        },
+        "commit": {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#15>",
+          "sha": "<sha#15>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#15>",
+          "author": {
+            "name": "<admin>",
+            "email": "admin@example.invalid",
+            "date": "<ts>"
+          },
+          "committer": {
+            "name": "<admin>",
+            "email": "admin@example.invalid",
+            "date": "<ts>"
+          },
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#2>",
+              "sha": "<sha#2>",
+              "created": "<ts>"
+            }
+          ],
+          "message": "add new.txt\n",
+          "tree": {
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#16>",
+            "sha": "<sha#16>",
+            "created": "<ts>"
+          }
+        },
+        "verification": {
+          "verified": false,
+          "reason": "gpg.error.not_signed_commit",
+          "signature": "",
+          "signer": null,
+          "payload": ""
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/acme/hist/contents/new.txt",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "content": "bmV3Cg==",
+        "message": "add again",
+        "branch": "main"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "repository file already exists [path: new.txt]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PUT",
+      "path": "/api/v1/repos/acme/hist/contents/README.md",
+      "auth": "admin",
+      "status": 200,
+      "request": {
+        "content": "IyBoaXN0CnVwZGF0ZWQK",
+        "message": "update readme",
+        "sha": "<sha#7>",
+        "branch": "main"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "content": {
+          "name": "README.md",
+          "path": "README.md",
+          "sha": "<sha#20>",
+          "last_commit_sha": "<sha#18>",
+          "type": "file",
+          "size": 15,
+          "encoding": "base64",
+          "content": "IyBoaXN0CnVwZGF0ZWQK",
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=main",
+          "html_url": "<base>/acme/hist/src/branch/main/README.md",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#20>",
+          "download_url": "<base>/acme/hist/raw/branch/main/README.md",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/README.md?ref=main",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#20>",
+            "html": "<base>/acme/hist/src/branch/main/README.md"
+          }
+        },
+        "commit": {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#18>",
+          "sha": "<sha#18>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#18>",
+          "author": {
+            "name": "<admin>",
+            "email": "admin@example.invalid",
+            "date": "<ts>"
+          },
+          "committer": {
+            "name": "<admin>",
+            "email": "admin@example.invalid",
+            "date": "<ts>"
+          },
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#15>",
+              "sha": "<sha#15>",
+              "created": "<ts>"
+            }
+          ],
+          "message": "update readme\n",
+          "tree": {
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#19>",
+            "sha": "<sha#19>",
+            "created": "<ts>"
+          }
+        },
+        "verification": {
+          "verified": false,
+          "reason": "gpg.error.not_signed_commit",
+          "signature": "",
+          "signer": null,
+          "payload": ""
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PUT",
+      "path": "/api/v1/repos/acme/hist/contents/README.md",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "content": "IyBoaXN0CnN0YWxlCg==",
+        "message": "stale update",
+        "sha": "<sha#7>",
+        "branch": "main"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "sha does not match [given: <sha#7>, expected: <sha#20>]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PUT",
+      "path": "/api/v1/repos/acme/hist/contents/README.md",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "content": "IyBoaXN0Cm5vIHNoYQo=",
+        "message": "no sha",
+        "branch": "main"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[SHA]: Required",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/acme/hist/contents/branch-file.txt",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "content": "Ygo=",
+        "message": "to new branch",
+        "branch": "main",
+        "new_branch": "api-branch"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "content": {
+          "name": "branch-file.txt",
+          "path": "branch-file.txt",
+          "sha": "<sha#23>",
+          "last_commit_sha": "<sha#21>",
+          "type": "file",
+          "size": 2,
+          "encoding": "base64",
+          "content": "Ygo=",
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/branch-file.txt?ref=api-branch",
+          "html_url": "<base>/acme/hist/src/branch/api-branch/branch-file.txt",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#23>",
+          "download_url": "<base>/acme/hist/raw/branch/api-branch/branch-file.txt",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/branch-file.txt?ref=api-branch",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#23>",
+            "html": "<base>/acme/hist/src/branch/api-branch/branch-file.txt"
+          }
+        },
+        "commit": {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#21>",
+          "sha": "<sha#21>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#21>",
+          "author": {
+            "name": "<admin>",
+            "email": "admin@example.invalid",
+            "date": "<ts>"
+          },
+          "committer": {
+            "name": "<admin>",
+            "email": "admin@example.invalid",
+            "date": "<ts>"
+          },
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#18>",
+              "sha": "<sha#18>",
+              "created": "<ts>"
+            }
+          ],
+          "message": "to new branch\n",
+          "tree": {
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#22>",
+            "sha": "<sha#22>",
+            "created": "<ts>"
+          }
+        },
+        "verification": {
+          "verified": false,
+          "reason": "gpg.error.not_signed_commit",
+          "signature": "",
+          "signer": null,
+          "payload": ""
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PUT",
+      "path": "/api/v1/repos/acme/hist/contents/new.txt",
+      "auth": "admin",
+      "status": 200,
+      "request": {
+        "content": "bmV3Mgo=",
+        "message": "update to new branch",
+        "sha": "<sha#17>",
+        "branch": "main",
+        "new_branch": "api-branch-2"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "content": {
+          "name": "new.txt",
+          "path": "new.txt",
+          "sha": "<sha#26>",
+          "last_commit_sha": "<sha#24>",
+          "type": "file",
+          "size": 5,
+          "encoding": "base64",
+          "content": "bmV3Mgo=",
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/hist/contents/new.txt?ref=api-branch-2",
+          "html_url": "<base>/acme/hist/src/branch/api-branch-2/new.txt",
+          "git_url": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#26>",
+          "download_url": "<base>/acme/hist/raw/branch/api-branch-2/new.txt",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/hist/contents/new.txt?ref=api-branch-2",
+            "git": "<base>/api/v1/repos/acme/hist/git/blobs/<sha#26>",
+            "html": "<base>/acme/hist/src/branch/api-branch-2/new.txt"
+          }
+        },
+        "commit": {
+          "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#24>",
+          "sha": "<sha#24>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/hist/commit/<sha#24>",
+          "author": {
+            "name": "<admin>",
+            "email": "admin@example.invalid",
+            "date": "<ts>"
+          },
+          "committer": {
+            "name": "<admin>",
+            "email": "admin@example.invalid",
+            "date": "<ts>"
+          },
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/hist/git/commits/<sha#18>",
+              "sha": "<sha#18>",
+              "created": "<ts>"
+            }
+          ],
+          "message": "update to new branch\n",
+          "tree": {
+            "url": "<base>/api/v1/repos/acme/hist/git/trees/<sha#25>",
+            "sha": "<sha#25>",
+            "created": "<ts>"
+          }
+        },
+        "verification": {
+          "verified": false,
+          "reason": "gpg.error.not_signed_commit",
+          "signature": "",
+          "signer": null,
+          "payload": ""
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/acme/hist/contents/x.txt",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "content": "eAo=",
+        "message": "dup branch",
+        "branch": "main",
+        "new_branch": "api-branch"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "branch already exists [name: api-branch]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/archive/main.zip",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/octet-stream",
+        "link": "<<base>/api/v1/repos/acme/hist/archive/<sha#18>.tar.gz?rev=<sha#18>>; rel=\"immutable\""
+      },
+      "body_prefix_hex": "504b0304",
+      "archive": [
+        {
+          "name": "hist/",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/README.md",
+          "size": 15,
+          "sha256": "f817eb30fc16a9f8613f4afcc0894740f77be6e89f88c99380305a89069a272f"
+        },
+        {
+          "name": "hist/docs/",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/docs/guide.md",
+          "size": 6,
+          "sha256": "90c390ec1de806bf945885cd0af51e90c3cd8cda0d0ff676051a56c20848c90f"
+        },
+        {
+          "name": "hist/new.txt",
+          "size": 4,
+          "sha256": "7aa7a5359173d05b63cfd682e3c38487f3cb4f7f1d60659fe59fab1505977d4c"
+        },
+        {
+          "name": "hist/src/",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/src/lib.rs",
+          "size": 13,
+          "sha256": "536e506bb90914c243a12b397b9a998f85ae2cbd9ba02dfd03a9e155ca5ca0f4"
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/archive/main.tar.gz",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/octet-stream",
+        "link": "<<base>/api/v1/repos/acme/hist/archive/<sha#18>.tar.gz?rev=<sha#18>>; rel=\"immutable\""
+      },
+      "body_prefix_hex": "1f8b0800",
+      "archive": [
+        {
+          "name": "hist",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/README.md",
+          "size": 15,
+          "sha256": "f817eb30fc16a9f8613f4afcc0894740f77be6e89f88c99380305a89069a272f"
+        },
+        {
+          "name": "hist/docs",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/docs/guide.md",
+          "size": 6,
+          "sha256": "90c390ec1de806bf945885cd0af51e90c3cd8cda0d0ff676051a56c20848c90f"
+        },
+        {
+          "name": "hist/new.txt",
+          "size": 4,
+          "sha256": "7aa7a5359173d05b63cfd682e3c38487f3cb4f7f1d60659fe59fab1505977d4c"
+        },
+        {
+          "name": "hist/src",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/src/lib.rs",
+          "size": 13,
+          "sha256": "536e506bb90914c243a12b397b9a998f85ae2cbd9ba02dfd03a9e155ca5ca0f4"
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/archive/<sha#4>.zip",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/octet-stream",
+        "link": "<<base>/api/v1/repos/acme/hist/archive/<sha#4>.tar.gz?rev=<sha#4>>; rel=\"immutable\""
+      },
+      "body_prefix_hex": "504b0304",
+      "archive": [
+        {
+          "name": "hist/",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/README.md",
+          "size": 7,
+          "sha256": "f61fd51ed8a1210100bca867c775464457dd5a21dd2368bfed695de3a2ca80e1"
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/hist/archive/nope.zip",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "unrecognized repository reference: nope",
+        "url": "<base>/api/swagger"
+      }
+    }
+  ]
+}

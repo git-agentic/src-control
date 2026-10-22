@@ -1,0 +1,165 @@
+{
+  "scenario": "A",
+  "title": "meta",
+  "error": null,
+  "exchanges": [
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/version",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "version": "1.22.6"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/version",
+      "auth": "none",
+      "status": 403,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "Only signed in user is allowed to call APIs."
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/healthz",
+      "auth": "none",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "status": "pass",
+        "description": "Gitea: Git with a cup of tea",
+        "checks": {
+          "cache:ping": [
+            {
+              "status": "pass",
+              "time": "<ts>"
+            }
+          ],
+          "database:ping": [
+            {
+              "status": "pass",
+              "time": "<ts>"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/user",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "login": "<admin>",
+        "login_name": "",
+        "source_id": "<id:source_id#1>",
+        "full_name": "",
+        "email": "admin@example.invalid",
+        "avatar_url": "<base>/avatars/98afc2e6474fc6c67d129b8b3043e959",
+        "html_url": "<base>/<admin>",
+        "language": "",
+        "is_admin": true,
+        "last_login": "<ts>",
+        "created": "<ts>",
+        "restricted": false,
+        "active": true,
+        "prohibit_login": false,
+        "location": "",
+        "website": "",
+        "description": "",
+        "visibility": "public",
+        "followers_count": 0,
+        "following_count": 0,
+        "starred_repos_count": 0,
+        "username": "<admin>"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/user",
+      "auth": "bad",
+      "status": 401,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user does not exist [uid: 0, name: ]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/user",
+      "auth": "none",
+      "status": 403,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "Only signed in user is allowed to call APIs."
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/<admin>/probe",
+      "auth": "none",
+      "status": 403,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "Only signed in user is allowed to call APIs."
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/<admin>/probe",
+      "auth": "bad",
+      "status": 401,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user does not exist [uid: 0, name: ]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/<admin>/missing",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "The target couldn't be found.",
+        "url": "<base>/api/swagger"
+      }
+    }
+  ]
+}

@@ -1,0 +1,653 @@
+{
+  "scenario": "J",
+  "title": "smart-http",
+  "error": null,
+  "exchanges": [
+    {
+      "kind": "git",
+      "name": "clone-admin-token",
+      "cmd": "git clone -q http://<creds>@<host>/acme/smart.git <tmp>/j-admin-token",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "push-admin-token",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git <sha#1>:refs/heads/j-admin-token",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'j-admin-token':        \nremote:   <base>/acme/smart/pulls/new/j-admin-token        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n * [new branch]      <sha#1> -> j-admin-token"
+    },
+    {
+      "kind": "git",
+      "name": "fetch-admin-token",
+      "cmd": "git fetch -q http://<creds>@<host>/acme/smart.git main",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "clone-oauth2-token",
+      "cmd": "git clone -q http://<creds>@<host>/acme/smart.git <tmp>/j-oauth2-token",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "push-oauth2-token",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git <sha#1>:refs/heads/j-oauth2-token",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'j-oauth2-token':        \nremote:   <base>/acme/smart/pulls/new/j-oauth2-token        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n * [new branch]      <sha#1> -> j-oauth2-token"
+    },
+    {
+      "kind": "git",
+      "name": "fetch-oauth2-token",
+      "cmd": "git fetch -q http://<creds>@<host>/acme/smart.git main",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "clone-bot-token",
+      "cmd": "git clone -q http://<creds>@<host>/acme/smart.git <tmp>/j-bot-token",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "push-bot-token",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git <sha#1>:refs/heads/j-bot-token",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'j-bot-token':        \nremote:   <base>/acme/smart/pulls/new/j-bot-token        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n * [new branch]      <sha#1> -> j-bot-token"
+    },
+    {
+      "kind": "git",
+      "name": "fetch-bot-token",
+      "cmd": "git fetch -q http://<creds>@<host>/acme/smart.git main",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "clone-other-name-admin-token",
+      "cmd": "git clone -q http://<creds>@<host>/acme/smart.git <tmp>/j-other-name-admin-token",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "push-other-name-admin-token",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git <sha#1>:refs/heads/j-other-name-admin-token",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'j-other-name-admin-token':        \nremote:   <base>/acme/smart/pulls/new/j-other-name-admin-token        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n * [new branch]      <sha#1> -> j-other-name-admin-token"
+    },
+    {
+      "kind": "git",
+      "name": "fetch-other-name-admin-token",
+      "cmd": "git fetch -q http://<creds>@<host>/acme/smart.git main",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "clone-bot-name-admin-token",
+      "cmd": "git clone -q http://<creds>@<host>/acme/smart.git <tmp>/j-bot-name-admin-token",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "push-bot-name-admin-token",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git <sha#1>:refs/heads/j-bot-name-admin-token",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'j-bot-name-admin-token':        \nremote:   <base>/acme/smart/pulls/new/j-bot-name-admin-token        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n * [new branch]      <sha#1> -> j-bot-name-admin-token"
+    },
+    {
+      "kind": "git",
+      "name": "fetch-bot-name-admin-token",
+      "cmd": "git fetch -q http://<creds>@<host>/acme/smart.git main",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "clone-token-as-username",
+      "cmd": "git clone -q http://<creds>@<host>/acme/smart.git <tmp>/j-token-as-username",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "push-token-as-username",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git <sha#1>:refs/heads/j-token-as-username",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'j-token-as-username':        \nremote:   <base>/acme/smart/pulls/new/j-token-as-username        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n * [new branch]      <sha#1> -> j-token-as-username"
+    },
+    {
+      "kind": "git",
+      "name": "fetch-token-as-username",
+      "cmd": "git fetch -q http://<creds>@<host>/acme/smart.git main",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "clone-bad-token",
+      "cmd": "git clone -q http://<creds>@<host>/acme/smart.git <tmp>/j-bad-token",
+      "ok": false,
+      "output": "remote: Failed to authenticate user\nfatal: Authentication failed for '<base>/acme/smart.git/'",
+      "refusal": [
+        "remote: failed to authenticate user",
+        "fatal: authentication failed for '/acme/smart.git/'"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "push-bad-token",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git <sha#1>:refs/heads/j-bad-token",
+      "ok": false,
+      "output": "remote: Failed to authenticate user\nfatal: Authentication failed for '<base>/acme/smart.git/'",
+      "refusal": [
+        "remote: failed to authenticate user",
+        "fatal: authentication failed for '/acme/smart.git/'"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "fetch-bad-token",
+      "cmd": "git fetch -q http://<creds>@<host>/acme/smart.git main",
+      "ok": false,
+      "output": "remote: Failed to authenticate user\nfatal: Authentication failed for '<base>/acme/smart.git/'",
+      "refusal": [
+        "remote: failed to authenticate user",
+        "fatal: authentication failed for '/acme/smart.git/'"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "clone-no-credentials",
+      "cmd": "git clone -q <base>/acme/smart.git <tmp>/j-no-credentials",
+      "ok": false,
+      "output": "fatal: could not read Username for '<base>': terminal prompts disabled",
+      "refusal": [
+        "fatal: could not read username for '': terminal prompts disabled"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "push-no-credentials",
+      "cmd": "git push <base>/acme/smart.git <sha#1>:refs/heads/j-no-credentials",
+      "ok": false,
+      "output": "fatal: could not read Username for '<base>': terminal prompts disabled",
+      "refusal": [
+        "fatal: could not read username for '': terminal prompts disabled"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "fetch-no-credentials",
+      "cmd": "git fetch -q <base>/acme/smart.git main",
+      "ok": false,
+      "output": "fatal: could not read Username for '<base>': terminal prompts disabled",
+      "refusal": [
+        "fatal: could not read username for '': terminal prompts disabled"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "ls-remote-hdr-basic-token-empty-password",
+      "cmd": "git -c http.extraHeader=<hdr-basic-token-empty-password> ls-remote <base>/acme/smart.git",
+      "ok": true,
+      "output": "<sha#1>\tHEAD\n<sha#1>\trefs/heads/j-admin-token\n<sha#1>\trefs/heads/j-bot-name-admin-token\n<sha#1>\trefs/heads/j-bot-token\n<sha#1>\trefs/heads/j-oauth2-token\n<sha#1>\trefs/heads/j-other-name-admin-token\n<sha#1>\trefs/heads/j-token-as-username\n<sha#1>\trefs/heads/main"
+    },
+    {
+      "kind": "git",
+      "name": "ls-remote-hdr-token",
+      "cmd": "git -c http.extraHeader=<hdr-token> ls-remote <base>/acme/smart.git",
+      "ok": true,
+      "output": "<sha#1>\tHEAD\n<sha#1>\trefs/heads/j-admin-token\n<sha#1>\trefs/heads/j-bot-name-admin-token\n<sha#1>\trefs/heads/j-bot-token\n<sha#1>\trefs/heads/j-oauth2-token\n<sha#1>\trefs/heads/j-other-name-admin-token\n<sha#1>\trefs/heads/j-token-as-username\n<sha#1>\trefs/heads/main"
+    },
+    {
+      "kind": "git",
+      "name": "ls-remote-hdr-bearer",
+      "cmd": "git -c http.extraHeader=<hdr-bearer> ls-remote <base>/acme/smart.git",
+      "ok": true,
+      "output": "<sha#1>\tHEAD\n<sha#1>\trefs/heads/j-admin-token\n<sha#1>\trefs/heads/j-bot-name-admin-token\n<sha#1>\trefs/heads/j-bot-token\n<sha#1>\trefs/heads/j-oauth2-token\n<sha#1>\trefs/heads/j-other-name-admin-token\n<sha#1>\trefs/heads/j-token-as-username\n<sha#1>\trefs/heads/main"
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/info/refs?service=git-upload-pack",
+      "auth": "none",
+      "status": 401,
+      "headers": {
+        "content-type": "text/plain;charset=utf-8",
+        "www-authenticate": "Basic realm=\"Gitea\""
+      },
+      "body_text": "Unauthorized\n",
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/info/refs?service=git-upload-pack",
+      "auth": "bad-tokbasic",
+      "status": 401,
+      "headers": {
+        "content-type": "text/plain;charset=utf-8"
+      },
+      "body_text": "Failed to authenticate user\n",
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/info/refs?service=git-upload-pack",
+      "auth": "admin-tokbasic",
+      "status": 200,
+      "headers": {
+        "content-type": "application/x-git-upload-pack-advertisement"
+      },
+      "body_text": "001e# service=git-upload-pack\n0000014c<sha#1> HEAD\\0multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want allow-reachable-sha1-in-want no-done symref=HEAD:refs/heads/main filter object-format=sha1 agent=git/2.52.0-Linux\n0046<sha#1> refs/heads/j-admin-token\n004f<sha#1> refs/heads/j-bot-name-admin-token\n0044<sha#1> refs/heads/j-bot-token\n0047<sha#1> refs/heads/j-oauth2-token\n0051<sha#1> refs/heads/j-other-name-admin-token\n004c<sha#1> refs/heads/j-token-as-username\n003d<sha#1> refs/heads/main\n0000",
+      "must_contain": [
+        "service=git-upload-pack"
+      ],
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/info/refs?service=git-upload-pack",
+      "auth": "oauth2-tokbasic",
+      "status": 200,
+      "headers": {
+        "content-type": "application/x-git-upload-pack-advertisement"
+      },
+      "body_text": "001e# service=git-upload-pack\n0000014c<sha#1> HEAD\\0multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want allow-reachable-sha1-in-want no-done symref=HEAD:refs/heads/main filter object-format=sha1 agent=git/2.52.0-Linux\n0046<sha#1> refs/heads/j-admin-token\n004f<sha#1> refs/heads/j-bot-name-admin-token\n0044<sha#1> refs/heads/j-bot-token\n0047<sha#1> refs/heads/j-oauth2-token\n0051<sha#1> refs/heads/j-other-name-admin-token\n004c<sha#1> refs/heads/j-token-as-username\n003d<sha#1> refs/heads/main\n0000",
+      "must_contain": [
+        "service=git-upload-pack"
+      ],
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/info/refs?service=git-receive-pack",
+      "auth": "none",
+      "status": 401,
+      "headers": {
+        "content-type": "text/plain;charset=utf-8",
+        "www-authenticate": "Basic realm=\"Gitea\""
+      },
+      "body_text": "Unauthorized\n",
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/info/refs?service=git-receive-pack",
+      "auth": "bad-tokbasic",
+      "status": 401,
+      "headers": {
+        "content-type": "text/plain;charset=utf-8"
+      },
+      "body_text": "Failed to authenticate user\n",
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/info/refs?service=git-receive-pack",
+      "auth": "admin-tokbasic",
+      "status": 200,
+      "headers": {
+        "content-type": "application/x-git-receive-pack-advertisement"
+      },
+      "body_text": "001f# service=git-receive-pack\n000000cd<sha#1> refs/heads/j-admin-token\\0report-status report-status-v2 delete-refs side-band-64k quiet atomic ofs-delta push-options object-format=sha1 agent=git/2.52.0-Linux\n004f<sha#1> refs/heads/j-bot-name-admin-token\n0044<sha#1> refs/heads/j-bot-token\n0047<sha#1> refs/heads/j-oauth2-token\n0051<sha#1> refs/heads/j-other-name-admin-token\n004c<sha#1> refs/heads/j-token-as-username\n003d<sha#1> refs/heads/main\n0000",
+      "must_contain": [
+        "service=git-receive-pack"
+      ],
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/info/refs?service=git-receive-pack",
+      "auth": "oauth2-tokbasic",
+      "status": 200,
+      "headers": {
+        "content-type": "application/x-git-receive-pack-advertisement"
+      },
+      "body_text": "001f# service=git-receive-pack\n000000cd<sha#1> refs/heads/j-admin-token\\0report-status report-status-v2 delete-refs side-band-64k quiet atomic ofs-delta push-options object-format=sha1 agent=git/2.52.0-Linux\n004f<sha#1> refs/heads/j-bot-name-admin-token\n0044<sha#1> refs/heads/j-bot-token\n0047<sha#1> refs/heads/j-oauth2-token\n0051<sha#1> refs/heads/j-other-name-admin-token\n004c<sha#1> refs/heads/j-token-as-username\n003d<sha#1> refs/heads/main\n0000",
+      "must_contain": [
+        "service=git-receive-pack"
+      ],
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/info/refs?service=git-upload-pack",
+      "auth": "admin-tokbasic",
+      "status": 200,
+      "headers": {
+        "content-type": "application/x-git-upload-pack-advertisement"
+      },
+      "body_text": "001e# service=git-upload-pack\n0000000eversion 2\n001bagent=git/2.52.0-Linux\n0013ls-refs=unborn\n0027fetch=shallow wait-for-done filter\n0012server-option\n0017object-format=sha1\n0000",
+      "must_contain": [
+        "version 2"
+      ],
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "fetch-sha-tip-v0",
+      "cmd": "git -c protocol.version=0 fetch -q http://<creds>@<host>/acme/smart.git <sha#1>",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "fetch-sha-old-v0",
+      "cmd": "git -c protocol.version=0 fetch -q http://<creds>@<host>/acme/smart.git <sha#2>",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "fetch-sha-dead-v0",
+      "cmd": "git -c protocol.version=0 fetch -q http://<creds>@<host>/acme/smart.git <sha#3>",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "fetch-sha-tip-v2",
+      "cmd": "git -c protocol.version=2 fetch -q http://<creds>@<host>/acme/smart.git <sha#1>",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "fetch-sha-old-v2",
+      "cmd": "git -c protocol.version=2 fetch -q http://<creds>@<host>/acme/smart.git <sha#2>",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "fetch-sha-dead-v2",
+      "cmd": "git -c protocol.version=2 fetch -q http://<creds>@<host>/acme/smart.git <sha#3>",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "ls-remote-v0",
+      "cmd": "git -c protocol.version=0 ls-remote http://<creds>@<host>/acme/smart.git",
+      "ok": true,
+      "output": "<sha#1>\tHEAD\n<sha#1>\trefs/heads/j-admin-token\n<sha#1>\trefs/heads/j-bot-name-admin-token\n<sha#1>\trefs/heads/j-bot-token\n<sha#1>\trefs/heads/j-oauth2-token\n<sha#1>\trefs/heads/j-other-name-admin-token\n<sha#1>\trefs/heads/j-token-as-username\n<sha#1>\trefs/heads/main"
+    },
+    {
+      "kind": "git",
+      "name": "ls-remote-v2",
+      "cmd": "git -c protocol.version=2 ls-remote http://<creds>@<host>/acme/smart.git",
+      "ok": true,
+      "output": "<sha#1>\tHEAD\n<sha#1>\trefs/heads/j-admin-token\n<sha#1>\trefs/heads/j-bot-name-admin-token\n<sha#1>\trefs/heads/j-bot-token\n<sha#1>\trefs/heads/j-oauth2-token\n<sha#1>\trefs/heads/j-other-name-admin-token\n<sha#1>\trefs/heads/j-token-as-username\n<sha#1>\trefs/heads/main"
+    },
+    {
+      "kind": "git",
+      "name": "clone-filter-blob-none",
+      "cmd": "git clone --filter=blob:none http://<creds>@<host>/acme/smart.git <tmp>/jpartial",
+      "ok": true,
+      "output": "Cloning into '<tmp>/jpartial'..."
+    },
+    {
+      "kind": "note",
+      "key": "partial_clone_missing_objects",
+      "value": true,
+      "strict": true
+    },
+    {
+      "kind": "note",
+      "key": "partial_clone_promisor",
+      "value": "true",
+      "strict": true
+    },
+    {
+      "kind": "git",
+      "name": "clone-depth-1",
+      "cmd": "git clone -q --depth=1 http://<creds>@<host>/acme/smart.git <tmp>/jshallow",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "note",
+      "key": "shallow_clone",
+      "value": "true",
+      "strict": true
+    },
+    {
+      "kind": "git",
+      "name": "unshallow",
+      "cmd": "git fetch -q --unshallow",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "git",
+      "name": "flw-absent-expected-and-absent",
+      "cmd": "git push --force-with-lease=refs/heads/b: http://<creds>@<host>/acme/smart.git <sha#4>:refs/heads/b",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'b':        \nremote:   <base>/acme/smart/pulls/new/b        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n * [new branch]      <sha#4> -> b"
+    },
+    {
+      "kind": "git",
+      "name": "flw-absent-expected-but-exists",
+      "cmd": "git push --force-with-lease=refs/heads/b: http://<creds>@<host>/acme/smart.git <sha#5>:refs/heads/b",
+      "ok": false,
+      "output": "To <base>/acme/smart.git\n ! [rejected]        <sha#5> -> b (stale info)\nerror: failed to push some refs to '<base>/acme/smart.git'",
+      "refusal": [
+        "! [rejected] -> b (stale info)",
+        "error: failed to push some refs to '/acme/smart.git'"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "flw-correct-lease-nonff",
+      "cmd": "git push --force-with-lease=refs/heads/b:<sha#4> http://<creds>@<host>/acme/smart.git <sha#5>:refs/heads/b",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'b':        \nremote:   <base>/acme/smart/pulls/new/b        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n + <short>..<short> <sha#5> -> b (forced update)"
+    },
+    {
+      "kind": "git",
+      "name": "flw-stale-lease",
+      "cmd": "git push --force-with-lease=refs/heads/b:<sha#4> http://<creds>@<host>/acme/smart.git <sha#4>:refs/heads/b",
+      "ok": false,
+      "output": "To <base>/acme/smart.git\n ! [rejected]        <sha#4> -> b (stale info)\nerror: failed to push some refs to '<base>/acme/smart.git'",
+      "refusal": [
+        "! [rejected] -> b (stale info)",
+        "error: failed to push some refs to '/acme/smart.git'"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "push-nonff-without-force",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git <sha#4>:refs/heads/b",
+      "ok": false,
+      "output": "To <base>/acme/smart.git\n ! [rejected]        <sha#4> -> b (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/smart.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details.",
+      "refusal": [
+        "! [rejected] -> b (non-fast-forward)",
+        "error: failed to push some refs to '/acme/smart.git'"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "push-tags",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git refs/tags/v1 refs/tags/v2",
+      "ok": true,
+      "output": "remote: .. Processing 2 references        \nremote: Processed 2 references in total        \nTo <base>/acme/smart.git\n * [new tag]         v1 -> v1\n * [new tag]         v2 -> v2"
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/smart/tags",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "2"
+      },
+      "body": [
+        {
+          "name": "v2",
+          "message": "release",
+          "id": "<sha#6>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/smart/git/commits/<sha#6>",
+            "sha": "<sha#1>",
+            "created": "<ts>"
+          },
+          "zipball_url": "<base>/acme/smart/archive/v2.zip",
+          "tarball_url": "<base>/acme/smart/archive/v2.tar.gz"
+        },
+        {
+          "name": "v1",
+          "message": "commit on main",
+          "id": "<sha#1>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/smart/git/commits/<sha#1>",
+            "sha": "<sha#1>",
+            "created": "<ts>"
+          },
+          "zipball_url": "<base>/acme/smart/archive/v1.zip",
+          "tarball_url": "<base>/acme/smart/archive/v1.tar.gz"
+        }
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/smart/git/refs/tags",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": [
+        {
+          "ref": "refs/tags/v1",
+          "url": "<base>/api/v1/repos/acme/smart/git/refs/tags/v1",
+          "object": {
+            "type": "commit",
+            "sha": "<sha#1>",
+            "url": "<base>/api/v1/repos/acme/smart/git/commits/<sha#1>"
+          }
+        },
+        {
+          "ref": "refs/tags/v2",
+          "url": "<base>/api/v1/repos/acme/smart/git/refs/tags/v2",
+          "object": {
+            "type": "tag",
+            "sha": "<sha#6>",
+            "url": "<base>/api/v1/repos/acme/smart/git/tags/<sha#6>"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "delete-tag-by-push",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git :refs/tags/v1",
+      "ok": true,
+      "output": "remote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n - [deleted]         v1"
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/smart/tags",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "1"
+      },
+      "body": [
+        {
+          "name": "v2",
+          "message": "release",
+          "id": "<sha#6>",
+          "commit": {
+            "url": "<base>/api/v1/repos/acme/smart/git/commits/<sha#6>",
+            "sha": "<sha#1>",
+            "created": "<ts>"
+          },
+          "zipball_url": "<base>/acme/smart/archive/v2.zip",
+          "tarball_url": "<base>/acme/smart/archive/v2.tar.gz"
+        }
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "delete-branch-by-push",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git :refs/heads/b",
+      "ok": true,
+      "output": "remote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/smart.git\n - [deleted]         b"
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/smart/branches/b",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "not found",
+        "url": "<base>/api/swagger",
+        "errors": null
+      }
+    },
+    {
+      "kind": "git",
+      "name": "delete-default-branch-by-push",
+      "cmd": "git push http://<creds>@<host>/acme/smart.git :refs/heads/main",
+      "ok": false,
+      "output": "remote: \nremote: error:        \nremote: error: branch main is the default branch and cannot be deleted        \nremote: error:        \nTo <base>/acme/smart.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/smart.git'",
+      "refusal": [
+        "remote: error: branch main is the default branch and cannot be deleted",
+        "! [remote rejected] main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/smart.git'"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/smart.git/HEAD",
+      "auth": "admin-tokbasic",
+      "status": 200,
+      "headers": {
+        "content-type": "text/plain"
+      },
+      "body_text": "ref: refs/heads/main\n"
+    }
+  ]
+}

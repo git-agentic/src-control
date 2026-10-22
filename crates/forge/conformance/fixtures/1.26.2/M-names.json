@@ -1,0 +1,2400 @@
+{
+  "scenario": "M",
+  "title": "names",
+  "error": null,
+  "exchanges": [
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "Mixed",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "Mixed",
+        "full_name": "acme/Mixed",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/Mixed/languages",
+        "html_url": "<base>/acme/Mixed",
+        "url": "<base>/api/v1/repos/acme/Mixed",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/Mixed.git",
+        "clone_url": "<base>/acme/Mixed.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 409,
+      "request": {
+        "name": "mixed",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "The repository with the same name already exists.",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 409,
+      "request": {
+        "name": "MIXED",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "The repository with the same name already exists.",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/mixed",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "Mixed",
+        "full_name": "acme/Mixed",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/Mixed/languages",
+        "html_url": "<base>/acme/Mixed",
+        "url": "<base>/api/v1/repos/acme/Mixed",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/Mixed.git",
+        "clone_url": "<base>/acme/Mixed.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/Mixed",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "Mixed",
+        "full_name": "acme/Mixed",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/Mixed/languages",
+        "html_url": "<base>/acme/Mixed",
+        "url": "<base>/api/v1/repos/acme/Mixed",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/Mixed.git",
+        "clone_url": "<base>/acme/Mixed.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/ACME/mixed",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "Mixed",
+        "full_name": "acme/Mixed",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/Mixed/languages",
+        "html_url": "<base>/acme/Mixed",
+        "url": "<base>/api/v1/repos/acme/Mixed",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/Mixed.git",
+        "clone_url": "<base>/acme/Mixed.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "name": ".",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name is reserved [name: .]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 500,
+      "request": {
+        "name": "..",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name is invalid [..]: must be valid alpha or numeric or dash(-_) or dot characters",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": ".hidden",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": ".hidden",
+        "full_name": "acme/.hidden",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/.hidden/languages",
+        "html_url": "<base>/acme/.hidden",
+        "url": "<base>/api/v1/repos/acme/.hidden",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/.hidden.git",
+        "clone_url": "<base>/acme/.hidden.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "-dash",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "-dash",
+        "full_name": "acme/-dash",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/-dash/languages",
+        "html_url": "<base>/acme/-dash",
+        "url": "<base>/api/v1/repos/acme/-dash",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/-dash.git",
+        "clone_url": "<base>/acme/-dash.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "name": "trail.git",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name pattern is not allowed [pattern: *.git]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "name": "wiki.wiki",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name pattern is not allowed [pattern: *.wiki]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "name": "feed.rss",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name pattern is not allowed [pattern: *.rss]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "name": "feed.atom",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name pattern is not allowed [pattern: *.atom]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "name": "a b",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[Name]: AlphaDashDot",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 500,
+      "request": {
+        "name": "a..b",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name is invalid [a..b]: must be valid alpha or numeric or dash(-_) or dot characters",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "api",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "api",
+        "full_name": "acme/api",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/api/languages",
+        "html_url": "<base>/acme/api",
+        "url": "<base>/api/v1/repos/acme/api",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/api.git",
+        "clone_url": "<base>/acme/api.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "admin",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "admin",
+        "full_name": "acme/admin",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/admin/languages",
+        "html_url": "<base>/acme/admin",
+        "url": "<base>/api/v1/repos/acme/admin",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/admin.git",
+        "clone_url": "<base>/acme/admin.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "user",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "user",
+        "full_name": "acme/user",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/user/languages",
+        "html_url": "<base>/acme/user",
+        "url": "<base>/api/v1/repos/acme/user",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/user.git",
+        "clone_url": "<base>/acme/user.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "assets",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "assets",
+        "full_name": "acme/assets",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/assets/languages",
+        "html_url": "<base>/acme/assets",
+        "url": "<base>/api/v1/repos/acme/assets",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/assets.git",
+        "clone_url": "<base>/acme/assets.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "name": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[Name]: MaxSize",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "ok_name-1.x",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "ok_name-1.x",
+        "full_name": "acme/ok_name-1.x",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/ok_name-1.x/languages",
+        "html_url": "<base>/acme/ok_name-1.x",
+        "url": "<base>/api/v1/repos/acme/ok_name-1.x",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/ok_name-1.x.git",
+        "clone_url": "<base>/acme/ok_name-1.x.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 0,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "name": "\u00fcn\u00ef",
+        "auto_init": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[Name]: AlphaDashDot",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "Acme"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user already exists [name: Acme]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "api"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name is reserved [name: api]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "username": "admin"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "name": "admin",
+        "full_name": "",
+        "email": "",
+        "avatar_url": "<base>/avatars/21232f297a57a5a743894a0e4a801fc3",
+        "description": "",
+        "website": "",
+        "location": "",
+        "visibility": "public",
+        "repo_admin_change_team_access": false,
+        "username": "admin"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "user"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name is reserved [name: user]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "assets"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name is reserved [name: assets]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "explore"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name is reserved [name: explore]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": ".dot"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[UserName]: invalid username",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "-dash"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[UserName]: invalid username",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "has space"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[UserName]: invalid username",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "username": "org.git"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "name": "org.git",
+        "full_name": "",
+        "email": "",
+        "avatar_url": "<base>/avatars/db2a58818a04fc2a8bf33359a138ef56",
+        "description": "",
+        "website": "",
+        "location": "",
+        "visibility": "public",
+        "repo_admin_change_team_access": false,
+        "username": "org.git"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[UserName]: MaxSize",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "Alice",
+        "email": "Alice@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user already exists [name: Alice]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "api",
+        "email": "api@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name is reserved [name: api]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "user",
+        "email": "user@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "name is reserved [name: user]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "-lead",
+        "email": "-lead@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[Username]: invalid username",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": ".lead",
+        "email": ".lead@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[Username]: invalid username",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "username": "trail.git",
+        "email": "trail.git@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "login": "trail.git",
+        "login_name": "",
+        "source_id": "<id:source_id#1>",
+        "full_name": "",
+        "email": "trail.git@example.invalid",
+        "avatar_url": "<base>/avatars/3ce0652da723aaa0dc714e724efb8034",
+        "html_url": "<base>/trail.git",
+        "language": "",
+        "is_admin": false,
+        "last_login": "<ts>",
+        "created": "<ts>",
+        "restricted": false,
+        "active": true,
+        "prohibit_login": false,
+        "location": "",
+        "website": "",
+        "description": "",
+        "visibility": "public",
+        "followers_count": 0,
+        "following_count": 0,
+        "starred_repos_count": 0,
+        "username": "trail.git"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/admin/users",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "username": "bad name",
+        "email": "badname@example.invalid",
+        "password": "<token>",
+        "must_change_password": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "[Username]: invalid username",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/repos",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "rename-me",
+        "auto_init": true
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "rename-me",
+        "full_name": "acme/rename-me",
+        "description": "",
+        "empty": false,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 23,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/rename-me/languages",
+        "html_url": "<base>/acme/rename-me",
+        "url": "<base>/api/v1/repos/acme/rename-me",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/rename-me.git",
+        "clone_url": "<base>/acme/rename-me.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 1,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PATCH",
+      "path": "/api/v1/repos/acme/rename-me",
+      "auth": "admin",
+      "status": 200,
+      "request": {
+        "name": "renamed"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "renamed",
+        "full_name": "acme/renamed",
+        "description": "",
+        "empty": false,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 23,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/renamed/languages",
+        "html_url": "<base>/acme/renamed",
+        "url": "<base>/api/v1/repos/acme/renamed",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/renamed.git",
+        "clone_url": "<base>/acme/renamed.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 1,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/rename-me",
+      "auth": "admin",
+      "status": 301,
+      "headers": {
+        "content-type": "text/html;charset=utf-8",
+        "location": "/api/v1/repos/acme/renamed"
+      },
+      "body_text": "<a href=\"/api/v1/repos/acme/renamed\">Moved Permanently</a>.\n\n"
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/renamed",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "renamed",
+        "full_name": "acme/renamed",
+        "description": "",
+        "empty": false,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 23,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/renamed/languages",
+        "html_url": "<base>/acme/renamed",
+        "url": "<base>/api/v1/repos/acme/renamed",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/renamed.git",
+        "clone_url": "<base>/acme/renamed.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 1,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/rename-me",
+      "auth": "dave",
+      "status": 301,
+      "headers": {
+        "content-type": "text/html;charset=utf-8",
+        "location": "/api/v1/repos/acme/renamed"
+      },
+      "body_text": "<a href=\"/api/v1/repos/acme/renamed\">Moved Permanently</a>.\n\n"
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/rename-me.git/info/refs?service=git-upload-pack",
+      "auth": "admin-tokbasic",
+      "status": 301,
+      "headers": {
+        "content-type": "text/html;charset=utf-8",
+        "location": "/acme/renamed/info/refs?service=git-upload-pack"
+      },
+      "body_text": "<a href=\"/acme/renamed/info/refs?service=git-upload-pack\">Moved Permanently</a>.\n\n",
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "git",
+      "name": "ls-remote-old-name",
+      "cmd": "git ls-remote http://<creds>@<host>/acme/rename-me.git",
+      "ok": true,
+      "output": "<sha#1>\tHEAD\n<sha#1>\trefs/heads/main\nwarning: redirecting to <base>/acme/renamed/"
+    },
+    {
+      "kind": "git",
+      "name": "ls-remote-new-name",
+      "cmd": "git ls-remote http://<creds>@<host>/acme/renamed.git",
+      "ok": true,
+      "output": "<sha#1>\tHEAD\n<sha#1>\trefs/heads/main"
+    },
+    {
+      "kind": "http",
+      "method": "PATCH",
+      "path": "/api/v1/repos/acme/renamed",
+      "auth": "admin",
+      "status": 422,
+      "request": {
+        "name": "mixed"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "repository already exists [uname: acme, name: mixed]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PATCH",
+      "path": "/api/v1/repos/acme/renamed",
+      "auth": "admin",
+      "status": 200,
+      "request": {
+        "name": "Renamed"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "Renamed",
+        "full_name": "acme/Renamed",
+        "description": "",
+        "empty": false,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 23,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/Renamed/languages",
+        "html_url": "<base>/acme/Renamed",
+        "url": "<base>/api/v1/repos/acme/Renamed",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/Renamed.git",
+        "clone_url": "<base>/acme/Renamed.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 1,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PATCH",
+      "path": "/api/v1/repos/acme/Renamed",
+      "auth": "admin",
+      "status": 200,
+      "request": {
+        "name": "renamed"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "renamed",
+        "full_name": "acme/renamed",
+        "description": "",
+        "empty": false,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "mirror": false,
+        "size": 23,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/renamed/languages",
+        "html_url": "<base>/acme/renamed",
+        "url": "<base>/api/v1/repos/acme/renamed",
+        "link": "",
+        "ssh_url": "ssh://<ssh-authority>/acme/renamed.git",
+        "clone_url": "<base>/acme/renamed.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "branch_count": 1,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_code": true,
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "allow_manual_merge": false,
+        "autodetect_manual_merge": false,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": true,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "topics": [],
+        "licenses": []
+      }
+    }
+  ]
+}
