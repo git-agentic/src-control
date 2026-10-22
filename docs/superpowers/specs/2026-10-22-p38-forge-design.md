@@ -254,7 +254,9 @@ line (`Status:` and headers), then the body is streamed.
 - **Ref namespace policy** (pre-receive): client pushes may write `refs/heads/*`
   and `refs/tags/*` only. `refs/replace/*`, `refs/forge/*`, `refs/pull/*`,
   `refs/notes/*` and anything else are refused. `refs/forge/` is hidden from
-  advertisement (`uploadpack.hideRefs`).
+  advertisement of both services with `transfer.hideRefs=refs/forge/` (tested with
+  git 2.54: `uploadpack.hideRefs` alone still lists it to receive-pack, and
+  `receive.hideRefs` alone still lists it to upload-pack).
 - **Branch protection applies to every mutation path, one policy function**
   shared by pre-receive, contents writes and merges: a protected branch refuses
   direct updates from receive-pack and contents writes when `enable_push` is
