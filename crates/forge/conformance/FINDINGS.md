@@ -192,3 +192,13 @@ Scenarios W (protected contents) and X (auth forms, token minting), plus additio
 - **Harness notes:** `--only` reruns can differ from the full ordered run because later scenarios read
   state from earlier ones (scenario B makes `alice` private); the full run is the reference. Cross-version
   `check` now fails about 310 exchanges because error text is compared.
+
+## Ref advertisement and web probes (round 6)
+
+- Real Gitea advertises `refs/pull/*` on both `git-upload-pack` and `git-receive-pack`. In scenario S
+  it also advertises `refs/changes`, `refs/custom`, `refs/keep-around`, `refs/notes` and `refs/replace`,
+  which a write collaborator can push. `sc-forge` advertises only `HEAD`, `refs/heads/*` and
+  `refs/tags/*` (departures pin the filtered list).
+- Four exchanges in scenario K are Gitea web-UI routes (`GET /acme/{vis,ghost}` as anonymous and as a
+  user). They are tagged `web` and skipped by default; `check --include-web` runs them for comparison
+  against real Gitea.
