@@ -66,7 +66,8 @@ recorded fixtures, not here.
   `head.ref` because stock Gitea ignores `head`.
 - `POST /pulls/{n}/merge` with `{"Do":"merge","head_commit_id":…}`.
 - `GET|POST /pulls/{n}/reviews`, `GET /pulls/{n}/reviews/{id}/comments`,
-  `GET /issues/{n}/comments`.
+  `GET|POST /issues/{n}/comments` (the recorded scenarios create comments; reads
+  need `read:issue`, writes `write:issue`).
 - `POST /statuses/{sha}`; `GET /commits/{sha}/status` (combined) and
   `GET /statuses/{sha}`.
 
@@ -253,7 +254,10 @@ line (`Status:` and headers), then the body is streamed.
   that SQLite later records as complete is on disk first. Commit-producing spawns
   (`commit-tree` for auto-init, contents writes and merges) get an explicit
   identity: `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` = the acting user's login and
-  `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` = `<login>@noreply.<public-url host>`,
+  `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` = the acting user's stored email (the
+  `--email` given at user creation; recorded Gitea shows the user's own address,
+  `<login>@noreply.localhost` for a noreply user), falling back to
+  `<login>@noreply.<public-url host>` when none is stored,
   with the acting user being the merger for merges and the authenticated writer for
   contents; server-originated commits (auto-init by a service account) use the
   creating user. No identity comes from system, global or repository config. Only the `pre-receive` and `post-receive` hook
@@ -276,10 +280,14 @@ line (`Status:` and headers), then the body is streamed.
   a PR is allowed and has its own checks. The default branch is not protected
   unless a rule says so (Gitea behaviour). Deleting the default branch is
   refused.
-- **Policy linearization:** authorization and protection are evaluated once when
-  a request starts (the hook re-reads protection at ref-update time under one
-  read transaction). A revocation or a new rule affects requests that start after
-  it commits; an in-flight push is not cancelled. Documented, not coordinated.
+- **Policy linearization:** one point per mutation path, stated so tests can
+  pin it. *Authorization* (is this user allowed to write this repo) is evaluated
+  once when the request starts, and a revocation does not cancel an in-flight
+  push. *Branch protection* is evaluated at the moment of the ref update: the
+  `pre-receive` hook for pushes (one read transaction, after the pack is
+  received), and the same policy function immediately before `update-ref` for
+  contents writes and merges. A new rule therefore affects any update that has
+  not yet reached its ref-update point. Not coordinated beyond that.
 - **PR retention:** the server keeps `refs/forge/pull/<n>/head` for every PR.
   It is created **before** the PR row is inserted (so a crash leaves at worst an
   orphan ref, never a PR whose head can be pruned), refreshed by `post-receive`
