@@ -408,6 +408,14 @@ answers 404); a repo with no statuses answers `state: ""` as 1.22.6 does.
   repo's registered children, rename the directory into `trash/`, delete the row,
   then remove the trash. Hooks verify `FORGE_GENERATION` against the database so
   a straggler fails closed.
+  The delete is a journaled sequence, so every crash point has a defined
+  recovery, run by the startup reconciler: a `deleting` row whose directory still
+  exists resumes at the rename (children are gone after a restart); a `deleting`
+  row whose directory is already in `trash/` finishes by deleting the row; a
+  `trash/<id>.git` with no row (crash after the row delete, or a failed
+  removal) is removed; and a `deleting` row with neither directory is deleted.
+  A repository name is reusable as soon as its row is gone, because directories
+  are addressed by immutable id.
 - **Default branch:** PATCH updates the row and bare `HEAD` together; the
   reconciler repairs a mismatch. A repo is `empty` when `HEAD` does not resolve
   (computed live). Names: lower-case uniqueness enforced by a database index;
