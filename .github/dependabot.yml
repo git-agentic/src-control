@@ -41,6 +41,11 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      # init, analyze and upload-sarif must run the same version (the action
+      # fails the job otherwise), so they are bumped in one PR.
+      codeql-action:
+        patterns: ["github/codeql-action/*"]
     ignore:
       # dtolnay/rust-toolchain encodes the toolchain in the pinned ref, so ANY
       # automated ref update can silently change the toolchain a workflow
