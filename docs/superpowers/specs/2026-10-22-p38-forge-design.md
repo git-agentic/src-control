@@ -51,7 +51,9 @@ recorded fixtures, not here.
   `GET /api/v1/users/{u}/orgs/{o}/permissions` (`can_create_repository`).
 - `POST|GET|DELETE /api/v1/users/{u}/tokens` (password auth; mint returns `sha1`;
   list returns `id`, `name`, `token_last_eight`).
-- `POST /api/v1/orgs/{o}/repos`; duplicate 409 or 422 "already exists".
+- `POST /api/v1/orgs/{o}/repos` and `POST|GET /api/v1/user/repos` (a repo may be
+  owned by a user; the recorded scope scenarios call `user/repos`, which needs
+  `write:user`/`read:user`); duplicate 409 or 422 "already exists".
 - `GET|PATCH|DELETE /api/v1/repos/{o}/{r}` (keys read: `full_name`, `name`,
   `empty`, `private`, `description`, `default_branch`, `permissions`).
 - `PUT|DELETE /api/v1/repos/{o}/{r}/collaborators/{u}` (204).
@@ -100,7 +102,13 @@ recorded fixtures, not here.
 - Combined status lists only the latest status per context; clients do not
   deduplicate. `X-Total-Count` equals the listed count.
 - `GET /commits` on an empty repo answers 409.
-- Git needs reachable-SHA fetch, `blob:none` filters, shallow fetch,
+- Git needs reachable-SHA fetch (tested with git 2.54, protocol v0: a commit
+  reachable only through a hidden `refs/forge/pull/*` ref is still fetchable with
+  `uploadpack.allowReachableSHA1InWant`, so `allowAnySHA1InWant` is not needed;
+  a commit no ref reaches is refused. Protocol v2 does not enforce reachability at
+  all, so any object whose id a reader knows is fetchable over v2, and the threat
+  model treats "deleted but not yet gc'd" objects as readable by anyone with read
+  access to the repo), `blob:none` filters, shallow fetch,
   `Git-Protocol: version=2`, and `push --force-with-lease=refs/heads/b:`.
 - Bootstrap scripts shell into the container for `admin user create --admin
   --must-change-password=false`, `admin user change-password`, and
@@ -156,7 +164,7 @@ is_admin, visibility), `org_members`, `tokens` (user, name, BLAKE3 hash,
 last_eight, scopes, expires_at), `repos` (id, owner, name, lower_name UNIQUE per
 owner, private, description, default_branch, state creating|live|deleting),
 `collaborators`, `pulls` (repo, number, head_ref, base_ref, title, body, state,
-merged, merge_commit_sha, `head_sha_at_merge`, `changed_files_at_merge`,
+merged, merge_commit_sha, `final_head_sha` (the head frozen at merge or close), `changed_files_at_merge`,
 timestamps), `merge_intents`, `reviews`, `comments`, `commit_statuses` (repo,
 sha, context, state, description, target_url, id AUTOINCREMENT),
 `branch_protections` (repo, branch, enable_push, enable_status_check,
@@ -216,7 +224,9 @@ requests, so an `admin` change is visible immediately.
   lockable by a stranger); argon2 runs under a global concurrency cap. The
   server refuses a non-loopback bind unless `--behind-proxy` or
   `--allow-plaintext` is given, and trusts a forwarded-for header only when
-  `--trusted-proxy-header` names it.
+  `--trusted-proxy-header` names it **and** the connection's peer address is inside a
+  configured `--trusted-proxies <CIDR,...>` (a forwarded-for value from any other
+  peer is ignored, so a client cannot spoof its address into the rate limiter).
 
 ### Git transport
 
@@ -293,11 +303,10 @@ line (`Status:` and headers), then the body is streamed.
   orphan ref, never a PR whose head can be pruned), refreshed by `post-receive`
   **only while the PR is open**, frozen when the PR is closed or merged. Freezing is ordered
   **ref first, then database**: the final head is written to the ref, then the
-  SQLite transition records `head_sha_at_merge` or the close (for a merge this is
+  SQLite transition records `final_head_sha` (merge or close) (for a merge this is
   step 7 of the merge algorithm, after the base update; the `merge_intents` row
   covers the gap). The reconciler repairs closed and merged PRs as well as open
-  ones: for each it makes the ref equal the stored final head (`head_sha_at_merge`,
-  or the head recorded at close), recreating it if missing,
+  ones: for each it makes the ref equal the stored final head (`final_head_sha`), recreating it if missing,
   and the pre-receive hook records the head into it before allowing a deletion of
   an open PR's head branch. A startup reconciler removes `refs/forge/pull/<n>/*`
   refs with no PR row and recreates a missing ref for an open PR from its stored
@@ -381,7 +390,7 @@ write access. Steps, all on captured object ids:
    answer 405 "try again later"; if the head moved, answer the stale-head
    response.
 7. Mark the intent done and the PR merged (`merge_commit_sha`,
-   `head_sha_at_merge`, `changed_files_at_merge`) in one SQLite transaction; return
+   `final_head_sha`, `changed_files_at_merge`) in one SQLite transaction; return
    200. After this the PR reads `merged: true` immediately.
 
 **Crash recovery.** Git and SQLite cannot commit together, so the intent row is
