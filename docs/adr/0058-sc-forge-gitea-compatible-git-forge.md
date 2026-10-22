@@ -44,7 +44,8 @@ limits, but no forge. It does not host Git repos for others, and
    texts, status codes, merge outcome strings), the forge reproduces it.
 3. **Scope is what clients call.** No Actions, webhooks, issues, wiki, LFS,
    OAuth apps or UI. Commit statuses are posted by the client's own runner;
-   branch protection supports `enable_push` and `status_check_contexts` only.
+   branch protection supports `enable_push`, `enable_status_check` and
+   `status_check_contexts` only.
    No SSH in v1 (follow-on: OpenSSH `AuthorizedKeysCommand`). No squash or
    rebase merge: every client sends `Do: merge` and no UI exists for a human to
    choose; other values answer 422. Same-repo pull requests only.
@@ -94,7 +95,7 @@ limits, but no forge. It does not host Git repos for others, and
    a running process.
 8. **Token format and storage.** Tokens are 40 hex characters (the length
    Gitea issues), stored as BLAKE3 hashes, compared in constant time, with
-   optional expiry and scopes (`all`, `read|write:{repository,user,
+   optional expiry and scopes (`all`, `public-only`, `read|write:{repository,user,
    organization,admin,issue}`). Basic auth with a password is accepted on the
    token-management routes only; git and the API accept a token as the Basic
    password under any username. Repo access is site admin, org owner, repo

@@ -74,7 +74,8 @@ recorded fixtures, not here.
 - `GET /repos/search`, `/branches`, `/git/refs/heads[/{b}]` (an array),
   `/commits` (`X-Total-Count`, paging), `/git/commits/{sha}` (+`.diff`),
   `/git/trees/{sha}?recursive=true`, `GET|POST|PUT /contents/{path}`,
-  `GET /archive/{ref}.zip`.
+  `GET /archive/{ref}.zip` and `.tar.gz` (the portal reads zip; the recorded
+  scenario also checks tar.gz, which `git archive --format=tar.gz` serves).
 
 **Tier 4, protection**
 - `POST|GET|PATCH|DELETE /branch_protections` (`branch_name`, `enable_push`,
@@ -116,8 +117,11 @@ token generation, and the constant-time compare move into `crates/crypto`**
 (RustCrypto stays quarantined there; the existing `random_hex` is the RNG
 entry point). `gix` is not used. rustls stays in `tlsio` and TLS is deferred.
 `CLAUDE.md`'s dependency rule gains one sentence in the F1 PR:
-`forge → {crypto, core}`. The crate is `#![cfg(unix)]` with a stub `main` so the
-Windows workspace check still compiles.
+`forge → {crypto, core}`. The crate has a library target
+(`scl_forge`, the whole implementation, `#![cfg(unix)]` at its root) and a thin
+binary target whose `main` is `#[cfg(unix)]` with a `#[cfg(not(unix))]` stub that
+prints "sc-forge is unix-only" and exits 2, so the Windows workspace check still
+compiles and `cargo test --workspace` skips the library's tests there.
 
 New direct dependencies:
 
@@ -157,8 +161,12 @@ sha, context, state, description, target_url, id AUTOINCREMENT),
 `branch_protections` (repo, branch, enable_push, enable_status_check,
 status_check_contexts JSON), `mergeability_cache` (repo, base_sha, head_sha →
 mergeable, changed_files), a per-repo index counter. Numbered SQL migrations run
-at `serve` startup only; `admin` commands refuse when the schema differs from
-their binary's, and `serve` never caches users or tokens across requests.
+by `serve` at startup and by `admin` **only when the database does not exist yet
+or is at schema version 0** (first-run bootstrap on an empty data directory, the
+documented `admin user create` then `serve` sequence); on an existing database
+`admin` refuses when the schema version differs from its binary's, and an older
+`serve` refuses a newer schema. `serve` never caches users or tokens across
+requests, so an `admin` change is visible immediately.
 
 ### Authentication
 
@@ -215,7 +223,15 @@ Routes: `GET /{o}/{r}.git/info/refs?service=…`, `POST …/git-upload-pack`,
 `POST …/git-receive-pack`. The server authenticates and authorizes (read for
 upload-pack, write for receive-pack), resolves the repo id from the database, and
 runs **`git http-backend`** as a CGI with `GIT_PROJECT_ROOT=<data>/repos/<id>.git`
-and `PATH_INFO` set to the service suffix. This keeps Git's own advertisement
+and `PATH_INFO` set to the service suffix. The CGI environment is built
+explicitly (the process environment is cleared): `GIT_PROJECT_ROOT`,
+`GIT_HTTP_EXPORT_ALL=1` (set only after authentication, so no
+`git-daemon-export-ok` marker is needed and an unexported repo cannot leak),
+`PATH_INFO`, `REQUEST_METHOD`, `QUERY_STRING`, `CONTENT_TYPE`, `CONTENT_LENGTH`
+(or chunked input), `HTTP_CONTENT_ENCODING`, `HTTP_GIT_PROTOCOL` from the client's
+`Git-Protocol` header when it matches `version=[0-9]+(:…)?`, `REMOTE_USER` (the
+authenticated login, set only after the write check), `REMOTE_ADDR`, plus the
+scrubbed variables below. This keeps Git's own advertisement
 preamble, content types, no-cache headers, `Content-Encoding: gzip` request
 handling and protocol v2 correct without re-implementation (verified: git 2.54
 serves an advertisement from a bare repo with the root set to the repo itself,
@@ -254,10 +270,15 @@ line (`Status:` and headers), then the body is streamed.
   a request starts (the hook re-reads protection at ref-update time under one
   read transaction). A revocation or a new rule affects requests that start after
   it commits; an in-flight push is not cancelled. Documented, not coordinated.
-- **PR retention:** the server keeps `refs/forge/pull/<n>/head` for every PR,
-  set at creation and refreshed by `post-receive` when the head branch moves,
-  and the pre-receive hook records the head into that ref before allowing a
-  deletion of a head branch. With `gc.auto=0`, no unreachable PR commit is
+- **PR retention:** the server keeps `refs/forge/pull/<n>/head` for every PR.
+  It is created **before** the PR row is inserted (so a crash leaves at worst an
+  orphan ref, never a PR whose head can be pruned), refreshed by `post-receive`
+  **only while the PR is open**, frozen when the PR is closed or merged (the final
+  head is written in the same step that records `head_sha_at_merge` or the close),
+  and the pre-receive hook records the head into it before allowing a deletion of
+  an open PR's head branch. A startup reconciler removes `refs/forge/pull/<n>/*`
+  refs with no PR row and recreates a missing ref for an open PR from its stored
+  head branch. With `gc.auto=0`, no unreachable PR commit is
   pruned; maintenance gc (F5) runs with a long `--prune` window under the repo
   lock.
 - **Admission control** before any git process: global and per-repo limits on
@@ -285,7 +306,7 @@ Minimum `git` 2.40 in tests; the container pins a current release
   `--end-of-options` precedes revisions; `--` precedes paths only, and paths are
   treated as literals with NUL-delimited output (`-z`). Output is size-capped.
 - **Reads:** `for-each-ref`, `rev-parse`, `log`/`rev-list` with a fixed `-z`
-  format, `cat-file`, `ls-tree -r -z`, `diff-tree`, `archive --format=zip`.
+  format, `cat-file`, `ls-tree -r -z`, `diff-tree`, `archive --format=zip|tar.gz`.
 - **Contents write** (POST/PUT): validate the path (reject empty, `.`, `..`,
   `.git` and its NTFS/HFS aliases, absolute paths; mode 100644 only), `hash-object
   -w`, a temp `GIT_INDEX_FILE` (`read-tree`, `update-index --cacheinfo`,

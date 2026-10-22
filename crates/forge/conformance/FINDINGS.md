@@ -40,7 +40,7 @@ Each version passes its own fixtures (22/22). Checking the 1.22.6 fixtures again
 
 **A to D (meta, users, repos, empty repo)**
 - No `WWW-Authenticate` on API 401s. `PATCH /admin/users/{u}` is 200. Token create returns
-  `{id,name,sha1,token_last_eight,scopes}` (1.26.2 adds `created_at`).
+  `{id,name,sha1,token_last_eight,scopes}` (1.26.2 adds `created_at` and `last_used_at`).
 - Scope enforcement is 403: a token with `read:user,read:organization,write:repository` cannot
   `POST /user/repos` (needs `write:user`) and cannot touch issue comments (needs `read:issue` or
   `write:issue`).
@@ -128,7 +128,8 @@ Each version passes its own fixtures (22/22). Checking the 1.22.6 fixtures again
 | Repo object | has `parent` and `repo_transfer` (null), `default_allow_maintainer_edit:false` | omits both, `default_allow_maintainer_edit:true` |
 | PR object | `assignees`, `requested_reviewers` null; list items include `additions/deletions/changed_files` | arrays; list items omit those three |
 | Email in comments and statuses | `bot@noreply.localhost` | `3+bot@noreply.localhost` |
-| Token and branch-protection objects | no `created_at`, no `priority` | adds `created_at` and `priority` |
+| Token objects | `id,name,scopes,sha1,token_last_eight` | adds `created_at`, `last_used_at` |
+| Branch-protection objects | already has `created_at`, `updated_at`, `rule_name` | adds `priority`, `enable_force_push`, `enable_force_push_allowlist`, `force_push_allowlist_{usernames,teams,deploy_keys}`, `block_admin_merge_override` |
 | Empty repo `GET contents` | `200 []` | 404 |
 | `GET commits?sha=nope` | 500 | 404 with body `null` |
 | `PUT contents` without sha | `422 [SHA]: Required` | `422 repository file already exists` |
