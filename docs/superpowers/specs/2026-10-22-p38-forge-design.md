@@ -230,8 +230,12 @@ requests, so an `admin` change is visible immediately.
 
 ### Git transport
 
-Routes: `GET /{o}/{r}.git/info/refs?service=…`, `POST …/git-upload-pack`,
-`POST …/git-receive-pack`. The server authenticates and authorizes (read for
+Routes: every path under `/{o}/{r}.git/` is authenticated and handed to
+`http-backend`: `GET info/refs?service=…`, `POST git-upload-pack`, `POST
+git-receive-pack`, and the dumb-HTTP reads (`GET HEAD`, `objects/info/packs`,
+`objects/..`), which `http-backend` serves from the same repository and which
+the recorded fixtures exercise; write methods other than `git-receive-pack` are
+refused. The server authenticates and authorizes (read for
 upload-pack, write for receive-pack), resolves the repo id from the database, and
 runs **`git http-backend`** as a CGI with `GIT_PROJECT_ROOT=<data>/repos/<id>.git`
 and `PATH_INFO` set to the service suffix. The CGI environment is built
@@ -301,7 +305,12 @@ line (`Status:` and headers), then the body is streamed.
 - **PR retention:** the server keeps `refs/forge/pull/<n>/head` for every PR.
   It is created **before** the PR row is inserted (so a crash leaves at worst an
   orphan ref, never a PR whose head can be pruned), refreshed by `post-receive`
-  **only while the PR is open**, frozen when the PR is closed or merged. Freezing is ordered
+  **only while the PR is open**, frozen when the PR is closed or merged. A refresh
+  by `post-receive` is a conditional database update (`state = open`, then an
+  `update-ref` compare-and-swap against the value it read), and the freeze first
+  sets the PR to `freezing` under the per-repo write lock, so a concurrent push
+  either lands before the freeze (and is captured as the final head) or sees
+  `freezing` and does not touch the ref. Freezing is ordered
   **ref first, then database**: the final head is written to the ref, then the
   SQLite transition records `final_head_sha` (merge or close) (for a merge this is
   step 7 of the merge algorithm, after the base update; the `merge_intents` row
@@ -434,8 +443,11 @@ answers 404); a repo with no statuses answers `state: ""` as 1.22.6 does.
 - **Create:** insert the row (`state=creating`), create the directory
   (`git init --bare` with the sanitized environment, `HEAD` symbolic to
   `refs/heads/<default_branch>`), optionally the initial commit (`auto_init`),
-  then mark live. A startup reconciler removes directories with no live row and
-  completes or removes `creating` rows.
+  then fsync the new repository directory and its parent `repos/` directory (and
+  `trash/` on a delete rename) before the row is marked live, so a power loss
+  cannot leave a live row whose directory entry never reached disk. A startup
+  reconciler removes directories with no live row and completes or removes
+  `creating` rows.
 - **Delete:** mark `deleting` (new work for that id is rejected), terminate the
   repo's registered children, rename the directory into `trash/`, delete the row,
   then remove the trash. Hooks verify `FORGE_GENERATION` against the database so
@@ -488,6 +500,32 @@ reconcilers repair the only cross-store gap. Copying `forge.db` alone is not a
 backup (it omits WAL contents). `synchronous=FULL` and the Git fsync settings above are
 kept. A restore test (kill -9 loop during pushes and merges, then reconcile and
 compare) ships with F4.
+
+## Appendix A: recorded route inventory and decisions
+
+The fixtures record 108 distinct HTTP route shapes (method plus structurally
+templated path, across scenarios A to X; derive the list with
+`python3 -I crates/forge/conformance/inventory.py crates/forge/conformance/fixtures/1.22.6`). The tiers above are what the two surveyed
+clients call. Every recorded route group has one decision, so no route is in the
+gate by accident:
+
+| Route group | Decision | Slice |
+|---|---|---|
+| `version`, `healthz`, `user`, `users/{u}`, `admin/users` (GET, POST, PATCH), tokens, org permissions | implement | F1 |
+| `orgs` POST/GET, `orgs/{o}/repos` POST/GET, `user/repos` POST/GET | implement | F1, F2 |
+| `repos/{o}/{r}` CRUD, `repos/search`, collaborators (GET, PUT, DELETE, `permission`) | implement | F2 |
+| `branches` (list, get, DELETE under the protection policy), `branch_protections` CRUD | implement | F2, F4 |
+| `tags`, `git/refs`, `git/refs/heads/*`, `git/refs/tags` | implement | F3 |
+| `commits` (list, get, `.diff`, `.patch`), `git/commits`, `git/trees`, `contents` (GET, POST, PUT), `archive` zip and tar.gz | implement | F3 |
+| `pulls` (create, list, get, PATCH), `pulls/{n}/merge` (POST, and GET as the is-merged probe), reviews (GET, POST), review comments, issue comments (GET, POST), `statuses`, combined `commits/{sha}/status` | implement | F4 |
+| `pulls/{n}.diff`, `.patch`, `/commits`, `/files`, `reviews/{id}` GET | extra: implement in F4 if it is a few lines of `git diff`/`log`, otherwise a `skip` departure with that reason | F4 |
+| Git smart and dumb HTTP under `/{o}/{r}.git/` | implement through `http-backend` | F2 |
+| Teams (`orgs/{o}/teams`, `teams/{id}/members`) | out (non-goal): `skip` departures, tagged `team` | F1 |
+| Web UI routes (`GET /{o}/{r}` and similar HTML pages) | out (non-goal): tagged `web`, excluded from the default gate | F1 |
+
+A slice is not done until each of its rows is either passing `check` or carries a
+reviewed departure entry; the F1 PR adds the departure entries for the `out`
+rows and any `extra` rows it declines.
 
 ## Phases
 
