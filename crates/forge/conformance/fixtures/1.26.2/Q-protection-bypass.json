@@ -1,0 +1,431 @@
+{
+  "scenario": "Q",
+  "title": "protection-bypass",
+  "error": null,
+  "exchanges": [
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/acme/bypass/branch_protections",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "branch_name": "main",
+        "enable_push": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "branch_name": "main",
+        "rule_name": "main",
+        "priority": 1,
+        "enable_push": false,
+        "enable_push_whitelist": false,
+        "push_whitelist_usernames": [],
+        "push_whitelist_teams": [],
+        "push_whitelist_deploy_keys": false,
+        "enable_force_push": false,
+        "enable_force_push_allowlist": false,
+        "force_push_allowlist_usernames": [],
+        "force_push_allowlist_teams": [],
+        "force_push_allowlist_deploy_keys": false,
+        "enable_merge_whitelist": false,
+        "merge_whitelist_usernames": [],
+        "merge_whitelist_teams": [],
+        "enable_status_check": false,
+        "status_check_contexts": null,
+        "required_approvals": 0,
+        "enable_approvals_whitelist": false,
+        "approvals_whitelist_username": [],
+        "approvals_whitelist_teams": [],
+        "block_on_rejected_reviews": false,
+        "block_on_official_review_requests": false,
+        "block_on_outdated_branch": false,
+        "dismiss_stale_approvals": false,
+        "ignore_stale_approvals": false,
+        "require_signed_commits": false,
+        "protected_file_patterns": "",
+        "unprotected_file_patterns": "",
+        "block_admin_merge_override": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/acme/bypass/contents/viaapi.txt",
+      "auth": "bot",
+      "status": 403,
+      "request": {
+        "content": "eAo=",
+        "message": "api to main",
+        "branch": "main"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user cannot commit to repo [user: bot]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/acme/bypass/contents/viaapi-admin.txt",
+      "auth": "admin",
+      "status": 403,
+      "request": {
+        "content": "eAo=",
+        "message": "api to main",
+        "branch": "main"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user cannot commit to repo [user: <admin>]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "PUT",
+      "path": "/api/v1/repos/acme/bypass/contents/README.md",
+      "auth": "bot",
+      "status": 403,
+      "request": {
+        "content": "Y2hhbmdlZAo=",
+        "message": "put to main",
+        "sha": "<sha#1>",
+        "branch": "main"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "user cannot commit to repo [user: bot]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/acme/bypass/contents/viapr.txt",
+      "auth": "bot",
+      "status": 201,
+      "request": {
+        "content": "eAo=",
+        "message": "api new branch",
+        "branch": "main",
+        "new_branch": "q-api"
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "content": {
+          "name": "viapr.txt",
+          "path": "viapr.txt",
+          "sha": "<sha#5>",
+          "last_commit_sha": "<sha#2>",
+          "last_committer_date": "<ts>",
+          "last_author_date": "<ts>",
+          "type": "file",
+          "size": 2,
+          "encoding": "base64",
+          "content": "eAo=",
+          "target": null,
+          "url": "<base>/api/v1/repos/acme/bypass/contents/viapr.txt?ref=q-api",
+          "html_url": "<base>/acme/bypass/src/branch/q-api/viapr.txt",
+          "git_url": "<base>/api/v1/repos/acme/bypass/git/blobs/<sha#5>",
+          "download_url": "<base>/acme/bypass/raw/branch/q-api/viapr.txt",
+          "submodule_git_url": null,
+          "_links": {
+            "self": "<base>/api/v1/repos/acme/bypass/contents/viapr.txt?ref=q-api",
+            "git": "<base>/api/v1/repos/acme/bypass/git/blobs/<sha#5>",
+            "html": "<base>/acme/bypass/src/branch/q-api/viapr.txt"
+          }
+        },
+        "commit": {
+          "url": "<base>/api/v1/repos/acme/bypass/git/commits/<sha#2>",
+          "sha": "<sha#2>",
+          "created": "<ts>",
+          "html_url": "<base>/acme/bypass/commit/<sha#2>",
+          "author": {
+            "name": "bot",
+            "email": "bot@example.invalid",
+            "date": "<ts>"
+          },
+          "committer": {
+            "name": "bot",
+            "email": "bot@example.invalid",
+            "date": "<ts>"
+          },
+          "parents": [
+            {
+              "url": "<base>/api/v1/repos/acme/bypass/git/commits/<sha#3>",
+              "sha": "<sha#3>",
+              "created": "<ts>"
+            }
+          ],
+          "message": "api new branch\n",
+          "tree": {
+            "url": "<base>/api/v1/repos/acme/bypass/git/trees/<sha#4>",
+            "sha": "<sha#4>",
+            "created": "<ts>"
+          }
+        },
+        "verification": {
+          "verified": false,
+          "reason": "gpg.error.not_signed_commit",
+          "signature": "",
+          "signer": null,
+          "payload": ""
+        }
+      }
+    },
+    {
+      "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/repos/acme/bypass/pulls/<id:path:pulls#1>/merge",
+      "auth": "bot-scoped",
+      "status": 200,
+      "request": {
+        "Do": "merge"
+      },
+      "headers": {},
+      "body_text": ""
+    },
+    {
+      "kind": "git",
+      "name": "push-unprotected-branch",
+      "cmd": "git push origin HEAD:refs/heads/fp1",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'fp1':        \nremote:   <base>/acme/bypass/pulls/new/fp1        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/bypass.git\n * [new branch]      HEAD -> fp1"
+    },
+    {
+      "kind": "git",
+      "name": "force-push-unprotected-branch",
+      "cmd": "git push -f origin HEAD:refs/heads/fp1",
+      "ok": true,
+      "output": "remote: \nremote: Create a new pull request for 'fp1':        \nremote:   <base>/acme/bypass/pulls/new/fp1        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/bypass.git\n + <short>..<short> HEAD -> fp1 (forced update)"
+    },
+    {
+      "kind": "git",
+      "name": "nonff-protected-push-disabled",
+      "cmd": "git push origin HEAD:refs/heads/main",
+      "ok": false,
+      "output": "To <base>/acme/bypass.git\n ! [rejected]        HEAD -> main (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/bypass.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details."
+    },
+    {
+      "kind": "http",
+      "method": "PATCH",
+      "path": "/api/v1/repos/acme/bypass/branch_protections/main",
+      "auth": "admin",
+      "status": 200,
+      "request": {
+        "enable_push": true
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "branch_name": "main",
+        "rule_name": "main",
+        "priority": 1,
+        "enable_push": true,
+        "enable_push_whitelist": false,
+        "push_whitelist_usernames": [],
+        "push_whitelist_teams": [],
+        "push_whitelist_deploy_keys": false,
+        "enable_force_push": false,
+        "enable_force_push_allowlist": false,
+        "force_push_allowlist_usernames": [],
+        "force_push_allowlist_teams": [],
+        "force_push_allowlist_deploy_keys": false,
+        "enable_merge_whitelist": false,
+        "merge_whitelist_usernames": [],
+        "merge_whitelist_teams": [],
+        "enable_status_check": false,
+        "status_check_contexts": null,
+        "required_approvals": 0,
+        "enable_approvals_whitelist": false,
+        "approvals_whitelist_username": [],
+        "approvals_whitelist_teams": [],
+        "block_on_rejected_reviews": false,
+        "block_on_official_review_requests": false,
+        "block_on_outdated_branch": false,
+        "dismiss_stale_approvals": false,
+        "ignore_stale_approvals": false,
+        "require_signed_commits": false,
+        "protected_file_patterns": "",
+        "unprotected_file_patterns": "",
+        "block_admin_merge_override": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>"
+      }
+    },
+    {
+      "kind": "git",
+      "name": "nonff-protected-push-enabled",
+      "cmd": "git push origin HEAD:refs/heads/main",
+      "ok": false,
+      "output": "To <base>/acme/bypass.git\n ! [rejected]        HEAD -> main (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/bypass.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details."
+    },
+    {
+      "kind": "git",
+      "name": "force-protected-push-enabled",
+      "cmd": "git push -f origin HEAD:refs/heads/main",
+      "ok": false,
+      "output": "remote: \nremote: error:        \nremote: error: branch main is protected from force push        \nremote: error:        \nTo <base>/acme/bypass.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/bypass.git'"
+    },
+    {
+      "kind": "git",
+      "name": "delete-protected-push-enabled",
+      "cmd": "git push origin :refs/heads/main",
+      "ok": false,
+      "output": "remote: \nremote: error:        \nremote: error: branch main is the default branch and cannot be deleted        \nremote: error:        \nTo <base>/acme/bypass.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/bypass.git'"
+    },
+    {
+      "kind": "http",
+      "method": "PATCH",
+      "path": "/api/v1/repos/acme/bypass/branch_protections/main",
+      "auth": "admin",
+      "status": 200,
+      "request": {
+        "enable_push": false
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "branch_name": "main",
+        "rule_name": "main",
+        "priority": 1,
+        "enable_push": false,
+        "enable_push_whitelist": false,
+        "push_whitelist_usernames": [],
+        "push_whitelist_teams": [],
+        "push_whitelist_deploy_keys": false,
+        "enable_force_push": false,
+        "enable_force_push_allowlist": false,
+        "force_push_allowlist_usernames": [],
+        "force_push_allowlist_teams": [],
+        "force_push_allowlist_deploy_keys": false,
+        "enable_merge_whitelist": false,
+        "merge_whitelist_usernames": [],
+        "merge_whitelist_teams": [],
+        "enable_status_check": false,
+        "status_check_contexts": null,
+        "required_approvals": 0,
+        "enable_approvals_whitelist": false,
+        "approvals_whitelist_username": [],
+        "approvals_whitelist_teams": [],
+        "block_on_rejected_reviews": false,
+        "block_on_official_review_requests": false,
+        "block_on_outdated_branch": false,
+        "dismiss_stale_approvals": false,
+        "ignore_stale_approvals": false,
+        "require_signed_commits": false,
+        "protected_file_patterns": "",
+        "unprotected_file_patterns": "",
+        "block_admin_merge_override": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>"
+      }
+    },
+    {
+      "kind": "git",
+      "name": "delete-protected-push-disabled",
+      "cmd": "git push origin :refs/heads/main",
+      "ok": false,
+      "output": "remote: \nremote: error:        \nremote: error: branch main is the default branch and cannot be deleted        \nremote: error:        \nTo <base>/acme/bypass.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/bypass.git'"
+    },
+    {
+      "kind": "http",
+      "method": "DELETE",
+      "path": "/api/v1/repos/acme/bypass/branches/main",
+      "auth": "admin",
+      "status": 403,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "can not delete default or pull request target branch",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "DELETE",
+      "path": "/api/v1/repos/acme/bypass/branches/main",
+      "auth": "bot",
+      "status": 403,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "can not delete default or pull request target branch",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/bypass/branches/main",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "name": "main",
+        "commit": {
+          "id": "<sha#6>",
+          "message": "Merge pull request 'PR q1' (#1) from q1 into main\n",
+          "url": "<base>/acme/bypass/commit/<sha#6>",
+          "author": {
+            "name": "bot",
+            "email": "bot@example.invalid",
+            "username": "bot"
+          },
+          "committer": {
+            "name": "bot",
+            "email": "bot@example.invalid",
+            "username": "bot"
+          },
+          "verification": {
+            "verified": false,
+            "reason": "gpg.error.not_signed_commit",
+            "signature": "",
+            "signer": null,
+            "payload": ""
+          },
+          "timestamp": "<ts>",
+          "added": null,
+          "removed": null,
+          "modified": null
+        },
+        "protected": true,
+        "required_approvals": 0,
+        "enable_status_check": false,
+        "status_check_contexts": null,
+        "user_can_push": false,
+        "user_can_merge": true,
+        "effective_branch_protection_name": "main"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "DELETE",
+      "path": "/api/v1/repos/acme/bypass/branch_protections/main",
+      "auth": "admin",
+      "status": 204,
+      "headers": {},
+      "body_text": ""
+    }
+  ]
+}

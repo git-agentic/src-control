@@ -1,0 +1,29 @@
+{
+  "server_version": {
+    "version": "1.26.2"
+  },
+  "scenarios": [
+    "A-meta.json",
+    "B-users-orgs-tokens.json",
+    "C-repos.json",
+    "D-empty-repo.json",
+    "E-history-reads.json",
+    "F-pulls.json",
+    "G-merge.json",
+    "H-statuses.json",
+    "I-branch-protection.json",
+    "J-smart-http.json",
+    "K-visibility-probing.json",
+    "L-force-private.json",
+    "M-names.json",
+    "N-default-branch.json",
+    "O-pr-head-lifecycle.json",
+    "P-pagination.json",
+    "Q-protection-bypass.json",
+    "R-token-scope-edges.json",
+    "S-ref-pushes.json",
+    "T-merge-outcomes.json",
+    "U-status-check-edges.json",
+    "V-smart-http-bytes.json"
+  ]
+}

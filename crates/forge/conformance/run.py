@@ -1,0 +1,1763 @@
+#!/usr/bin/env python3
+"""Gitea conformance scenario runner (stdlib only; run as `python3 -I run.py ...`).
+
+  record  run every scenario against a real Gitea and write normalized fixtures
+  check   run the same scenarios against any server and compare with fixtures
+  diff    compare two fixture directories offline (A = expected, B = actual)
+  show    print a one-line-per-exchange digest of a fixture directory
+
+See README.md. Scenarios are the functions at the bottom of this file.
+"""
+import argparse
+import base64
+import json as J
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TRACKED_HEADERS = ("content-type", "x-total-count", "link", "www-authenticate", "location")
+# Every scalar in a recorded body is compared by value after normalization, except volatile ones:
+# `message`/`errors` (text, see must_contain), any `url`/`*_url` (host-dependent), repo `size`, the racy
+# `mergeable` (a PR flips to "checking" after every base change; see the notes in G/T), `language` and the
+# async open-PR/issue counters, plus
+# paths a call lists in `volatile=[...]` (dotted key path, or a bare key name; `$text` for a text body).
+TOKEN_KEYS = {"sha1", "token", "token_last_eight", "password"}
+SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
+SHORT_RE = re.compile(r"\b[0-9a-f]{7,12}\.\.\.?[0-9a-f]{7,12}\b")
+TS_RE = re.compile(r"\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?(?:Z| ?[+-]\d\d:?\d\d)?")
+RFC_RE = re.compile(r"[A-Z][a-z]{2}, \d{1,2} [A-Z][a-z]{2} \d{4} \d\d:\d\d:\d\d [+-]\d{4}")
+USERS = ("alice", "bot", "carol", "dave")
+
+
+class SetupError(Exception):
+    """A call a scenario relies on did not behave as the scenario needs."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):  # surface 3xx as-is
+        return None
+
+
+OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+class R:
+    def __init__(self, status, headers, data):
+        self.status = status
+        self.headers = {k.lower(): v for k, v in headers.items()}
+        self.data = data
+        self.text = data.decode("utf-8", "replace")
+        self.json, self.is_json = None, False
+        if data.strip()[:1] in (b"{", b"[") or data.strip() == b"null":
+            try:
+                self.json, self.is_json = J.loads(data), True
+            except ValueError:
+                pass
+
+
+PH_RE = re.compile(r"<(sha|id:[^#<>]*)#(\d+)>")
+ID_RE = re.compile(r"^<id:[^#<>]*#\d+>$")
+
+
+def sort_keys(v):
+    if isinstance(v, dict):
+        return {k: sort_keys(v[k]) for k in sorted(v)}
+    return [sort_keys(x) for x in v] if isinstance(v, list) else v
+
+
+def jtype(v):
+    if isinstance(v, str) and ID_RE.match(v):
+        return "number"
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    return "array" if isinstance(v, list) else "object"
+
+
+class Bij:
+    """Placeholder identity per scenario: `<sha#2>` in the fixture must always be the same actual value
+    as each other `<sha#2>`, and two different placeholders must stay different values."""
+
+    def __init__(self):
+        self.f, self.r = {}, {}
+        self.lf, self.lr = {}, {}
+
+    def new_exchange(self):
+        self.lf, self.lr = {}, {}
+
+    def pair(self, kind, e, a):
+        # body ids of different entities can coincide numerically, so they only keep identity inside one exchange
+        f, r = (self.f, self.r) if kind == "sha" or kind.startswith("id:path:") else (self.lf, self.lr)
+        return f.setdefault((kind, e), a) == a and r.setdefault((kind, a), e) == e
+
+
+def eq_str(exp, act, bij, d, shown):
+    skel = lambda x: PH_RE.sub(lambda m: "<%s>" % m.group(1), x)  # noqa: E731
+    if skel(exp) != skel(act):
+        d.append(("fail", f"{shown}: value {exp!r} expected, got {act!r}"))
+        return False
+    for me, ma in zip(PH_RE.finditer(exp), PH_RE.finditer(act)):
+        if not bij.pair(me.group(1), me.group(2), ma.group(2)):
+            d.append(("fail", f"{shown}: identity mismatch, {me.group(0)} expected but {ma.group(0)} is a different "
+                              f"value than it was paired with earlier"))
+            return False
+    return True
+
+
+def is_volatile(key, dotted, parent, volatile):
+    if dotted in volatile or key in volatile:
+        return True
+    k = key or ""
+    if k in ("message", "errors", "url", "mergeable", "language", "open_pr_counter", "open_issues_count") or (k.endswith("_url") and k != "target_url"):
+        return True
+    return k == "size" and isinstance(parent, dict) and "full_name" in parent
+
+
+def cmp_json(exp, act, path, d, volatile, bij, key=None, parent=None):
+    te, ta = jtype(exp), jtype(act)
+    shown = path or "$"
+    if te != ta:
+        d.append(("fail", f"{shown}: type {te} expected, got {ta}"))
+        return
+    dotted = re.sub(r"\[\d+\]", "", path).lstrip(".")
+    if is_volatile(key, dotted, parent, volatile):
+        return
+    if te == "object":
+        for k, v in exp.items():
+            if k not in act:
+                d.append(("fail", f"{path}.{k}: key missing"))
+            else:
+                cmp_json(v, act[k], f"{path}.{k}", d, volatile, bij, k, exp)
+    elif te == "array":
+        if len(exp) != len(act):
+            d.append(("fail", f"{shown}: array length {len(exp)} expected, got {len(act)}"))
+        for i, (a, b) in enumerate(zip(exp, act)):
+            cmp_json(a, b, f"{path}[{i}]", d, volatile, bij, key, parent)
+    elif isinstance(exp, str):
+        eq_str(exp, act, bij, d, shown)
+    elif exp != act:
+        d.append(("fail", f"{shown}: value {exp!r} expected, got {act!r}"))
+
+
+def msg_text(ex):
+    b = ex.get("body")
+    if isinstance(b, dict) and isinstance(b.get("message"), str):
+        return b["message"]
+    if "body" in ex:
+        return J.dumps(b)
+    return ex.get("body_text") or ex.get("output") or ""
+
+
+def cmp_exchange(exp, act, bij):
+    """Return [(level, text)] where level is 'fail' or 'warn'. Empty list means match."""
+    d = []
+    bij.new_exchange()
+    if exp["kind"] != act["kind"]:
+        return [("fail", f"kind {exp['kind']} expected, got {act['kind']}")]
+    if exp["kind"] == "note":
+        if exp["key"] != act["key"]:
+            d.append(("fail", f"note {exp['key']} expected, got {act['key']}"))
+        elif exp["value"] != act["value"]:
+            lvl = "fail" if exp.get("strict", True) else "warn"
+            d.append((lvl, f"note {exp['key']}: {exp['value']!r} expected, got {act['value']!r}"))
+        return d
+    if exp["kind"] == "git":
+        if exp["name"] != act["name"]:
+            return [("fail", f"git step {exp['name']} expected, got {act['name']}")]
+        if exp["ok"] != act["ok"]:
+            d.append(("fail", f"git ok={exp['ok']} expected, got {act['ok']}: {act['output'][:200]!r}"))
+    else:
+        if exp["method"] != act["method"] or not eq_str(exp["path"], act["path"], bij, [], ""):
+            return [("fail", f"request {exp['method']} {exp['path']} expected, got {act['method']} {act['path']}")]
+        if exp["status"] != act["status"]:
+            d.append(("fail", f"status {exp['status']} expected, got {act['status']}: {msg_text(act)[:200]!r}"))
+        for h, v in exp.get("headers", {}).items():
+            got = act.get("headers", {}).get(h)
+            if got is None:
+                d.append(("fail", f"header {h}: expected {v!r}, missing"))
+            else:
+                eq_str(v, got, bij, d, f"header {h}")
+        volatile = set(exp.get("volatile", []))
+        if "body" in exp:
+            if "body" not in act:
+                d.append(("fail", f"expected JSON body, got {act.get('body_text', '')[:120]!r}"))
+            else:
+                cmp_json(exp["body"], act["body"], "", d, volatile, bij)
+        elif "body_text" in exp and "$text" not in volatile:
+            if "body_text" not in act:
+                d.append(("fail", f"expected text body, got JSON {J.dumps(act.get('body'))[:120]}"))
+            else:
+                eq_str(exp["body_text"], act["body_text"], bij, d, "text body")
+        if "body_prefix_hex" in exp and exp["body_prefix_hex"] != act.get("body_prefix_hex"):
+            d.append(("fail", f"body prefix {exp['body_prefix_hex']} expected, got {act.get('body_prefix_hex')}"))
+    text = msg_text(act).lower()
+    for w in exp.get("must_contain", []):
+        if w.lower() not in text:
+            d.append(("fail", f"message lacks {w!r}: {text[:200]!r}"))
+    return d
+
+
+# --------------------------------------------------------------------------- context
+
+class Ctx:
+    def __init__(self, base, admin_token, mode):
+        self.base = base.rstrip("/")
+        self.hostport = urllib.parse.urlparse(self.base).netloc
+        self.mode = mode
+        self.secrets = {admin_token}
+        self.pw = {}
+        self.vars = {}
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="sc-conf-"))
+        os.makedirs(self.tmp + "/home")
+        self.admin_user = "siteadmin"
+        bad = secrets.token_hex(20)
+        self.secrets.add(bad)
+        self.principals = {
+            "none": None,
+            "bad": {"kind": "token", "user": "nobody", "secret": bad},
+            "admin": {"kind": "token", "user": "siteadmin", "secret": admin_token},
+        }
+        self.recording = True
+        self.reset_scenario()
+        self.ex = []
+        self.expected = []
+        self.cursor = 0
+        self.diffs = []  # (scenario, index, label, [(level, text)])
+        self.verbose = False
+        self.base_ready = False
+        r = self.call("GET", "/user", rec=False)
+        if r.status != 200 or not r.json:
+            raise SystemExit(f"admin token rejected by {self.base}: {r.status} {r.text[:200]}")
+        self.admin_user = r.json["login"]
+        self.principals["admin"]["user"] = self.admin_user
+        self.principals["admin-basic"] = dict(self.principals["admin"], kind="basic")
+        self.principals["admin-bearer"] = dict(self.principals["admin"], kind="bearer")
+
+    # -- normalization
+    def sha_ph(self, h):
+        return "<sha#%d>" % self.sha_ord.setdefault(h, len(self.sha_ord) + 1)
+
+    def id_ph(self, space, v):
+        m = (self.id_ord if space.startswith("path:") else self.id_local).setdefault(space, {})
+        return "<id:%s#%d>" % (space, m.setdefault(v, len(m) + 1))
+
+    def scrub(self, s):
+        for sec in sorted(self.secrets, key=len, reverse=True):
+            if sec:
+                s = s.replace(sec, "<token>")
+        s = s.replace(self.base, "<base>").replace(self.hostport, "<host>").replace(self.tmp, "<tmp>")
+        return re.sub(r"\b%s\b" % re.escape(self.admin_user), "<admin>", s)
+
+    def ns(self, s):
+        s = self.scrub(s)
+        # pkt-line adverts glue a 4-hex length in front of the id ("0146<sha> HEAD"), so \b misses it
+        s = re.sub(r"[0-9a-f]{40}(?= (?:HEAD|refs/|capabilities))", lambda m: self.sha_ph(m.group(0)), s)
+        s = SHA_RE.sub(lambda m: self.sha_ph(m.group(0)), s)
+        s = SHORT_RE.sub("<short>..<short>", s)
+        return RFC_RE.sub("<ts>", TS_RE.sub("<ts>", s))
+
+    def nj(self, v):
+        # register shas/ids in sorted-key order first so numbering does not depend on key order;
+        # body ids are numbered per call (see Bij), path ids and shas per scenario
+        self.id_local = {}
+        self._nj(sort_keys(v), (), None)
+        return self._nj(v, (), None)
+
+    def _nj(self, v, path, key):
+        if isinstance(v, dict):
+            return {k: self._nj(x, path + (k,), k) for k, x in v.items()}
+        if isinstance(v, list):
+            return [self._nj(x, path, key) for x in v]
+        if isinstance(v, str):
+            return "<token>" if key in TOKEN_KEYS else self.ns(v)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and key and (key in ("id", "uid") or key.endswith("_id")):
+            return self.id_ph(".".join(path), v)
+        return v
+
+    def np(self, p):
+        path, _, q = p.partition("?")
+        segs, out = path.split("/"), []
+        for i, s in enumerate(segs):
+            m = re.fullmatch(r"(\d+)(\.[a-z]+)?", s)
+            if m and not SHA_RE.fullmatch(s):
+                out.append(self.id_ph("path:" + (segs[i - 1] if i else ""), int(m.group(1))) + (m.group(2) or ""))
+            else:
+                out.append(self.ns(s))
+        return "/".join(out) + ("?" + self.ns(q) if q else "")
+
+    def reset_scenario(self):
+        self.sha_ord, self.id_ord, self.id_local, self.bij = {}, {}, {}, Bij()
+
+    # -- recording
+    def push_ex(self, ex):
+        if not self.recording:
+            return
+        i = len(self.ex)
+        self.ex.append(ex)
+        if self.mode == "check":
+            if i >= len(self.expected):
+                self.diffs.append((i, ex_label(ex), [("fail", "extra exchange not present in fixture")]))
+            else:
+                self.diffs.append((i, ex_label(ex), cmp_exchange(self.expected[i], ex, self.bij)))
+
+    def note(self, key, value, strict=True):
+        self.push_ex({"kind": "note", "key": key, "value": value, "strict": strict})
+
+    def new_password(self):
+        p = secrets.token_hex(12)
+        self.secrets.add(p)
+        return p
+
+    # -- HTTP
+    def call(self, method, path, json=None, as_="admin", expect=None, must_contain=None,
+             volatile=None, headers=None, data=None, api=True, binary=False, rec=True, track=(),
+             retry_while=None, retry_s=90, no_retry=False):
+        full = ("/api/v1" + path) if api else path
+        hdrs = {"Accept": "application/json", "User-Agent": "sc-forge-conformance"}
+        p = self.principals[as_]
+        if p:
+            if p["kind"] == "token":
+                hdrs["Authorization"] = "token " + p["secret"]
+            elif p["kind"] == "bearer":
+                hdrs["Authorization"] = "Bearer " + p["secret"]
+            else:
+                hdrs["Authorization"] = "Basic " + base64.b64encode(f"{p['user']}:{p['secret']}".encode()).decode()
+        if json is not None:
+            data = J.dumps(json).encode()
+            hdrs["Content-Type"] = "application/json"
+        hdrs.update(headers or {})
+        if retry_while is None and method == "POST" and path.endswith("/merge") and not no_retry:
+            retry_while = ["try again later"]
+        deadline = time.time() + retry_s
+        while True:
+            req = urllib.request.Request(self.base + full, data=data, method=method, headers=hdrs)
+            try:
+                with OPENER.open(req, timeout=120) as resp:
+                    r = R(resp.status, dict(resp.headers), resp.read())
+            except urllib.error.HTTPError as e:
+                r = R(e.code, dict(e.headers), e.read())
+            # `retry_while`: re-send while the response text has one of these markers, and record only the
+            # last response (used for Gitea's "Please try again later" while a PR is being checked)
+            if not retry_while or time.time() >= deadline or not any(w in r.text.lower() for w in retry_while):
+                break
+            time.sleep(1)
+        if rec:
+            ex = {"kind": "http", "method": method, "path": self.np(full), "auth": as_,
+                  "status": r.status}
+            if json is not None:
+                ex["request"] = self.nj(json)
+            hd = {h: self.ns(r.headers[h]).replace(" ", "").lower() if h == "content-type" else self.ns(r.headers[h])
+                  for h in TRACKED_HEADERS + tuple(track) if h in r.headers}
+            ex["headers"] = hd
+            if r.is_json and (not binary or r.status >= 300):
+                ex["body"] = self.nj(r.json)
+            elif binary:
+                ex["body_prefix_hex"] = r.data[:4].hex()
+            else:
+                ex["body_text"] = self.ns(r.text[:3000]).replace("\x00", "\\0")
+            for k, v in (("must_contain", must_contain), ("volatile", volatile)):
+                if v:
+                    ex[k] = list(v)
+            self.push_ex(ex)
+        if expect is not None:
+            ok = expect if isinstance(expect, (list, tuple, set)) else [expect]
+            if r.status not in ok:
+                raise SetupError(f"{method} {full}: expected {sorted(ok)}, got {r.status}: {r.text[:300]}")
+        return r
+
+    # -- git
+    def git_url(self, repo, who="admin", user=None, secret=None, org="acme"):
+        p = self.principals[who]
+        u, s = (p["user"] if user is None else user), (secret if secret is not None else p["secret"])
+        host = self.base.split("://", 1)
+        auth = f"{urllib.parse.quote(u, safe='')}:{urllib.parse.quote(s, safe='')}@" if (u or s) else ""
+        return f"{host[0]}://{auth}{host[1]}/{org}/{repo}.git"
+
+    def git(self, args, cwd=None, name=None, rec=True, ok=None, must_contain=None, extra_header=None,
+            env_extra=None):
+        pre = ["-c", "credential.helper=", "-c", "advice.detachedHead=false", "-c", "init.defaultBranch=main",
+               "-c", "user.name=Conf", "-c", "user.email=conf@example.invalid", "-c", "commit.gpgsign=false"]
+        if extra_header:
+            pre += ["-c", "http.extraHeader=" + extra_header[1]]
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": self.tmp + "/home", "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
+        env.update(env_extra or {})
+        p = subprocess.run(["git"] + pre + args, cwd=cwd, env=env, capture_output=True, timeout=180)
+        out = (p.stdout + p.stderr).decode("utf-8", "replace")
+        if rec:
+            cmd = "git " + (f"-c http.extraHeader=<{extra_header[0]}> " if extra_header else "") + " ".join(args)
+            ex = {"kind": "git", "name": name or args[0], "cmd": self.ns(cmd), "ok": p.returncode == 0,
+                  "output": self.ns(out.strip()[-2000:])}
+            if must_contain:
+                ex["must_contain"] = list(must_contain)
+            self.push_ex(ex)
+        want = ok if ok is not None else (None if rec else True)
+        if want is not None and (p.returncode == 0) != want:
+            raise SetupError(f"git {' '.join(self.ns(a) for a in args)}: exit {p.returncode}: {self.ns(out)[-400:]}")
+        return p.returncode == 0, out.strip()
+
+    def wc(self, repo, who="admin", org="acme"):
+        path = f"{self.tmp}/wc-{org}-{repo}"
+        if not os.path.isdir(path):
+            self.git(["clone", self.git_url(repo, who, org=org), path], rec=False)
+        return path
+
+    def push_branch(self, repo, branch, files, base="origin/main", msg=None, who="admin", org="acme"):
+        """Commit `files` on `branch` (from rev `base`, or from nothing when None) and push it. Returns the sha."""
+        p = self.wc(repo, who, org)
+        self.git(["fetch", "origin"], cwd=p, rec=False)
+        if base is None:
+            self.git(["symbolic-ref", "HEAD", f"refs/heads/{branch}"], cwd=p, rec=False)
+        else:
+            self.git(["checkout", "-q", "-B", branch, base], cwd=p, rec=False)
+        for rel, content in files.items():
+            fp = os.path.join(p, rel)
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+            with open(fp, "w") as f:
+                f.write(content)
+        self.git(["add", "-A"], cwd=p, rec=False)
+        self.git(["commit", "-q", "-m", msg or f"commit on {branch}"], cwd=p, rec=False)
+        self.git(["push", "-q", "-f", "origin", f"{branch}:{branch}"], cwd=p, rec=False)
+        return self.git(["rev-parse", "HEAD"], cwd=p, rec=False)[1]
+
+    def head(self, repo, branch="main", org="acme"):
+        return self.call("GET", f"/repos/{org}/{repo}/branches/{branch}", rec=False, expect=200).json["commit"]["id"]
+
+    def mk_user(self, name, rec=False):
+        pw = self.new_password()
+        r = self.call("POST", "/admin/users", {"username": name, "email": f"{name}@example.invalid", "password": pw,
+                                               "must_change_password": False}, expect=201, rec=rec)
+        self.pw[name] = pw
+        return r
+
+    def mk_token(self, user, name, scopes, principal, rec=False):
+        self.principals[f"{user}-basic"] = {"kind": "basic", "user": user, "secret": self.pw[user]}
+        r = self.call("POST", f"/users/{user}/tokens", {"name": name, "scopes": scopes}, as_=f"{user}-basic",
+                      expect=201, rec=rec)
+        tok = r.json["sha1"]
+        self.secrets.add(tok)
+        self.principals[principal] = {"kind": "token", "user": user, "secret": tok}
+        return r
+
+    def mk_repo(self, name, auto_init=True, org="acme", collab=None, rec=False, default_branch="main"):
+        body = {"name": name, "private": True, "auto_init": auto_init, "default_branch": default_branch}
+        if auto_init:
+            body["readme"] = "Default"
+        self.call("POST", f"/orgs/{org}/repos", body, expect=201, rec=rec)
+        for u, perm in (collab or {"bot": "write", "alice": "write", "carol": "read"}).items():
+            self.call("PUT", f"/repos/{org}/{name}/collaborators/{u}", {"permission": perm}, expect=204, rec=False)
+
+    def api_file(self, repo, path, content, msg="api commit", branch="main", org="acme"):
+        r = self.call("POST", f"/repos/{org}/{repo}/contents/{path}", {
+            "content": base64.b64encode(content.encode()).decode(), "message": msg, "branch": branch},
+            expect=201, rec=False)
+        return r.json["commit"]["sha"]
+
+
+def ex_label(ex):
+    if ex["kind"] == "http":
+        return f"{ex['method']} {ex['path']} -> {ex['status']}"
+    if ex["kind"] == "git":
+        return f"git {ex['name']}: {ex['cmd'][:100]}"
+    return f"note {ex['key']}"
+
+
+def ensure_base(c):
+    """Idempotent, unrecorded: users, org and tokens that most scenarios need."""
+    if c.base_ready:
+        return
+    for u in USERS:
+        if u not in c.pw:
+            if c.call("GET", f"/users/{u}", rec=False).status == 404:
+                c.mk_user(u)
+            else:
+                raise SetupError(f"user {u} exists with an unknown password: use a fresh server")
+    if c.call("GET", "/orgs/acme", rec=False).status == 404:
+        c.call("POST", "/orgs", {"username": "acme", "full_name": "Acme", "visibility": "private"}, expect=201, rec=False)
+    for u in USERS:
+        if u not in c.principals:
+            c.mk_token(u, "conf-all", ["all"], u)
+    if "bot-scoped" not in c.principals:
+        c.mk_token("bot", "conf-scoped", ["read:user", "read:organization", "write:repository"], "bot-scoped")
+    if "alice-ro" not in c.principals:
+        c.mk_token("alice", "conf-ro", ["read:repository"], "alice-ro")
+    # token-as-Basic-password principals for git smart HTTP endpoints (`<name>-tokbasic`)
+    for who in ("admin", "bad") + USERS:
+        c.principals[f"{who}-tokbasic"] = dict(c.principals[who], kind="basic")
+    c.principals["oauth2-tokbasic"] = dict(c.principals["admin"], kind="basic", user="oauth2")
+    c.base_ready = True
+
+
+# --------------------------------------------------------------------------- runner
+
+SCENARIOS = []
+
+
+def scenario(sid, slug, base=True):
+    def deco(fn):
+        SCENARIOS.append((sid, slug, base, fn))
+        return fn
+    return deco
+
+
+def run_all(c, only, out=None, fixtures=None):
+    summary = []
+    for sid, slug, needs_base, fn in SCENARIOS:
+        if only and sid not in only:
+            continue
+        fname = f"{sid}-{slug}.json"
+        c.ex, c.cursor, c.diffs = [], 0, []
+        c.reset_scenario()
+        c.expected, skip = [], None
+        if c.mode == "check":
+            fp = os.path.join(fixtures, fname)
+            if not os.path.exists(fp):
+                summary.append((sid, slug, "FAIL", ["no fixture " + fname]))
+                continue
+            fx = J.load(open(fp))
+            c.expected = fx["exchanges"]
+            skip = fx.get("error")
+        t0 = time.time()
+        err = None
+        try:
+            if needs_base:
+                ensure_base(c)
+            fn(c)
+        except Exception as e:  # noqa: BLE001 - scenario failures are data
+            err = f"{type(e).__name__}: {e}"
+        dt = time.time() - t0
+        if c.mode == "record":
+            os.makedirs(out, exist_ok=True)
+            with open(os.path.join(out, fname), "w") as f:
+                J.dump({"scenario": sid, "title": slug, "error": err, "exchanges": c.ex}, f, indent=2)
+                f.write("\n")
+            summary.append((sid, slug, "ERROR" if err else "ok", [err] if err else [], len(c.ex), dt))
+            continue
+        lines, failed = [], False
+        for i, label, ds in c.diffs:
+            bad = [x for x in ds if x[0] == "fail"]
+            failed |= bool(bad)
+            if bad or ds or c.verbose:
+                lines.append(f"  {'FAIL' if bad else ('warn' if ds else 'ok  ')} #{i:02d} {label}")
+                lines += [f"       {lv}: {t}" for lv, t in ds]
+        if err:
+            failed = True
+            lines.append(f"  ERROR {err}")
+            if skip:
+                failed = False
+                lines.append(f"  (fixture recorded the same error: {skip})")
+        elif len(c.ex) < len(c.expected):
+            failed = True
+            lines.append(f"  FAIL {len(c.expected) - len(c.ex)} recorded exchange(s) not produced")
+        summary.append((sid, slug, "FAIL" if failed else "ok", lines, len(c.ex), dt))
+    return summary
+
+
+def cmd_run(a):
+    c = Ctx(a.base_url, a.admin_token, a.cmd)
+    c.verbose = a.verbose
+    only = set(a.only.split(",")) if a.only else None
+    t0 = time.time()
+    try:
+        if a.cmd == "record":
+            ver = c.call("GET", "/version", rec=False).json
+            summary = run_all(c, only, out=a.out)
+            os.makedirs(a.out, exist_ok=True)
+            with open(os.path.join(a.out, "meta.json"), "w") as f:
+                J.dump({"server_version": ver, "scenarios": sorted(x for x in os.listdir(a.out) if x.endswith(".json") and x != "meta.json")}, f, indent=2)
+                f.write("\n")
+        else:
+            summary = run_all(c, only, fixtures=a.fixtures)
+    finally:
+        shutil.rmtree(c.tmp, ignore_errors=True)
+    bad = 0
+    for s in summary:
+        sid, slug, st, lines = s[:4]
+        extra = f"  ({s[4]} exchanges, {s[5]:.1f}s)" if len(s) > 4 else ""
+        print(f"[{sid}] {slug}: {st}{extra}")
+        for ln in lines:
+            print(ln if a.cmd == "check" else f"  {ln}")
+        bad += st in ("FAIL", "ERROR")
+    print(f"\n{len(summary) - bad}/{len(summary)} scenarios ok in {time.time() - t0:.0f}s")
+    return 1 if bad else 0
+
+
+def load_dir(d):
+    out = {}
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".json") and f != "meta.json":
+            out[f] = J.load(open(os.path.join(d, f)))
+    return out
+
+
+def cmd_diff(a):
+    A, B, bad = load_dir(a.a), load_dir(a.b), 0
+    for f in sorted(set(A) | set(B)):
+        if f not in A or f not in B:
+            print(f"{f}: only in {'A' if f in A else 'B'}")
+            continue
+        ea, eb = A[f]["exchanges"], B[f]["exchanges"]
+        print(f"{f}: {len(ea)} vs {len(eb)} exchanges" + (f"  (errors: A={A[f]['error']!r} B={B[f]['error']!r})" if A[f]["error"] or B[f]["error"] else ""))
+        bij = Bij()
+        for i, (x, y) in enumerate(zip(ea, eb)):
+            ds = cmp_exchange(x, y, bij)
+            ma, mb = msg_text(x), msg_text(y)
+            texty = isinstance(x.get("body"), dict) and "message" in x["body"] or "body_text" in x
+            if ma != mb and x["kind"] == "http" and ma and mb and texty:
+                ds.append(("info", f"text differs: {ma[:160]!r} vs {mb[:160]!r}"))
+            if ds:
+                bad += 1
+                print(f"  #{i:02d} {ex_label(x)}")
+                for lv, t in ds:
+                    print(f"       {lv}: {t}")
+    return 0
+
+
+def cmd_show(a):
+    for f, fx in load_dir(a.dir).items():
+        if a.only and not f.startswith(tuple(a.only.split(","))):
+            continue
+        print(f"== {f}" + (f"  ERROR {fx['error']}" if fx["error"] else ""))
+        for i, ex in enumerate(fx["exchanges"]):
+            if ex["kind"] == "note":
+                print(f"  #{i:02d} note {ex['key']} = {ex['value']!r}")
+                continue
+            print(f"  #{i:02d} {ex_label(ex)}" + (f"  [{ex.get('auth')}]" if ex["kind"] == "http" else ""))
+            if ex["kind"] == "git" and not a.body:
+                print(f"       ok={ex['ok']} | " + " / ".join(x.strip() for x in ex["output"].splitlines()[-2:] if x.strip())[:200])
+            if a.body:
+                if ex["kind"] == "git":
+                    print("       " + ex["output"].replace("\n", "\n       ")[:a.limit])
+                else:
+                    if ex.get("headers"):
+                        print(f"       headers {ex['headers']}")
+                    b = ex.get("body", ex.get("body_text", ex.get("body_prefix_hex")))
+                    print("       " + (J.dumps(b) if not isinstance(b, str) else b)[:a.limit])
+            else:
+                m = msg_text(ex)
+                if m and ex["kind"] == "http" and ex["status"] >= 300:
+                    print(f"       {m[:140]}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="run.py")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("record", "check"):
+        p = sub.add_parser(name)
+        p.add_argument("--base-url", required=True)
+        p.add_argument("--admin-token", required=True)
+        p.add_argument("--only", help="comma-separated scenario ids, e.g. A,F")
+        p.add_argument("-v", "--verbose", action="store_true")
+        if name == "record":
+            p.add_argument("--out", required=True)
+        else:
+            p.add_argument("--fixtures", required=True)
+    p = sub.add_parser("diff")
+    p.add_argument("a")
+    p.add_argument("b")
+    p = sub.add_parser("show")
+    p.add_argument("dir")
+    p.add_argument("--only")
+    p.add_argument("--body", action="store_true")
+    p.add_argument("--limit", type=int, default=600)
+    a = ap.parse_args()
+    sys.exit({"record": cmd_run, "check": cmd_run, "diff": cmd_diff, "show": cmd_show}[a.cmd](a))
+
+
+# =========================================================================== scenarios
+# Each scenario is a function of the Ctx. `c.call(...)` records an exchange; `rec=False` calls are
+# setup and are not compared. Use `must_contain` for the words a `message` must carry, `exact` to
+# force value equality of a body path, `loose` to compare a path by type only.
+
+
+@scenario("A", "meta", base=False)
+def sc_meta(c):
+    c.call("GET", "/version")
+    c.call("GET", "/version", as_="none")
+    c.call("GET", "/api/healthz", as_="none", api=False)
+    c.call("GET", "/user")
+    c.call("GET", "/user", as_="bad")
+    c.call("GET", "/user", as_="none")
+    c.call("POST", "/user/repos", {"name": "probe", "private": True}, expect=201, rec=False)
+    me = c.admin_user
+    c.call("GET", f"/repos/{me}/probe", as_="none")
+    c.call("GET", f"/repos/{me}/probe", as_="bad")
+    c.call("GET", f"/repos/{me}/missing")
+
+
+@scenario("B", "users-orgs-tokens", base=False)
+def sc_users(c):
+    pw = c.new_password()
+    body = {"username": "alice", "email": "alice@example.invalid", "password": pw, "must_change_password": False}
+    c.call("POST", "/admin/users", body, expect=201)
+    c.pw["alice"] = pw
+    c.call("POST", "/admin/users", body, must_contain=["already exists"])
+    c.mk_user("bot", rec=True)
+    c.mk_user("carol")
+    c.mk_user("dave")
+    pw2 = c.new_password()
+    c.call("PATCH", "/admin/users/alice", {"login_name": "alice", "source_id": 0, "password": pw2,
+                                           "visibility": "private", "must_change_password": False})
+    c.pw["alice"] = pw2
+    c.call("GET", "/users/alice")
+    c.call("GET", "/users/alice", as_="none")
+    c.call("GET", "/users/nobody-here", must_contain=["not exist"])
+    org = {"username": "acme", "full_name": "Acme", "visibility": "private"}
+    c.call("POST", "/orgs", org, expect=201)
+    c.call("POST", "/orgs", org, must_contain=["already exists"])
+    c.call("GET", "/orgs/acme")
+    c.call("GET", "/orgs/nobody-org")
+    c.call("GET", f"/users/{c.admin_user}/orgs/acme/permissions")
+    c.call("GET", "/users/alice/orgs/acme/permissions")
+    team = c.call("POST", "/orgs/acme/teams", {"name": "devs", "permission": "read", "includes_all_repositories": False,
+                                               "units": ["repo.code", "repo.pulls"]}, expect=201, rec=False).json
+    c.call("PUT", f"/teams/{team['id']}/members/carol", expect=204, rec=False)
+    c.call("GET", "/users/carol/orgs/acme/permissions")
+    # tokens
+    c.mk_token("alice", "ci", ["read:repository"], "alice-ro", rec=True)
+    r = c.mk_token("alice", "tmp", ["read:repository", "write:repository"], "alice-tmp", rec=True)
+    order = ["id", "name", "scopes"]  # list order of same-second tokens is a tie-break on some versions
+    c.call("GET", "/users/alice/tokens", as_="alice-basic", volatile=order)
+    c.call("GET", "/users/alice/tokens", as_="alice-ro")
+    c.call("DELETE", f"/users/alice/tokens/{r.json['id']}", as_="alice-basic")
+    c.call("GET", "/users/alice/tokens", as_="alice-basic", volatile=order)
+    c.call("POST", "/users/alice/tokens", {"name": "ci", "scopes": ["all"]}, as_="alice-basic")
+    c.mk_token("alice", "all", ["all"], "alice")
+    c.mk_token("bot", "scoped", ["read:user", "read:organization", "write:repository"], "bot-scoped", rec=True)
+    c.mk_token("bot", "all", ["all"], "bot")
+    c.mk_token("carol", "all", ["all"], "carol")
+    c.mk_token("dave", "all", ["all"], "dave")
+    c.call("POST", "/orgs/acme/repos", {"name": "nope"}, as_="alice-ro")
+    # scope enforcement: read-only token against writes, on a repo alice owns
+    c.call("POST", "/user/repos", {"name": "scoped", "auto_init": True, "private": True}, as_="alice", expect=201, rec=False)
+    f = c.call("GET", "/repos/alice/scoped/contents/README.md", rec=False, expect=200).json
+    sha = c.head("scoped", org="alice")
+    c.call("GET", "/repos/alice/scoped", as_="alice-ro")
+    c.call("POST", "/user/repos", {"name": "nope"}, as_="alice-ro")
+    c.call("POST", "/repos/alice/scoped/contents/new.txt", {"content": "aGk=", "message": "m"}, as_="alice-ro")
+    c.call("PUT", "/repos/alice/scoped/contents/README.md", {"content": "aGk=", "message": "m", "sha": f["sha"]}, as_="alice-ro")
+    c.call("PUT", "/repos/alice/scoped/collaborators/carol", {"permission": "write"}, as_="alice-ro")
+    c.call("POST", f"/repos/alice/scoped/statuses/{sha}", {"state": "success", "context": "x"}, as_="alice-ro")
+    # the scoped bot token
+    c.call("GET", "/user", as_="bot-scoped")
+    c.call("GET", "/orgs/acme", as_="bot-scoped")
+    c.call("GET", "/admin/users", as_="bot-scoped")
+    c.call("POST", "/user/repos", {"name": "botrepo", "private": True}, as_="bot-scoped")
+    c.call("GET", "/repos/alice/scoped", as_="bot-scoped")
+
+
+def local_commit(c, p, files, msg="local commit"):
+    for rel, content in files.items():
+        fp = os.path.join(p, rel)
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        with open(fp, "w") as f:
+            f.write(content)
+    c.git(["add", "-A"], cwd=p, rec=False)
+    c.git(["commit", "-q", "-m", msg], cwd=p, rec=False)
+    return c.git(["rev-parse", "HEAD"], cwd=p, rec=False)[1]
+
+
+@scenario("C", "repos")
+def sc_repos(c):
+    create = {"name": "alpha", "auto_init": True, "default_branch": "main", "private": True, "readme": "Default"}
+    c.call("POST", "/orgs/acme/repos", create, expect=201)
+    c.call("POST", "/orgs/acme/repos", create, must_contain=["already exists"])
+    c.call("POST", "/orgs/acme/repos", {"name": "empty", "auto_init": False, "private": True, "default_branch": "main"},
+           expect=201)
+    c.call("GET", "/repos/acme/alpha")
+    c.call("GET", "/repos/acme/empty")
+    c.call("GET", "/repos/acme/missing")
+    c.call("PATCH", "/repos/acme/alpha", {"private": True})
+    c.call("PATCH", "/repos/acme/alpha", {"has_actions": True})
+    c.call("PATCH", "/repos/acme/alpha", {"description": "Alpha repo"})
+    c.call("GET", "/repos/search?limit=50&sort=alpha")
+    c.call("GET", "/repos/search?q=alp&limit=50")
+    # access before any grant
+    c.call("GET", "/repos/acme/alpha", as_="dave")
+    c.call("GET", "/repos/acme/alpha", as_="bad")
+    c.call("GET", "/repos/acme/alpha", as_="none")
+    # collaborators
+    c.call("PUT", "/repos/acme/alpha/collaborators/bot", {"permission": "write"})
+    c.call("PUT", "/repos/acme/alpha/collaborators/carol", {"permission": "read"})
+    c.call("PUT", "/repos/acme/alpha/collaborators/alice", {"permission": "write"})
+    c.call("PUT", "/repos/acme/alpha/collaborators/nobody-here", {"permission": "write"})
+    c.call("GET", "/repos/acme/alpha/collaborators")
+    c.call("GET", "/repos/acme/alpha/collaborators/bot/permission")
+    c.call("GET", "/repos/acme/alpha", as_="bot")
+    c.call("GET", "/repos/acme/alpha", as_="bot-scoped")
+    c.call("GET", "/repos/acme/alpha", as_="carol")
+    c.call("GET", "/repos/search?limit=50&sort=alpha", as_="carol")
+    c.call("DELETE", "/repos/acme/alpha/collaborators/carol")
+    c.call("GET", "/repos/acme/alpha", as_="carol")
+    c.call("PUT", "/repos/acme/alpha/collaborators/carol", {"permission": "read"}, expect=204)
+    # pushes over HTTP
+    p = c.wc("alpha", "bot")
+    local_commit(c, p, {"bot.txt": "bot\n"})
+    c.git(["push", "origin", "HEAD:refs/heads/bot-branch"], cwd=p, name="push-write-collab")
+    c.git(["push", c.git_url("alpha", "bot-scoped"), "HEAD:refs/heads/bot-scoped-branch"], cwd=p, name="push-write-scoped-token")
+    c.git(["push", c.git_url("alpha", "alice-ro"), "HEAD:refs/heads/ro-scope"], cwd=p, name="push-readonly-scope")
+    c.git(["push", c.git_url("alpha", "carol"), "HEAD:refs/heads/carol-branch"], cwd=p, name="push-read-collab")
+    c.git(["push", c.git_url("alpha", "dave"), "HEAD:refs/heads/dave-branch"], cwd=p, name="push-no-grant")
+    c.git(["clone", c.git_url("alpha", "dave"), c.tmp + "/dave-clone"], name="clone-no-grant")
+    c.git(["clone", c.git_url("alpha", "carol"), c.tmp + "/carol-clone"], name="clone-read-collab")
+    # delete
+    c.call("POST", "/orgs/acme/repos", {"name": "doomed", "auto_init": True, "private": True}, expect=201)
+    c.call("DELETE", "/repos/acme/doomed")
+    c.call("GET", "/repos/acme/doomed")
+    c.call("DELETE", "/repos/acme/doomed")
+    c.call("POST", "/orgs/acme/repos", {"name": "doomed", "auto_init": True, "private": True}, expect=201)
+
+
+@scenario("D", "empty-repo")
+def sc_empty(c):
+    c.mk_repo("blank", auto_init=False)
+    c.call("GET", "/repos/acme/blank")
+    for path in ("/commits", "/commits?sha=main&limit=1", "/branches", "/branches/main", "/git/refs/heads",
+                 "/git/refs", "/contents", "/contents/README.md", "/git/trees/main", "/git/commits/HEAD",
+                 "/archive/main.zip", "/tags", "/pulls?state=all"):
+        c.call("GET", "/repos/acme/blank" + path)
+
+
+@scenario("E", "history-reads")
+def sc_history(c):
+    c.mk_repo("hist", auto_init=False)
+    c1 = c.push_branch("hist", "main", {"README.md": "# hist\n"}, base=None, msg="first")
+    c2 = c.push_branch("hist", "main", {"docs/guide.md": "guide\n", "src/lib.rs": "fn main() {}\n"}, msg="second")
+    c3 = c.push_branch("hist", "main", {"README.md": "# hist\nedited\n"}, msg="third")
+    f1 = c.push_branch("hist", "feat/x", {"feat1.txt": "f1\n"}, base=c2, msg="feat one")
+    f2 = c.push_branch("hist", "feat/x", {"feat2.txt": "f2\n"}, base="origin/feat/x", msg="feat two")
+    R = "/repos/acme/hist"
+    c.call("GET", R)
+    c.call("GET", R + "/branches")
+    c.call("GET", R + "/branches?limit=1&page=2")
+    c.call("GET", R + "/branches/main")
+    c.call("GET", R + "/branches/feat/x")
+    c.call("GET", R + "/branches/nope")
+    c.call("GET", R + "/git/refs/heads")
+    c.call("GET", R + "/git/refs/heads/main")
+    c.call("GET", R + "/git/refs/heads/feat/x")
+    c.call("GET", R + "/git/refs/heads/nope")
+    c.call("GET", R + "/git/refs")
+    q = "&stat=false&files=false&verification=false"
+    c.call("GET", R + f"/commits?sha=main&limit=50{q}")
+    c.call("GET", R + f"/commits?sha=main&limit=2&page=1{q}")
+    c.call("GET", R + f"/commits?sha=main&limit=2&page=2{q}")
+    c.call("GET", R + f"/commits?sha=main&limit=2&page=3{q}")
+    c.call("GET", R + f"/commits?sha=feat/x&limit=50{q}")
+    c.call("GET", R + f"/commits?sha={f2}&limit=50{q}")
+    c.call("GET", R + "/commits?sha=main&limit=1")
+    c.call("GET", R + f"/commits?sha=nope&limit=50{q}")
+    c.call("GET", R + f"/git/commits/{c3}")
+    c.call("GET", R + f"/git/commits/{f2}")
+    c.call("GET", R + f"/git/commits/{c3}.diff", must_contain=["diff --git"])
+    c.call("GET", R + f"/git/commits/{c3}.patch", must_contain=["From "])
+    c.call("GET", R + f"/git/commits/{'0' * 40}")
+    c.call("GET", R + f"/git/trees/{c3}?recursive=true")
+    c.call("GET", R + f"/git/trees/{c3}")
+    c.call("GET", R + "/git/trees/main?recursive=true&per_page=2&page=1")
+    c.call("GET", R + "/contents")
+    c.call("GET", R + "/contents?ref=feat/x")
+    c.call("GET", R + "/contents/docs")
+    c.call("GET", R + "/contents/README.md?ref=main")
+    c.call("GET", R + f"/contents/README.md?ref={c1}")
+    c.call("GET", R + "/contents/src/lib.rs")
+    c.call("GET", R + "/contents/nope.txt")
+    c.call("GET", R + "/contents/README.md?ref=nope")
+    sha = c.call("GET", R + "/contents/README.md?ref=main", rec=False).json["sha"]
+    b64 = lambda s: base64.b64encode(s.encode()).decode()  # noqa: E731
+    c.call("POST", R + "/contents/new.txt", {"content": b64("new\n"), "message": "add new.txt", "branch": "main"})
+    c.call("POST", R + "/contents/new.txt", {"content": b64("new\n"), "message": "add again", "branch": "main"})
+    c.call("PUT", R + "/contents/README.md", {"content": b64("# hist\nupdated\n"), "message": "update readme",
+                                              "sha": sha, "branch": "main"})
+    c.call("PUT", R + "/contents/README.md", {"content": b64("# hist\nstale\n"), "message": "stale update",
+                                              "sha": sha, "branch": "main"})
+    c.call("PUT", R + "/contents/README.md", {"content": b64("# hist\nno sha\n"), "message": "no sha", "branch": "main"})
+    c.call("POST", R + "/contents/branch-file.txt", {"content": b64("b\n"), "message": "to new branch",
+                                                    "branch": "main", "new_branch": "api-branch"})
+    sha2 = c.call("GET", R + "/contents/new.txt?ref=main", rec=False).json["sha"]
+    c.call("PUT", R + "/contents/new.txt", {"content": b64("new2\n"), "message": "update to new branch", "sha": sha2,
+                                           "branch": "main", "new_branch": "api-branch-2"})
+    c.call("POST", R + "/contents/x.txt", {"content": b64("x\n"), "message": "dup branch", "branch": "main",
+                                          "new_branch": "api-branch"})
+    c.call("GET", R + "/archive/main.zip", binary=True)
+    c.call("GET", R + "/archive/main.tar.gz", binary=True)
+    c.call("GET", R + f"/archive/{c1}.zip", binary=True)
+    c.call("GET", R + "/archive/nope.zip", binary=True)
+
+
+def b64(s):
+    return base64.b64encode(s.encode()).decode()
+
+
+def mkpr(c, repo, branch, files, title=None, rec=False, base="main", settle=False, as_="bot-scoped",
+         more=(), from_="origin/main"):
+    """Push `branch` (one commit per files dict) and open a PR for it. Returns (number, head_sha)."""
+    sha = c.push_branch(repo, branch, files, base=from_, msg=f"add {branch}")
+    for extra in more:
+        sha = c.push_branch(repo, branch, extra, base=f"origin/{branch}", msg=f"more on {branch}")
+    r = c.call("POST", f"/repos/acme/{repo}/pulls", {"title": title or f"PR {branch}", "body": f"body {branch}",
+                                                     "head": branch, "base": base}, as_=as_, expect=201, rec=rec)
+    if settle:  # Gitea answers "Please try again later" to a merge while the PR is still being checked
+        settled(c, repo, r.json["number"])
+    return r.json["number"], sha
+
+
+def get_pr(c, repo, n, rec=False, **kw):
+    return c.call("GET", f"/repos/acme/{repo}/pulls/{n}", rec=rec, expect=None if rec else 200, **kw).json
+
+
+def wait_for(fn, timeout=10.0, step=0.25):
+    """Poll fn() until truthy. Returns (value, seconds)."""
+    t0 = time.time()
+    while True:
+        v = fn()
+        if v or time.time() - t0 > timeout:
+            return v, time.time() - t0
+        time.sleep(step)
+
+
+def settled(c, repo, n, timeout=40, pre=3.0):
+    """Wait until Gitea has finished (re)checking a PR. The API shows `mergeable: true` before the check
+    starts, so probe the merge endpoint with a bogus head_commit_id (never merges) until it stops saying
+    "Please try again later" twice in a row."""
+    time.sleep(pre)
+    t0, good = time.time(), 0
+    while time.time() - t0 < timeout:
+        r = c.call("POST", f"/repos/acme/{repo}/pulls/{n}/merge", {"Do": "merge", "head_commit_id": "0" * 40},
+                   as_="bot-scoped", rec=False, no_retry=True)
+        good = 0 if "try again later" in r.text.lower() else good + 1
+        if good >= 2:
+            return True
+        time.sleep(1)
+    return False
+
+
+def advance_main(c, repo, name):
+    sha = c.push_branch(repo, "adv-" + name, {name + ".txt": name + "\n"}, msg="advance " + name)
+    c.git(["push", "-q", "origin", f"{sha}:refs/heads/main"], cwd=c.wc(repo), rec=False)
+    return sha
+
+
+def parents(c, repo, sha):
+    p = c.wc(repo)
+    c.git(["fetch", "-q", "origin"], cwd=p, rec=False)
+    return len(c.git(["rev-list", "--parents", "-n1", sha], cwd=p, rec=False)[1].split()) - 1
+
+
+def tokbasic(c, who):
+    return "none" if who == "none" else f"{who}-tokbasic"
+
+
+@scenario("F", "pulls")
+def sc_pulls(c):
+    c.mk_repo("prs")
+    R, A = "/repos/acme/prs", "bot-scoped"
+    c.push_branch("prs", "f1", {"f1.txt": "one\n"})
+    c.push_branch("prs", "f2", {"f2.txt": "two\n"})
+    new = {"title": "Add f1", "body": "First", "head": "f1", "base": "main"}
+    p1 = c.call("POST", R + "/pulls", new, as_=A, expect=201, volatile=["mergeable"])
+    n1 = p1.json["number"]
+    c.call("POST", R + "/pulls", new, as_=A)
+    n2 = c.call("POST", R + "/pulls", {"title": "Add f2", "body": "Second", "head": "f2", "base": "main"},
+                as_=A, expect=201, volatile=["mergeable"]).json["number"]
+    c.call("POST", R + "/pulls", {"title": "x", "head": "nope", "base": "main"}, as_=A)
+    c.call("POST", R + "/pulls", {"title": "x", "head": "main", "base": "main"}, as_=A)
+    c.call("POST", R + "/pulls", {"title": "x", "head": "f1", "base": "nope"}, as_=A)
+    c.call("POST", R + "/pulls", {"head": "f1", "base": "main"}, as_=A)
+    lst = c.call("GET", R + "/pulls?state=all&head=acme%3Af2&limit=50", as_=A)
+    c.note("head_filter_returned_heads", [x["head"]["ref"] for x in lst.json])
+    c.call("GET", R + "/pulls?state=open&limit=50", as_=A)
+    c.call("GET", R + "/pulls?state=closed&limit=50", as_=A)
+    c.call("GET", R + f"/pulls/{n1}", as_=A, volatile=["mergeable"])
+    c.call("GET", R + "/pulls/999", as_=A)
+    # head moves when a commit is pushed to the head branch
+    old = p1.json["head"]["sha"]
+    new_sha = c.push_branch("prs", "f1", {"f1b.txt": "more\n"}, base="origin/f1")
+    imm = get_pr(c, "prs", n1)["head"]["sha"]
+    c.note("head_sha_updated_immediately", imm == new_sha, strict=False)
+    ok, dt = wait_for(lambda: get_pr(c, "prs", n1)["head"]["sha"] == new_sha)
+    c.note("head_sha_updated_within_10s", bool(ok))
+    final = c.call("GET", R + f"/pulls/{n1}", as_=A, volatile=["mergeable"])
+    c.note("head_sha_changed_after_push", final.json["head"]["sha"] != old)
+    c.call("GET", R + f"/pulls?state=open&limit=50", as_=A)
+    c.call("GET", R + f"/pulls/{n1}.diff", as_=A)
+    c.call("GET", R + f"/pulls/{n1}.patch", as_=A, volatile=["$text"])
+    c.call("GET", R + f"/pulls/{n1}/commits", as_=A)
+    c.call("GET", R + f"/pulls/{n1}/files", as_=A)
+    # close / reopen / edit
+    c.call("PATCH", R + f"/pulls/{n2}", {"state": "closed"}, as_=A, volatile=["mergeable"])
+    c.call("GET", R + "/pulls?state=closed&limit=50", as_=A)
+    c.call("PATCH", R + f"/pulls/{n2}", {"state": "open"}, as_=A, volatile=["mergeable"])
+    c.call("PATCH", R + f"/pulls/{n2}", {"title": "Renamed f2"}, as_=A, volatile=["mergeable"])
+    # reviews
+    c.call("GET", R + f"/pulls/{n1}/reviews", as_=A)
+    c.call("POST", R + f"/pulls/{n1}/reviews", {"body": "looks fine", "event": "COMMENT"})
+    c.call("POST", R + f"/pulls/{n1}/reviews", {"body": "please change", "event": "REQUEST_CHANGES"}, as_="alice")
+    c.call("POST", R + f"/pulls/{n1}/reviews", {"body": "now ok", "event": "APPROVED"}, as_="alice")
+    c.call("POST", R + f"/pulls/{n1}/reviews", {"body": "read only approves", "event": "APPROVED"}, as_="carol")
+    c.call("POST", R + f"/pulls/{n1}/reviews", {"body": "self approve", "event": "APPROVED"}, as_=A)
+    c.call("POST", R + f"/pulls/{n1}/reviews", {"body": "bogus", "event": "BOGUS"}, as_="alice")
+    revs = c.call("GET", R + f"/pulls/{n1}/reviews", as_=A)
+    c.call("GET", R + f"/pulls/{n1}/reviews?page=1&limit=25", as_=A)
+    rid = revs.json[0]["id"]
+    c.call("GET", R + f"/pulls/{n1}/reviews/{rid}", as_=A)
+    c.call("GET", R + f"/pulls/{n1}/reviews/{rid}/comments", as_=A)
+    for who in (A, "bot"):
+        c.call("GET", R + f"/issues/{n1}/comments", as_=who)
+        c.call("POST", R + f"/issues/{n1}/comments", {"body": "hello"}, as_=who)
+        c.call("GET", R + f"/issues/{n1}/comments", as_=who)
+
+
+@scenario("G", "merge")
+def sc_merge(c):
+    c.mk_repo("merges")
+    R, A = "/repos/acme/merges", "bot-scoped"
+
+    def merge(n, body, **kw):
+        return c.call("POST", R + f"/pulls/{n}/merge", body, as_=A, **kw)
+
+    def getpr(n, **kw):  # `mergeable` flips while Gitea re-checks open PRs after every base change
+        return c.call("GET", R + f"/pulls/{n}", as_=A, volatile=["mergeable"], **kw)
+
+    def settle_merged(n, label):
+        first = get_pr(c, "merges", n)
+        final, dt = wait_for(lambda: get_pr(c, "merges", n)["merged"] and get_pr(c, "merges", n))
+        c.note(f"{label}_merged_immediately_after_merge_call", first["merged"], strict=False)
+        c.note(f"{label}_merged_within_10s", bool(final))
+        c.note(f"{label}_seconds_to_merged", round(dt), strict=False)
+        return final or get_pr(c, "merges", n)
+
+    # 1. clean merge
+    n1, s1 = mkpr(c, "merges", "m1", {"m1.txt": "1\n"})
+    c.call("GET", R + f"/pulls/{n1}/merge", as_=A)
+    getpr(n1)
+    merge(n1, {"Do": "merge"})
+    fin = settle_merged(n1, "merge")
+    c.call("GET", R + f"/pulls/{n1}", as_=A)
+    c.note("merged_flag_true_after_merge", fin["merged"] is True)
+    c.note("merge_commit_sha_present", bool(fin.get("merge_commit_sha")))
+    c.note("merge_commit_parent_count", parents(c, "merges", fin["merge_commit_sha"]) if fin.get("merge_commit_sha") else -1)
+    c.note("head_sha_unchanged_after_merge", fin["head"]["sha"] == s1)
+    c.call("GET", R + f"/pulls/{n1}/merge", as_=A)
+    merge(n1, {"Do": "merge"})  # retry after success
+    # 1b. merge immediately after creation (check not finished): unrecorded, outcome kept as notes
+    nb, sb = mkpr(c, "merges", "m1b", {"m1b.txt": "b\n"})
+    r = merge(nb, {"Do": "merge"}, rec=False, no_retry=True)
+    c.note("immediate_merge_status", r.status, strict=False)
+    c.note("immediate_merge_message", (r.json or {}).get("message", "") if r.is_json else r.text.strip()[:80], strict=False)
+    if r.status != 200:
+        merge(nb, {"Do": "merge"}, rec=False)
+    settle_merged(nb, "immediate")
+    c.call("GET", R + f"/pulls/{nb}", as_=A)
+    # 2. correct head_commit_id
+    n2, s2 = mkpr(c, "merges", "m2", {"m2.txt": "2\n"})
+    merge(n2, {"Do": "merge", "head_commit_id": s2})
+    settle_merged(n2, "headid")
+    # 3. wrong head_commit_id, then right one
+    n3, s3 = mkpr(c, "merges", "m3", {"m3.txt": "3\n"})
+    merge(n3, {"Do": "merge", "head_commit_id": "0" * 40})
+    merge(n3, {"Do": "merge", "head_commit_id": s2})
+    getpr(n3)
+    merge(n3, {"Do": "merge", "head_commit_id": s3})
+    settle_merged(n3, "wrongid_then_right")
+    # invalid Do / missing Do (this PR stays open; it is closed below so it does not slow later checks)
+    n6, s6 = mkpr(c, "merges", "m6", {"m6.txt": "6\n"})
+    merge(n6, {"Do": "bogus"})
+    merge(n6, {})
+    c.call("PATCH", R + f"/pulls/{n6}", {"state": "closed"}, as_=A, rec=False, expect=201)
+    # 4. head already an ancestor of base (empty merge)
+    n4, s4 = mkpr(c, "merges", "m4", {"m4.txt": "4\n"})
+    c.git(["push", "-q", "origin", f"{s4}:refs/heads/main"], cwd=c.wc("merges"), rec=False)
+    time.sleep(6)
+    getpr(n4)
+    merge(n4, {"Do": "merge"}, no_retry=True)
+    getpr(n4)
+    c.call("POST", R + "/pulls", {"title": "again", "head": "m1", "base": "main"}, as_=A)  # head contained in base
+    c.call("PATCH", R + f"/pulls/{n4}", {"state": "closed"}, as_=A, rec=False)
+    # 5. conflict. Gitea answers a conflicting merge with the same "Please try again later" it uses while checking.
+    base_sha = c.push_branch("merges", "cbase", {"conflict.txt": "base\n"})
+    c.git(["push", "-q", "origin", f"{base_sha}:refs/heads/main"], cwd=c.wc("merges"), rec=False)
+    na, _ = mkpr(c, "merges", "cf1", {"conflict.txt": "one\n"})
+    nc, _ = mkpr(c, "merges", "cf2", {"conflict.txt": "two\n"})
+    merge(na, {"Do": "merge"})
+    time.sleep(8)
+    c.note("conflicting_pr_mergeable_after_8s", get_pr(c, "merges", nc)["mergeable"], strict=False)
+    c.call("GET", R + f"/pulls/{nc}", as_=A)
+    merge(nc, {"Do": "merge"}, no_retry=True)
+    c.call("PATCH", R + f"/pulls/{nc}", {"state": "closed"}, as_=A, rec=False)
+    # 6. closed PR
+    n5, _ = mkpr(c, "merges", "m5", {"m5.txt": "5\n"})
+    c.call("PATCH", R + f"/pulls/{n5}", {"state": "closed"}, as_=A)
+    merge(n5, {"Do": "merge"})
+    c.call("GET", R + f"/pulls/{n5}", as_=A)
+    # 7. merge styles
+    nq, _ = mkpr(c, "merges", "sq", {"sq1.txt": "a\n"}, more=[{"sq2.txt": "b\n"}])
+    merge(nq, {"Do": "squash"})
+    fin = settle_merged(nq, "squash")
+    c.call("GET", R + f"/pulls/{nq}", as_=A)
+    c.note("squash_parent_count", parents(c, "merges", fin["merge_commit_sha"]) if fin.get("merge_commit_sha") else -1)
+    nr, _ = mkpr(c, "merges", "rb", {"rb1.txt": "a\n"}, more=[{"rb2.txt": "b\n"}])
+    advance_main(c, "merges", "adv1")
+    merge(nr, {"Do": "rebase"})
+    fin = settle_merged(nr, "rebase")
+    c.call("GET", R + f"/pulls/{nr}", as_=A)
+    c.note("rebase_parent_count", parents(c, "merges", fin["merge_commit_sha"]) if fin.get("merge_commit_sha") else -1)
+    nm, _ = mkpr(c, "merges", "rm", {"rm1.txt": "a\n"})
+    advance_main(c, "merges", "adv2")
+    merge(nm, {"Do": "rebase-merge"})
+    fin = settle_merged(nm, "rebase_merge")
+    c.note("rebase_merge_parent_count", parents(c, "merges", fin["merge_commit_sha"]) if fin.get("merge_commit_sha") else -1)
+    nf, _ = mkpr(c, "merges", "ffo", {"ffo.txt": "a\n"})
+    merge(nf, {"Do": "fast-forward-only"})
+    fin = settle_merged(nf, "ff_only")
+    c.call("GET", R + f"/pulls/{nf}", as_=A)
+    c.note("ff_only_parent_count", parents(c, "merges", fin["merge_commit_sha"]) if fin.get("merge_commit_sha") else -1)
+    nf2, _ = mkpr(c, "merges", "ffo2", {"ffo2.txt": "a\n"})
+    advance_main(c, "merges", "adv3")
+    time.sleep(6)
+    merge(nf2, {"Do": "fast-forward-only"}, no_retry=True)
+    getpr(nf2)
+    c.call("PATCH", R + f"/pulls/{nf2}", {"state": "closed"}, as_=A, rec=False)
+    # 8. required status checks
+    ns_, ss = mkpr(c, "merges", "sc1", {"sc1.txt": "s\n"})
+    c.call("POST", R + "/branch_protections", {"branch_name": "main", "enable_push": False,
+                                               "enable_status_check": True, "status_check_contexts": ["ci/test"]},
+           expect=201)
+    merge(ns_, {"Do": "merge"}, must_contain=["required status checks"])
+    for state in ("pending", "failure"):
+        c.call("POST", R + f"/statuses/{ss}", {"state": state, "context": "ci/test"}, expect=201, rec=False)
+        merge(ns_, {"Do": "merge"}, must_contain=["required status checks"])
+    c.call("POST", R + f"/statuses/{ss}", {"state": "success", "context": "ci/test"}, expect=201, rec=False)
+    merge(ns_, {"Do": "merge"})
+    settle_merged(ns_, "status_gated")
+    c.call("DELETE", R + "/branch_protections/main")
+
+
+@scenario("H", "statuses")
+def sc_statuses(c):
+    c.mk_repo("status")
+    R = "/repos/acme/status"
+    shas = [c.head("status")] + [c.api_file("status", f"f{i}.txt", f"{i}\n", f"commit {i}") for i in range(1, 5)]
+    s0, s1, s2, s3, s4 = shas
+
+    def post(sha, state, ctx, **kw):
+        body = {"state": state, "context": ctx, "description": f"{ctx} is {state}", "target_url": "http://example.invalid/run/1"}
+        return c.call("POST", R + f"/statuses/{sha}", body, **kw)
+
+    def combined(sha):
+        return c.call("GET", R + f"/commits/{sha}/status?limit=50")
+
+    r = combined(s0)
+    c.note("combined_state_no_statuses", r.json["state"])
+    c.call("GET", R + f"/statuses/{s0}?limit=100")
+    c.call("GET", R + f"/commits/{s0}/statuses?limit=100")
+    # same context twice
+    post(s1, "pending", "ci/test", as_="bot-scoped", expect=201)
+    r = combined(s1)
+    c.note("combined_state_pending", r.json["state"])
+    post(s1, "success", "ci/test", as_="bot-scoped", expect=201)
+    r = combined(s1)
+    c.note("combined_statuses_after_pending_then_success", len(r.json["statuses"]))
+    c.call("GET", R + f"/statuses/{s1}?limit=100")
+    r = c.call("GET", R + f"/commits/{s1}/statuses?limit=100")
+    c.note("list_history_len_after_two_posts", len(r.json))
+    # mixes
+    post(s2, "success", "ci/test", expect=201)
+    post(s2, "failure", "ci/lint", expect=201)
+    c.note("combined_success_plus_failure", combined(s2).json["state"])
+    post(s2, "success", "ci/lint", expect=201)
+    c.note("combined_all_success", combined(s2).json["state"])
+    post(s2, "pending", "ci/other", expect=201)
+    c.note("combined_success_plus_pending", combined(s2).json["state"])
+    post(s2, "error", "ci/err", expect=201)
+    c.note("combined_with_error", combined(s2).json["state"])
+    combined(s2)
+    # state strings
+    for st in ("success", "pending", "failure", "error", "warning", "skipped", "bogus", ""):
+        post(s3, st, f"st-{st or 'empty'}")
+    combined(s3)
+    c.call("POST", R + f"/statuses/{s3}", {"state": "success"})
+    c.call("POST", R + f"/statuses/{s3}", {"context": "no-state"})
+    c.call("POST", R + f"/statuses/{s3}", {"state": "success", "context": "x" * 300})
+    # unknown / malformed sha, no permission
+    post("0123456789abcdef0123456789abcdef01234567", "success", "ci/test")
+    post("nope", "success", "ci/test")
+    post(s4, "success", "ci/test", as_="carol")
+    post(s4, "success", "ci/test", as_="dave")
+    combined("0123456789abcdef0123456789abcdef01234567")
+    c.call("GET", R + "/commits/main/status?limit=50")
+    c.call("GET", R + "/statuses/main?limit=100")
+
+
+@scenario("I", "branch-protection")
+def sc_protection(c):
+    c.mk_repo("prot")
+    R = "/repos/acme/prot"
+    c.call("GET", R + "/branch_protections")
+    body = {"branch_name": "main", "enable_push": False, "enable_status_check": True, "status_check_contexts": ["ci/test"]}
+    c.call("POST", R + "/branch_protections", body, expect=201)
+    c.call("POST", R + "/branch_protections", body)
+    c.call("GET", R + "/branch_protections")
+    c.call("GET", R + "/branch_protections/main")
+    c.call("GET", R + "/branch_protections/nope")
+    c.call("POST", R + "/branch_protections", body, as_="bot")
+    p = c.wc("prot", "bot")
+    local_commit(c, p, {"direct.txt": "x\n"})
+    c.git(["push", "origin", "HEAD:refs/heads/main"], cwd=p, name="push-protected-write-collab",
+          must_contain=["protected"])
+    c.git(["push", c.git_url("prot", "admin"), "HEAD:refs/heads/main"], cwd=p, name="push-protected-admin")
+    c.git(["push", "origin", "HEAD:refs/heads/other"], cwd=p, name="push-other-branch")
+    c.git(["push", "origin", ":refs/heads/main"], cwd=p, name="delete-protected-by-push")
+    c.call("PATCH", R + "/branch_protections/main", {"enable_push": True})
+    c.git(["push", "origin", "HEAD:refs/heads/main"], cwd=p, name="push-after-enable-push")
+    c.call("PATCH", R + "/branch_protections/main", {"enable_status_check": False})
+    c.call("PATCH", R + "/branch_protections/nope", {"enable_push": True})
+    c.call("DELETE", R + "/branch_protections/main")
+    c.call("GET", R + "/branch_protections/main")
+    c.call("DELETE", R + "/branch_protections/main")
+
+
+@scenario("J", "smart-http")
+def sc_smart(c):
+    c.mk_repo("smart")
+    wcp = c.wc("smart")
+    tok = c.principals["admin"]["secret"]
+    tip_old = c.head("smart")
+    c.push_branch("smart", "main", {"a.txt": "a\n"})
+    c.push_branch("smart", "main", {"b.txt": "b\n"})
+    tip = c.push_branch("smart", "main", {"a.txt": "a edited\n"})  # a.txt's first blob is history-only (partial clone)
+    dead = c.push_branch("smart", "tmp-dead", {"dead.txt": "x\n"})
+    c.git(["push", "-q", "origin", ":refs/heads/tmp-dead"], cwd=wcp, rec=False)
+    url = lambda **kw: c.git_url("smart", **kw)  # noqa: E731
+    variants = [
+        ("admin-token", dict(who="admin")),
+        ("oauth2-token", dict(who="admin", user="oauth2")),
+        ("bot-token", dict(who="bot")),
+        ("other-name-admin-token", dict(who="admin", user="someone")),
+        ("bot-name-admin-token", dict(who="admin", user="bot")),
+        ("token-as-username", dict(who="admin", user=tok, secret="")),
+        ("bad-token", dict(who="bad")),
+        ("no-credentials", dict(who="admin", user="", secret="")),
+    ]
+    for label, kw in variants:
+        u = url(**kw)
+        c.git(["clone", "-q", u, f"{c.tmp}/j-{label}"], name=f"clone-{label}")
+        c.git(["push", u, f"{tip}:refs/heads/j-{label}"], cwd=wcp, name=f"push-{label}")
+        c.git(["fetch", "-q", u, "main"], cwd=wcp, name=f"fetch-{label}")
+    plain = url(user="", secret="")
+    hdrs = [("hdr-basic-token-empty-password", "Authorization: Basic " + base64.b64encode(f"{tok}:".encode()).decode()),
+            ("hdr-token", "Authorization: token " + tok), ("hdr-bearer", "Authorization: Bearer " + tok)]
+    for label, h in hdrs:
+        c.git(["ls-remote", plain], name=f"ls-remote-{label}", extra_header=(label, h))
+    # raw endpoints
+    for svc in ("git-upload-pack", "git-receive-pack"):
+        for who in ("none", "bad", "admin", "oauth2"):
+            c.call("GET", f"/acme/smart.git/info/refs?service={svc}", as_=tokbasic(c, who), api=False,
+                   volatile=["$text"], must_contain=[f"service={svc}"] if who in ("admin", "oauth2") else None)
+    c.call("GET", "/acme/smart.git/info/refs?service=git-upload-pack", as_="admin-tokbasic", api=False,
+           headers={"Git-Protocol": "version=2"}, volatile=["$text"], must_contain=["version 2"])
+    # fetch a commit by id
+    fd = c.tmp + "/jfetch"
+    c.git(["init", "-q", fd], rec=False)
+    for proto in ("0", "2"):
+        for label, sha in (("tip", tip), ("old", tip_old), ("dead", dead)):
+            c.git(["-c", f"protocol.version={proto}", "fetch", "-q", url(who="admin"), sha], cwd=fd,
+                  name=f"fetch-sha-{label}-v{proto}")
+    for proto in ("0", "2"):
+        c.git(["-c", f"protocol.version={proto}", "ls-remote", url(who="admin")], name=f"ls-remote-v{proto}")
+    # partial and shallow clones
+    d = c.tmp + "/jpartial"
+    c.git(["clone", "--filter=blob:none", url(who="admin"), d], name="clone-filter-blob-none")
+    if os.path.isdir(d):
+        miss = c.git(["rev-list", "--objects", "--all", "--missing=print"], cwd=d, rec=False)[1].splitlines()
+        c.note("partial_clone_missing_objects", sum(1 for x in miss if x.startswith("?")) > 0)
+        c.note("partial_clone_promisor", c.git(["config", "--get", "remote.origin.promisor"], cwd=d, rec=False, ok=None)[1])
+    d2 = c.tmp + "/jshallow"
+    c.git(["clone", "-q", "--depth=1", url(who="admin"), d2], name="clone-depth-1")
+    if os.path.isdir(d2):
+        c.note("shallow_clone", c.git(["rev-parse", "--is-shallow-repository"], cwd=d2, rec=False)[1])
+        c.git(["fetch", "-q", "--unshallow"], cwd=d2, name="unshallow")
+    # force-with-lease
+    a = c.push_branch("smart", "flw-a", {"flw.txt": "A\n"})
+    b = c.push_branch("smart", "flw-b", {"flw.txt": "B\n"})
+    u = url(who="admin")
+    c.git(["push", "--force-with-lease=refs/heads/b:", u, f"{a}:refs/heads/b"], cwd=wcp, name="flw-absent-expected-and-absent")
+    c.git(["push", "--force-with-lease=refs/heads/b:", u, f"{b}:refs/heads/b"], cwd=wcp, name="flw-absent-expected-but-exists")
+    c.git(["push", f"--force-with-lease=refs/heads/b:{a}", u, f"{b}:refs/heads/b"], cwd=wcp, name="flw-correct-lease-nonff")
+    c.git(["push", f"--force-with-lease=refs/heads/b:{a}", u, f"{a}:refs/heads/b"], cwd=wcp, name="flw-stale-lease")
+    c.git(["push", u, f"{a}:refs/heads/b"], cwd=wcp, name="push-nonff-without-force")
+    # tags and deletes
+    c.git(["tag", "v1", tip], cwd=wcp, rec=False)
+    c.git(["tag", "-a", "v2", "-m", "release", tip], cwd=wcp, rec=False)
+    c.git(["push", u, "refs/tags/v1", "refs/tags/v2"], cwd=wcp, name="push-tags")
+    c.call("GET", "/repos/acme/smart/tags")
+    c.call("GET", "/repos/acme/smart/git/refs/tags")
+    c.git(["push", u, ":refs/tags/v1"], cwd=wcp, name="delete-tag-by-push")
+    c.call("GET", "/repos/acme/smart/tags")
+    c.git(["push", u, ":refs/heads/b"], cwd=wcp, name="delete-branch-by-push")
+    c.call("GET", "/repos/acme/smart/branches/b")
+    c.git(["push", u, ":refs/heads/main"], cwd=wcp, name="delete-default-branch-by-push")
+    c.call("GET", "/acme/smart.git/HEAD", as_="admin-tokbasic", api=False)
+
+
+@scenario("K", "visibility-probing")
+def sc_visibility(c):
+    c.mk_repo("vis")
+    for who in ("none", "bad", "dave", "carol"):
+        for repo in ("vis", "ghost"):
+            c.call("GET", f"/repos/acme/{repo}", as_=who)
+            c.call("GET", f"/repos/acme/{repo}/contents", as_=who)
+            c.call("GET", f"/repos/acme/{repo}/branches", as_=who)
+            c.call("GET", f"/acme/{repo}.git/info/refs?service=git-upload-pack", as_=tokbasic(c, who), api=False,
+                   volatile=["$text"])
+            c.call("GET", f"/acme/{repo}.git/info/refs?service=git-receive-pack", as_=tokbasic(c, who), api=False,
+                   volatile=["$text"])
+    for who in ("none", "dave"):
+        for repo in ("vis", "ghost"):
+            c.call("GET", f"/acme/{repo}", as_=tokbasic(c, who), api=False, volatile=["$text"])
+            c.git(["ls-remote", c.git_url(repo, who)] if who != "none" else ["ls-remote", c.git_url(repo, "admin", user="", secret="")],
+                  name=f"ls-remote-{repo}-{who}")
+    for who in ("none", "dave", "carol", "admin"):
+        c.call("GET", "/repos/search?limit=50&sort=alpha", as_=who)
+    c.call("GET", "/repos/search?q=vis&limit=50", as_="dave")
+    c.call("GET", "/user/repos?limit=50", as_="dave")
+    c.call("GET", "/orgs/acme", as_="dave")
+    c.call("GET", "/orgs/acme/repos", as_="dave")
+    c.call("GET", "/orgs/acme/repos?limit=50", as_="carol")
+    c.call("GET", "/orgs/acme/repos?limit=50", as_="none")
+
+
+@scenario("L", "force-private")
+def sc_force_private(c):
+    c.call("POST", "/orgs/acme/repos", {"name": "pub1", "private": False, "auto_init": True})
+    c.call("GET", "/repos/acme/pub1")
+    c.call("PATCH", "/repos/acme/pub1", {"private": False})
+    c.call("GET", "/repos/acme/pub1")
+    c.call("PATCH", "/repos/acme/pub1", {"private": True})
+    c.call("PATCH", "/repos/acme/pub1", {"private": False})
+    c.call("POST", "/orgs/acme/repos", {"name": "nodef", "auto_init": False})
+    c.call("POST", "/user/repos", {"name": "pub2", "private": False}, as_="alice")
+    c.call("GET", "/repos/alice/pub2", as_="none")
+    c.call("GET", "/repos/alice/pub2", as_="dave")
+    c.call("POST", "/user/repos", {"name": "nodef2"}, as_="alice")
+    c.call("POST", "/orgs", {"username": "pubco", "visibility": "public"})
+    c.call("GET", "/orgs/pubco", as_="dave")
+    c.call("POST", "/orgs/pubco/repos", {"name": "pubrepo", "private": False})
+    c.call("GET", "/repos/pubco/pubrepo", as_="dave")
+
+
+@scenario("M", "names")
+def sc_names(c):
+    for name in ("Mixed", "mixed", "MIXED"):
+        c.call("POST", "/orgs/acme/repos", {"name": name, "auto_init": False})
+    c.call("GET", "/repos/acme/mixed")
+    c.call("GET", "/repos/acme/Mixed")
+    c.call("GET", "/repos/ACME/mixed")
+    for name in (".", "..", ".hidden", "-dash", "trail.git", "wiki.wiki", "feed.rss", "feed.atom", "a b", "a..b",
+                 "api", "admin", "user", "assets", "x" * 101, "ok_name-1.x", "ünï"):
+        c.call("POST", "/orgs/acme/repos", {"name": name, "auto_init": False})
+    for n, i in (("Acme", 1), ("api", 2), ("admin", 3), ("user", 4), ("assets", 5), ("explore", 6), (".dot", 7),
+                 ("-dash", 8), ("has space", 9), ("org.git", 10), ("x" * 41, 11)):
+        c.call("POST", "/orgs", {"username": n})
+    for n in ("Alice", "api", "user", "-lead", ".lead", "trail.git", "bad name"):
+        c.call("POST", "/admin/users", {"username": n, "email": f"{n.replace(' ', '')}@example.invalid", "password": c.new_password(),
+                                        "must_change_password": False})
+    c.call("POST", "/orgs/acme/repos", {"name": "rename-me", "auto_init": True}, expect=201)
+    c.call("PATCH", "/repos/acme/rename-me", {"name": "renamed"})
+    c.call("GET", "/repos/acme/rename-me")
+    c.call("GET", "/repos/acme/renamed")
+    c.call("GET", "/repos/acme/rename-me", as_="dave")
+    c.call("GET", "/acme/rename-me.git/info/refs?service=git-upload-pack", as_="admin-tokbasic", api=False,
+           volatile=["$text"])
+    c.git(["ls-remote", c.git_url("rename-me", "admin")], name="ls-remote-old-name")
+    c.git(["ls-remote", c.git_url("renamed", "admin")], name="ls-remote-new-name")
+    c.call("PATCH", "/repos/acme/renamed", {"name": "mixed"})
+    c.call("PATCH", "/repos/acme/renamed", {"name": "Renamed"})
+    c.call("PATCH", "/repos/acme/Renamed", {"name": "renamed"})
+
+
+@scenario("N", "default-branch")
+def sc_default_branch(c):
+    c.mk_repo("dflt")
+    c.push_branch("dflt", "dev", {"dev.txt": "d\n"})
+    R = "/repos/acme/dflt"
+    c.call("PATCH", R, {"default_branch": "nope"})
+    c.call("PATCH", R, {"default_branch": "dev"})
+    c.call("GET", R)
+    c.git(["ls-remote", "--symref", c.git_url("dflt"), "HEAD"], name="ls-remote-symref-after-change")
+    c.call("GET", R + "/branches")
+    c.call("GET", R + "/contents")
+    d = c.tmp + "/ndflt"
+    c.git(["clone", "-q", c.git_url("dflt"), d], name="clone-after-change")
+    if os.path.isdir(d):
+        c.note("clone_checked_out_branch", c.git(["symbolic-ref", "--short", "HEAD"], cwd=d, rec=False)[1])
+    c.call("PATCH", R, {"default_branch": "main"}, retry_while=["already in queue"])  # async branch sync, 1.26
+    c.call("DELETE", R + "/branches/dev")
+    # empty repo, first push name decides?
+    c.mk_repo("fresh1", auto_init=False)
+    c.call("GET", "/repos/acme/fresh1")
+    c.push_branch("fresh1", "trunk", {"t.txt": "t\n"}, base=None)
+    c.call("GET", "/repos/acme/fresh1")
+    c.git(["ls-remote", "--symref", c.git_url("fresh1"), "HEAD"], name="ls-remote-symref-trunk-first")
+    c.call("GET", "/repos/acme/fresh1/branches")
+    c.mk_repo("fresh2", auto_init=False)
+    c.push_branch("fresh2", "main", {"t.txt": "t\n"}, base=None)
+    c.call("GET", "/repos/acme/fresh2")
+    c.mk_repo("fresh3", auto_init=False, default_branch="develop")
+    c.call("GET", "/repos/acme/fresh3")
+    c.push_branch("fresh3", "main", {"t.txt": "t\n"}, base=None)
+    c.call("GET", "/repos/acme/fresh3")
+    c.git(["ls-remote", "--symref", c.git_url("fresh3"), "HEAD"], name="ls-remote-symref-main-pushed-first")
+    c.push_branch("fresh3", "develop", {"u.txt": "u\n"}, base="origin/main")
+    c.call("GET", "/repos/acme/fresh3")
+    c.git(["ls-remote", "--symref", c.git_url("fresh3"), "HEAD"], name="ls-remote-symref-develop-pushed-second")
+
+
+@scenario("O", "pr-head-lifecycle")
+def sc_pr_lifecycle(c):
+    c.mk_repo("life")
+    R, A = "/repos/acme/life", "bot-scoped"
+    wcp = c.wc("life")
+    url = c.git_url("life")
+    # 1. force-push the head branch
+    n1, s1 = mkpr(c, "life", "l1", {"l1.txt": "1\n"})
+    c.call("GET", R + f"/pulls/{n1}", as_=A)
+    s1b = c.push_branch("life", "l1", {"l1-other.txt": "rewritten\n"}, base="origin/main", msg="rewritten")
+    ok, _ = wait_for(lambda: get_pr(c, "life", n1)["head"]["sha"] == s1b)
+    c.note("force_push_head_sha_follows", bool(ok))
+    c.call("GET", R + f"/pulls/{n1}", as_=A)
+    c.call("GET", R + "/pulls?state=open&limit=50", as_=A)
+    c.git(["ls-remote", url, "refs/pull/*"], name="ls-remote-pull-refs", cwd=wcp)
+    # 2. delete the head branch while the PR is open
+    n2, s2 = mkpr(c, "life", "l2", {"l2.txt": "2\n"})
+    c.call("DELETE", R + "/branches/l2")
+    time.sleep(1)
+    c.call("GET", R + f"/pulls/{n2}", as_=A)
+    c.call("GET", R + "/pulls?state=open&limit=50", as_=A)
+    c.call("POST", R + f"/pulls/{n2}/merge", {"Do": "merge"}, as_=A)
+    c.call("GET", R + f"/pulls/{n2}", as_=A)
+    c.git(["ls-remote", url, "refs/pull/*"], name="ls-remote-pull-refs-after-delete", cwd=wcp)
+    c.call("GET", R + f"/pulls/{n2}/commits", as_=A)
+    c.call("GET", R + f"/pulls/{n2}.diff", as_=A)
+    # 3. merge, then recreate the head branch at a new commit
+    n3, s3 = mkpr(c, "life", "l3", {"l3.txt": "3\n"})
+    c.call("POST", R + f"/pulls/{n3}/merge", {"Do": "merge"}, as_=A)
+    wait_for(lambda: get_pr(c, "life", n3)["merged"])
+    s3b = c.push_branch("life", "l3", {"l3-new.txt": "again\n"}, base="origin/main", msg="reborn l3")
+    time.sleep(2)
+    j = c.call("GET", R + f"/pulls/{n3}", as_=A)
+    c.note("merged_pr_head_sha_frozen", j.json["head"]["sha"] == s3)
+    c.note("merged_pr_head_sha_follows_new_branch", j.json["head"]["sha"] == s3b)
+    # 4. closed PR, then branch deleted
+    n4, _ = mkpr(c, "life", "l4", {"l4.txt": "4\n"})
+    c.call("PATCH", R + f"/pulls/{n4}", {"state": "closed"}, as_=A)
+    c.call("DELETE", R + "/branches/l4")
+    time.sleep(1)
+    c.call("GET", R + f"/pulls/{n4}", as_=A)
+    c.call("PATCH", R + f"/pulls/{n4}", {"state": "open"}, as_=A)
+    c.call("GET", R + f"/pulls/{n4}", as_=A)
+    # 5. head commit pushed straight into base
+    n5, s5 = mkpr(c, "life", "l5", {"l5.txt": "5\n"})
+    c.git(["push", "-q", "origin", f"{s5}:refs/heads/main"], cwd=wcp, rec=False)
+    ok, dt = wait_for(lambda: get_pr(c, "life", n5)["merged"], timeout=15)
+    c.note("direct_push_marks_pr_merged", bool(ok))
+    c.note("direct_push_seconds_to_detect", round(dt), strict=False)
+    c.call("GET", R + f"/pulls/{n5}", as_=A)
+    c.call("GET", R + f"/pulls/{n5}/merge", as_=A)
+
+
+@scenario("P", "pagination")
+def sc_pagination(c):
+    c.mk_repo("pages")
+    R, A = "/repos/acme/pages", "bot-scoped"
+    for i in range(1, 6):
+        time.sleep(1.1)  # distinct commit/update times: some Gitea versions order by time and tie-break randomly
+        mkpr(c, "pages", f"pg{i}", {f"pg{i}.txt": f"{i}\n"}, title=f"PR {i}", settle=0)
+    head = c.head("pages")
+    for i in range(1, 6):
+        time.sleep(1.1)  # statuses created in the same second list in a random order on some versions
+        c.call("POST", R + f"/statuses/{head}", {"state": "success", "context": f"s{i}"}, expect=201, rec=False)
+    for pg in (1, 2, 3, 0, -1):
+        c.call("GET", R + f"/pulls?state=all&limit=2&page={pg}", as_=A)
+    for lim in (0, 100, 51, 50, -1):
+        r = c.call("GET", R + f"/pulls?state=all&limit={lim}", as_=A)
+        c.note(f"pulls_limit_{lim}_count", len(r.json) if isinstance(r.json, list) else -1)
+    c.call("GET", R + "/pulls?state=all&limit=abc", as_=A)
+    c.call("GET", R + "/pulls?state=all&sort=oldest&limit=5", as_=A)
+    c.call("GET", R + "/pulls?state=all&sort=newest&limit=5", as_=A)
+    c.call("GET", R + "/pulls?state=all&sort=recentupdate&limit=5", as_=A)
+    for pg in (1, 2, 3, 4):
+        c.call("GET", R + f"/branches?limit=2&page={pg}", as_=A)
+    p = c.wc("pages")
+    c.git(["push", "-q", "origin"] + [f"{head}:refs/heads/many{i:02d}" for i in range(55)], cwd=p, rec=False)
+    for q in ("", "?limit=100", "?limit=51", "?limit=0", "?page=2", "?limit=50&page=2"):
+        r = c.call("GET", R + "/branches" + q, as_=A, rec=False)  # 55 verbose branch objects: keep counts only
+        c.note(f"branches{q or '_default'}_count", len(r.json))
+        c.note(f"branches{q or '_default'}_headers", {h: r.headers[h].replace(c.base, "<base>") for h in ("x-total-count", "link") if h in r.headers})
+    for pg in (1, 2, 3):
+        c.call("GET", R + f"/commits/{head}/statuses?limit=2&page={pg}", as_=A)
+    for pg in (1, 2):
+        c.call("GET", R + f"/statuses/{head}?limit=3&page={pg}", as_=A)
+    c.call("GET", R + f"/commits/{head}/status?limit=2&page=1", as_=A)
+    c.call("GET", R + f"/commits/{head}/status?limit=2&page=2", as_=A)
+    for i in range(1, 4):
+        c.mk_repo(f"pgrepo{i}", auto_init=False)
+    for pg in (1, 2, 3):
+        c.call("GET", f"/repos/search?q=pgrepo&limit=2&page={pg}&sort=alpha")
+
+
+@scenario("Q", "protection-bypass")
+def sc_bypass(c):
+    c.mk_repo("bypass")
+    R = "/repos/acme/bypass"
+    c.call("POST", R + "/branch_protections", {"branch_name": "main", "enable_push": False}, expect=201)
+    c.call("POST", R + "/contents/viaapi.txt", {"content": b64("x\n"), "message": "api to main", "branch": "main"}, as_="bot")
+    c.call("POST", R + "/contents/viaapi-admin.txt", {"content": b64("x\n"), "message": "api to main", "branch": "main"})
+    sha = c.call("GET", R + "/contents/README.md", rec=False).json["sha"]
+    c.call("PUT", R + "/contents/README.md", {"content": b64("changed\n"), "message": "put to main", "sha": sha,
+                                              "branch": "main"}, as_="bot")
+    c.call("POST", R + "/contents/viapr.txt", {"content": b64("x\n"), "message": "api new branch", "branch": "main",
+                                               "new_branch": "q-api"}, as_="bot")
+    n1, _ = mkpr(c, "bypass", "q1", {"q1.txt": "1\n"})
+    c.call("POST", R + f"/pulls/{n1}/merge", {"Do": "merge"}, as_="bot-scoped")
+    wait_for(lambda: get_pr(c, "bypass", n1)["merged"])
+    # force-push on an unprotected branch
+    p = c.wc("bypass", "bot")
+    c.git(["fetch", "-q", "origin"], cwd=p, rec=False)
+    c.git(["checkout", "-q", "-B", "fp1", "origin/main"], cwd=p, rec=False)
+    local_commit(c, p, {"fp.txt": "1\n"})
+    c.git(["push", "origin", "HEAD:refs/heads/fp1"], cwd=p, name="push-unprotected-branch")
+    c.git(["reset", "-q", "--hard", "origin/main"], cwd=p, rec=False)
+    local_commit(c, p, {"fp.txt": "2\n"})
+    c.git(["push", "-f", "origin", "HEAD:refs/heads/fp1"], cwd=p, name="force-push-unprotected-branch")
+    # non-ff to the protected branch, before and after enable_push
+    c.git(["reset", "-q", "--hard", "origin/main~1"], cwd=p, rec=False)
+    local_commit(c, p, {"div.txt": "d\n"})
+    c.git(["push", "origin", "HEAD:refs/heads/main"], cwd=p, name="nonff-protected-push-disabled")
+    c.call("PATCH", R + "/branch_protections/main", {"enable_push": True})
+    c.git(["push", "origin", "HEAD:refs/heads/main"], cwd=p, name="nonff-protected-push-enabled")
+    c.git(["push", "-f", "origin", "HEAD:refs/heads/main"], cwd=p, name="force-protected-push-enabled")
+    c.git(["push", "origin", ":refs/heads/main"], cwd=p, name="delete-protected-push-enabled")
+    c.call("PATCH", R + "/branch_protections/main", {"enable_push": False})
+    c.git(["push", "origin", ":refs/heads/main"], cwd=p, name="delete-protected-push-disabled")
+    c.call("DELETE", R + "/branches/main")
+    c.call("DELETE", R + "/branches/main", as_="bot")
+    c.call("GET", R + "/branches/main")
+    c.call("DELETE", R + "/branch_protections/main")
+
+
+@scenario("R", "token-scope-edges")
+def sc_token_edges(c):
+    c.call("POST", "/user/repos", {"name": "scoped2", "auto_init": True, "private": True}, as_="alice", expect=201, rec=False)
+    c.mk_token("alice", "po", ["public-only", "read:repository"], "alice-po", rec=True)
+    c.call("GET", "/repos/alice/scoped2", as_="alice-po")
+    c.call("GET", "/user", as_="alice-po")
+    c.call("GET", "/repos/search?limit=50", as_="alice-po")
+    c.call("POST", "/users/alice/tokens", {"name": "via-ro", "scopes": ["all"]}, as_="alice-ro")
+    c.call("POST", "/users/alice/tokens", {"name": "via-all-token", "scopes": ["all"]}, as_="alice")
+    c.principals["alice-tokpw"] = {"kind": "basic", "user": "alice", "secret": c.principals["alice"]["secret"]}
+    c.call("POST", "/users/alice/tokens", {"name": "via-token-as-password", "scopes": ["read:repository"]}, as_="alice-tokpw")
+    c.call("GET", "/users/alice/tokens", as_="alice-tokpw", volatile=["id", "name", "scopes"])  # order is a tie-break
+    c.principals["alice-pw-on-bot"] = {"kind": "basic", "user": "alice", "secret": c.pw["alice"]}
+    c.call("POST", "/users/bot/tokens", {"name": "stolen", "scopes": ["all"]}, as_="alice-pw-on-bot")
+    c.call("GET", "/users/bot/tokens", as_="alice-pw-on-bot")
+    c.call("POST", "/users/alice/tokens", {"name": "badscope", "scopes": ["nonsense"]}, as_="alice-basic")
+    c.call("POST", "/users/alice/tokens", {"name": "noscope"}, as_="alice-basic")
+    c.call("POST", "/users/alice/tokens", {"name": "", "scopes": ["all"]}, as_="alice-basic")
+    c.mk_token("alice", "wo", ["write:organization"], "alice-wo", rec=True)
+    c.call("POST", "/orgs", {"username": "botorg"}, as_="bot")
+    c.call("POST", "/orgs/botorg/repos", {"name": "intruder"}, as_="alice-wo")
+    c.call("POST", "/orgs/botorg/repos", {"name": "intruder"}, as_="alice")
+    c.call("POST", "/orgs/botorg/repos", {"name": "legit"}, as_="bot")
+    c.call("GET", "/orgs/botorg", as_="alice-wo")
+    c.call("GET", "/repos/alice/scoped2", as_="alice-wo")
+    c.call("GET", "/repos/alice/scoped2/branches", as_="bot-scoped")
+
+
+@scenario("S", "ref-pushes")
+def sc_refs(c):
+    c.mk_repo("refs")
+    R = "/repos/acme/refs"
+    n1, s1 = mkpr(c, "refs", "r1", {"r1.txt": "1\n"}, settle=1)
+    p = c.wc("refs", "bot")
+    c.git(["fetch", "-q", "origin"], cwd=p, rec=False)
+    c.git(["checkout", "-q", "-B", "work", "origin/main"], cwd=p, rec=False)
+    h = local_commit(c, p, {"w.txt": "w\n"})
+    c.git(["tag", "-a", "annot", "-m", "annotated", h], cwd=p, rec=False)
+    tests = [
+        ("replace-ref", f"{h}:refs/replace/{s1}"),
+        ("pull-1-head", f"{h}:refs/pull/1/head"),
+        ("pull-1-head-forced", f"+{h}:refs/pull/1/head"),
+        ("pull-999-head", f"{h}:refs/pull/999/head"),
+        ("heads-pull-1-head", f"{h}:refs/heads/pull/1/head"),
+        ("lightweight-tag", f"{h}:refs/tags/v-bot"),
+        ("annotated-tag", "refs/tags/annot:refs/tags/annot"),
+        ("notes-ref", f"{h}:refs/notes/commits"),
+        ("for-ref", f"{h}:refs/for/main"),
+        ("changes-ref", f"{h}:refs/changes/1/2"),
+        ("keep-around-ref", f"{h}:refs/keep-around/{h}"),
+        ("arbitrary-ref", f"{h}:refs/custom/thing"),
+        ("tag-delete", ":refs/tags/v-bot"),
+    ]
+    for name, spec in tests:
+        c.git(["push", "origin", spec], cwd=p, name="bot-push-" + name)
+    c.git(["push", c.git_url("refs", "carol"), f"{h}:refs/tags/v-carol"], cwd=p, name="read-collab-push-tag")
+    c.git(["ls-remote", c.git_url("refs", "admin")], name="ls-remote-all-refs")
+    c.call("GET", R + "/git/refs", as_="bot-scoped")
+    c.call("GET", R + "/tags", as_="bot-scoped")
+    c.call("GET", R + f"/pulls/{n1}", as_="bot-scoped", volatile=["mergeable"])
+
+
+@scenario("T", "merge-outcomes")
+def sc_outcomes(c):
+    c.mk_repo("outcomes")
+    R, A = "/repos/acme/outcomes", "bot-scoped"
+    wcp = c.wc("outcomes")
+
+    def getpr(n):
+        return c.call("GET", R + f"/pulls/{n}", as_=A, volatile=["mergeable"])
+
+    def try_pr(title, head):
+        """Open a PR and record what Gitea says about it and about merging it."""
+        r = c.call("POST", R + "/pulls", {"title": title, "head": head, "base": "main"}, as_=A, volatile=["mergeable"])
+        if r.status == 201:
+            n = r.json["number"]
+            time.sleep(6)
+            getpr(n)
+            c.call("POST", R + f"/pulls/{n}/merge", {"Do": "merge"}, as_=A, no_retry=True,
+                   volatile=["$text"])  # 1.26 sends a truncated JSON body here, sometimes empty
+            getpr(n)
+        return r
+
+    c.push_branch("outcomes", "orph", {"orph.txt": "o\n"}, base=None)
+    try_pr("unrelated", "orph")
+    c.push_branch("outcomes", "tid", {"t.txt": "t\n"})
+    c.git(["rm", "-q", "t.txt"], cwd=wcp, rec=False)
+    c.git(["commit", "-q", "-m", "remove t"], cwd=wcp, rec=False)
+    c.git(["push", "-q", "-f", "origin", "HEAD:refs/heads/tid"], cwd=wcp, rec=False)
+    try_pr("same tree", "tid")
+    cont = c.push_branch("outcomes", "cont", {"cont.txt": "c\n"})
+    c.git(["push", "-q", "origin", f"{cont}:refs/heads/main"], cwd=wcp, rec=False)
+    try_pr("contained", "cont")
+    n1, _ = mkpr(c, "outcomes", "ok1", {"ok1.txt": "1\n"}, more=[{"ok1b.txt": "2\n"}])
+    getpr(n1)
+    c.call("POST", R + f"/pulls/{n1}/merge", {"Do": "merge"}, as_=A)
+    wait_for(lambda: get_pr(c, "outcomes", n1)["merged"])
+    getpr(n1)
+    c.call("POST", R + f"/pulls/{n1}/merge", {"Do": "merge"}, as_=A)
+    c.push_branch("outcomes", "cbase", {"cf.txt": "base\n"})
+    c.git(["push", "-q", "origin", "origin/cbase:refs/heads/main"], cwd=wcp, rec=False)
+    na, _ = mkpr(c, "outcomes", "cfa", {"cf.txt": "a\n"})
+    nb, _ = mkpr(c, "outcomes", "cfb", {"cf.txt": "b\n"})
+    c.call("POST", R + f"/pulls/{na}/merge", {"Do": "merge"}, as_=A)
+    time.sleep(8)
+    c.note("conflicting_pr_mergeable_after_8s", get_pr(c, "outcomes", nb)["mergeable"], strict=False)
+    c.call("GET", R + f"/pulls/{nb}", as_=A)
+    c.call("POST", R + f"/pulls/{nb}/merge", {"Do": "merge"}, as_=A, no_retry=True)
+    c.call("PATCH", R + f"/pulls/{nb}", {"state": "closed"}, as_=A)
+    c.call("GET", R + f"/pulls/{nb}", as_=A)
+
+
+@scenario("U", "status-check-edges")
+def sc_check_edges(c):
+    c.mk_repo("checks")
+    R, A = "/repos/acme/checks", "bot-scoped"
+    n1, h1 = mkpr(c, "checks", "u1", {"u1.txt": "1\n"})
+    main_sha = c.head("checks")
+    c.call("POST", R + "/branch_protections", {"branch_name": "main", "enable_push": False,
+                                               "enable_status_check": True, "status_check_contexts": ["ci/test"]},
+           expect=201)
+
+    def post(sha, state, ctx):
+        c.call("POST", R + f"/statuses/{sha}", {"state": state, "context": ctx}, expect=201, rec=False)
+
+    def merge(n):
+        return c.call("POST", R + f"/pulls/{n}/merge", {"Do": "merge"}, as_=A)
+
+    post(main_sha, "success", "ci/test")
+    merge(n1)  # a status exists, but on another commit
+    for state in ("warning", "error", "failure", "pending"):
+        post(h1, state, "ci/test")
+        merge(n1)
+    post(h1, "success", "ci/other")
+    merge(n1)  # wrong context
+    post(h1, "skipped", "ci/test")
+    merge(n1)  # `skipped` on the required context
+    wait_for(lambda: get_pr(c, "checks", n1)["merged"])
+    c.call("GET", R + f"/pulls/{n1}", as_=A, volatile=["mergeable"])
+    n3, h3 = mkpr(c, "checks", "u3", {"u3.txt": "3\n"})
+    post(h3, "success", "ci/test")
+    merge(n3)
+    # status posted, then the head moves
+    n2, h2 = mkpr(c, "checks", "u2", {"u2.txt": "2\n"})
+    post(h2, "success", "ci/test")
+    h2b = c.push_branch("checks", "u2", {"u2b.txt": "b\n"}, base="origin/u2")
+    wait_for(lambda: get_pr(c, "checks", n2)["head"]["sha"] == h2b)
+    merge(n2)
+    post(h2b, "success", "ci/test")
+    merge(n2)
+    c.call("DELETE", R + "/branch_protections/main")
+
+
+@scenario("V", "smart-http-bytes")
+def sc_wire(c):
+    import gzip
+    c.mk_repo("wire")
+    head = c.head("wire")
+    for svc in ("git-upload-pack", "git-receive-pack"):
+        c.call("GET", f"/acme/wire.git/info/refs?service={svc}", as_="admin-tokbasic", api=False,
+               track=("cache-control", "expires", "pragma"), volatile=["$text"],
+               must_contain=[f"001e# service=git-upload-pack\n0000" if svc == "git-upload-pack"
+                             else "001f# service=git-receive-pack\n0000"])
+        c.call("GET", f"/acme/wire.git/info/refs?service={svc}", api=False, as_="none",
+               track=("cache-control", "expires", "pragma"), volatile=["$text"])
+    r = c.call("GET", "/acme/wire.git/info/refs?service=git-upload-pack", as_="admin-tokbasic", api=False,
+               headers={"Git-Protocol": "version=2"}, track=("cache-control",), volatile=["$text"])
+    c.note("v2_advert_first_bytes", r.data[:46].decode("latin-1").replace("\n", "\\n"))
+    def advert_notes(svc, label):
+        r = c.call("GET", f"/acme/wire.git/info/refs?service={svc}", as_="admin-tokbasic", api=False, volatile=["$text"])
+        d = r.data
+        c.note(f"{label}_preamble", d[:d.find(b"0000") + 4].decode("latin-1").replace("\n", "\\n"))
+        first = d[d.find(b"0000") + 4:]
+        caps = first.split(b"\x00", 1)[1].split(b"\n", 1)[0].decode("latin-1") if b"\x00" in first else ""
+        c.note(f"{label}_capabilities", re.sub(r"agent=git/\S+", "agent=git/<v>", caps), strict=False)
+        c.note(f"{label}_first_pkt_prefix", first[:4].decode("latin-1"), strict=False)
+
+    advert_notes("git-upload-pack", "v0_upload")
+    advert_notes("git-receive-pack", "receive")
+    c.call("GET", "/acme/wire.git/HEAD", as_="admin-tokbasic", api=False)
+    c.call("GET", "/acme/wire.git/objects/info/packs", as_="admin-tokbasic", api=False)
+    want = f"want {head} side-band-64k ofs-delta\n".encode()
+    req = b"%04x" % (len(want) + 4) + want + b"0000" + b"0009done\n"
+    ct = {"Content-Type": "application/x-git-upload-pack-request", "Accept": "application/x-git-upload-pack-result"}
+    r1 = c.call("POST", "/acme/wire.git/git-upload-pack", data=req, headers=ct, as_="admin-tokbasic", api=False,
+                binary=True, track=("cache-control",))
+    c.note("plain_upload_pack_response_head", r1.data[:8].decode("latin-1"))
+    r2 = c.call("POST", "/acme/wire.git/git-upload-pack", data=gzip.compress(req),
+                headers=dict(ct, **{"Content-Encoding": "gzip"}), as_="admin-tokbasic", api=False, binary=True,
+                track=("cache-control",))
+    c.note("gzip_upload_pack_response_head", r2.data[:8].decode("latin-1"))
+    c.call("POST", "/acme/wire.git/git-upload-pack", data=req, headers=ct, as_="none", api=False)
+    c.call("POST", "/acme/wire.git/git-receive-pack", data=b"0000", as_="none", api=False,
+           headers={"Content-Type": "application/x-git-receive-pack-request"})
+    c.call("POST", "/acme/wire.git/git-upload-pack", data=req, headers=ct, as_="dave-tokbasic", api=False)
+
+
+# @@SCENARIOS@@
+
+if __name__ == "__main__":
+    main()

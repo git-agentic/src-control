@@ -1,0 +1,288 @@
+{
+  "scenario": "D",
+  "title": "empty-repo",
+  "error": null,
+  "exchanges": [
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "blank",
+        "full_name": "acme/blank",
+        "description": "",
+        "empty": true,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "parent": null,
+        "mirror": false,
+        "size": 22,
+        "language": "",
+        "languages_url": "<base>/api/v1/repos/acme/blank/languages",
+        "html_url": "<base>/acme/blank",
+        "url": "<base>/api/v1/repos/acme/blank",
+        "link": "",
+        "ssh_url": "ssh://git@localhost:2222/acme/blank.git",
+        "clone_url": "<base>/acme/blank.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": false,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "repo_transfer": null
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/commits",
+      "auth": "admin",
+      "status": 409,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "Git Repository is empty.",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/commits?sha=main&limit=1",
+      "auth": "admin",
+      "status": 409,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "Git Repository is empty.",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/branches",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "0"
+      },
+      "body": null
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/branches/main",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": [
+          "branch does not exist [name: main]"
+        ],
+        "message": "The target couldn't be found.",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/git/refs/heads",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "The target couldn't be found.",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/git/refs",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "The target couldn't be found.",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/contents",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": []
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/contents/README.md",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": []
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/git/trees/main",
+      "auth": "admin",
+      "status": 400,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "sha not found [main]",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/git/commits/HEAD",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "HEAD",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/archive/main.zip",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "message": "unrecognized repository reference: main",
+        "url": "<base>/api/swagger"
+      }
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/tags",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8",
+        "x-total-count": "0"
+      },
+      "body": []
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/blank/pulls?state=all",
+      "auth": "admin",
+      "status": 404,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "errors": null,
+        "message": "The target couldn't be found.",
+        "url": "<base>/api/swagger"
+      }
+    }
+  ]
+}
