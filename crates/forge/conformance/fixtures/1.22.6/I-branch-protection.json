@@ -221,7 +221,7 @@
     {
       "kind": "git",
       "name": "push-protected-admin",
-      "cmd": "git push http://<admin>:<token>@<host>/acme/prot.git HEAD:refs/heads/main",
+      "cmd": "git push http://<creds>@<host>/acme/prot.git HEAD:refs/heads/main",
       "ok": false,
       "output": "remote: \nremote: Gitea: Not allowed to push to protected branch main        \nTo <base>/acme/prot.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'",
       "refusal": [

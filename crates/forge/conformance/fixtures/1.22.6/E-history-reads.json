@@ -54,7 +54,7 @@
         "html_url": "<base>/acme/hist",
         "url": "<base>/api/v1/repos/acme/hist",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/hist.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/hist.git",
         "clone_url": "<base>/acme/hist.git",
         "original_url": "",
         "website": "",
@@ -2176,7 +2176,44 @@
         "content-type": "application/octet-stream",
         "link": "<<base>/api/v1/repos/acme/hist/archive/<sha#18>.tar.gz?rev=<sha#18>>; rel=\"immutable\""
       },
-      "body_prefix_hex": "504b0304"
+      "body_prefix_hex": "504b0304",
+      "archive": [
+        {
+          "name": "hist/",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/README.md",
+          "size": 15,
+          "sha256": "f817eb30fc16a9f8613f4afcc0894740f77be6e89f88c99380305a89069a272f"
+        },
+        {
+          "name": "hist/docs/",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/docs/guide.md",
+          "size": 6,
+          "sha256": "90c390ec1de806bf945885cd0af51e90c3cd8cda0d0ff676051a56c20848c90f"
+        },
+        {
+          "name": "hist/new.txt",
+          "size": 4,
+          "sha256": "7aa7a5359173d05b63cfd682e3c38487f3cb4f7f1d60659fe59fab1505977d4c"
+        },
+        {
+          "name": "hist/src/",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/src/lib.rs",
+          "size": 13,
+          "sha256": "536e506bb90914c243a12b397b9a998f85ae2cbd9ba02dfd03a9e155ca5ca0f4"
+        }
+      ]
     },
     {
       "kind": "http",
@@ -2188,7 +2225,44 @@
         "content-type": "application/octet-stream",
         "link": "<<base>/api/v1/repos/acme/hist/archive/<sha#18>.tar.gz?rev=<sha#18>>; rel=\"immutable\""
       },
-      "body_prefix_hex": "1f8b0800"
+      "body_prefix_hex": "1f8b0800",
+      "archive": [
+        {
+          "name": "hist",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/README.md",
+          "size": 15,
+          "sha256": "f817eb30fc16a9f8613f4afcc0894740f77be6e89f88c99380305a89069a272f"
+        },
+        {
+          "name": "hist/docs",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/docs/guide.md",
+          "size": 6,
+          "sha256": "90c390ec1de806bf945885cd0af51e90c3cd8cda0d0ff676051a56c20848c90f"
+        },
+        {
+          "name": "hist/new.txt",
+          "size": 4,
+          "sha256": "7aa7a5359173d05b63cfd682e3c38487f3cb4f7f1d60659fe59fab1505977d4c"
+        },
+        {
+          "name": "hist/src",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/src/lib.rs",
+          "size": 13,
+          "sha256": "536e506bb90914c243a12b397b9a998f85ae2cbd9ba02dfd03a9e155ca5ca0f4"
+        }
+      ]
     },
     {
       "kind": "http",
@@ -2200,7 +2274,19 @@
         "content-type": "application/octet-stream",
         "link": "<<base>/api/v1/repos/acme/hist/archive/<sha#4>.tar.gz?rev=<sha#4>>; rel=\"immutable\""
       },
-      "body_prefix_hex": "504b0304"
+      "body_prefix_hex": "504b0304",
+      "archive": [
+        {
+          "name": "hist/",
+          "size": 0,
+          "sha256": null
+        },
+        {
+          "name": "hist/README.md",
+          "size": 7,
+          "sha256": "f61fd51ed8a1210100bca867c775464457dd5a21dd2368bfed695de3a2ca80e1"
+        }
+      ]
     },
     {
       "kind": "http",

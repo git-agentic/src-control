@@ -60,7 +60,7 @@
         "html_url": "<base>/acme/alpha",
         "url": "<base>/api/v1/repos/acme/alpha",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
         "clone_url": "<base>/acme/alpha.git",
         "original_url": "",
         "website": "",
@@ -196,7 +196,7 @@
         "html_url": "<base>/acme/empty",
         "url": "<base>/api/v1/repos/acme/empty",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/empty.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/empty.git",
         "clone_url": "<base>/acme/empty.git",
         "original_url": "",
         "website": "",
@@ -302,7 +302,7 @@
         "html_url": "<base>/acme/alpha",
         "url": "<base>/api/v1/repos/acme/alpha",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
         "clone_url": "<base>/acme/alpha.git",
         "original_url": "",
         "website": "",
@@ -408,7 +408,7 @@
         "html_url": "<base>/acme/empty",
         "url": "<base>/api/v1/repos/acme/empty",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/empty.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/empty.git",
         "clone_url": "<base>/acme/empty.git",
         "original_url": "",
         "website": "",
@@ -474,9 +474,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "message": "not found",
         "url": "<base>/api/swagger",
-        "errors": null
+        "errors": null,
+        "message": "not found"
       }
     },
     {
@@ -532,7 +532,7 @@
         "html_url": "<base>/acme/alpha",
         "url": "<base>/api/v1/repos/acme/alpha",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
         "clone_url": "<base>/acme/alpha.git",
         "original_url": "",
         "website": "",
@@ -641,7 +641,7 @@
         "html_url": "<base>/acme/alpha",
         "url": "<base>/api/v1/repos/acme/alpha",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
         "clone_url": "<base>/acme/alpha.git",
         "original_url": "",
         "website": "",
@@ -750,7 +750,7 @@
         "html_url": "<base>/acme/alpha",
         "url": "<base>/api/v1/repos/acme/alpha",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
         "clone_url": "<base>/acme/alpha.git",
         "original_url": "",
         "website": "",
@@ -860,7 +860,7 @@
             "html_url": "<base>/acme/alpha",
             "url": "<base>/api/v1/repos/acme/alpha",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+            "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
             "clone_url": "<base>/acme/alpha.git",
             "original_url": "",
             "website": "",
@@ -956,7 +956,7 @@
             "html_url": "<base>/acme/empty",
             "url": "<base>/api/v1/repos/acme/empty",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/acme/empty.git",
+            "ssh_url": "ssh://<creds>@localhost:2222/acme/empty.git",
             "clone_url": "<base>/acme/empty.git",
             "original_url": "",
             "website": "",
@@ -1052,7 +1052,7 @@
             "html_url": "<base>/alice/scoped",
             "url": "<base>/api/v1/repos/alice/scoped",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/alice/scoped.git",
+            "ssh_url": "ssh://<creds>@localhost:2222/alice/scoped.git",
             "clone_url": "<base>/alice/scoped.git",
             "original_url": "",
             "website": "",
@@ -1148,7 +1148,7 @@
             "html_url": "<base>/<admin>/probe",
             "url": "<base>/api/v1/repos/<admin>/probe",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/<admin>/probe.git",
+            "ssh_url": "ssh://<creds>@localhost:2222/<admin>/probe.git",
             "clone_url": "<base>/<admin>/probe.git",
             "original_url": "",
             "website": "",
@@ -1260,7 +1260,7 @@
             "html_url": "<base>/acme/alpha",
             "url": "<base>/api/v1/repos/acme/alpha",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+            "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
             "clone_url": "<base>/acme/alpha.git",
             "original_url": "",
             "website": "",
@@ -1590,7 +1590,7 @@
         "html_url": "<base>/acme/alpha",
         "url": "<base>/api/v1/repos/acme/alpha",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
         "clone_url": "<base>/acme/alpha.git",
         "original_url": "",
         "website": "",
@@ -1696,7 +1696,7 @@
         "html_url": "<base>/acme/alpha",
         "url": "<base>/api/v1/repos/acme/alpha",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
         "clone_url": "<base>/acme/alpha.git",
         "original_url": "",
         "website": "",
@@ -1802,7 +1802,7 @@
         "html_url": "<base>/acme/alpha",
         "url": "<base>/api/v1/repos/acme/alpha",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
         "clone_url": "<base>/acme/alpha.git",
         "original_url": "",
         "website": "",
@@ -1912,7 +1912,7 @@
             "html_url": "<base>/acme/alpha",
             "url": "<base>/api/v1/repos/acme/alpha",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/acme/alpha.git",
+            "ssh_url": "ssh://<creds>@localhost:2222/acme/alpha.git",
             "clone_url": "<base>/acme/alpha.git",
             "original_url": "",
             "website": "",
@@ -1989,9 +1989,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "errors": null,
         "message": "not found",
-        "url": "<base>/api/swagger"
+        "url": "<base>/api/swagger",
+        "errors": null
       }
     },
     {
@@ -2016,14 +2016,14 @@
     {
       "kind": "git",
       "name": "push-write-scoped-token",
-      "cmd": "git push http://bot:<token>@<host>/acme/alpha.git HEAD:refs/heads/bot-scoped-branch",
+      "cmd": "git push http://<creds>@<host>/acme/alpha.git HEAD:refs/heads/bot-scoped-branch",
       "ok": true,
       "output": "remote: \nremote: Create a new pull request for 'bot-scoped-branch':        \nremote:   <base>/acme/alpha/pulls/new/bot-scoped-branch        \nremote: \nremote: . Processing 1 references        \nremote: Processed 1 references in total        \nTo <base>/acme/alpha.git\n * [new branch]      HEAD -> bot-scoped-branch"
     },
     {
       "kind": "git",
       "name": "push-readonly-scope",
-      "cmd": "git push http://alice:<token>@<host>/acme/alpha.git HEAD:refs/heads/ro-scope",
+      "cmd": "git push http://<creds>@<host>/acme/alpha.git HEAD:refs/heads/ro-scope",
       "ok": false,
       "output": "remote: Forbidden\nfatal: unable to access '<base>/acme/alpha.git/': The requested URL returned error: 403",
       "refusal": [
@@ -2034,7 +2034,7 @@
     {
       "kind": "git",
       "name": "push-read-collab",
-      "cmd": "git push http://carol:<token>@<host>/acme/alpha.git HEAD:refs/heads/carol-branch",
+      "cmd": "git push http://<creds>@<host>/acme/alpha.git HEAD:refs/heads/carol-branch",
       "ok": false,
       "output": "remote: \nremote: error:        \nremote: error: User permission denied for writing.        \nremote: error:        \nTo <base>/acme/alpha.git\n ! [remote rejected] HEAD -> carol-branch (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/alpha.git'",
       "refusal": [
@@ -2046,7 +2046,7 @@
     {
       "kind": "git",
       "name": "push-no-grant",
-      "cmd": "git push http://dave:<token>@<host>/acme/alpha.git HEAD:refs/heads/dave-branch",
+      "cmd": "git push http://<creds>@<host>/acme/alpha.git HEAD:refs/heads/dave-branch",
       "ok": false,
       "output": "remote: Repository not found\nfatal: repository '<base>/acme/alpha.git/' not found",
       "refusal": [
@@ -2057,7 +2057,7 @@
     {
       "kind": "git",
       "name": "clone-no-grant",
-      "cmd": "git clone http://dave:<token>@<host>/acme/alpha.git <tmp>/dave-clone",
+      "cmd": "git clone http://<creds>@<host>/acme/alpha.git <tmp>/dave-clone",
       "ok": false,
       "output": "Cloning into '<tmp>/dave-clone'...\nremote: Repository not found\nfatal: repository '<base>/acme/alpha.git/' not found",
       "refusal": [
@@ -2068,7 +2068,7 @@
     {
       "kind": "git",
       "name": "clone-read-collab",
-      "cmd": "git clone http://carol:<token>@<host>/acme/alpha.git <tmp>/carol-clone",
+      "cmd": "git clone http://<creds>@<host>/acme/alpha.git <tmp>/carol-clone",
       "ok": true,
       "output": "Cloning into '<tmp>/carol-clone'..."
     },
@@ -2127,7 +2127,7 @@
         "html_url": "<base>/acme/doomed",
         "url": "<base>/api/v1/repos/acme/doomed",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/doomed.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/doomed.git",
         "clone_url": "<base>/acme/doomed.git",
         "original_url": "",
         "website": "",
@@ -2277,7 +2277,7 @@
         "html_url": "<base>/acme/doomed",
         "url": "<base>/api/v1/repos/acme/doomed",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/doomed.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/acme/doomed.git",
         "clone_url": "<base>/acme/doomed.git",
         "original_url": "",
         "website": "",

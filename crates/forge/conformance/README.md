@@ -29,11 +29,18 @@ actions disabled, and `OFFLINE_MODE=true`. The admin user is `siteadmin` because
 A full record run needs a **fresh** server: scenarios create `alice`, `bot`, `carol`, `dave`, the org
 `acme` and repos such as `alpha` and `hist`. The images must already be pulled.
 
+## Fixture hygiene
+
+`record` ends with a scan of the written files and fails on URL user-info (`://user:pw@`), auth headers,
+raw 40-hex ids and any known token or password. Scenario error texts, git command lines and timeouts are
+scrubbed before they are stored; git clones are cached per principal, so a collaborator's push never runs
+with the admin's credentials.
+
 ## Check any server
 
 ```sh
 python3 -I run.py check --base-url http://127.0.0.1:3000 --admin-token "$TOKEN" --fixtures fixtures/1.26.2/
-python3 -I run.py check ... --only F,G -v          # a subset, verbose (see the note below)
+python3 -I run.py check ... --only F,G -v          # report only F and G (all scenarios still run)
 python3 -I run.py diff fixtures/1.22.6 fixtures/1.26.2   # offline version diff
 python3 -I run.py show fixtures/1.26.2 --only G --body    # what was recorded
 ```
@@ -42,10 +49,9 @@ python3 -I run.py show fixtures/1.26.2 --only G --body    # what was recorded
 admin token has all scopes, the ability to create users through `POST /admin/users` and tokens
 through `POST /users/{u}/tokens` with Basic auth, and git smart HTTP on the same base URL.
 
-`--only` skips the other scenarios, but a few facts are set by earlier ones (for example scenario B makes
-`alice` a private user, which shows in the owner object of her repos), and `search` or listing calls see
-every repo created so far. Compare a subset only against fixtures recorded the same way; the reference
-run is the full ordered one.
+`--only A,F` still **runs every scenario**, in order, because later scenarios read state created by earlier
+ones (users, orgs, repos, `search` results); it only filters what is reported (check) or written (record).
+An unknown id exits with status 2. `run.py diff` exits 1 when the two fixture sets differ.
 
 ### What is compared
 
@@ -67,9 +73,12 @@ observations called notes). Exchange N of the run is compared with exchange N of
   naming a different sha fails. A recorded `errors: []` requires the actual `errors` to be empty or absent.
   A failing exchange prints both texts. `must_contain=[...]` is an additional check.
 - Text bodies (diffs, patches) are compared exactly unless the call marks `volatile=["$text"]`.
+- Archives (`binary=True` calls answered 200): the zip or tar.gz is parsed and its entries are compared by
+  normalized name, size and SHA-256 of the content, so a server that only sends the 4-byte signature fails.
 - git commands: exit status (ok or not) and, for a failing step, the refusal text: the recorded
   `remote:`/`fatal:`/`error:`/`!` lines (normalized, without hosts and ids) must all appear in the actual
   output, so a push refused for another reason fails. `must_contain` words are checked too.
+- `ls-remote --symref` steps record their normalized stdout as a strict note (`<step>_stdout`).
 - Notes: recorded observations such as `merged_within_10s`. A note marked `strict=False` (timing, or a
   race kept for the record) is stored but never compared.
 - Repo fields Gitea updates asynchronously after a push (`empty`, `default_branch`) are read with
@@ -89,21 +98,31 @@ success, ...), as well as every deliberate sc-forge difference.
 `departures.json` is a list of `{scenario, exchange, label, expect, reason}`. Pass it with
 `check --departures departures.json` (never when checking real Gitea).
 
-- `exchange`: a fixture index, a list or range `"a-b"` (then `labels` is required, one per member), or a
+- `kind` (`http`, `git`, `note`) and `match` identify the exchange: `METHOD /path/template` as recorded
+  (placeholders included), the git step name, or the note key. `match` is required for a single index.
+  `exchange` is a fixture index, a list or range `"a-b"` (then `matches` is required, one per member), or a
   git step name / note key. Indexes are identical in `fixtures/1.22.6` and `fixtures/1.26.2`.
-- `label`: required for a single index; must be contained in the fixture exchange's label.
+- The identity is enforced twice: a fixture exchange that no longer matches is a `stale departure`, and an
+  override is refused (`applied to a different exchange`) when the exchange actually produced differs,
+  including for `skip`.
 - `expect` keys: `status` (number or list), `message_contains`, `ok` (git), `value` (note; works for
   `strict=False` notes too), `fields` (pin body values by dotted path, `$len` pins an array length),
   `ignore_fields` (compare the recorded body strictly except these keys), `ignore_body` (compare only the
   checks above) and `skip` (only when unavoidable; say why in `reason`).
 - An entry with `fields` or `ignore_fields` and no `status` still compares the rest of the body strictly.
-- Load errors (the run aborts): unknown scenario id, unknown `expect` key, missing `reason` or `label`,
-  a range or list without matching `labels`, two entries for one (scenario, index), and any entry that
+- Load errors (the run aborts): unknown scenario id, unknown `expect` key, missing `reason`, `kind` or `match`,
+  a range or list without matching `matches`, two entries for one (scenario, index), and any entry that
   expects a refusal (`status` >= 400 or `ok:false`) without `message_contains`, so a departure cannot hide
   a wrong error message.
 - Run-time failures: `stale departure` (the index is out of range or the label no longer matches),
   `duplicate departure` (name-based entries that resolve to the same exchange) and `unexpected` (the actual
   answer does not meet `expect`). A met entry prints `expected difference honoured`.
+- `message_contains` is enforced on refusals (actual status >= 400); `fields` on successful bodies.
+- Scenario `expect=` assertions guard preconditions and only run in `record` mode (and for unrecorded setup
+  calls). In `check` mode a recorded exchange that answers differently is a diff, never an abort.
+- Teams (scenario B: create team, add member, carol's org permission) are tagged `team` and covered by
+  departures because sc-forge has no teams. Basic-**password** auth on an ordinary API route (scenarios B,
+  R, X) is covered by departures too: sc-forge accepts a password only on `/users/{u}/tokens*`.
 - The `message_contains` words for sc-forge's own error texts (merge style, state, rename, branch) are
   placeholders: reword them when sc-forge's messages are fixed.
 

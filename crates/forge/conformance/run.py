@@ -10,6 +10,8 @@ See README.md. Scenarios are the functions at the bottom of this file.
 """
 import argparse
 import base64
+import hashlib
+import io
 import json as J
 import os
 import re
@@ -17,11 +19,13 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 TRACKED_HEADERS = ("content-type", "x-total-count", "link", "www-authenticate", "location")
 # Every scalar in a recorded body is compared by value after normalization, except volatile ones:
@@ -215,8 +219,11 @@ def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None):
     if exp["kind"] == "note":
         if exp["key"] != act["key"]:
             d.append(("fail", f"note {exp['key']} expected, got {act['key']}"))
-        elif exp["value"] != act["value"] and exp.get("strict", True):  # strict=False notes are informational
-            d.append(("fail", f"note {exp['key']}: {exp['value']!r} expected, got {act['value']!r}"))
+        elif exp.get("strict", True):  # strict=False notes are informational
+            ev, av = exp["value"], act["value"]
+            same = eq_str(ev, av, bij, [], "") if isinstance(ev, str) and isinstance(av, str) else ev == av
+            if not same:
+                d.append(("fail", f"note {exp['key']}: {ev!r} expected, got {av!r}"))
         return d
     if exp["kind"] == "git":
         if exp["name"] != act["name"]:
@@ -275,6 +282,20 @@ def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None):
                 eq_str(exp["body_text"], act["body_text"], bij, d, "text body")
         if "body_prefix_hex" in exp and exp["body_prefix_hex"] != act.get("body_prefix_hex"):
             d.append(("fail", f"body prefix {exp['body_prefix_hex']} expected, got {act.get('body_prefix_hex')}"))
+        if "archive" in exp:
+            if not act.get("archive"):
+                d.append(("fail", f"archive entries expected, got {act.get('archive_error', 'none')}"))
+            else:
+                ea, aa = exp["archive"], act["archive"]
+                if len(ea) != len(aa):
+                    d.append(("fail", f"archive has {len(aa)} entries, {len(ea)} expected: "
+                                      f"{[x['name'] for x in aa][:6]}"))
+                for x, y in zip(ea, aa):
+                    if not eq_str(x["name"], y["name"], bij, [], ""):
+                        d.append(("fail", f"archive entry {x['name']!r} expected, got {y['name']!r}"))
+                    elif (x["size"], x["sha256"]) != (y["size"], y["sha256"]):
+                        d.append(("fail", f"archive entry {x['name']!r}: size/hash {x['size']}/{(x['sha256'] or '')[:8]} "
+                                          f"expected, got {y['size']}/{(y['sha256'] or '')[:8]}"))
     text = msg_text(act).lower()
     for w in exp.get("must_contain", []):
         if w.lower() not in text:
@@ -300,6 +321,13 @@ def dep_indexes(spec, expected):
 EXPECT_KEYS = {"status", "message_contains", "ok", "value", "fields", "ignore_fields", "ignore_body", "skip"}
 
 
+def ex_ident(ex):
+    """What an exchange is: `METHOD /path/template`, the git step name, or the note key."""
+    if ex["kind"] == "http":
+        return f"{ex['method']} {ex['path']}"
+    return ex["name"] if ex["kind"] == "git" else ex["key"]
+
+
 def load_departures(path, scenario_ids):
     """Read and validate departures.json; any problem is a load error (SystemExit)."""
     deps = J.load(open(path))
@@ -319,6 +347,8 @@ def load_departures(path, scenario_ids):
             errs.append(f"{where}: unknown expect keys {sorted(set(e) - EXPECT_KEYS)}")
         if not d.get("reason"):
             errs.append(f"{where}: reason is required")
+        if d.get("kind") not in ("http", "git", "note"):
+            errs.append(f"{where}: kind must be http, git or note")
         sts = e.get("status")
         sts = sts if isinstance(sts, list) else ([sts] if sts is not None else [])
         if (any(x >= 400 for x in sts) or e.get("ok") is False) and not e.get("message_contains"):
@@ -327,14 +357,19 @@ def load_departures(path, scenario_ids):
         idx = None
         if isinstance(spec, int) and not isinstance(spec, bool):
             idx = [spec]
-            if not d.get("label"):
-                errs.append(f"{where}: a single-index entry needs a label")
+            m = d.get("match")
+            if not m:
+                errs.append(f"{where}: a single-index entry needs `match` (METHOD /path, git step name or note key)")
+            elif d.get("kind") == "http" and not re.match(r"^[A-Z]+ /", m):
+                errs.append(f"{where}: http `match` must look like 'METHOD /path'")
         elif isinstance(spec, (list, str)) and (isinstance(spec, list) or re.fullmatch(r"\d+-\d+", spec)):
             idx = dep_indexes(spec, [])
-            if len(d.get("labels") or []) != len(idx):
-                errs.append(f"{where}: a range or list needs `labels` with one entry per exchange ({len(idx)})")
+            if len(d.get("matches") or []) != len(idx):
+                errs.append(f"{where}: a range or list needs `matches` with one entry per exchange ({len(idx)})")
         elif not isinstance(spec, str):
             errs.append(f"{where}: bad exchange {spec!r}")
+        elif d.get("kind") == "http":
+            errs.append(f"{where}: a name can only select a git step or a note")
         for i in idx or []:
             if (d["scenario"], i) in seen:
                 errs.append(f"{where}: duplicate entry for {d['scenario']}#{i} (also {seen[(d['scenario'], i)]})")
@@ -355,13 +390,17 @@ def dget(b, path):
     return b
 
 
-def apply_override(exp, act, ov, bij):
+def apply_override(exp, act, ov, bij, match=None):
     """Check `act` against a departure instead of the recorded exchange.
 
-    Targeted checks (status, message_contains, ok, value, fields) always run. The recorded body is still compared
-    strictly when the entry only names `ignore_fields`/`fields` (those keys are left out), so a departure never
-    widens more than it says."""
+    The exchange must be the one the entry names (kind and `match`), skip included. Targeted checks (status,
+    message_contains, ok, value, fields) run next; message_contains applies to refusals (status >= 400, or any
+    git output) and `fields` to successful bodies. The recorded body is still compared strictly when the entry
+    only names `ignore_fields`/`fields`, so a departure never widens more than it says."""
     e, why, d = ov["expect"], ov.get("reason", ""), []
+    match = match if match is not None else ov.get("match")
+    if act["kind"] != ov["kind"] or (match and not eq_str(match, ex_ident(act), bij, [], "")):
+        return [("fail", f"departure for {ov['kind']} {match!r} applied to a different exchange: {ex_ident(act)!r}")]
     if e.get("skip"):
         return [("honoured", f"skipped: {why}")]
     if act["kind"] == "note":
@@ -380,14 +419,16 @@ def apply_override(exp, act, ov, bij):
         if sts is not None and act["status"] not in sts:
             d.append(("fail", f"unexpected: status {sts} expected, got {act['status']}: {msg_text(act)[:160]!r}"))
         txt = msg_text(act).lower()
-        for w in e.get("message_contains", []):
-            if w.lower() not in txt:
-                d.append(("fail", f"unexpected: message lacks {w!r}: {txt[:160]!r}"))
-        for k, v in (e.get("fields") or {}).items():
-            body = act.get("body")
-            got = len(body) if k == "$len" and isinstance(body, list) else dget(body, k)
-            if got != v:
-                d.append(("fail", f"unexpected: {k} {v!r} expected, got {got!r}"))
+        if act["status"] >= 400:
+            for w in e.get("message_contains", []):
+                if w.lower() not in txt:
+                    d.append(("fail", f"unexpected: message lacks {w!r}: {txt[:160]!r}"))
+        if act["status"] < 400:
+            for k, v in (e.get("fields") or {}).items():
+                body = act.get("body")
+                got = len(body) if k == "$len" and isinstance(body, list) else dget(body, k)
+                if got != v:
+                    d.append(("fail", f"unexpected: {k} {v!r} expected, got {got!r}"))
         pins = list((e.get("fields") or {}))
         if not e.get("ignore_body") and sts is None and (e.get("ignore_fields") or pins):
             skip = list(e.get("ignore_fields") or []) + [k for k in pins if k != "$len"]
@@ -454,7 +495,7 @@ class Ctx:
         return re.sub(r"\b%s\b" % re.escape(self.admin_user), "<admin>", s)
 
     def ns(self, s):
-        s = self.scrub(s)
+        s = re.sub(r"(://)[^/@\s\"']+@", r"\1<creds>@", self.scrub(s))
         # pkt-line adverts glue a 4-hex length in front of the id ("0146<sha> HEAD"), so \b misses it
         s = re.sub(r"[0-9a-f]{40}(?= (?:HEAD|refs/|capabilities))", lambda m: self.sha_ph(m.group(0)), s)
         s = SHA_RE.sub(lambda m: self.sha_ph(m.group(0)), s)
@@ -521,7 +562,7 @@ class Ctx:
     # -- HTTP
     def call(self, method, path, json=None, as_="admin", expect=None, must_contain=None,
              volatile=None, headers=None, data=None, api=True, binary=False, rec=True, track=(),
-             retry_while=None, retry_s=90, no_retry=False, settle_keys=None):
+             retry_while=None, retry_s=90, no_retry=False, settle_keys=None, tags=()):
         full = ("/api/v1" + path) if api else path
         hdrs = {"Accept": "application/json", "User-Agent": "sc-forge-conformance"}
         p = self.principals[as_]
@@ -589,11 +630,15 @@ class Ctx:
                 ex["body"] = self.nj(r.json)
             elif binary:
                 ex["body_prefix_hex"] = r.data[:4].hex()
+                if r.status == 200:
+                    ex.update(self.archive_entries(r.data))
             else:
                 ex["body_text"] = self.ns(r.text[:3000]).replace("\x00", "\\0")
             for k, v in (("must_contain", must_contain), ("volatile", volatile)):
                 if v:
                     ex[k] = list(v)
+            if tags:
+                ex["tags"] = list(tags)
             if unsettled:
                 ex["unsettled"] = True
             if first_differs:
@@ -601,11 +646,30 @@ class Ctx:
             self.push_ex(ex)
             if unsettled and self.mode == "record":
                 raise SetupError(f"{method} {full}: value did not settle within 25 s")
-        if expect is not None:
+        # `expect` guards the scenario's own preconditions. A recorded exchange is the thing under test, so in
+        # check mode a different answer is a diff to report, never an abort.
+        if expect is not None and (self.mode == "record" or not rec):
             ok = expect if isinstance(expect, (list, tuple, set)) else [expect]
             if r.status not in ok:
                 raise SetupError(f"{method} {full}: expected {sorted(ok)}, got {r.status}: {r.text[:300]}")
         return r
+
+    def archive_entries(self, data):
+        """Normalized entry names, sizes and content hashes of a zip or tar.gz, so a bare signature fails."""
+        try:
+            if data[:2] == b"PK":
+                z = zipfile.ZipFile(io.BytesIO(data))
+                ents = [(i.filename, 0 if i.is_dir() else i.file_size, None if i.is_dir() else hashlib.sha256(z.read(i)).hexdigest())
+                        for i in z.infolist()]
+            elif data[:2] == b"\x1f\x8b":
+                t = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+                ents = [(m.name, 0 if m.isdir() else m.size, None if m.isdir() else hashlib.sha256(t.extractfile(m).read()).hexdigest())
+                        for m in t.getmembers() if m.isfile() or m.isdir()]
+            else:
+                return {"archive_error": "not a zip or tar.gz"}
+        except Exception as e:  # noqa: BLE001
+            return {"archive_error": f"unreadable archive: {type(e).__name__}"}
+        return {"archive": sorted(({"name": self.ns(n), "size": sz, "sha256": h} for n, sz, h in ents), key=lambda x: x["name"])}
 
     # -- git
     def git_url(self, repo, who="admin", user=None, secret=None, org="acme"):
@@ -616,15 +680,19 @@ class Ctx:
         return f"{host[0]}://{auth}{host[1]}/{org}/{repo}.git"
 
     def git(self, args, cwd=None, name=None, rec=True, ok=None, must_contain=None, extra_header=None,
-            env_extra=None):
+            env_extra=None, note_stdout=False):
         pre = ["-c", "credential.helper=", "-c", "advice.detachedHead=false", "-c", "init.defaultBranch=main",
                "-c", "user.name=Conf", "-c", "user.email=conf@example.invalid", "-c", "commit.gpgsign=false"]
         if extra_header:
             pre += ["-c", "http.extraHeader=" + extra_header[1]]
+            self.secrets.update({extra_header[1], extra_header[1].split()[-1]})
         env = {"PATH": os.environ.get("PATH", ""), "HOME": self.tmp + "/home", "GIT_CONFIG_NOSYSTEM": "1",
                "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
         env.update(env_extra or {})
-        p = subprocess.run(["git"] + pre + args, cwd=cwd, env=env, capture_output=True, timeout=180)
+        try:
+            p = subprocess.run(["git"] + pre + args, cwd=cwd, env=env, capture_output=True, timeout=180)
+        except subprocess.TimeoutExpired:  # str(e) would carry the command line with credentials
+            raise SetupError(f"git {' '.join(self.ns(a) for a in args)}: timed out after 180 s") from None
         out = (p.stdout + p.stderr).decode("utf-8", "replace")
         if rec:
             cmd = "git " + (f"-c http.extraHeader=<{extra_header[0]}> " if extra_header else "") + " ".join(args)
@@ -635,13 +703,15 @@ class Ctx:
             if p.returncode != 0:
                 ex["refusal"] = refusal_lines(ex["output"])
             self.push_ex(ex)
+            if note_stdout:
+                self.note(f"{ex['name']}_stdout", self.ns(p.stdout.decode("utf-8", "replace").strip()))
         want = ok if ok is not None else (None if rec else True)
         if want is not None and (p.returncode == 0) != want:
             raise SetupError(f"git {' '.join(self.ns(a) for a in args)}: exit {p.returncode}: {self.ns(out)[-400:]}")
         return p.returncode == 0, out.strip()
 
     def wc(self, repo, who="admin", org="acme"):
-        path = f"{self.tmp}/wc-{org}-{repo}"
+        path = f"{self.tmp}/wc-{org}-{repo}-{who}"  # one clone per principal: `origin` embeds that principal's token
         if not os.path.isdir(path):
             self.git(["clone", self.git_url(repo, who, org=org), path], rec=False)
         return path
@@ -744,16 +814,38 @@ def scenario(sid, slug, base=True):
     return deco
 
 
+SECRET_PATTERNS = (re.compile(r"://[^/@\s\"']+:[^/@\s\"']*@"), re.compile(r"Authorization: ?(?:Basic|Bearer|token) +[A-Za-z0-9+/=_.-]{6,}", re.I),
+                   re.compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])"))
+
+
+def scan_fixtures(out, secret_values):
+    """Fail on anything credential-shaped in the recorded files: URL userinfo, auth headers, raw 40-hex ids, known secrets."""
+    hits = []
+    for f in sorted(os.listdir(out)):
+        if not f.endswith(".json"):
+            continue
+        text = open(os.path.join(out, f)).read()
+        for pat in SECRET_PATTERNS:
+            m = pat.search(text)
+            if m:
+                hits.append(f"{f}: matches {pat.pattern[:40]!r}: {m.group(0)[:30]!r}")
+        for sec in secret_values:
+            if len(sec) >= 8 and sec in text:
+                hits.append(f"{f}: contains a secret value ({sec[:3]}...)")
+    return hits
+
+
 def run_all(c, only, out=None, fixtures=None, departures=()):
+    """Run every scenario in order (they read earlier state); `only` filters what is reported/written."""
     summary = []
     for sid, slug, needs_base, fn in SCENARIOS:
-        if only and sid not in only:
-            continue
+        selected = not only or sid in only
         fname = f"{sid}-{slug}.json"
         c.ex, c.cursor, c.diffs = [], 0, []
         c.reset_scenario()
-        c.expected, skip = [], None
-        if c.mode == "check":
+        c.expected, skip, stale = [], None, []
+        c.overrides = {}
+        if c.mode == "check" and selected:
             fp = os.path.join(fixtures, fname)
             if not os.path.exists(fp):
                 summary.append((sid, slug, "FAIL", ["no fixture " + fname]))
@@ -761,7 +853,6 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
             fx = J.load(open(fp))
             c.expected = fx["exchanges"]
             skip = fx.get("error")
-            c.overrides, stale = {}, []
             for dep in departures:
                 if dep["scenario"] != sid:
                     continue
@@ -769,18 +860,19 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
                 bad = [i for i in idx if not 0 <= i < len(c.expected)]
                 if not idx or bad:
                     stale.append(f"stale departure {dep['exchange']!r}: no such exchange in {fname} ({dep.get('reason', '')})")
-                labels = dep.get("labels") or ([dep["label"]] if dep.get("label") and len(idx) == 1 else [None] * len(idx))
+                matches = dep.get("matches") or ([dep["match"]] if dep.get("match") and len(idx) == 1 else [None] * len(idx))
                 for k, i in enumerate(idx):
                     if i in bad:
                         continue
-                    if labels[k] and labels[k] not in ex_label(c.expected[i]):
-                        stale.append(f"stale departure #{i}: fixture exchange is {ex_label(c.expected[i])!r}, "
-                                     f"departure says {labels[k]!r}")
+                    got = ex_ident(c.expected[i])
+                    if (matches[k] and matches[k] != got) or c.expected[i]["kind"] != dep["kind"]:
+                        stale.append(f"stale departure #{i}: fixture exchange is {c.expected[i]['kind']} {got!r}, "
+                                     f"departure says {dep['kind']} {matches[k]!r}")
                         continue
                     if i in c.overrides:
                         stale.append(f"duplicate departure for #{i} ({dep.get('reason', '')})")
                         continue
-                    c.overrides[i] = dep
+                    c.overrides[i] = dict(dep, match=matches[k] or got)
         t0 = time.time()
         err = None
         try:
@@ -790,6 +882,8 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
         except Exception as e:  # noqa: BLE001 - scenario failures are data
             err = c.ns(f"{type(e).__name__}: {e}")[:1500]
         dt = time.time() - t0
+        if not selected:
+            continue
         if c.mode == "record":
             os.makedirs(out, exist_ok=True)
             with open(os.path.join(out, fname), "w") as f:
@@ -828,12 +922,17 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
 
 
 def cmd_run(a):
-    deps = load_departures(a.departures, {x[0] for x in SCENARIOS}) if getattr(a, "departures", None) else []
+    ids = {x[0] for x in SCENARIOS}
+    only = set(a.only.split(",")) if a.only else None
+    if only and only - ids:
+        print(f"unknown scenario id(s) {sorted(only - ids)}; known: {sorted(ids)}", file=sys.stderr)
+        return 2
+    deps = load_departures(a.departures, ids) if getattr(a, "departures", None) else []
     c = Ctx(a.base_url, a.admin_token, a.cmd)
     c.strict_first_read = getattr(a, "strict_first_read", False)
     c.verbose = a.verbose
-    only = set(a.only.split(",")) if a.only else None
     t0 = time.time()
+    leaks = []
     try:
         if a.cmd == "record":
             ver = c.call("GET", "/version", rec=False).json
@@ -842,6 +941,7 @@ def cmd_run(a):
             with open(os.path.join(a.out, "meta.json"), "w") as f:
                 J.dump({"server_version": ver, "scenarios": sorted(x for x in os.listdir(a.out) if x.endswith(".json") and x != "meta.json")}, f, indent=2)
                 f.write("\n")
+            leaks = scan_fixtures(a.out, c.secrets)
         else:
             summary = run_all(c, only, fixtures=a.fixtures, departures=deps)
     finally:
@@ -855,8 +955,10 @@ def cmd_run(a):
         for ln in lines:
             print(ln if a.cmd == "check" else f"  {ln}")
         bad += st in ("FAIL", "ERROR")
-    print(f"\n{len(summary) - bad}/{len(summary)} scenarios ok in {time.time() - t0:.0f}s")
-    return 1 if bad else 0
+    for h in leaks:
+        print(f"LEAK {h}")
+    print(f"\n{len(summary) - bad}/{len(summary)} scenarios ok in {time.time() - t0:.0f}s" + (f"; {len(leaks)} credential-shaped value(s) in the fixtures" if leaks else ""))
+    return 1 if bad or leaks else 0
 
 
 def load_dir(d):
@@ -872,6 +974,7 @@ def cmd_diff(a):
     for f in sorted(set(A) | set(B)):
         if f not in A or f not in B:
             print(f"{f}: only in {'A' if f in A else 'B'}")
+            bad += 1
             continue
         ea, eb = A[f]["exchanges"], B[f]["exchanges"]
         print(f"{f}: {len(ea)} vs {len(eb)} exchanges" + (f"  (errors: A={A[f]['error']!r} B={B[f]['error']!r})" if A[f]["error"] or B[f]["error"] else ""))
@@ -887,7 +990,8 @@ def cmd_diff(a):
                 print(f"  #{i:02d} {ex_label(x)}")
                 for lv, t in ds:
                     print(f"       {lv}: {t}")
-    return 0
+    print(f"{bad} differing exchange(s)")
+    return 1 if bad or {f for f in A} ^ {f for f in B} else 0
 
 
 def cmd_show(a):
@@ -924,7 +1028,7 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--base-url", required=True)
         p.add_argument("--admin-token", required=True)
-        p.add_argument("--only", help="comma-separated scenario ids, e.g. A,F")
+        p.add_argument("--only", help="comma-separated scenario ids, e.g. A,F: all scenarios still run, only these are reported")
         p.add_argument("-v", "--verbose", action="store_true")
         if name == "record":
             p.add_argument("--out", required=True)
@@ -990,10 +1094,12 @@ def sc_users(c):
     c.call("GET", "/orgs/nobody-org")
     c.call("GET", f"/users/{c.admin_user}/orgs/acme/permissions")
     c.call("GET", "/users/alice/orgs/acme/permissions")
+    # teams: a non-goal for sc-forge, so these exchanges are tagged and tolerate a server without them
     team = c.call("POST", "/orgs/acme/teams", {"name": "devs", "permission": "read", "includes_all_repositories": False,
-                                               "units": ["repo.code", "repo.pulls"]}, expect=201, rec=False).json
-    c.call("PUT", f"/teams/{team['id']}/members/carol", expect=204, rec=False)
-    c.call("GET", "/users/carol/orgs/acme/permissions")
+                                               "units": ["repo.code", "repo.pulls"]}, expect=201, tags=["team"])
+    tid = team.json.get("id", 0) if team.is_json and isinstance(team.json, dict) else 0
+    c.call("PUT", f"/teams/{tid}/members/carol", expect=204, tags=["team"])
+    c.call("GET", "/users/carol/orgs/acme/permissions", tags=["team"])
     # tokens
     c.mk_token("alice", "ci", ["read:repository"], "alice-ro", rec=True)
     r = c.mk_token("alice", "tmp", ["read:repository", "write:repository"], "alice-tmp", rec=True)
@@ -1679,7 +1785,7 @@ def sc_default_branch(c):
     c.call("PATCH", R, {"default_branch": "nope"})
     c.call("PATCH", R, {"default_branch": "dev"})
     c.call("GET", R)
-    c.git(["ls-remote", "--symref", c.git_url("dflt"), "HEAD"], name="ls-remote-symref-after-change")
+    c.git(["ls-remote", "--symref", c.git_url("dflt"), "HEAD"], name="ls-remote-symref-after-change", note_stdout=True)
     c.call("GET", R + "/branches")
     c.call("GET", R + "/contents")
     d = c.tmp + "/ndflt"
@@ -1693,7 +1799,7 @@ def sc_default_branch(c):
     repo_state(c, "/repos/acme/fresh1", "fresh1_before_push")
     c.push_branch("fresh1", "trunk", {"t.txt": "t\n"}, base=None)
     repo_state(c, "/repos/acme/fresh1", "fresh1_after_trunk")
-    c.git(["ls-remote", "--symref", c.git_url("fresh1"), "HEAD"], name="ls-remote-symref-trunk-first")
+    c.git(["ls-remote", "--symref", c.git_url("fresh1"), "HEAD"], name="ls-remote-symref-trunk-first", note_stdout=True)
     c.call("GET", "/repos/acme/fresh1/branches")
     c.mk_repo("fresh2", auto_init=False)
     c.push_branch("fresh2", "main", {"t.txt": "t\n"}, base=None)
@@ -1702,10 +1808,10 @@ def sc_default_branch(c):
     repo_state(c, "/repos/acme/fresh3", "fresh3_before_push")
     c.push_branch("fresh3", "main", {"t.txt": "t\n"}, base=None)
     repo_state(c, "/repos/acme/fresh3", "fresh3_after_main")
-    c.git(["ls-remote", "--symref", c.git_url("fresh3"), "HEAD"], name="ls-remote-symref-main-pushed-first")
+    c.git(["ls-remote", "--symref", c.git_url("fresh3"), "HEAD"], name="ls-remote-symref-main-pushed-first", note_stdout=True)
     c.push_branch("fresh3", "develop", {"u.txt": "u\n"}, base="origin/main")
     repo_state(c, "/repos/acme/fresh3", "fresh3_after_develop")
-    c.git(["ls-remote", "--symref", c.git_url("fresh3"), "HEAD"], name="ls-remote-symref-develop-pushed-second")
+    c.git(["ls-remote", "--symref", c.git_url("fresh3"), "HEAD"], name="ls-remote-symref-develop-pushed-second", note_stdout=True)
 
 
 @scenario("O", "pr-head-lifecycle")
@@ -2103,7 +2209,7 @@ def sc_auth_forms(c):
     c.call("GET", "/user", as_="siteowner-pw")
     r = c.call("POST", "/users/bot/tokens", {"name": "by-site-admin-password", "scopes": ["read:repository"]},
                as_="siteowner-pw")
-    c.call("GET", "/users/bot/tokens", as_="siteowner-pw")
+    c.call("GET", "/users/bot/tokens", as_="siteowner-pw", volatile=["id", "name", "scopes"])  # same-second tie order
     c.call("POST", "/users/bot/tokens", {"name": "by-admin-token", "scopes": ["read:repository"]}, as_="admin")
     # a read-only token used as the Basic password mints what?
     c.principals["alice-ro-as-password"] = {"kind": "basic", "user": "alice", "secret": c.principals["alice-ro"]["secret"]}

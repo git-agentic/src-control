@@ -192,7 +192,8 @@
         "content-type": "application/x-git-upload-pack-result",
         "cache-control": "max-age=0, private, must-revalidate, no-transform"
       },
-      "body_prefix_hex": "30303038"
+      "body_prefix_hex": "30303038",
+      "archive_error": "not a zip or tar.gz"
     },
     {
       "kind": "note",
@@ -210,7 +211,8 @@
         "content-type": "application/x-git-upload-pack-result",
         "cache-control": "max-age=0, private, must-revalidate, no-transform"
       },
-      "body_prefix_hex": "30303038"
+      "body_prefix_hex": "30303038",
+      "archive_error": "not a zip or tar.gz"
     },
     {
       "kind": "note",

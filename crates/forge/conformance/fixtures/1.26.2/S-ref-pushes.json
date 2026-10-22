@@ -115,7 +115,7 @@
     {
       "kind": "git",
       "name": "read-collab-push-tag",
-      "cmd": "git push http://carol:<token>@<host>/acme/refs.git <sha#1>:refs/tags/v-carol",
+      "cmd": "git push http://<creds>@<host>/acme/refs.git <sha#1>:refs/tags/v-carol",
       "ok": false,
       "output": "remote: \nremote: error:        \nremote: error: User permission denied for writing.        \nremote: error:        \nTo <base>/acme/refs.git\n ! [remote rejected] <sha#1> -> v-carol (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/refs.git'",
       "refusal": [
@@ -127,7 +127,7 @@
     {
       "kind": "git",
       "name": "ls-remote-all-refs",
-      "cmd": "git ls-remote http://<admin>:<token>@<host>/acme/refs.git",
+      "cmd": "git ls-remote http://<creds>@<host>/acme/refs.git",
       "ok": true,
       "output": "<sha#3>\tHEAD\n<sha#1>\trefs/changes/1/2\n<sha#1>\trefs/custom/thing\n<sha#3>\trefs/heads/main\n<sha#1>\trefs/heads/pull/1/head\n<sha#2>\trefs/heads/r1\n<sha#1>\trefs/keep-around/<sha#1>\n<sha#1>\trefs/notes/commits\n<sha#2>\trefs/pull/1/head\n<sha#1>\trefs/replace/<sha#2>\n<sha#4>\trefs/tags/annot\n<sha#1>\trefs/tags/annot^{}"
     },
@@ -367,7 +367,7 @@
             "html_url": "<base>/acme/refs",
             "url": "<base>/api/v1/repos/acme/refs",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/acme/refs.git",
+            "ssh_url": "ssh://<creds>@localhost:2222/acme/refs.git",
             "clone_url": "<base>/acme/refs.git",
             "original_url": "",
             "website": "",
@@ -469,7 +469,7 @@
             "html_url": "<base>/acme/refs",
             "url": "<base>/api/v1/repos/acme/refs",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/acme/refs.git",
+            "ssh_url": "ssh://<creds>@localhost:2222/acme/refs.git",
             "clone_url": "<base>/acme/refs.git",
             "original_url": "",
             "website": "",

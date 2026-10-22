@@ -341,6 +341,69 @@
     },
     {
       "kind": "http",
+      "method": "POST",
+      "path": "/api/v1/orgs/acme/teams",
+      "auth": "admin",
+      "status": 201,
+      "request": {
+        "name": "devs",
+        "permission": "read",
+        "includes_all_repositories": false,
+        "units": [
+          "repo.code",
+          "repo.pulls"
+        ]
+      },
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "name": "devs",
+        "description": "",
+        "organization": {
+          "id": "<id:organization.id#1>",
+          "name": "acme",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "description": "",
+          "website": "",
+          "location": "",
+          "visibility": "private",
+          "repo_admin_change_team_access": false,
+          "username": "acme"
+        },
+        "includes_all_repositories": false,
+        "permission": "none",
+        "units": [
+          "repo.code",
+          "repo.pulls"
+        ],
+        "units_map": {
+          "repo.code": "read",
+          "repo.pulls": "read"
+        },
+        "can_create_org_repo": false
+      },
+      "tags": [
+        "team"
+      ]
+    },
+    {
+      "kind": "http",
+      "method": "PUT",
+      "path": "/api/v1/teams/<id:path:teams#1>/members/carol",
+      "auth": "admin",
+      "status": 204,
+      "headers": {},
+      "body_text": "",
+      "tags": [
+        "team"
+      ]
+    },
+    {
+      "kind": "http",
       "method": "GET",
       "path": "/api/v1/users/carol/orgs/acme/permissions",
       "auth": "admin",
@@ -354,7 +417,10 @@
         "can_write": false,
         "can_read": false,
         "can_create_repository": false
-      }
+      },
+      "tags": [
+        "team"
+      ]
     },
     {
       "kind": "http",
@@ -621,7 +687,7 @@
         "html_url": "<base>/alice/scoped",
         "url": "<base>/api/v1/repos/alice/scoped",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/alice/scoped.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/alice/scoped.git",
         "clone_url": "<base>/alice/scoped.git",
         "original_url": "",
         "website": "",
@@ -858,9 +924,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
+        "message": "not found",
         "url": "<base>/api/swagger",
-        "errors": null,
-        "message": "not found"
+        "errors": null
       }
     }
   ]

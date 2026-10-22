@@ -2,7 +2,8 @@
  {
   "scenario": "G",
   "exchange": 39,
-  "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#8>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#8>/merge",
   "expect": {
    "status": 409,
    "message_contains": [
@@ -14,7 +15,8 @@
  {
   "scenario": "T",
   "exchange": 20,
-  "label": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#6>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#6>/merge",
   "expect": {
    "status": 409,
    "message_contains": [
@@ -26,7 +28,8 @@
  {
   "scenario": "G",
   "exchange": 43,
-  "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#10>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#10>/merge",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -38,7 +41,8 @@
  {
   "scenario": "G",
   "exchange": 44,
-  "label": "squash_merged_immediately_after_merge_call",
+  "kind": "note",
+  "match": "squash_merged_immediately_after_merge_call",
   "expect": {
    "value": false
   },
@@ -47,7 +51,8 @@
  {
   "scenario": "G",
   "exchange": 45,
-  "label": "squash_merged_within_10s",
+  "kind": "note",
+  "match": "squash_merged_within_10s",
   "expect": {
    "value": false
   },
@@ -56,7 +61,8 @@
  {
   "scenario": "G",
   "exchange": 47,
-  "label": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#10>",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#10>",
   "expect": {
    "ignore_body": true,
    "fields": {
@@ -69,7 +75,8 @@
  {
   "scenario": "G",
   "exchange": 48,
-  "label": "squash_parent_count",
+  "kind": "note",
+  "match": "squash_parent_count",
   "expect": {
    "value": -1
   },
@@ -78,7 +85,8 @@
  {
   "scenario": "G",
   "exchange": 49,
-  "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#11>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#11>/merge",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -90,7 +98,8 @@
  {
   "scenario": "G",
   "exchange": 50,
-  "label": "rebase_merged_immediately_after_merge_call",
+  "kind": "note",
+  "match": "rebase_merged_immediately_after_merge_call",
   "expect": {
    "value": false
   },
@@ -99,7 +108,8 @@
  {
   "scenario": "G",
   "exchange": 51,
-  "label": "rebase_merged_within_10s",
+  "kind": "note",
+  "match": "rebase_merged_within_10s",
   "expect": {
    "value": false
   },
@@ -108,7 +118,8 @@
  {
   "scenario": "G",
   "exchange": 53,
-  "label": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#11>",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#11>",
   "expect": {
    "ignore_body": true,
    "fields": {
@@ -121,7 +132,8 @@
  {
   "scenario": "G",
   "exchange": 54,
-  "label": "rebase_parent_count",
+  "kind": "note",
+  "match": "rebase_parent_count",
   "expect": {
    "value": -1
   },
@@ -130,7 +142,8 @@
  {
   "scenario": "G",
   "exchange": 55,
-  "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#12>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#12>/merge",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -142,7 +155,8 @@
  {
   "scenario": "G",
   "exchange": 56,
-  "label": "rebase_merge_merged_immediately_after_merge_call",
+  "kind": "note",
+  "match": "rebase_merge_merged_immediately_after_merge_call",
   "expect": {
    "value": false
   },
@@ -151,7 +165,8 @@
  {
   "scenario": "G",
   "exchange": 57,
-  "label": "rebase_merge_merged_within_10s",
+  "kind": "note",
+  "match": "rebase_merge_merged_within_10s",
   "expect": {
    "value": false
   },
@@ -160,7 +175,8 @@
  {
   "scenario": "G",
   "exchange": 59,
-  "label": "rebase_merge_parent_count",
+  "kind": "note",
+  "match": "rebase_merge_parent_count",
   "expect": {
    "value": -1
   },
@@ -169,7 +185,8 @@
  {
   "scenario": "G",
   "exchange": 60,
-  "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#13>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#13>/merge",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -181,7 +198,8 @@
  {
   "scenario": "G",
   "exchange": 61,
-  "label": "ff_only_merged_immediately_after_merge_call",
+  "kind": "note",
+  "match": "ff_only_merged_immediately_after_merge_call",
   "expect": {
    "value": false
   },
@@ -190,7 +208,8 @@
  {
   "scenario": "G",
   "exchange": 62,
-  "label": "ff_only_merged_within_10s",
+  "kind": "note",
+  "match": "ff_only_merged_within_10s",
   "expect": {
    "value": false
   },
@@ -199,7 +218,8 @@
  {
   "scenario": "G",
   "exchange": 64,
-  "label": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#13>",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#13>",
   "expect": {
    "ignore_body": true,
    "fields": {
@@ -212,7 +232,8 @@
  {
   "scenario": "G",
   "exchange": 65,
-  "label": "ff_only_parent_count",
+  "kind": "note",
+  "match": "ff_only_parent_count",
   "expect": {
    "value": -1
   },
@@ -221,7 +242,8 @@
  {
   "scenario": "G",
   "exchange": 66,
-  "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#14>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#14>/merge",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -233,7 +255,8 @@
  {
   "scenario": "G",
   "exchange": 3,
-  "label": "merge_merged_immediately_after_merge_call",
+  "kind": "note",
+  "match": "merge_merged_immediately_after_merge_call",
   "expect": {
    "value": true
   },
@@ -242,7 +265,8 @@
  {
   "scenario": "G",
   "exchange": 13,
-  "label": "immediate_merge_status",
+  "kind": "note",
+  "match": "immediate_merge_status",
   "expect": {
    "value": 200
   },
@@ -251,7 +275,8 @@
  {
   "scenario": "G",
   "exchange": 14,
-  "label": "immediate_merge_message",
+  "kind": "note",
+  "match": "immediate_merge_message",
   "expect": {
    "value": ""
   },
@@ -260,7 +285,8 @@
  {
   "scenario": "G",
   "exchange": 15,
-  "label": "immediate_merged_immediately_after_merge_call",
+  "kind": "note",
+  "match": "immediate_merged_immediately_after_merge_call",
   "expect": {
    "value": true
   },
@@ -269,7 +295,8 @@
  {
   "scenario": "G",
   "exchange": 20,
-  "label": "headid_merged_immediately_after_merge_call",
+  "kind": "note",
+  "match": "headid_merged_immediately_after_merge_call",
   "expect": {
    "value": true
   },
@@ -278,7 +305,8 @@
  {
   "scenario": "G",
   "exchange": 27,
-  "label": "wrongid_then_right_merged_immediately_after_merge_call",
+  "kind": "note",
+  "match": "wrongid_then_right_merged_immediately_after_merge_call",
   "expect": {
    "value": true
   },
@@ -287,7 +315,8 @@
  {
   "scenario": "G",
   "exchange": 73,
-  "label": "status_gated_merged_immediately_after_merge_call",
+  "kind": "note",
+  "match": "status_gated_merged_immediately_after_merge_call",
   "expect": {
    "value": true
   },
@@ -296,7 +325,8 @@
  {
   "scenario": "T",
   "exchange": 2,
-  "label": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#1>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#1>/merge",
   "expect": {
    "status": 409,
    "message_contains": [
@@ -309,7 +339,8 @@
  {
   "scenario": "H",
   "exchange": 39,
-  "label": "POST /api/v1/repos/acme/status/statuses/<sha#5>",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/<sha#5>",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -321,7 +352,8 @@
  {
   "scenario": "H",
   "exchange": 40,
-  "label": "POST /api/v1/repos/acme/status/statuses/nope",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/nope",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -333,7 +365,8 @@
  {
   "scenario": "S",
   "exchange": 0,
-  "label": "bot-push-replace-ref",
+  "kind": "git",
+  "match": "bot-push-replace-ref",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -346,7 +379,8 @@
  {
   "scenario": "S",
   "exchange": 1,
-  "label": "bot-push-pull-1-head",
+  "kind": "git",
+  "match": "bot-push-pull-1-head",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -359,7 +393,8 @@
  {
   "scenario": "S",
   "exchange": 2,
-  "label": "bot-push-pull-1-head-forced",
+  "kind": "git",
+  "match": "bot-push-pull-1-head-forced",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -372,7 +407,8 @@
  {
   "scenario": "S",
   "exchange": 3,
-  "label": "bot-push-pull-999-head",
+  "kind": "git",
+  "match": "bot-push-pull-999-head",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -385,7 +421,8 @@
  {
   "scenario": "S",
   "exchange": 7,
-  "label": "bot-push-notes-ref",
+  "kind": "git",
+  "match": "bot-push-notes-ref",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -398,7 +435,8 @@
  {
   "scenario": "S",
   "exchange": 8,
-  "label": "bot-push-for-ref",
+  "kind": "git",
+  "match": "bot-push-for-ref",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -411,7 +449,8 @@
  {
   "scenario": "S",
   "exchange": 9,
-  "label": "bot-push-changes-ref",
+  "kind": "git",
+  "match": "bot-push-changes-ref",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -424,7 +463,8 @@
  {
   "scenario": "S",
   "exchange": 10,
-  "label": "bot-push-keep-around-ref",
+  "kind": "git",
+  "match": "bot-push-keep-around-ref",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -437,7 +477,8 @@
  {
   "scenario": "S",
   "exchange": 11,
-  "label": "bot-push-arbitrary-ref",
+  "kind": "git",
+  "match": "bot-push-arbitrary-ref",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -450,7 +491,8 @@
  {
   "scenario": "S",
   "exchange": 15,
-  "label": "GET /api/v1/repos/acme/refs/git/refs",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/refs/git/refs",
   "expect": {
    "ignore_body": true,
    "fields": {
@@ -462,7 +504,8 @@
  {
   "scenario": "X",
   "exchange": 31,
-  "label": "POST /api/v1/users/alice/tokens",
+  "kind": "http",
+  "match": "POST /api/v1/users/alice/tokens",
   "expect": {
    "status": 403,
    "message_contains": [
@@ -475,7 +518,8 @@
  {
   "scenario": "X",
   "exchange": 33,
-  "label": "GET /api/v1/users/alice/tokens",
+  "kind": "http",
+  "match": "GET /api/v1/users/alice/tokens",
   "expect": {
    "status": 403,
    "message_contains": [
@@ -487,8 +531,9 @@
  },
  {
   "scenario": "B",
-  "exchange": 17,
-  "label": "GET /api/v1/users/alice/tokens",
+  "exchange": 19,
+  "kind": "http",
+  "match": "GET /api/v1/users/alice/tokens",
   "expect": {
    "status": [
     401,
@@ -503,7 +548,8 @@
  {
   "scenario": "R",
   "exchange": 4,
-  "label": "POST /api/v1/users/alice/tokens",
+  "kind": "http",
+  "match": "POST /api/v1/users/alice/tokens",
   "expect": {
    "status": [
     401,
@@ -518,7 +564,8 @@
  {
   "scenario": "R",
   "exchange": 5,
-  "label": "POST /api/v1/users/alice/tokens",
+  "kind": "http",
+  "match": "POST /api/v1/users/alice/tokens",
   "expect": {
    "status": [
     401,
@@ -533,7 +580,8 @@
  {
   "scenario": "R",
   "exchange": 6,
-  "label": "POST /api/v1/users/alice/tokens",
+  "kind": "http",
+  "match": "POST /api/v1/users/alice/tokens",
   "expect": {
    "status": [
     401,
@@ -548,7 +596,8 @@
  {
   "scenario": "R",
   "exchange": 7,
-  "label": "GET /api/v1/users/alice/tokens",
+  "kind": "http",
+  "match": "GET /api/v1/users/alice/tokens",
   "expect": {
    "status": [
     401,
@@ -563,7 +612,8 @@
  {
   "scenario": "X",
   "exchange": 30,
-  "label": "POST /api/v1/users/bot/tokens",
+  "kind": "http",
+  "match": "POST /api/v1/users/bot/tokens",
   "expect": {
    "status": [
     401,
@@ -578,7 +628,8 @@
  {
   "scenario": "E",
   "exchange": 19,
-  "label": "GET /api/v1/repos/acme/hist/commits?sha=nope&limit=50&stat=false&files=false&verification=false",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/hist/commits?sha=nope&limit=50&stat=false&files=false&verification=false",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -590,7 +641,8 @@
  {
   "scenario": "G",
   "exchange": 12,
-  "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#1>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#1>/merge",
   "expect": {
    "status": 405,
    "message_contains": [
@@ -602,7 +654,8 @@
  {
   "scenario": "T",
   "exchange": 16,
-  "label": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#4>/merge",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#4>/merge",
   "expect": {
    "status": 405,
    "message_contains": [
@@ -614,7 +667,8 @@
  {
   "scenario": "L",
   "exchange": 2,
-  "label": "PATCH /api/v1/repos/acme/pub1",
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/pub1",
   "expect": {
    "ignore_fields": [
     "private"
@@ -628,7 +682,8 @@
  {
   "scenario": "L",
   "exchange": 5,
-  "label": "PATCH /api/v1/repos/acme/pub1",
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/pub1",
   "expect": {
    "ignore_fields": [
     "private"
@@ -642,7 +697,8 @@
  {
   "scenario": "L",
   "exchange": 3,
-  "label": "GET /api/v1/repos/acme/pub1",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/pub1",
   "expect": {
    "ignore_fields": [
     "private"
@@ -656,7 +712,8 @@
  {
   "scenario": "H",
   "exchange": 33,
-  "label": "POST /api/v1/repos/acme/status/statuses/<sha#4>",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/<sha#4>",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -668,7 +725,8 @@
  {
   "scenario": "H",
   "exchange": 34,
-  "label": "POST /api/v1/repos/acme/status/statuses/<sha#4>",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/<sha#4>",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -680,7 +738,8 @@
  {
   "scenario": "H",
   "exchange": 43,
-  "label": "POST /api/v1/repos/acme/status/statuses/<sha#7>",
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/<sha#7>",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -692,7 +751,8 @@
  {
   "scenario": "H",
   "exchange": 35,
-  "label": "GET /api/v1/repos/acme/status/commits/<sha#4>/status?limit=50",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/<sha#4>/status?limit=50",
   "expect": {
    "ignore_fields": [
     "total_count",
@@ -704,7 +764,8 @@
  {
   "scenario": "H",
   "exchange": 44,
-  "label": "GET /api/v1/repos/acme/status/commits/<sha#7>/status?limit=50",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/<sha#7>/status?limit=50",
   "expect": {
    "status": 200,
    "ignore_body": true,
@@ -718,7 +779,8 @@
  {
   "scenario": "H",
   "exchange": 45,
-  "label": "combined_state_only_bogus",
+  "kind": "note",
+  "match": "combined_state_only_bogus",
   "expect": {
    "value": "pending"
   },
@@ -727,7 +789,8 @@
  {
   "scenario": "H",
   "exchange": 46,
-  "label": "combined_total_only_bogus",
+  "kind": "note",
+  "match": "combined_total_only_bogus",
   "expect": {
    "value": 0
   },
@@ -736,7 +799,8 @@
  {
   "scenario": "H",
   "exchange": 47,
-  "label": "GET /api/v1/repos/acme/status/statuses/<sha#7>?limit=100",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/statuses/<sha#7>?limit=100",
   "expect": {
    "status": 200,
    "ignore_body": true,
@@ -749,7 +813,8 @@
  {
   "scenario": "M",
   "exchange": 42,
-  "label": "PATCH /api/v1/repos/acme/rename-me",
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/rename-me",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -761,7 +826,8 @@
  {
   "scenario": "M",
   "exchange": 43,
-  "label": "GET /api/v1/repos/acme/rename-me",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/rename-me",
   "expect": {
    "status": 200,
    "ignore_body": true,
@@ -774,7 +840,8 @@
  {
   "scenario": "M",
   "exchange": 44,
-  "label": "GET /api/v1/repos/acme/renamed",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/renamed",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -786,7 +853,8 @@
  {
   "scenario": "M",
   "exchange": 45,
-  "label": "GET /api/v1/repos/acme/rename-me",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/rename-me",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -798,7 +866,8 @@
  {
   "scenario": "M",
   "exchange": 46,
-  "label": "GET /acme/rename-me.git/info/refs?service=git-upload-pack",
+  "kind": "http",
+  "match": "GET /acme/rename-me.git/info/refs?service=git-upload-pack",
   "expect": {
    "status": 200,
    "ignore_body": true
@@ -808,7 +877,8 @@
  {
   "scenario": "M",
   "exchange": 48,
-  "label": "ls-remote-new-name",
+  "kind": "git",
+  "match": "ls-remote-new-name",
   "expect": {
    "ok": false,
    "message_contains": [
@@ -820,7 +890,8 @@
  {
   "scenario": "M",
   "exchange": 49,
-  "label": "PATCH /api/v1/repos/acme/renamed",
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/renamed",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -832,7 +903,8 @@
  {
   "scenario": "M",
   "exchange": 50,
-  "label": "PATCH /api/v1/repos/acme/renamed",
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/renamed",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -844,7 +916,8 @@
  {
   "scenario": "M",
   "exchange": 51,
-  "label": "PATCH /api/v1/repos/acme/Renamed",
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/Renamed",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -856,7 +929,8 @@
  {
   "scenario": "N",
   "exchange": 0,
-  "label": "PATCH /api/v1/repos/acme/dflt",
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/dflt",
   "expect": {
    "status": 422,
    "message_contains": [
@@ -868,7 +942,8 @@
  {
   "scenario": "O",
   "exchange": 14,
-  "label": "GET /api/v1/repos/acme/life/pulls/<id:path:pulls#3>",
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/life/pulls/<id:path:pulls#3>",
   "expect": {
    "ignore_fields": [
     "head.sha"
@@ -879,7 +954,8 @@
  {
   "scenario": "O",
   "exchange": 15,
-  "label": "merged_pr_head_sha_frozen",
+  "kind": "note",
+  "match": "merged_pr_head_sha_frozen",
   "expect": {
    "value": true
   },
@@ -888,7 +964,8 @@
  {
   "scenario": "O",
   "exchange": 16,
-  "label": "merged_pr_head_sha_follows_new_branch",
+  "kind": "note",
+  "match": "merged_pr_head_sha_follows_new_branch",
   "expect": {
    "value": false
   },
@@ -897,7 +974,8 @@
  {
   "scenario": "K",
   "exchange": 29,
-  "label": "GET /acme/ghost.git/info/refs?service=git-receive-pack",
+  "kind": "http",
+  "match": "GET /acme/ghost.git/info/refs?service=git-receive-pack",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -909,7 +987,8 @@
  {
   "scenario": "K",
   "exchange": 39,
-  "label": "GET /acme/ghost.git/info/refs?service=git-receive-pack",
+  "kind": "http",
+  "match": "GET /acme/ghost.git/info/refs?service=git-receive-pack",
   "expect": {
    "status": 404,
    "message_contains": [
@@ -917,5 +996,110 @@
    ]
   },
   "reason": "sc-forge answers 404, not Gitea's 403 'Push to create is not enabled'"
+ },
+ {
+  "scenario": "B",
+  "exchange": 13,
+  "kind": "http",
+  "match": "POST /api/v1/orgs/acme/teams",
+  "expect": {
+   "status": [
+    404,
+    405,
+    501
+   ],
+   "message_contains": [
+    "not"
+   ]
+  },
+  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text)"
+ },
+ {
+  "scenario": "B",
+  "exchange": 14,
+  "kind": "http",
+  "match": "PUT /api/v1/teams/<id:path:teams#1>/members/carol",
+  "expect": {
+   "status": [
+    404,
+    405,
+    501
+   ],
+   "message_contains": [
+    "not"
+   ]
+  },
+  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text)"
+ },
+ {
+  "scenario": "B",
+  "exchange": 15,
+  "kind": "http",
+  "match": "GET /api/v1/users/carol/orgs/acme/permissions",
+  "expect": {
+   "status": [
+    200,
+    404
+   ],
+   "message_contains": [
+    "not found"
+   ],
+   "fields": {
+    "can_read": false
+   }
+  },
+  "reason": "carol is not a team member without teams: no read permission via the org (200 all false or 404). teams are a non-goal in sc-forge (words in message_contains are placeholders for its text)"
+ },
+ {
+  "scenario": "X",
+  "exchange": 18,
+  "kind": "http",
+  "match": "GET /api/v1/user",
+  "expect": {
+   "status": 401,
+   "message_contains": [
+    "auth"
+   ]
+  },
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text"
+ },
+ {
+  "scenario": "X",
+  "exchange": 19,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/authrepo",
+  "expect": {
+   "status": 401,
+   "message_contains": [
+    "auth"
+   ]
+  },
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text"
+ },
+ {
+  "scenario": "X",
+  "exchange": 20,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/authrepo/statuses/<sha#1>",
+  "expect": {
+   "status": 401,
+   "message_contains": [
+    "auth"
+   ]
+  },
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text"
+ },
+ {
+  "scenario": "X",
+  "exchange": 27,
+  "kind": "http",
+  "match": "GET /api/v1/user",
+  "expect": {
+   "status": 401,
+   "message_contains": [
+    "auth"
+   ]
+  },
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text"
  }
 ]

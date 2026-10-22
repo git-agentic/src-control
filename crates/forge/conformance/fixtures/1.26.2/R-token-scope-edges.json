@@ -42,9 +42,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
+        "errors": null,
         "message": "not found",
-        "url": "<base>/api/swagger",
-        "errors": null
+        "url": "<base>/api/swagger"
       }
     },
     {
@@ -179,22 +179,22 @@
         },
         {
           "id": "<id:id#3>",
-          "name": "all",
+          "name": "ci",
           "sha1": "<token>",
           "token_last_eight": "<token>",
           "scopes": [
-            "all"
+            "read:repository"
           ],
           "created_at": "<ts>",
           "last_used_at": "<ts>"
         },
         {
           "id": "<id:id#4>",
-          "name": "ci",
+          "name": "all",
           "sha1": "<token>",
           "token_last_eight": "<token>",
           "scopes": [
-            "read:repository"
+            "all"
           ],
           "created_at": "<ts>",
           "last_used_at": "<ts>"
@@ -437,7 +437,7 @@
         "html_url": "<base>/botorg/legit",
         "url": "<base>/api/v1/repos/botorg/legit",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/botorg/legit.git",
+        "ssh_url": "ssh://<creds>@localhost:2222/botorg/legit.git",
         "clone_url": "<base>/botorg/legit.git",
         "original_url": "",
         "website": "",
