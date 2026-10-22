@@ -1,10 +1,11 @@
 # Design: sc-forge, a Gitea-compatible Git forge (P38)
 
-- **Date:** 2026-10-22
+- **Date:** 2026-10-22 (revision 2, after independent design review)
 - **Status:** Draft, pre-implementation (ADR-0058 is Proposed)
-- **ADR to write at build time:** firm ADR-0058 from Proposed to Accepted when F2 ships
-- **Contract source:** `crates/forge/conformance/` (recorded from real Gitea 1.22.6
-  and 1.26.2; see "Conformance") and the client survey summarized below
+- **ADR:** ADR-0058 is firmed from Proposed to Accepted when the phase is built
+  (ROADMAP "How a phase gets built")
+- **Contract source:** `crates/forge/conformance/` (recorded from real Gitea
+  1.22.6 and 1.26.2; see "Conformance") plus the client survey summarized below
 
 ## Goal
 
@@ -19,299 +20,420 @@ flows against `sc-forge`. Wire compatibility is the means, not the product.
 
 ## Non-goals (and why)
 
-- **A web UI.** The clients are programs. Humans use their own Git tooling and
-  the portal.
+- **A web UI.** The clients are programs.
 - **Actions/CI, webhooks, issues, wiki, packages, LFS, OAuth apps.** No client
   calls them. Commit statuses are posted by the client's own suite runner;
   protection can require named status contexts.
-- **SSH transport (v1).** No client uses it: the portal's URL policy forbids
-  `ssh://` and the agent runtime authenticates over HTTP only. Follow-on:
-  OpenSSH with `AuthorizedKeysCommand` calling `sc-forge`, not an in-process SSH
-  server. `user/keys` is cut with it.
-- **Squash and rebase merge, forks.** Every merge request seen sends
-  `Do: "merge"`; there is no UI where a human picks a style. `Do` values other
-  than `merge` answer 422 until a client needs them. Pull requests are same
-  repository only.
-- **Required approvals in branch protection.** Clients read reviews and decide
-  client-side; nothing reads server-side approval rules. Protection supports
-  `enable_push` and `status_check_contexts` only.
-- **High availability.** One writer process, one data disk, snapshot backup.
+- **SSH transport (v1).** No client uses it. Follow-on: OpenSSH with
+  `AuthorizedKeysCommand`, not an in-process SSH server. `user/keys` goes with it.
+- **Squash and rebase merge, forks, repo/user rename.** Every merge request seen
+  sends `Do: "merge"`; other values answer 422. Pull requests are same
+  repository only. Rename answers 422.
+- **Required approvals in branch protection.** Clients decide on reviews
+  client-side.
+- **High availability.** One writer process, one data volume.
 - **Storing `.sc/` repos.** Hosted repos are bare Git (ADR-0058, decision 1).
-  They get none of secrets, per-file encryption or private branches.
 - **Changing Gitea's behaviour for the better.** Where a client matches on a
-  Gitea quirk (error text, status codes, "try again later"), `sc-forge`
-  reproduces it. Improvements are made after the clients are migrated.
+  Gitea quirk (error text, status code), `sc-forge` reproduces it. The one
+  deliberate departure: merge is synchronous (see "Merge").
 
 ## What the clients need
 
-Tiers decide build order. Each row is a route plus the response keys a client
-actually reads; full keys, status codes and message texts live in the recorded
-fixtures, not here.
+Tiers decide build order. Full keys, status codes and message texts live in the
+recorded fixtures, not here.
 
 **Tier 1, the default delivery path**
-- `GET /api/v1/version`, `GET /api/healthz` (container health).
-- `GET /api/v1/user`; `GET /api/v1/users/{u}`.
-- `POST /api/v1/admin/users`, `PATCH /api/v1/admin/users/{u}` (password reset,
-  visibility); duplicate create answers 422.
+- `GET /api/v1/version`, `GET /api/healthz`; `GET /api/v1/user`; `GET /api/v1/users/{u}`.
+- `POST /api/v1/admin/users`, `PATCH /api/v1/admin/users/{u}`; duplicate create 422.
 - `POST /api/v1/orgs`, `GET /api/v1/orgs/{o}`,
   `GET /api/v1/users/{u}/orgs/{o}/permissions` (`can_create_repository`).
-- `POST|GET|DELETE /api/v1/users/{u}/tokens` under HTTP Basic (password): the
-  mint response carries `sha1`; list carries `id`, `name`, `token_last_eight`.
-  The admin token is not accepted on these routes.
-- `POST /api/v1/orgs/{o}/repos` (`name`, `description`, `private`,
-  `default_branch`, `auto_init`, `readme`); duplicate answers 409 or 422 with
-  "already exists".
-- `GET|PATCH|DELETE /api/v1/repos/{o}/{r}`; keys read: `full_name`, `name`,
-  `empty`, `private`, `description`, `default_branch`, `permissions`.
+- `POST|GET|DELETE /api/v1/users/{u}/tokens` (password auth; mint returns `sha1`;
+  list returns `id`, `name`, `token_last_eight`).
+- `POST /api/v1/orgs/{o}/repos`; duplicate 409 or 422 "already exists".
+- `GET|PATCH|DELETE /api/v1/repos/{o}/{r}` (keys read: `full_name`, `name`,
+  `empty`, `private`, `description`, `default_branch`, `permissions`).
 - `PUT|DELETE /api/v1/repos/{o}/{r}/collaborators/{u}` (204).
-- `GET /api/v1/repos/{o}/{r}/branches/{b}` (`commit.id`).
-- Git smart HTTP at `/{o}/{r}.git` (see "Git transport").
+- `GET /repos/{o}/{r}/branches/{b}` (`commit.id`).
+- Git smart HTTP at `/{o}/{r}.git`.
 
 **Tier 2, pull requests and gating**
-- `POST|GET /pulls`, `GET|PATCH /pulls/{n}`; the full PR object comes back from
-  create (`number`, `state`, `merged`, `merge_commit_sha`, `changed_files`,
-  `mergeable`, `head.{ref,sha,repo.full_name}`, `base.{ref,sha,repo.full_name}`,
-  `html_url`). `GET /pulls?state=all&head=…&limit=50` must work; clients filter
-  by `head.ref` themselves because stock Gitea ignores `head`.
+- `POST|GET /pulls`, `GET|PATCH /pulls/{n}` (full PR object from create:
+  `number`, `state`, `merged`, `merge_commit_sha`, `changed_files`, `mergeable`,
+  `head.{ref,sha,repo.full_name}`, `base.{ref,sha,repo.full_name}`, `html_url`);
+  `GET /pulls?state=all&head=…&limit=50` must work, and clients filter by
+  `head.ref` because stock Gitea ignores `head`.
 - `POST /pulls/{n}/merge` with `{"Do":"merge","head_commit_id":…}`.
 - `GET|POST /pulls/{n}/reviews`, `GET /pulls/{n}/reviews/{id}/comments`,
   `GET /issues/{n}/comments`.
 - `POST /statuses/{sha}`; `GET /commits/{sha}/status` (combined) and
-  `GET /statuses/{sha}` (history).
+  `GET /statuses/{sha}`.
 
-**Tier 3, content reads (import and portal)**
-- `GET /repos/search`, `GET /branches`, `GET /git/refs/heads[/{b}]` (an array),
-  `GET /commits` (`X-Total-Count`, paging), `GET /git/commits/{sha}` (+`.diff`),
-  `GET /git/trees/{sha}?recursive=true`, `GET|POST|PUT /contents/{path}`,
+**Tier 3, content reads and writes**
+- `GET /repos/search`, `/branches`, `/git/refs/heads[/{b}]` (an array),
+  `/commits` (`X-Total-Count`, paging), `/git/commits/{sha}` (+`.diff`),
+  `/git/trees/{sha}?recursive=true`, `GET|POST|PUT /contents/{path}`,
   `GET /archive/{ref}.zip`.
 
 **Tier 4, protection**
-- `POST|GET|PATCH|DELETE /branch_protections` with `branch_name`,
-  `enable_push`, `enable_status_check`, `status_check_contexts`; a merge that
-  lacks a required context is refused with a message containing
-  "required status checks".
+- `POST|GET|PATCH|DELETE /branch_protections` (`branch_name`, `enable_push`,
+  `enable_status_check`, `status_check_contexts`).
 
 **Client behaviours that are part of the contract**
-- Auth is `Authorization: token T`. Git uses HTTP Basic with the token as the
-  password under any username, including `oauth2`. A client re-resolves its token
-  once on 401 and replays, including POST.
-- A foreign token on a private repo must answer what Gitea answers (the
-  fixtures decide 401 versus 404); one flow asserts it.
-- Merge outcomes are classified by case-insensitive substring of the body:
-  "conflict" with 405 or 409, "try again later" with 405 (with
-  `changed_files == 0` meaning nothing to merge). A 2xx merge answer is not
-  trusted; the client re-reads the PR for `merged` and `merge_commit_sha`.
+- Auth is `Authorization: token T`; git uses Basic with the token as password
+  under any username (including `oauth2`). Clients re-resolve their token once
+  on 401 and replay, including POST.
+- A foreign token on a private repo answers what Gitea answers (one flow asserts
+  401). Where no client asserts otherwise and Gitea leaks existence, `sc-forge`
+  does not (see "Existence").
+- Merge outcomes are classified by case-insensitive substring: "conflict" with
+  405 or 409; "try again later" with 405, with `changed_files == 0` meaning
+  nothing to merge; a protection refusal contains "required status checks". A 2xx
+  merge answer is not trusted; clients re-read the PR for `merged` and
+  `merge_commit_sha`.
 - A PR is "landed" if its frozen head is an ancestor of trunk, or the merge
-  commit has one parent and the tree comparison matches (squash). A real merge
-  commit satisfies the first rule.
-- Combined status must list only the latest status per context; clients do not
-  deduplicate. `X-Total-Count` must equal the listed count.
+  commit has one parent and a tree comparison matches. A real merge commit
+  satisfies the first rule.
+- Combined status lists only the latest status per context; clients do not
+  deduplicate. `X-Total-Count` equals the listed count.
 - `GET /commits` on an empty repo answers 409.
-- Git needs `uploadpack.allowReachableSHA1InWant`, `uploadpack.allowFilter`,
-  shallow fetch, `Git-Protocol: version=2`, and
-  `push --force-with-lease=refs/heads/b:` semantics.
-- Bootstrap shells into the container: `admin user create --admin
+- Git needs reachable-SHA fetch, `blob:none` filters, shallow fetch,
+  `Git-Protocol: version=2`, and `push --force-with-lease=refs/heads/b:`.
+- Bootstrap scripts shell into the container for `admin user create --admin
   --must-change-password=false`, `admin user change-password`, and
-  `admin user generate-access-token --scopes all --raw`. `sc-forge` accepts the
-  same subcommands and flags so those scripts need only a binary name change.
+  `admin user generate-access-token --scopes all --raw`; `sc-forge` accepts the
+  same subcommands and flags.
 
 ## Architecture
 
 ### Crate and dependency rule
 
-New top-level adapter `crates/forge` (package `scl-forge`, binary `sc-forge`).
-It is a sibling of `cli` and `desktop`, not a consumer of `repo`: hosted repos
-are plain Git, so `scl-repo` is not linked. Dependencies: `scl-core` only if a
-helper is shared (BLAKE3 token hashing, `atomic_write_durable`); `scl-tlsio` is
-linked only when TLS is added (deferred). **`gix` stays quarantined in
-`gitio`; the forge does not use it.** All Git access is the system `git`
-binary, spawned with argument arrays (never a shell), as the P18 bridge already
-does. `CLAUDE.md`'s dependency rule gains one sentence in the F1 PR.
+New top-level adapter `crates/forge` (package `scl-forge`, binary `sc-forge`),
+sibling of `cli` and `desktop`. It links `{crypto, core}` and never `repo`,
+`vfs` or `gitio`: hosted repos are plain Git. **Password hashing (`argon2`),
+token generation, and the constant-time compare move into `crates/crypto`**
+(RustCrypto stays quarantined there; the existing `random_hex` is the RNG
+entry point). `gix` is not used. rustls stays in `tlsio` and TLS is deferred.
+`CLAUDE.md`'s dependency rule gains one sentence in the F1 PR:
+`forge → {crypto, core}`. The crate is `#![cfg(unix)]` with a stub `main` so the
+Windows workspace check still compiles.
 
-New direct dependencies, each named here so review sees them:
+New direct dependencies:
 
 | Dependency | Why |
 |---|---|
-| `hyper` 1.x + `hyper-util` + `tokio` (multi-thread rt, net, process, io-util) | Routes with JSON, queries and streamed pack bodies; `hyper` and `tokio` are already in the lockfile through `objio`'s S3 SDK. Confined to `scl-forge`. |
-| `rusqlite` (`bundled`) | Metadata. Relational queries (PR lists, status latest-per-context, collaborator joins), transactions and migrations; flat files would reimplement a database badly. First SQLite use in the workspace. |
-| a password hash (`argon2`) | Basic-auth password verification for token routes. |
+| `hyper` 1.x (`http1` only) + `hyper-util` + `tokio` (multi-thread rt, net, process, io-util, signal) | HTTP server and process supervision. `hyper` and `tokio` are already in the lockfile through `objio`; this crate adds the server and multi-thread runtime, nothing in `core`/`repo`. |
+| `rusqlite` (`bundled`) | Metadata. Relational queries (PR lists, latest status per context, joins), transactions, migrations; flat files would reimplement a database. First SQLite and first C-compiled dependency in the workspace; the SBOM job must list it. |
+| `argon2` (in `crates/crypto`) | Password verification on token routes. |
+
+No `deny.toml` exists; `audit.yml` and the SBOM job are the gates. CI adds a
+conformance job (Python 3 stdlib) and a `git` version check.
 
 ### Storage layout (`--data-dir`)
 
 ```
-<data>/forge.db            SQLite, WAL, one writer connection + readers
-<data>/repos/<o>/<r>.git   bare repositories (lower-cased canonical names)
-<data>/hooks/              hook shims, selected with -c core.hooksPath
-<data>/tmp/                scratch for index files and archives
+<data>/forge.db            SQLite, WAL, synchronous=FULL
+<data>/repos/<id>.git      bare repositories, named by immutable repo id
+<data>/hooks/              hook shims (selected per spawn)
+<data>/trash/<id>.git      repos pending final deletion
+<data>/tmp/                scratch (index files, archives, pinned HOME)
 ```
 
-The data disk is the unit of backup (disk snapshot), as with Gitea. No secret
-lives outside it.
+Repositories are addressed by immutable numeric id, never by owner/name; the
+database maps names to ids. Deleting and recreating `acme/alpha` yields a new id
+and a new directory, so a lingering process cannot see the replacement.
 
 ### Metadata (SQLite)
 
-`users` (login, lower_login, kind user|org, email, password hash, is_admin,
-visibility), `org_members` (org, user, owner|member), `tokens` (user, name,
-BLAKE3 hash of the raw token, last_eight, scopes, expires_at, created_at),
-`repos` (owner, name, lower_name, private, description, default_branch),
-`collaborators` (repo, user, read|write|admin), `pulls` (repo, number,
-head_ref, base_ref, title, body, state, merged, merge_commit_sha, head_sha at
-merge, changed_files, timestamps), `reviews`, `comments`, `commit_statuses`
-(repo, sha, context, state, description, target_url, created), `branch_protections`
-(repo, branch, enable_push, status_check_contexts JSON). Per-repo `index`
-counter for PR and comment numbers. Schema migrations are numbered SQL applied
-at startup under a version table; a newer schema than the binary refuses to
-start.
+`users` (login, lower_login UNIQUE, kind user|org, email, password hash,
+is_admin, visibility), `org_members`, `tokens` (user, name, BLAKE3 hash,
+last_eight, scopes, expires_at), `repos` (id, owner, name, lower_name UNIQUE per
+owner, private, description, default_branch, state live|deleting),
+`collaborators`, `pulls` (repo, number, head_ref, base_ref, title, body, state,
+merged, merge_commit_sha, `head_sha_at_merge`, `changed_files_at_merge`,
+timestamps), `merge_intents`, `reviews`, `comments`, `commit_statuses` (repo,
+sha, context, state, description, target_url, id AUTOINCREMENT),
+`branch_protections` (repo, branch, enable_push, enable_status_check,
+status_check_contexts JSON), `mergeability_cache` (repo, base_sha, head_sha →
+mergeable, changed_files), a per-repo index counter. Numbered SQL migrations run
+at `serve` startup only; `admin` commands refuse when the schema differs from
+their binary's, and `serve` never caches users or tokens across requests.
 
-### Auth and authorization
+### Authentication
 
 - Tokens are 40 hex characters (the length Gitea issues; clients treat them as
-  opaque). Stored as BLAKE3 hashes, compared in constant time, optional expiry.
-  The token-store primitives follow ADR-0040's (`sct-` format excepted);
-  `serve_tokens.rs` is single-repo and file-backed, so only the ideas carry over.
-- Accepted credentials: `Authorization: token T`, `Bearer T`, Basic with the
-  token as password (any username), and Basic with a user's password on the
-  token routes only. Password attempts are rate-limited per login.
-- Scopes: `all`, `read|write:{repository,user,organization,admin,issue}`;
-  `public-only` is accepted and ignored (all repos are private by
-  configuration). Every route declares the scope category and level it needs.
-- Repository access = site admin, org owner, repo owner, or a collaborator
-  grant (read < write < admin). Org membership alone grants nothing
-  (`FORCE_PRIVATE` semantics). A token is intersected with its user's access.
-  There are no teams.
-- Authorization failures answer what the recorded Gitea answers (401, 403 or 404
-  per route), not a uniform choice.
+  opaque), stored as BLAKE3 hashes, compared in constant time, optional expiry.
+  The primitives follow ADR-0040's; `serve_tokens.rs` is file-backed and
+  single-repo, so only the design carries over.
+- **Credential rules per route class, enforced by the router table:**
+
+| Route class | Accepted credential | Additional rule |
+|---|---|---|
+| `/users/{u}/tokens*` | Basic with the user's **password only**. A token is never accepted here, as password or header. | Authenticated user must equal `{u}`. |
+| `admin/*` | Token with `write:admin` (or `read:admin` for GETs), user must be site admin. | |
+| Everything else | `token T`, `Bearer T`, or Basic with a **token** as password (any username). A Basic password is never tried as a user password. | Scope and actor rules below. |
+
+  The router table is the single source of authorization: every route
+  declares its class, required scope category and level, and an actor/target
+  rule. A route without a declaration does not compile; a test enumerates the
+  table against the fixture routes.
+- **Scopes:** `all`, `read|write:{repository,user,organization,admin,issue}`.
+  `public-only` is rejected at issuance (422), since every repo is private.
+- **Actor rules:** a token acts as its user and is intersected with the user's
+  access. Organization-scoped writes (`write:organization`, repo creation in an
+  org) require the user to be an owner of that org or a site admin; a user can
+  mint and delete only their own tokens; nested ids (review, comment) are
+  checked against the repo in the path before use.
+- **Repository access** = site admin, org owner, repo owner, or collaborator
+  grant (read < write < admin). Org membership alone grants nothing. No teams.
+  `POST /pulls/{n}/merge` requires write.
+- **Existence.** Anonymous and foreign callers get the same response for a
+  nonexistent repo and an unauthorized private repo wherever no client asserts a
+  difference (the fixtures include both cases for the API and for git);
+  `repos/search` and every listing filter by the caller's access.
+- **`private: false`** on create or PATCH is accepted, stored as true and
+  returned as true (`FORCE_PRIVATE`). There is no anonymous read.
+- **Rate limits and bind gate.** Password attempts back off exponentially per
+  login and are capped per source (not a lockout; a service account must not be
+  lockable by a stranger); argon2 runs under a global concurrency cap. The
+  server refuses a non-loopback bind unless `--behind-proxy` or
+  `--allow-plaintext` is given, and trusts a forwarded-for header only when
+  `--trusted-proxy-header` names it.
 
 ### Git transport
 
-Routes: `GET /{o}/{r}.git/info/refs?service=git-upload-pack|git-receive-pack`,
-`POST /{o}/{r}.git/git-upload-pack`, `POST /{o}/{r}.git/git-receive-pack`.
+Routes: `GET /{o}/{r}.git/info/refs?service=…`, `POST …/git-upload-pack`,
+`POST …/git-receive-pack`. The server authenticates and authorizes (read for
+upload-pack, write for receive-pack), resolves the repo id from the database, and
+runs **`git http-backend`** as a CGI with `GIT_PROJECT_ROOT=<data>/repos/<id>.git`
+and `PATH_INFO` set to the service suffix. This keeps Git's own advertisement
+preamble, content types, no-cache headers, `Content-Encoding: gzip` request
+handling and protocol v2 correct without re-implementation (verified: git 2.54
+serves an advertisement from a bare repo with the root set to the repo itself,
+and answers 403 for receive-pack unless `REMOTE_USER` is set, which the server
+sets only after the write check). The CGI response is parsed up to its blank
+line (`Status:` and headers), then the body is streamed.
 
-- The server authenticates and authorizes first (read for upload-pack, write for
-  receive-pack), then spawns `git upload-pack --stateless-rpc` or
-  `git receive-pack --stateless-rpc` directly, no CGI. Request body streams to
-  stdin and stdout streams back. `Git-Protocol` maps to `GIT_PROTOCOL` when it
-  matches `version=[0-9]+(:…)?`.
-- Spawn flags: `-c uploadpack.allowFilter=true -c
-  uploadpack.allowReachableSHA1InWant=true -c receive.fsckObjects=true -c
-  receive.maxInputSize=<limit> -c core.hooksPath=<data>/hooks`. Hooks are never
-  read from a repository, so a pushed `hooks/` cannot run.
-- Unauthenticated access to a private repo answers 401 with
-  `WWW-Authenticate: Basic`, so git prompts and retries.
-- A `pre-receive` shim (`sc-forge hook pre-receive`, environment carries repo and
-  user ids) enforces branch protection (`enable_push: false` rejects any update
-  to the branch from receive-pack) and refuses deleting the default branch. The
-  merge path does not go through receive-pack, so protection does not block
-  server-side merges.
-- A per-repository write lock serializes ref updates made by the server itself
-  (merges, content commits). Pushes rely on Git's own ref locking.
+- **Subprocess environment** is built from scratch for every Git spawn
+  (`env_clear`): fixed `PATH`, `HOME=<data>/tmp/home`, `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_NO_REPLACE_OBJECTS=1`, `GIT_ATTR_NOSYSTEM=1`,
+  `GIT_TERMINAL_PROMPT=0`, and per-spawn config through `GIT_CONFIG_COUNT`:
+  `core.hooksPath=<data>/hooks` (on **every** spawn, including `update-ref`,
+  which runs `reference-transaction`), `uploadpack.allowFilter=true`,
+  `uploadpack.allowReachableSHA1InWant=true`, `uploadpackfilter.allow=false` with
+  an explicit allow for `blob:none` only, `receive.fsckObjects=true`,
+  `receive.maxInputSize`, `receive.autogc=false`, `gc.auto=0`,
+  `core.useReplaceRefs=false`. Only the `pre-receive` and `post-receive` hook
+  shims exist; the hook child receives only `FORGE_REPO_ID`, `FORGE_USER_ID`,
+  `FORGE_GENERATION`, `FORGE_DB` and git's quarantine variables.
+- **Ref namespace policy** (pre-receive): client pushes may write `refs/heads/*`
+  and `refs/tags/*` only. `refs/replace/*`, `refs/forge/*`, `refs/pull/*`,
+  `refs/notes/*` and anything else are refused. `refs/forge/` is hidden from
+  advertisement (`uploadpack.hideRefs`).
+- **Branch protection applies to every mutation path, one policy function**
+  shared by pre-receive, contents writes and merges: a protected branch refuses
+  direct updates from receive-pack and contents writes when `enable_push` is
+  false, refuses non-fast-forward and deletion always, and permits only the
+  server-side merge path (which has its own checks). The default branch is not
+  protected unless a rule says so (Gitea behaviour). Deleting the default branch
+  is refused.
+- **Policy linearization:** authorization and protection are evaluated once when
+  a request starts (the hook re-reads protection at ref-update time under one
+  read transaction). A revocation or a new rule affects requests that start after
+  it commits; an in-flight push is not cancelled. Documented, not coordinated.
+- **PR retention:** the server keeps `refs/forge/pull/<n>/head` for every PR,
+  set at creation and refreshed by `post-receive` when the head branch moves,
+  and the pre-receive hook records the head into that ref before allowing a
+  deletion of a head branch. With `gc.auto=0`, no unreachable PR commit is
+  pruned; maintenance gc (F5) runs with a long `--prune` window under the repo
+  lock.
+- **Admission control** before any git process: global and per-repo limits on
+  concurrent git children, per-process wall-clock timeout, per-process
+  `RLIMIT_CPU`/`RLIMIT_FSIZE`, a free-space reserve checked before accepting a
+  push, and a per-owner byte quota (default off). `receive.maxInputSize` bounds
+  the incoming pack only, so expansion is bounded by the quota and the disk
+  reserve; the container applies cgroup memory and PID limits.
+- **Process ownership:** each child runs in its own process group; cancellation,
+  client disconnect, timeout and shutdown kill the group and reap it; stderr is
+  drained concurrently with a size cap. `serve` handles SIGTERM by refusing new
+  work, draining for a bounded time, killing stragglers, then closing the
+  database.
 
 ### Server-side Git operations
 
-All plumbing, no working tree, all against the bare repo. Minimum `git` 2.40
-(`merge-tree --write-tree`), shared with the clients' own requirement.
+All plumbing against the bare repo, no working tree, same sanitized environment.
+Minimum `git` 2.40 in tests; the container pins a current release
+(`merge-tree --write-tree` needs 2.38 or newer).
 
-- **Reads:** `for-each-ref`, `rev-parse`, `log` and `rev-list` with a fixed
-  format, `cat-file`, `ls-tree -r`, `diff-tree`/`diff`, `archive --format=zip`.
-- **Contents write:** temp `GIT_INDEX_FILE` (`read-tree`, `update-index
-  --cacheinfo`, `write-tree`), `commit-tree`, then `update-ref <ref> <new> <old>`
-  as a compare-and-swap. A stale `sha` in a PUT fails like Gitea.
-- **Merge (`Do: merge`):** under the repo lock, re-read base and head tips;
-  refuse if `head_commit_id` is present and differs from the head tip; run
-  `git merge-tree --write-tree base head`; on conflict answer as Gitea does; on a
-  head that is an ancestor of base answer Gitea's "nothing to merge" form; else
-  `commit-tree -p base -p head` with a Gitea-style message and the merging user
-  as author and committer, then `update-ref base new old`. The answer is
-  synchronous: the PR reads `merged: true` as soon as the call returns, so the
-  clients' re-read always sees the transition.
-- **Mergeability** (`mergeable` on the PR object) is computed on read with
-  `merge-tree`, not cached.
-- **Argument hygiene:** ref names and repo names validated by allowlist before
-  use; every spawned command separates options from operands with `--`; owner and
-  repo path components come from database lookups, never from the URL string.
+- **Argument hygiene.** Names are checked against an allowlist first. Every ref
+  or revision from a client is resolved once to a full object id with
+  `rev-parse --verify --end-of-options <rev>^{commit}`; only ids reach
+  `merge-tree`, `commit-tree -p`, `update-ref`, `archive`, `diff-tree`.
+  `--end-of-options` precedes revisions; `--` precedes paths only, and paths are
+  treated as literals with NUL-delimited output (`-z`). Output is size-capped.
+- **Reads:** `for-each-ref`, `rev-parse`, `log`/`rev-list` with a fixed `-z`
+  format, `cat-file`, `ls-tree -r -z`, `diff-tree`, `archive --format=zip`.
+- **Contents write** (POST/PUT): validate the path (reject empty, `.`, `..`,
+  `.git` and its NTFS/HFS aliases, absolute paths; mode 100644 only), `hash-object
+  -w`, a temp `GIT_INDEX_FILE` (`read-tree`, `update-index --cacheinfo`,
+  `write-tree`), `commit-tree`, then `update-ref <ref> <new> <old>` (zero old id
+  for an unborn branch). The branch must pass the protection policy first. A
+  lost CAS rebuilds from the new tip, revalidates the supplied blob `sha`, and
+  retries up to 3 times, then answers 409. Server-made commits bypass
+  `receive.fsckObjects`, so the path rules above are the check.
+- **Per-repo write lock** serializes the server's own ref writes (contents,
+  merges, PR-ref updates). It does not exclude receive-pack; the guarantees below
+  come from Git's atomic ref transaction, not the lock.
+
+### Merge
+
+`POST /pulls/{n}/merge` with `Do: merge` (other values 422). The caller needs
+write access. Steps, all on captured object ids:
+
+1. Resolve `base_oid` and `head_oid` once. If `head_commit_id` is present and
+   differs from `head_oid`, answer the recorded stale-head response.
+2. If the PR is already merged or closed, answer the recorded response. If
+   `head_oid` is an ancestor of `base_oid`, answer Gitea's "nothing to merge"
+   form (405, "Please try again later", `changed_files` 0).
+3. Required status check: if the base has a protection rule with
+   `enable_status_check`, every context in `status_check_contexts` must have a
+   latest status of `success` on **`head_oid`** (missing, pending, failure and
+   error refuse with the recorded 405 or 409 and the text "required status
+   checks"). No admin bypass in v1.
+4. `git merge-tree --write-tree base_oid head_oid`: exit 0 is clean, exit 1 is a
+   conflict (answer the recorded conflict form), anything else is an internal
+   error. Never infer from output presence.
+5. Insert a `merge_intents` row (PR, `base_oid`, `head_oid`, `merge_oid` computed
+   by `commit-tree -p base_oid -p head_oid`, state `pending`).
+6. One `git update-ref --stdin` transaction: `start`, `verify refs/heads/<head>
+   <head_oid>`, `update refs/heads/<base> <merge_oid> <base_oid>`, `prepare`,
+   `commit`. The `verify` makes "the head I checked is the head I merged" atomic
+   with the base update. If base moved, recompute once or twice (bounded), then
+   answer 405 "try again later"; if the head moved, answer the stale-head
+   response.
+7. Mark the intent done and the PR merged (`merge_commit_sha`,
+   `head_sha_at_merge`, `changed_files_at_merge`) in one SQLite transaction; return
+   200. After this the PR reads `merged: true` immediately.
+
+**Crash recovery.** Git and SQLite cannot commit together, so the intent row is
+the journal. On startup and on any read or merge retry that finds a `pending`
+intent: if the base ref equals `merge_oid`, finalize the PR as merged; if it
+equals `base_oid`, mark the intent aborted; otherwise (base moved on) the merge
+landed if `merge_oid` is an ancestor of the base, else aborted. A retried merge
+request therefore recovers the original outcome instead of reporting "nothing to
+merge". The merge commit message and identity follow Gitea's (`Merge pull
+request '<title>' (#<n>) from <head> into <base>`, the merging user).
+
+**Mergeability** (`mergeable`, and `changed_files` on open PRs) is computed with
+`merge-tree` and cached by `(base_sha, head_sha)`, which are content-addressed so
+the cache never goes stale. Closed and merged PRs never run it. List endpoints
+use the cache and compute misses under a small concurrency limit.
+
+**PR head lifecycle.** An open PR's `head.sha` is the live branch tip (a
+force-push shows immediately); a merged PR's `head.sha` is frozen at merge; a
+closed PR keeps its last head through `refs/forge/pull/<n>/head`. Whether a
+push of the head commit straight into base marks the PR merged, as Gitea does, is
+decided from the recorded fixtures.
+
+### Statuses
+
+Any caller with write on the repo may post any context (Gitea's trust boundary:
+the writer is trusted, status contexts are not attestations; stated here so it is
+not mistaken for one). "Latest" per context is the highest insertion id. The
+combined `state` and `X-Total-Count` follow the fixtures.
+
+### Repository lifecycle
+
+- **Create:** insert the row (`state=creating`), create the directory
+  (`git init --bare` with the sanitized environment, `HEAD` symbolic to
+  `refs/heads/<default_branch>`), optionally the initial commit (`auto_init`),
+  then mark live. A startup reconciler removes directories with no live row and
+  completes or removes `creating` rows.
+- **Delete:** mark `deleting` (new work for that id is rejected), terminate the
+  repo's registered children, rename the directory into `trash/`, delete the row,
+  then remove the trash. Hooks verify `FORGE_GENERATION` against the database so
+  a straggler fails closed.
+- **Default branch:** PATCH updates the row and bare `HEAD` together; the
+  reconciler repairs a mismatch. A repo is `empty` when `HEAD` does not resolve
+  (computed live). Names: lower-case uniqueness enforced by a database index;
+  reserved names (`api`, `admin`, `assets`, `user`, `login`, and the rest of
+  Gitea's list), leading `-` or `.`, a trailing `.git`, and anything outside
+  `[A-Za-z0-9._-]` are rejected.
 
 ### HTTP surface rules
 
 - JSON errors in Gitea's shape `{"message": "...", "url": "<base>/api/swagger"}`
-  with the status and message texts the fixtures pin.
-- Pagination: `page` and `limit` (cap 50, default 30), `X-Total-Count`, and a
-  `Link` header where Gitea sends one. Routes Gitea does not paginate do not
-  paginate here.
-- Request limits: JSON body cap, a header cap, a git request cap
-  (`--max-pack-size`, reusing ADR-0041's vocabulary), an idle timeout, a global
-  connection cap, and a per-git-process wall-clock limit.
-- `GET /api/v1/version` answers a Gitea-compatible version string plus a
-  `sc-forge` build suffix; clients only use the route as a health probe.
+  with the recorded statuses and texts.
+- Pagination: `page`, `limit` (cap 50), `X-Total-Count`, `Link` where Gitea
+  sends one; ordering is pinned per route from the fixtures. Routes Gitea does
+  not paginate do not paginate here.
+- Limits: JSON body cap, header cap, idle timeout, global connection cap, git
+  request caps (inflated size included).
+- `GET /api/v1/version` answers a Gitea-compatible version plus a `sc-forge`
+  suffix; clients use the route as a health probe.
 
 ### CLI
 
 ```
-sc-forge serve --data-dir DIR --listen ADDR --public-url URL [limits…]
+sc-forge serve --data-dir DIR --listen ADDR --public-url URL [--behind-proxy|--allow-plaintext] [limits…]
 sc-forge admin user create --username U --password P --email E [--admin] [--must-change-password=false]
 sc-forge admin user change-password --username U --password P [--must-change-password=false]
 sc-forge admin user generate-access-token --username U [--token-name N] [--scopes S,…] [--raw]
 sc-forge admin org create --name O --owner U
-sc-forge hook pre-receive          # internal
+sc-forge hook pre-receive|post-receive      # internal
 ```
 
-`admin` operates on the data dir directly (SQLite locking makes it safe while
-`serve` runs); it needs no network.
+`admin` operates on the data directory directly and needs no network.
+
+### Backup and durability
+
+The supported backup is a crash-consistent volume snapshot. SQLite WAL and Git
+ref updates both survive a crash, and the merge-intent journal plus the
+reconcilers repair the only cross-store gap. Copying `forge.db` alone is not a
+backup (it omits WAL contents). `synchronous=FULL` and Git's default fsync are
+kept. A restore test (kill -9 loop during pushes and merges, then reconcile and
+compare) ships with F4.
 
 ## Phases
 
+Every slice ends with its conformance fixtures passing `check`, plus end-to-end
+tests driving `sc-forge` with real `git`.
+
 | # | Slice | Done when |
 |---|---|---|
-| F0 | Contract | Recorder harness plus fixtures from Gitea 1.22.6 and 1.26.2 (`crates/forge/conformance/`), this spec, ADR-0058 Proposed, reviewed. |
-| F1 | Skeleton, auth, bootstrap CLI | `serve` boots; migrations; users, orgs, tokens (Basic mint/list/delete), scopes, `/version`, `/healthz`, `/user`, `/users/{u}`, admin user create/patch, permissions; `admin …` CLI parity. Tier-1 non-repo fixtures pass `check`. |
-| F2 | Repos and Git transport | Repo create/get/patch/search/delete, collaborators, `branches/{b}`, smart HTTP with ACL and pre-receive hook. Real `git` clone, push, fetch-by-sha, partial clone, shallow, `--force-with-lease`; 401 and foreign-token behaviour match fixtures. The multi-tenant threat-model pass is done before this merges. |
-| F3 | Content API | Branches, refs, commits, git commits/trees/diff, contents GET/POST/PUT, archive zip. |
-| F4 | PRs, statuses, merge, protection | Pulls, reviews, comments, merge (stale-head guard, conflict, empty, protection refusals), statuses with latest-per-context, branch protection. |
-| F5 | Ops | Container image (git 2.40+, no sshd), limits, structured logs, `--data-dir` backup note, optional TLS decision. |
-| F6 | Conformance on the first deployment | The consumers' own end-to-end flows run with only the Project Git host swapped. src-control's exit gate. |
+| F0 | Contract | Recorder harness and fixtures from Gitea 1.22.6 and 1.26.2 merged, findings reconciled into this spec, ADR-0058 reviewed. |
+| F1 | Skeleton, auth, bootstrap CLI | `serve` boots; migrations; router table with per-route policy; users, orgs, tokens, scopes, the credential-rule table with negative tests (token cannot mint tokens; Alice's password cannot mint Bob's); `/version`, `/healthz`, `/user`, admin users; `admin …` parity; crypto-crate additions. |
+| F2 | Repos and Git transport | Repo create/get/patch/search/delete lifecycle with reconcilers, collaborators, `branches/{b}`, `http-backend` transport with ACL, environment scrub, ref-namespace policy, admission control, process groups. Real `git`: clone, push, fetch-by-sha, `blob:none`, shallow, `--force-with-lease`, gzip request bodies, replace-ref push refused. **Threat-model pass #1 (auth, tenancy, transport, resources) merges with this slice** as a `docs/THREAT-MODEL.md` section plus the tests it names. |
+| F3 | Content API | Branches, refs, commits, git commits/trees/diff, contents GET/POST/PUT with the protection policy and path rules, archive zip. |
+| F4 | PRs, statuses, merge, protection | Pulls, reviews, comments, statuses, protection, merge with intents and recovery, PR retention refs. **Threat-model pass #2 (server-side writes, merge races, contents bypass)**, kill -9 restore test, protection-bypass tests across receive-pack, contents and merge. |
+| F5 | Ops | Container image (current git, no sshd), cgroup limits documented, structured logs without secrets, maintenance gc, SIGTERM drain test, free-space admission test, bind-gate tests. |
+| F6 | Conformance on the first deployment | The consumers' own end-to-end flows run with only the Project Git host swapped. src-control's exit gate; not reproducible from this repo's CI. |
 
 ## Conformance
 
 `crates/forge/conformance/run.py` has two modes. `record` drives real Gitea
-through scenarios and writes normalized fixtures (status, selected headers,
-body, placeholders for shas, timestamps, ids and hosts). `check` replays the same
-scenarios against any server and compares: status exactly, recorded headers,
-every recorded JSON key present with the same JSON type (extra keys allowed),
-and message texts by the distinctive substrings the scenario lists.
+through scenarios and writes normalized fixtures; `check` replays them against
+any server. Normalization keeps identity: shas and ids become stable
+placeholders (`<sha#1>`, `<sha#2>`), so two different commits stay distinct and
+`merged: true` cannot match `merged: false`. `check` compares status exactly,
+recorded headers, and every recorded JSON value after normalization; only keys
+marked volatile (timestamps, host-bearing URLs) are type-only. Scenarios may
+carry state assertions (merged after merge, `head.sha` changes after a push).
+Message texts are compared by the distinctive substrings the scenario lists.
 
-The recorded fixtures are the contract. Where fixtures from the two Gitea
-versions differ, the spec names the version `sc-forge` follows (the older
-pinned compose version, 1.22.6, unless a client needs the newer behaviour).
-Fixtures replace the clients' hand-authored transcripts, several of which are
-labelled "authored, not recorded". F6 is the acceptance run, not the regression
-suite: CI runs `check` plus end-to-end tests that drive `sc-forge` with real
-`git`.
-
-## Threat model (to complete before F2 merges)
-
-Hosting other people's repositories is the first time this project accepts
-untrusted writers over a network, which `docs/THREAT-MODEL.md` names as a
-revisit trigger for signed ref attestation. The F2 gate covers:
-
-- Token handling: hashing, constant-time compare, expiry, scope enforcement
-  matrix per route, per-login rate limit on passwords, token and password
-  redaction in logs.
-- Tenant isolation: repo path derivation, ref and path validation, argument
-  injection into `git`, symlink and `..` handling in contents and archive.
-- Resource abuse: pack size, object count, decompression, concurrent processes,
-  slow clients, giant trees.
-- Hook confinement: `core.hooksPath` pinned, no repo-supplied hooks, no
-  `core.fsmonitor`/`core.sshCommand`/`protocol` config reachable from a pushed
-  repo.
-- Ref rollback and force pushes: the existing deferred gittuf-style signed ref
-  attestation is out of scope here; v1 documents the gap.
-- Data integrity: SQLite and repo directory consistency after a crash (repo
-  create and delete are two-phase with a startup reconciler).
+Where the two Gitea versions differ, the spec names the version `sc-forge`
+follows: the older pinned one (1.22.6) unless a client needs the newer. The
+fixtures replace the clients' hand-authored transcripts, several of which are
+labelled authored, not recorded. CI runs `check` against the in-tree server on
+every PR.
 
 ## Open questions
 
-1. Foreign-token status (401 or 404) and the exact merge texts are decided by the
-   recorded fixtures, not here.
+1. Foreign-token and nonexistent-repo statuses, merge refusal texts, the
+   manually-merged PR detection, and paging order come from the recorded
+   fixtures and are folded into this spec when F0 closes.
 2. TLS: all known deployments terminate at a proxy or private network. Add
-   `tlsio` only if a deployment needs it; it needs a sync-to-hyper adapter.
-3. Which Gitea version string `/version` reports.
-4. Whether `has_actions` PATCH is accepted and ignored or refused.
+   `tlsio` only if one needs it (it needs a sync-to-hyper adapter).
+3. Which Gitea version string `/version` reports; whether `has_actions` PATCH is
+   accepted and ignored or refused.
+4. Signed ref attestation (the THREAT-MODEL's deferred gittuf-shaped item) is out
+   of scope; v1 documents the rollback gap.

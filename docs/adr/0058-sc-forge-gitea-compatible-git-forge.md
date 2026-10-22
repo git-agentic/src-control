@@ -24,9 +24,12 @@ limits, but no forge. It does not host Git repos for others, and
 
 ## Decision
 
-1. **Hosted repos are bare Git.** The forge serves them with spawned
-   `git upload-pack` and `git receive-pack` (`--stateless-rpc`). `gix` has no
-   server side, and the P18 bridge already depends on system `git`. The `.sc/`
+1. **Hosted repos are bare Git.** The forge serves them by running
+   `git http-backend` as a CGI per request, after its own authentication and
+   authorization (write access sets `REMOTE_USER`, without which receive-pack
+   answers 403). `gix` has no server side, and the P18 bridge already depends on
+   system `git`. Using `http-backend` keeps the advertisement framing, content
+   types, gzip request handling and protocol v2 in Git's hands. The `.sc/`
    alternative is rejected for now: P9 export fails closed on encrypted content
    and private branches are refused at the Git bridge, so `.sc/` repos behind a
    Git face would carry the cost of both models without delivering either's
@@ -46,24 +49,47 @@ limits, but no forge. It does not host Git repos for others, and
    rebase merge: every client sends `Do: merge` and no UI exists for a human to
    choose; other values answer 422. Same-repo pull requests only.
 4. **New top-level adapter `crates/forge` (package `scl-forge`, binary
-   `sc-forge`).** It does not link `scl-repo`. `gix` stays in `gitio` and is not
-   used; rustls stays in `tlsio` and TLS is deferred (known deployments
-   terminate at a proxy). `CLAUDE.md`'s dependency rule is amended in the first
-   code PR.
+   `sc-forge`) linking `{crypto, core}` only.** It does not link `scl-repo`,
+   `vfs` or `gitio`. Password hashing (`argon2`), token generation and the
+   constant-time compare are added to `crates/crypto` so RustCrypto stays
+   quarantined there. `gix` is not used; rustls stays in `tlsio` and TLS is
+   deferred (known deployments terminate at a proxy). `CLAUDE.md`'s dependency
+   rule gains `forge → {crypto, core}` in the first code PR. The crate is
+   unix-only behind a stub `main`.
 5. **Metadata is SQLite on the data disk** (`rusqlite`, bundled, WAL, numbered
    migrations): PR lists, latest-status-per-context and collaborator joins are
    relational and need transactions. One writer process; the disk snapshot is
    the backup, as with Gitea today.
-6. **Runtime is `hyper` + `tokio`, confined to `scl-forge`.** Both are already
-   in the lockfile through `objio`. Hand-rolling HTTP parsing for streamed pack
-   bodies and 40 routes was rejected. `sc serve --http`'s thread-per-connection
+6. **Runtime is a `hyper` (HTTP/1) server on a multi-thread `tokio` runtime,
+   confined to `scl-forge`.** Both crates are already in the lockfile through
+   `objio`'s S3 SDK (which uses only tokio's `rt`); this adds the server and the
+   multi-thread runtime to one crate. Hand-rolling HTTP parsing for streamed
+   pack bodies and 40 routes was rejected. `sc serve --http`'s thread-per-connection
    server is unchanged.
-7. **Merge is synchronous and server-side, in the bare repo, by plumbing:**
-   `git merge-tree --write-tree` plus `commit-tree` with two parents, then a
-   compare-and-swap `update-ref`, under a per-repo lock. The `head_commit_id`
-   guard compares against the live head tip. This gives clients a real merge
-   commit (the ancestry rule of their landing check) and makes `merged: true`
-   visible on the next read. Minimum `git` 2.40.
+7. **Merge is synchronous and server-side, in the bare repo, by plumbing, on
+   captured object ids.** Required status contexts are checked against the head
+   id, `git merge-tree --write-tree` (exit code 1 means conflict) and
+   `commit-tree` build a two-parent merge commit, and one `update-ref --stdin`
+   transaction with `verify <head> <head_oid>` and `update <base> <new> <old>`
+   publishes it, so "the head I checked is the head I merged" is atomic. A
+   `merge_intents` journal row written before the ref update makes the
+   Git/SQLite gap recoverable: startup and retries finalize or abort from the ref
+   state. The merge is the only path allowed onto a protected branch. This gives
+   clients a real merge commit (the ancestry rule of their landing check) and
+   `merged: true` on the next read.
+7a. **Protection is one policy for every mutation path.** Receive-pack
+   (pre-receive), contents writes and merges share one function; client pushes
+   are limited to `refs/heads/*` and `refs/tags/*` (so `refs/replace/*` and
+   server refs cannot be written), every Git spawn runs with
+   `GIT_NO_REPLACE_OBJECTS=1`, a scrubbed environment and a pinned
+   `core.hooksPath`, and the server keeps `refs/forge/pull/<n>/head` so
+   unmerged PR commits survive branch deletion and gc.
+7b. **Credentials are strictly separated by route.** Token routes accept a
+   user's password only (never a token) and only for that user; every other
+   route accepts a token only (a Basic password is never tried as a password).
+   Scopes cannot be raised by a token; `public-only` is rejected at issuance.
+   Repo identity on disk is an immutable id, so delete-and-recreate cannot alias
+   a running process.
 8. **Token format and storage.** Tokens are 40 hex characters (the length
    Gitea issues), stored as BLAKE3 hashes, compared in constant time, with
    optional expiry and scopes (`all`, `read|write:{repository,user,
@@ -91,6 +117,8 @@ limits, but no forge. It does not host Git repos for others, and
   incident. Gitea behaviours the clients do not exercise are not promised.
 - Recording from two Gitea versions will expose differences; the forge follows
   the older pinned version unless a client requires the newer.
+- The threat-model pass runs twice: with F2 (authentication, tenancy, transport,
+  resources) and with F4 (server-side writes, merge races, contents bypass).
 - Phase F6 is an acceptance run against the first deployment's own end-to-end
   flows. It is src-control's exit gate but cannot run from this repository's CI;
   the fixtures and `check` are the regression suite.
