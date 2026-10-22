@@ -153,7 +153,7 @@ and a new directory, so a lingering process cannot see the replacement.
 `users` (login, lower_login UNIQUE, kind user|org, email, password hash,
 is_admin, visibility), `org_members`, `tokens` (user, name, BLAKE3 hash,
 last_eight, scopes, expires_at), `repos` (id, owner, name, lower_name UNIQUE per
-owner, private, description, default_branch, state live|deleting),
+owner, private, description, default_branch, state creating|live|deleting),
 `collaborators`, `pulls` (repo, number, head_ref, base_ref, title, body, state,
 merged, merge_commit_sha, `head_sha_at_merge`, `changed_files_at_merge`,
 timestamps), `merge_intents`, `reviews`, `comments`, `commit_statuses` (repo,
@@ -248,7 +248,15 @@ line (`Status:` and headers), then the body is streamed.
   `uploadpack.allowReachableSHA1InWant=true`, `uploadpackfilter.allow=false` with
   an explicit allow for `blob:none` only, `receive.fsckObjects=true`,
   `receive.maxInputSize`, `receive.autogc=false`, `gc.auto=0`,
-  `core.useReplaceRefs=false`. Only the `pre-receive` and `post-receive` hook
+  `core.useReplaceRefs=false`, and durability (`core.fsync=all`,
+  `core.fsyncMethod=fsync`, `receive.fsyncObjects=true`), so a loose object or ref
+  that SQLite later records as complete is on disk first. Commit-producing spawns
+  (`commit-tree` for auto-init, contents writes and merges) get an explicit
+  identity: `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` = the acting user's login and
+  `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` = `<login>@noreply.<public-url host>`,
+  with the acting user being the merger for merges and the authenticated writer for
+  contents; server-originated commits (auto-init by a service account) use the
+  creating user. No identity comes from system, global or repository config. Only the `pre-receive` and `post-receive` hook
   shims exist; the hook child receives only `FORGE_REPO_ID`, `FORGE_USER_ID`,
   `FORGE_GENERATION`, `FORGE_DB` and git's quarantine variables.
 - **Ref namespace policy** (pre-receive): client pushes may write `refs/heads/*`
@@ -275,8 +283,13 @@ line (`Status:` and headers), then the body is streamed.
 - **PR retention:** the server keeps `refs/forge/pull/<n>/head` for every PR.
   It is created **before** the PR row is inserted (so a crash leaves at worst an
   orphan ref, never a PR whose head can be pruned), refreshed by `post-receive`
-  **only while the PR is open**, frozen when the PR is closed or merged (the final
-  head is written in the same step that records `head_sha_at_merge` or the close),
+  **only while the PR is open**, frozen when the PR is closed or merged. Freezing is ordered
+  **ref first, then database**: the final head is written to the ref, then the
+  SQLite transition records `head_sha_at_merge` or the close (for a merge this is
+  step 7 of the merge algorithm, after the base update; the `merge_intents` row
+  covers the gap). The reconciler repairs closed and merged PRs as well as open
+  ones: for each it makes the ref equal the stored final head (`head_sha_at_merge`,
+  or the head recorded at close), recreating it if missing,
   and the pre-receive hook records the head into it before allowing a deletion of
   an open PR's head branch. A startup reconciler removes `refs/forge/pull/<n>/*`
   refs with no PR row and recreates a missing ref for an open PR from its stored
@@ -455,7 +468,7 @@ sc-forge hook pre-receive|post-receive      # internal
 The supported backup is a crash-consistent volume snapshot. SQLite WAL and Git
 ref updates both survive a crash, and the merge-intent journal plus the
 reconcilers repair the only cross-store gap. Copying `forge.db` alone is not a
-backup (it omits WAL contents). `synchronous=FULL` and Git's default fsync are
+backup (it omits WAL contents). `synchronous=FULL` and the Git fsync settings above are
 kept. A restore test (kill -9 loop during pushes and merges, then reconcile and
 compare) ships with F4.
 
