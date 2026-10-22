@@ -603,8 +603,9 @@ header. Decisions drawn from it, beyond those stated in the sections above:
   default branch leaves `empty: true` (computed from `HEAD`).
 - **Names.** Duplicate repo names are case-insensitive (409). Rename answers 422
   (departure; Gitea redirects). `PATCH default_branch` naming a missing branch
-  answers 422 (Gitea silently keeps the old one). Reserved names are the union of
-  both versions' lists plus `api`.
+  answers 422 (Gitea silently keeps the old one). Reserved-name lists apply to user
+  and organization names only (union of both versions' lists plus `api`); repo
+  names follow the "Repository lifecycle" rules above.
 - **Messages to reproduce** (clients match on them): repo duplicate 409 `The
   repository with the same name already exists.`; user and org duplicate 422
   `user already exists [name: x]`; stale head 409 `head out of date`; protection
