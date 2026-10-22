@@ -170,7 +170,7 @@ their binary's, and `serve` never caches users or tokens across requests.
 
 | Route class | Accepted credential | Additional rule |
 |---|---|---|
-| `/users/{u}/tokens*` | Basic with the user's **password only**. A token is never accepted here, as password or header. (Recorded Gitea accepts an all-scope token as the Basic password on these routes. Whether a read-only token can mint a broader one that way was not recorded in the first pass; accepting any token here would let it, so this is a defensive departure. Site admins are held to the same rule until a recording shows otherwise.) | Authenticated user must equal `{u}`. |
+| `/users/{u}/tokens*` | Basic with the user's **password only**. A token is never accepted here, as password or header. (Recorded Gitea accepts an all-scope token as the Basic password on these routes. Whether a read-only token can mint a broader one that way was not recorded in the first pass; accepting any token here would let it, so this is a defensive departure. A read-only token as the Basic password is refused 403 in Gitea, so the defensive departure only closes the broader-scope variants.) | Authenticated user must equal `{u}`, or be a site admin authenticating with their own password (recorded: allowed in Gitea; the admin's token is 401 there). |
 | `admin/*` | Token with `write:admin` (or `read:admin` for GETs), user must be site admin. | |
 | Everything else | `token T`, `Bearer T`, or Basic with a **token** as password under any username, or the token as username with an empty password (recorded for git; API recordings for Bearer and token-as-username are in the follow-up scenarios). A Basic password is never tried as a user password. | Scope and actor rules below. |
 
@@ -501,7 +501,7 @@ header. Decisions drawn from it, beyond those stated in the sections above:
   405 "try again later"; unrelated histories answer a classifiable 409; `Do`
   other than `merge` is 422 (Gitea: 500 for `fast-forward-only`, other styles
   accepted); `private:false` is not stored; token routes refuse tokens and
-  require the caller to be `{u}`; client pushes limited to `refs/heads/*` and
+  require the caller to be `{u}` or a password-authenticated site admin; client pushes limited to `refs/heads/*` and
   `refs/tags/*`; unknown status states are 422; repo rename is 422; `PATCH
   default_branch` to a missing branch is 422; a merged PR's head is frozen;
   receive-pack on a missing repo is 404. Not departures, by the version rule:
@@ -510,9 +510,9 @@ header. Decisions drawn from it, beyond those stated in the sections above:
 
 ## Open questions
 
-1. Site admins minting tokens for other users and a read-only token used as a
-   Basic password on token routes are recorded in the follow-up scenarios; the
-   spec's rule for them is provisional until those land.
+1. The merge of a PR whose head is already in base (recorded: 405 `try again later`,
+   `changed_files` 0) has no departure entry; sc-forge reproduces it, so the
+   fixture applies unchanged.
 2. TLS: all known deployments terminate at a proxy or private network. Add
    `tlsio` only if one needs it (it needs a sync-to-hyper adapter).
 3. Which Gitea version string `/version` reports; whether `has_actions` PATCH is

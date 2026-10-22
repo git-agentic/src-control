@@ -159,3 +159,34 @@ Each version passes its own fixtures (22/22). Checking the 1.22.6 fixtures again
 - A full record run takes about 2.5 to 3 minutes per version and needs a fresh server (the merge
   scenario waits for Gitea's async PR checks and is the slowest, about 45 s).
 - Fixtures are 3.5 MB across the two versions; compact JSON would roughly halve that.
+
+## Additional recordings (review follow-up)
+
+Scenarios W (protected contents) and X (auth forms, token minting), plus additions to H and T.
+
+- **Contents API on a protected `main` with `enable_push:true`:** allowed, with and without
+  `enable_status_check`, even with the required context unmet and nothing posted (`POST contents` 201,
+  `PUT contents` 200, for the write collaborator and the admin). Only `enable_push:false` blocks it
+  (403, scenario Q).
+- **Direct fast-forward push with `enable_push:true`, status check on, context unmet:** accepted
+  (W#8; I#12 confirms). Required status checks gate merges, not pushes.
+- **Auth forms on API routes** (`GET /user`, a private repo read, `POST statuses`): `Authorization:
+  token T`, `Bearer T`, Basic `bot:T`, `oauth2:T`, `anyname:T`, Basic `T:`, and Basic with the real
+  password all work. A bad token is 401 in every form.
+- **Token minting:** the site admin using Basic with the admin's **password** on `POST
+  /users/bot/tokens` is allowed (201) and may list (200). The admin's **token** on that route is `401
+  "auth required"`. A read-only token used as the Basic password on `POST /users/alice/tokens` is
+  refused with 403 (`required scope write:user`) and mints nothing; listing with it is 403
+  (`read:user`).
+- **Combined status:** unknown sha is `200` with empty fields on 1.22.6 and 404 on 1.26.2. A lone
+  `bogus` status reads `state:"bogus"` on 1.22.6 and `"pending"` on 1.26.2, both with `total_count:1`.
+  (An earlier note here said an unknown state counts as failing; that holds only in a mix.)
+- **Unrelated-histories merge:** 409. The 1.22.6 body is `{"Style":"merge","StdOut":"","StdErr":"fatal:
+  refusing to merge unrelated histories\n","Err":{"Stderr":null}}` (no `message` key); the 1.26.2 body
+  is truncated or empty.
+- **Reopening a closed PR whose head branch was deleted** is racy on 1.26.2: the PATCH answers `open`,
+  then the PR sometimes reverts to `closed` (3 of 6 trials). That state is volatile and excluded from
+  comparison.
+- **Harness notes:** `--only` reruns can differ from the full ordered run because later scenarios read
+  state from earlier ones (scenario B makes `alice` private); the full run is the reference. Cross-version
+  `check` now fails about 310 exchanges because error text is compared.
