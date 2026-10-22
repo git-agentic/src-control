@@ -28,11 +28,8 @@ import urllib.request
 import zipfile
 
 TRACKED_HEADERS = ("content-type", "x-total-count", "link", "www-authenticate", "location")
-# Every scalar in a recorded body is compared by value after normalization, except volatile ones:
-# `message`/`errors` (text, see must_contain), any `url`/`*_url` (host-dependent), repo `size`, the racy
-# `mergeable` (a PR flips to "checking" after every base change; see the notes in G/T), `language` and the
-# async open-PR/issue counters, plus
-# paths a call lists in `volatile=[...]` (dotted key path, or a bare key name; `$text` for a text body).
+# Every scalar in a recorded body is compared by value after normalization, except DEFAULT_VOLATILE (below) and
+# the dotted paths a call lists in `volatile=[...]` (`$text` for a text body).
 TOKEN_KEYS = {"sha1", "token", "token_last_eight", "password"}
 SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
 SHORT_RE = re.compile(r"\b[0-9a-f]{7,12}\.\.\.?[0-9a-f]{7,12}\b")
@@ -121,13 +118,22 @@ def eq_str(exp, act, bij, d, shown):
     return True
 
 
+# Keys compared by type only, at any depth. Everything else is compared by value, including `url`/`*_url`
+# (after the base URL became <base>), commit/review `message`, `body` and status `description`.
+#   avatar_url            hash of the e-mail or a generated avatar; differs per server
+#   mergeable             flips while Gitea re-checks a PR after every base change
+#   language              repo language stats are computed asynchronously
+#   open_pr_counter, open_issues_count   async counters in embedded repo objects
+#   size (repo objects only, detected by `full_name`)   disk size of the bare repo
+# Per-call/per-departure entries (`volatile=`, `ignore_fields`) are dotted paths and match only that path.
+# The top-level `message`/`errors` of an HTTP error response are compared as text by cmp_exchange instead.
+DEFAULT_VOLATILE = {"avatar_url", "mergeable", "language", "open_pr_counter", "open_issues_count"}
+
+
 def is_volatile(key, dotted, parent, volatile):
-    if dotted in volatile or key in volatile:
+    if dotted in volatile or key in DEFAULT_VOLATILE:
         return True
-    k = key or ""
-    if k in ("message", "errors", "url", "mergeable", "language", "open_pr_counter", "open_issues_count") or (k.endswith("_url") and k != "target_url"):
-        return True
-    return k == "size" and isinstance(parent, dict) and "full_name" in parent
+    return key == "size" and isinstance(parent, dict) and "full_name" in parent
 
 
 def cmp_json(exp, act, path, d, volatile, bij, key=None, parent=None):
@@ -210,7 +216,7 @@ def refusal_lines(text):
     return out
 
 
-def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None):
+def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None, skip_headers=()):
     """Return [(level, text)] where level is 'fail' or 'warn'. Empty list means match."""
     d = []
     bij.new_exchange()
@@ -264,12 +270,16 @@ def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None):
             d.append(("fail", f"first read {act['first_read_differs']['first']} differs from the settled "
                               f"{act['first_read_differs']['settled']} (--strict-first-read)"))
         for h, v in exp.get("headers", {}).items():
+            if h in skip_headers:
+                continue
             got = act.get("headers", {}).get(h)
             if got is None:
                 d.append(("fail", f"header {h}: expected {v!r}, missing"))
             else:
                 eq_str(v, got, bij, d, f"header {h}")
         volatile = set(exp.get("volatile", [])) | set(extra_volatile)
+        if es >= 400 or act["status"] >= 400:
+            volatile |= {"message", "errors"}  # top-level error text: compared above (or by a departure)
         if "body" in exp:
             if "body" not in act:
                 d.append(("fail", f"expected JSON body, got {act.get('body_text', '')[:120]!r}"))
@@ -318,7 +328,8 @@ def dep_indexes(spec, expected):
     return [i for i, e in enumerate(expected) if e.get("name") == spec or e.get("key") == spec]
 
 
-EXPECT_KEYS = {"status", "message_contains", "ok", "value", "fields", "ignore_fields", "ignore_body", "skip"}
+EXPECT_KEYS = {"status", "message_contains", "ok", "value", "fields", "ignore_fields", "ignore_body",
+               "ignore_headers", "skip"}
 
 
 def ex_ident(ex):
@@ -430,9 +441,17 @@ def apply_override(exp, act, ov, bij, match=None):
                 if got != v:
                     d.append(("fail", f"unexpected: {k} {v!r} expected, got {got!r}"))
         pins = list((e.get("fields") or {}))
-        if not e.get("ignore_body") and sts is None and (e.get("ignore_fields") or pins):
+        status_ok = sts is None or act["status"] in sts
+        if status_ok:
+            # everything the entry does not replace is still compared: headers (minus `ignore_headers`), the body
+            # minus `ignore_fields` and the pinned keys, or no body at all only with an explicit `ignore_body`
+            if e.get("ignore_body"):
+                saved = exp
+                exp = {k: v for k, v in exp.items() if k not in ("body", "body_text", "body_prefix_hex", "archive")}
             skip = list(e.get("ignore_fields") or []) + [k for k in pins if k != "$len"]
-            d += [x for x in cmp_exchange(exp, act, bij, extra_volatile=skip) if x[0] == "fail"]
+            d += [x for x in cmp_exchange(exp, act, bij, extra_volatile=skip,
+                                          status_override=act["status"] if sts is not None else None,
+                                          skip_headers=tuple(e.get("ignore_headers") or [])) if x[0] == "fail"]
     return d or [("honoured", why)]
 
 
@@ -495,11 +514,13 @@ class Ctx:
         return re.sub(r"\b%s\b" % re.escape(self.admin_user), "<admin>", s)
 
     def ns(self, s):
-        s = re.sub(r"(://)[^/@\s\"']+@", r"\1<creds>@", self.scrub(s))
+        s = re.sub(r"(://)[^/@\s\"':]*:[^/@\s\"']*@", r"\1<creds>@", self.scrub(s))  # user:password@ only (ssh://git@ stays)
         # pkt-line adverts glue a 4-hex length in front of the id ("0146<sha> HEAD"), so \b misses it
         s = re.sub(r"[0-9a-f]{40}(?= (?:HEAD|refs/|capabilities))", lambda m: self.sha_ph(m.group(0)), s)
         s = SHA_RE.sub(lambda m: self.sha_ph(m.group(0)), s)
         s = SHORT_RE.sub("<short>..<short>", s)
+        # database counters inside URL fragments (`#issuecomment-7`) depend on everything created before
+        s = re.sub(r"#(issuecomment|issue|event)-(\d+)", lambda m: f"#{m.group(1)}-" + self.id_ph("fragment:" + m.group(1), int(m.group(2))), s)
         return RFC_RE.sub("<ts>", TS_RE.sub("<ts>", s))
 
     def nj(self, v):
@@ -871,6 +892,12 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
                         continue
                     if i in c.overrides:
                         stale.append(f"duplicate departure for #{i} ({dep.get('reason', '')})")
+                        continue
+                    rs, sts = c.expected[i].get("status"), dep["expect"].get("status")
+                    sts = sts if isinstance(sts, list) else ([sts] if sts is not None else [])
+                    if rs is not None and any((x >= 400) != (rs >= 400) for x in sts) and not dep["expect"].get("ignore_body"):
+                        stale.append(f"departure #{i} changes the status class (recorded {rs}, expects {sts}): its body "
+                                     f"cannot match the recorded one, so it needs ignore_body with a reason")
                         continue
                     c.overrides[i] = dict(dep, match=matches[k] or got)
         t0 = time.time()

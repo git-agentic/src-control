@@ -423,7 +423,7 @@
         "html_url": "<base>/botorg/legit",
         "url": "<base>/api/v1/repos/botorg/legit",
         "link": "",
-        "ssh_url": "ssh://<creds>@localhost:2222/botorg/legit.git",
+        "ssh_url": "ssh://git@localhost:2222/botorg/legit.git",
         "clone_url": "<base>/botorg/legit.git",
         "original_url": "",
         "website": "",

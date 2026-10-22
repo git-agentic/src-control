@@ -42,9 +42,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "errors": null,
         "message": "not found",
-        "url": "<base>/api/swagger"
+        "url": "<base>/api/swagger",
+        "errors": null
       }
     },
     {
@@ -437,7 +437,7 @@
         "html_url": "<base>/botorg/legit",
         "url": "<base>/api/v1/repos/botorg/legit",
         "link": "",
-        "ssh_url": "ssh://<creds>@localhost:2222/botorg/legit.git",
+        "ssh_url": "ssh://git@localhost:2222/botorg/legit.git",
         "clone_url": "<base>/botorg/legit.git",
         "original_url": "",
         "website": "",
@@ -540,9 +540,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "message": "not found",
         "url": "<base>/api/swagger",
-        "errors": null
+        "errors": null,
+        "message": "not found"
       }
     }
   ]

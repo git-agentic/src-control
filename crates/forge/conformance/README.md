@@ -62,9 +62,15 @@ observations called notes). Exchange N of the run is compared with exchange N of
   (`content-type`, `x-total-count`, `link`, `www-authenticate`, `location`, plus any a call tracks),
   and the body.
 - JSON bodies: every recorded key must exist with the same type, extra keys are allowed, arrays must
-  have the same length, and every scalar is compared by **value** after normalization. Only volatile
-  values are compared by type: `message` and `errors` (text), every `url`/`*_url` key (they carry the
-  host), a repo `size`, and paths a call lists in `volatile=[...]`.
+  have the same length, and every scalar is compared by **value** after normalization. That includes
+  commit, review and status `message`/`body`/`description` content and every `url`/`*_url` (html_url,
+  clone_url, ssh_url, commit_url, target_url, ...) once the base URL is `<base>`, so a response that names
+  the wrong repository fails. Only an explicit allowlist (`DEFAULT_VOLATILE` in `run.py`, with a comment
+  per entry) and the dotted paths a call lists in `volatile=[...]` are compared by type: `avatar_url`
+  (avatar hash), `mergeable` (flips while a PR is checked), `language` and the open-PR/issue counters
+  (computed asynchronously), repo `size`. The top-level `message`/`errors` of an HTTP error response are
+  compared as text (next bullet). Database counters inside URL fragments (`#issuecomment-7`) are
+  normalized to placeholders.
 - Error text: for every recorded exchange with status >= 400 whose body has `message` (or a non-empty
   `errors`), the actual text must equal the recorded text after normalization: lower case, and only
   id-shaped trailing details dropped (`[uid: 0, name: ]`, `[id: x, rel_path: ]`, numeric `id:`/`issue_id:`
@@ -107,9 +113,16 @@ success, ...), as well as every deliberate sc-forge difference.
   including for `skip`.
 - `expect` keys: `status` (number or list), `message_contains`, `ok` (git), `value` (note; works for
   `strict=False` notes too), `fields` (pin body values by dotted path, `$len` pins an array length),
-  `ignore_fields` (compare the recorded body strictly except these keys), `ignore_body` (compare only the
-  checks above) and `skip` (only when unavoidable; say why in `reason`).
-- An entry with `fields` or `ignore_fields` and no `status` still compares the rest of the body strictly.
+  `ignore_fields` (dotted paths left out of the body comparison), `ignore_headers` (recorded headers left out),
+  `ignore_body` (no body comparison at all) and `skip` (only when unavoidable; say why in `reason`).
+- A departure replaces only what it names. Whatever it sets (`status`, `fields`, `message_contains`, ...), the
+  recorded headers (minus `ignore_headers`) and every JSON field not in `ignore_fields` or `fields` are still
+  compared, and a top-level error `message` is checked by `message_contains` instead of the recorded text.
+  Only an explicit `ignore_body` drops the body comparison. If a departure moves the status across the
+  2xx/4xx boundary (for example 201 to 422) the recorded body cannot match, so the run fails with
+  "needs ignore_body with a reason" until the entry says so; the generator adds `ignore_body` and the reason
+  in that case, plus `ignore_headers` for the headers that cannot exist on the other side (`location`,
+  `x-total-count`, `link`, and `content-type` of a redirect).
 - Load errors (the run aborts): unknown scenario id, unknown `expect` key, missing `reason`, `kind` or `match`,
   a range or list without matching `matches`, two entries for one (scenario, index), and any entry that
   expects a refusal (`status` >= 400 or `ok:false`) without `message_contains`, so a departure cannot hide

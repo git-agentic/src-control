@@ -34,9 +34,10 @@
    "status": 422,
    "message_contains": [
     "merge"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge supports only Do=merge, not squash (reword message_contains once sc-forge's text is fixed)"
+  "reason": "sc-forge supports only Do=merge, not squash (reword message_contains once sc-forge's text is fixed) [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "G",
@@ -91,9 +92,10 @@
    "status": 422,
    "message_contains": [
     "merge"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge supports only Do=merge, not rebase (reword message_contains once sc-forge's text is fixed)"
+  "reason": "sc-forge supports only Do=merge, not rebase (reword message_contains once sc-forge's text is fixed) [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "G",
@@ -148,9 +150,10 @@
    "status": 422,
    "message_contains": [
     "merge"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge supports only Do=merge, not rebase-merge (reword message_contains once sc-forge's text is fixed)"
+  "reason": "sc-forge supports only Do=merge, not rebase-merge (reword message_contains once sc-forge's text is fixed) [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "G",
@@ -191,9 +194,10 @@
    "status": 422,
    "message_contains": [
     "merge"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge supports only Do=merge, not fast-forward-only (reword message_contains once sc-forge's text is fixed)"
+  "reason": "sc-forge supports only Do=merge, not fast-forward-only (reword message_contains once sc-forge's text is fixed) [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "G",
@@ -332,7 +336,8 @@
    "message_contains": [
     "conflict",
     "unrelated"
-   ]
+   ],
+   "ignore_body": true
   },
   "reason": "sc-forge sends {\"message\":\"Merge conflict: unrelated histories\"}; Gitea sends a {Style,StdOut,StdErr,Err} body (1.26.2 truncates it)"
  },
@@ -589,9 +594,10 @@
    ],
    "message_contains": [
     "password"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
+  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused [ignore_body: the recorded 201 body has another shape than the departed answer]"
  },
  {
   "scenario": "R",
@@ -605,9 +611,13 @@
    ],
    "message_contains": [
     "password"
+   ],
+   "ignore_body": true,
+   "ignore_headers": [
+    "x-total-count"
    ]
   },
-  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
+  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "X",
@@ -718,9 +728,10 @@
    "status": 422,
    "message_contains": [
     "state"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge rejects the unknown status state 'bogus'"
+  "reason": "sc-forge rejects the unknown status state 'bogus' [ignore_body: the recorded 201 body has another shape than the departed answer]"
  },
  {
   "scenario": "H",
@@ -731,9 +742,10 @@
    "status": 422,
    "message_contains": [
     "state"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge rejects the unknown status state ''"
+  "reason": "sc-forge rejects the unknown status state '' [ignore_body: the recorded 201 body has another shape than the departed answer]"
  },
  {
   "scenario": "H",
@@ -744,9 +756,10 @@
    "status": 422,
    "message_contains": [
     "state"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge rejects the unknown status state 'bogus'"
+  "reason": "sc-forge rejects the unknown status state 'bogus' [ignore_body: the recorded 201 body has another shape than the departed answer]"
  },
  {
   "scenario": "H",
@@ -774,7 +787,7 @@
     "total_count": 0
    }
   },
-  "reason": "the only status on this commit was refused: no statuses, combined state pending (1.26.2 behaviour)"
+  "reason": "the only status on this commit was refused: no statuses, combined state pending (1.26.2 behaviour); ignore_body: the recorded body lists that status"
  },
  {
   "scenario": "H",
@@ -808,7 +821,7 @@
     "$len": 0
    }
   },
-  "reason": "the status list is empty because the bogus state was refused"
+  "reason": "the status list is empty because the bogus state was refused; ignore_body: the recorded body is a one-element list"
  },
  {
   "scenario": "M",
@@ -819,9 +832,10 @@
    "status": 422,
    "message_contains": [
     "rename"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge does not rename repos"
+  "reason": "sc-forge does not rename repos [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "M",
@@ -833,9 +847,13 @@
    "ignore_body": true,
    "fields": {
     "name": "rename-me"
-   }
+   },
+   "ignore_headers": [
+    "location",
+    "content-type"
+   ]
   },
-  "reason": "the old name still resolves (no rename)"
+  "reason": "the old name still resolves (no rename) [ignore_body: the recorded 307 body has another shape than the departed answer]"
  },
  {
   "scenario": "M",
@@ -846,9 +864,10 @@
    "status": 404,
    "message_contains": [
     "not found"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "the new name does not exist"
+  "reason": "the new name does not exist [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "M",
@@ -859,9 +878,14 @@
    "status": 404,
    "message_contains": [
     "not found"
+   ],
+   "ignore_body": true,
+   "ignore_headers": [
+    "location",
+    "content-type"
    ]
   },
-  "reason": "no access, no redirect: 404 as for any private repo"
+  "reason": "no access, no redirect: 404 as for any private repo [ignore_body: the recorded 307 body has another shape than the departed answer]"
  },
  {
   "scenario": "M",
@@ -870,9 +894,13 @@
   "match": "GET /acme/rename-me.git/info/refs?service=git-upload-pack",
   "expect": {
    "status": 200,
-   "ignore_body": true
+   "ignore_body": true,
+   "ignore_headers": [
+    "location",
+    "content-type"
+   ]
   },
-  "reason": "info/refs of the old name works directly (no redirect)"
+  "reason": "info/refs of the old name works directly (no redirect) [ignore_body: the recorded 307 body has another shape than the departed answer]"
  },
  {
   "scenario": "M",
@@ -909,9 +937,10 @@
    "status": 404,
    "message_contains": [
     "not found"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "the new name does not exist"
+  "reason": "the new name does not exist [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "M",
@@ -922,9 +951,10 @@
    "status": 404,
    "message_contains": [
     "not found"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "the new name does not exist"
+  "reason": "the new name does not exist [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "N",
@@ -935,9 +965,10 @@
    "status": 422,
    "message_contains": [
     "branch"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge rejects a default branch that does not exist"
+  "reason": "sc-forge rejects a default branch that does not exist [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "O",
@@ -1010,9 +1041,10 @@
    ],
    "message_contains": [
     "not"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text)"
+  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text) [ignore_body: the recorded 201 body has another shape than the departed answer]"
  },
  {
   "scenario": "B",
@@ -1027,9 +1059,10 @@
    ],
    "message_contains": [
     "not"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text)"
+  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text) [ignore_body: the recorded 204 body has another shape than the departed answer]"
  },
  {
   "scenario": "B",
@@ -1046,9 +1079,10 @@
    ],
    "fields": {
     "can_read": false
-   }
+   },
+   "ignore_body": true
   },
-  "reason": "carol is not a team member without teams: no read permission via the org (200 all false or 404). teams are a non-goal in sc-forge (words in message_contains are placeholders for its text)"
+  "reason": "carol is not a team member without teams: no read permission via the org (200 all false or 404). teams are a non-goal in sc-forge (words in message_contains are placeholders for its text) [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "X",
@@ -1059,9 +1093,10 @@
    "status": 401,
    "message_contains": [
     "auth"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text"
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "X",
@@ -1072,9 +1107,10 @@
    "status": 401,
    "message_contains": [
     "auth"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text"
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "X",
@@ -1085,9 +1121,10 @@
    "status": 401,
    "message_contains": [
     "auth"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text"
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 201 body has another shape than the departed answer]"
  },
  {
   "scenario": "X",
@@ -1098,8 +1135,9 @@
    "status": 401,
    "message_contains": [
     "auth"
-   ]
+   ],
+   "ignore_body": true
   },
-  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text"
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
  }
 ]
