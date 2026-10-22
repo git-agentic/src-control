@@ -584,6 +584,12 @@
       ]
     },
     {
+      "kind": "note",
+      "key": "unrelated_merge_exact_body",
+      "value": "",
+      "strict": false
+    },
+    {
       "kind": "http",
       "method": "GET",
       "path": "/api/v1/repos/acme/outcomes/pulls/<id:path:pulls#1>",

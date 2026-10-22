@@ -211,6 +211,11 @@
       "output": "remote: \nremote: Gitea: Not allowed to push to protected branch main        \nTo <base>/acme/prot.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'",
       "must_contain": [
         "protected"
+      ],
+      "refusal": [
+        "remote: gitea: not allowed to push to protected branch main",
+        "! [remote rejected] head -> main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/prot.git'"
       ]
     },
     {
@@ -218,7 +223,12 @@
       "name": "push-protected-admin",
       "cmd": "git push http://<admin>:<token>@<host>/acme/prot.git HEAD:refs/heads/main",
       "ok": false,
-      "output": "remote: \nremote: Gitea: Not allowed to push to protected branch main        \nTo <base>/acme/prot.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'"
+      "output": "remote: \nremote: Gitea: Not allowed to push to protected branch main        \nTo <base>/acme/prot.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'",
+      "refusal": [
+        "remote: gitea: not allowed to push to protected branch main",
+        "! [remote rejected] head -> main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/prot.git'"
+      ]
     },
     {
       "kind": "git",
@@ -232,7 +242,12 @@
       "name": "delete-protected-by-push",
       "cmd": "git push origin :refs/heads/main",
       "ok": false,
-      "output": "remote: \nremote: Gitea: branch main is the default branch and cannot be deleted        \nTo <base>/acme/prot.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'"
+      "output": "remote: \nremote: Gitea: branch main is the default branch and cannot be deleted        \nTo <base>/acme/prot.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'",
+      "refusal": [
+        "remote: gitea: branch main is the default branch and cannot be deleted",
+        "! [remote rejected] main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/prot.git'"
+      ]
     },
     {
       "kind": "http",

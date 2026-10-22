@@ -24,6 +24,8 @@
     "S-ref-pushes.json",
     "T-merge-outcomes.json",
     "U-status-check-edges.json",
-    "V-smart-http-bytes.json"
+    "V-smart-http-bytes.json",
+    "W-protected-contents.json",
+    "X-auth-forms.json"
   ]
 }

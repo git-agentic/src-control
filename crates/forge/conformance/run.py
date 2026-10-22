@@ -161,7 +161,39 @@ def msg_text(ex):
     return ex.get("body_text") or ex.get("output") or ""
 
 
-def cmp_exchange(exp, act, bij):
+def norm_msg(t):
+    """Compare error text without ids, hosts or trailing `[uid: 0, name: ]` detail."""
+    t = re.sub(r"<[^<>]*>", "", (t or "").lower())
+    t = re.sub(r"\s*\[[^\]]*\]\s*$", "", t)
+    return re.sub(r"\s+", " ", t).strip(" .:\n")
+
+
+def err_text(v):
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list):
+        return " ".join(x for x in v if isinstance(x, str))
+    return ""
+
+
+NOISE = re.compile(r"processed|processing|references in total|create a new pull request|resolving|counting|compressing")
+
+
+def refusal_lines(text):
+    """The lines of a failed git command that say why it failed (remote:/fatal:/error:/! lines), normalized."""
+    out = []
+    for raw in text.splitlines():
+        l = raw.strip()
+        if not re.match(r"^(remote:|fatal:|error:|!)", l):
+            continue
+        l = re.sub(r"\s+", " ", re.sub(r"<[^<>]*>", "", l).lower()).strip()
+        if l in ("remote:", "error:", "!", "remote: error:") or NOISE.search(l) or l in out:
+            continue
+        out.append(l)
+    return out
+
+
+def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None):
     """Return [(level, text)] where level is 'fail' or 'warn'. Empty list means match."""
     d = []
     bij.new_exchange()
@@ -170,27 +202,43 @@ def cmp_exchange(exp, act, bij):
     if exp["kind"] == "note":
         if exp["key"] != act["key"]:
             d.append(("fail", f"note {exp['key']} expected, got {act['key']}"))
-        elif exp["value"] != act["value"]:
-            lvl = "fail" if exp.get("strict", True) else "warn"
-            d.append((lvl, f"note {exp['key']}: {exp['value']!r} expected, got {act['value']!r}"))
+        elif exp["value"] != act["value"] and exp.get("strict", True):  # strict=False notes are informational
+            d.append(("fail", f"note {exp['key']}: {exp['value']!r} expected, got {act['value']!r}"))
         return d
     if exp["kind"] == "git":
         if exp["name"] != act["name"]:
             return [("fail", f"git step {exp['name']} expected, got {act['name']}")]
         if exp["ok"] != act["ok"]:
             d.append(("fail", f"git ok={exp['ok']} expected, got {act['ok']}: {act['output'][:200]!r}"))
+        elif not exp["ok"]:
+            have = act.get("refusal") or refusal_lines(act["output"])
+            for line in exp.get("refusal", []):
+                if line not in have:
+                    d.append(("fail", f"git refusal {line!r} expected, got {have[:4]!r}"))
     else:
         if exp["method"] != act["method"] or not eq_str(exp["path"], act["path"], bij, [], ""):
             return [("fail", f"request {exp['method']} {exp['path']} expected, got {act['method']} {act['path']}")]
-        if exp["status"] != act["status"]:
-            d.append(("fail", f"status {exp['status']} expected, got {act['status']}: {msg_text(act)[:200]!r}"))
+        es = exp["status"] if status_override is None else status_override
+        if es != act["status"]:
+            d.append(("fail", f"status {es} expected, got {act['status']}: {msg_text(act)[:200]!r}"))
+        elif es >= 400 and isinstance(exp.get("body"), dict) and status_override is None:
+            ab = act.get("body") if isinstance(act.get("body"), dict) else None
+            for key in ("message", "errors"):
+                if key not in exp["body"]:
+                    continue
+                ev = err_text(exp["body"][key])
+                if key == "errors" and not ev:
+                    continue
+                av = err_text(ab.get(key)) if ab is not None else (msg_text(act) if key == "message" else "")
+                if norm_msg(ev) != norm_msg(av):
+                    d.append(("fail", f"{key} {ev!r} expected, got {av!r}"))
         for h, v in exp.get("headers", {}).items():
             got = act.get("headers", {}).get(h)
             if got is None:
                 d.append(("fail", f"header {h}: expected {v!r}, missing"))
             else:
                 eq_str(v, got, bij, d, f"header {h}")
-        volatile = set(exp.get("volatile", []))
+        volatile = set(exp.get("volatile", [])) | set(extra_volatile)
         if "body" in exp:
             if "body" not in act:
                 d.append(("fail", f"expected JSON body, got {act.get('body_text', '')[:120]!r}"))
@@ -210,6 +258,50 @@ def cmp_exchange(exp, act, bij):
     return d
 
 
+# ---- departures: reviewed, intentional differences from the recorded Gitea behaviour
+
+def dep_indexes(spec, expected):
+    if isinstance(spec, bool):
+        return []
+    if isinstance(spec, int):
+        return [spec]
+    if isinstance(spec, list):
+        return [i for x in spec for i in dep_indexes(x, expected)]
+    m = re.fullmatch(r"(\d+)-(\d+)", str(spec))
+    if m:
+        return list(range(int(m.group(1)), int(m.group(2)) + 1))
+    return [i for i, e in enumerate(expected) if e.get("name") == spec or e.get("key") == spec]
+
+
+def apply_override(exp, act, ov, bij):
+    """Check `act` against a departure instead of the recorded exchange."""
+    e, why, d = ov["expect"], ov.get("reason", ""), []
+    if e.get("skip"):
+        return [("honoured", f"skipped: {why}")]
+    if act["kind"] == "note":
+        if "value" in e and act["value"] != e["value"]:
+            d.append(("fail", f"unexpected: note {act['key']} {e['value']!r} expected, got {act['value']!r}"))
+    elif act["kind"] == "git":
+        if "ok" in e and act["ok"] != e["ok"]:
+            d.append(("fail", f"unexpected: git ok={e['ok']} expected, got {act['ok']}: {act['output'][:160]!r}"))
+        txt = act["output"].lower()
+        for w in e.get("message_contains", []):
+            if w.lower() not in txt:
+                d.append(("fail", f"unexpected: output lacks {w!r}"))
+    else:
+        sts = e.get("status")
+        sts = sts if isinstance(sts, list) else ([sts] if sts is not None else None)
+        if sts is not None and act["status"] not in sts:
+            d.append(("fail", f"unexpected: status {sts} expected, got {act['status']}: {msg_text(act)[:160]!r}"))
+        txt = msg_text(act).lower()
+        for w in e.get("message_contains", []):
+            if w.lower() not in txt:
+                d.append(("fail", f"unexpected: message lacks {w!r}: {txt[:160]!r}"))
+        if not e.get("ignore_body") and e.get("ignore_fields") and sts is None:
+            d += [x for x in cmp_exchange(exp, act, bij, extra_volatile=e["ignore_fields"]) if x[0] == "fail"]
+    return d or [("honoured", why)]
+
+
 # --------------------------------------------------------------------------- context
 
 class Ctx:
@@ -220,8 +312,7 @@ class Ctx:
         self.secrets = {admin_token}
         self.pw = {}
         self.vars = {}
-        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="sc-conf-"))
-        os.makedirs(self.tmp + "/home")
+        self.tmp = None
         self.admin_user = "siteadmin"
         bad = secrets.token_hex(20)
         self.secrets.add(bad)
@@ -236,8 +327,10 @@ class Ctx:
         self.expected = []
         self.cursor = 0
         self.diffs = []  # (scenario, index, label, [(level, text)])
+        self.overrides = {}  # fixture index -> departure entry, check mode only
         self.verbose = False
         self.base_ready = False
+        self.first_read = None
         r = self.call("GET", "/user", rec=False)
         if r.status != 200 or not r.json:
             raise SystemExit(f"admin token rejected by {self.base}: {r.status} {r.text[:200]}")
@@ -245,6 +338,9 @@ class Ctx:
         self.principals["admin"]["user"] = self.admin_user
         self.principals["admin-basic"] = dict(self.principals["admin"], kind="basic")
         self.principals["admin-bearer"] = dict(self.principals["admin"], kind="bearer")
+        # last: nothing above may exit with a temp dir to leak (cmd_run removes it in a finally)
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="sc-conf-"))
+        os.makedirs(self.tmp + "/home")
 
     # -- normalization
     def sha_ph(self, h):
@@ -258,7 +354,9 @@ class Ctx:
         for sec in sorted(self.secrets, key=len, reverse=True):
             if sec:
                 s = s.replace(sec, "<token>")
-        s = s.replace(self.base, "<base>").replace(self.hostport, "<host>").replace(self.tmp, "<tmp>")
+        s = s.replace(self.base, "<base>").replace(self.hostport, "<host>")
+        if self.tmp:
+            s = s.replace(self.tmp, "<tmp>")
         return re.sub(r"\b%s\b" % re.escape(self.admin_user), "<admin>", s)
 
     def ns(self, s):
@@ -311,7 +409,12 @@ class Ctx:
             if i >= len(self.expected):
                 self.diffs.append((i, ex_label(ex), [("fail", "extra exchange not present in fixture")]))
             else:
-                self.diffs.append((i, ex_label(ex), cmp_exchange(self.expected[i], ex, self.bij)))
+                exp = self.expected[i]
+                if i in self.overrides:
+                    ds = apply_override(exp, ex, self.overrides[i], self.bij)
+                else:
+                    ds = cmp_exchange(exp, ex, self.bij)
+                self.diffs.append((i, ex_label(ex), ds))
 
     def note(self, key, value, strict=True):
         self.push_ex({"kind": "note", "key": key, "value": value, "strict": strict})
@@ -324,7 +427,7 @@ class Ctx:
     # -- HTTP
     def call(self, method, path, json=None, as_="admin", expect=None, must_contain=None,
              volatile=None, headers=None, data=None, api=True, binary=False, rec=True, track=(),
-             retry_while=None, retry_s=90, no_retry=False):
+             retry_while=None, retry_s=90, no_retry=False, settle_keys=None):
         full = ("/api/v1" + path) if api else path
         hdrs = {"Accept": "application/json", "User-Agent": "sc-forge-conformance"}
         p = self.principals[as_]
@@ -333,6 +436,8 @@ class Ctx:
                 hdrs["Authorization"] = "token " + p["secret"]
             elif p["kind"] == "bearer":
                 hdrs["Authorization"] = "Bearer " + p["secret"]
+            elif p["kind"] == "basic-nopass":  # the token as the Basic user name, empty password
+                hdrs["Authorization"] = "Basic " + base64.b64encode(f"{p['secret']}:".encode()).decode()
             else:
                 hdrs["Authorization"] = "Basic " + base64.b64encode(f"{p['user']}:{p['secret']}".encode()).decode()
         if json is not None:
@@ -341,19 +446,38 @@ class Ctx:
         hdrs.update(headers or {})
         if retry_while is None and method == "POST" and path.endswith("/merge") and not no_retry:
             retry_while = ["try again later"]
-        deadline = time.time() + retry_s
-        while True:
+        def send():
             req = urllib.request.Request(self.base + full, data=data, method=method, headers=hdrs)
             try:
                 with OPENER.open(req, timeout=120) as resp:
-                    r = R(resp.status, dict(resp.headers), resp.read())
+                    return R(resp.status, dict(resp.headers), resp.read())
             except urllib.error.HTTPError as e:
-                r = R(e.code, dict(e.headers), e.read())
+                return R(e.code, dict(e.headers), e.read())
+
+        deadline = time.time() + retry_s
+        while True:
+            r = send()
             # `retry_while`: re-send while the response text has one of these markers, and record only the
             # last response (used for Gitea's "Please try again later" while a PR is being checked)
             if not retry_while or time.time() >= deadline or not any(w in r.text.lower() for w in retry_while):
                 break
             time.sleep(1)
+        if settle_keys and r.status == 200 and r.is_json:
+            # Gitea updates some repo fields (empty, default_branch) asynchronously after a push: record the
+            # value that is stable on 8 consecutive reads (4 s, <= 25 s); the first read is left in `first_read`
+            def proj(x):
+                def get(b, k):
+                    for part in k.split("."):
+                        b = b.get(part) if isinstance(b, dict) else None
+                    return b
+                return [get(x.json, k) for k in settle_keys] if x.is_json else None
+            hist = [proj(r)]
+            self.first_read = dict(zip(settle_keys, hist[0]))
+            end = time.time() + 25
+            while time.time() < end and not (len(hist) >= 8 and all(h == hist[-1] for h in hist[-8:])):
+                time.sleep(0.5)
+                r = send()
+                hist.append(proj(r))
         if rec:
             ex = {"kind": "http", "method": method, "path": self.np(full), "auth": as_,
                   "status": r.status}
@@ -403,6 +527,8 @@ class Ctx:
                   "output": self.ns(out.strip()[-2000:])}
             if must_contain:
                 ex["must_contain"] = list(must_contain)
+            if p.returncode != 0:
+                ex["refusal"] = refusal_lines(ex["output"])
             self.push_ex(ex)
         want = ok if ok is not None else (None if rec else True)
         if want is not None and (p.returncode == 0) != want:
@@ -513,7 +639,7 @@ def scenario(sid, slug, base=True):
     return deco
 
 
-def run_all(c, only, out=None, fixtures=None):
+def run_all(c, only, out=None, fixtures=None, departures=()):
     summary = []
     for sid, slug, needs_base, fn in SCENARIOS:
         if only and sid not in only:
@@ -530,6 +656,22 @@ def run_all(c, only, out=None, fixtures=None):
             fx = J.load(open(fp))
             c.expected = fx["exchanges"]
             skip = fx.get("error")
+            c.overrides, stale = {}, []
+            for dep in departures:
+                if dep["scenario"] != sid:
+                    continue
+                idx = dep_indexes(dep["exchange"], c.expected)
+                bad = [i for i in idx if not 0 <= i < len(c.expected)]
+                if not idx or bad:
+                    stale.append(f"stale departure {dep['exchange']!r}: no such exchange in {fname} ({dep.get('reason', '')})")
+                for i in idx:
+                    if i in bad:
+                        continue
+                    if dep.get("label") and dep["label"] not in ex_label(c.expected[i]) and len(idx) == 1:
+                        stale.append(f"stale departure #{i}: fixture exchange is {ex_label(c.expected[i])!r}, "
+                                     f"departure says {dep['label']!r}")
+                        continue
+                    c.overrides[i] = dep
         t0 = time.time()
         err = None
         try:
@@ -537,7 +679,7 @@ def run_all(c, only, out=None, fixtures=None):
                 ensure_base(c)
             fn(c)
         except Exception as e:  # noqa: BLE001 - scenario failures are data
-            err = f"{type(e).__name__}: {e}"
+            err = c.ns(f"{type(e).__name__}: {e}")[:1500]
         dt = time.time() - t0
         if c.mode == "record":
             os.makedirs(out, exist_ok=True)
@@ -549,24 +691,35 @@ def run_all(c, only, out=None, fixtures=None):
         lines, failed = [], False
         for i, label, ds in c.diffs:
             bad = [x for x in ds if x[0] == "fail"]
+            hon = [x for x in ds if x[0] == "honoured"]
             failed |= bool(bad)
-            if bad or ds or c.verbose:
-                lines.append(f"  {'FAIL' if bad else ('warn' if ds else 'ok  ')} #{i:02d} {label}")
-                lines += [f"       {lv}: {t}" for lv, t in ds]
+            if bad or hon or ds or c.verbose:
+                tag = "FAIL" if bad else ("ok* " if hon else ("warn" if ds else "ok  "))
+                lines.append(f"  {tag} #{i:02d} {label}")
+                lines += [f"       {'expected difference honoured' if lv == 'honoured' else lv}: {t}" for lv, t in ds]
         if err:
+            if skip and norm_msg(skip) == norm_msg(err):
+                lines.append(f"  (fixture recorded the same error: {skip[:200]})")
+            else:
+                failed = True
+                lines.append(f"  ERROR {err}")
+                if skip:
+                    lines.append(f"  fixture recorded a different error: {skip[:300]}")
+        elif skip:
             failed = True
-            lines.append(f"  ERROR {err}")
-            if skip:
-                failed = False
-                lines.append(f"  (fixture recorded the same error: {skip})")
+            lines.append(f"  FAIL fixture recorded an error but the scenario completed: {skip[:300]}")
         elif len(c.ex) < len(c.expected):
             failed = True
             lines.append(f"  FAIL {len(c.expected) - len(c.ex)} recorded exchange(s) not produced")
+        if stale:
+            failed = True
+            lines += ["  FAIL " + x for x in stale]
         summary.append((sid, slug, "FAIL" if failed else "ok", lines, len(c.ex), dt))
     return summary
 
 
 def cmd_run(a):
+    deps = J.load(open(a.departures)) if getattr(a, "departures", None) else []
     c = Ctx(a.base_url, a.admin_token, a.cmd)
     c.verbose = a.verbose
     only = set(a.only.split(",")) if a.only else None
@@ -580,9 +733,10 @@ def cmd_run(a):
                 J.dump({"server_version": ver, "scenarios": sorted(x for x in os.listdir(a.out) if x.endswith(".json") and x != "meta.json")}, f, indent=2)
                 f.write("\n")
         else:
-            summary = run_all(c, only, fixtures=a.fixtures)
+            summary = run_all(c, only, fixtures=a.fixtures, departures=deps)
     finally:
-        shutil.rmtree(c.tmp, ignore_errors=True)
+        if c.tmp:
+            shutil.rmtree(c.tmp, ignore_errors=True)
     bad = 0
     for s in summary:
         sid, slug, st, lines = s[:4]
@@ -666,6 +820,7 @@ def main():
             p.add_argument("--out", required=True)
         else:
             p.add_argument("--fixtures", required=True)
+            p.add_argument("--departures", help="JSON list of reviewed differences from the recorded behaviour")
     p = sub.add_parser("diff")
     p.add_argument("a")
     p.add_argument("b")
@@ -841,7 +996,7 @@ def sc_history(c):
     f1 = c.push_branch("hist", "feat/x", {"feat1.txt": "f1\n"}, base=c2, msg="feat one")
     f2 = c.push_branch("hist", "feat/x", {"feat2.txt": "f2\n"}, base="origin/feat/x", msg="feat two")
     R = "/repos/acme/hist"
-    c.call("GET", R)
+    repo_state(c, R, "hist")
     c.call("GET", R + "/branches")
     c.call("GET", R + "/branches?limit=1&page=2")
     c.call("GET", R + "/branches/main")
@@ -956,6 +1111,13 @@ def parents(c, repo, sha):
     p = c.wc(repo)
     c.git(["fetch", "-q", "origin"], cwd=p, rec=False)
     return len(c.git(["rev-list", "--parents", "-n1", sha], cwd=p, rec=False)[1].split()) - 1
+
+
+def repo_state(c, path, label):
+    """GET a repo whose `empty`/`default_branch` may lag a push: record the settled value, keep the race as a note."""
+    r = c.call("GET", path, settle_keys=["empty", "default_branch"])
+    c.note(f"{label}_first_read", c.first_read, strict=False)
+    return r
 
 
 def tokbasic(c, who):
@@ -1151,8 +1313,8 @@ def sc_merge(c):
 def sc_statuses(c):
     c.mk_repo("status")
     R = "/repos/acme/status"
-    shas = [c.head("status")] + [c.api_file("status", f"f{i}.txt", f"{i}\n", f"commit {i}") for i in range(1, 5)]
-    s0, s1, s2, s3, s4 = shas
+    shas = [c.head("status")] + [c.api_file("status", f"f{i}.txt", f"{i}\n", f"commit {i}") for i in range(1, 6)]
+    s0, s1, s2, s3, s4, s5 = shas
 
     def post(sha, state, ctx, **kw):
         body = {"state": state, "context": ctx, "description": f"{ctx} is {state}", "target_url": "http://example.invalid/run/1"}
@@ -1169,6 +1331,7 @@ def sc_statuses(c):
     post(s1, "pending", "ci/test", as_="bot-scoped", expect=201)
     r = combined(s1)
     c.note("combined_state_pending", r.json["state"])
+    time.sleep(1.1)  # same-second statuses list in random order on some versions
     post(s1, "success", "ci/test", as_="bot-scoped", expect=201)
     r = combined(s1)
     c.note("combined_statuses_after_pending_then_success", len(r.json["statuses"]))
@@ -1198,6 +1361,12 @@ def sc_statuses(c):
     post("nope", "success", "ci/test")
     post(s4, "success", "ci/test", as_="carol")
     post(s4, "success", "ci/test", as_="dave")
+    # a commit whose only status has an unknown state string
+    post(s5, "bogus", "ci/bogus-only", expect=201)
+    r = combined(s5)
+    c.note("combined_state_only_bogus", r.json["state"])
+    c.note("combined_total_only_bogus", r.json["total_count"])
+    c.call("GET", R + f"/statuses/{s5}?limit=100")
     combined("0123456789abcdef0123456789abcdef01234567")
     c.call("GET", R + "/commits/main/status?limit=50")
     c.call("GET", R + "/statuses/main?limit=100")
@@ -1409,21 +1578,21 @@ def sc_default_branch(c):
     c.call("DELETE", R + "/branches/dev")
     # empty repo, first push name decides?
     c.mk_repo("fresh1", auto_init=False)
-    c.call("GET", "/repos/acme/fresh1")
+    repo_state(c, "/repos/acme/fresh1", "fresh1_before_push")
     c.push_branch("fresh1", "trunk", {"t.txt": "t\n"}, base=None)
-    c.call("GET", "/repos/acme/fresh1")
+    repo_state(c, "/repos/acme/fresh1", "fresh1_after_trunk")
     c.git(["ls-remote", "--symref", c.git_url("fresh1"), "HEAD"], name="ls-remote-symref-trunk-first")
     c.call("GET", "/repos/acme/fresh1/branches")
     c.mk_repo("fresh2", auto_init=False)
     c.push_branch("fresh2", "main", {"t.txt": "t\n"}, base=None)
-    c.call("GET", "/repos/acme/fresh2")
+    repo_state(c, "/repos/acme/fresh2", "fresh2_after_main")
     c.mk_repo("fresh3", auto_init=False, default_branch="develop")
-    c.call("GET", "/repos/acme/fresh3")
+    repo_state(c, "/repos/acme/fresh3", "fresh3_before_push")
     c.push_branch("fresh3", "main", {"t.txt": "t\n"}, base=None)
-    c.call("GET", "/repos/acme/fresh3")
+    repo_state(c, "/repos/acme/fresh3", "fresh3_after_main")
     c.git(["ls-remote", "--symref", c.git_url("fresh3"), "HEAD"], name="ls-remote-symref-main-pushed-first")
     c.push_branch("fresh3", "develop", {"u.txt": "u\n"}, base="origin/main")
-    c.call("GET", "/repos/acme/fresh3")
+    repo_state(c, "/repos/acme/fresh3", "fresh3_after_develop")
     c.git(["ls-remote", "--symref", c.git_url("fresh3"), "HEAD"], name="ls-remote-symref-develop-pushed-second")
 
 
@@ -1469,7 +1638,8 @@ def sc_pr_lifecycle(c):
     time.sleep(1)
     c.call("GET", R + f"/pulls/{n4}", as_=A)
     c.call("PATCH", R + f"/pulls/{n4}", {"state": "open"}, as_=A)
-    c.call("GET", R + f"/pulls/{n4}", as_=A)
+    # 1.26 answers "open" and then sometimes reverts the PR to "closed" (head branch missing): racy, state not compared
+    c.call("GET", R + f"/pulls/{n4}", as_=A, volatile=["state", "closed_at"])
     # 5. head commit pushed straight into base
     n5, s5 = mkpr(c, "life", "l5", {"l5.txt": "5\n"})
     c.git(["push", "-q", "origin", f"{s5}:refs/heads/main"], cwd=wcp, rec=False)
@@ -1631,20 +1801,22 @@ def sc_outcomes(c):
     def getpr(n):
         return c.call("GET", R + f"/pulls/{n}", as_=A, volatile=["mergeable"])
 
-    def try_pr(title, head):
+    def try_pr(title, head, raw_note=None):
         """Open a PR and record what Gitea says about it and about merging it."""
         r = c.call("POST", R + "/pulls", {"title": title, "head": head, "base": "main"}, as_=A, volatile=["mergeable"])
         if r.status == 201:
             n = r.json["number"]
             time.sleep(6)
             getpr(n)
-            c.call("POST", R + f"/pulls/{n}/merge", {"Do": "merge"}, as_=A, no_retry=True,
-                   volatile=["$text"])  # 1.26 sends a truncated JSON body here, sometimes empty
+            m = c.call("POST", R + f"/pulls/{n}/merge", {"Do": "merge"}, as_=A, no_retry=True,
+                       volatile=["$text"])  # 1.26 sends a truncated JSON body here, sometimes empty
+            if raw_note:
+                c.note(raw_note, c.ns(m.text), strict=False)
             getpr(n)
         return r
 
     c.push_branch("outcomes", "orph", {"orph.txt": "o\n"}, base=None)
-    try_pr("unrelated", "orph")
+    try_pr("unrelated", "orph", raw_note="unrelated_merge_exact_body")
     c.push_branch("outcomes", "tid", {"t.txt": "t\n"})
     c.git(["rm", "-q", "t.txt"], cwd=wcp, rec=False)
     c.git(["commit", "-q", "-m", "remove t"], cwd=wcp, rec=False)
@@ -1755,6 +1927,82 @@ def sc_wire(c):
     c.call("POST", "/acme/wire.git/git-receive-pack", data=b"0000", as_="none", api=False,
            headers={"Content-Type": "application/x-git-receive-pack-request"})
     c.call("POST", "/acme/wire.git/git-upload-pack", data=req, headers=ct, as_="dave-tokbasic", api=False)
+
+
+@scenario("W", "protected-contents")
+def sc_protected_contents(c):
+    c.mk_repo("pcont")
+    R = "/repos/acme/pcont"
+    c.call("POST", R + "/branch_protections", {"branch_name": "main", "enable_push": True}, expect=201)
+    for who in ("bot", "admin"):
+        c.call("POST", R + f"/contents/w1-{who}.txt", {"content": b64("x\n"), "message": "create on main",
+                                                       "branch": "main"}, as_=who)
+    sha = c.call("GET", R + "/contents/README.md", rec=False).json["sha"]
+    c.call("PUT", R + "/contents/README.md", {"content": b64("pushable\n"), "message": "update on main", "sha": sha,
+                                              "branch": "main"}, as_="bot")
+    # now require ci/test and post nothing
+    c.call("PATCH", R + "/branch_protections/main", {"enable_status_check": True, "status_check_contexts": ["ci/test"]})
+    for who in ("bot", "admin"):
+        c.call("POST", R + f"/contents/w2-{who}.txt", {"content": b64("x\n"), "message": "create, check unmet",
+                                                       "branch": "main"}, as_=who)
+    sha = c.call("GET", R + "/contents/README.md", rec=False).json["sha"]
+    c.call("PUT", R + "/contents/README.md", {"content": b64("again\n"), "message": "update, check unmet",
+                                              "sha": sha, "branch": "main"}, as_="bot")
+    # direct fast-forward push: enable_push:true + required context unmet
+    p = c.wc("pcont", "bot")
+    c.git(["fetch", "-q", "origin"], cwd=p, rec=False)
+    c.git(["checkout", "-q", "-B", "work", "origin/main"], cwd=p, rec=False)
+    local_commit(c, p, {"ff.txt": "ff\n"})
+    c.git(["push", "origin", "HEAD:refs/heads/main"], cwd=p, name="ff-push-enable-push-status-unmet")
+    # and once the required context has succeeded on the tip
+    tip = c.head("pcont")
+    c.call("POST", R + f"/statuses/{tip}", {"state": "success", "context": "ci/test"}, expect=201, rec=False)
+    c.call("POST", R + "/contents/w3-bot.txt", {"content": b64("x\n"), "message": "create, check met", "branch": "main"},
+           as_="bot")
+    c.call("GET", R + "/branch_protections/main")
+
+
+@scenario("X", "auth-forms")
+def sc_auth_forms(c):
+    c.mk_repo("authrepo")
+    R = "/repos/acme/authrepo"
+    sha = c.head("authrepo")
+    tok = c.principals["bot"]["secret"]
+    c.principals["bot-bearer"] = dict(c.principals["bot"], kind="bearer")
+    c.principals["bot-basic-token-password"] = dict(c.principals["bot"], kind="basic")
+    c.principals["bot-basic-token-user"] = dict(c.principals["bot"], kind="basic-nopass")
+    c.principals["bot-basic-oauth2"] = dict(c.principals["bot"], kind="basic", user="oauth2")
+    c.principals["bot-basic-other-name"] = dict(c.principals["bot"], kind="basic", user="someone")
+    c.principals["bad-bearer"] = dict(c.principals["bad"], kind="bearer")
+    c.principals["bad-basic-token-user"] = dict(c.principals["bad"], kind="basic-nopass")
+    c.principals["bot-basic-password"] = {"kind": "basic", "user": "bot", "secret": c.pw["bot"]}
+    forms = ["bot", "bot-bearer", "bot-basic-token-password", "bot-basic-token-user", "bot-basic-oauth2",
+             "bot-basic-other-name", "bot-basic-password", "bad-bearer", "bad-basic-token-user"]
+    for i, who in enumerate(forms):
+        c.call("GET", "/user", as_=who)
+        c.call("GET", R, as_=who)
+        c.call("POST", R + f"/statuses/{sha}", {"state": "success", "context": f"auth-{i}"}, as_=who)
+    # site admin with a password
+    pw = c.new_password()
+    c.call("POST", "/admin/users", {"username": "siteowner", "email": "siteowner@example.invalid", "password": pw,
+                                    "must_change_password": False}, expect=201, rec=False)
+    c.call("PATCH", "/admin/users/siteowner", {"login_name": "siteowner", "source_id": 0, "admin": True}, expect=200, rec=False)
+    c.principals["siteowner-pw"] = {"kind": "basic", "user": "siteowner", "secret": pw}
+    c.call("GET", "/user", as_="siteowner-pw")
+    r = c.call("POST", "/users/bot/tokens", {"name": "by-site-admin-password", "scopes": ["read:repository"]},
+               as_="siteowner-pw")
+    c.call("GET", "/users/bot/tokens", as_="siteowner-pw")
+    c.call("POST", "/users/bot/tokens", {"name": "by-admin-token", "scopes": ["read:repository"]}, as_="admin")
+    # a read-only token used as the Basic password mints what?
+    c.principals["alice-ro-as-password"] = {"kind": "basic", "user": "alice", "secret": c.principals["alice-ro"]["secret"]}
+    r = c.call("POST", "/users/alice/tokens", {"name": "minted-by-readonly-token", "scopes": ["all"]},
+               as_="alice-ro-as-password")
+    c.note("readonly_token_as_password_status", r.status)
+    if r.status == 201:
+        c.secrets.add(r.json["sha1"])
+        c.principals["minted"] = {"kind": "token", "user": "alice", "secret": r.json["sha1"]}
+        c.call("POST", "/user/repos", {"name": "minted-probe", "private": True}, as_="minted")
+    c.call("GET", "/users/alice/tokens", as_="alice-ro-as-password", volatile=["id", "name", "scopes"])
 
 
 # @@SCENARIOS@@

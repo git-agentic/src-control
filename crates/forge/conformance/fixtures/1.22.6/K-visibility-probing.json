@@ -732,7 +732,10 @@
       "name": "ls-remote-vis-none",
       "cmd": "git ls-remote <base>/acme/vis.git",
       "ok": false,
-      "output": "fatal: could not read Username for '<base>': terminal prompts disabled"
+      "output": "fatal: could not read Username for '<base>': terminal prompts disabled",
+      "refusal": [
+        "fatal: could not read username for '': terminal prompts disabled"
+      ]
     },
     {
       "kind": "http",
@@ -754,7 +757,10 @@
       "name": "ls-remote-ghost-none",
       "cmd": "git ls-remote <base>/acme/ghost.git",
       "ok": false,
-      "output": "fatal: could not read Username for '<base>': terminal prompts disabled"
+      "output": "fatal: could not read Username for '<base>': terminal prompts disabled",
+      "refusal": [
+        "fatal: could not read username for '': terminal prompts disabled"
+      ]
     },
     {
       "kind": "http",
@@ -776,7 +782,11 @@
       "name": "ls-remote-vis-dave",
       "cmd": "git ls-remote http://dave:<token>@<host>/acme/vis.git",
       "ok": false,
-      "output": "remote: Repository not found\nfatal: repository '<base>/acme/vis.git/' not found"
+      "output": "remote: Repository not found\nfatal: repository '<base>/acme/vis.git/' not found",
+      "refusal": [
+        "remote: repository not found",
+        "fatal: repository '/acme/vis.git/' not found"
+      ]
     },
     {
       "kind": "http",
@@ -798,7 +808,11 @@
       "name": "ls-remote-ghost-dave",
       "cmd": "git ls-remote http://dave:<token>@<host>/acme/ghost.git",
       "ok": false,
-      "output": "remote: Repository not found\nfatal: repository '<base>/acme/ghost.git/' not found"
+      "output": "remote: Repository not found\nfatal: repository '<base>/acme/ghost.git/' not found",
+      "refusal": [
+        "remote: repository not found",
+        "fatal: repository '/acme/ghost.git/' not found"
+      ]
     },
     {
       "kind": "http",

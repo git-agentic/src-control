@@ -209,7 +209,11 @@
       "name": "nonff-protected-push-disabled",
       "cmd": "git push origin HEAD:refs/heads/main",
       "ok": false,
-      "output": "To <base>/acme/bypass.git\n ! [rejected]        HEAD -> main (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/bypass.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details."
+      "output": "To <base>/acme/bypass.git\n ! [rejected]        HEAD -> main (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/bypass.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details.",
+      "refusal": [
+        "! [rejected] head -> main (non-fast-forward)",
+        "error: failed to push some refs to '/acme/bypass.git'"
+      ]
     },
     {
       "kind": "http",
@@ -257,21 +261,35 @@
       "name": "nonff-protected-push-enabled",
       "cmd": "git push origin HEAD:refs/heads/main",
       "ok": false,
-      "output": "To <base>/acme/bypass.git\n ! [rejected]        HEAD -> main (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/bypass.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details."
+      "output": "To <base>/acme/bypass.git\n ! [rejected]        HEAD -> main (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/bypass.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details.",
+      "refusal": [
+        "! [rejected] head -> main (non-fast-forward)",
+        "error: failed to push some refs to '/acme/bypass.git'"
+      ]
     },
     {
       "kind": "git",
       "name": "force-protected-push-enabled",
       "cmd": "git push -f origin HEAD:refs/heads/main",
       "ok": false,
-      "output": "remote: \nremote: Gitea: branch main is protected from force push        \nTo <base>/acme/bypass.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/bypass.git'"
+      "output": "remote: \nremote: Gitea: branch main is protected from force push        \nTo <base>/acme/bypass.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/bypass.git'",
+      "refusal": [
+        "remote: gitea: branch main is protected from force push",
+        "! [remote rejected] head -> main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/bypass.git'"
+      ]
     },
     {
       "kind": "git",
       "name": "delete-protected-push-enabled",
       "cmd": "git push origin :refs/heads/main",
       "ok": false,
-      "output": "remote: \nremote: Gitea: branch main is the default branch and cannot be deleted        \nTo <base>/acme/bypass.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/bypass.git'"
+      "output": "remote: \nremote: Gitea: branch main is the default branch and cannot be deleted        \nTo <base>/acme/bypass.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/bypass.git'",
+      "refusal": [
+        "remote: gitea: branch main is the default branch and cannot be deleted",
+        "! [remote rejected] main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/bypass.git'"
+      ]
     },
     {
       "kind": "http",
@@ -319,7 +337,12 @@
       "name": "delete-protected-push-disabled",
       "cmd": "git push origin :refs/heads/main",
       "ok": false,
-      "output": "remote: \nremote: Gitea: branch main is the default branch and cannot be deleted        \nTo <base>/acme/bypass.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/bypass.git'"
+      "output": "remote: \nremote: Gitea: branch main is the default branch and cannot be deleted        \nTo <base>/acme/bypass.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/bypass.git'",
+      "refusal": [
+        "remote: gitea: branch main is the default branch and cannot be deleted",
+        "! [remote rejected] main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/bypass.git'"
+      ]
     },
     {
       "kind": "http",

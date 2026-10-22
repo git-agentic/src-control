@@ -33,7 +33,7 @@ A full record run needs a **fresh** server: scenarios create `alice`, `bot`, `ca
 
 ```sh
 python3 -I run.py check --base-url http://127.0.0.1:3000 --admin-token "$TOKEN" --fixtures fixtures/1.26.2/
-python3 -I run.py check ... --only F,G -v          # a subset, verbose
+python3 -I run.py check ... --only F,G -v          # a subset, verbose (see the note below)
 python3 -I run.py diff fixtures/1.22.6 fixtures/1.26.2   # offline version diff
 python3 -I run.py show fixtures/1.26.2 --only G --body    # what was recorded
 ```
@@ -41,6 +41,11 @@ python3 -I run.py show fixtures/1.26.2 --only G --body    # what was recorded
 `check` exits non-zero on any failure. Requirements on the server under test: a fresh instance whose
 admin token has all scopes, the ability to create users through `POST /admin/users` and tokens
 through `POST /users/{u}/tokens` with Basic auth, and git smart HTTP on the same base URL.
+
+`--only` skips the other scenarios, but a few facts are set by earlier ones (for example scenario B makes
+`alice` a private user, which shows in the owner object of her repos), and `search` or listing calls see
+every repo created so far. Compare a subset only against fixtures recorded the same way; the reference
+run is the full ordered one.
 
 ### What is compared
 
@@ -54,12 +59,42 @@ observations called notes). Exchange N of the run is compared with exchange N of
   have the same length, and every scalar is compared by **value** after normalization. Only volatile
   values are compared by type: `message` and `errors` (text), every `url`/`*_url` key (they carry the
   host), a repo `size`, and paths a call lists in `volatile=[...]`.
-- `message` text is checked with `must_contain=[...]`: each word must appear, case-insensitively,
-  in the response message.
+- Error text: for every recorded exchange with status >= 400 whose body has `message` (or a non-empty
+  `errors`), the actual text must equal the recorded text after normalization (lower case, placeholders
+  removed, a trailing bracketed detail such as `[uid: 0, name: ]` removed). A failing exchange prints both
+  texts. `must_contain=[...]` is an additional check: each word must appear in the response message.
 - Text bodies (diffs, patches) are compared exactly unless the call marks `volatile=["$text"]`.
-- git commands: exit status (ok or not) and `must_contain` words in the combined output.
-- Notes: recorded observations such as `merged_within_10s`. A note marked `strict=False` (timing)
-  only warns.
+- git commands: exit status (ok or not) and, for a failing step, the refusal text: the recorded
+  `remote:`/`fatal:`/`error:`/`!` lines (normalized, without hosts and ids) must all appear in the actual
+  output, so a push refused for another reason fails. `must_contain` words are checked too.
+- Notes: recorded observations such as `merged_within_10s`. A note marked `strict=False` (timing, or a
+  race kept for the record) is stored but never compared.
+- Repo fields Gitea updates asynchronously after a push (`empty`, `default_branch`) are read with
+  `settle_keys`: the call polls until three consecutive reads agree (up to 15 s) and records that value;
+  the first read is kept as a non-strict note.
+
+### Departures
+
+`departures.json` lists reviewed, intentional differences between sc-forge and the recorded Gitea
+behaviour. Pass it with `check --departures departures.json`. Each entry is
+`{scenario, exchange, label, expect, reason}`:
+
+- `exchange` is a fixture index, a list of indexes, a range `"a-b"`, or a git step name or note key.
+  Indexes are the same in `fixtures/1.22.6` and `fixtures/1.26.2` (their sequences are identical).
+- `label` (single index only) must be contained in the fixture exchange's label, so an entry that points
+  at a moved exchange is reported as stale instead of silently covering the wrong one.
+- `expect` replaces the strict comparison for that exchange: `status` (number or list), `message_contains`,
+  `ok` (git), `value` (note), `ignore_body` (status only), `ignore_fields` (compare strictly except these
+  keys), or `skip`.
+- A matching exchange prints `expected difference honoured`; one that does not match the `expect` is a
+  failure (`unexpected`). An entry whose exchange no longer exists or whose label no longer matches
+  fails the run (`stale departure`). Do not pass departures when checking real Gitea.
+
+Departures that need a decision in sc-forge and could not be tied to one exchange are listed below.
+
+- Conflict merge: the departure covers the exchanges after the note `conflicting_pr_mergeable_after_8s`
+  in G and T. The merge of a PR whose head is already in base (`G#33`, `T#10`) also answers Gitea's
+  `405 Please try again later`; sc-forge may answer it differently and has no departure yet.
 
 ### Normalization
 
@@ -109,6 +144,8 @@ order does not matter. Nothing else is sorted: array order is part of the contra
 | T | merge outcome table: unrelated history, identical tree, contained head, conflicts |
 | U | status-check edge cases: other commit, warning/skipped/error, moved head |
 | V | raw smart HTTP bytes and headers, gzip request body |
+| W | contents API and direct pushes on a protected branch with `enable_push:true`, with and without a required status check |
+| X | token, Bearer and Basic auth forms on API routes; site admin password; read-only token as Basic password |
 
 ## Add a scenario
 

@@ -156,17 +156,6 @@
       "body": [
         {
           "id": "<id:id#1>",
-          "name": "via-token-as-password",
-          "sha1": "<token>",
-          "token_last_eight": "<token>",
-          "scopes": [
-            "read:repository"
-          ],
-          "created_at": "<ts>",
-          "last_used_at": "<ts>"
-        },
-        {
-          "id": "<id:id#2>",
           "name": "po",
           "sha1": "<token>",
           "token_last_eight": "<token>",
@@ -178,8 +167,8 @@
           "last_used_at": "<ts>"
         },
         {
-          "id": "<id:id#3>",
-          "name": "ci",
+          "id": "<id:id#2>",
+          "name": "via-token-as-password",
           "sha1": "<token>",
           "token_last_eight": "<token>",
           "scopes": [
@@ -189,12 +178,23 @@
           "last_used_at": "<ts>"
         },
         {
-          "id": "<id:id#4>",
+          "id": "<id:id#3>",
           "name": "all",
           "sha1": "<token>",
           "token_last_eight": "<token>",
           "scopes": [
             "all"
+          ],
+          "created_at": "<ts>",
+          "last_used_at": "<ts>"
+        },
+        {
+          "id": "<id:id#4>",
+          "name": "ci",
+          "sha1": "<token>",
+          "token_last_eight": "<token>",
+          "scopes": [
+            "read:repository"
           ],
           "created_at": "<ts>",
           "last_used_at": "<ts>"

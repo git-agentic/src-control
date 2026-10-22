@@ -1,0 +1,331 @@
+[
+  {
+    "scenario": "G",
+    "exchange": 39,
+    "expect": {
+      "status": 409,
+      "message_contains": [
+        "conflict"
+      ]
+    },
+    "reason": "sc-forge answers a conflicting merge with 409 and a conflict message instead of Gitea's 405 'Please try again later'",
+    "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#8>/merge"
+  },
+  {
+    "scenario": "T",
+    "exchange": 20,
+    "expect": {
+      "status": 409,
+      "message_contains": [
+        "conflict"
+      ]
+    },
+    "reason": "sc-forge answers a conflicting merge with 409 and a conflict message instead of Gitea's 405 'Please try again later'",
+    "label": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#6>/merge"
+  },
+  {
+    "scenario": "L",
+    "exchange": 2,
+    "expect": {
+      "ignore_fields": [
+        "private"
+      ]
+    },
+    "reason": "sc-forge keeps private:true when asked for private:false",
+    "label": "PATCH /api/v1/repos/acme/pub1"
+  },
+  {
+    "scenario": "L",
+    "exchange": 5,
+    "expect": {
+      "ignore_fields": [
+        "private"
+      ]
+    },
+    "reason": "sc-forge keeps private:true when asked for private:false",
+    "label": "PATCH /api/v1/repos/acme/pub1"
+  },
+  {
+    "scenario": "L",
+    "exchange": 3,
+    "expect": {
+      "ignore_fields": [
+        "private"
+      ]
+    },
+    "reason": "GET after PATCH private:false: sc-forge still reports private:true",
+    "label": "GET /api/v1/repos/acme/pub1"
+  },
+  {
+    "scenario": "R",
+    "exchange": 6,
+    "expect": {
+      "status": [
+        401,
+        403
+      ]
+    },
+    "reason": "sc-forge refuses an access token used as the Basic password on /users/{u}/tokens",
+    "label": "POST /api/v1/users/alice/tokens"
+  },
+  {
+    "scenario": "R",
+    "exchange": 7,
+    "expect": {
+      "status": [
+        401,
+        403
+      ]
+    },
+    "reason": "sc-forge refuses an access token used as the Basic password on /users/{u}/tokens",
+    "label": "GET /api/v1/users/alice/tokens"
+  },
+  {
+    "scenario": "S",
+    "exchange": 0,
+    "expect": {
+      "ok": false
+    },
+    "reason": "sc-forge accepts only refs/heads and refs/tags from a push",
+    "label": "bot-push-replace-ref"
+  },
+  {
+    "scenario": "S",
+    "exchange": 7,
+    "expect": {
+      "ok": false
+    },
+    "reason": "sc-forge accepts only refs/heads and refs/tags from a push",
+    "label": "bot-push-notes-ref"
+  },
+  {
+    "scenario": "S",
+    "exchange": 9,
+    "expect": {
+      "ok": false
+    },
+    "reason": "sc-forge accepts only refs/heads and refs/tags from a push",
+    "label": "bot-push-changes-ref"
+  },
+  {
+    "scenario": "S",
+    "exchange": 10,
+    "expect": {
+      "ok": false
+    },
+    "reason": "sc-forge accepts only refs/heads and refs/tags from a push",
+    "label": "bot-push-keep-around-ref"
+  },
+  {
+    "scenario": "S",
+    "exchange": 11,
+    "expect": {
+      "ok": false
+    },
+    "reason": "sc-forge accepts only refs/heads and refs/tags from a push",
+    "label": "bot-push-arbitrary-ref"
+  },
+  {
+    "scenario": "S",
+    "exchange": 15,
+    "expect": {
+      "status": 200,
+      "ignore_body": true
+    },
+    "reason": "the ref list is shorter because the extra refs were refused",
+    "label": "GET /api/v1/repos/acme/refs/git/refs"
+  },
+  {
+    "scenario": "H",
+    "exchange": 33,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge rejects the unknown status state 'bogus'",
+    "label": "POST /api/v1/repos/acme/status/statuses/<sha#4>"
+  },
+  {
+    "scenario": "H",
+    "exchange": 34,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge rejects the unknown status state ''",
+    "label": "POST /api/v1/repos/acme/status/statuses/<sha#4>"
+  },
+  {
+    "scenario": "H",
+    "exchange": 43,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge rejects the unknown status state 'bogus'",
+    "label": "POST /api/v1/repos/acme/status/statuses/<sha#7>"
+  },
+  {
+    "scenario": "H",
+    "exchange": 35,
+    "expect": {
+      "status": 200,
+      "ignore_body": true
+    },
+    "reason": "total_count counts the two states sc-forge refuses",
+    "label": "GET /api/v1/repos/acme/status/commits/<sha#4>/status?limit=50"
+  },
+  {
+    "scenario": "H",
+    "exchange": "44-47",
+    "expect": {
+      "skip": true
+    },
+    "reason": "commit whose only status was refused has no statuses in sc-forge"
+  },
+  {
+    "scenario": "M",
+    "exchange": 42,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge does not rename repos",
+    "label": "PATCH /api/v1/repos/acme/rename-me"
+  },
+  {
+    "scenario": "M",
+    "exchange": "43-51",
+    "expect": {
+      "skip": true
+    },
+    "reason": "everything after the rename depends on it having happened"
+  },
+  {
+    "scenario": "N",
+    "exchange": 0,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge rejects a default branch that does not exist",
+    "label": "PATCH /api/v1/repos/acme/dflt"
+  },
+  {
+    "scenario": "G",
+    "exchange": 43,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge supports only Do=merge, not squash",
+    "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#10>/merge"
+  },
+  {
+    "scenario": "G",
+    "exchange": "44-48",
+    "expect": {
+      "skip": true
+    },
+    "reason": "reads that follow a squash merge assume it happened"
+  },
+  {
+    "scenario": "G",
+    "exchange": 49,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge supports only Do=merge, not rebase",
+    "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#11>/merge"
+  },
+  {
+    "scenario": "G",
+    "exchange": "50-54",
+    "expect": {
+      "skip": true
+    },
+    "reason": "reads that follow a rebase merge assume it happened"
+  },
+  {
+    "scenario": "G",
+    "exchange": 55,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge supports only Do=merge, not rebase-merge",
+    "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#12>/merge"
+  },
+  {
+    "scenario": "G",
+    "exchange": "56-59",
+    "expect": {
+      "skip": true
+    },
+    "reason": "reads that follow a rebase-merge merge assume it happened"
+  },
+  {
+    "scenario": "G",
+    "exchange": 60,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge supports only Do=merge, not fast-forward-only",
+    "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#13>/merge"
+  },
+  {
+    "scenario": "G",
+    "exchange": "61-65",
+    "expect": {
+      "skip": true
+    },
+    "reason": "reads that follow a fast-forward-only merge assume it happened"
+  },
+  {
+    "scenario": "G",
+    "exchange": 66,
+    "expect": {
+      "status": 422
+    },
+    "reason": "sc-forge supports only Do=merge, not fast-forward-only",
+    "label": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#14>/merge"
+  },
+  {
+    "scenario": "O",
+    "exchange": 14,
+    "expect": {
+      "skip": true
+    },
+    "reason": "sc-forge freezes head.sha at merge; Gitea follows a recreated branch",
+    "label": "GET /api/v1/repos/acme/life/pulls/<id:path:pulls#3>"
+  },
+  {
+    "scenario": "O",
+    "exchange": 15,
+    "expect": {
+      "value": true
+    },
+    "reason": "sc-forge freezes head.sha at merge",
+    "label": "merged_pr_head_sha_frozen"
+  },
+  {
+    "scenario": "O",
+    "exchange": 16,
+    "expect": {
+      "value": false
+    },
+    "reason": "sc-forge does not follow a recreated branch after merge",
+    "label": "merged_pr_head_sha_follows_new_branch"
+  },
+  {
+    "scenario": "K",
+    "exchange": 29,
+    "expect": {
+      "status": 404
+    },
+    "reason": "sc-forge answers 404, not Gitea's 403 'Push to create is not enabled', for a missing repo",
+    "label": "GET /acme/ghost.git/info/refs?service=git-receive-pack"
+  },
+  {
+    "scenario": "K",
+    "exchange": 39,
+    "expect": {
+      "status": 404
+    },
+    "reason": "sc-forge answers 404, not Gitea's 403 'Push to create is not enabled', for a missing repo",
+    "label": "GET /acme/ghost.git/info/refs?service=git-receive-pack"
+  }
+]

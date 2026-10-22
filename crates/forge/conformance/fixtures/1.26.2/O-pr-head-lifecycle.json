@@ -1185,7 +1185,7 @@
           "html_url": "<base>/acme/life/pulls/1",
           "diff_url": "<base>/acme/life/pulls/1.diff",
           "patch_url": "<base>/acme/life/pulls/1.patch",
-          "mergeable": true,
+          "mergeable": false,
           "merged": false,
           "merged_at": null,
           "merge_commit_sha": null,
@@ -3223,7 +3223,11 @@
         "closed_at": null,
         "pin_order": 0,
         "content_version": 0
-      }
+      },
+      "volatile": [
+        "state",
+        "closed_at"
+      ]
     },
     {
       "kind": "note",

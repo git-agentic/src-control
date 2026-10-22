@@ -232,6 +232,11 @@
       "output": "remote: \nremote: error:        \nremote: error: Not allowed to push to protected branch main        \nremote: error:        \nTo <base>/acme/prot.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'",
       "must_contain": [
         "protected"
+      ],
+      "refusal": [
+        "remote: error: not allowed to push to protected branch main",
+        "! [remote rejected] head -> main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/prot.git'"
       ]
     },
     {
@@ -239,7 +244,12 @@
       "name": "push-protected-admin",
       "cmd": "git push http://<admin>:<token>@<host>/acme/prot.git HEAD:refs/heads/main",
       "ok": false,
-      "output": "remote: \nremote: error:        \nremote: error: Not allowed to push to protected branch main        \nremote: error:        \nTo <base>/acme/prot.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'"
+      "output": "remote: \nremote: error:        \nremote: error: Not allowed to push to protected branch main        \nremote: error:        \nTo <base>/acme/prot.git\n ! [remote rejected] HEAD -> main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'",
+      "refusal": [
+        "remote: error: not allowed to push to protected branch main",
+        "! [remote rejected] head -> main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/prot.git'"
+      ]
     },
     {
       "kind": "git",
@@ -253,7 +263,12 @@
       "name": "delete-protected-by-push",
       "cmd": "git push origin :refs/heads/main",
       "ok": false,
-      "output": "remote: \nremote: error:        \nremote: error: branch main is the default branch and cannot be deleted        \nremote: error:        \nTo <base>/acme/prot.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'"
+      "output": "remote: \nremote: error:        \nremote: error: branch main is the default branch and cannot be deleted        \nremote: error:        \nTo <base>/acme/prot.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/prot.git'",
+      "refusal": [
+        "remote: error: branch main is the default branch and cannot be deleted",
+        "! [remote rejected] main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/prot.git'"
+      ]
     },
     {
       "kind": "http",
@@ -375,9 +390,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "errors": null,
         "message": "not found",
-        "url": "<base>/api/swagger"
+        "url": "<base>/api/swagger",
+        "errors": null
       }
     },
     {
@@ -399,9 +414,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
+        "message": "not found",
         "url": "<base>/api/swagger",
-        "errors": null,
-        "message": "not found"
+        "errors": null
       }
     },
     {

@@ -134,42 +134,63 @@
       "name": "clone-bad-token",
       "cmd": "git clone -q http://nobody:<token>@<host>/acme/smart.git <tmp>/j-bad-token",
       "ok": false,
-      "output": "remote: Verify\nfatal: Authentication failed for '<base>/acme/smart.git/'"
+      "output": "remote: Verify\nfatal: Authentication failed for '<base>/acme/smart.git/'",
+      "refusal": [
+        "remote: verify",
+        "fatal: authentication failed for '/acme/smart.git/'"
+      ]
     },
     {
       "kind": "git",
       "name": "push-bad-token",
       "cmd": "git push http://nobody:<token>@<host>/acme/smart.git <sha#1>:refs/heads/j-bad-token",
       "ok": false,
-      "output": "remote: Verify\nfatal: Authentication failed for '<base>/acme/smart.git/'"
+      "output": "remote: Verify\nfatal: Authentication failed for '<base>/acme/smart.git/'",
+      "refusal": [
+        "remote: verify",
+        "fatal: authentication failed for '/acme/smart.git/'"
+      ]
     },
     {
       "kind": "git",
       "name": "fetch-bad-token",
       "cmd": "git fetch -q http://nobody:<token>@<host>/acme/smart.git main",
       "ok": false,
-      "output": "remote: Verify\nfatal: Authentication failed for '<base>/acme/smart.git/'"
+      "output": "remote: Verify\nfatal: Authentication failed for '<base>/acme/smart.git/'",
+      "refusal": [
+        "remote: verify",
+        "fatal: authentication failed for '/acme/smart.git/'"
+      ]
     },
     {
       "kind": "git",
       "name": "clone-no-credentials",
       "cmd": "git clone -q <base>/acme/smart.git <tmp>/j-no-credentials",
       "ok": false,
-      "output": "fatal: could not read Username for '<base>': terminal prompts disabled"
+      "output": "fatal: could not read Username for '<base>': terminal prompts disabled",
+      "refusal": [
+        "fatal: could not read username for '': terminal prompts disabled"
+      ]
     },
     {
       "kind": "git",
       "name": "push-no-credentials",
       "cmd": "git push <base>/acme/smart.git <sha#1>:refs/heads/j-no-credentials",
       "ok": false,
-      "output": "fatal: could not read Username for '<base>': terminal prompts disabled"
+      "output": "fatal: could not read Username for '<base>': terminal prompts disabled",
+      "refusal": [
+        "fatal: could not read username for '': terminal prompts disabled"
+      ]
     },
     {
       "kind": "git",
       "name": "fetch-no-credentials",
       "cmd": "git fetch -q <base>/acme/smart.git main",
       "ok": false,
-      "output": "fatal: could not read Username for '<base>': terminal prompts disabled"
+      "output": "fatal: could not read Username for '<base>': terminal prompts disabled",
+      "refusal": [
+        "fatal: could not read username for '': terminal prompts disabled"
+      ]
     },
     {
       "kind": "git",
@@ -442,7 +463,11 @@
       "name": "flw-absent-expected-but-exists",
       "cmd": "git push --force-with-lease=refs/heads/b: http://<admin>:<token>@<host>/acme/smart.git <sha#5>:refs/heads/b",
       "ok": false,
-      "output": "To <base>/acme/smart.git\n ! [rejected]        <sha#5> -> b (stale info)\nerror: failed to push some refs to '<base>/acme/smart.git'"
+      "output": "To <base>/acme/smart.git\n ! [rejected]        <sha#5> -> b (stale info)\nerror: failed to push some refs to '<base>/acme/smart.git'",
+      "refusal": [
+        "! [rejected] -> b (stale info)",
+        "error: failed to push some refs to '/acme/smart.git'"
+      ]
     },
     {
       "kind": "git",
@@ -456,14 +481,22 @@
       "name": "flw-stale-lease",
       "cmd": "git push --force-with-lease=refs/heads/b:<sha#4> http://<admin>:<token>@<host>/acme/smart.git <sha#4>:refs/heads/b",
       "ok": false,
-      "output": "To <base>/acme/smart.git\n ! [rejected]        <sha#4> -> b (stale info)\nerror: failed to push some refs to '<base>/acme/smart.git'"
+      "output": "To <base>/acme/smart.git\n ! [rejected]        <sha#4> -> b (stale info)\nerror: failed to push some refs to '<base>/acme/smart.git'",
+      "refusal": [
+        "! [rejected] -> b (stale info)",
+        "error: failed to push some refs to '/acme/smart.git'"
+      ]
     },
     {
       "kind": "git",
       "name": "push-nonff-without-force",
       "cmd": "git push http://<admin>:<token>@<host>/acme/smart.git <sha#4>:refs/heads/b",
       "ok": false,
-      "output": "To <base>/acme/smart.git\n ! [rejected]        <sha#4> -> b (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/smart.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details."
+      "output": "To <base>/acme/smart.git\n ! [rejected]        <sha#4> -> b (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/smart.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details.",
+      "refusal": [
+        "! [rejected] -> b (non-fast-forward)",
+        "error: failed to push some refs to '/acme/smart.git'"
+      ]
     },
     {
       "kind": "git",
@@ -600,7 +633,12 @@
       "name": "delete-default-branch-by-push",
       "cmd": "git push http://<admin>:<token>@<host>/acme/smart.git :refs/heads/main",
       "ok": false,
-      "output": "remote: \nremote: Gitea: branch main is the default branch and cannot be deleted        \nTo <base>/acme/smart.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/smart.git'"
+      "output": "remote: \nremote: Gitea: branch main is the default branch and cannot be deleted        \nTo <base>/acme/smart.git\n ! [remote rejected] main (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/smart.git'",
+      "refusal": [
+        "remote: gitea: branch main is the default branch and cannot be deleted",
+        "! [remote rejected] main (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/smart.git'"
+      ]
     },
     {
       "kind": "http",

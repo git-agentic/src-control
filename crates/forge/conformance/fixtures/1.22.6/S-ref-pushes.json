@@ -15,21 +15,35 @@
       "name": "bot-push-pull-1-head",
       "cmd": "git push origin <sha#1>:refs/pull/1/head",
       "ok": false,
-      "output": "To <base>/acme/refs.git\n ! [rejected]        <sha#1> -> refs/pull/1/head (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/refs.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details."
+      "output": "To <base>/acme/refs.git\n ! [rejected]        <sha#1> -> refs/pull/1/head (non-fast-forward)\nerror: failed to push some refs to '<base>/acme/refs.git'\nhint: Updates were rejected because a pushed branch tip is behind its remote\nhint: counterpart. If you want to integrate the remote changes, use 'git pull'\nhint: before pushing again.\nhint: See the 'Note about fast-forwards' in 'git push --help' for details.",
+      "refusal": [
+        "! [rejected] -> refs/pull/1/head (non-fast-forward)",
+        "error: failed to push some refs to '/acme/refs.git'"
+      ]
     },
     {
       "kind": "git",
       "name": "bot-push-pull-1-head-forced",
       "cmd": "git push origin +<sha#1>:refs/pull/1/head",
       "ok": false,
-      "output": "remote: error: hook declined to update refs/pull/1/head        \nTo <base>/acme/refs.git\n ! [remote rejected] <sha#1> -> refs/pull/1/head (hook declined)\nerror: failed to push some refs to '<base>/acme/refs.git'"
+      "output": "remote: error: hook declined to update refs/pull/1/head        \nTo <base>/acme/refs.git\n ! [remote rejected] <sha#1> -> refs/pull/1/head (hook declined)\nerror: failed to push some refs to '<base>/acme/refs.git'",
+      "refusal": [
+        "remote: error: hook declined to update refs/pull/1/head",
+        "! [remote rejected] -> refs/pull/1/head (hook declined)",
+        "error: failed to push some refs to '/acme/refs.git'"
+      ]
     },
     {
       "kind": "git",
       "name": "bot-push-pull-999-head",
       "cmd": "git push origin <sha#1>:refs/pull/999/head",
       "ok": false,
-      "output": "remote: error: hook declined to update refs/pull/999/head        \nTo <base>/acme/refs.git\n ! [remote rejected] <sha#1> -> refs/pull/999/head (hook declined)\nerror: failed to push some refs to '<base>/acme/refs.git'"
+      "output": "remote: error: hook declined to update refs/pull/999/head        \nTo <base>/acme/refs.git\n ! [remote rejected] <sha#1> -> refs/pull/999/head (hook declined)\nerror: failed to push some refs to '<base>/acme/refs.git'",
+      "refusal": [
+        "remote: error: hook declined to update refs/pull/999/head",
+        "! [remote rejected] -> refs/pull/999/head (hook declined)",
+        "error: failed to push some refs to '/acme/refs.git'"
+      ]
     },
     {
       "kind": "git",
@@ -64,7 +78,11 @@
       "name": "bot-push-for-ref",
       "cmd": "git push origin <sha#1>:refs/for/main",
       "ok": false,
-      "output": "To <base>/acme/refs.git\n ! [remote rejected] <sha#1> -> refs/for/main (topic-branch is not set)\nerror: failed to push some refs to '<base>/acme/refs.git'"
+      "output": "To <base>/acme/refs.git\n ! [remote rejected] <sha#1> -> refs/for/main (topic-branch is not set)\nerror: failed to push some refs to '<base>/acme/refs.git'",
+      "refusal": [
+        "! [remote rejected] -> refs/for/main (topic-branch is not set)",
+        "error: failed to push some refs to '/acme/refs.git'"
+      ]
     },
     {
       "kind": "git",
@@ -99,7 +117,12 @@
       "name": "read-collab-push-tag",
       "cmd": "git push http://carol:<token>@<host>/acme/refs.git <sha#1>:refs/tags/v-carol",
       "ok": false,
-      "output": "remote: \nremote: Gitea: User permission denied for writing.        \nTo <base>/acme/refs.git\n ! [remote rejected] <sha#1> -> v-carol (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/refs.git'"
+      "output": "remote: \nremote: Gitea: User permission denied for writing.        \nTo <base>/acme/refs.git\n ! [remote rejected] <sha#1> -> v-carol (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/refs.git'",
+      "refusal": [
+        "remote: gitea: user permission denied for writing.",
+        "! [remote rejected] -> v-carol (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/refs.git'"
+      ]
     },
     {
       "kind": "git",
@@ -338,7 +361,7 @@
             "template": false,
             "parent": null,
             "mirror": false,
-            "size": 25,
+            "size": 26,
             "language": "",
             "languages_url": "<base>/api/v1/repos/acme/refs/languages",
             "html_url": "<base>/acme/refs",
@@ -436,7 +459,7 @@
             "template": false,
             "parent": null,
             "mirror": false,
-            "size": 25,
+            "size": 26,
             "language": "",
             "languages_url": "<base>/api/v1/repos/acme/refs/languages",
             "html_url": "<base>/acme/refs",

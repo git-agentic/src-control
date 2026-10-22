@@ -48,7 +48,7 @@
         "template": false,
         "parent": null,
         "mirror": false,
-        "size": 24,
+        "size": 25,
         "language": "Rust",
         "languages_url": "<base>/api/v1/repos/acme/hist/languages",
         "html_url": "<base>/acme/hist",
@@ -104,6 +104,15 @@
         "mirror_updated": "<ts>",
         "repo_transfer": null
       }
+    },
+    {
+      "kind": "note",
+      "key": "hist_first_read",
+      "value": {
+        "empty": false,
+        "default_branch": "main"
+      },
+      "strict": false
     },
     {
       "kind": "http",

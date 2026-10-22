@@ -11,9 +11,10 @@ pass="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 
 # Pick a free host port, then let Docker bind it; retry if someone raced us.
 started=0
+err=""
 for _ in 1 2 3 4 5; do
   port="$(python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
-  if docker run -d --name "$name" -p "127.0.0.1:${port}:3000" \
+  if err="$(docker run -d --name "$name" -p "127.0.0.1:${port}:3000" \
     -e GITEA__database__DB_TYPE=sqlite3 \
     -e GITEA__security__INSTALL_LOCK=true \
     -e GITEA__service__DISABLE_REGISTRATION=true \
@@ -24,13 +25,18 @@ for _ in 1 2 3 4 5; do
     -e GITEA__repository__DEFAULT_PRIVATE=private \
     -e GITEA__repository__FORCE_PRIVATE=true \
     -e GITEA__server__OFFLINE_MODE=true \
-    "$image" >/dev/null 2>&1; then
+    "$image" 2>&1)"; then
     started=1
     break
   fi
+  # Only a lost port race is worth retrying; anything else (missing image, daemon down) is fatal.
   docker rm -f "$name" >/dev/null 2>&1 || true
+  case "$err" in
+    *"port is already allocated"*|*"address already in use"*|*"ports are not available"*) ;;
+    *) echo "docker run failed for $image: $err" >&2; exit 1 ;;
+  esac
 done
-[ "$started" = 1 ] || { echo "could not start $image" >&2; exit 1; }
+[ "$started" = 1 ] || { echo "could not start $image after retries: $err" >&2; exit 1; }
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true' ERR
 
 base="http://127.0.0.1:${port}"

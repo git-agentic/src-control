@@ -170,20 +170,20 @@
         },
         {
           "id": "<id:id#3>",
-          "name": "ci",
-          "sha1": "<token>",
-          "token_last_eight": "<token>",
-          "scopes": [
-            "read:repository"
-          ]
-        },
-        {
-          "id": "<id:id#4>",
           "name": "all",
           "sha1": "<token>",
           "token_last_eight": "<token>",
           "scopes": [
             "all"
+          ]
+        },
+        {
+          "id": "<id:id#4>",
+          "name": "ci",
+          "sha1": "<token>",
+          "token_last_eight": "<token>",
+          "scopes": [
+            "read:repository"
           ]
         }
       ],

@@ -715,6 +715,15 @@
       }
     },
     {
+      "kind": "note",
+      "key": "fresh1_before_push_first_read",
+      "value": {
+        "empty": true,
+        "default_branch": "main"
+      },
+      "strict": false
+    },
+    {
       "kind": "http",
       "method": "GET",
       "path": "/api/v1/repos/acme/fresh1",
@@ -753,13 +762,13 @@
         "name": "fresh1",
         "full_name": "acme/fresh1",
         "description": "",
-        "empty": true,
+        "empty": false,
         "private": true,
         "fork": false,
         "template": false,
         "mirror": false,
         "size": 22,
-        "language": "",
+        "language": "Text",
         "languages_url": "<base>/api/v1/repos/acme/fresh1/languages",
         "html_url": "<base>/acme/fresh1",
         "url": "<base>/api/v1/repos/acme/fresh1",
@@ -775,7 +784,7 @@
         "open_issues_count": 0,
         "open_pr_counter": 0,
         "release_counter": 0,
-        "default_branch": "main",
+        "default_branch": "trunk",
         "archived": false,
         "created_at": "<ts>",
         "updated_at": "<ts>",
@@ -821,11 +830,20 @@
       }
     },
     {
+      "kind": "note",
+      "key": "fresh1_after_trunk_first_read",
+      "value": {
+        "empty": true,
+        "default_branch": "main"
+      },
+      "strict": false
+    },
+    {
       "kind": "git",
       "name": "ls-remote-symref-trunk-first",
       "cmd": "git ls-remote --symref http://<admin>:<token>@<host>/acme/fresh1.git HEAD",
       "ok": true,
-      "output": ""
+      "output": "ref: refs/heads/trunk\tHEAD\n<sha#5>\tHEAD"
     },
     {
       "kind": "http",
@@ -835,9 +853,46 @@
       "status": 200,
       "headers": {
         "content-type": "application/json;charset=utf-8",
-        "x-total-count": "0"
+        "x-total-count": "1"
       },
-      "body": null
+      "body": [
+        {
+          "name": "trunk",
+          "commit": {
+            "id": "<sha#5>",
+            "message": "commit on trunk\n",
+            "url": "<base>/acme/fresh1/commit/<sha#5>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "verification": {
+              "verified": false,
+              "reason": "gpg.error.not_signed_commit",
+              "signature": "",
+              "signer": null,
+              "payload": ""
+            },
+            "timestamp": "<ts>",
+            "added": null,
+            "removed": null,
+            "modified": null
+          },
+          "protected": false,
+          "required_approvals": 0,
+          "enable_status_check": false,
+          "status_check_contexts": [],
+          "user_can_push": true,
+          "user_can_merge": true,
+          "effective_branch_protection_name": ""
+        }
+      ]
     },
     {
       "kind": "http",
@@ -878,13 +933,13 @@
         "name": "fresh2",
         "full_name": "acme/fresh2",
         "description": "",
-        "empty": true,
+        "empty": false,
         "private": true,
         "fork": false,
         "template": false,
         "mirror": false,
-        "size": 22,
-        "language": "",
+        "size": 23,
+        "language": "Text",
         "languages_url": "<base>/api/v1/repos/acme/fresh2/languages",
         "html_url": "<base>/acme/fresh2",
         "url": "<base>/api/v1/repos/acme/fresh2",
@@ -944,6 +999,15 @@
         "topics": [],
         "licenses": []
       }
+    },
+    {
+      "kind": "note",
+      "key": "fresh2_after_main_first_read",
+      "value": {
+        "empty": true,
+        "default_branch": "main"
+      },
+      "strict": false
     },
     {
       "kind": "http",
@@ -1052,6 +1116,15 @@
       }
     },
     {
+      "kind": "note",
+      "key": "fresh3_before_push_first_read",
+      "value": {
+        "empty": true,
+        "default_branch": "develop"
+      },
+      "strict": false
+    },
+    {
       "kind": "http",
       "method": "GET",
       "path": "/api/v1/repos/acme/fresh3",
@@ -1090,13 +1163,13 @@
         "name": "fresh3",
         "full_name": "acme/fresh3",
         "description": "",
-        "empty": true,
+        "empty": false,
         "private": true,
         "fork": false,
         "template": false,
         "mirror": false,
         "size": 22,
-        "language": "",
+        "language": "Text",
         "languages_url": "<base>/api/v1/repos/acme/fresh3/languages",
         "html_url": "<base>/acme/fresh3",
         "url": "<base>/api/v1/repos/acme/fresh3",
@@ -1112,7 +1185,7 @@
         "open_issues_count": 0,
         "open_pr_counter": 0,
         "release_counter": 0,
-        "default_branch": "develop",
+        "default_branch": "main",
         "archived": false,
         "created_at": "<ts>",
         "updated_at": "<ts>",
@@ -1156,6 +1229,15 @@
         "topics": [],
         "licenses": []
       }
+    },
+    {
+      "kind": "note",
+      "key": "fresh3_after_main_first_read",
+      "value": {
+        "empty": true,
+        "default_branch": "develop"
+      },
+      "strict": false
     },
     {
       "kind": "git",
@@ -1208,7 +1290,7 @@
         "fork": false,
         "template": false,
         "mirror": false,
-        "size": 22,
+        "size": 23,
         "language": "Text",
         "languages_url": "<base>/api/v1/repos/acme/fresh3/languages",
         "html_url": "<base>/acme/fresh3",
@@ -1271,11 +1353,20 @@
       }
     },
     {
+      "kind": "note",
+      "key": "fresh3_after_develop_first_read",
+      "value": {
+        "empty": false,
+        "default_branch": "main"
+      },
+      "strict": false
+    },
+    {
       "kind": "git",
       "name": "ls-remote-symref-develop-pushed-second",
       "cmd": "git ls-remote --symref http://<admin>:<token>@<host>/acme/fresh3.git HEAD",
       "ok": true,
-      "output": "ref: refs/heads/develop\tHEAD\n<sha#5>\tHEAD"
+      "output": "ref: refs/heads/develop\tHEAD\n<sha#6>\tHEAD"
     }
   ]
 }

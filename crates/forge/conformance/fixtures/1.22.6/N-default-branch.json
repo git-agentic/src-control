@@ -691,6 +691,15 @@
       }
     },
     {
+      "kind": "note",
+      "key": "fresh1_before_push_first_read",
+      "value": {
+        "empty": true,
+        "default_branch": "main"
+      },
+      "strict": false
+    },
+    {
       "kind": "http",
       "method": "GET",
       "path": "/api/v1/repos/acme/fresh1",
@@ -729,14 +738,14 @@
         "name": "fresh1",
         "full_name": "acme/fresh1",
         "description": "",
-        "empty": true,
+        "empty": false,
         "private": true,
         "fork": false,
         "template": false,
         "parent": null,
         "mirror": false,
         "size": 22,
-        "language": "",
+        "language": "Text",
         "languages_url": "<base>/api/v1/repos/acme/fresh1/languages",
         "html_url": "<base>/acme/fresh1",
         "url": "<base>/api/v1/repos/acme/fresh1",
@@ -751,7 +760,7 @@
         "open_issues_count": 0,
         "open_pr_counter": 0,
         "release_counter": 0,
-        "default_branch": "main",
+        "default_branch": "trunk",
         "archived": false,
         "created_at": "<ts>",
         "updated_at": "<ts>",
@@ -793,11 +802,20 @@
       }
     },
     {
+      "kind": "note",
+      "key": "fresh1_after_trunk_first_read",
+      "value": {
+        "empty": true,
+        "default_branch": "main"
+      },
+      "strict": false
+    },
+    {
       "kind": "git",
       "name": "ls-remote-symref-trunk-first",
       "cmd": "git ls-remote --symref http://<admin>:<token>@<host>/acme/fresh1.git HEAD",
       "ok": true,
-      "output": ""
+      "output": "ref: refs/heads/trunk\tHEAD\n<sha#5>\tHEAD"
     },
     {
       "kind": "http",
@@ -807,9 +825,46 @@
       "status": 200,
       "headers": {
         "content-type": "application/json;charset=utf-8",
-        "x-total-count": "0"
+        "x-total-count": "1"
       },
-      "body": null
+      "body": [
+        {
+          "name": "trunk",
+          "commit": {
+            "id": "<sha#5>",
+            "message": "commit on trunk\n",
+            "url": "<base>/acme/fresh1/commit/<sha#5>",
+            "author": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "committer": {
+              "name": "Conf",
+              "email": "conf@example.invalid",
+              "username": ""
+            },
+            "verification": {
+              "verified": false,
+              "reason": "gpg.error.not_signed_commit",
+              "signature": "",
+              "signer": null,
+              "payload": ""
+            },
+            "timestamp": "<ts>",
+            "added": null,
+            "removed": null,
+            "modified": null
+          },
+          "protected": false,
+          "required_approvals": 0,
+          "enable_status_check": false,
+          "status_check_contexts": [],
+          "user_can_push": true,
+          "user_can_merge": true,
+          "effective_branch_protection_name": ""
+        }
+      ]
     },
     {
       "kind": "http",
@@ -850,14 +905,14 @@
         "name": "fresh2",
         "full_name": "acme/fresh2",
         "description": "",
-        "empty": true,
+        "empty": false,
         "private": true,
         "fork": false,
         "template": false,
         "parent": null,
         "mirror": false,
-        "size": 22,
-        "language": "",
+        "size": 23,
+        "language": "Text",
         "languages_url": "<base>/api/v1/repos/acme/fresh2/languages",
         "html_url": "<base>/acme/fresh2",
         "url": "<base>/api/v1/repos/acme/fresh2",
@@ -914,106 +969,13 @@
       }
     },
     {
-      "kind": "http",
-      "method": "GET",
-      "path": "/api/v1/repos/acme/fresh3",
-      "auth": "admin",
-      "status": 200,
-      "headers": {
-        "content-type": "application/json;charset=utf-8"
-      },
-      "body": {
-        "id": "<id:id#1>",
-        "owner": {
-          "id": "<id:owner.id#1>",
-          "login": "acme",
-          "login_name": "",
-          "source_id": "<id:owner.source_id#1>",
-          "full_name": "Acme",
-          "email": "",
-          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
-          "html_url": "<base>/acme",
-          "language": "",
-          "is_admin": false,
-          "last_login": "<ts>",
-          "created": "<ts>",
-          "restricted": false,
-          "active": false,
-          "prohibit_login": false,
-          "location": "",
-          "website": "",
-          "description": "",
-          "visibility": "private",
-          "followers_count": 0,
-          "following_count": 0,
-          "starred_repos_count": 0,
-          "username": "acme"
-        },
-        "name": "fresh3",
-        "full_name": "acme/fresh3",
-        "description": "",
+      "kind": "note",
+      "key": "fresh2_after_main_first_read",
+      "value": {
         "empty": true,
-        "private": true,
-        "fork": false,
-        "template": false,
-        "parent": null,
-        "mirror": false,
-        "size": 22,
-        "language": "",
-        "languages_url": "<base>/api/v1/repos/acme/fresh3/languages",
-        "html_url": "<base>/acme/fresh3",
-        "url": "<base>/api/v1/repos/acme/fresh3",
-        "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/fresh3.git",
-        "clone_url": "<base>/acme/fresh3.git",
-        "original_url": "",
-        "website": "",
-        "stars_count": 0,
-        "forks_count": 0,
-        "watchers_count": 1,
-        "open_issues_count": 0,
-        "open_pr_counter": 0,
-        "release_counter": 0,
-        "default_branch": "develop",
-        "archived": false,
-        "created_at": "<ts>",
-        "updated_at": "<ts>",
-        "archived_at": "<ts>",
-        "permissions": {
-          "admin": true,
-          "push": true,
-          "pull": true
-        },
-        "has_issues": true,
-        "internal_tracker": {
-          "enable_time_tracker": true,
-          "allow_only_contributors_to_track_time": true,
-          "enable_issue_dependencies": true
-        },
-        "has_wiki": true,
-        "has_pull_requests": true,
-        "has_projects": true,
-        "projects_mode": "all",
-        "has_releases": true,
-        "has_packages": true,
-        "has_actions": false,
-        "ignore_whitespace_conflicts": false,
-        "allow_merge_commits": true,
-        "allow_rebase": true,
-        "allow_rebase_explicit": true,
-        "allow_squash_merge": true,
-        "allow_fast_forward_only_merge": true,
-        "allow_rebase_update": true,
-        "default_delete_branch_after_merge": false,
-        "default_merge_style": "merge",
-        "default_allow_maintainer_edit": false,
-        "avatar_url": "",
-        "internal": false,
-        "mirror_interval": "",
-        "object_format_name": "sha1",
-        "mirror_updated": "<ts>",
-        "repo_transfer": null
-      }
+        "default_branch": "main"
+      },
+      "strict": false
     },
     {
       "kind": "http",
@@ -1118,11 +1080,13 @@
       }
     },
     {
-      "kind": "git",
-      "name": "ls-remote-symref-main-pushed-first",
-      "cmd": "git ls-remote --symref http://<admin>:<token>@<host>/acme/fresh3.git HEAD",
-      "ok": true,
-      "output": ""
+      "kind": "note",
+      "key": "fresh3_before_push_first_read",
+      "value": {
+        "empty": true,
+        "default_branch": "develop"
+      },
+      "strict": false
     },
     {
       "kind": "http",
@@ -1169,8 +1133,8 @@
         "template": false,
         "parent": null,
         "mirror": false,
-        "size": 23,
-        "language": "",
+        "size": 22,
+        "language": "Text",
         "languages_url": "<base>/api/v1/repos/acme/fresh3/languages",
         "html_url": "<base>/acme/fresh3",
         "url": "<base>/api/v1/repos/acme/fresh3",
@@ -1227,11 +1191,138 @@
       }
     },
     {
+      "kind": "note",
+      "key": "fresh3_after_main_first_read",
+      "value": {
+        "empty": true,
+        "default_branch": "develop"
+      },
+      "strict": false
+    },
+    {
+      "kind": "git",
+      "name": "ls-remote-symref-main-pushed-first",
+      "cmd": "git ls-remote --symref http://<admin>:<token>@<host>/acme/fresh3.git HEAD",
+      "ok": true,
+      "output": ""
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/api/v1/repos/acme/fresh3",
+      "auth": "admin",
+      "status": 200,
+      "headers": {
+        "content-type": "application/json;charset=utf-8"
+      },
+      "body": {
+        "id": "<id:id#1>",
+        "owner": {
+          "id": "<id:owner.id#1>",
+          "login": "acme",
+          "login_name": "",
+          "source_id": "<id:owner.source_id#1>",
+          "full_name": "Acme",
+          "email": "",
+          "avatar_url": "<base>/avatars/53bce4f1dfa0fe8e7ca126f91b35d3a6",
+          "html_url": "<base>/acme",
+          "language": "",
+          "is_admin": false,
+          "last_login": "<ts>",
+          "created": "<ts>",
+          "restricted": false,
+          "active": false,
+          "prohibit_login": false,
+          "location": "",
+          "website": "",
+          "description": "",
+          "visibility": "private",
+          "followers_count": 0,
+          "following_count": 0,
+          "starred_repos_count": 0,
+          "username": "acme"
+        },
+        "name": "fresh3",
+        "full_name": "acme/fresh3",
+        "description": "",
+        "empty": false,
+        "private": true,
+        "fork": false,
+        "template": false,
+        "parent": null,
+        "mirror": false,
+        "size": 23,
+        "language": "Text",
+        "languages_url": "<base>/api/v1/repos/acme/fresh3/languages",
+        "html_url": "<base>/acme/fresh3",
+        "url": "<base>/api/v1/repos/acme/fresh3",
+        "link": "",
+        "ssh_url": "ssh://git@localhost:2222/acme/fresh3.git",
+        "clone_url": "<base>/acme/fresh3.git",
+        "original_url": "",
+        "website": "",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 1,
+        "open_issues_count": 0,
+        "open_pr_counter": 0,
+        "release_counter": 0,
+        "default_branch": "main",
+        "archived": false,
+        "created_at": "<ts>",
+        "updated_at": "<ts>",
+        "archived_at": "<ts>",
+        "permissions": {
+          "admin": true,
+          "push": true,
+          "pull": true
+        },
+        "has_issues": true,
+        "internal_tracker": {
+          "enable_time_tracker": true,
+          "allow_only_contributors_to_track_time": true,
+          "enable_issue_dependencies": true
+        },
+        "has_wiki": true,
+        "has_pull_requests": true,
+        "has_projects": true,
+        "projects_mode": "all",
+        "has_releases": true,
+        "has_packages": true,
+        "has_actions": false,
+        "ignore_whitespace_conflicts": false,
+        "allow_merge_commits": true,
+        "allow_rebase": true,
+        "allow_rebase_explicit": true,
+        "allow_squash_merge": true,
+        "allow_fast_forward_only_merge": true,
+        "allow_rebase_update": true,
+        "default_delete_branch_after_merge": false,
+        "default_merge_style": "merge",
+        "default_allow_maintainer_edit": false,
+        "avatar_url": "",
+        "internal": false,
+        "mirror_interval": "",
+        "object_format_name": "sha1",
+        "mirror_updated": "<ts>",
+        "repo_transfer": null
+      }
+    },
+    {
+      "kind": "note",
+      "key": "fresh3_after_develop_first_read",
+      "value": {
+        "empty": false,
+        "default_branch": "main"
+      },
+      "strict": false
+    },
+    {
       "kind": "git",
       "name": "ls-remote-symref-develop-pushed-second",
       "cmd": "git ls-remote --symref http://<admin>:<token>@<host>/acme/fresh3.git HEAD",
       "ok": true,
-      "output": "ref: refs/heads/develop\tHEAD\n<sha#5>\tHEAD"
+      "output": "ref: refs/heads/develop\tHEAD\n<sha#6>\tHEAD"
     }
   ]
 }

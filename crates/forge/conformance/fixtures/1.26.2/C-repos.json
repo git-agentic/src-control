@@ -1989,9 +1989,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "url": "<base>/api/swagger",
         "errors": null,
-        "message": "not found"
+        "message": "not found",
+        "url": "<base>/api/swagger"
       }
     },
     {
@@ -2025,28 +2025,45 @@
       "name": "push-readonly-scope",
       "cmd": "git push http://alice:<token>@<host>/acme/alpha.git HEAD:refs/heads/ro-scope",
       "ok": false,
-      "output": "remote: Forbidden\nfatal: unable to access '<base>/acme/alpha.git/': The requested URL returned error: 403"
+      "output": "remote: Forbidden\nfatal: unable to access '<base>/acme/alpha.git/': The requested URL returned error: 403",
+      "refusal": [
+        "remote: forbidden",
+        "fatal: unable to access '/acme/alpha.git/': the requested url returned error: 403"
+      ]
     },
     {
       "kind": "git",
       "name": "push-read-collab",
       "cmd": "git push http://carol:<token>@<host>/acme/alpha.git HEAD:refs/heads/carol-branch",
       "ok": false,
-      "output": "remote: \nremote: error:        \nremote: error: User permission denied for writing.        \nremote: error:        \nTo <base>/acme/alpha.git\n ! [remote rejected] HEAD -> carol-branch (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/alpha.git'"
+      "output": "remote: \nremote: error:        \nremote: error: User permission denied for writing.        \nremote: error:        \nTo <base>/acme/alpha.git\n ! [remote rejected] HEAD -> carol-branch (pre-receive hook declined)\nerror: failed to push some refs to '<base>/acme/alpha.git'",
+      "refusal": [
+        "remote: error: user permission denied for writing.",
+        "! [remote rejected] head -> carol-branch (pre-receive hook declined)",
+        "error: failed to push some refs to '/acme/alpha.git'"
+      ]
     },
     {
       "kind": "git",
       "name": "push-no-grant",
       "cmd": "git push http://dave:<token>@<host>/acme/alpha.git HEAD:refs/heads/dave-branch",
       "ok": false,
-      "output": "remote: Repository not found\nfatal: repository '<base>/acme/alpha.git/' not found"
+      "output": "remote: Repository not found\nfatal: repository '<base>/acme/alpha.git/' not found",
+      "refusal": [
+        "remote: repository not found",
+        "fatal: repository '/acme/alpha.git/' not found"
+      ]
     },
     {
       "kind": "git",
       "name": "clone-no-grant",
       "cmd": "git clone http://dave:<token>@<host>/acme/alpha.git <tmp>/dave-clone",
       "ok": false,
-      "output": "Cloning into '<tmp>/dave-clone'...\nremote: Repository not found\nfatal: repository '<base>/acme/alpha.git/' not found"
+      "output": "Cloning into '<tmp>/dave-clone'...\nremote: Repository not found\nfatal: repository '<base>/acme/alpha.git/' not found",
+      "refusal": [
+        "remote: repository not found",
+        "fatal: repository '/acme/alpha.git/' not found"
+      ]
     },
     {
       "kind": "git",
@@ -2185,9 +2202,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
+        "message": "not found",
         "url": "<base>/api/swagger",
-        "errors": null,
-        "message": "not found"
+        "errors": null
       }
     },
     {
