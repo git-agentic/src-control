@@ -161,11 +161,24 @@ def msg_text(ex):
     return ex.get("body_text") or ex.get("output") or ""
 
 
+TRAIL_STRIP = (re.compile(r"\s*\[uid: [^\]]*\]\s*$"), re.compile(r"\s*\[id: [^\]]*rel_path: [^\]]*\]\s*$"))
+ID_PAIRS = re.compile(r"\b(?:id|issue_id|head_repo_id|base_repo_id): \d+,?\s*")
+
+
 def norm_msg(t):
-    """Compare error text without ids, hosts or trailing `[uid: 0, name: ]` detail."""
-    t = re.sub(r"<[^<>]*>", "", (t or "").lower())
-    t = re.sub(r"\s*\[[^\]]*\]\s*$", "", t)
+    """Error text for comparison: lower case, trailing `[uid: .., name: ..]` and `[id: .., rel_path: ..]` details
+    and numeric `id:` pairs dropped. Other brackets stay: `[name: alice]` and `[write:user]` are meaningful.
+    Placeholders such as `<sha#3>` stay too, so eq_str can check which value a message names."""
+    t = (t or "").lower()
+    for r in TRAIL_STRIP:
+        t = r.sub("", t)
+    t = ID_PAIRS.sub("", t)
     return re.sub(r"\s+", " ", t).strip(" .:\n")
+
+
+def msg_equal(exp_text, act_text, bij):
+    tmp = []
+    return eq_str(norm_msg(exp_text), norm_msg(act_text), bij, tmp, "")
 
 
 def err_text(v):
@@ -227,11 +240,22 @@ def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None):
                 if key not in exp["body"]:
                     continue
                 ev = err_text(exp["body"][key])
-                if key == "errors" and not ev:
-                    continue
                 av = err_text(ab.get(key)) if ab is not None else (msg_text(act) if key == "message" else "")
-                if norm_msg(ev) != norm_msg(av):
+                if key == "errors":
+                    if exp["body"][key] is None:
+                        continue
+                    if exp["body"][key] == [] and av:
+                        d.append(("fail", f"errors expected empty, got {av!r}"))
+                        continue
+                    if not ev:
+                        continue
+                if not msg_equal(ev, av, bij):
                     d.append(("fail", f"{key} {ev!r} expected, got {av!r}"))
+        if act.get("unsettled"):
+            d.append(("fail", "repo state did not settle (8 equal reads) within 25 s"))
+        if act.get("first_read_differs"):
+            d.append(("fail", f"first read {act['first_read_differs']['first']} differs from the settled "
+                              f"{act['first_read_differs']['settled']} (--strict-first-read)"))
         for h, v in exp.get("headers", {}).items():
             got = act.get("headers", {}).get(h)
             if got is None:
@@ -273,8 +297,70 @@ def dep_indexes(spec, expected):
     return [i for i, e in enumerate(expected) if e.get("name") == spec or e.get("key") == spec]
 
 
+EXPECT_KEYS = {"status", "message_contains", "ok", "value", "fields", "ignore_fields", "ignore_body", "skip"}
+
+
+def load_departures(path, scenario_ids):
+    """Read and validate departures.json; any problem is a load error (SystemExit)."""
+    deps = J.load(open(path))
+    seen, errs = {}, []
+    if not isinstance(deps, list):
+        raise SystemExit(f"{path}: expected a JSON list")
+    for n, d in enumerate(deps):
+        where = f"{path}[{n}]"
+        if d.get("scenario") not in scenario_ids:
+            errs.append(f"{where}: unknown scenario {d.get('scenario')!r}")
+            continue
+        e = d.get("expect")
+        if not isinstance(e, dict) or not e:
+            errs.append(f"{where}: expect must be a non-empty object")
+            continue
+        if set(e) - EXPECT_KEYS:
+            errs.append(f"{where}: unknown expect keys {sorted(set(e) - EXPECT_KEYS)}")
+        if not d.get("reason"):
+            errs.append(f"{where}: reason is required")
+        sts = e.get("status")
+        sts = sts if isinstance(sts, list) else ([sts] if sts is not None else [])
+        if (any(x >= 400 for x in sts) or e.get("ok") is False) and not e.get("message_contains"):
+            errs.append(f"{where}: an expected refusal (status >= 400 or git ok:false) needs message_contains")
+        spec = d.get("exchange")
+        idx = None
+        if isinstance(spec, int) and not isinstance(spec, bool):
+            idx = [spec]
+            if not d.get("label"):
+                errs.append(f"{where}: a single-index entry needs a label")
+        elif isinstance(spec, (list, str)) and (isinstance(spec, list) or re.fullmatch(r"\d+-\d+", spec)):
+            idx = dep_indexes(spec, [])
+            if len(d.get("labels") or []) != len(idx):
+                errs.append(f"{where}: a range or list needs `labels` with one entry per exchange ({len(idx)})")
+        elif not isinstance(spec, str):
+            errs.append(f"{where}: bad exchange {spec!r}")
+        for i in idx or []:
+            if (d["scenario"], i) in seen:
+                errs.append(f"{where}: duplicate entry for {d['scenario']}#{i} (also {seen[(d['scenario'], i)]})")
+            seen[(d["scenario"], i)] = where
+    if errs:
+        raise SystemExit("departures.json is invalid:\n  " + "\n  ".join(errs))
+    return deps
+
+
+def dget(b, path):
+    for part in path.split("."):
+        if isinstance(b, list):
+            b = b[int(part)] if part.isdigit() and int(part) < len(b) else None
+        elif isinstance(b, dict):
+            b = b.get(part)
+        else:
+            return None
+    return b
+
+
 def apply_override(exp, act, ov, bij):
-    """Check `act` against a departure instead of the recorded exchange."""
+    """Check `act` against a departure instead of the recorded exchange.
+
+    Targeted checks (status, message_contains, ok, value, fields) always run. The recorded body is still compared
+    strictly when the entry only names `ignore_fields`/`fields` (those keys are left out), so a departure never
+    widens more than it says."""
     e, why, d = ov["expect"], ov.get("reason", ""), []
     if e.get("skip"):
         return [("honoured", f"skipped: {why}")]
@@ -287,7 +373,7 @@ def apply_override(exp, act, ov, bij):
         txt = act["output"].lower()
         for w in e.get("message_contains", []):
             if w.lower() not in txt:
-                d.append(("fail", f"unexpected: output lacks {w!r}"))
+                d.append(("fail", f"unexpected: output lacks {w!r}: {txt[-160:]!r}"))
     else:
         sts = e.get("status")
         sts = sts if isinstance(sts, list) else ([sts] if sts is not None else None)
@@ -297,8 +383,15 @@ def apply_override(exp, act, ov, bij):
         for w in e.get("message_contains", []):
             if w.lower() not in txt:
                 d.append(("fail", f"unexpected: message lacks {w!r}: {txt[:160]!r}"))
-        if not e.get("ignore_body") and e.get("ignore_fields") and sts is None:
-            d += [x for x in cmp_exchange(exp, act, bij, extra_volatile=e["ignore_fields"]) if x[0] == "fail"]
+        for k, v in (e.get("fields") or {}).items():
+            body = act.get("body")
+            got = len(body) if k == "$len" and isinstance(body, list) else dget(body, k)
+            if got != v:
+                d.append(("fail", f"unexpected: {k} {v!r} expected, got {got!r}"))
+        pins = list((e.get("fields") or {}))
+        if not e.get("ignore_body") and sts is None and (e.get("ignore_fields") or pins):
+            skip = list(e.get("ignore_fields") or []) + [k for k in pins if k != "$len"]
+            d += [x for x in cmp_exchange(exp, act, bij, extra_volatile=skip) if x[0] == "fail"]
     return d or [("honoured", why)]
 
 
@@ -331,6 +424,7 @@ class Ctx:
         self.verbose = False
         self.base_ready = False
         self.first_read = None
+        self.strict_first_read = False
         r = self.call("GET", "/user", rec=False)
         if r.status != 200 or not r.json:
             raise SystemExit(f"admin token rejected by {self.base}: {r.status} {r.text[:200]}")
@@ -462,6 +556,7 @@ class Ctx:
             if not retry_while or time.time() >= deadline or not any(w in r.text.lower() for w in retry_while):
                 break
             time.sleep(1)
+        unsettled, first_differs = False, None
         if settle_keys and r.status == 200 and r.is_json:
             # Gitea updates some repo fields (empty, default_branch) asynchronously after a push: record the
             # value that is stable on 8 consecutive reads (4 s, <= 25 s); the first read is left in `first_read`
@@ -474,10 +569,14 @@ class Ctx:
             hist = [proj(r)]
             self.first_read = dict(zip(settle_keys, hist[0]))
             end = time.time() + 25
-            while time.time() < end and not (len(hist) >= 8 and all(h == hist[-1] for h in hist[-8:])):
+            stable = lambda: len(hist) >= 8 and all(h == hist[-1] for h in hist[-8:])  # noqa: E731
+            while time.time() < end and not stable():
                 time.sleep(0.5)
                 r = send()
                 hist.append(proj(r))
+            unsettled = not stable()
+            if self.strict_first_read and hist[0] != hist[-1]:
+                first_differs = {"first": dict(zip(settle_keys, hist[0])), "settled": dict(zip(settle_keys, hist[-1]))}
         if rec:
             ex = {"kind": "http", "method": method, "path": self.np(full), "auth": as_,
                   "status": r.status}
@@ -495,7 +594,13 @@ class Ctx:
             for k, v in (("must_contain", must_contain), ("volatile", volatile)):
                 if v:
                     ex[k] = list(v)
+            if unsettled:
+                ex["unsettled"] = True
+            if first_differs:
+                ex["first_read_differs"] = first_differs
             self.push_ex(ex)
+            if unsettled and self.mode == "record":
+                raise SetupError(f"{method} {full}: value did not settle within 25 s")
         if expect is not None:
             ok = expect if isinstance(expect, (list, tuple, set)) else [expect]
             if r.status not in ok:
@@ -664,12 +769,16 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
                 bad = [i for i in idx if not 0 <= i < len(c.expected)]
                 if not idx or bad:
                     stale.append(f"stale departure {dep['exchange']!r}: no such exchange in {fname} ({dep.get('reason', '')})")
-                for i in idx:
+                labels = dep.get("labels") or ([dep["label"]] if dep.get("label") and len(idx) == 1 else [None] * len(idx))
+                for k, i in enumerate(idx):
                     if i in bad:
                         continue
-                    if dep.get("label") and dep["label"] not in ex_label(c.expected[i]) and len(idx) == 1:
+                    if labels[k] and labels[k] not in ex_label(c.expected[i]):
                         stale.append(f"stale departure #{i}: fixture exchange is {ex_label(c.expected[i])!r}, "
-                                     f"departure says {dep['label']!r}")
+                                     f"departure says {labels[k]!r}")
+                        continue
+                    if i in c.overrides:
+                        stale.append(f"duplicate departure for #{i} ({dep.get('reason', '')})")
                         continue
                     c.overrides[i] = dep
         t0 = time.time()
@@ -719,8 +828,9 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
 
 
 def cmd_run(a):
-    deps = J.load(open(a.departures)) if getattr(a, "departures", None) else []
+    deps = load_departures(a.departures, {x[0] for x in SCENARIOS}) if getattr(a, "departures", None) else []
     c = Ctx(a.base_url, a.admin_token, a.cmd)
+    c.strict_first_read = getattr(a, "strict_first_read", False)
     c.verbose = a.verbose
     only = set(a.only.split(",")) if a.only else None
     t0 = time.time()
@@ -821,6 +931,8 @@ def main():
         else:
             p.add_argument("--fixtures", required=True)
             p.add_argument("--departures", help="JSON list of reviewed differences from the recorded behaviour")
+            p.add_argument("--strict-first-read", action="store_true",
+                           help="fail when the first read of an async repo field differs from the settled value")
     p = sub.add_parser("diff")
     p.add_argument("a")
     p.add_argument("b")

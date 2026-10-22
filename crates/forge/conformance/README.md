@@ -60,9 +60,12 @@ observations called notes). Exchange N of the run is compared with exchange N of
   values are compared by type: `message` and `errors` (text), every `url`/`*_url` key (they carry the
   host), a repo `size`, and paths a call lists in `volatile=[...]`.
 - Error text: for every recorded exchange with status >= 400 whose body has `message` (or a non-empty
-  `errors`), the actual text must equal the recorded text after normalization (lower case, placeholders
-  removed, a trailing bracketed detail such as `[uid: 0, name: ]` removed). A failing exchange prints both
-  texts. `must_contain=[...]` is an additional check: each word must appear in the response message.
+  `errors`), the actual text must equal the recorded text after normalization: lower case, and only
+  id-shaped trailing details dropped (`[uid: 0, name: ]`, `[id: x, rel_path: ]`, numeric `id:`/`issue_id:`
+  pairs). Other brackets are kept, so `[name: alice]` and `[write:user]` vs `[read:user]` stay distinct.
+  Placeholders such as `<sha#3>` are kept and compared with the scenario's identity mapping, so a message
+  naming a different sha fails. A recorded `errors: []` requires the actual `errors` to be empty or absent.
+  A failing exchange prints both texts. `must_contain=[...]` is an additional check.
 - Text bodies (diffs, patches) are compared exactly unless the call marks `volatile=["$text"]`.
 - git commands: exit status (ok or not) and, for a failing step, the refusal text: the recorded
   `remote:`/`fatal:`/`error:`/`!` lines (normalized, without hosts and ids) must all appear in the actual
@@ -70,31 +73,45 @@ observations called notes). Exchange N of the run is compared with exchange N of
 - Notes: recorded observations such as `merged_within_10s`. A note marked `strict=False` (timing, or a
   race kept for the record) is stored but never compared.
 - Repo fields Gitea updates asynchronously after a push (`empty`, `default_branch`) are read with
-  `settle_keys`: the call polls until three consecutive reads agree (up to 15 s) and records that value;
-  the first read is kept as a non-strict note.
+  `settle_keys`: the call polls until 8 consecutive reads (4 s) agree, for at most 25 s, and records that
+  value; the first read is kept as a non-strict note. If the value does not settle in 25 s the exchange
+  **fails** (record mode raises). `check --strict-first-read` additionally fails when the first read
+  differs from the settled value (for a server that has no such lag, such as sc-forge).
 
-### Departures
+### Departures and the gate
 
-`departures.json` lists reviewed, intentional differences between sc-forge and the recorded Gitea
-behaviour. Pass it with `check --departures departures.json`. Each entry is
-`{scenario, exchange, label, expect, reason}`:
+sc-forge's CI gate is `fixtures/1.22.6` plus `departures.json`. `fixtures/1.26.2` is reference only, for
+the version rule: follow 1.22.6 unless it answers 500, an empty message or a malformed body, in which
+case follow 1.26.2. So `departures.json` has no version field and must cover every exchange where
+1.22.6 recorded one of those and sc-forge follows 1.26.2 (unknown sha on `commits?sha=`, merge retry after
+success, ...), as well as every deliberate sc-forge difference.
 
-- `exchange` is a fixture index, a list of indexes, a range `"a-b"`, or a git step name or note key.
-  Indexes are the same in `fixtures/1.22.6` and `fixtures/1.26.2` (their sequences are identical).
-- `label` (single index only) must be contained in the fixture exchange's label, so an entry that points
-  at a moved exchange is reported as stale instead of silently covering the wrong one.
-- `expect` replaces the strict comparison for that exchange: `status` (number or list), `message_contains`,
-  `ok` (git), `value` (note), `ignore_body` (status only), `ignore_fields` (compare strictly except these
-  keys), or `skip`.
-- A matching exchange prints `expected difference honoured`; one that does not match the `expect` is a
-  failure (`unexpected`). An entry whose exchange no longer exists or whose label no longer matches
-  fails the run (`stale departure`). Do not pass departures when checking real Gitea.
+`departures.json` is a list of `{scenario, exchange, label, expect, reason}`. Pass it with
+`check --departures departures.json` (never when checking real Gitea).
 
-Departures that need a decision in sc-forge and could not be tied to one exchange are listed below.
+- `exchange`: a fixture index, a list or range `"a-b"` (then `labels` is required, one per member), or a
+  git step name / note key. Indexes are identical in `fixtures/1.22.6` and `fixtures/1.26.2`.
+- `label`: required for a single index; must be contained in the fixture exchange's label.
+- `expect` keys: `status` (number or list), `message_contains`, `ok` (git), `value` (note; works for
+  `strict=False` notes too), `fields` (pin body values by dotted path, `$len` pins an array length),
+  `ignore_fields` (compare the recorded body strictly except these keys), `ignore_body` (compare only the
+  checks above) and `skip` (only when unavoidable; say why in `reason`).
+- An entry with `fields` or `ignore_fields` and no `status` still compares the rest of the body strictly.
+- Load errors (the run aborts): unknown scenario id, unknown `expect` key, missing `reason` or `label`,
+  a range or list without matching `labels`, two entries for one (scenario, index), and any entry that
+  expects a refusal (`status` >= 400 or `ok:false`) without `message_contains`, so a departure cannot hide
+  a wrong error message.
+- Run-time failures: `stale departure` (the index is out of range or the label no longer matches),
+  `duplicate departure` (name-based entries that resolve to the same exchange) and `unexpected` (the actual
+  answer does not meet `expect`). A met entry prints `expected difference honoured`.
+- The `message_contains` words for sc-forge's own error texts (merge style, state, rename, branch) are
+  placeholders: reword them when sc-forge's messages are fixed.
 
-- Conflict merge: the departure covers the exchanges after the note `conflicting_pr_mergeable_after_8s`
-  in G and T. The merge of a PR whose head is already in base (`G#33`, `T#10`) also answers Gitea's
-  `405 Please try again later`; sc-forge may answer it differently and has no departure yet.
+Not covered by a departure: the merge of a PR whose head is already in base. sc-forge reproduces Gitea's
+`405 "Please try again later"` with `changed_files: 0`, so the recorded exchanges apply unchanged. The
+combined status for a sha with no statuses (1.22.6 `state:""`, 1.26.2 `pending`) and for an unknown sha
+(1.22.6 `200` with empty fields, 1.26.2 `404`) are not 500/empty-message/malformed cases, so the rule gives
+no departure; add one when sc-forge's answer is decided.
 
 ### Normalization
 
