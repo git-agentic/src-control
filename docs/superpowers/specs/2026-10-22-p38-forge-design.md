@@ -371,9 +371,10 @@ not mistaken for one). "Latest" per context is the highest insertion id. Recorde
 facts: the POST response key is `status`; the combined endpoint lists only the
 latest per context (success plus failure is `failure`, success plus pending is
 `pending`); the history endpoints list everything. **Departures:** unknown state
-strings answer 422 (Gitea stores any string); an unknown sha answers 404 (1.22.6
-answers 500, 1.26.2 404); a repo with no statuses answers `state: ""` as
-1.22.6 does.
+strings answer 422 (Gitea stores any string); a status POST to an unknown sha
+answers 404 (both versions answer 500: an internal error is not a contract); the
+combined status of an unknown sha is `200` with empty fields (1.22.6; 1.26.2
+answers 404); a repo with no statuses answers `state: ""` as 1.22.6 does.
 
 ### Repository lifecycle
 
@@ -476,8 +477,9 @@ header. Decisions drawn from it, beyond those stated in the sections above:
   Pushing the head commit straight into base does not mark the PR merged, so there
   is no manual-merge detection. Approving your own PR is 422. Unknown review
   `event` values are stored as `PENDING`.
-- **Protection.** Contents writes to a protected branch answer 403 (also for
-  admins; allowed with `new_branch`); force pushes and deletions of a protected
+- **Protection.** Contents writes to a protected branch answer 403 when
+  `enable_push` is false (also for admins; allowed with `new_branch`, and
+  allowed when `enable_push` is true even if required contexts are unmet); force pushes and deletions of a protected
   branch are refused; force pushes to unprotected branches are allowed; a merge
   through a PR is allowed. Push refusal text: `Not allowed to push to protected
   branch <name>`.
@@ -504,9 +506,17 @@ header. Decisions drawn from it, beyond those stated in the sections above:
   require the caller to be `{u}` or a password-authenticated site admin; client pushes limited to `refs/heads/*` and
   `refs/tags/*`; unknown status states are 422; repo rename is 422; `PATCH
   default_branch` to a missing branch is 422; a merged PR's head is frozen;
-  receive-pack on a missing repo is 404. Not departures, by the version rule:
-  unknown sha on a status POST is 404 (1.26.2); `public-only` is 403 (1.22.6);
-  the combined status of an unknown sha is `200` empty (1.22.6).
+  receive-pack on a missing repo is 404; a status POST to an unknown sha is
+  404 (recorded 500 on both). The version rule also forces entries where 1.22.6
+  recorded a 500, an empty message or a malformed body and 1.26.2 is followed
+  (for example `commits?sha=<unknown>` answers 404, a retried merge says `The PR
+  is already merged`). Not departures: `public-only` is 403 (1.22.6) and the
+  combined status of an unknown sha is `200` empty (1.22.6).
+
+  **The gate.** sc-forge's CI gate is `fixtures/1.22.6` plus `departures.json`;
+  `fixtures/1.26.2` is reference data for the version rule, not a second gate.
+  The pre-receive refusal for a ref outside `refs/heads/*` and `refs/tags/*` reads
+  `refusing to update <ref>: only refs/heads/* and refs/tags/* are writable`.
 
 ## Open questions
 

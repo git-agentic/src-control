@@ -86,7 +86,8 @@ limits, but no forge. It does not host Git repos for others, and
    `core.hooksPath`, and the server keeps `refs/forge/pull/<n>/head` so
    unmerged PR commits survive branch deletion and gc.
 7b. **Credentials are strictly separated by route.** Token routes accept a
-   user's password only (never a token) and only for that user; every other
+   user's password only (never a token) and only for that user (or a site admin
+   authenticating with their own password, which Gitea allows); every other
    route accepts a token only (a Basic password is never tried as a password).
    Scopes cannot be raised by a token; `public-only` tokens are accepted and denied every (private) repo.
    Repo identity on disk is an immutable id, so delete-and-recreate cannot alias

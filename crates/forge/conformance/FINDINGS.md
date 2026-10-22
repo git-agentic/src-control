@@ -68,7 +68,8 @@ Each version passes its own fixtures (22/22). Checking the 1.22.6 fixtures again
 
 **H (statuses)**
 - The POST response key is `status`, not `state`. Any state string is accepted and stored (`bogus`,
-  empty). An unknown sha is 500 (1.22.6) or 404 (1.26.2). Combined state: success plus failure is
+  empty). A status POST to an unknown sha is 500 on both versions (the combined-status GET of an
+  unknown sha is 200 empty on 1.22.6 and 404 on 1.26.2). Combined state: success plus failure is
   `failure`; success plus pending is `pending`. No statuses: `state:""`, `sha:""` (1.22.6) or
   `state:"pending"` with the real `sha` (1.26.2).
 
