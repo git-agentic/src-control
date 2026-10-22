@@ -131,6 +131,8 @@ DEFAULT_VOLATILE = {"avatar_url", "mergeable", "language", "open_pr_counter", "o
 
 
 def is_volatile(key, dotted, parent, volatile):
+    if "!" + dotted in volatile:  # a call that settled this key asks for a by-value comparison
+        return False
     if dotted in volatile or key in DEFAULT_VOLATILE:
         return True
     return key == "size" and isinstance(parent, dict) and "full_name" in parent
@@ -186,6 +188,17 @@ def norm_msg(t):
     return re.sub(r"\s+", " ", t).strip(" .:\n")
 
 
+def eq_val(ev, av, bij):
+    """Equality of note/pin values; strings are compared with placeholder identity (`<sha#2>`)."""
+    if isinstance(ev, str) and isinstance(av, str):
+        return eq_str(ev, av, bij, [], "")
+    if isinstance(ev, list) and isinstance(av, list):
+        return len(ev) == len(av) and all(eq_val(x, y, bij) for x, y in zip(ev, av))
+    if isinstance(ev, dict) and isinstance(av, dict):
+        return ev.keys() == av.keys() and all(eq_val(ev[k], av[k], bij) for k in ev)
+    return ev == av
+
+
 def msg_equal(exp_text, act_text, bij):
     tmp = []
     return eq_str(norm_msg(exp_text), norm_msg(act_text), bij, tmp, "")
@@ -216,19 +229,39 @@ def refusal_lines(text):
     return out
 
 
+def cmp_request(exp, act, bij):
+    """The request side of an HTTP exchange: the principal it authenticated as and the normalized JSON body."""
+    d = []
+    if exp.get("auth") != act.get("auth"):
+        d.append(("fail", f"request authenticated as {act.get('auth')!r}, the fixture says {exp.get('auth')!r}"))
+    er, ar = exp.get("request"), act.get("request")
+    if er is None and ar is None:
+        return d
+    if er is None or ar is None:
+        d.append(("fail", f"request body {er!r} expected, got {ar!r}"))
+        return d
+    sub = []
+    cmp_json(er, ar, "", sub, set(), bij)
+    d += [("fail", "request body" + x[1]) for x in sub]
+    return d
+
+
 def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None, skip_headers=()):
     """Return [(level, text)] where level is 'fail' or 'warn'. Empty list means match."""
     d = []
     bij.new_exchange()
     if exp["kind"] != act["kind"]:
         return [("fail", f"kind {exp['kind']} expected, got {act['kind']}")]
+    if ("web" in exp.get("tags", [])) != ("web" in act.get("tags", [])):
+        return [("fail", f"web tag differs: fixture {exp.get('tags', [])}, scenario {act.get('tags', [])}")]
+    if act.get("skipped"):  # a web-tagged exchange, not run without --include-web
+        return []
     if exp["kind"] == "note":
         if exp["key"] != act["key"]:
             d.append(("fail", f"note {exp['key']} expected, got {act['key']}"))
         elif exp.get("strict", True):  # strict=False notes are informational
             ev, av = exp["value"], act["value"]
-            same = eq_str(ev, av, bij, [], "") if isinstance(ev, str) and isinstance(av, str) else ev == av
-            if not same:
+            if not eq_val(ev, av, bij):
                 d.append(("fail", f"note {exp['key']}: {ev!r} expected, got {av!r}"))
         return d
     if exp["kind"] == "git":
@@ -244,6 +277,7 @@ def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None, skip_he
     else:
         if exp["method"] != act["method"] or not eq_str(exp["path"], act["path"], bij, [], ""):
             return [("fail", f"request {exp['method']} {exp['path']} expected, got {act['method']} {act['path']}")]
+        d += cmp_request(exp, act, bij)
         es = exp["status"] if status_override is None else status_override
         if es != act["status"]:
             d.append(("fail", f"status {es} expected, got {act['status']}: {msg_text(act)[:200]!r}"))
@@ -277,7 +311,7 @@ def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None, skip_he
                 d.append(("fail", f"header {h}: expected {v!r}, missing"))
             else:
                 eq_str(v, got, bij, d, f"header {h}")
-        volatile = set(exp.get("volatile", [])) | set(extra_volatile)
+        volatile = set(exp.get("volatile", [])) | set(extra_volatile) | {"!" + k for k in exp.get("strict_keys", [])}
         if es >= 400 or act["status"] >= 400:
             volatile |= {"message", "errors"}  # top-level error text: compared above (or by a departure)
         if "body" in exp:
@@ -328,8 +362,11 @@ def dep_indexes(spec, expected):
     return [i for i, e in enumerate(expected) if e.get("name") == spec or e.get("key") == spec]
 
 
-EXPECT_KEYS = {"status", "message_contains", "ok", "value", "fields", "ignore_fields", "ignore_body",
-               "ignore_headers", "skip"}
+EXPECT_KEYS = {
+    "http": {"status", "message_contains", "fields", "ignore_fields", "ignore_headers", "ignore_body", "skip"},
+    "git": {"ok", "message_contains", "skip"},
+    "note": {"value", "skip"},
+}
 
 
 def ex_ident(ex):
@@ -354,8 +391,11 @@ def load_departures(path, scenario_ids):
         if not isinstance(e, dict) or not e:
             errs.append(f"{where}: expect must be a non-empty object")
             continue
-        if set(e) - EXPECT_KEYS:
-            errs.append(f"{where}: unknown expect keys {sorted(set(e) - EXPECT_KEYS)}")
+        kind = d.get("kind")
+        allowed = EXPECT_KEYS.get(kind, set().union(*EXPECT_KEYS.values()))
+        if set(e) - allowed:
+            errs.append(f"{where}: expect key(s) {sorted(set(e) - allowed)} do not apply to a {kind} exchange "
+                        f"(allowed: {sorted(allowed)})")
         if not d.get("reason"):
             errs.append(f"{where}: reason is required")
         if d.get("kind") not in ("http", "git", "note"):
@@ -415,7 +455,7 @@ def apply_override(exp, act, ov, bij, match=None):
     if e.get("skip"):
         return [("honoured", f"skipped: {why}")]
     if act["kind"] == "note":
-        if "value" in e and act["value"] != e["value"]:
+        if "value" in e and not eq_val(e["value"], act["value"], bij):
             d.append(("fail", f"unexpected: note {act['key']} {e['value']!r} expected, got {act['value']!r}"))
     elif act["kind"] == "git":
         if "ok" in e and act["ok"] != e["ok"]:
@@ -485,6 +525,8 @@ class Ctx:
         self.base_ready = False
         self.first_read = None
         self.strict_first_read = False
+        self.include_web = False
+        self.web_skipped = 0
         r = self.call("GET", "/user", rec=False)
         if r.status != 200 or not r.json:
             raise SystemExit(f"admin token rejected by {self.base}: {r.status} {r.text[:200]}")
@@ -519,6 +561,10 @@ class Ctx:
         s = re.sub(r"[0-9a-f]{40}(?= (?:HEAD|refs/|capabilities))", lambda m: self.sha_ph(m.group(0)), s)
         s = SHA_RE.sub(lambda m: self.sha_ph(m.group(0)), s)
         s = SHORT_RE.sub("<short>..<short>", s)
+        # the SSH authority is derived from the server's own SSH config (ssh://git@localhost:2222/x.git or
+        # git@host:x.git); keep the repo path, drop the host, so a server without SSH compares equal
+        s = re.sub(r"ssh://[^/\s\"']+/", "ssh://<ssh-authority>/", s)
+        s = re.sub(r"(?<![\w/@.-])[\w.-]+@[\w.-]+:(?=[\w.-]+/[\w.-]+\.git\b)", "<ssh-authority>:", s)
         # database counters inside URL fragments (`#issuecomment-7`) depend on everything created before
         s = re.sub(r"#(issuecomment|issue|event)-(\d+)", lambda m: f"#{m.group(1)}-" + self.id_ph("fragment:" + m.group(1), int(m.group(2))), s)
         return RFC_RE.sub("<ts>", TS_RE.sub("<ts>", s))
@@ -583,8 +629,14 @@ class Ctx:
     # -- HTTP
     def call(self, method, path, json=None, as_="admin", expect=None, must_contain=None,
              volatile=None, headers=None, data=None, api=True, binary=False, rec=True, track=(),
-             retry_while=None, retry_s=90, no_retry=False, settle_keys=None, tags=()):
+             retry_while=None, retry_s=90, no_retry=False, settle_keys=None, tags=(), strict_keys=()):
         full = ("/api/v1" + path) if api else path
+        if "web" in tags and self.mode == "check" and not self.include_web and rec:
+            # Gitea web UI route (sc-forge has no web UI): keep the slot so exchange indexes stay aligned
+            self.web_skipped += 1
+            self.push_ex({"kind": "http", "method": method, "path": self.np(full), "auth": as_, "status": 0,
+                          "headers": {}, "tags": list(tags), "skipped": True})
+            return R(0, {}, b"")
         hdrs = {"Accept": "application/json", "User-Agent": "sc-forge-conformance"}
         p = self.principals[as_]
         if p:
@@ -660,6 +712,8 @@ class Ctx:
                     ex[k] = list(v)
             if tags:
                 ex["tags"] = list(tags)
+            if strict_keys:  # keys of DEFAULT_VOLATILE that this (settled) exchange asserts by value
+                ex["strict_keys"] = list(strict_keys)
             if unsettled:
                 ex["unsettled"] = True
             if first_differs:
@@ -865,7 +919,7 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
         c.ex, c.cursor, c.diffs = [], 0, []
         c.reset_scenario()
         c.expected, skip, stale = [], None, []
-        c.overrides = {}
+        c.overrides, c.web_skipped = {}, 0
         if c.mode == "check" and selected:
             fp = os.path.join(fixtures, fname)
             if not os.path.exists(fp):
@@ -918,33 +972,35 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
                 f.write("\n")
             summary.append((sid, slug, "ERROR" if err else "ok", [err] if err else [], len(c.ex), dt))
             continue
-        lines, failed = [], False
+        lines, nfail = [], 0
         for i, label, ds in c.diffs:
             bad = [x for x in ds if x[0] == "fail"]
             hon = [x for x in ds if x[0] == "honoured"]
-            failed |= bool(bad)
+            nfail += bool(bad)
             if bad or hon or ds or c.verbose:
                 tag = "FAIL" if bad else ("ok* " if hon else ("warn" if ds else "ok  "))
                 lines.append(f"  {tag} #{i:02d} {label}")
                 lines += [f"       {'expected difference honoured' if lv == 'honoured' else lv}: {t}" for lv, t in ds]
+        # unpaired exchanges and errors: each counts as a failed exchange
+        missing = len(c.expected) - len(c.ex)
         if err:
             if skip and norm_msg(skip) == norm_msg(err):
                 lines.append(f"  (fixture recorded the same error: {skip[:200]})")
             else:
-                failed = True
-                lines.append(f"  ERROR {err}")
+                nfail += 1
+                lines.append(f"  ERROR {err}" + ("" if skip else "  (the fixture recorded no error)"))
                 if skip:
                     lines.append(f"  fixture recorded a different error: {skip[:300]}")
         elif skip:
-            failed = True
+            nfail += 1
             lines.append(f"  FAIL fixture recorded an error but the scenario completed: {skip[:300]}")
-        elif len(c.ex) < len(c.expected):
-            failed = True
-            lines.append(f"  FAIL {len(c.expected) - len(c.ex)} recorded exchange(s) not produced")
+        if missing > 0:
+            nfail += missing
+            lines.append(f"  FAIL {missing} recorded exchange(s) not produced (fixture has {len(c.expected)}, run made {len(c.ex)})")
         if stale:
-            failed = True
+            nfail += len(stale)
             lines += ["  FAIL " + x for x in stale]
-        summary.append((sid, slug, "FAIL" if failed else "ok", lines, len(c.ex), dt))
+        summary.append((sid, slug, "FAIL" if nfail else "ok", lines, len(c.ex), dt, nfail, c.web_skipped))
     return summary
 
 
@@ -957,6 +1013,7 @@ def cmd_run(a):
     deps = load_departures(a.departures, ids) if getattr(a, "departures", None) else []
     c = Ctx(a.base_url, a.admin_token, a.cmd)
     c.strict_first_read = getattr(a, "strict_first_read", False)
+    c.include_web = getattr(a, "include_web", False)
     c.verbose = a.verbose
     t0 = time.time()
     leaks = []
@@ -984,7 +1041,12 @@ def cmd_run(a):
         bad += st in ("FAIL", "ERROR")
     for h in leaks:
         print(f"LEAK {h}")
-    print(f"\n{len(summary) - bad}/{len(summary)} scenarios ok in {time.time() - t0:.0f}s" + (f"; {len(leaks)} credential-shaped value(s) in the fixtures" if leaks else ""))
+    nfail = sum(s[6] for s in summary if len(s) > 6)
+    web = sum(s[7] for s in summary if len(s) > 7)
+    print(f"\n{len(summary) - bad}/{len(summary)} scenarios ok in {time.time() - t0:.0f}s"
+          + (f"; {nfail} failed exchange(s)" if a.cmd == "check" else "")
+          + (f"; {web} web exchange(s) skipped (check --include-web runs them)" if web else "")
+          + (f"; {len(leaks)} credential-shaped value(s) in the fixtures" if leaks else ""))
     return 1 if bad or leaks else 0
 
 
@@ -1062,6 +1124,8 @@ def main():
         else:
             p.add_argument("--fixtures", required=True)
             p.add_argument("--departures", help="JSON list of reviewed differences from the recorded behaviour")
+            p.add_argument("--include-web", action="store_true",
+                           help="also run the exchanges tagged `web` (Gitea web UI routes); skipped by default")
             p.add_argument("--strict-first-read", action="store_true",
                            help="fail when the first read of an async repo field differs from the settled value")
     p = sub.add_parser("diff")
@@ -1358,6 +1422,32 @@ def parents(c, repo, sha):
     return len(c.git(["rev-list", "--parents", "-n1", sha], cwd=p, rec=False)[1].split()) - 1
 
 
+def advert_refs(data):
+    """Ref names advertised in a smart-HTTP info/refs body (pkt-lines `<sha> <ref>[\\0caps]`)."""
+    refs, i = [], 0
+    while i + 4 <= len(data):
+        try:
+            n = int(data[i:i + 4], 16)
+        except ValueError:
+            break
+        if n < 4:
+            i += 4
+            continue
+        payload, i = data[i + 4:i + n], i + n
+        line = payload.split(b"\0", 1)[0].decode("latin-1").strip()
+        m = re.match(r"^[0-9a-f]{40} (.+)$", line)
+        if m:
+            refs.append(m.group(1))
+    return refs
+
+
+def advert_probe(c, repo, label):
+    """Record which refs each service advertises (sc-forge hides everything but heads and tags)."""
+    for svc, key in (("git-upload-pack", "upload_pack"), ("git-receive-pack", "receive_pack")):
+        r = c.call("GET", f"/acme/{repo}.git/info/refs?service={svc}", as_="admin-tokbasic", api=False, volatile=["$text"])
+        c.note(f"{label}_advertised_refs_{key}", [c.ns(x) for x in advert_refs(r.data)])
+
+
 def repo_state(c, path, label):
     """GET a repo whose `empty`/`default_branch` may lag a push: record the settled value, keep the race as a note."""
     r = c.call("GET", path, settle_keys=["empty", "default_branch"])
@@ -1502,8 +1592,10 @@ def sc_merge(c):
     nc, _ = mkpr(c, "merges", "cf2", {"conflict.txt": "two\n"})
     merge(na, {"Do": "merge"})
     time.sleep(8)
-    c.note("conflicting_pr_mergeable_after_8s", get_pr(c, "merges", nc)["mergeable"], strict=False)
-    c.call("GET", R + f"/pulls/{nc}", as_=A)
+    # settled conflict state: poll until 8 equal reads, then `mergeable` is compared by value (false)
+    cf = c.call("GET", R + f"/pulls/{nc}", as_=A, settle_keys=["mergeable"], strict_keys=["mergeable"])
+    if c.mode == "record" and cf.json.get("mergeable") is not False:
+        raise SetupError(f"the conflicting PR settled as mergeable={cf.json.get('mergeable')!r}")
     merge(nc, {"Do": "merge"}, no_retry=True)
     c.call("PATCH", R + f"/pulls/{nc}", {"state": "closed"}, as_=A, rec=False)
     # 6. closed PR
@@ -1742,7 +1834,7 @@ def sc_visibility(c):
                    volatile=["$text"])
     for who in ("none", "dave"):
         for repo in ("vis", "ghost"):
-            c.call("GET", f"/acme/{repo}", as_=tokbasic(c, who), api=False, volatile=["$text"])
+            c.call("GET", f"/acme/{repo}", as_=tokbasic(c, who), api=False, volatile=["$text"], tags=["web"])  # Gitea web UI
             c.git(["ls-remote", c.git_url(repo, who)] if who != "none" else ["ls-remote", c.git_url(repo, "admin", user="", secret="")],
                   name=f"ls-remote-{repo}-{who}")
     for who in ("none", "dave", "carol", "admin"):
@@ -1855,7 +1947,7 @@ def sc_pr_lifecycle(c):
     c.note("force_push_head_sha_follows", bool(ok))
     c.call("GET", R + f"/pulls/{n1}", as_=A)
     c.call("GET", R + "/pulls?state=open&limit=50", as_=A)
-    c.git(["ls-remote", url, "refs/pull/*"], name="ls-remote-pull-refs", cwd=wcp)
+    c.git(["ls-remote", url, "refs/pull/*"], name="ls-remote-pull-refs", cwd=wcp, note_stdout=True)
     # 2. delete the head branch while the PR is open
     n2, s2 = mkpr(c, "life", "l2", {"l2.txt": "2\n"})
     c.call("DELETE", R + "/branches/l2")
@@ -1864,7 +1956,8 @@ def sc_pr_lifecycle(c):
     c.call("GET", R + "/pulls?state=open&limit=50", as_=A)
     c.call("POST", R + f"/pulls/{n2}/merge", {"Do": "merge"}, as_=A)
     c.call("GET", R + f"/pulls/{n2}", as_=A)
-    c.git(["ls-remote", url, "refs/pull/*"], name="ls-remote-pull-refs-after-delete", cwd=wcp)
+    c.git(["ls-remote", url, "refs/pull/*"], name="ls-remote-pull-refs-after-delete", cwd=wcp, note_stdout=True)
+    advert_probe(c, "life", "life")
     c.call("GET", R + f"/pulls/{n2}/commits", as_=A)
     c.call("GET", R + f"/pulls/{n2}.diff", as_=A)
     # 3. merge, then recreate the head branch at a new commit
@@ -2031,7 +2124,8 @@ def sc_refs(c):
     for name, spec in tests:
         c.git(["push", "origin", spec], cwd=p, name="bot-push-" + name)
     c.git(["push", c.git_url("refs", "carol"), f"{h}:refs/tags/v-carol"], cwd=p, name="read-collab-push-tag")
-    c.git(["ls-remote", c.git_url("refs", "admin")], name="ls-remote-all-refs")
+    c.git(["ls-remote", c.git_url("refs", "admin")], name="ls-remote-all-refs", note_stdout=True)
+    advert_probe(c, "refs", "refs")
     c.call("GET", R + "/git/refs", as_="bot-scoped")
     c.call("GET", R + "/tags", as_="bot-scoped")
     c.call("GET", R + f"/pulls/{n1}", as_="bot-scoped", volatile=["mergeable"])
@@ -2082,8 +2176,9 @@ def sc_outcomes(c):
     nb, _ = mkpr(c, "outcomes", "cfb", {"cf.txt": "b\n"})
     c.call("POST", R + f"/pulls/{na}/merge", {"Do": "merge"}, as_=A)
     time.sleep(8)
-    c.note("conflicting_pr_mergeable_after_8s", get_pr(c, "outcomes", nb)["mergeable"], strict=False)
-    c.call("GET", R + f"/pulls/{nb}", as_=A)
+    cf = c.call("GET", R + f"/pulls/{nb}", as_=A, settle_keys=["mergeable"], strict_keys=["mergeable"])
+    if c.mode == "record" and cf.json.get("mergeable") is not False:
+        raise SetupError(f"the conflicting PR settled as mergeable={cf.json.get('mergeable')!r}")
     c.call("POST", R + f"/pulls/{nb}/merge", {"Do": "merge"}, as_=A, no_retry=True)
     c.call("PATCH", R + f"/pulls/{nb}", {"state": "closed"}, as_=A)
     c.call("GET", R + f"/pulls/{nb}", as_=A)

@@ -1,7 +1,7 @@
 [
  {
   "scenario": "G",
-  "exchange": 39,
+  "exchange": 38,
   "kind": "http",
   "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#8>/merge",
   "expect": {
@@ -14,7 +14,7 @@
  },
  {
   "scenario": "T",
-  "exchange": 20,
+  "exchange": 19,
   "kind": "http",
   "match": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#6>/merge",
   "expect": {
@@ -27,7 +27,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 43,
+  "exchange": 42,
   "kind": "http",
   "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#10>/merge",
   "expect": {
@@ -41,7 +41,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 44,
+  "exchange": 43,
   "kind": "note",
   "match": "squash_merged_immediately_after_merge_call",
   "expect": {
@@ -51,7 +51,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 45,
+  "exchange": 44,
   "kind": "note",
   "match": "squash_merged_within_10s",
   "expect": {
@@ -61,7 +61,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 47,
+  "exchange": 46,
   "kind": "http",
   "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#10>",
   "expect": {
@@ -75,7 +75,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 48,
+  "exchange": 47,
   "kind": "note",
   "match": "squash_parent_count",
   "expect": {
@@ -85,7 +85,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 49,
+  "exchange": 48,
   "kind": "http",
   "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#11>/merge",
   "expect": {
@@ -99,7 +99,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 50,
+  "exchange": 49,
   "kind": "note",
   "match": "rebase_merged_immediately_after_merge_call",
   "expect": {
@@ -109,7 +109,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 51,
+  "exchange": 50,
   "kind": "note",
   "match": "rebase_merged_within_10s",
   "expect": {
@@ -119,7 +119,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 53,
+  "exchange": 52,
   "kind": "http",
   "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#11>",
   "expect": {
@@ -133,7 +133,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 54,
+  "exchange": 53,
   "kind": "note",
   "match": "rebase_parent_count",
   "expect": {
@@ -143,7 +143,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 55,
+  "exchange": 54,
   "kind": "http",
   "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#12>/merge",
   "expect": {
@@ -157,7 +157,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 56,
+  "exchange": 55,
   "kind": "note",
   "match": "rebase_merge_merged_immediately_after_merge_call",
   "expect": {
@@ -167,7 +167,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 57,
+  "exchange": 56,
   "kind": "note",
   "match": "rebase_merge_merged_within_10s",
   "expect": {
@@ -177,7 +177,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 59,
+  "exchange": 58,
   "kind": "note",
   "match": "rebase_merge_parent_count",
   "expect": {
@@ -187,7 +187,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 60,
+  "exchange": 59,
   "kind": "http",
   "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#13>/merge",
   "expect": {
@@ -201,7 +201,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 61,
+  "exchange": 60,
   "kind": "note",
   "match": "ff_only_merged_immediately_after_merge_call",
   "expect": {
@@ -211,7 +211,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 62,
+  "exchange": 61,
   "kind": "note",
   "match": "ff_only_merged_within_10s",
   "expect": {
@@ -221,7 +221,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 64,
+  "exchange": 63,
   "kind": "http",
   "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#13>",
   "expect": {
@@ -235,7 +235,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 65,
+  "exchange": 64,
   "kind": "note",
   "match": "ff_only_parent_count",
   "expect": {
@@ -245,7 +245,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 66,
+  "exchange": 65,
   "kind": "http",
   "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#14>/merge",
   "expect": {
@@ -318,7 +318,7 @@
  },
  {
   "scenario": "G",
-  "exchange": 73,
+  "exchange": 72,
   "kind": "note",
   "match": "status_gated_merged_immediately_after_merge_call",
   "expect": {
@@ -495,14 +495,18 @@
  },
  {
   "scenario": "S",
-  "exchange": 15,
+  "exchange": 20,
   "kind": "http",
   "match": "GET /api/v1/repos/acme/refs/git/refs",
   "expect": {
    "ignore_body": true,
    "fields": {
     "$len": 4
-   }
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
   },
   "reason": "the ref list holds only refs/heads and refs/tags in sc-forge (4 of 10 recorded refs); the elements differ with the refused refs"
  },
@@ -614,6 +618,7 @@
    ],
    "ignore_body": true,
    "ignore_headers": [
+    "link",
     "x-total-count"
    ]
   },
@@ -770,6 +775,10 @@
    "ignore_fields": [
     "total_count",
     "statuses"
+   ],
+   "ignore_headers": [
+    "link",
+    "x-total-count"
    ]
   },
   "reason": "total_count and the status list include the two states sc-forge refuses; the combined `state` is still compared"
@@ -785,7 +794,11 @@
    "fields": {
     "state": "pending",
     "total_count": 0
-   }
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
   },
   "reason": "the only status on this commit was refused: no statuses, combined state pending (1.26.2 behaviour); ignore_body: the recorded body lists that status"
  },
@@ -819,7 +832,11 @@
    "ignore_body": true,
    "fields": {
     "$len": 0
-   }
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
   },
   "reason": "the status list is empty because the bogus state was refused; ignore_body: the recorded body is a one-element list"
  },
@@ -972,7 +989,7 @@
  },
  {
   "scenario": "O",
-  "exchange": 14,
+  "exchange": 20,
   "kind": "http",
   "match": "GET /api/v1/repos/acme/life/pulls/<id:path:pulls#3>",
   "expect": {
@@ -984,7 +1001,7 @@
  },
  {
   "scenario": "O",
-  "exchange": 15,
+  "exchange": 21,
   "kind": "note",
   "match": "merged_pr_head_sha_frozen",
   "expect": {
@@ -994,7 +1011,7 @@
  },
  {
   "scenario": "O",
-  "exchange": 16,
+  "exchange": 22,
   "kind": "note",
   "match": "merged_pr_head_sha_follows_new_branch",
   "expect": {
@@ -1027,6 +1044,95 @@
    ]
   },
   "reason": "sc-forge answers 404, not Gitea's 403 'Push to create is not enabled'"
+ },
+ {
+  "scenario": "O",
+  "exchange": 5,
+  "kind": "note",
+  "match": "ls-remote-pull-refs_stdout",
+  "expect": {
+   "value": ""
+  },
+  "reason": "no refs/pull/* is advertised by sc-forge (it keeps refs/forge/pull/*, hidden). sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "O",
+  "exchange": 12,
+  "kind": "note",
+  "match": "ls-remote-pull-refs-after-delete_stdout",
+  "expect": {
+   "value": ""
+  },
+  "reason": "no refs/pull/* is advertised by sc-forge (it keeps refs/forge/pull/*, hidden). sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "O",
+  "exchange": 14,
+  "kind": "note",
+  "match": "life_advertised_refs_upload_pack",
+  "expect": {
+   "value": [
+    "HEAD",
+    "refs/heads/l1",
+    "refs/heads/main"
+   ]
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "O",
+  "exchange": 16,
+  "kind": "note",
+  "match": "life_advertised_refs_receive_pack",
+  "expect": {
+   "value": [
+    "refs/heads/l1",
+    "refs/heads/main"
+   ]
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "S",
+  "exchange": 15,
+  "kind": "note",
+  "match": "ls-remote-all-refs_stdout",
+  "expect": {
+   "value": "<sha#3>\tHEAD\n<sha#3>\trefs/heads/main\n<sha#1>\trefs/heads/pull/1/head\n<sha#2>\trefs/heads/r1\n<sha#4>\trefs/tags/annot\n<sha#1>\trefs/tags/annot^{}"
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "S",
+  "exchange": 17,
+  "kind": "note",
+  "match": "refs_advertised_refs_upload_pack",
+  "expect": {
+   "value": [
+    "HEAD",
+    "refs/heads/main",
+    "refs/heads/pull/1/head",
+    "refs/heads/r1",
+    "refs/tags/annot",
+    "refs/tags/annot^{}"
+   ]
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "S",
+  "exchange": 19,
+  "kind": "note",
+  "match": "refs_advertised_refs_receive_pack",
+  "expect": {
+   "value": [
+    "refs/heads/main",
+    "refs/heads/pull/1/head",
+    "refs/heads/r1",
+    "refs/tags/annot"
+   ]
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
  },
  {
   "scenario": "B",

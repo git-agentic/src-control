@@ -54,7 +54,7 @@
         "html_url": "<base>/acme/blank",
         "url": "<base>/api/v1/repos/acme/blank",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/blank.git",
+        "ssh_url": "ssh://<ssh-authority>/acme/blank.git",
         "clone_url": "<base>/acme/blank.git",
         "original_url": "",
         "website": "",

@@ -197,9 +197,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "message": "not found",
         "url": "<base>/api/swagger",
-        "errors": null
+        "errors": null,
+        "message": "not found"
       }
     },
     {
@@ -390,9 +390,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
+        "message": "not found",
         "url": "<base>/api/swagger",
-        "errors": null,
-        "message": "not found"
+        "errors": null
       }
     },
     {
@@ -429,9 +429,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "errors": null,
         "message": "not found",
-        "url": "<base>/api/swagger"
+        "url": "<base>/api/swagger",
+        "errors": null
       }
     }
   ]

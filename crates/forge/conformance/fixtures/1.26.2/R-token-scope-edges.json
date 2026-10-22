@@ -437,7 +437,7 @@
         "html_url": "<base>/botorg/legit",
         "url": "<base>/api/v1/repos/botorg/legit",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/botorg/legit.git",
+        "ssh_url": "ssh://<ssh-authority>/botorg/legit.git",
         "clone_url": "<base>/botorg/legit.git",
         "original_url": "",
         "website": "",
@@ -540,9 +540,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "url": "<base>/api/swagger",
         "errors": null,
-        "message": "not found"
+        "message": "not found",
+        "url": "<base>/api/swagger"
       }
     }
   ]

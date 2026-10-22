@@ -53,7 +53,7 @@
         "html_url": "<base>/acme/hist",
         "url": "<base>/api/v1/repos/acme/hist",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/hist.git",
+        "ssh_url": "ssh://<ssh-authority>/acme/hist.git",
         "clone_url": "<base>/acme/hist.git",
         "original_url": "",
         "website": "",
@@ -355,9 +355,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
+        "errors": null,
         "message": "not found",
-        "url": "<base>/api/swagger",
-        "errors": null
+        "url": "<base>/api/swagger"
       }
     },
     {
@@ -442,9 +442,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
-        "message": "not found",
         "url": "<base>/api/swagger",
-        "errors": null
+        "errors": null,
+        "message": "not found"
       }
     },
     {
@@ -1804,11 +1804,11 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
+        "message": "not found",
+        "url": "<base>/api/swagger",
         "errors": [
           "object does not exist [id: nope, rel_path: ]"
-        ],
-        "message": "not found",
-        "url": "<base>/api/swagger"
+        ]
       }
     },
     {

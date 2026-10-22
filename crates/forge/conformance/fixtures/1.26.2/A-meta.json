@@ -156,9 +156,9 @@
         "content-type": "application/json;charset=utf-8"
       },
       "body": {
+        "errors": null,
         "message": "not found",
-        "url": "<base>/api/swagger",
-        "errors": null
+        "url": "<base>/api/swagger"
       }
     }
   ]

@@ -132,6 +132,76 @@
       "output": "<sha#3>\tHEAD\n<sha#1>\trefs/changes/1/2\n<sha#1>\trefs/custom/thing\n<sha#3>\trefs/heads/main\n<sha#1>\trefs/heads/pull/1/head\n<sha#2>\trefs/heads/r1\n<sha#1>\trefs/keep-around/<sha#1>\n<sha#1>\trefs/notes/commits\n<sha#2>\trefs/pull/1/head\n<sha#1>\trefs/replace/<sha#2>\n<sha#4>\trefs/tags/annot\n<sha#1>\trefs/tags/annot^{}"
     },
     {
+      "kind": "note",
+      "key": "ls-remote-all-refs_stdout",
+      "value": "<sha#3>\tHEAD\n<sha#1>\trefs/changes/1/2\n<sha#1>\trefs/custom/thing\n<sha#3>\trefs/heads/main\n<sha#1>\trefs/heads/pull/1/head\n<sha#2>\trefs/heads/r1\n<sha#1>\trefs/keep-around/<sha#1>\n<sha#1>\trefs/notes/commits\n<sha#2>\trefs/pull/1/head\n<sha#1>\trefs/replace/<sha#2>\n<sha#4>\trefs/tags/annot\n<sha#1>\trefs/tags/annot^{}",
+      "strict": true
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/refs.git/info/refs?service=git-upload-pack",
+      "auth": "admin-tokbasic",
+      "status": 200,
+      "headers": {
+        "content-type": "application/x-git-upload-pack-advertisement"
+      },
+      "body_text": "001e# service=git-upload-pack\n0000014c<sha#3> HEAD\\0multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want allow-reachable-sha1-in-want no-done symref=HEAD:refs/heads/main filter object-format=sha1 agent=git/2.52.0-Linux\n003e<sha#1> refs/changes/1/2\n003f<sha#1> refs/custom/thing\n003d<sha#3> refs/heads/main\n0044<sha#1> refs/heads/pull/1/head\n003b<sha#2> refs/heads/r1\n0067<sha#1> refs/keep-around/<sha#1>\n0040<sha#1> refs/notes/commits\n003e<sha#2> refs/pull/1/head\n0063<sha#1> refs/replace/<sha#2>\n003d<sha#4> refs/tags/annot\n0040<sha#1> refs/tags/annot^{}\n0000",
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "note",
+      "key": "refs_advertised_refs_upload_pack",
+      "value": [
+        "HEAD",
+        "refs/changes/1/2",
+        "refs/custom/thing",
+        "refs/heads/main",
+        "refs/heads/pull/1/head",
+        "refs/heads/r1",
+        "refs/keep-around/<sha#1>",
+        "refs/notes/commits",
+        "refs/pull/1/head",
+        "refs/replace/<sha#2>",
+        "refs/tags/annot",
+        "refs/tags/annot^{}"
+      ],
+      "strict": true
+    },
+    {
+      "kind": "http",
+      "method": "GET",
+      "path": "/acme/refs.git/info/refs?service=git-receive-pack",
+      "auth": "admin-tokbasic",
+      "status": 200,
+      "headers": {
+        "content-type": "application/x-git-receive-pack-advertisement"
+      },
+      "body_text": "001f# service=git-receive-pack\n000000c5<sha#1> refs/changes/1/2\\0report-status report-status-v2 delete-refs side-band-64k quiet atomic ofs-delta push-options object-format=sha1 agent=git/2.52.0-Linux\n003f<sha#1> refs/custom/thing\n003d<sha#3> refs/heads/main\n0044<sha#1> refs/heads/pull/1/head\n003b<sha#2> refs/heads/r1\n0067<sha#1> refs/keep-around/<sha#1>\n0040<sha#1> refs/notes/commits\n003e<sha#2> refs/pull/1/head\n0063<sha#1> refs/replace/<sha#2>\n003d<sha#4> refs/tags/annot\n0000",
+      "volatile": [
+        "$text"
+      ]
+    },
+    {
+      "kind": "note",
+      "key": "refs_advertised_refs_receive_pack",
+      "value": [
+        "refs/changes/1/2",
+        "refs/custom/thing",
+        "refs/heads/main",
+        "refs/heads/pull/1/head",
+        "refs/heads/r1",
+        "refs/keep-around/<sha#1>",
+        "refs/notes/commits",
+        "refs/pull/1/head",
+        "refs/replace/<sha#2>",
+        "refs/tags/annot"
+      ],
+      "strict": true
+    },
+    {
       "kind": "http",
       "method": "GET",
       "path": "/api/v1/repos/acme/refs/git/refs",
@@ -367,7 +437,7 @@
             "html_url": "<base>/acme/refs",
             "url": "<base>/api/v1/repos/acme/refs",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/acme/refs.git",
+            "ssh_url": "ssh://<ssh-authority>/acme/refs.git",
             "clone_url": "<base>/acme/refs.git",
             "original_url": "",
             "website": "",
@@ -469,7 +539,7 @@
             "html_url": "<base>/acme/refs",
             "url": "<base>/api/v1/repos/acme/refs",
             "link": "",
-            "ssh_url": "ssh://git@localhost:2222/acme/refs.git",
+            "ssh_url": "ssh://<ssh-authority>/acme/refs.git",
             "clone_url": "<base>/acme/refs.git",
             "original_url": "",
             "website": "",

@@ -674,7 +674,7 @@
         "html_url": "<base>/alice/scoped",
         "url": "<base>/api/v1/repos/alice/scoped",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/alice/scoped.git",
+        "ssh_url": "ssh://<ssh-authority>/alice/scoped.git",
         "clone_url": "<base>/alice/scoped.git",
         "original_url": "",
         "website": "",

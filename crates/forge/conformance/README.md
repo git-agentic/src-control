@@ -70,7 +70,12 @@ observations called notes). Exchange N of the run is compared with exchange N of
   (avatar hash), `mergeable` (flips while a PR is checked), `language` and the open-PR/issue counters
   (computed asynchronously), repo `size`. The top-level `message`/`errors` of an HTTP error response are
   compared as text (next bullet). Database counters inside URL fragments (`#issuecomment-7`) are
-  normalized to placeholders.
+  normalized to placeholders, and the SSH authority a server derives from its own config
+  (`ssh://git@localhost:2222/acme/alpha.git`, `git@host:acme/alpha.git`) becomes `<ssh-authority>`, so
+  `ssh_url` is compared by repo path only.
+- The one place `mergeable` is compared by value: the conflicting PR in scenarios G and T. The call polls
+  until 8 consecutive reads agree (`settle_keys`), the settled value must be `false` when recording, and
+  the exchange lists `strict_keys: ["mergeable"]` so `check` compares that value too.
 - Error text: for every recorded exchange with status >= 400 whose body has `message` (or a non-empty
   `errors`), the actual text must equal the recorded text after normalization: lower case, and only
   id-shaped trailing details dropped (`[uid: 0, name: ]`, `[id: x, rel_path: ]`, numeric `id:`/`issue_id:`
@@ -93,6 +98,30 @@ observations called notes). Exchange N of the run is compared with exchange N of
   **fails** (record mode raises). `check --strict-first-read` additionally fails when the first read
   differs from the settled value (for a server that has no such lag, such as sc-forge).
 
+### Unpaired exchanges and errors
+
+Every unpaired item is a failed exchange and is counted in the `check` totals ("N failed exchange(s)"):
+a fixture exchange the run did not produce (the fixture has a trailing extra one), an exchange the run
+produced that the fixture lacks, a scenario error the fixture did not record, and a fixture error the run
+no longer hits (a different error text is a failure too; the same text is accepted).
+
+### Web UI exchanges
+
+Calls tagged `web` hit Gitea's web UI routes (for example `GET /acme/{repo}` answering `303` to the login
+page). sc-forge has no web UI, so `check` skips them by default and prints how many it skipped; the slot is
+kept so exchange indexes stay aligned. `check --include-web` runs them for real-Gitea comparisons. The skip
+is by tag (`tags=["web"]` in the scenario, `"tags": ["web"]` in the fixture); a scenario and fixture that
+disagree about the tag fail. `record` always runs and records them, and `diff` compares them like any other
+exchange.
+
+### Ref advertisement probes
+
+Scenarios O and S record the stdout of `git ls-remote` (a strict note `<step>_stdout`) and the ref names
+advertised by `info/refs?service=git-upload-pack` and `git-receive-pack` (notes `*_advertised_refs_*`).
+Gitea advertises `refs/pull/N/head`, and other namespaces a collaborator may push; sc-forge advertises only
+HEAD, `refs/heads/*` and `refs/tags/*` and hides `refs/forge/*` on both services (`transfer.hideRefs`), so
+these notes carry departures with the filtered list.
+
 ### Departures and the gate
 
 sc-forge's CI gate is `fixtures/1.22.6` plus `departures.json`. `fixtures/1.26.2` is reference only, for
@@ -111,7 +140,9 @@ success, ...), as well as every deliberate sc-forge difference.
 - The identity is enforced twice: a fixture exchange that no longer matches is a `stale departure`, and an
   override is refused (`applied to a different exchange`) when the exchange actually produced differs,
   including for `skip`.
-- `expect` keys: `status` (number or list), `message_contains`, `ok` (git), `value` (note; works for
+- `expect` keys depend on `kind`: http `status`, `message_contains`, `fields`, `ignore_fields`,
+  `ignore_headers`, `ignore_body`, `skip`; git `ok`, `message_contains`, `skip`; note `value`, `skip`.
+  A key that does not apply to the entry's kind is a load error. The keys: `status` (number or list), `message_contains`, `ok` (git), `value` (note; works for
   `strict=False` notes too), `fields` (pin body values by dotted path, `$len` pins an array length),
   `ignore_fields` (dotted paths left out of the body comparison), `ignore_headers` (recorded headers left out),
   `ignore_body` (no body comparison at all) and `skip` (only when unavoidable; say why in `reason`).

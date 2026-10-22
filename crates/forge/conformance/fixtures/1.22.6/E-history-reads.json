@@ -54,7 +54,7 @@
         "html_url": "<base>/acme/hist",
         "url": "<base>/api/v1/repos/acme/hist",
         "link": "",
-        "ssh_url": "ssh://git@localhost:2222/acme/hist.git",
+        "ssh_url": "ssh://<ssh-authority>/acme/hist.git",
         "clone_url": "<base>/acme/hist.git",
         "original_url": "",
         "website": "",
