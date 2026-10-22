@@ -168,16 +168,18 @@ their binary's, and `serve` never caches users or tokens across requests.
 
 | Route class | Accepted credential | Additional rule |
 |---|---|---|
-| `/users/{u}/tokens*` | Basic with the user's **password only**. A token is never accepted here, as password or header. | Authenticated user must equal `{u}`. |
+| `/users/{u}/tokens*` | Basic with the user's **password only**. A token is never accepted here, as password or header. (Recorded Gitea accepts a token as the Basic password on these routes, which lets a stolen read-only token mint a broader one; a deliberate departure.) | Authenticated user must equal `{u}`. |
 | `admin/*` | Token with `write:admin` (or `read:admin` for GETs), user must be site admin. | |
-| Everything else | `token T`, `Bearer T`, or Basic with a **token** as password (any username). A Basic password is never tried as a user password. | Scope and actor rules below. |
+| Everything else | `token T`, `Bearer T`, or Basic with a **token** as password under any username, or the token as username with an empty password (all recorded for git and API). A Basic password is never tried as a user password. | Scope and actor rules below. |
 
   The router table is the single source of authorization: every route
   declares its class, required scope category and level, and an actor/target
   rule. A route without a declaration does not compile; a test enumerates the
   table against the fixture routes.
-- **Scopes:** `all`, `read|write:{repository,user,organization,admin,issue}`.
-  `public-only` is rejected at issuance (422), since every repo is private.
+- **Scopes:** `all`, `read|write:{repository,user,organization,admin,issue}`,
+  `public-only`. Gitea accepts `public-only` and denies private repos to such a
+  token (403 or 404 by version); `sc-forge` accepts it and answers 404, so every
+  repo (all are private) is invisible to it.
 - **Actor rules:** a token acts as its user and is intersected with the user's
   access. Organization-scoped writes (`write:organization`, repo creation in an
   org) require the user to be an owner of that org or a site admin; a user can
@@ -186,12 +188,17 @@ their binary's, and `serve` never caches users or tokens across requests.
 - **Repository access** = site admin, org owner, repo owner, or collaborator
   grant (read < write < admin). Org membership alone grants nothing. No teams.
   `POST /pulls/{n}/merge` requires write.
-- **Existence.** Anonymous and foreign callers get the same response for a
-  nonexistent repo and an unauthorized private repo wherever no client asserts a
-  difference (the fixtures include both cases for the API and for git);
-  `repos/search` and every listing filter by the caller's access.
+- **Existence.** Recorded Gitea behaviour is kept: a valid token without access
+  gets 404, identical to a missing repo (API and git); a bad or unknown token
+  gets 401; anonymous API calls get 403 `Only signed in user is allowed to call
+  APIs.` and anonymous git gets 401 with `WWW-Authenticate: Basic realm=...`.
+  Gitea leaks one case (receive-pack on a missing org repo answers 403 "Push to
+  create is not enabled"); `sc-forge` answers 404 there. `repos/search` and every
+  listing filter by the caller's access.
 - **`private: false`** on create or PATCH is accepted, stored as true and
-  returned as true (`FORCE_PRIVATE`). There is no anonymous read.
+  returned as true. (Recorded Gitea forces it only on create and stores `false`
+  from a PATCH; that is an anonymous-read hole `sc-forge` does not copy.) There
+  is no anonymous read.
 - **Rate limits and bind gate.** Password attempts back off exponentially per
   login and are capped per source (not a lockout; a service account must not be
   lockable by a stranger); argon2 runs under a global concurrency cap. The
@@ -293,15 +300,24 @@ write access. Steps, all on captured object ids:
    differs from `head_oid`, answer the recorded stale-head response.
 2. If the PR is already merged or closed, answer the recorded response. If
    `head_oid` is an ancestor of `base_oid`, answer Gitea's "nothing to merge"
-   form (405, "Please try again later", `changed_files` 0).
+   form (405, "Please try again later", `changed_files` 0). A merge of a closed
+   PR is 404; a retry after success is 405 `The PR is already merged`; a missing
+   head branch is 404.
 3. Required status check: if the base has a protection rule with
    `enable_status_check`, every context in `status_check_contexts` must have a
-   latest status of `success` on **`head_oid`** (missing, pending, failure and
-   error refuse with the recorded 405 or 409 and the text "required status
-   checks"). No admin bypass in v1.
+   latest status of `success` or `skipped` on **`head_oid`** (recorded: `skipped`
+   satisfies the requirement; `warning`, `error`, `failure`, `pending`, a status
+   on another sha or another context do not). A refusal is 405 with a message
+   containing "Not all required status checks successful". No admin bypass in v1.
 4. `git merge-tree --write-tree base_oid head_oid`: exit 0 is clean, exit 1 is a
-   conflict (answer the recorded conflict form), anything else is an internal
-   error. Never infer from output presence.
+   conflict, anything else is an internal error (unrelated histories answer 409
+   with a valid JSON body). Never infer from output presence. **Deliberate
+   departure:** a conflict answers `409 {"message":"Merge conflict: <paths>"}`.
+   Recorded Gitea answers 405 "Please try again later" for a conflict, which is
+   indistinguishable from "still checking" and makes a client retry until its
+   deadline; the agent runtime already classifies 405 or 409 containing
+   "conflict" as a worker-fixable conflict, so the explicit form is both
+   compatible and strictly better.
 5. Insert a `merge_intents` row (PR, `base_oid`, `head_oid`, `merge_oid` computed
    by `commit-tree -p base_oid -p head_oid`, state `pending`).
 6. One `git update-ref --stdin` transaction: `start`, `verify refs/heads/<head>
@@ -338,8 +354,13 @@ decided from the recorded fixtures.
 
 Any caller with write on the repo may post any context (Gitea's trust boundary:
 the writer is trusted, status contexts are not attestations; stated here so it is
-not mistaken for one). "Latest" per context is the highest insertion id. The
-combined `state` and `X-Total-Count` follow the fixtures.
+not mistaken for one). "Latest" per context is the highest insertion id. Recorded
+facts: the POST response key is `status`; the combined endpoint lists only the
+latest per context (success plus failure is `failure`, success plus pending is
+`pending`); the history endpoints list everything. **Departures:** unknown state
+strings answer 422 (Gitea stores any string); an unknown sha answers 404 (1.22.6
+answers 500, 1.26.2 404); a repo with no statuses answers `state: ""` as
+1.22.6 does.
 
 ### Repository lifecycle
 
@@ -426,11 +447,51 @@ fixtures replace the clients' hand-authored transcripts, several of which are
 labelled authored, not recorded. CI runs `check` against the in-tree server on
 every PR.
 
+## Contract decisions from the recordings
+
+`crates/forge/conformance/FINDINGS.md` holds every observed status, body and
+header. Decisions drawn from it, beyond those stated in the sections above:
+
+- **Version rule.** Follow 1.22.6 unless it answers 500, an empty message or a
+  malformed body; then follow 1.26.2.
+- **Pull requests.** `PATCH pulls/{n}` answers 201 (as Gitea does). The `head=`
+  filter on the list is ignored; lists are newest first, default page 30, cap 50,
+  a bad `limit` falls back to the default. Force-pushing the head moves `head.sha`
+  on an open PR; **a merged PR's `head.sha` is frozen at merge** (Gitea's follows
+  a recreated branch; the agent runtime compares it against a frozen landing sha,
+  so frozen is the safe reading). Deleting the head branch leaves the PR open.
+  Pushing the head commit straight into base does not mark the PR merged, so there
+  is no manual-merge detection. Approving your own PR is 422. Unknown review
+  `event` values are stored as `PENDING`.
+- **Protection.** Contents writes to a protected branch answer 403 (also for
+  admins; allowed with `new_branch`); force pushes and deletions of a protected
+  branch are refused; force pushes to unprotected branches are allowed; a merge
+  through a PR is allowed. Push refusal text: `Not allowed to push to protected
+  branch <name>`.
+- **Refs a writer may push.** Recorded Gitea lets a write collaborator push
+  `refs/replace/*`, `notes`, `changes` and custom namespaces. `sc-forge` allows
+  `refs/heads/*` and `refs/tags/*` only (departure; see "Git transport").
+- **Empty repos.** `commits` 409 `Git Repository is empty.`; `branches` 200 with
+  body `null`; `contents` 200 `[]`. A first push to a branch other than the
+  default branch leaves `empty: true` (computed from `HEAD`).
+- **Names.** Duplicate repo names are case-insensitive (409). Rename answers 422
+  (departure; Gitea redirects). `PATCH default_branch` naming a missing branch
+  answers 422 (Gitea silently keeps the old one). Reserved names are the union of
+  both versions' lists plus `api`.
+- **Messages to reproduce** (clients match on them): repo duplicate 409 `The
+  repository with the same name already exists.`; user and org duplicate 422
+  `user already exists [name: x]`; stale head 409 `head out of date`; protection
+  push refusal text above; protection merge refusal text above.
+- **Departures, in one place:** conflict is 409 not 405; `private:false` is not
+  stored; token routes refuse tokens; `refs/*` restricted; unknown status states
+  and unknown shas are errors; rename and `Do` other than `merge` are 422; a
+  merged PR's head is frozen; receive-pack on a missing repo is 404. Each is
+  covered by a fixture that `check` marks as an expected difference.
+
 ## Open questions
 
-1. Foreign-token and nonexistent-repo statuses, merge refusal texts, the
-   manually-merged PR detection, and paging order come from the recorded
-   fixtures and are folded into this spec when F0 closes.
+1. The `check` expected-difference list (the departures above) needs an explicit
+   per-exchange override format in the harness before F1 can pass `check`.
 2. TLS: all known deployments terminate at a proxy or private network. Add
    `tlsio` only if one needs it (it needs a sync-to-hyper adapter).
 3. Which Gitea version string `/version` reports; whether `has_actions` PATCH is
