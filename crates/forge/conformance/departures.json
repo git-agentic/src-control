@@ -1245,5 +1245,62 @@
    "ignore_body": true
   },
   "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "H",
+  "exchange": 0,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/<sha#1>/status?limit=50",
+  "expect": {
+   "ignore_fields": [
+    "state",
+    "sha"
+   ],
+   "fields": {
+    "state": "pending"
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "existing commit with no statuses: sc-forge answers state pending with the real sha (1.26.2); 1.22.6's state '' and sha '' is an empty answer, so the version rule picks 1.26.2"
+ },
+ {
+  "scenario": "H",
+  "exchange": 48,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/<sha#5>/status?limit=50",
+  "expect": {
+   "status": 404,
+   "ignore_body": true,
+   "message_contains": [
+    "not found"
+   ],
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "combined status of an unknown sha: 404 (1.26.2); 1.22.6's 200 with empty fields is an empty answer, so the version rule picks 1.26.2. 'not found' is a placeholder word for sc-forge's text"
+ },
+ {
+  "scenario": "H",
+  "exchange": 49,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/main/status?limit=50",
+  "expect": {
+   "status": 200,
+   "ignore_body": true,
+   "fields": {
+    "state": "pending",
+    "total_count": 0
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "the only status on this commit was the refused bogus state: no statuses, combined state pending; ignore_body: the recorded body lists that status"
  }
 ]

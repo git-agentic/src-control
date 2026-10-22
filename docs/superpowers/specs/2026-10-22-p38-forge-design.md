@@ -436,9 +436,12 @@ facts: the POST response key is `status`; the combined endpoint lists only the
 latest per context (success plus failure is `failure`, success plus pending is
 `pending`); the history endpoints list everything. **Departures:** unknown state
 strings answer 422 (Gitea stores any string); a status POST to an unknown sha
-answers 404 (both versions answer 500: an internal error is not a contract); the
-combined status of an unknown sha is `200` with empty fields (1.22.6; 1.26.2
-answers 404); a repo with no statuses answers `state: ""` as 1.22.6 does.
+answers 404 (both versions answer 500: an internal error is not a contract). By
+the version rule (1.22.6's `state: ""` and `sha: ""` on an existing commit with no
+statuses, and its `200` with empty fields for an unknown sha, are empty
+answers), the combined status of an existing commit with no statuses is
+`state: "pending"` with the real `sha` (1.26.2), and the combined status of an
+unknown sha is 404 (1.26.2). Each has an entry in `departures.json`.
 
 ### Repository lifecycle
 
@@ -464,10 +467,16 @@ answers 404); a repo with no statuses answers `state: ""` as 1.22.6 does.
   are addressed by immutable id.
 - **Default branch:** PATCH updates the row and bare `HEAD` together; the
   reconciler repairs a mismatch. A repo is `empty` when `HEAD` does not resolve
-  (computed live). Names: lower-case uniqueness enforced by a database index;
-  reserved names (`api`, `admin`, `assets`, `user`, `login`, and the rest of
-  Gitea's list), leading `-` or `.`, a trailing `.git`, and anything outside
-  `[A-Za-z0-9._-]` are rejected.
+  (computed live). **Repository names** follow the recorded Gitea rules: pattern
+  `[A-Za-z0-9._-]`, at most 100 characters, case-insensitive uniqueness per owner
+  (a database index on the lower-cased name), `.` and `..` reserved, and the
+  suffixes `.git`, `.wiki`, `.rss` and `.atom` rejected; a leading `.` or `-`,
+  `a..b`, and names such as `api`, `admin`, `user` and `assets` are **accepted**
+  (recorded 201 on 1.22.6), which is safe because repositories live on disk under
+  their immutable id, never under their name. **User and organization names**
+  share the URL namespace with `/api/...` and the other top-level routes, so they
+  additionally reject a reserved list (the union of both versions' lists plus
+  `api`, `admin`, `assets`, `user`, `login`).
 
 ### HTTP surface rules
 
@@ -478,8 +487,10 @@ answers 404); a repo with no statuses answers `state: ""` as 1.22.6 does.
   not paginate do not paginate here.
 - Limits: JSON body cap, header cap, idle timeout, global connection cap, git
   request caps (inflated size included).
-- `GET /api/v1/version` answers a Gitea-compatible version plus a `sc-forge`
-  suffix; clients use the route as a health probe.
+- `GET /api/v1/version` answers exactly the recorded Gitea version
+  (`{"version":"1.22.6"}`), because clients may sniff it and the fixture compares
+  it by value; the server's identity is in a `Server: sc-forge/<version>` response
+  header instead.
 
 ### CLI
 
@@ -626,7 +637,6 @@ header. Decisions drawn from it, beyond those stated in the sections above:
    fixture applies unchanged.
 2. TLS: all known deployments terminate at a proxy or private network. Add
    `tlsio` only if one needs it (it needs a sync-to-hyper adapter).
-3. Which Gitea version string `/version` reports; whether `has_actions` PATCH is
-   accepted and ignored or refused.
+3. Whether `has_actions` PATCH is accepted and ignored or refused.
 4. Signed ref attestation (the THREAT-MODEL's deferred gittuf-shaped item) is out
    of scope; v1 documents the rollback gap.
