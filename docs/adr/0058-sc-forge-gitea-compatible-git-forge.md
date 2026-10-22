@@ -33,7 +33,7 @@ limits, but no forge. It does not host Git repos for others, and
    alternative is rejected for now: P9 export fails closed on encrypted content
    and private branches are refused at the Git bridge, so `.sc/` repos behind a
    Git face would carry the cost of both models without delivering either's
-   guarantees. Consequence, stated plainly: **hosted Project repos get none of
+   guarantees. Consequence, stated plainly: **hosted project repos get none of
    src-control's committed secrets, per-file encryption or private branches.**
    Revisit when an sc-native transport exists for the agent runtime.
 2. **The API is a Gitea-compatible subset, not a new API.** Clients then switch
@@ -74,7 +74,8 @@ limits, but no forge. It does not host Git repos for others, and
    publishes it, so "the head I checked is the head I merged" is atomic. A
    `merge_intents` journal row written before the ref update makes the
    Git/SQLite gap recoverable: startup and retries finalize or abort from the ref
-   state. The merge is the only path allowed onto a protected branch. This gives
+   state. A merge through a PR is always allowed onto a protected branch; direct updates
+   follow the rule's `enable_push` (required status contexts gate merges only). This gives
    clients a real merge commit (the ancestry rule of their landing check) and
    `merged: true` on the next read.
 7a. **Protection is one policy for every mutation path.** Receive-pack
@@ -87,7 +88,7 @@ limits, but no forge. It does not host Git repos for others, and
 7b. **Credentials are strictly separated by route.** Token routes accept a
    user's password only (never a token) and only for that user; every other
    route accepts a token only (a Basic password is never tried as a password).
-   Scopes cannot be raised by a token; `public-only` is rejected at issuance.
+   Scopes cannot be raised by a token; `public-only` tokens are accepted and denied every (private) repo.
    Repo identity on disk is an immutable id, so delete-and-recreate cannot alias
    a running process.
 8. **Token format and storage.** Tokens are 40 hex characters (the length
@@ -128,7 +129,7 @@ limits, but no forge. It does not host Git repos for others, and
 - **`.sc/` repos behind a Git bridge:** see decision 1.
 - **Keep running Gitea:** the operating cost and its Actions, UI and SSH surface
   are the problem; the used surface is small.
-- **A new REST API with a Portal provider from day one:** the clients are
+- **A new REST API with a portal provider from day one:** the clients are
   already written against Gitea; compatibility is the cheap way to ship, and a
   native provider can follow once the forge exists.
 - **In-process SSH server (`russh`):** large dependency for a transport nobody
@@ -139,6 +140,7 @@ limits, but no forge. It does not host Git repos for others, and
 
 ## Open
 
-Foreign-token status codes and merge message texts come from the recorded
-fixtures. Whether `has_actions` PATCH is accepted or refused, the `/version`
-string, and an eventual TLS option are decided during F1 and F5.
+Whether `has_actions` PATCH is accepted or refused, the `/version` string, and
+an eventual TLS option are decided during F1 and F5. Foreign-token codes, merge
+message texts and the deliberate departures from Gitea are recorded in the spec
+("Contract decisions from the recordings") and `crates/forge/conformance/`.

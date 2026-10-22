@@ -34,8 +34,10 @@ flows against `sc-forge`. Wire compatibility is the means, not the product.
 - **High availability.** One writer process, one data volume.
 - **Storing `.sc/` repos.** Hosted repos are bare Git (ADR-0058, decision 1).
 - **Changing Gitea's behaviour for the better.** Where a client matches on a
-  Gitea quirk (error text, status code), `sc-forge` reproduces it. The one
-  deliberate departure: merge is synchronous (see "Merge").
+  Gitea quirk (error text, status code), `sc-forge` reproduces it. Deliberate
+  departures (synchronous merge among them) are listed in one place, under
+  "Contract decisions from the recordings", and are enforced by a
+  `departures.json` override file in the harness.
 
 ## What the clients need
 
@@ -168,9 +170,9 @@ their binary's, and `serve` never caches users or tokens across requests.
 
 | Route class | Accepted credential | Additional rule |
 |---|---|---|
-| `/users/{u}/tokens*` | Basic with the user's **password only**. A token is never accepted here, as password or header. (Recorded Gitea accepts a token as the Basic password on these routes, which lets a stolen read-only token mint a broader one; a deliberate departure.) | Authenticated user must equal `{u}`. |
+| `/users/{u}/tokens*` | Basic with the user's **password only**. A token is never accepted here, as password or header. (Recorded Gitea accepts an all-scope token as the Basic password on these routes. Whether a read-only token can mint a broader one that way was not recorded in the first pass; accepting any token here would let it, so this is a defensive departure. Site admins are held to the same rule until a recording shows otherwise.) | Authenticated user must equal `{u}`. |
 | `admin/*` | Token with `write:admin` (or `read:admin` for GETs), user must be site admin. | |
-| Everything else | `token T`, `Bearer T`, or Basic with a **token** as password under any username, or the token as username with an empty password (all recorded for git and API). A Basic password is never tried as a user password. | Scope and actor rules below. |
+| Everything else | `token T`, `Bearer T`, or Basic with a **token** as password under any username, or the token as username with an empty password (recorded for git; API recordings for Bearer and token-as-username are in the follow-up scenarios). A Basic password is never tried as a user password. | Scope and actor rules below. |
 
   The router table is the single source of authorization: every route
   declares its class, required scope category and level, and an actor/target
@@ -178,8 +180,9 @@ their binary's, and `serve` never caches users or tokens across requests.
   table against the fixture routes.
 - **Scopes:** `all`, `read|write:{repository,user,organization,admin,issue}`,
   `public-only`. Gitea accepts `public-only` and denies private repos to such a
-  token (403 or 404 by version); `sc-forge` accepts it and answers 404, so every
-  repo (all are private) is invisible to it.
+  token (403 on 1.22.6, 404 on 1.26.2); `sc-forge` accepts it and follows 1.22.6
+  (403 `token scope is limited to public repos`), so every repo (all are private)
+  is denied to it.
 - **Actor rules:** a token acts as its user and is intersected with the user's
   access. Organization-scoped writes (`write:organization`, repo creation in an
   org) require the user to be an owner of that org or a site admin; a user can
@@ -239,10 +242,14 @@ line (`Status:` and headers), then the body is streamed.
 - **Branch protection applies to every mutation path, one policy function**
   shared by pre-receive, contents writes and merges: a protected branch refuses
   direct updates from receive-pack and contents writes when `enable_push` is
-  false, refuses non-fast-forward and deletion always, and permits only the
-  server-side merge path (which has its own checks). The default branch is not
-  protected unless a rule says so (Gitea behaviour). Deleting the default branch
-  is refused.
+  false and refuses non-fast-forward updates and deletion always. With
+  `enable_push: true` a fast-forward push is accepted, and (recorded) it is not
+  gated by `enable_status_check`: the required contexts gate **merges** only,
+  because a status cannot exist for a commit that has not been pushed yet. An
+  operator who wants no direct pushes sets `enable_push: false`. A merge through
+  a PR is allowed and has its own checks. The default branch is not protected
+  unless a rule says so (Gitea behaviour). Deleting the default branch is
+  refused.
 - **Policy linearization:** authorization and protection are evaluated once when
   a request starts (the hook re-reads protection at ref-update time under one
   read transaction). A revocation or a new rule affects requests that start after
@@ -310,8 +317,11 @@ write access. Steps, all on captured object ids:
    on another sha or another context do not). A refusal is 405 with a message
    containing "Not all required status checks successful". No admin bypass in v1.
 4. `git merge-tree --write-tree base_oid head_oid`: exit 0 is clean, exit 1 is a
-   conflict, anything else is an internal error (unrelated histories answer 409
-   with a valid JSON body). Never infer from output presence. **Deliberate
+   conflict, anything else is an internal error. Unrelated histories make
+   `merge-tree` exit with a fatal status, so a `merge-base` check runs first and
+   answers `409 {"message":"Merge conflict: unrelated histories"}` (recorded
+   Gitea sends a body with no `message` key, which no client can classify).
+   Never infer from output presence. **Deliberate
    departure:** a conflict answers `409 {"message":"Merge conflict: <paths>"}`.
    Recorded Gitea answers 405 "Please try again later" for a conflict, which is
    indistinguishable from "still checking" and makes a client retry until its
@@ -331,8 +341,11 @@ write access. Steps, all on captured object ids:
    200. After this the PR reads `merged: true` immediately.
 
 **Crash recovery.** Git and SQLite cannot commit together, so the intent row is
-the journal. On startup and on any read or merge retry that finds a `pending`
-intent: if the base ref equals `merge_oid`, finalize the PR as merged; if it
+the journal. Recovery runs at startup (before the listener accepts) and,
+afterwards, only while holding the per-repo write lock, which a live merge holds
+for steps 5 to 7; a read that finds a `pending` intent while the lock is held
+treats the PR as not yet merged and does not touch the intent, so recovery can
+never abort a merge that is still in flight. On a `pending` intent: if the base ref equals `merge_oid`, finalize the PR as merged; if it
 equals `base_oid`, mark the intent aborted; otherwise (base moved on) the merge
 landed if `merge_oid` is an ancestor of the base, else aborted. A retried merge
 request therefore recovers the original outcome instead of reporting "nothing to
@@ -346,9 +359,9 @@ use the cache and compute misses under a small concurrency limit.
 
 **PR head lifecycle.** An open PR's `head.sha` is the live branch tip (a
 force-push shows immediately); a merged PR's `head.sha` is frozen at merge; a
-closed PR keeps its last head through `refs/forge/pull/<n>/head`. Whether a
-push of the head commit straight into base marks the PR merged, as Gitea does, is
-decided from the recorded fixtures.
+closed PR keeps its last head through `refs/forge/pull/<n>/head`. Pushing the
+head commit straight into base does not mark the PR merged (recorded; the
+agent runtime's landing check handles a trunk that contains the commits).
 
 ### Statuses
 
@@ -427,7 +440,7 @@ tests driving `sc-forge` with real `git`.
 | F3 | Content API | Branches, refs, commits, git commits/trees/diff, contents GET/POST/PUT with the protection policy and path rules, archive zip. |
 | F4 | PRs, statuses, merge, protection | Pulls, reviews, comments, statuses, protection, merge with intents and recovery, PR retention refs. **Threat-model pass #2 (server-side writes, merge races, contents bypass)**, kill -9 restore test, protection-bypass tests across receive-pack, contents and merge. |
 | F5 | Ops | Container image (current git, no sshd), cgroup limits documented, structured logs without secrets, maintenance gc, SIGTERM drain test, free-space admission test, bind-gate tests. |
-| F6 | Conformance on the first deployment | The consumers' own end-to-end flows run with only the Project Git host swapped. src-control's exit gate; not reproducible from this repo's CI. |
+| F6 | Conformance on the first deployment | The consumers' own end-to-end flows run with only the project Git host swapped. src-control's exit gate; not reproducible from this repo's CI. |
 
 ## Conformance
 
@@ -482,16 +495,24 @@ header. Decisions drawn from it, beyond those stated in the sections above:
   repository with the same name already exists.`; user and org duplicate 422
   `user already exists [name: x]`; stale head 409 `head out of date`; protection
   push refusal text above; protection merge refusal text above.
-- **Departures, in one place:** conflict is 409 not 405; `private:false` is not
-  stored; token routes refuse tokens; `refs/*` restricted; unknown status states
-  and unknown shas are errors; rename and `Do` other than `merge` are 422; a
-  merged PR's head is frozen; receive-pack on a missing repo is 404. Each is
-  covered by a fixture that `check` marks as an expected difference.
+- **Departures, in one place** (each is an entry in `departures.json`, and an
+  override that stops matching an exchange fails the run): synchronous merge (no
+  "still checking" 405); a conflict is 409 with "conflict" in the message, not
+  405 "try again later"; unrelated histories answer a classifiable 409; `Do`
+  other than `merge` is 422 (Gitea: 500 for `fast-forward-only`, other styles
+  accepted); `private:false` is not stored; token routes refuse tokens and
+  require the caller to be `{u}`; client pushes limited to `refs/heads/*` and
+  `refs/tags/*`; unknown status states are 422; repo rename is 422; `PATCH
+  default_branch` to a missing branch is 422; a merged PR's head is frozen;
+  receive-pack on a missing repo is 404. Not departures, by the version rule:
+  unknown sha on a status POST is 404 (1.26.2); `public-only` is 403 (1.22.6);
+  the combined status of an unknown sha is `200` empty (1.22.6).
 
 ## Open questions
 
-1. The `check` expected-difference list (the departures above) needs an explicit
-   per-exchange override format in the harness before F1 can pass `check`.
+1. Site admins minting tokens for other users and a read-only token used as a
+   Basic password on token routes are recorded in the follow-up scenarios; the
+   spec's rule for them is provisional until those land.
 2. TLS: all known deployments terminate at a proxy or private network. Add
    `tlsio` only if one needs it (it needs a sync-to-hyper adapter).
 3. Which Gitea version string `/version` reports; whether `has_actions` PATCH is
