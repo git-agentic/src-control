@@ -102,13 +102,15 @@ recorded fixtures, not here.
 - Combined status lists only the latest status per context; clients do not
   deduplicate. `X-Total-Count` equals the listed count.
 - `GET /commits` on an empty repo answers 409.
-- Git needs reachable-SHA fetch (tested with git 2.54, protocol v0: a commit
-  reachable only through a hidden `refs/forge/pull/*` ref is still fetchable with
-  `uploadpack.allowReachableSHA1InWant`, so `allowAnySHA1InWant` is not needed;
-  a commit no ref reaches is refused. Protocol v2 does not enforce reachability at
-  all, so any object whose id a reader knows is fetchable over v2, and the threat
-  model treats "deleted but not yet gc'd" objects as readable by anyone with read
-  access to the repo), `blob:none` filters, shallow fetch,
+- Git needs fetch by SHA, including the tip of a deleted branch (recorded for
+  protocol v0 and v2). Tested with git 2.54: over v0, `allowReachableSHA1InWant`
+  serves a commit reachable only through a hidden `refs/forge/pull/*` ref but
+  refuses a commit no ref reaches, which the recorded scenario fetches; so
+  `sc-forge` sets `uploadpack.allowAnySHA1InWant=true`. This adds no exposure
+  over protocol v2, which does not enforce reachability at all: any object whose
+  id a reader knows is already fetchable over v2. The threat model therefore
+  treats "deleted but not yet gc'd" objects as readable by anyone with read
+  access to the repo. Also needed: `blob:none` filters, shallow fetch,
   `Git-Protocol: version=2`, and `push --force-with-lease=refs/heads/b:`.
 - Bootstrap scripts shell into the container for `admin user create --admin
   --must-change-password=false`, `admin user change-password`, and
@@ -260,7 +262,7 @@ line (`Status:` and headers), then the body is streamed.
   `GIT_TERMINAL_PROMPT=0`, and per-spawn config through `GIT_CONFIG_COUNT`:
   `core.hooksPath=<data>/hooks` (on **every** spawn, including `update-ref`,
   which runs `reference-transaction`), `uploadpack.allowFilter=true`,
-  `uploadpack.allowReachableSHA1InWant=true`, `uploadpackfilter.allow=false` with
+  `uploadpack.allowAnySHA1InWant=true`, `uploadpackfilter.allow=false` with
   an explicit allow for `blob:none` only, `receive.fsckObjects=true`,
   `receive.maxInputSize`, `receive.autogc=false`, `gc.auto=0`,
   `core.useReplaceRefs=false`, and durability (`core.fsync=all`,
