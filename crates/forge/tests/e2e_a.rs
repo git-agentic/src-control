@@ -625,23 +625,17 @@ fn must_change_password_blocks_password_authentication() {
 #[test]
 fn admin_cli_changes_are_visible_to_the_running_server() {
     let s = Srv::start();
-    scl_forge::admin::user_create(
-        &s.dir,
-        "carol",
-        "carol-pw-1",
-        "c@example.invalid",
-        false,
-        false,
-    )
-    .unwrap();
+    let (pw1, pw2) = (scl_crypto::generate_token(), scl_crypto::generate_token());
+    scl_forge::admin::user_create(&s.dir, "carol", &pw1, "c@example.invalid", false, false)
+        .unwrap();
     let t = scl_forge::admin::generate_access_token(&s.dir, "carol", "cli", &["read:user".into()])
         .unwrap();
     assert_eq!(s.get("/api/v1/user", &token(&t)).json()["login"], "carol");
-    scl_forge::admin::user_change_password(&s.dir, "carol", "carol-pw-2", false).unwrap();
+    scl_forge::admin::user_change_password(&s.dir, "carol", &pw2, false).unwrap();
     assert_eq!(
         s.post(
             "/api/v1/users/carol/tokens",
-            &basic("carol", "carol-pw-1"),
+            &basic("carol", &pw1),
             json!({"name": "o", "scopes": ["all"]})
         )
         .status,
@@ -650,7 +644,7 @@ fn admin_cli_changes_are_visible_to_the_running_server() {
     assert_eq!(
         s.post(
             "/api/v1/users/carol/tokens",
-            &basic("carol", "carol-pw-2"),
+            &basic("carol", &pw2),
             json!({"name": "n", "scopes": ["all"]})
         )
         .status,
@@ -658,10 +652,15 @@ fn admin_cli_changes_are_visible_to_the_running_server() {
     );
     scl_forge::admin::org_create(&s.dir, "cliorg", "carol").unwrap();
     assert_eq!(s.get("/api/v1/orgs/cliorg", &token(&s.admin)).status, 200);
-    assert!(
-        scl_forge::admin::user_create(&s.dir, "carol", "x", "c@example.invalid", false, false)
-            .is_err()
-    );
+    assert!(scl_forge::admin::user_create(
+        &s.dir,
+        "carol",
+        &pw1,
+        "c@example.invalid",
+        false,
+        false
+    )
+    .is_err());
     assert!(
         scl_forge::admin::generate_access_token(&s.dir, "carol", "cli", &["all".into()]).is_err(),
         "duplicate token name"
@@ -1034,7 +1033,7 @@ fn patching_one_field_never_rewrites_another() {
         .unwrap()
         .unwrap();
     // A stale snapshot of alice, then an admin grant and a password reset land...
-    let hash = scl_crypto::hash_password("fresh");
+    let hash = scl_crypto::hash_password(&scl_crypto::generate_token());
     scl_forge::store::update_user(
         &conn,
         alice.id,

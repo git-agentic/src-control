@@ -24,7 +24,7 @@ static DUMMY: OnceLock<String> = OnceLock::new();
 /// attempt does not pay for hashing on top of verifying, which would make it
 /// measurably slower than a wrong password for a real account.
 pub fn warm_up() {
-    DUMMY.get_or_init(|| hash_password("sc-forge-dummy"));
+    DUMMY.get_or_init(|| hash_password(&crate::random_hex(16)));
 }
 
 /// Verify `password` against a PHC `stored` hash. With `None` (no such account)
@@ -39,7 +39,7 @@ pub fn verify_password(password: &str, stored: Option<&str>) -> bool {
     let (parsed, real_account) = match real {
         Some(p) => (p, true),
         None => {
-            dummy = DUMMY.get_or_init(|| hash_password("sc-forge-dummy"));
+            dummy = DUMMY.get_or_init(|| hash_password(&crate::random_hex(16)));
             (
                 PasswordHash::new(dummy).expect("our own hash parses"),
                 false,
@@ -81,24 +81,39 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn pw() -> String {
+        crate::random_hex(12)
+    }
+
     #[test]
     fn password_round_trip_and_rejection() {
-        let h = hash_password("correct horse");
+        let (right, wrong) = (pw(), pw());
+        let h = hash_password(&right);
         assert!(h.starts_with("$argon2id$"));
-        assert!(verify_password("correct horse", Some(&h)));
-        assert!(!verify_password("correct horsf", Some(&h)));
-        assert!(!verify_password("", Some(&h)));
+        assert!(verify_password(&right, Some(&h)));
+        assert!(!verify_password(&wrong, Some(&h)));
+        assert!(
+            !verify_password(&right[..right.len() - 1], Some(&h)),
+            "a prefix is not the password"
+        );
+        assert!(
+            !verify_password(&right[..0], Some(&h)),
+            "empty is not the password"
+        );
     }
 
     #[test]
     fn same_password_hashes_differently() {
-        assert_ne!(hash_password("pw"), hash_password("pw"));
+        let p = pw();
+        assert_ne!(hash_password(&p), hash_password(&p));
     }
 
     #[test]
     fn absent_account_and_garbage_hash_never_verify() {
-        assert!(!verify_password("anything", None));
-        assert!(!verify_password("anything", Some("not-a-phc-string")));
+        let p = pw();
+        assert!(!verify_password(&p, None));
+        assert!(!verify_password(&p, Some("not-a-phc-string")));
+        assert!(!verify_password(&p, Some("")));
     }
 
     #[test]

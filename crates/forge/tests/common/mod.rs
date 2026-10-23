@@ -93,7 +93,7 @@ impl Srv {
         admin::user_create(
             &dir,
             "siteadmin",
-            "admin-pw-1",
+            &scl_crypto::generate_token(),
             "admin@example.invalid",
             true,
             false,
