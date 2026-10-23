@@ -294,10 +294,22 @@ pub fn resolve(method: &str, path: &str) -> Result<(&'static Route, Params), boo
 /// deleted or replaced `forge.db` (which `connect` would recreate empty) is
 /// reported as down rather than as a healthy server whose routes all fail.
 fn database_ready(app: &App) -> bool {
-    db::db_path(&app.data_dir).exists()
-        && db::connect(&app.data_dir)
-            .and_then(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?))
-            .is_ok_and(|v| v == db::SCHEMA_VERSION)
+    if !db::db_path(&app.data_dir).exists() {
+        return false;
+    }
+    let Ok(conn) = db::connect(&app.data_dir) else {
+        return false;
+    };
+    let version = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0));
+    // The version alone can be forged by a replacement file; the tables must answer too.
+    version.is_ok_and(|v| v == db::SCHEMA_VERSION)
+        && ["users", "org_members", "tokens"].iter().all(|t| {
+            conn.query_row(&format!("SELECT 1 FROM {t} LIMIT 1"), [], |_| Ok(()))
+                .map_or_else(
+                    |e| matches!(e, rusqlite::Error::QueryReturnedNoRows),
+                    |()| true,
+                )
+        })
 }
 
 fn healthz(app: &App) -> Resp {

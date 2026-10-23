@@ -200,6 +200,10 @@ fn run_admin(cmd: AdminCmd) -> Result<()> {
 }
 
 fn run_serve(a: ServeArgs) -> Result<()> {
+    scl_forge::server::validate_public_url(&a.public_url).map_err(anyhow::Error::msg)?;
+    if a.max_connections == 0 {
+        bail!("--max-connections must be at least 1");
+    }
     bind_gate(&a.listen, a.behind_proxy, a.allow_plaintext).map_err(anyhow::Error::msg)?;
     let cidrs = a
         .trusted_proxies
@@ -230,7 +234,7 @@ fn run_serve(a: ServeArgs) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async {
+    let result: Result<()> = rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(a.listen)
             .await
             .with_context(|| format!("bind {}", a.listen))?;
@@ -245,5 +249,9 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         };
         serve(listener, app, limits, stop, Duration::from_secs(30)).await;
         Ok(())
-    })
+    });
+    // Queued password verifications run on blocking threads that the drain deadline
+    // cannot cancel; do not let dropping the runtime wait for them.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    result
 }

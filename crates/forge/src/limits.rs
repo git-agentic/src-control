@@ -136,6 +136,20 @@ impl Backoff {
         Duration::from_millis(50u64.saturating_mul(1u64 << (n - 1).min(16))).min(self.max_delay)
     }
 
+    /// Give back a reservation for an attempt that failed on our side (a database
+    /// error), which says nothing about the credential and must not count against
+    /// the source.
+    pub fn cancel(&self, ip: IpAddr) {
+        if let Some(v) = self
+            .by_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&source_key(ip))
+        {
+            v.pop();
+        }
+    }
+
     /// A success clears the login's failures and returns the source's reservation.
     pub fn success(&self, login: &str, ip: IpAddr) {
         let ip = source_key(ip);
@@ -263,6 +277,15 @@ mod tests {
         assert!(b.begin(ip("8.8.8.8")), "other sources are unaffected");
         b.success("u", ip("9.9.9.9")); // a success gives its reservation back
         assert!(b.begin(ip("9.9.9.9")));
+    }
+
+    #[test]
+    fn a_cancelled_reservation_is_returned() {
+        let b = Backoff::new(1, Duration::ZERO);
+        assert!(b.begin(ip("7.7.7.7")));
+        assert!(!b.begin(ip("7.7.7.7")));
+        b.cancel(ip("7.7.7.7"));
+        assert!(b.begin(ip("7.7.7.7")));
     }
 
     #[test]

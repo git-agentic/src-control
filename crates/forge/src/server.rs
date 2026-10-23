@@ -127,8 +127,28 @@ fn to_response(r: Resp) -> Response<Full<Bytes>> {
     for (k, v) in r.headers {
         b = b.header(k, v);
     }
-    b.body(Full::new(Bytes::from(r.body)))
-        .expect("static header names are valid")
+    // A header value hyper refuses must not panic the connection task: answer 500.
+    b.body(Full::new(Bytes::from(r.body))).unwrap_or_else(|_| {
+        let mut e = Response::new(Full::new(Bytes::from_static(
+            b"{\"message\":\"internal server error\"}",
+        )));
+        *e.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+        e
+    })
+}
+
+/// Check `--public-url` at startup: an `http(s)://` URL of visible ASCII only, so
+/// it can be placed in `Link` headers and bodies without surprises.
+pub fn validate_public_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"));
+    match rest {
+        Some(r) if !r.is_empty() && r.bytes().all(|b| b.is_ascii_graphic()) => Ok(()),
+        _ => Err(format!(
+            "--public-url {url:?} must be an http:// or https:// URL of visible ASCII characters (percent-encode anything else)"
+        )),
+    }
 }
 
 /// Serve until `shutdown` resolves, then wait up to `drain` for in-flight
@@ -176,4 +196,25 @@ pub fn make_app(
     argon_slots: usize,
 ) -> Arc<App> {
     Arc::new(App::new(data_dir, public_url, proxies, argon_slots))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_url_must_be_header_safe() {
+        assert!(validate_public_url("http://127.0.0.1:3000").is_ok());
+        assert!(validate_public_url("https://git.example.com/forge").is_ok());
+        for bad in [
+            "",
+            "ftp://x",
+            "http://",
+            "http://ex ample",
+            "http://exämple.com",
+            "http://x\r\nSet-Cookie: a",
+        ] {
+            assert!(validate_public_url(bad).is_err(), "{bad:?}");
+        }
+    }
 }

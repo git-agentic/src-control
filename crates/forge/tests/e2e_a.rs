@@ -1155,3 +1155,45 @@ fn healthz_reports_a_missing_database_and_token_names_may_need_escaping() {
     std::fs::remove_file(scl_forge::db::db_path(&s.dir)).unwrap();
     assert_eq!(s.send("GET", "/api/healthz", None, None).status, 503);
 }
+
+#[test]
+fn a_database_with_the_right_version_but_no_tables_is_not_ready() {
+    let s = Srv::start();
+    assert_eq!(s.send("GET", "/api/healthz", None, None).status, 200);
+    std::fs::remove_file(scl_forge::db::db_path(&s.dir)).unwrap();
+    let c = scl_forge::db::connect(&s.dir).unwrap();
+    c.pragma_update(None, "user_version", scl_forge::db::SCHEMA_VERSION)
+        .unwrap();
+    drop(c);
+    assert_eq!(
+        s.send("GET", "/api/healthz", None, None).status,
+        503,
+        "version alone does not make a database ready"
+    );
+}
+
+#[test]
+fn serve_refuses_unusable_settings_at_startup() {
+    let dir = std::env::temp_dir().join(format!("scl-forge-serve-args-{}", std::process::id()));
+    let bin = env!("CARGO_BIN_EXE_sc-forge");
+    let run = |extra: &[&str]| {
+        std::process::Command::new(bin)
+            .args(["serve", "--listen", "127.0.0.1:0", "--data-dir"])
+            .arg(&dir)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let o = run(&[
+        "--public-url",
+        "http://127.0.0.1:1",
+        "--max-connections",
+        "0",
+    ]);
+    assert!(
+        !o.status.success() && String::from_utf8_lossy(&o.stderr).contains("--max-connections")
+    );
+    let o = run(&["--public-url", "http://exämple.com"]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("--public-url"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -149,7 +149,10 @@ pub fn by_password(app: &App, conn: &Connection, req: &Req, cred: &Cred) -> Resu
     }
     let found = match store::find_by_login(conn, login) {
         Ok(u) => u.filter(|u| !u.is_org),
-        Err(e) => return Err(app.internal(&e)),
+        Err(e) => {
+            app.backoff.cancel(req.source);
+            return Err(app.internal(&e));
+        }
     };
     let ok = {
         let _slot = app.gate.acquire();
