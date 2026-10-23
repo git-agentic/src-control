@@ -690,13 +690,15 @@
   "match": "PATCH /api/v1/repos/acme/pub1",
   "expect": {
    "ignore_fields": [
-    "private"
+    "private",
+    "internal"
    ],
    "fields": {
-    "private": true
+    "private": true,
+    "internal": false
    }
   },
-  "reason": "sc-forge keeps private:true; only `private` may differ"
+  "reason": "sc-forge keeps private:true and internal:false (every repository is private, none is `internal`); Gitea flips both when private:false is PATCHed. Only `private` and `internal` may differ"
  },
  {
   "scenario": "L",
@@ -705,13 +707,15 @@
   "match": "PATCH /api/v1/repos/acme/pub1",
   "expect": {
    "ignore_fields": [
-    "private"
+    "private",
+    "internal"
    ],
    "fields": {
-    "private": true
+    "private": true,
+    "internal": false
    }
   },
-  "reason": "sc-forge keeps private:true; only `private` may differ"
+  "reason": "sc-forge keeps private:true and internal:false (every repository is private, none is `internal`); Gitea flips both when private:false is PATCHed. Only `private` and `internal` may differ"
  },
  {
   "scenario": "L",
@@ -720,13 +724,15 @@
   "match": "GET /api/v1/repos/acme/pub1",
   "expect": {
    "ignore_fields": [
-    "private"
+    "private",
+    "internal"
    ],
    "fields": {
-    "private": true
+    "private": true,
+    "internal": false
    }
   },
-  "reason": "GET after PATCH private:false still reports private:true"
+  "reason": "sc-forge keeps private:true and internal:false (every repository is private, none is `internal`); Gitea flips both when private:false is PATCHed. Only `private` and `internal` may differ"
  },
  {
   "scenario": "H",

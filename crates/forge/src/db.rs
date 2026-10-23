@@ -49,7 +49,32 @@ const MIGRATIONS: &[&str] = &[
         expires_unix INTEGER,
         UNIQUE (user_id, name)
     );",
+    // 2: repositories (named by immutable id on disk) and collaborators. `private` is not
+    // stored: every repository is private.
+    "CREATE TABLE repos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL,
+        lower_name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        website TEXT NOT NULL DEFAULT '',
+        default_branch TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('creating', 'live', 'deleting')),
+        created_unix INTEGER NOT NULL,
+        updated_unix INTEGER NOT NULL,
+        UNIQUE (owner_id, lower_name)
+    );
+    CREATE TABLE collaborators (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        mode TEXT NOT NULL CHECK (mode IN ('read', 'write', 'admin')),
+        PRIMARY KEY (repo_id, user_id)
+    );",
 ];
+
+/// Every table the current schema creates; `/healthz` probes each, so a missing or unreadable one
+/// (whatever the recorded version says) reads as not ready.
+pub const TABLES: &[&str] = &["users", "org_members", "tokens", "repos", "collaborators"];
 
 /// Database failures a caller reports to the operator.
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +106,14 @@ pub fn connect(data_dir: &Path) -> Result<Connection, DbError> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // SQLite's built-in lower() folds ASCII only; searches need Unicode-aware case folding.
+    conn.create_scalar_function(
+        "ulower",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| Ok(ctx.get::<String>(0)?.to_lowercase()),
+    )?;
     Ok(conn)
 }
 

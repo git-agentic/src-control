@@ -24,6 +24,26 @@ impl Gate {
         }
     }
 
+    /// Wait up to `deadline` for a slot; `None` when none became free (the caller answers
+    /// 503 instead of queueing without bound).
+    pub fn acquire_timeout(&self, deadline: Duration) -> Option<Permit<'_>> {
+        let end = Instant::now() + deadline;
+        let mut n = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *n == 0 {
+            let left = end.checked_duration_since(Instant::now())?;
+            let (g, res) = self
+                .cv
+                .wait_timeout(n, left)
+                .unwrap_or_else(|e| e.into_inner());
+            n = g;
+            if res.timed_out() && *n == 0 {
+                return None;
+            }
+        }
+        *n -= 1;
+        Some(Permit(self))
+    }
+
     /// Block until a slot is free.
     pub fn acquire(&self) -> Permit<'_> {
         let mut n = self.free.lock().unwrap_or_else(|e| e.into_inner());
@@ -374,6 +394,17 @@ mod tests {
             Proxies::default().resolve(ip("127.0.0.1"), Some("6.6.6.6")),
             ip("127.0.0.1")
         );
+    }
+
+    #[test]
+    fn gate_acquire_times_out_instead_of_queueing() {
+        let g = Gate::new(1);
+        let held = g.acquire();
+        let t = Instant::now();
+        assert!(g.acquire_timeout(Duration::from_millis(60)).is_none());
+        assert!(t.elapsed() >= Duration::from_millis(55));
+        drop(held);
+        assert!(g.acquire_timeout(Duration::from_millis(60)).is_some());
     }
 
     #[test]

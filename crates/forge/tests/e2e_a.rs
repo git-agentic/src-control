@@ -900,7 +900,7 @@ fn user_and_org_repo_creation_routes_apply_scope_and_actor_rules() {
             )
         );
     }
-    // The owner and a site admin pass the policy (the handler itself arrives with F2).
+    // The owner and a site admin pass the policy and really create (F2a); a second create is 409.
     assert_eq!(
         s.post(
             "/api/v1/orgs/botorg/repos",
@@ -908,12 +908,17 @@ fn user_and_org_repo_creation_routes_apply_scope_and_actor_rules() {
             json!({"name": "legit"})
         )
         .status,
-        501
+        201
     );
     assert_eq!(
         s.post("/api/v1/orgs/botorg/repos", &adm, json!({"name": "legit"}))
             .status,
-        501
+        409
+    );
+    assert_eq!(
+        s.post("/api/v1/orgs/botorg/repos", &adm, json!({"name": "legit2"}))
+            .status,
+        201
     );
     let r = s.post("/api/v1/orgs/ghost/repos", &adm, json!({"name": "x"}));
     assert_eq!(

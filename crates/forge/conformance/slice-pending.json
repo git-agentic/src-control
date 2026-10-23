@@ -1,4 +1,5 @@
 {
- "A": [6, "POST /api/v1/user/repos"],
- "B": [25, "POST /api/v1/user/repos"]
+ "B": [25, "GET /api/v1/repos/alice/scoped/contents/README.md"],
+ "C": [27, "git clone"],
+ "N": [0, "git clone"]
 }

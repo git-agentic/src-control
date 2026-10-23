@@ -100,3 +100,22 @@ fn token_routes_are_exactly_the_password_routes() {
         );
     }
 }
+
+#[test]
+fn every_route_with_a_repository_parameter_resolves_it_through_the_actor() {
+    use scl_forge::routes::Actor;
+    for r in ROUTES.iter().filter(|r| r.pattern.contains("{r}")) {
+        assert!(
+            matches!(r.actor, Actor::Repo(_) | Actor::RepoOwner),
+            "{} {} names a repository but does not use Actor::Repo/RepoOwner",
+            r.method,
+            r.pattern
+        );
+        assert!(
+            r.need.is_some(),
+            "{} {} must declare a scope",
+            r.method,
+            r.pattern
+        );
+    }
+}

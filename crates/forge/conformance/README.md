@@ -46,7 +46,7 @@ python3 -I run.py diff fixtures/1.22.6 fixtures/1.26.2   # offline version diff
 python3 -I run.py show fixtures/1.26.2 --only G --body    # what was recorded
 ```
 
-Against the in-tree server use `./forge-check.sh` (it bootstraps an empty data directory with the `admin` CLI,
+Against the in-tree server use `./forge-check.sh` (it replays scenarios `A,B,C,L,N,R`; the others wait for their routes, see `slice-pending.json` and the spec's "F2a decisions"; it bootstraps an empty data directory with the `admin` CLI,
 starts `sc-forge serve` on a free loopback port, runs `check` with the departures and `slice-pending.json`, and
 stops the server; CI runs it). `check --pending FILE` takes a JSON map `{scenario: [N, "METHOD /path"]}` (a bare `N` is also accepted): the
 server is expected to answer the first N exchanges of that scenario, the scenario must then stop at the named setup

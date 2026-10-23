@@ -16,7 +16,7 @@ pub const GITEA_VERSION: &str = "1.22.6";
 const DEFAULT_PAGE: i64 = 30;
 const MAX_PAGE: i64 = 50;
 
-fn user_json(base: &str, u: &User) -> Value {
+pub(crate) fn user_json(base: &str, u: &User) -> Value {
     json!({
         "id": u.id,
         "login": u.login,
@@ -44,7 +44,7 @@ fn user_json(base: &str, u: &User) -> Value {
     })
 }
 
-fn org_json(base: &str, o: &User) -> Value {
+pub(crate) fn org_json(base: &str, o: &User) -> Value {
     json!({
         "id": o.id,
         "name": o.login,
@@ -60,7 +60,7 @@ fn org_json(base: &str, o: &User) -> Value {
     })
 }
 
-fn no_such_user(ctx: &Ctx, name: &str) -> Resp {
+pub(crate) fn no_such_user(ctx: &Ctx, name: &str) -> Resp {
     error(
         &ctx.app.base,
         404,
@@ -77,12 +77,12 @@ pub fn org_missing(app: &crate::routes::App, name: &str) -> Resp {
     )
 }
 
-fn no_such_org(ctx: &Ctx, name: &str) -> Resp {
+pub(crate) fn no_such_org(ctx: &Ctx, name: &str) -> Resp {
     org_missing(ctx.app, name)
 }
 
 /// A JSON object body; an empty body is `{}`.
-fn body(ctx: &Ctx) -> Result<Value, Resp> {
+pub(crate) fn body(ctx: &Ctx) -> Result<Value, Resp> {
     if ctx.req.body.is_empty() {
         return Ok(json!({}));
     }
@@ -92,11 +92,11 @@ fn body(ctx: &Ctx) -> Result<Value, Resp> {
     }
 }
 
-fn str_field(v: &Value, key: &str) -> Option<String> {
+pub(crate) fn str_field(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(String::from)
 }
 
-fn page_params(ctx: &Ctx) -> (i64, i64) {
+pub(crate) fn page_params(ctx: &Ctx) -> (i64, i64) {
     let num = |k: &str| ctx.req.param(k).and_then(|v| v.parse::<i64>().ok());
     // Page is clamped so offset arithmetic cannot overflow.
     let page = num("page")
@@ -111,11 +111,48 @@ fn page_params(ctx: &Ctx) -> (i64, i64) {
 }
 
 /// 200 with `X-Total-Count` and Gitea's `Link` header.
-fn paged(ctx: &Ctx, path: &str, total: i64, page: i64, limit: i64, items: Vec<Value>) -> Resp {
+pub(crate) fn paged(
+    ctx: &Ctx,
+    path: &str,
+    total: i64,
+    page: i64,
+    limit: i64,
+    items: Vec<Value>,
+) -> Resp {
+    paged_with(ctx, path, total, page, limit, &[], items)
+}
+
+/// Percent-encode everything except the RFC 3986 unreserved characters, so a value can sit inside
+/// a `<...>` link target without being able to close it or start another entry.
+pub(crate) fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Like [`paged`], carrying `extra` query parameters (already strictly percent-encoded with [`pct_encode`], in the order
+/// Gitea emits them: alphabetical after `limit` and `page`) into every `Link` URL, so following
+/// a page link repeats the same query.
+pub(crate) fn paged_with(
+    ctx: &Ctx,
+    path: &str,
+    total: i64,
+    page: i64,
+    limit: i64,
+    extra: &[(&str, String)],
+    items: Vec<Value>,
+) -> Resp {
+    let tail: String = extra.iter().map(|(k, v)| format!("&{k}={v}")).collect();
     let last = ((total + limit - 1) / limit).max(1);
     let url = |p: i64, rel: &str| {
         format!(
-            "<{}/api/v1{path}?limit={limit}&page={p}>; rel=\"{rel}\"",
+            "<{}/api/v1{path}?limit={limit}&page={p}{tail}>; rel=\"{rel}\"",
             ctx.app.base
         )
     };
@@ -168,7 +205,7 @@ pub fn get_user(ctx: &mut Ctx) -> Resp {
 
 /// Visible to the caller: public and limited organizations to any signed-in
 /// caller, private ones to owners and site admins.
-fn org_visible(ctx: &Ctx, org: &User) -> rusqlite::Result<bool> {
+pub(crate) fn org_visible(ctx: &Ctx, org: &User) -> rusqlite::Result<bool> {
     let me = &ctx.who.user;
     Ok(org.visibility != "private" || me.is_admin || store::is_org_owner(ctx.conn, org.id, me.id)?)
 }
@@ -236,7 +273,13 @@ fn name_error(label: &str, name: &str, e: NameError) -> String {
     }
 }
 
-fn valid_visibility(v: &str) -> bool {
+/// An email must be usable as a commit identity too (it reaches git through the environment):
+/// no control characters and no angle brackets.
+fn email_ok(e: &str) -> bool {
+    e.contains('@') && !e.chars().any(|c| c.is_control() || matches!(c, '<' | '>'))
+}
+
+pub(crate) fn valid_visibility(v: &str) -> bool {
     matches!(v, "public" | "limited" | "private")
 }
 
@@ -308,7 +351,7 @@ pub fn admin_create_user(ctx: &mut Ctx) -> Resp {
     if email.is_empty() {
         return error(&base, 422, "[Email]: Required");
     }
-    if !email.contains('@') {
+    if !email_ok(&email) {
         return error(&base, 422, "[Email]: Email");
     }
     if password.is_empty() {
@@ -365,7 +408,7 @@ pub fn admin_patch_user(ctx: &mut Ctx) -> Resp {
         return error(&base, 422, "[Visibility]: invalid visibility");
     }
     let email = str_field(&b, "email");
-    if email.as_deref().is_some_and(|e| !e.contains('@')) {
+    if email.as_deref().is_some_and(|e| !email_ok(e)) {
         return error(&base, 422, "[Email]: Email");
     }
     let password_hash = match str_field(&b, "password") {

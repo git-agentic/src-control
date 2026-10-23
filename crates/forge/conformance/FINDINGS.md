@@ -5,8 +5,8 @@ Recorded 2026-10-22 against `gitea/gitea:1.22.6-rootless` and `1.26.2-rootless` 
 letters match `fixtures/<version>/<letter>-*.json`. Every statement below was observed, not read
 from source. "Both" means both versions answered the same.
 
-Each version passes its own fixtures (22/22). Checking the 1.22.6 fixtures against 1.26.2 passes 3/22
-(I, Q, V); every failure is a difference listed in the last table.
+Each version passes its own fixtures (24/24). Checking the 1.22.6 fixtures against 1.26.2 passes only 2/24;
+every failure is a difference listed in the last table.
 
 ## Headline answers
 

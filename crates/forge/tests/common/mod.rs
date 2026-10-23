@@ -22,6 +22,9 @@ pub struct Srv {
     pub base: String,
     /// All-scope token of the site admin `siteadmin`.
     pub admin: String,
+    /// The runner the server uses (tests occupy its slots to stage a busy server).
+    pub runner: std::sync::Arc<scl_forge::gitproc::Git>,
+    _data_lock: scl_forge::lifecycle::DirLock,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -82,7 +85,20 @@ impl Srv {
         Srv::start_cfg(Limits::default(), Some(b))
     }
 
+    /// Start with a runner of `slots` concurrent git children and the given admission deadline.
+    pub fn start_git(slots: usize, admission: std::time::Duration) -> Srv {
+        Srv::start_full(Limits::default(), None, Some((slots, admission)))
+    }
+
     fn start_cfg(limits: Limits, backoff: Option<scl_forge::limits::Backoff>) -> Srv {
+        Srv::start_full(limits, backoff, None)
+    }
+
+    fn start_full(
+        limits: Limits,
+        backoff: Option<scl_forge::limits::Backoff>,
+        git_cfg: Option<(usize, std::time::Duration)>,
+    ) -> Srv {
         let dir = std::env::temp_dir().join(format!(
             "scl-forge-e2e-{}-{}",
             std::process::id(),
@@ -106,7 +122,15 @@ impl Srv {
         std_l.set_nonblocking(true).unwrap();
         let addr = std_l.local_addr().unwrap();
         let base = format!("http://{addr}");
-        let mut app = scl_forge::routes::App::new(dir.clone(), &base, Proxies::default(), 4);
+        let data_lock = scl_forge::lifecycle::DirLock::acquire(&dir).unwrap();
+        let (slots, admission) = git_cfg.unwrap_or((8, std::time::Duration::from_secs(5)));
+        let git = std::sync::Arc::new(
+            scl_forge::gitproc::Git::new(&dir, scl_forge::gitproc::find_git().expect("git"), slots)
+                .unwrap()
+                .with_limits(std::time::Duration::from_secs(30), admission, 16 << 20),
+        );
+        let life = scl_forge::lifecycle::Lifecycle::new(&dir, git.clone()).unwrap();
+        let mut app = scl_forge::routes::App::new(dir.clone(), &base, Proxies::default(), 4, life);
         if let Some(b) = backoff {
             app.backoff = b;
         }
@@ -133,6 +157,8 @@ impl Srv {
             });
         });
         Srv {
+            runner: git,
+            _data_lock: data_lock,
             addr,
             dir,
             base,
@@ -198,6 +224,49 @@ impl Srv {
     }
     pub fn post(&self, path: &str, auth: &str, body: Value) -> Resp {
         self.send("POST", path, Some(auth), Some(&body))
+    }
+
+    /// Run git directly against repository `id`'s bare directory (the test's stand-in for a push,
+    /// which F2b serves over HTTP).
+    pub fn git(&self, id: i64, args: &[&str], stdin: Option<&[u8]>) -> String {
+        let g = scl_forge::gitproc::Git::new(
+            &self.dir,
+            scl_forge::gitproc::find_git().expect("git"),
+            4,
+        )
+        .unwrap();
+        let dir = self.dir.join("repos").join(format!("{id}.git"));
+        let id_ = scl_forge::gitproc::Identity::new("T", "t@example.invalid").unwrap();
+        let out = g
+            .run(&scl_forge::gitproc::Spec {
+                repo: Some(&dir),
+                args,
+                stdin,
+                identity: Some(&id_),
+            })
+            .unwrap();
+        assert!(
+            out.ok(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.text()
+    }
+
+    /// Make branch `name` in repository `id` point at a new empty commit on top of `parent` (or a root).
+    pub fn commit_on(&self, id: i64, name: &str, parent: Option<&str>) -> String {
+        let tree = self.git(id, &["mktree"], Some(b""));
+        let mut args = vec!["commit-tree", tree.as_str()];
+        if let Some(p) = parent {
+            args.extend(["-p", p]);
+        }
+        let oid = self.git(id, &args, Some(b"msg\n"));
+        self.git(
+            id,
+            &["update-ref", &format!("refs/heads/{name}"), &oid],
+            None,
+        );
+        oid
     }
 
     /// Create a user through the admin API, returning (login, password).
