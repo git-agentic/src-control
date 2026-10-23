@@ -426,7 +426,7 @@ impl From<std::io::Error> for LaunchError {
 }
 
 /// The CGI variables and git config of one transport, on top of the scrubbed base environment.
-fn environment(l: &Launch) -> Vec<(String, String)> {
+fn environment(l: &Launch, marker: &std::path::Path) -> Vec<(String, String)> {
     let cfg = &l.app.transports.cfg;
     let git = &l.app.life.git;
     let extra = [
@@ -480,6 +480,7 @@ fn environment(l: &Launch) -> Vec<(String, String)> {
     var("FORGE_DATA_DIR", git.data_dir().display().to_string());
     var("FORGE_REPO_ID", id.to_string());
     var("FORGE_USER_ID", l.plan.user.id.to_string());
+    var("FORGE_ACCEPT_MARKER", marker.display().to_string());
     env
 }
 
@@ -505,6 +506,12 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
     let cancel = reg.cancel.clone();
 
     let git = &l.app.life.git;
+    static MARKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let marker = git.data_dir().join("tmp").join(format!(
+        "accept-{}-{}",
+        std::process::id(),
+        MARKERS.fetch_add(1, Ordering::SeqCst)
+    ));
     let (cpu, fsize, mem) = (
         cfg.cpu_secs,
         cfg.max_pack.saturating_add(256 << 20),
@@ -513,7 +520,7 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
     let mut cmd = Command::new(git.bin());
     cmd.arg("http-backend")
         .env_clear()
-        .envs(environment(&l))
+        .envs(environment(&l, &marker))
         .current_dir(git.data_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -580,6 +587,7 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
         timeout: cfg.timeout,
         app: l.app.clone(),
         repo_id,
+        marker,
         // Only the push itself stamps the repository, not the advertisement that precedes it.
         receive: l.plan.path.sub == transport::Sub::ReceivePack,
     };
@@ -714,6 +722,8 @@ struct Supervise {
     timeout: Duration,
     app: Arc<App>,
     repo_id: i64,
+    /// Written by the pre-receive hook when it let the push through.
+    marker: std::path::PathBuf,
     receive: bool,
 }
 
@@ -728,6 +738,7 @@ impl Supervise {
             timeout,
             app,
             repo_id,
+            marker,
             receive,
             ..
         } = self;
@@ -786,11 +797,12 @@ impl Supervise {
                 status.map_or_else(|e| e.to_string(), |s| s.to_string()),
                 String::from_utf8_lossy(&err).trim()
             );
-        } else if receive {
+        } else if receive && marker.exists() {
             if let Ok(conn) = crate::db::connect(&app.data_dir) {
                 let _ = repos::touch(&conn, repo_id, crate::timefmt::now());
             }
         }
+        let _ = std::fs::remove_file(&marker);
         // Wake the request pump, which may still be waiting on the client. (Not `cancel`: that
         // aborts the response reader, which may still be forwarding the last bytes.)
         done.cancel();

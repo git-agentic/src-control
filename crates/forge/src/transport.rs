@@ -252,7 +252,6 @@ pub struct Plan {
 /// every git request follows: credentials (401), method (405), scope (403), repository and
 /// existence (404 for missing, not-live or invisible alike), permission (403).
 pub fn authorize(app: &App, req: &Req, path: GitPath) -> Result<Plan, Resp> {
-    let service = service_of(&path.sub, req.param("service")).map_err(|NotSmart| not_found())?;
     let conn = crate::db::connect(&app.data_dir).map_err(|e| internal(app, &e))?;
     let cred = auth::parse(req);
     let Some(secret) = credential(&cred) else {
@@ -266,6 +265,8 @@ pub fn authorize(app: &App, req: &Req, path: GitPath) -> Result<Plan, Resp> {
     if req.method != path.sub.method() {
         return Err(method_not_allowed(path.sub.method()));
     }
+    // After credentials and method, so the fixed error order holds for a malformed `service` too.
+    let service = service_of(&path.sub, req.param("service")).map_err(|NotSmart| not_found())?;
     let (needs_write, perm) = match service {
         Some(Service::Receive) => (true, Perm::Write),
         _ => (false, Perm::Read),

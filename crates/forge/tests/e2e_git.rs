@@ -962,3 +962,55 @@ fn a_request_queued_for_a_slot_does_not_start_git_after_shutdown() {
     assert_eq!(app.life.registry.live(), 0);
     drop(held);
 }
+
+#[test]
+fn only_a_push_the_hook_accepted_stamps_the_repository() {
+    let s = Srv::start();
+    let c = Client::new("stamp");
+    let url = repo(&s, "smart");
+    let auth = token(&s.admin);
+    let work = seeded(&c, &url, &auth);
+    let stamp = || s.get("/api/v1/repos/siteadmin/smart", &auth).json()["updated_at"].to_string();
+    wait_for("the first push to finish stamping", || {
+        s.app.life.registry.live() == 0
+    });
+    let t0 = stamp();
+    std::thread::sleep(std::time::Duration::from_millis(1200)); // timestamps have second resolution
+                                                                // an advertisement and a push the hook rejects (git still exits 0 after reporting `ng`)
+    s.send(
+        "GET",
+        &format!("/siteadmin/smart.git{RP}"),
+        Some(&auth),
+        None,
+    );
+    let (ok, _) = c.git_in(&work, Some(&auth), &["push", &url, "main:refs/replace/x"]);
+    assert!(!ok);
+    wait_for("cleanup", || s.app.life.registry.live() == 0);
+    assert_eq!(stamp(), t0, "neither stamps");
+    put_commit(&c, &work, "b.txt", "two\n");
+    c.ok(&work, Some(&auth), &["push", "-q", &url, "main"]);
+    wait_for("the stamp", || stamp() != t0);
+}
+
+#[test]
+fn a_malformed_service_keeps_the_fixed_error_order() {
+    let s = Srv::start();
+    let auth = token(&s.admin);
+    repo(&s, "smart");
+    let p = "/siteadmin/smart.git/info/refs?service=bogus";
+    assert_eq!(
+        s.send("GET", p, None, None).status,
+        401,
+        "credentials first"
+    );
+    assert_eq!(
+        s.send("POST", p, Some(&auth), None).status,
+        405,
+        "then the method"
+    );
+    assert_eq!(
+        s.send("GET", p, Some(&auth), None).status,
+        404,
+        "then the dumb listing is refused"
+    );
+}

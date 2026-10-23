@@ -99,6 +99,13 @@ pub fn run() -> i32 {
     for r in &refusals {
         eprintln!("{r}");
     }
+    // Tell the server that this push was let through, so it stamps the repository only for a push
+    // that could change a ref (git exits 0 after reporting a rejection, too).
+    if refusals.is_empty() && !lines.is_empty() {
+        if let Some(m) = std::env::var_os("FORGE_ACCEPT_MARKER") {
+            let _ = std::fs::write(m, b"");
+        }
+    }
     i32::from(!refusals.is_empty())
 }
 
