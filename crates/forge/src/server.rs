@@ -260,6 +260,11 @@ mod tests {
             "raw characters are encoded, not passed through"
         );
         assert_eq!(validate_public_url("http://h").unwrap(), "http://h");
+        assert_eq!(
+            validate_public_url("http://exämple.com").unwrap(),
+            "http://xn--exmple-cua.com",
+            "unicode hosts become their ASCII form"
+        );
         for bad in [
             "",
             "ftp://x",

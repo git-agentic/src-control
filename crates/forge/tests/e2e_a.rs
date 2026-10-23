@@ -1209,7 +1209,7 @@ fn serve_refuses_unusable_settings_at_startup() {
         "0",
     ]);
     assert!(refused && err.contains("--max-connections"), "{err}");
-    for bad in ["http://exämple.com", "http:///forge"] {
+    for bad in ["http://ex ample", "http:///forge"] {
         let (refused, err) = run(&["--public-url", bad]);
         assert!(refused && err.contains("--public-url"), "{bad}: {err}");
     }
