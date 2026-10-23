@@ -9,6 +9,7 @@
 //! XChaCha20-Poly1305; the DEK is wrapped once per recipient via X25519 ECDH +
 //! HKDF. Authorization is "do you hold a recipient private key."
 
+pub mod credentials;
 pub mod envelope;
 pub mod error;
 pub mod key;
@@ -16,6 +17,7 @@ pub mod private;
 pub mod provider;
 pub mod signing;
 
+pub use credentials::{ct_eq, generate_token, hash_password, hash_token, verify_password, warm_up};
 pub use envelope::{
     decrypt_path, encrypt_path, encrypt_path_randomized, encrypt_path_randomized_with_rng, open,
     revoke, rewrap_for, seal, unwrap_dek_with, wrap_dek_for,

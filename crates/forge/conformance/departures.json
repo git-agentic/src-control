@@ -516,13 +516,15 @@
   "kind": "http",
   "match": "POST /api/v1/users/alice/tokens",
   "expect": {
-   "status": 403,
+   "status": [
+    401,
+    403
+   ],
    "message_contains": [
-    "scope",
-    "write:user"
+    "password"
    ]
   },
-  "reason": "scope-error text differs by version; sc-forge names the scope"
+  "reason": "token routes take the user's password only; a token sent as the Basic password fails password verification, so sc-forge answers with a password-class refusal instead of Gitea's scope error"
  },
  {
   "scenario": "X",
@@ -530,13 +532,15 @@
   "kind": "http",
   "match": "GET /api/v1/users/alice/tokens",
   "expect": {
-   "status": 403,
+   "status": [
+    401,
+    403
+   ],
    "message_contains": [
-    "scope",
-    "read:user"
+    "password"
    ]
   },
-  "reason": "scope-error text differs by version; sc-forge names the scope"
+  "reason": "token routes take the user's password only; a token sent as the Basic password fails password verification, so sc-forge answers with a password-class refusal instead of Gitea's scope error"
  },
  {
   "scenario": "B",
@@ -1181,7 +1185,7 @@
     404
    ],
    "message_contains": [
-    "not found"
+    "hasorgoruservisible"
    ],
    "fields": {
     "can_read": false
@@ -1302,5 +1306,29 @@
    ]
   },
   "reason": "the only status on this commit was the refused bogus state: no statuses, combined state pending; ignore_body: the recorded body lists that status"
+ },
+ {
+  "scenario": "X",
+  "exchange": 32,
+  "kind": "note",
+  "match": "readonly_token_as_password_status",
+  "expect": {
+   "value": 401
+  },
+  "reason": "a read-only token sent as the Basic password on a token route fails password verification (401); Gitea answers 403 for the missing write:user scope"
+ },
+ {
+  "scenario": "A",
+  "exchange": 2,
+  "kind": "http",
+  "match": "GET /api/healthz",
+  "expect": {
+   "status": 200,
+   "ignore_fields": [
+    "description",
+    "checks"
+   ]
+  },
+  "reason": "the health body names this server and reports only the checks it has (database), not Gitea's description or cache check; status and content type stay compared"
  }
 ]

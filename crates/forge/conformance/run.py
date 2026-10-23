@@ -910,15 +910,20 @@ def scan_fixtures(out, secret_values):
     return hits
 
 
-def run_all(c, only, out=None, fixtures=None, departures=()):
-    """Run every scenario in order (they read earlier state); `only` filters what is reported/written."""
+def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
+    """Run every scenario in order (they read earlier state); `only` filters what is reported/written.
+
+    `pending` (check only) maps a scenario id to the number of leading exchanges the server under test is expected
+    to answer, or to [number, text]; later exchanges need routes from a slice that is not built yet. The run must stop
+    exactly there, and with a text the stop error must contain it (so an F1 step failing at the same index is not hidden)."""
     summary = []
+    pending = pending or {}
     for sid, slug, needs_base, fn in SCENARIOS:
         selected = not only or sid in only
         fname = f"{sid}-{slug}.json"
         c.ex, c.cursor, c.diffs = [], 0, []
         c.reset_scenario()
-        c.expected, skip, stale = [], None, []
+        c.expected, skip, stale, deferred, ndeferred, stop = [], None, [], None, 0, None
         c.overrides, c.web_skipped = {}, 0
         if c.mode == "check" and selected:
             fp = os.path.join(fixtures, fname)
@@ -954,6 +959,16 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
                                      f"cannot match the recorded one, so it needs ignore_body with a reason")
                         continue
                     c.overrides[i] = dict(dep, match=matches[k] or got)
+            if sid in pending:
+                deferred, stop = pending[sid] if isinstance(pending[sid], list) else (pending[sid], None)
+                ndeferred = max(0, len(c.expected) - deferred)
+                if not 0 <= deferred < len(c.expected):
+                    # nothing is deferred: the entry is stale (the scenario is whole) and must not hide an error
+                    stale.append(f"stale pending entry {deferred}: {fname} has {len(c.expected)} exchanges, "
+                                 f"so nothing is deferred; remove the entry")
+                    deferred = None
+                else:
+                    c.expected = c.expected[:deferred]
         t0 = time.time()
         err = None
         try:
@@ -983,7 +998,9 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
                 lines += [f"       {'expected difference honoured' if lv == 'honoured' else lv}: {t}" for lv, t in ds]
         # unpaired exchanges and errors: each counts as a failed exchange
         missing = len(c.expected) - len(c.ex)
-        if err:
+        if err and deferred is not None and len(c.ex) == deferred and (stop is None or stop in err):
+            lines.append(f"  (pending: {ndeferred} later exchange(s) need a later slice; the scenario stopped at #{deferred}: {err[:100]})")
+        elif err:
             if skip and norm_msg(skip) == norm_msg(err):
                 lines.append(f"  (fixture recorded the same error: {skip[:200]})")
             else:
@@ -991,16 +1008,19 @@ def run_all(c, only, out=None, fixtures=None, departures=()):
                 lines.append(f"  ERROR {err}" + ("" if skip else "  (the fixture recorded no error)"))
                 if skip:
                     lines.append(f"  fixture recorded a different error: {skip[:300]}")
-        elif skip:
+        elif skip and deferred is None:
             nfail += 1
             lines.append(f"  FAIL fixture recorded an error but the scenario completed: {skip[:300]}")
+        elif deferred is not None and ndeferred:
+            nfail += 1
+            lines.append(f"  FAIL the scenario completed but {ndeferred} exchange(s) are listed as pending: update the pending file")
         if missing > 0:
             nfail += missing
             lines.append(f"  FAIL {missing} recorded exchange(s) not produced (fixture has {len(c.expected)}, run made {len(c.ex)})")
         if stale:
             nfail += len(stale)
             lines += ["  FAIL " + x for x in stale]
-        summary.append((sid, slug, "FAIL" if nfail else "ok", lines, len(c.ex), dt, nfail, c.web_skipped))
+        summary.append((sid, slug, "FAIL" if nfail else "ok", lines, len(c.ex), dt, nfail, c.web_skipped, ndeferred))
     return summary
 
 
@@ -1027,7 +1047,11 @@ def cmd_run(a):
                 f.write("\n")
             leaks = scan_fixtures(a.out, c.secrets)
         else:
-            summary = run_all(c, only, fixtures=a.fixtures, departures=deps)
+            pend = J.load(open(a.pending)) if getattr(a, "pending", None) else {}
+            if set(pend) - ids:
+                print(f"pending names unknown scenario(s) {sorted(set(pend) - ids)}", file=sys.stderr)
+                return 2
+            summary = run_all(c, only, fixtures=a.fixtures, departures=deps, pending=pend)
     finally:
         if c.tmp:
             shutil.rmtree(c.tmp, ignore_errors=True)
@@ -1043,9 +1067,11 @@ def cmd_run(a):
         print(f"LEAK {h}")
     nfail = sum(s[6] for s in summary if len(s) > 6)
     web = sum(s[7] for s in summary if len(s) > 7)
+    pend_n = sum(s[8] for s in summary if len(s) > 8)
     print(f"\n{len(summary) - bad}/{len(summary)} scenarios ok in {time.time() - t0:.0f}s"
           + (f"; {nfail} failed exchange(s)" if a.cmd == "check" else "")
           + (f"; {web} web exchange(s) skipped (check --include-web runs them)" if web else "")
+          + (f"; {pend_n} exchange(s) pending a later slice" if pend_n else "")
           + (f"; {len(leaks)} credential-shaped value(s) in the fixtures" if leaks else ""))
     return 1 if bad or leaks else 0
 
@@ -1124,6 +1150,7 @@ def main():
         else:
             p.add_argument("--fixtures", required=True)
             p.add_argument("--departures", help="JSON list of reviewed differences from the recorded behaviour")
+            p.add_argument("--pending", help="JSON map scenario id -> leading exchange count the server answers; the rest wait for a later slice")
             p.add_argument("--include-web", action="store_true",
                            help="also run the exchanges tagged `web` (Gitea web UI routes); skipped by default")
             p.add_argument("--strict-first-read", action="store_true",
