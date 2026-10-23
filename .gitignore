@@ -24,3 +24,7 @@ apps/desktop/src-tauri/gen/
 
 # Generated SBOMs (CI artifacts, never committed)
 *.cdx.json
+
+# Python bytecode (the conformance harness runs with python3 -I)
+__pycache__/
+*.pyc
