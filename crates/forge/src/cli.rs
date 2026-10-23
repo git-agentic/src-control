@@ -257,6 +257,10 @@ fn run_serve(a: ServeArgs) -> Result<()> {
     )?);
     let git_version = scl_forge::gitproc::check_version(&git).map_err(anyhow::Error::msg)?;
     eprintln!("sc-forge: {git_version}");
+    scl_forge::hook::install(
+        &std::fs::canonicalize(&a.data_dir)?,
+        &std::env::current_exe().context("cannot find the sc-forge binary")?,
+    )?;
     let life = scl_forge::lifecycle::Lifecycle::new(&a.data_dir, git)?;
     // Resolve whatever a crash left, before the listener is bound.
     let report = life.reconcile(&db::connect(&a.data_dir)?, scl_forge::timefmt::now())?;

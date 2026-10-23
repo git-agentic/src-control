@@ -129,6 +129,11 @@ impl Srv {
                 .unwrap()
                 .with_limits(std::time::Duration::from_secs(30), admission, 16 << 20),
         );
+        scl_forge::hook::install(
+            git.data_dir(),
+            std::path::Path::new(env!("CARGO_BIN_EXE_sc-forge")),
+        )
+        .unwrap();
         let life = scl_forge::lifecycle::Lifecycle::new(&dir, git.clone()).unwrap();
         let mut app = scl_forge::routes::App::new(dir.clone(), &base, Proxies::default(), 4, life);
         if let Some(b) = backoff {

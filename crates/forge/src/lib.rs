@@ -10,6 +10,7 @@
 pub mod admin;
 pub mod api;
 pub mod auth;
+pub mod cgi;
 pub mod db;
 pub mod gitproc;
 pub mod gitread;
@@ -20,6 +21,7 @@ pub mod limits;
 pub mod names;
 pub mod policy;
 pub mod refname;
+pub mod registry;
 pub mod repo_api;
 pub mod repos;
 pub mod routes;

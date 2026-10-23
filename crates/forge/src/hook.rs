@@ -56,6 +56,18 @@ pub fn lookup(data_dir: &Path, repo_id: i64) -> Result<(String, bool), String> {
     }
 }
 
+/// Point `<data>/hooks/pre-receive` at `exe` (this binary): a symlink, so git runs the hook with no
+/// shell and the path needs no quoting. Replaced atomically, at every start, because the binary's
+/// path can change between runs.
+pub fn install(data_dir: &Path, exe: &Path) -> std::io::Result<()> {
+    let hooks = data_dir.join("hooks");
+    std::fs::create_dir_all(&hooks)?;
+    let tmp = hooks.join(".pre-receive.new");
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(exe, &tmp)?;
+    std::fs::rename(&tmp, hooks.join("pre-receive"))
+}
+
 /// Entry point: returns the process exit code.
 pub fn run() -> i32 {
     let (Some(data), Some(id)) = (

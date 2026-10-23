@@ -412,8 +412,8 @@ pub struct Reserve {
 }
 
 /// Bytes held for one push; returned on drop.
-pub struct Held<'a> {
-    pool: &'a Reserve,
+pub struct Held {
+    pool: std::sync::Arc<Reserve>,
     bytes: u64,
 }
 
@@ -429,10 +429,10 @@ impl Reserve {
     }
 
     /// Reserve `need` bytes for a push, or `None` when the disk cannot promise it (507).
-    pub fn reserve(&self, free: u64, floor: u64, need: u64) -> Option<Held<'_>> {
+    pub fn reserve(self: &std::sync::Arc<Self>, free: u64, floor: u64, need: u64) -> Option<Held> {
         // lazy `then`: a refused reservation must not build a guard whose drop returns bytes never held
         self.try_hold(free, floor, need).then(|| Held {
-            pool: self,
+            pool: self.clone(),
             bytes: need,
         })
     }
@@ -443,7 +443,7 @@ impl Reserve {
     }
 }
 
-impl Held<'_> {
+impl Held {
     /// Grow the reservation by `more` bytes as a push proceeds; `false` when the disk cannot
     /// promise it (the push is aborted).
     pub fn grow(&mut self, free: u64, floor: u64, more: u64) -> bool {
@@ -456,7 +456,7 @@ impl Held<'_> {
     }
 }
 
-impl Drop for Held<'_> {
+impl Drop for Held {
     fn drop(&mut self) {
         let mut h = self.pool.held.lock().unwrap_or_else(|e| e.into_inner());
         *h = h.saturating_sub(self.bytes);
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn the_reservation_never_overcommits_and_returns_on_drop() {
-        let r = Reserve::default();
+        let r = std::sync::Arc::new(Reserve::default());
         let a = r
             .reserve(1000, 100, 400)
             .expect("first fits: 1000 free, floor 100, need 400");
