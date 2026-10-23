@@ -137,23 +137,49 @@ fn to_response(r: Resp) -> Response<Full<Bytes>> {
     })
 }
 
-/// Check `--public-url` at startup: an `http(s)://` URL of visible ASCII only, so
-/// it can be placed in `Link` headers and bodies without surprises.
+/// Is `a` a plain `host[:port]` authority? An allowlist, not a denylist: a DNS-style
+/// name (letters, digits, `.`, `-`) or a bracketed IPv6 address, then an optional
+/// numeric port. No user-info, no empty host.
+fn valid_authority(a: &str) -> bool {
+    let (host_ok, port) = if let Some(rest) = a.strip_prefix('[') {
+        let Some((v6, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let port = if after.is_empty() {
+            None
+        } else {
+            match after.strip_prefix(':') {
+                Some(p) => Some(p),
+                None => return false,
+            }
+        };
+        (v6.parse::<std::net::Ipv6Addr>().is_ok(), port)
+    } else {
+        let (h, p) = a.split_once(':').map_or((a, None), |(h, p)| (h, Some(p)));
+        let ok = !h.is_empty()
+            && !h.starts_with(['.', '-'])
+            && h.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        (ok, p)
+    };
+    host_ok
+        && port
+            .is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Check `--public-url` at startup: `http(s)://host[:port][/path]` of visible ASCII,
+/// so it can be placed in `Link` headers and bodies without surprises.
 pub fn validate_public_url(url: &str) -> Result<(), String> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"));
-    let host = rest
+    let authority = rest
         .and_then(|r| r.split(['/', '?', '#']).next())
         .unwrap_or("");
-    // A host must come first: not empty, and not just a port or user-info.
-    // No user-info: credentials in a base URL would leak into every Link header, and the
-    // host after an `@` is easy to get empty.
-    let host_ok = !host.is_empty() && !host.starts_with(':') && !host.contains('@');
     match rest {
-        Some(r) if host_ok && r.bytes().all(|b| b.is_ascii_graphic()) => Ok(()),
+        Some(r) if valid_authority(authority) && r.bytes().all(|b| b.is_ascii_graphic()) => Ok(()),
         _ => Err(format!(
-            "--public-url {url:?} must be an http:// or https:// URL with a host, of visible ASCII characters (percent-encode anything else)"
+            "--public-url {url:?} must be http(s)://host[:port][/path] with a DNS name or bracketed IPv6 host, no user-info, and visible ASCII only (percent-encode anything else)"
         )),
     }
 }
@@ -213,6 +239,9 @@ mod tests {
     fn public_url_must_be_header_safe() {
         assert!(validate_public_url("http://127.0.0.1:3000").is_ok());
         assert!(validate_public_url("https://git.example.com/forge").is_ok());
+        assert!(validate_public_url("http://[::1]:3000").is_ok());
+        assert!(validate_public_url("http://[2001:db8::1]/forge").is_ok());
+        assert!(validate_public_url("http://localhost").is_ok());
         for bad in [
             "",
             "ftp://x",
