@@ -910,6 +910,16 @@ def scan_fixtures(out, secret_values):
     return hits
 
 
+def dump_fixture(obj, f):
+    """Write a scenario fixture compactly: the header keys on one line, then one exchange per line, so a
+    diff still reads per exchange but the file is roughly half the size of indented JSON."""
+    head = {k: v for k, v in obj.items() if k != "exchanges"}
+    h = J.dumps(head, separators=(",", ":"))[:-1]
+    f.write(h + (',' if head else '') + '"exchanges":[\n')
+    f.write(",\n".join(J.dumps(e, separators=(",", ":")) for e in obj["exchanges"]))
+    f.write("\n]}\n")
+
+
 def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
     """Run every scenario in order (they read earlier state); `only` filters what is reported/written.
 
@@ -983,8 +993,7 @@ def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
         if c.mode == "record":
             os.makedirs(out, exist_ok=True)
             with open(os.path.join(out, fname), "w") as f:
-                J.dump({"scenario": sid, "title": slug, "error": err, "exchanges": c.ex}, f, indent=2)
-                f.write("\n")
+                dump_fixture({"scenario": sid, "title": slug, "error": err, "exchanges": c.ex}, f)
             summary.append((sid, slug, "ERROR" if err else "ok", [err] if err else [], len(c.ex), dt))
             continue
         lines, nfail = [], 0

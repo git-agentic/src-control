@@ -160,7 +160,8 @@ Each version passes its own fixtures (22/22). Checking the 1.22.6 fixtures again
 
 - A full record run takes about 2.5 to 3 minutes per version and needs a fresh server (the merge
   scenario waits for Gitea's async PR checks and is the slowest, about 45 s).
-- Fixtures are 3.5 MB across the two versions; compact JSON would roughly halve that.
+- Fixtures are stored compactly (header on one line, one exchange per line): 2.3 MB across the two versions, down from 3.8 MB.
+  Most of the rest is real payload (diffs, base64, git output), so further savings would mean dropping recorded content.
 
 ## Additional recordings (review follow-up)
 
