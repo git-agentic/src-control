@@ -186,6 +186,8 @@ impl Cidr {
                 IpAddr::V6(a) => u128::from(a),
             }
         }
+        // A dual-stack socket reports an IPv4 peer as ::ffff:a.b.c.d.
+        let ip = ip.to_canonical();
         if self.net.is_ipv4() != ip.is_ipv4() {
             return false;
         }
@@ -307,6 +309,21 @@ mod tests {
             .unwrap()
             .contains(ip("203.0.113.9")));
         assert!(Cidr::parse("10.0.0.0/33").is_err());
+    }
+
+    #[test]
+    fn mapped_ipv4_peers_match_ipv4_cidrs() {
+        let c = Cidr::parse("10.0.0.0/8").unwrap();
+        assert!(c.contains(ip("::ffff:10.0.0.5")));
+        assert!(!c.contains(ip("::ffff:11.0.0.5")));
+        let p = Proxies {
+            header: Some("x-forwarded-for".into()),
+            cidrs: vec![c],
+        };
+        assert_eq!(
+            p.resolve(ip("::ffff:10.0.0.5"), Some("203.0.113.9")),
+            ip("203.0.113.9")
+        );
     }
 
     #[test]
