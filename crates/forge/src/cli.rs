@@ -88,6 +88,9 @@ struct ServeArgs {
     /// Disk reserved up front for a push whose size is not announced, bytes.
     #[arg(long, default_value_t = 256 << 20)]
     push_reserve: u64,
+    /// Memory limit of each git transport child, bytes, Linux only (0 = none).
+    #[arg(long, default_value_t = 8 << 30)]
+    git_memory_limit: u64,
     /// Concurrent password verifications (Argon2 is memory-hard).
     #[arg(long, default_value_t = 4)]
     argon2_concurrency: usize,
@@ -320,6 +323,7 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         max_request: a.max_request_bytes,
         min_free: a.min_free_bytes,
         push_reserve: a.push_reserve,
+        git_memory: a.git_memory_limit,
         ..Default::default()
     };
     let mut app = make_app(a.data_dir, &public_url, proxies, a.argon2_concurrency, life);

@@ -149,7 +149,9 @@ pub fn login_by_email(conn: &Connection, email: &str) -> rusqlite::Result<Option
     if email.is_empty() {
         return Ok(None);
     }
-    let mut st = conn.prepare("SELECT login FROM users WHERE lower(email) = lower(?1) LIMIT 2")?;
+    let mut st = conn.prepare(
+        "SELECT login FROM users WHERE kind = 'user' AND lower(email) = lower(?1) LIMIT 2",
+    )?;
     let found = st
         .query_map([email], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;

@@ -69,6 +69,8 @@ struct Slot {
 #[derive(Default)]
 pub struct Registry {
     slots: Mutex<HashMap<i64, Slot>>,
+    /// Set at shutdown: nothing registers afterwards.
+    stopped: AtomicBool,
     idle: Condvar,
     next: AtomicU64,
 }
@@ -95,7 +97,10 @@ impl Registry {
         still_live: impl FnOnce() -> bool,
     ) -> Option<Registration> {
         let mut slots = self.lock();
-        if slots.get(&repo).is_some_and(|s| s.closed) || !still_live() {
+        if self.stopped.load(Ordering::SeqCst)
+            || slots.get(&repo).is_some_and(|s| s.closed)
+            || !still_live()
+        {
             return None;
         }
         let key = self.next.fetch_add(1, Ordering::SeqCst);
@@ -154,9 +159,12 @@ impl Registry {
         self.lock().remove(&repo);
     }
 
-    /// Cancel every live transport (shutdown).
+    /// Cancel every live transport and refuse new ones (shutdown): a request still queued for
+    /// admission must not start a child after the sweep.
     pub fn cancel_all(&self) {
-        self.lock()
+        let slots = self.lock();
+        self.stopped.store(true, Ordering::SeqCst);
+        slots
             .values()
             .flat_map(|s| s.live.values())
             .for_each(Cancel::cancel);

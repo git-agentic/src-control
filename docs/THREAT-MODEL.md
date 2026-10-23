@@ -887,37 +887,55 @@ unless said otherwise).
   `version=N[:key=value...]` of safe characters (`transport::tests`). `REMOTE_USER` is set only after the write check, so
   `http-backend` enables `receive-pack` for that request alone. The advertisement carries the server's git
   version and platform (`agent=git/2.x-<os>`), as stock git does.
-- **Request framing.** Request bodies are never buffered: they stream through a bounded channel to the child. A gzip
-  `upload-pack` request is inflated **by the server** under a hard cap on the *inflated* size (`--max-request-bytes`,
-  16 MiB), because `git http-backend` has no counter on expanded bytes; the child never sees `Content-Encoding`
-  (`gzip_request_bodies_are_inflated_by_the_server_under_a_cap`: a 200 kB bomb that inflates to 64 MiB is a 413, bad
-  gzip 400, other encodings and gzip on a push 415). Peak memory per transport is bounded by the cap plus a few fixed
-  channel buffers; with `--max-transports` 64 the worst case is the product, not unbounded.
+- **Request framing.** Plain request bodies are never buffered: they stream through a bounded channel to the child. A
+  gzip `upload-pack` request is read and inflated **by the server before any process starts**, under a cap on both the
+  compressed and the *inflated* size (`--max-request-bytes`, 16 MiB), because `git http-backend` has no counter on
+  expanded bytes; the child gets the plain bytes with an exact `Content-Length` and never sees `Content-Encoding`. A bomb
+  or bad gzip is therefore a deterministic 413/400 and never gets a process
+  (`gzip_request_bodies_are_inflated_by_the_server_under_a_cap`; other encodings and gzip on a push are 415). Server
+  memory is bounded per transport by about twice the cap while a gzip body is inflated (the buffer plus its chunked
+  copy) and a few fixed channel buffers otherwise; with `--max-transports` 64 the worst case is the product.
+- **Cache policy.** Everything served is authenticated, so nothing may be cached publicly: git's `public,
+  max-age=31536000` on loose objects and packs is replaced with Gitea's private policy and its `Expires` dropped, and RPC
+  results and 401s carry the same private policy (`authenticated_object_reads_are_never_publicly_cacheable`).
 - **Resource exhaustion.** Admission before any process exists: a per-repository slot, then a global slot, both under one
   `--admission-wait` deadline (503 + `Retry-After`; per-repository first so a flood on one repository cannot hold global
   slots while it waits). Pushes reserve disk (`--min-free-bytes` floor, `--push-reserve` up front, grown in 64 MiB
   steps as bytes arrive); an unreservable push is 507 before it starts, or aborted mid-stream. The reservation is
   accounting, not enforcement: a push can write more than it reserved up to `--max-pack-size`
   (`receive.maxInputSize`, `RLIMIT_FSIZE`); a hard guarantee needs filesystem quotas or the container's cgroup limits.
-  The child runs with `RLIMIT_CPU` (900 s), `RLIMIT_FSIZE` and `RLIMIT_CORE=0`, a wall-clock limit
+  The child runs with `RLIMIT_CPU` (900 s), `RLIMIT_FSIZE`, `RLIMIT_CORE=0` and, on Linux, `RLIMIT_DATA`
+  (`--git-memory-limit`, 8 GiB; anonymous memory, so a pack declaring a huge compressed object cannot take the host;
+  not enforced on macOS and untested in CI: a cgroup limit on the service is the real bound), a wall-clock limit
   (`--git-timeout`) and directional stall deadlines (`--git-idle-timeout`: no request bytes while git waits for them, or
   no room in the response because the client does not read), all of which end the transport
   (`slots_are_bounded_then_released_when_the_client_disconnects`, `a_stalled_upload_is_cut_off_by_the_idle_deadline`,
   `the_wall_clock_limit_ends_a_transport`, `a_push_over_the_size_cap_fails_and_changes_nothing`,
-  `a_full_disk_reserve_refuses_pushes_with_507_but_not_reads`). Remaining exposure: an authenticated user with write
-  access can hold transport slots for `--git-idle-timeout` each; there are no per-user quotas (F5). A push killed
-  mid-way can leave a quarantine directory under `objects/` (git removes it on the next receive; `gc` is F5).
+  `a_full_disk_reserve_refuses_pushes_with_507_but_not_reads`). Remaining exposure: any authenticated user with read
+  access can hold transport slots, for `--git-timeout` (30 minutes) each by trickling a byte just inside the idle
+  deadline, and a user who can create repositories gets 16 slots per repository, so one account can fill the 64 global
+  slots and make everyone else wait out `--admission-wait` (503). There are no per-user quotas yet (F5; a per-user
+  limit would also throttle Engine, whose clones come from one service account, so it needs a deliberate budget).
+  The disk reservation counts bytes already written twice (free space has dropped and the push still holds them), so it
+  errs on the side of refusing. A killed push gets SIGTERM first (git removes its lock files and quarantine directory
+  from its signal handlers) and SIGKILL after one second; a server killed outright can still leave a stale
+  `refs/heads/<x>.lock` or `objects/incoming-*` behind (cleanup is F5).
 - **Process control.** One supervisor thread owns each child and its process group and signals the group while the
   leader is still an unreaped zombie (so a reused group id cannot be hit); the registry holds a cancel flag, never a
   group id. A client that hangs up ends the child (`a_large_push_and_clone_stream_and_a_vanished_client_ends_the_child`);
   deleting a repository first closes its registry slot, cancels and waits for every transport on it, and refuses to
   rename the directory while one survives (`deleting_a_repository_ends_its_running_transports_first`); shutdown
-  cancels what is left after the drain deadline (`shutdown_ends_a_running_transport`). A server killed outright
+  cancels what is left after the drain deadline and refuses to register anything new, so a request still queued for a slot
+  cannot start git afterwards (`shutdown_ends_a_running_transport`,
+  `a_request_queued_for_a_slot_does_not_start_git_after_shutdown`). A server killed outright
   (SIGKILL, OOM) leaves children running until the container's PID namespace or the service manager's cgroup ends them.
 - **Response integrity.** The CGI header block is parsed and only a whitelist of headers (content type, cache and
   validator headers) is forwarded, each validated against control characters; a child that fails after the response head
   was sent ends the stream with an error so the connection drops instead of finishing a truncated body with a clean
-  terminator (`a_stalled_upload_is_cut_off_by_the_idle_deadline`). Because `git http-backend` writes its response head
+  terminator: the response body ends only with an explicit end marker from the supervisor's clean verdict, so a closed
+  channel is an error (`a_stalled_upload_is_cut_off_by_the_idle_deadline`). Behind a proxy that speaks HTTP/1.0 to its
+  upstream (nginx's default) a cut stream can look like a clean end; git's own pkt-line framing still detects most
+  truncations, and the deployment should set `proxy_http_version 1.1`. Because `git http-backend` writes its response head
   before it reads the request, an aborted push is visible to the client as a broken connection, not as a 408/413 status.
 - **Transport security.** The server speaks plaintext HTTP and refuses a non-loopback bind unless told that a TLS proxy
   fronts it (`--behind-proxy`) or plaintext is wanted (`--allow-plaintext`); tokens cross this socket. No TLS and no SSH

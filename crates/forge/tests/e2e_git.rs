@@ -895,3 +895,70 @@ fn shutdown_ends_a_running_transport() {
     assert_eq!(app.life.registry.live(), 0);
     drop(held);
 }
+
+#[test]
+fn authenticated_object_reads_are_never_publicly_cacheable() {
+    let s = Srv::start();
+    let c = Client::new("cache");
+    let url = repo(&s, "smart");
+    let auth = token(&s.admin);
+    seeded(&c, &url, &auth);
+    let oid = s.git(1, &["rev-parse", "HEAD"], None);
+    // a loose object (git says `public, max-age=31536000` for these) and the info/refs advertisement
+    let loose = format!("/siteadmin/smart.git/objects/{}/{}", &oid[..2], &oid[2..]);
+    let r = s.send("GET", &loose, Some(&auth), None);
+    assert_eq!(
+        r.status,
+        200,
+        "a small push leaves loose objects: {}",
+        body_text(&r)
+    );
+    let cc = r.headers["cache-control"].to_ascii_lowercase();
+    assert!(cc.contains("private") && !cc.contains("public"), "{cc}");
+    assert!(!r.headers.contains_key("expires"), "no far-future expiry");
+    let r = s.send(
+        "GET",
+        &format!("/siteadmin/smart.git{UP}"),
+        Some(&auth),
+        None,
+    );
+    assert!(!r.headers["cache-control"]
+        .to_ascii_lowercase()
+        .contains("public"));
+}
+
+#[test]
+fn a_request_queued_for_a_slot_does_not_start_git_after_shutdown() {
+    let s = Srv::start_transport(scl_forge::cgi::Cfg {
+        max_transports: 1,
+        ..Default::default()
+    });
+    let auth = token(&s.admin);
+    repo(&s, "smart");
+    let held = stalled_push(&s, &auth, "smart");
+    wait_for("the transport", || s.app.life.registry.live() == 1);
+    let app = s.app.clone();
+    let addr = s.addr;
+    let admin = s.admin.clone();
+    let queued = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut sock = std::net::TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .unwrap();
+        write!(
+            sock,
+            "GET /siteadmin/smart.git{UP} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: {}\r\n\r\n",
+            token(&admin)
+        )
+        .ok();
+        let mut buf = Vec::new();
+        let _ = sock.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).to_string()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300)); // let it reach the admission queue
+    drop(s);
+    let reply = queued.join().unwrap();
+    assert!(!reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert_eq!(app.life.registry.live(), 0);
+    drop(held);
+}

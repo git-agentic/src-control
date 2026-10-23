@@ -56,6 +56,8 @@ pub struct Cfg {
     pub push_reserve: u64,
     /// `RLIMIT_CPU` of the child, seconds.
     pub cpu_secs: u64,
+    /// `RLIMIT_DATA` of the child on Linux, bytes (0 = none).
+    pub git_memory: u64,
 }
 
 impl Default for Cfg {
@@ -71,6 +73,7 @@ impl Default for Cfg {
             min_free: 1 << 30,
             push_reserve: 256 << 20,
             cpu_secs: 900,
+            git_memory: 8 << 30,
         }
     }
 }
@@ -156,7 +159,13 @@ impl Body for ChannelBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
-        self.rx.poll_recv(cx).map(|o| o.map(|r| r.map(Frame::data)))
+        // An empty chunk is the explicit end; a channel that closes without one means the
+        // transport was cut short, which must reach the client as an error, not a clean end.
+        self.rx.poll_recv(cx).map(|o| match o {
+            Some(Ok(b)) if b.is_empty() => None,
+            Some(r) => Some(r.map(Frame::data)),
+            None => Some(Err(std::io::Error::other("transport aborted"))),
+        })
     }
 }
 
@@ -224,14 +233,57 @@ const ABORT_BAD: u16 = 400;
 const ABORT_TOO_LARGE: u16 = 413;
 const ABORT_NO_SPACE: u16 = 507;
 
+/// Read a gzip request body completely and inflate it, before any process exists: a bad or
+/// oversized body is then a plain 400/413, never a race with the response head `git http-backend`
+/// writes before it reads its input. `cap` bounds both the compressed and the inflated size.
+async fn inflate_body(mut body: Incoming, cap: u64, idle: Duration) -> Result<Vec<u8>, u16> {
+    let mut dec = flate2::write::GzDecoder::new(Sink {
+        buf: Vec::new(),
+        total: 0,
+        cap,
+        over: false,
+    });
+    let mut seen: u64 = 0;
+    loop {
+        let frame = match tokio::time::timeout(idle, body.frame()).await {
+            Err(_) => return Err(ABORT_TIMEOUT),
+            Ok(None) => break,
+            Ok(Some(Err(_))) => return Err(ABORT_BAD),
+            Ok(Some(Ok(f))) => f,
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        seen += data.len() as u64;
+        if seen > cap {
+            return Err(ABORT_TOO_LARGE);
+        }
+        if dec.write_all(&data).is_err() {
+            return Err(if dec.get_ref().over {
+                ABORT_TOO_LARGE
+            } else {
+                ABORT_BAD
+            });
+        }
+    }
+    match dec.finish() {
+        Ok(sink) => Ok(sink.buf),
+        Err(_) => Err(ABORT_BAD),
+    }
+}
+
 struct Pump {
-    body: Incoming,
+    /// The client's request body, streamed; `None` when `preload` holds all of it.
+    body: Option<Incoming>,
+    preload: Vec<u8>,
     tx: mpsc::Sender<Bytes>,
+    /// Abort: delete, timeout, the client went away, shutdown.
     cancel: Cancel,
+    /// The transport ended on its own (set by the supervisor last).
+    done: Cancel,
     abort: Arc<AtomicU16>,
     idle: Duration,
     cap: u64,
-    gzip: bool,
     reservation: Option<Reservation>,
 }
 
@@ -249,7 +301,11 @@ impl Pump {
         self.cancel.cancel();
     }
 
-    /// Hand `chunk` to the child; `false` when the pump must stop (the transport was cancelled).
+    async fn stopped(&self) {
+        tokio::select! { () = self.cancel.cancelled() => {}, () = self.done.cancelled() => {} }
+    }
+
+    /// Hand `chunk` to the child; `false` when the pump must stop.
     async fn send(&mut self, chunk: Bytes, forwarded: u64) -> bool {
         if let Some(r) = &mut self.reservation {
             while forwarded > r.reserved {
@@ -268,7 +324,7 @@ impl Pump {
             }
         }
         tokio::select! {
-            () = self.cancel.cancelled() => false,
+            () = self.stopped() => false,
             r = self.tx.send_timeout(chunk, self.idle) => match r {
                 Ok(()) => true,
                 Err(mpsc::error::SendTimeoutError::Timeout(_)) => { self.stop(ABORT_TIMEOUT); false }
@@ -279,24 +335,24 @@ impl Pump {
     }
 
     async fn run(mut self) {
-        let mut seen: u64 = 0;
         let mut forwarded: u64 = 0;
-        let mut inflater = self.gzip.then(|| {
-            flate2::write::GzDecoder::new(Sink {
-                buf: Vec::new(),
-                total: 0,
-                cap: self.cap,
-                over: false,
-            })
-        });
+        for p in pieces_of(std::mem::take(&mut self.preload)) {
+            forwarded += p.len() as u64;
+            if !self.send(p, forwarded).await {
+                return;
+            }
+        }
+        let Some(mut body) = self.body.take() else {
+            return; // dropping the sender ends the child's stdin
+        };
         loop {
             let frame = tokio::select! {
-                () = self.cancel.cancelled() => return,
-                f = tokio::time::timeout(self.idle, self.body.frame()) => f,
+                () = self.stopped() => return,
+                f = tokio::time::timeout(self.idle, body.frame()) => f,
             };
             let frame = match frame {
                 Err(_) => return self.stop(ABORT_TIMEOUT),
-                Ok(None) => break,
+                Ok(None) => return,
                 // The client's connection broke mid-request: end the transport.
                 Ok(Some(Err(_))) => return self.cancel.cancel(),
                 Ok(Some(Ok(f))) => f,
@@ -304,50 +360,14 @@ impl Pump {
             let Ok(data) = frame.into_data() else {
                 continue;
             };
-            seen += data.len() as u64;
-            if seen > self.cap {
+            forwarded += data.len() as u64;
+            if forwarded > self.cap {
                 return self.stop(ABORT_TOO_LARGE);
             }
-            let pieces: Vec<Bytes> = match inflater.as_mut() {
-                None => vec![data],
-                Some(d) => {
-                    let wrote = d.write_all(&data);
-                    let sink = d.get_mut();
-                    if wrote.is_err() {
-                        let status = if sink.over {
-                            ABORT_TOO_LARGE
-                        } else {
-                            ABORT_BAD
-                        };
-                        return self.stop(status);
-                    }
-                    pieces_of(std::mem::take(&mut sink.buf))
-                }
-            };
-            for p in pieces {
-                forwarded += p.len() as u64;
-                if forwarded > self.cap && !self.gzip {
-                    return self.stop(ABORT_TOO_LARGE);
-                }
-                if !self.send(p, forwarded).await {
-                    return;
-                }
+            if !self.send(data, forwarded).await {
+                return;
             }
         }
-        if let Some(d) = inflater {
-            match d.finish() {
-                Ok(mut sink) => {
-                    for p in pieces_of(std::mem::take(&mut sink.buf)) {
-                        forwarded += p.len() as u64;
-                        if !self.send(p, forwarded).await {
-                            return;
-                        }
-                    }
-                }
-                Err(_) => self.stop(ABORT_BAD),
-            }
-        }
-        // Dropping the sender ends the child's stdin.
     }
 }
 
@@ -363,6 +383,7 @@ struct Started {
     body: mpsc::Receiver<std::io::Result<Bytes>>,
     stdin: mpsc::Sender<Bytes>,
     cancel: Cancel,
+    done: Cancel,
 }
 
 /// Everything `launch` needs.
@@ -464,7 +485,11 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
     let cancel = reg.cancel.clone();
 
     let git = &l.app.life.git;
-    let (cpu, fsize) = (cfg.cpu_secs, cfg.max_pack.saturating_add(256 << 20));
+    let (cpu, fsize, mem) = (
+        cfg.cpu_secs,
+        cfg.max_pack.saturating_add(256 << 20),
+        cfg.git_memory,
+    );
     let mut cmd = Command::new(git.bin());
     cmd.arg("http-backend")
         .env_clear()
@@ -477,11 +502,22 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
     // SAFETY: the closure runs between fork and exec and only calls setrlimit (async-signal-safe).
     unsafe {
         cmd.pre_exec(move || {
-            for (res, v) in [
+            #[allow(unused_mut)]
+            let mut limits = vec![
                 (libc::RLIMIT_CPU, cpu),
                 (libc::RLIMIT_FSIZE, fsize),
                 (libc::RLIMIT_CORE, 0),
-            ] {
+            ];
+            // Heap and anonymous mappings (file-backed pack mappings are not counted): a crafted
+            // pack declaring a huge compressed object cannot take the host's memory. Linux only,
+            // where RLIMIT_DATA covers mmap since 4.7; macOS does not enforce it usefully.
+            #[cfg(target_os = "linux")]
+            if mem > 0 {
+                limits.push((libc::RLIMIT_DATA, mem));
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = mem;
+            for (res, v) in limits {
                 let lim = libc::rlimit {
                     rlim_cur: v as libc::rlim_t,
                     rlim_max: v as libc::rlim_t,
@@ -508,8 +544,11 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
     let (head_tx, head_rx) = oneshot::channel();
     let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<bool>();
 
+    let done = Cancel::default();
+    let child_slot = Arc::new(Mutex::new(Some(child)));
     let sup = Supervise {
-        child,
+        child: child_slot.clone(),
+        done: done.clone(),
         stderr,
         reg,
         _permits: l.permits,
@@ -524,9 +563,12 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
         .name("forge-supervise".into())
         .spawn(move || sup.run())
     {
-        // The child is unreaped (a zombie holds its group id), so this signal is safe.
-        // SAFETY: killpg only sends a signal to the group this call created.
+        // The supervisor never started, so the child is still ours: kill the group, then reap.
+        // SAFETY: killpg only sends a signal to the group this call created, whose leader is unreaped.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        if let Some(mut c) = child_slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = c.wait();
+        }
         return Err(e.into());
     }
     let stall = cfg.idle;
@@ -549,6 +591,7 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
         body: body_rx,
         stdin: stdin_tx,
         cancel,
+        done,
     })
 }
 
@@ -573,8 +616,15 @@ fn read_out(
     cancel: Cancel,
     rt: tokio::runtime::Handle,
 ) {
+    // Cancellation-aware: a reader stuck on a client that does not read must not outlive the
+    // transport it belongs to.
     let forward = |item: std::io::Result<Bytes>| -> bool {
-        rt.block_on(body_tx.send_timeout(item, stall)).is_ok()
+        rt.block_on(async {
+            tokio::select! {
+                () = cancel.cancelled() => false,
+                r = body_tx.send_timeout(item, stall) => r.is_ok(),
+            }
+        })
     };
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 32 * 1024];
@@ -614,13 +664,18 @@ fn read_out(
             }
         }
     }
-    if !verdict.recv().unwrap_or(false) {
+    // Only a clean finish ends the body with the explicit end marker; every other way out
+    // (error frame here, or the channel simply closing) reaches the client as an error.
+    if verdict.recv().unwrap_or(false) {
+        let _ = forward(Ok(Bytes::new()));
+    } else {
         let _ = forward(Err(std::io::Error::other("git did not finish")));
     }
 }
 
 struct Supervise {
-    child: Child,
+    child: Arc<Mutex<Option<Child>>>,
+    done: Cancel,
     stderr: ChildStderr,
     reg: Registration,
     _permits: Permits,
@@ -635,7 +690,8 @@ struct Supervise {
 impl Supervise {
     fn run(self) {
         let Supervise {
-            mut child,
+            child,
+            done,
             stderr,
             reg,
             verdict,
@@ -645,6 +701,9 @@ impl Supervise {
             receive,
             ..
         } = self;
+        let Some(mut child) = child.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
         let pgid = child.id() as i32;
         let cancel = reg.cancel.clone();
         let tail = std::thread::Builder::new()
@@ -670,7 +729,19 @@ impl Supervise {
             std::thread::sleep(nap);
             nap = (nap * 2).min(Duration::from_millis(50));
         };
+        // Ask first when we are the ones ending it: git removes its lock files and quarantine
+        // directories from its signal handlers, SIGKILL would leave them behind. Then, whatever the
+        // reason, end the whole group (a hook's background child may outlive the leader).
         // SAFETY: killpg only sends a signal; the leader is unreaped, so the group id is ours.
+        if reason != "exited" {
+            unsafe { libc::killpg(pgid, libc::SIGTERM) };
+            let until = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < until
+                && matches!(crate::gitproc::exited_unreaped(pgid), Ok(false))
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
         let status = child.wait();
         let ok = reason == "exited" && status.as_ref().is_ok_and(|s| s.success());
@@ -687,8 +758,9 @@ impl Supervise {
                 let _ = repos::touch(&conn, repo_id, crate::timefmt::now());
             }
         }
-        // Wake the request pump, which may still be waiting on the client.
-        cancel.cancel();
+        // Wake the request pump, which may still be waiting on the client. (Not `cancel`: that
+        // aborts the response reader, which may still be forwarding the last bytes.)
+        done.cancel();
     }
 }
 
@@ -756,6 +828,28 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
     let Some(permits) = t.admit(repo_id).await else {
         return buffered(text(503, "Service Unavailable\n").with("retry-after", "5".into()));
     };
+    // A gzip request is read and inflated whole before anything starts, so its 400/413 is a plain
+    // answer and a bomb never gets a process (git itself would buffer an upload-pack request anyway).
+    let mut body = Some(body);
+    let mut preload = Vec::new();
+    if gzip {
+        match inflate_body(body.take().expect("present"), cap, t.cfg.idle).await {
+            Ok(v) => preload = v,
+            Err(status) => {
+                let msg = match status {
+                    ABORT_TOO_LARGE => "Request Entity Too Large\n",
+                    ABORT_TIMEOUT => "Request Timeout\n",
+                    _ => "Bad Request\n",
+                };
+                return buffered(text(status, msg));
+            }
+        }
+    }
+    let content_length = if gzip {
+        Some(preload.len() as u64)
+    } else {
+        content_length
+    };
     let mut reservation = None;
     let mut held = None;
     if is_receive {
@@ -779,7 +873,7 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
     }
     let launch_args = Launch {
         app: app.clone(),
-        content_length: (!gzip && has_body).then_some(content_length).flatten(),
+        content_length: has_body.then_some(content_length).flatten(),
         content_type: has_body
             .then(|| transport::content_type(req.header("content-type")))
             .flatten(),
@@ -804,6 +898,7 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
         body: out,
         stdin,
         cancel,
+        done,
     } = started;
     // From here, dropping this guard (the client went away, or we return an error) ends the child.
     let guard = cancel.on_drop();
@@ -814,12 +909,13 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
         tokio::spawn(
             Pump {
                 body,
+                preload,
                 tx: stdin,
                 cancel: cancel.clone(),
+                done,
                 abort: abort.clone(),
                 idle: t.cfg.idle,
                 cap,
-                gzip,
                 reservation,
             }
             .run(),
@@ -836,10 +932,19 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
             return buffered(text(status, "git transport failed\n"));
         }
     };
+    // git marks loose objects and packs `public, max-age=31536000`; behind a shared cache that would
+    // serve an authorized object to anyone. Everything authenticated is private.
+    let public = head
+        .headers
+        .iter()
+        .any(|(k, v)| k == "cache-control" && v.to_ascii_lowercase().contains("public"));
     let mut b = Response::builder().status(head.status);
     for (k, v) in head.headers {
+        if public && k == "expires" {
+            continue;
+        }
         // The RPC endpoints answer with Gitea's cache policy (recorded), not git's no-cache one.
-        let v = if is_rpc && k == "cache-control" {
+        let v = if k == "cache-control" && (is_rpc || public) {
             transport::PRIVATE_CACHE.to_string()
         } else {
             v
