@@ -438,6 +438,14 @@ pub static ROUTES: &[Route] = &[
         api::not_implemented,
     ),
     r(
+        "DELETE",
+        "/repos/{o}/{r}/contents/{p..}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Write),
+        api::not_implemented,
+    ),
+    r(
         "GET",
         "/repos/{o}/{r}/archive/{a..}",
         Token,

@@ -42,6 +42,9 @@ pub struct Resp {
     /// Held back by the server before writing (failed-login backoff), on the
     /// async runtime so it occupies no blocking thread.
     pub delay: Duration,
+    /// Dropped once the body has been written (or the connection died): a resource budget that
+    /// must cover the response's bytes in flight, not just the handler.
+    pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 const JSON_CT: &str = "application/json;charset=utf-8";
@@ -54,6 +57,7 @@ impl Resp {
             headers: vec![("content-type", JSON_CT.into())],
             body: serde_json::to_vec(v).expect("serializing a Value cannot fail"),
             delay: Duration::ZERO,
+            hold: None,
         }
     }
 
@@ -64,6 +68,7 @@ impl Resp {
             headers: vec![],
             body: vec![],
             delay: Duration::ZERO,
+            hold: None,
         }
     }
 

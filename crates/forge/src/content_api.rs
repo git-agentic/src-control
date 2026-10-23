@@ -61,6 +61,11 @@ fn is_empty(ctx: &Ctx, a: &Access) -> Result<bool, Resp> {
     gitread::is_empty(&ctx.app.life.git, &dir(ctx, a)).map_err(|e| read_err(ctx, a, e))
 }
 
+/// No branch and no tag at all (a repository with only an unborn default is not this).
+fn no_refs(ctx: &Ctx, a: &Access) -> Result<bool, Resp> {
+    all_refs(ctx, a).map(|rows| rows.is_empty())
+}
+
 fn resolve(ctx: &Ctx, a: &Access, rev: &str, peel: Peel) -> Result<Option<Resolved>, Resp> {
     gitobj::resolve(
         &ctx.app.life.git,
@@ -276,14 +281,15 @@ pub fn list_tags(ctx: &mut Ctx) -> Resp {
             .iter()
             .map(|r| {
                 let name = r.name.strip_prefix("refs/tags/").unwrap_or(&r.name);
+                let enc = name.split('/').map(pct_encode).collect::<Vec<_>>().join("/");
                 json!({
                     "name": name,
                     "message": r.subject,
                     "id": r.oid,
                     // Recorded Gitea quirk: the url names the tag object, the sha the commit.
                     "commit": json!({"url": format!("{}/git/commits/{}", api_base(ctx, &a), r.oid), "sha": r.commit(), "created": rfc3339(r.commit_date)}),
-                    "zipball_url": format!("{web}/archive/{name}.zip"),
-                    "tarball_url": format!("{web}/archive/{name}.tar.gz"),
+                    "zipball_url": format!("{web}/archive/{enc}.zip"),
+                    "tarball_url": format!("{web}/archive/{enc}.tar.gz"),
                 })
             })
             .collect();
@@ -311,12 +317,20 @@ pub fn list_commits(ctx: &mut Ctx) -> Resp {
 }
 
 fn list_commits_inner(ctx: &Ctx, a: &Access) -> Resp {
-    match is_empty(ctx, a) {
-        Ok(true) => return error(&ctx.app.base, 409, "Git Repository is empty."),
-        Ok(false) => {}
-        Err(r) => return r,
+    if param(ctx, "not").is_some() {
+        // Recorded Gitea filters by it; ignoring it would serve unfiltered history.
+        return error(&ctx.app.base, 400, "the `not` parameter is not supported");
     }
-    let rev = param(ctx, "sha").unwrap_or_else(|| a.repo.default_branch.clone());
+    let named = param(ctx, "sha").filter(|v| !v.is_empty());
+    let empty = || error(&ctx.app.base, 409, "Git Repository is empty.");
+    if named.is_none() {
+        match is_empty(ctx, a) {
+            Ok(true) => return empty(),
+            Ok(false) => {}
+            Err(r) => return r,
+        }
+    }
+    let rev = named.unwrap_or_else(|| a.repo.default_branch.clone());
     let path = param(ctx, "path").filter(|p| !p.is_empty());
     if let Some(p) = &path {
         if !gitobj::valid_path(p) {
@@ -326,7 +340,13 @@ fn list_commits_inner(ctx: &Ctx, a: &Access) -> Resp {
     let head = match resolve(ctx, a, &rev, Peel::Commit) {
         Ok(Some(h)) => h,
         // Gitea answers 500 here; a client error is a 404 (departure).
-        Ok(None) => return error(&ctx.app.base, 404, &format!("ref not found [{rev}]")),
+        Ok(None) => {
+            return match no_refs(ctx, a) {
+                Ok(true) => empty(),
+                Ok(false) => error(&ctx.app.base, 404, &format!("ref not found [{rev}]")),
+                Err(r) => r,
+            }
+        }
         Err(r) => return r,
     };
     let (page, limit) = page_params(ctx);
@@ -408,6 +428,7 @@ pub fn get_git_commit(ctx: &mut Ctx) -> Resp {
             headers: vec![("content-type", "text/plain;charset=utf-8".into())],
             body: bytes,
             delay: std::time::Duration::ZERO,
+            hold: None,
         };
         match form {
             Some("diff") => match git_err(
@@ -418,7 +439,11 @@ pub fn get_git_commit(ctx: &mut Ctx) -> Resp {
                 Ok(b) => text(b),
                 Err(r) => r,
             },
-            Some(_) => match git_err(ctx, &a, gitobj::patch_text(git, &d, &c.oid)) {
+            Some(_) => match git_err(
+                ctx,
+                &a,
+                gitobj::patch_text(git, &d, &c.oid, c.parents.len() > 1),
+            ) {
                 Ok(b) => text(b),
                 Err(r) => r,
             },
@@ -549,7 +574,9 @@ fn content_json(
     };
     let size = e.size.unwrap_or(0);
     let (mut encoding, mut content, mut target) = (Value::Null, Value::Null, Value::Null);
-    if ty == "symlink" {
+    // A link target is a path (PATH_MAX); a bigger blob is not read, and a listing reads at most
+    // LAST_COMMIT_BUDGET of them, so one tree cannot make the server read thousands of blobs.
+    if ty == "symlink" && size <= 4096 && (with_content || exact_last) {
         let b = git_err(ctx, a, gitobj::blob(git, &d, &e.oid))?;
         target = Value::String(String::from_utf8_lossy(&b).to_string());
     } else if ty == "file" && with_content && size <= gitobj::MAX_BLOB {
@@ -600,17 +627,27 @@ pub fn get_contents(ctx: &mut Ctx) -> Resp {
         Err(r) => return r,
     };
     read_locked(ctx, &a, |ctx| {
-        // Recorded: an empty repository lists nothing and answers `[]` for any path.
-        match is_empty(ctx, &a) {
-            Ok(true) => return Resp::json(200, &json!([])),
-            Ok(false) => {}
-            Err(r) => return r,
+        // Recorded: an empty repository lists nothing and answers `[]` for any path. A named ref
+        // that exists wins over an unborn default branch (a repository holding only `feat`).
+        let named = param(ctx, "ref").filter(|v| !v.is_empty());
+        if named.is_none() {
+            match is_empty(ctx, &a) {
+                Ok(true) => return Resp::json(200, &json!([])),
+                Ok(false) => {}
+                Err(r) => return r,
+            }
         }
         let path = ctx.param("p").trim_matches('/').to_string();
-        let refname = param(ctx, "ref").unwrap_or_else(|| a.repo.default_branch.clone());
+        let refname = named.unwrap_or_else(|| a.repo.default_branch.clone());
         let head = match resolve(ctx, &a, &refname, Peel::Commit) {
             Ok(Some(h)) => h,
-            Ok(None) => return contents_not_found(ctx, &refname, ""),
+            Ok(None) => {
+                return match no_refs(ctx, &a) {
+                    Ok(true) => Resp::json(200, &json!([])),
+                    Ok(false) => contents_not_found(ctx, &refname, ""),
+                    Err(r) => r,
+                }
+            }
             Err(r) => return r,
         };
         let (git, d) = (&ctx.app.life.git, dir(ctx, &a));
@@ -679,6 +716,30 @@ pub fn get_contents(ctx: &mut Ctx) -> Resp {
 
 // ---- archive ----
 
+/// Archives in memory at once, server-wide: one is up to `MAX_ARCHIVE` of tar plus its gzip while it is
+/// built, and up to `MAX_ARCHIVE` until the client has read it. The runner gate does not cover this
+/// (its permit ends with the git process).
+const MAX_ARCHIVES: usize = 4;
+static ARCHIVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One of the `MAX_ARCHIVES` slots; released when dropped, which `Resp::hold` defers to the end of
+/// the response body.
+struct ArchiveSlot;
+
+impl ArchiveSlot {
+    fn take() -> Option<ArchiveSlot> {
+        let slot = ArchiveSlot;
+        // Over the limit the slot drops again at once, which gives the count back.
+        (ARCHIVES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < MAX_ARCHIVES).then_some(slot)
+    }
+}
+
+impl Drop for ArchiveSlot {
+    fn drop(&mut self) {
+        ARCHIVES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// `GET /repos/{o}/{r}/archive/{ref..}.{zip,tar.gz}`.
 pub fn get_archive(ctx: &mut Ctx) -> Resp {
     let a = match acc(ctx) {
@@ -704,6 +765,13 @@ pub fn get_archive(ctx: &mut Ctx) -> Resp {
                 )
             }
             Err(r) => return r,
+        };
+        let Some(slot) = ArchiveSlot::take() else {
+            return error(
+                &ctx.app.base,
+                503,
+                "too many archives are being built, try again",
+            );
         };
         let (git, d) = (&ctx.app.life.git, dir(ctx, &a));
         let tar = match git_err(ctx, &a, gitobj::archive(git, &d, &oid, &a.repo.name, zip)) {
@@ -737,6 +805,26 @@ pub fn get_archive(ctx: &mut Ctx) -> Resp {
             ],
             body,
             delay: std::time::Duration::ZERO,
+            hold: Some(Box::new(slot)),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_slots_are_limited_and_come_back_when_dropped() {
+        let held: Vec<_> = (0..MAX_ARCHIVES)
+            .map(|_| ArchiveSlot::take().unwrap())
+            .collect();
+        assert!(ArchiveSlot::take().is_none(), "over the limit");
+        assert!(
+            ArchiveSlot::take().is_none(),
+            "a refusal does not leak a count"
+        );
+        drop(held);
+        assert!(ArchiveSlot::take().is_some());
+    }
 }

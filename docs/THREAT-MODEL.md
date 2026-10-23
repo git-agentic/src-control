@@ -950,13 +950,21 @@ Threat-model pass #2 for the read endpoints. Tests are in `crates/forge/tests/e2
   grammar that yields a ref name or an object id, paths are literal (`--literal-pathspecs`, `--`), so `--output=`,
   `:/x`, `main^{/x}`, `@{0}`, glob and pathspec magic and `refs/forge/*` are 404 or 422
   (`revisions_are_names_or_ids_never_git_syntax`, `paths_are_literals_not_patterns`).
-- **Hidden refs.** Only `refs/heads` and `refs/tags` are listed or resolvable; `refs/forge` and any future `refs/pull`
+- **Hidden refs.** Only `refs/heads` and `refs/tags` are listed or resolvable by name; `refs/forge` and any future `refs/pull`
   are not (`refs_tags_and_trees`).
 - **Visibility parity.** A repository a caller cannot read answers the same 404 as a missing one on every content route
   (`a_reader_without_access_gets_the_same_404_as_for_a_missing_repository`).
-- **Resource use.** Every read is a bounded child process (output cap, 120 s timeout, runner gate, 503 when busy) under the
-  repository read lock. An archive is held in RAM up to 128 MiB per request and the runner gate bounds the number at
-  once, so peak memory is the gate size times that cap. Lower `--git-concurrency` on small hosts.
+- **Resource use.** Every read is a bounded child process (output cap, runner gate, 503 when busy) under the
+  repository read lock; capped commands get 120 s, the rest the runner's own timeout. The git runner's permit ends
+  with the process, so memory held *after* it is bounded separately: at most 4 archives exist at once server-wide
+  (`ArchiveSlot`; a fifth is 503), each held until its body has been written, up to 128 MiB of tar plus its gzip
+  while it is built (`archive_slots_are_limited_and_come_back_when_dropped`). Listings, recursive trees and diffs are
+  parsed in memory up to their 64 MiB output cap each, bounded only by `--max-connections`; a directory listing reads
+  at most 100 symlink targets of at most 4 KiB. A single request can still run up to about 100 sequential `git log`
+  calls while holding the repository read lock, so a delete or default-branch change can wait behind it.
+- **Revision resolution is by object id.** A hex id names any object in the repository's object store, including
+  commits reachable only from a deleted branch, as in Gitea (the F2b note on fetch by id applies); only branch and
+  tag *names* are limited to `refs/heads` and `refs/tags`.
 - **Not covered.** Content is served as stored: a file in a repository is returned base64-encoded in JSON, and raw/web
   URLs are not served, so no response is rendered as HTML.
 

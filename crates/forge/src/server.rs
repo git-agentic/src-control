@@ -152,13 +152,48 @@ fn to_response(r: Resp) -> Response<RespBody> {
         b = b.header(k, v);
     }
     // A header value hyper refuses must not panic the connection task: answer 500.
-    b.body(full(Bytes::from(r.body))).unwrap_or_else(|_| {
+    let body = match r.hold {
+        Some(hold) => Held {
+            inner: Full::new(Bytes::from(r.body)),
+            _hold: hold,
+        }
+        .map_err(|e| match e {})
+        .boxed(),
+        None => full(Bytes::from(r.body)),
+    };
+    b.body(body).unwrap_or_else(|_| {
         let mut e = Response::new(full(Bytes::from_static(
             b"{\"message\":\"internal server error\"}",
         )));
         *e.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
         e
     })
+}
+
+/// A buffered body that keeps `_hold` alive until hyper drops it.
+struct Held {
+    inner: Full<Bytes>,
+    _hold: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl hyper::body::Body for Held {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 fn full(b: Bytes) -> RespBody {

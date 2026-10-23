@@ -191,6 +191,7 @@ pub(crate) fn paged_sorted(
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
             (k.to_string(), v.to_string())
         })
+        .rev() // the request parser reads the first value of a repeated parameter; the last insert wins
         .collect();
     q.insert("limit".into(), limit.to_string());
     let last = ((total + limit - 1) / limit).max(1);

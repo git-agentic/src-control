@@ -199,6 +199,7 @@ fn text(status: u16, body: &str) -> crate::http::Resp {
         headers: vec![("content-type", "text/plain;charset=utf-8".into())],
         body: body.as_bytes().to_vec(),
         delay: Duration::ZERO,
+        hold: None,
     }
 }
 

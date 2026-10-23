@@ -411,11 +411,23 @@ pub fn diff_text(
     )?)
 }
 
-/// A mailbox-format patch of one commit (`.patch`).
-pub fn patch_text(git: &Git, dir: &Path, oid: &str) -> Result<Vec<u8>, GitError> {
-    must(run(
-        git,
-        dir,
+/// A mailbox-format patch of one commit (`.patch`). `format-patch` skips merges (and `-1` would
+/// then print the first non-merge commit it meets), so a merge is shown against its first parent.
+pub fn patch_text(git: &Git, dir: &Path, oid: &str, merge: bool) -> Result<Vec<u8>, GitError> {
+    let args: &[&str] = if merge {
+        &[
+            "show",
+            "--pretty=email",
+            "-m",
+            "--first-parent",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--end-of-options",
+            oid,
+        ]
+    } else {
         &[
             "format-patch",
             "-1",
@@ -428,9 +440,9 @@ pub fn patch_text(git: &Git, dir: &Path, oid: &str) -> Result<Vec<u8>, GitError>
             "--no-renames",
             "--end-of-options",
             oid,
-        ],
-        Some(BIG),
-    )?)
+        ]
+    };
+    must(run(git, dir, args, Some(BIG))?)
 }
 
 /// One entry of a tree.

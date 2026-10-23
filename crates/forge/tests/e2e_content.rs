@@ -348,6 +348,120 @@ fn the_empty_repository_answers_the_recorded_shapes_and_a_busy_runner_is_503() {
 }
 
 #[test]
+fn a_merge_commit_is_shown_against_its_first_parent_and_a_symlink_has_its_target() {
+    let w = world();
+    let work = w.dir.join("w");
+    git(&work, &["checkout", "-q", "-b", "merged", "main"]);
+    git(
+        &work,
+        &["merge", "-q", "--no-ff", "feat/x", "-m", "merge feat"],
+    );
+    std::os::unix::fs::symlink("README.md", work.join("link")).unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "link"]);
+    let tip = git(&work, &["rev-parse", "HEAD"]);
+    let merge = git(&work, &["rev-parse", "HEAD~1"]);
+    let url = format!("{}/siteadmin/smart.git", w.s.base);
+    let h = format!("http.extraHeader=Authorization: {}", w.auth);
+    git(&work, &["-c", &h, "push", "-q", &url, "merged"]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while w.s.app.life.registry.live() != 0 && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let c = w.json(&format!("/git/commits/{merge}"));
+    assert_eq!(c["parents"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        c["files"],
+        json!([{"filename": "x.txt", "status": "added"}])
+    );
+    let p = String::from_utf8_lossy(&w.get(&format!("/git/commits/{merge}.patch")).raw).to_string();
+    assert!(
+        p.starts_with(&format!("From {merge} ")) && p.contains("Subject: [PATCH] merge feat"),
+        "the patch of a merge is the merge's own: {p}"
+    );
+    assert!(p.contains("+++ b/x.txt"), "{p}");
+    let d = String::from_utf8_lossy(&w.get(&format!("/git/commits/{merge}.diff")).raw).to_string();
+    assert!(d.contains("+++ b/x.txt"), "{d}");
+    let l = w.json("/contents/link?ref=merged");
+    assert_eq!(
+        (l["type"].as_str(), l["target"].as_str()),
+        (Some("symlink"), Some("README.md"))
+    );
+    let listing = w.json("/contents?ref=merged");
+    let l = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "link")
+        .unwrap();
+    assert_eq!(l["target"], "README.md", "{tip}");
+}
+
+#[test]
+fn an_unborn_default_branch_does_not_hide_a_pushed_branch_and_a_busy_runner_is_503() {
+    let s = Srv::start_git(1, std::time::Duration::from_millis(100));
+    let auth = token(&s.admin);
+    s.post(
+        "/api/v1/user/repos",
+        &auth,
+        json!({"name": "only-feat", "default_branch": "main"}),
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "scl-forge-unborn-{}-{}",
+        std::process::id(),
+        s.addr.port()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let w = dir.join("w");
+    git(&dir, &["init", "-q", "-b", "feat", w.to_str().unwrap()]);
+    std::fs::write(w.join("f.txt"), "f\n").unwrap();
+    git(&w, &["add", "."]);
+    git(&w, &["commit", "-q", "-m", "only on feat"]);
+    let url = format!("{}/siteadmin/only-feat.git", s.base);
+    git(
+        &w,
+        &[
+            "-c",
+            &format!("http.extraHeader=Authorization: {auth}"),
+            "push",
+            "-q",
+            &url,
+            "feat",
+        ],
+    );
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while s.app.life.registry.live() != 0 && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let get = |p: &str| s.get(&format!("/api/v1/repos/siteadmin/only-feat{p}"), &auth);
+    // the default branch is unborn: unnamed reads keep the recorded empty-repository answers ...
+    assert_eq!(get("/commits").status, 409);
+    assert_eq!(get("/contents").json(), json!([]));
+    // ... but a named, existing branch is served
+    let c = get("/commits?sha=feat");
+    assert_eq!(c.status, 200, "{}", c.msg());
+    assert_eq!(c.json().as_array().unwrap().len(), 1);
+    assert_eq!(get("/contents/f.txt?ref=feat").json()["name"], "f.txt");
+    assert_eq!(get("/commits?sha=nope").status, 404);
+    assert_eq!(get("/commits?not=feat").status, 400);
+    let busy = s.runner.occupy_for_tests();
+    for p in [
+        "/commits?sha=feat",
+        "/tags",
+        "/git/refs",
+        "/git/commits/feat",
+        "/git/trees/feat",
+        "/contents?ref=feat",
+        "/archive/feat.zip",
+    ] {
+        assert_eq!(get(p).status, 503, "{p}");
+    }
+    drop(busy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_reader_without_access_gets_the_same_404_as_for_a_missing_repository() {
     let w = world();
     let pw = w.s.mk_user("mallory");
