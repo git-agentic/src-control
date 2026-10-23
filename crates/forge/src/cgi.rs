@@ -344,7 +344,7 @@ impl Pump {
                         }
                     }
                 }
-                Err(_) => return self.stop(ABORT_BAD),
+                Err(_) => self.stop(ABORT_BAD),
             }
         }
         // Dropping the sender ends the child's stdin.
