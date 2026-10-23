@@ -119,10 +119,26 @@ pub(crate) fn paged(
     limit: i64,
     items: Vec<Value>,
 ) -> Resp {
+    paged_with(ctx, path, total, page, limit, &[], items)
+}
+
+/// Like [`paged`], carrying `extra` query parameters (already percent-encoded, in the order
+/// Gitea emits them: alphabetical after `limit` and `page`) into every `Link` URL, so following
+/// a page link repeats the same query.
+pub(crate) fn paged_with(
+    ctx: &Ctx,
+    path: &str,
+    total: i64,
+    page: i64,
+    limit: i64,
+    extra: &[(&str, String)],
+    items: Vec<Value>,
+) -> Resp {
+    let tail: String = extra.iter().map(|(k, v)| format!("&{k}={v}")).collect();
     let last = ((total + limit - 1) / limit).max(1);
     let url = |p: i64, rel: &str| {
         format!(
-            "<{}/api/v1{path}?limit={limit}&page={p}>; rel=\"{rel}\"",
+            "<{}/api/v1{path}?limit={limit}&page={p}{tail}>; rel=\"{rel}\"",
             ctx.app.base
         )
     };
@@ -243,6 +259,12 @@ fn name_error(label: &str, name: &str, e: NameError) -> String {
     }
 }
 
+/// An email must be usable as a commit identity too (it reaches git through the environment):
+/// no control characters and no angle brackets.
+fn email_ok(e: &str) -> bool {
+    e.contains('@') && !e.chars().any(|c| c.is_control() || matches!(c, '<' | '>'))
+}
+
 pub(crate) fn valid_visibility(v: &str) -> bool {
     matches!(v, "public" | "limited" | "private")
 }
@@ -315,7 +337,7 @@ pub fn admin_create_user(ctx: &mut Ctx) -> Resp {
     if email.is_empty() {
         return error(&base, 422, "[Email]: Required");
     }
-    if !email.contains('@') {
+    if !email_ok(&email) {
         return error(&base, 422, "[Email]: Email");
     }
     if password.is_empty() {
@@ -372,7 +394,7 @@ pub fn admin_patch_user(ctx: &mut Ctx) -> Resp {
         return error(&base, 422, "[Visibility]: invalid visibility");
     }
     let email = str_field(&b, "email");
-    if email.as_deref().is_some_and(|e| !e.contains('@')) {
+    if email.as_deref().is_some_and(|e| !email_ok(e)) {
         return error(&base, 422, "[Email]: Email");
     }
     let password_hash = match str_field(&b, "password") {

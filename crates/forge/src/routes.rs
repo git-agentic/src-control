@@ -358,7 +358,7 @@ pub static ROUTES: &[Route] = &[
 type Params = Vec<(&'static str, String)>;
 
 /// Decode `%XX` escapes in a path segment; `None` when malformed or not UTF-8.
-fn percent_decode(s: &str) -> Option<String> {
+pub(crate) fn percent_decode(s: &str) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

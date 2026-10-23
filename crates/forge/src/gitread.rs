@@ -45,6 +45,12 @@ pub fn list_branches(git: &Git, dir: &Path) -> Result<Vec<Branch>, GitError> {
         ],
         ..Default::default()
     })?;
+    if !out.ok() {
+        // A damaged or vanished repository is not an empty one.
+        return Err(GitError::Failed(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
@@ -55,6 +61,18 @@ pub fn list_branches(git: &Git, dir: &Path) -> Result<Vec<Branch>, GitError> {
             })
         })
         .collect())
+}
+
+/// Exit status 1 from `rev-parse --verify -q` means "no such ref"; anything else (128: not a
+/// repository, corrupt) is a failure the caller must not read as absence.
+fn found(out: &crate::gitproc::Out) -> Result<bool, GitError> {
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::Failed(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        )),
+    }
 }
 
 /// The commit a branch points at, or `None` when the branch does not exist (or the name is not
@@ -69,7 +87,7 @@ pub fn branch_oid(git: &Git, dir: &Path, name: &str) -> Result<Option<String>, G
         args: &["rev-parse", "--verify", "-q", "--end-of-options", &full],
         ..Default::default()
     })?;
-    Ok(out.ok().then(|| out.text()))
+    Ok(found(&out)?.then(|| out.text()))
 }
 
 /// A repository is empty when `HEAD` does not resolve to a commit (computed live).
@@ -79,7 +97,7 @@ pub fn is_empty(git: &Git, dir: &Path) -> Result<bool, GitError> {
         args: &["rev-parse", "--verify", "-q", "HEAD"],
         ..Default::default()
     })?;
-    Ok(!out.ok())
+    Ok(!found(&out)?)
 }
 
 fn person(line: &str) -> Option<Person> {
@@ -192,6 +210,23 @@ mod tests {
         assert!(is_empty(&g, &dir).unwrap());
         assert_eq!(list_branches(&g, &dir).unwrap(), vec![]);
         assert_eq!(branch_oid(&g, &dir, "main").unwrap(), None);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_damaged_repository_is_an_error_not_an_empty_one() {
+        let (g, d, _dir) = repo("damaged");
+        let broken = d.join("2.git"); // an empty directory: not a repository
+        std::fs::create_dir_all(&broken).unwrap();
+        assert!(matches!(is_empty(&g, &broken), Err(GitError::Failed(_))));
+        assert!(matches!(
+            list_branches(&g, &broken),
+            Err(GitError::Failed(_))
+        ));
+        assert!(matches!(
+            branch_oid(&g, &broken, "main"),
+            Err(GitError::Failed(_))
+        ));
         let _ = std::fs::remove_dir_all(d);
     }
 

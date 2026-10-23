@@ -34,6 +34,9 @@ pub enum GitError {
     OutputTooLarge,
     #[error("could not run git: {0}")]
     Spawn(#[from] std::io::Error),
+    /// git ran and failed in a way that means "something is wrong", not "not found".
+    #[error("git failed: {0}")]
+    Failed(String),
 }
 
 /// What a finished git run produced.
@@ -103,14 +106,28 @@ impl Git {
     pub fn new(data_dir: &Path, bin: PathBuf, concurrency: usize) -> std::io::Result<Git> {
         std::fs::create_dir_all(data_dir.join("hooks"))?;
         std::fs::create_dir_all(data_dir.join("tmp").join("home"))?;
+        // Absolute, once: the child runs with the data directory as its working directory, so a
+        // relative path would resolve against itself and target `data/data/...`.
+        let data_dir = std::fs::canonicalize(data_dir)?;
         Ok(Git {
-            data_dir: data_dir.to_path_buf(),
+            data_dir,
             bin,
             gate: Gate::new(concurrency),
             timeout: Duration::from_secs(30),
             admission: Duration::from_secs(5),
             max_output: 16 << 20,
         })
+    }
+
+    /// The absolute data directory this runner works in.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Hold one admission slot until the returned permit is dropped. For tests that need a
+    /// saturated runner (every other spawn waits out its admission deadline and gets `Busy`).
+    pub fn occupy_for_tests(&self) -> crate::limits::Permit<'_> {
+        self.gate.acquire()
     }
 
     pub fn with_limits(mut self, timeout: Duration, admission: Duration, max_output: usize) -> Git {
@@ -408,7 +425,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             hooks,
-            format!("{}/hooks", d.display()),
+            format!("{}/hooks", g.data_dir().display()),
             "hooksPath is pinned to the server's directory"
         );
         assert!(
@@ -416,6 +433,54 @@ mod tests {
                 .iter()
                 .all(|(k, _)| !k.starts_with("GIT_AUTHOR")),
             "no identity unless asked"
+        );
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_relative_data_dir_becomes_absolute_and_repos_land_where_expected() {
+        let rel = PathBuf::from(format!("scl-forge-rel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rel);
+        let g = Git::new(&rel, find_git().expect("git"), 2).unwrap();
+        assert!(g.data_dir().is_absolute());
+        let repo = g.data_dir().join("repos").join("1.git");
+        std::fs::create_dir_all(g.data_dir().join("repos")).unwrap();
+        let out = g
+            .run(&Spec {
+                args: &[
+                    "init",
+                    "--bare",
+                    "--quiet",
+                    "--template=",
+                    repo.to_str().unwrap(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.ok());
+        assert!(
+            rel.join("repos").join("1.git").join("HEAD").is_file(),
+            "created under the path the caller gave, not `rel/rel/...`"
+        );
+        assert!(!rel.join(&rel).exists());
+        let _ = std::fs::remove_dir_all(&rel);
+    }
+
+    #[test]
+    fn a_child_inherits_nothing_from_the_server_environment() {
+        let (g, d) = git("inherit");
+        std::env::set_var("SC_FORGE_TEST_SENTINEL", "leaked");
+        let out = g
+            .run_program(OsStr::new("/usr/bin/env"), &Spec::default())
+            .unwrap();
+        std::env::remove_var("SC_FORGE_TEST_SENTINEL");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            !text.contains("SC_FORGE_TEST_SENTINEL"),
+            "env_clear must hide the parent environment:\n{text}"
+        );
+        assert!(
+            text.contains("GIT_NO_REPLACE_OBJECTS=1") && text.contains("GIT_CEILING_DIRECTORIES=")
         );
         let _ = std::fs::remove_dir_all(d);
     }
@@ -447,7 +512,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(hooks.text(), format!("{}/hooks", d.display()));
+        assert_eq!(hooks.text(), format!("{}/hooks", g.data_dir().display()));
         let user = g
             .run(&Spec {
                 repo: Some(&repo),

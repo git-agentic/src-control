@@ -775,35 +775,244 @@ fn concurrent_creates_of_one_name_yield_exactly_one_repository() {
 
 #[test]
 fn deleting_a_repo_while_requests_are_in_flight_leaves_nothing_behind() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let (w, _) = world();
     let r = w.mk("gone", true);
     let id = r["id"].as_i64().unwrap();
+    let before = w.s.get("/api/v1/repos/acme/gone/branches", &w.adm).json();
+    assert!(before.is_array());
     let (s, adm) = (&w.s, &w.adm);
+    let (reads, stop) = (AtomicUsize::new(0), AtomicBool::new(false));
     std::thread::scope(|sc| {
         let readers: Vec<_> = (0..4)
             .map(|_| {
                 sc.spawn(|| {
-                    (0..10)
-                        .map(|_| s.get("/api/v1/repos/acme/gone/branches", adm).status)
-                        .collect::<Vec<_>>()
+                    let mut seen = Vec::new();
+                    while !stop.load(Ordering::SeqCst) {
+                        let r = s.get("/api/v1/repos/acme/gone/branches", adm);
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        seen.push((r.status, r.json()));
+                    }
+                    seen
                 })
             })
             .collect();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        while reads.load(Ordering::SeqCst) < 8 {
+            std::thread::sleep(std::time::Duration::from_millis(2)); // overlap is proven, not slept
+        }
         assert_eq!(
             s.send("DELETE", "/api/v1/repos/acme/gone", Some(adm), None)
                 .status,
             204
         );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop.store(true, Ordering::SeqCst);
+        let mut ok_before_delete = 0;
         for h in readers {
-            for st in h.join().unwrap() {
-                assert!(
-                    st == 200 || st == 404,
-                    "reads see the repo or its absence, never an error: {st}"
-                );
+            for (status, body) in h.join().unwrap() {
+                match status {
+                    200 => {
+                        assert_eq!(body, before, "a read that wins the race sees the full branch list, never an empty or partial one");
+                        ok_before_delete += 1;
+                    }
+                    404 => {}
+                    other => panic!("reads see the repo or its absence, never {other}"),
+                }
             }
         }
+        assert!(ok_before_delete > 0, "some reads overlapped the delete");
     });
     assert!(!w.s.dir.join("repos").join(format!("{id}.git")).exists());
     assert!(!w.s.dir.join("trash").join(format!("{id}.git")).exists());
+}
+
+#[test]
+fn a_write_collaborator_can_delete_branches_and_scope_is_checked_before_existence() {
+    let (w, t) = world();
+    let id = w.mk("r", false)["id"].as_i64().unwrap();
+    let main = w.s.commit_on(id, "main", None);
+    w.s.commit_on(id, "topic", Some(&main));
+    w.collab("r", "carol", "write");
+    assert_eq!(
+        w.s.send(
+            "DELETE",
+            "/api/v1/repos/acme/r/branches/topic",
+            Some(&token(&t["carol"])),
+            None
+        )
+        .status,
+        204
+    );
+    // a token without the repository scope: 403 on a repo that exists and on one that does not
+    let pw = w.s.mk_user("scoped");
+    let user_only = token(&w.s.mk_token("scoped", &pw, "u", &["read:user"]));
+    for repo in ["r", "ghost"] {
+        let r = w.s.get(&format!("/api/v1/repos/acme/{repo}"), &user_only);
+        assert_eq!(
+            (r.status, r.msg().as_str()),
+            (
+                403,
+                "token does not have at least one of required scope(s): [read:repository]"
+            ),
+            "{repo}"
+        );
+    }
+}
+
+#[test]
+fn a_repository_that_is_being_deleted_is_invisible_to_everyone() {
+    let (w, _) = world();
+    w.mk("going", false);
+    let conn = scl_forge::db::connect(&w.s.dir).unwrap();
+    conn.execute(
+        "UPDATE repos SET state = 'deleting' WHERE name = 'going'",
+        [],
+    )
+    .unwrap();
+    for path in [
+        "/api/v1/repos/acme/going",
+        "/api/v1/repos/acme/going/branches",
+    ] {
+        assert_eq!(
+            w.s.get(path, &w.adm).status,
+            404,
+            "{path}: even for a site admin"
+        );
+    }
+    assert_eq!(
+        w.s.get("/api/v1/repos/search", &w.adm).headers["x-total-count"],
+        "0"
+    );
+    let dup =
+        w.s.post("/api/v1/orgs/acme/repos", &w.adm, json!({"name": "going"}));
+    assert_eq!(
+        dup.status, 409,
+        "the name stays blocked until the delete finishes"
+    );
+}
+
+#[test]
+fn search_decodes_q_and_page_links_repeat_the_query() {
+    let (w, _) = world();
+    for (n, d) in [
+        ("s1", "hello world"),
+        ("s2", "hello world"),
+        ("s3", "hello world"),
+        ("other", "nothing"),
+    ] {
+        let r = w.s.post(
+            "/api/v1/orgs/acme/repos",
+            &w.adm,
+            json!({"name": n, "description": d}),
+        );
+        assert_eq!(r.status, 201);
+    }
+    for q in ["hello%20world", "hello+world"] {
+        let r = w.s.get(
+            &format!("/api/v1/repos/search?q={q}&limit=2&sort=alpha"),
+            &w.adm,
+        );
+        assert_eq!(r.headers["x-total-count"], "3", "{q}");
+        assert_eq!(r.json()["data"].as_array().unwrap().len(), 2, "{q}");
+    }
+    let r = w.s.get(
+        "/api/v1/repos/search?q=hello%20world&limit=2&sort=alpha",
+        &w.adm,
+    );
+    let link = r.headers["link"].clone();
+    assert!(
+        link.contains("limit=2&page=2&q=hello%20world&sort=alpha>; rel=\"next\""),
+        "{link}"
+    );
+}
+
+#[test]
+fn malformed_collaborator_and_email_input_is_refused() {
+    let (w, _) = world();
+    w.mk("r", false);
+    for bad in [
+        json!({"permission": 123}),
+        json!({"permission": {"x": 1}}),
+        json!({"permission": true}),
+    ] {
+        let r = w.s.send(
+            "PUT",
+            "/api/v1/repos/acme/r/collaborators/bob",
+            Some(&w.adm),
+            Some(&bad),
+        );
+        assert_eq!(r.status, 422, "{bad}");
+    }
+    assert_eq!(
+        w.s.get("/api/v1/repos/acme/r/collaborators", &w.adm)
+            .headers["x-total-count"],
+        "0",
+        "nothing was granted"
+    );
+    // an email that could not be a commit identity is refused where users are made
+    let r = w.s.post(
+        "/api/v1/admin/users",
+        &w.adm,
+        json!({"username": "evil", "email": "x@y>", "password": "pw"}),
+    );
+    assert_eq!((r.status, r.msg().as_str()), (422, "[Email]: Email"));
+    let r = w.s.post(
+        "/api/v1/admin/users",
+        &w.adm,
+        json!({"username": "evil2", "email": "x@y\nz", "password": "pw"}),
+    );
+    assert_eq!(r.status, 422);
+}
+
+#[test]
+fn a_saturated_runner_answers_503_on_reads_and_writes_not_500() {
+    let s = Srv::start_git(1, std::time::Duration::from_millis(150));
+    let adm = token(&s.admin);
+    s.post("/api/v1/orgs", &adm, json!({"username": "acme"}));
+    assert_eq!(
+        s.post(
+            "/api/v1/orgs/acme/repos",
+            &adm,
+            json!({"name": "r", "auto_init": true})
+        )
+        .status,
+        201
+    );
+    let slot = s.runner.occupy_for_tests();
+    for (method, path, body) in [
+        ("GET", "/api/v1/repos/acme/r", None),
+        ("GET", "/api/v1/repos/acme/r/branches", None),
+        ("GET", "/api/v1/repos/acme/r/branches/main", None),
+        ("GET", "/api/v1/repos/search", None),
+        (
+            "POST",
+            "/api/v1/orgs/acme/repos",
+            Some(json!({"name": "other"})),
+        ),
+        (
+            "PATCH",
+            "/api/v1/repos/acme/r",
+            Some(json!({"default_branch": "dev"})),
+        ),
+    ] {
+        let r = s.send(method, path, Some(&adm), body.as_ref());
+        assert_eq!(
+            r.status,
+            503,
+            "{method} {path}: {}",
+            String::from_utf8_lossy(&r.raw)
+        );
+    }
+    drop(slot);
+    assert_eq!(
+        s.get("/api/v1/repos/acme/r", &adm).status,
+        200,
+        "and it recovers"
+    );
+    // a failed create under load did not leave its name blocked
+    assert_eq!(
+        s.post("/api/v1/orgs/acme/repos", &adm, json!({"name": "other"}))
+            .status,
+        201
+    );
 }

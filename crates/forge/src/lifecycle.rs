@@ -18,7 +18,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Exclusive hold on the data directory for the life of the process.
 pub struct DirLock(#[allow(dead_code)] File);
@@ -80,6 +80,7 @@ pub struct Report {
     pub trash_removed: usize,
     pub orphans_moved: usize,
     pub head_repaired: usize,
+    pub head_repair_failed: usize,
     pub missing_dirs: usize,
 }
 
@@ -87,7 +88,7 @@ pub struct Report {
 pub struct Lifecycle {
     data_dir: PathBuf,
     pub git: Arc<Git>,
-    locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+    locks: Mutex<HashMap<i64, Arc<RwLock<()>>>>,
     #[cfg(test)]
     crash_at: Mutex<Option<&'static str>>,
 }
@@ -97,12 +98,37 @@ impl Lifecycle {
         for d in ["repos", "trash", "orphans"] {
             std::fs::create_dir_all(data_dir.join(d))?;
         }
+        // Absolute (the git children run with this as their working directory) and durable: the
+        // layout directories' own entries must survive a power loss before any row points at them.
+        let data_dir = std::fs::canonicalize(data_dir)?;
+        for d in ["repos", "trash", "orphans"] {
+            fsync_dir(&data_dir.join(d))?;
+        }
+        fsync_dir(&data_dir)?;
         Ok(Lifecycle {
-            data_dir: data_dir.to_path_buf(),
+            data_dir,
             git,
             locks: Mutex::default(),
             #[cfg(test)]
             crash_at: Mutex::default(),
+        })
+    }
+
+    /// Run `f` (a read of repository `id` on disk) under the shared lock, and only if the
+    /// repository is still `live` once the lock is held. `None` means it is gone (deleted or being
+    /// deleted): the caller answers as for a missing repository. Without this, a read that
+    /// overlapped the delete's rename could see a half-vanished repository as an empty one.
+    pub fn with_read<T>(
+        &self,
+        conn: &Connection,
+        id: i64,
+        f: impl FnOnce() -> T,
+    ) -> Result<Option<T>, rusqlite::Error> {
+        let lock = self.lock_for(id);
+        let _shared = lock.read().unwrap_or_else(|e| e.into_inner());
+        Ok(match repos::find_by_id(conn, id)? {
+            Some(r) if r.state == "live" => Some(f()),
+            _ => None,
         })
     }
 
@@ -115,8 +141,10 @@ impl Lifecycle {
         self.data_dir.join("trash").join(format!("{id}.git"))
     }
 
-    /// The mutex that serializes the server's operations on repository `id`.
-    pub fn lock_for(&self, id: i64) -> Arc<Mutex<()>> {
+    /// The lock that serializes the server's operations on repository `id`: delete, default-branch
+    /// change and branch delete take it exclusively; reads of the repository take it shared (see
+    /// [`Lifecycle::with_read`]), so a read can never straddle the delete's rename.
+    pub fn lock_for(&self, id: i64) -> Arc<RwLock<()>> {
         self.locks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -197,8 +225,15 @@ impl Lifecycle {
             Err(e) => {
                 // An ordinary failure rolls back now; if even that fails the row stays `creating`
                 // and the next startup finishes the job.
-                let _ = remove_any(&self.repo_dir(row.id));
-                let _ = repos::delete_row(conn, row.id);
+                match remove_any(&self.repo_dir(row.id)) {
+                    Ok(()) => {
+                        let _ = repos::delete_row(conn, row.id);
+                    }
+                    Err(c) => eprintln!(
+                        "sc-forge: could not remove {} ({c}); the row stays `creating` for the next startup",
+                        self.repo_dir(row.id).display()
+                    ),
+                }
                 Err(e)
             }
         }
@@ -274,6 +309,7 @@ impl Lifecycle {
         self.step("committed")?;
         fsync_tree(&dir)?;
         fsync_dir(&self.data_dir.join("repos"))?;
+        fsync_dir(&self.data_dir)?;
         self.step("synced")?;
         if !repos::set_state(conn, row.id, "creating", "live", now)? {
             return Err(LifecycleError::Gone);
@@ -285,7 +321,7 @@ impl Lifecycle {
     /// `Gone` when it was not `live` (someone else is already deleting it).
     pub fn delete(&self, conn: &Connection, repo: &Repo, now: i64) -> Result<(), LifecycleError> {
         let lock = self.lock_for(repo.id);
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _held = lock.write().unwrap_or_else(|e| e.into_inner());
         if !repos::set_state(conn, repo.id, "live", "deleting", now)? {
             return Err(LifecycleError::Gone);
         }
@@ -323,10 +359,13 @@ impl Lifecycle {
         now: i64,
     ) -> Result<(), LifecycleError> {
         let lock = self.lock_for(repo.id);
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _held = lock.write().unwrap_or_else(|e| e.into_inner());
         let current = repos::find_by_id(conn, repo.id)?
             .filter(|r| r.state == "live")
             .ok_or(LifecycleError::Gone)?;
+        if current.default_branch == branch {
+            return Ok(()); // decided under the lock: a concurrent PATCH may already have set it
+        }
         let dir = self.repo_dir(current.id);
         let full = refname::branch_ref(branch);
         let exists = self.git.run(&Spec {
@@ -357,11 +396,12 @@ impl Lifecycle {
         branch: &str,
     ) -> Result<(), LifecycleError> {
         let lock = self.lock_for(repo.id);
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _held = lock.write().unwrap_or_else(|e| e.into_inner());
         let current = repos::find_by_id(conn, repo.id)?
             .filter(|r| r.state == "live")
             .ok_or(LifecycleError::Gone)?;
-        if current.default_branch == branch {
+        // Case-insensitive: on a case-insensitive filesystem `MAIN` aliases the loose ref `main`.
+        if current.default_branch.eq_ignore_ascii_case(branch) {
             return Err(LifecycleError::GitFailed(
                 "refusing to delete the default branch".into(),
             ));
@@ -380,15 +420,38 @@ impl Lifecycle {
         Ok(())
     }
 
+    /// Move `p` out of the way into `orphans/` (never deleting it).
+    fn to_orphans(&self, p: &Path) -> std::io::Result<PathBuf> {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut to = self.data_dir.join("orphans").join(&name);
+        let mut n = 0;
+        while to.exists() {
+            n += 1;
+            to = self.data_dir.join("orphans").join(format!("{name}.{n}"));
+        }
+        std::fs::rename(p, &to)?;
+        fsync_dir(&self.data_dir.join("orphans"))?;
+        Ok(to)
+    }
+
     /// Resolve every state a crash can leave. Run once at startup, before the listener is bound
     /// and while holding the [`DirLock`]. Nothing is ever deleted that a live repository might
-    /// own: a directory with no row at all moves to `orphans/`.
+    /// own: a directory with no row, and the directory of a `creating` row, move to `orphans/`
+    /// (a restored database can resurrect either). A database error aborts the pass before any
+    /// directory is touched on its account.
     pub fn reconcile(&self, conn: &Connection, now: i64) -> Result<Report, LifecycleError> {
         let mut rep = Report::default();
         // 1. creating: roll back (the row does not record auto_init, so a half-initialized
-        //    repository is never promoted; the client never saw a 201 for it).
+        //    repository is never promoted; the client never saw a 201 for it). The directory is
+        //    kept in orphans/, and the row is deleted only after that succeeded.
         for r in repos::list_in_state(conn, "creating")? {
-            let _ = remove_any(&self.repo_dir(r.id));
+            let dir = self.repo_dir(r.id);
+            if std::fs::symlink_metadata(&dir).is_ok() {
+                self.to_orphans(&dir)?;
+            }
             repos::delete_row(conn, r.id)?;
             rep.creating_rolled_back += 1;
         }
@@ -407,12 +470,13 @@ impl Lifecycle {
             let _ = std::fs::remove_dir_all(&to);
             rep.deleting_finished += 1;
         }
-        // 3. trash with no row.
+        // 3. trash with no row. A lookup error propagates: it must never read as "no row".
         for e in std::fs::read_dir(self.data_dir.join("trash"))? {
             let p = e?.path();
-            let known = file_id(&p)
-                .and_then(|id| repos::find_by_id(conn, id).ok().flatten())
-                .is_some();
+            let known = match file_id(&p) {
+                Some(id) => repos::find_by_id(conn, id)?.is_some(),
+                None => false,
+            };
             if !known {
                 remove_any(&p)?;
                 rep.trash_removed += 1;
@@ -421,21 +485,12 @@ impl Lifecycle {
         // 4. a directory in repos/ with no row at all: keep it, out of the way, never delete it.
         for e in std::fs::read_dir(self.data_dir.join("repos"))? {
             let p = e?.path();
-            let known = file_id(&p)
-                .and_then(|id| repos::find_by_id(conn, id).ok().flatten())
-                .is_some();
+            let known = match file_id(&p) {
+                Some(id) => repos::find_by_id(conn, id)?.is_some(),
+                None => false,
+            };
             if !known {
-                let name = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let mut to = self.data_dir.join("orphans").join(&name);
-                let mut n = 0;
-                while to.exists() {
-                    n += 1;
-                    to = self.data_dir.join("orphans").join(format!("{name}.{n}"));
-                }
-                std::fs::rename(&p, &to)?;
+                let to = self.to_orphans(&p)?;
                 eprintln!(
                     "sc-forge: {} has no repository row; moved to {}",
                     p.display(),
@@ -445,7 +500,8 @@ impl Lifecycle {
             }
         }
         // 5. live: HEAD follows the row (the row is the authority); a missing directory is
-        //    reported, never silently dropped.
+        //    reported, never silently dropped; one repository that cannot be repaired is reported
+        //    and does not stop the others (or the server) from starting.
         for r in repos::list_in_state(conn, "live")? {
             let dir = self.repo_dir(r.id);
             if !dir.is_dir() {
@@ -457,14 +513,28 @@ impl Lifecycle {
                 continue;
             }
             let want = refname::branch_ref(&r.default_branch);
-            let head = self.git.run(&Spec {
-                repo: Some(&dir),
-                args: &["symbolic-ref", "-q", "HEAD"],
-                ..Default::default()
-            })?;
-            if head.text() != want {
+            let fix = || -> Result<bool, LifecycleError> {
+                let head = self.git.run(&Spec {
+                    repo: Some(&dir),
+                    args: &["symbolic-ref", "-q", "HEAD"],
+                    ..Default::default()
+                })?;
+                if head.text() == want {
+                    return Ok(false);
+                }
                 self.run(&dir, &["symbolic-ref", "HEAD", &want], None, None)?;
-                rep.head_repaired += 1;
+                Ok(true)
+            };
+            match fix() {
+                Ok(true) => rep.head_repaired += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!(
+                        "sc-forge: cannot repair HEAD of {}/{} (id {}): {e}",
+                        r.owner, r.name, r.id
+                    );
+                    rep.head_repair_failed += 1;
+                }
             }
         }
         let _ = now;
@@ -774,6 +844,7 @@ mod tests {
                 trash_removed: 1,
                 orphans_moved: 1,
                 head_repaired: 1,
+                head_repair_failed: 0,
                 missing_dirs: 1
             }
         );
@@ -899,5 +970,144 @@ mod tests {
         drop(first);
         assert!(DirLock::acquire(&dir).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupted_creates_directory_is_kept_in_orphans_not_deleted() {
+        let e = env("keep-creating");
+        e.lc.arm("committed");
+        assert!(matches!(
+            make(&e, "half", true),
+            Err(LifecycleError::Crash(_))
+        ));
+        let id = repos::find_row(&e.conn, "owner", "half")
+            .unwrap()
+            .unwrap()
+            .id;
+        let rep = e.lc.reconcile(&e.conn, 20).unwrap();
+        assert_eq!(rep.creating_rolled_back, 1);
+        assert!(!e.lc.repo_dir(id).exists());
+        assert!(
+            e.dir
+                .join("orphans")
+                .join(format!("{id}.git"))
+                .join("HEAD")
+                .is_file(),
+            "the data survives, out of service"
+        );
+        assert!(repos::find_row(&e.conn, "owner", "half").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_cleanup_keeps_the_creating_row_so_the_name_stays_blocked_until_it_is_done() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env("cleanup-fails");
+        e.lc.arm("committed");
+        assert!(matches!(
+            make(&e, "stuck", true),
+            Err(LifecycleError::Crash(_))
+        ));
+        let id = repos::find_row(&e.conn, "owner", "stuck")
+            .unwrap()
+            .unwrap()
+            .id;
+        // repos/ becomes read-only: neither removal nor a move out of it can succeed
+        let repos_dir = e.dir.join("repos");
+        std::fs::set_permissions(&repos_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let blocked = e.lc.reconcile(&e.conn, 20);
+        std::fs::set_permissions(&repos_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if std::fs::metadata(&repos_dir)
+            .map(|_| nix_is_root())
+            .unwrap_or(false)
+        {
+            return; // root ignores directory permissions; the scenario cannot be staged
+        }
+        assert!(blocked.is_err(), "the failed move is reported");
+        let row = repos::find_row(&e.conn, "owner", "stuck")
+            .unwrap()
+            .expect("the journal row survives a failed cleanup");
+        assert_eq!(row.state, "creating");
+        assert!(e.lc.repo_dir(id).exists(), "nothing was lost");
+        assert!(
+            matches!(make(&e, "stuck", false), Err(LifecycleError::Exists)),
+            "the name stays blocked until the cleanup is done"
+        );
+        assert_eq!(
+            e.lc.reconcile(&e.conn, 30).unwrap().creating_rolled_back,
+            1,
+            "the next pass finishes it"
+        );
+        assert!(make(&e, "stuck", false).is_ok());
+    }
+
+    fn nix_is_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn a_database_error_aborts_the_pass_before_any_directory_moves() {
+        let e = env("db-error");
+        let live = make(&e, "alive", true).unwrap();
+        std::fs::create_dir_all(e.lc.repo_dir(98).join("objects")).unwrap(); // an orphan to be moved
+        e.conn
+            .execute_batch("ALTER TABLE repos RENAME TO repos_gone")
+            .unwrap();
+        assert!(e.lc.reconcile(&e.conn, 20).is_err());
+        assert!(
+            e.lc.repo_dir(live.id).join("HEAD").is_file(),
+            "a live repository is never moved on a lookup error"
+        );
+        assert!(e.lc.repo_dir(98).exists(), "nothing was touched");
+    }
+
+    #[test]
+    fn one_unrepairable_repository_does_not_stop_the_pass() {
+        let e = env("one-bad");
+        let bad = make(&e, "bad", true).unwrap();
+        let good =
+            e.lc.create(&e.conn, &e.owner, &e.owner, "good", "", "main", true, 10)
+                .unwrap();
+        e.lc.git
+            .run(&Spec {
+                repo: Some(&e.lc.repo_dir(good.id)),
+                args: &["symbolic-ref", "HEAD", "refs/heads/other"],
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::remove_file(e.lc.repo_dir(bad.id).join("HEAD")).unwrap(); // no longer a repository
+        let rep = e.lc.reconcile(&e.conn, 20).unwrap();
+        assert_eq!((rep.head_repair_failed, rep.head_repaired), (1, 1));
+        assert_eq!(head(&e, &good), "refs/heads/main");
+    }
+
+    #[test]
+    fn naming_the_current_default_branch_is_a_no_op_decided_under_the_lock() {
+        let e = env("default-noop");
+        let r = make(&e, "alpha", true).unwrap();
+        e.lc.set_default_branch(&e.conn, &r, "main", 20).unwrap(); // already main
+        assert_eq!(head(&e, &r), "refs/heads/main");
+        // a stale snapshot naming another branch as current still resolves against the row
+        let stale = Repo {
+            default_branch: "dev".into(),
+            ..r.clone()
+        };
+        e.lc.set_default_branch(&e.conn, &stale, "main", 21)
+            .unwrap();
+        assert_eq!(
+            repos::find_by_id(&e.conn, r.id)
+                .unwrap()
+                .unwrap()
+                .default_branch,
+            "main"
+        );
+    }
+
+    #[test]
+    fn the_default_branch_cannot_be_deleted_by_a_case_alias() {
+        let e = env("case-alias");
+        let r = make(&e, "alpha", true).unwrap();
+        assert!(e.lc.delete_branch(&e.conn, &r, "MAIN").is_err());
+        assert!(rev(&e, &r, "refs/heads/main").is_some());
     }
 }

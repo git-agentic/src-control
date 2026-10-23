@@ -720,19 +720,39 @@ the smart-HTTP transport, hooks, ref policy, admission control and threat-model 
   would (`refname::valid_branch`) and addressed only as `refs/heads/<name>`; deleting the default
   branch is 403 `can not delete default branch`; an empty repository lists branches as `null`.
 - **Lifecycle.** `serve` holds an exclusive `flock` on `<data>/.lock`, requires git 2.40 or
-  newer, then reconciles once before binding the listener. Per-repository mutexes serialize
-  create-finalize, delete, default-branch change and branch delete, each re-checking `live`
-  under the lock with conditional SQL. Creation fsyncs the whole new tree and `repos/`; any
-  failure before `live` rolls back in-process; **every `creating` row is rolled back at
-  startup** (the row does not record `auto_init`); a directory in `repos/` with no row at all is
-  **moved to `orphans/`, never deleted**, so a restored or recreated database cannot erase
-  repositories; a `live` row whose directory is missing is reported, never dropped.
+  newer, then reconciles once before binding the listener. The data directory is made absolute
+  once (the git children run with it as their working directory) and its layout directories are
+  fsynced. A per-repository read/write lock serializes the server's operations on one id:
+  delete, default-branch change and branch delete take it exclusively and re-check `live` under
+  it with conditional SQL; **reads of a repository's data take it shared and re-check `live`**
+  (`Lifecycle::with_read`), so a read can never straddle a delete's rename and see a
+  half-vanished repository as an empty one. Creation fsyncs the whole new tree, `repos/` and the
+  data directory; any failure before `live` rolls back in-process, and the `creating` row is
+  deleted only after the directory was removed (a failed cleanup keeps the row, so the name
+  stays blocked until the next startup finishes it). At startup **every `creating` row is rolled
+  back** (the row does not record `auto_init`) and its directory is **moved to `orphans/`, not
+  deleted**, as is a directory with no row at all: a restored or recreated database can
+  resurrect either, and nothing the server did not just create is ever deleted. A database error
+  during reconcile aborts the pass before any directory is touched on its account; a `live` row
+  whose directory is missing is reported, never dropped; one repository whose `HEAD` cannot be
+  repaired is reported and does not stop the server from starting.
 - **Git runner.** Every spawn is `env_clear` with an explicit `--git-dir` (never discovery),
   `GIT_CEILING_DIRECTORIES`, pinned per-spawn config, its own process group (signalled while the
   leader is still an unreaped zombie, so the group id cannot be reused), a deadline, capped
   output drained by dedicated threads, and an admission slot with a deadline (503 when busy,
-  `--git-concurrency`, default 8). Commit identity values containing control characters or
-  angle brackets are refused.
+  `--git-concurrency`, default 8); every handler answers a busy runner 503, never 500. A read
+  that fails because git failed (exit 128, a damaged repository) is an error, not an empty
+  repository. Commit identity values containing control characters or angle brackets are
+  refused, including in the email given to `admin/users` create and patch.
+- **Search and paging.** `q` is percent-decoded (`+` is a space); every `Link` URL repeats the
+  query in the recorded order (`limit`, `page`, then `q`, `sort` alphabetically). A collaborator
+  `permission` of the wrong JSON type is 422, never a default grant. The default branch cannot
+  be deleted through a case alias (`MAIN`), whatever the filesystem.
+- **Rollout.** Migration 2 has no down path and an older `serve` refuses a newer schema, so
+  rolling the binary back means restoring a pre-F2a `forge.db`; the next startup then moves
+  every repository directory to `orphans/` (safe, and recoverable by restoring the database).
+  Not verified against Gitea's source: `/user/repos` is scoped `write:user`/`read:user` as
+  recorded (B#26, B#34); whether Gitea also requires a repository scope there is open.
 - **Conformance gate.** `forge-check.sh` replays `A`, `B`, `C`, `L`, `N` and `R`; `B` stops at
   its first contents call (F3), `C` and `N` at their first `git clone` (F2b), and `X`, `D`,
   `K`, `M` stay out until their routes exist (they make recorded calls to unbuilt routes, which

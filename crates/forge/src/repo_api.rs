@@ -1,7 +1,8 @@
 //! F2a handlers: repositories, search and lists, collaborators, branches. Authentication, scope
 //! and the repository permission check already passed in `routes::dispatch` (`ctx.access`).
 
-use crate::api::{body, page_params, paged, str_field, user_json};
+use crate::api::{body, page_params, paged, paged_with, str_field, user_json};
+use crate::gitproc::GitError;
 use crate::gitread;
 use crate::http::{error, not_found, Resp};
 use crate::lifecycle::LifecycleError;
@@ -37,6 +38,19 @@ fn life_err(app: &App, e: LifecycleError) -> Resp {
     }
 }
 
+/// The one mapping of a failed read of a repository: busy is 503; a repository that is no
+/// longer `live` (a read that raced its delete) is the same 404 as a missing one; anything else
+/// is a 500.
+fn git_read_err(app: &App, conn: &rusqlite::Connection, repo_id: i64, e: GitError) -> Resp {
+    if matches!(e, GitError::Busy) {
+        return error(&app.base, 503, "too many git operations in flight");
+    }
+    match repos::find_by_id(conn, repo_id) {
+        Ok(Some(r)) if r.state == "live" => app.internal(&e),
+        _ => not_found(&app.base, "The target couldn't be found.", None),
+    }
+}
+
 fn ssh_authority(base: &str) -> String {
     base.split("://")
         .nth(1)
@@ -52,8 +66,15 @@ fn repo_json(app: &App, conn: &rusqlite::Connection, r: &Repo, perm: Perm) -> Re
     let owner = store::find_by_id(conn, r.owner_id)
         .map_err(|e| app.internal(&e))?
         .ok_or_else(|| app.internal(&"repo without owner"))?;
-    let empty =
-        gitread::is_empty(&app.life.git, &app.life.repo_dir(r.id)).map_err(|e| app.internal(&e))?;
+    // Under the shared repository lock, and only while the repository is still live: a read must
+    // never straddle a delete's rename and see a half-vanished repository as an empty one.
+    let empty = match app.life.with_read(conn, r.id, || {
+        gitread::is_empty(&app.life.git, &app.life.repo_dir(r.id))
+    }) {
+        Err(e) => return Err(app.internal(&e)),
+        Ok(None) => return Err(not_found(&app.base, "The target couldn't be found.", None)),
+        Ok(Some(res)) => res.map_err(|e| git_read_err(app, conn, r.id, e))?,
+    };
     let mut owner_json = user_json(&app.base, &owner);
     owner_json["active"] = json!(false); // recorded: the owner object inside a repository reads inactive
     owner_json["login_name"] = json!(""); // recorded: the nested owner never carries the login_name
@@ -235,7 +256,9 @@ pub fn patch_repo(ctx: &mut Ctx) -> Resp {
     if str_field(&b, "name").is_some_and(|n| n != a.repo.name) {
         return error(&base, 422, "repository rename is not supported");
     }
-    if let Some(branch) = str_field(&b, "default_branch").filter(|n| *n != a.repo.default_branch) {
+    // Always handed to the locked operation, which compares against the row under the lock (a
+    // snapshot taken before the lock could be stale).
+    if let Some(branch) = str_field(&b, "default_branch") {
         if !refname::valid_branch(&branch) {
             return error(&base, 422, "[DefaultBranch]: invalid branch name");
         }
@@ -333,19 +356,49 @@ fn query_list(ctx: &Ctx, filter: &Filter, sort: Sort, path: &str, wrap: bool) ->
 
 /// `GET /repos/search`: `{"ok": true, "data": [...]}`; a `public-only` token sees nothing.
 pub fn search(ctx: &mut Ctx) -> Resp {
-    let q = ctx.req.param("q").map(|v| v.replace('+', " "));
+    // `q` arrives percent-encoded with `+` for a space (form encoding).
+    let q = ctx
+        .req
+        .param("q")
+        .and_then(|v| crate::routes::percent_decode(&v.replace('+', " ")));
     let sort = if ctx.req.param("sort") == Some("alpha") {
         Sort::Alpha
     } else {
         Sort::Id
     };
-    query_list(
-        ctx,
+    // Page links repeat the query, in the recorded order (alphabetical after limit and page).
+    let mut extra: Vec<(&str, String)> = Vec::new();
+    if let Some(raw) = ctx.req.param("q") {
+        extra.push(("q", raw.to_string()));
+    }
+    if ctx.req.param("sort") == Some("alpha") {
+        extra.push(("sort", "alpha".to_string()));
+    }
+    let (page, limit) = page_params(ctx);
+    match repos::list_visible(
+        ctx.conn,
+        &ctx.who.user,
+        token_public_only(ctx),
         &Filter { q, owner_id: None },
         sort,
-        "/repos/search",
-        true,
-    )
+        page,
+        limit,
+    ) {
+        Ok((rows, total)) => {
+            let items = match listed(ctx, &rows) {
+                Ok(i) => i,
+                Err(r) => return r,
+            };
+            let links = paged_with(ctx, "/repos/search", total, page, limit, &extra, vec![]);
+            let mut r = Resp::json(200, &json!({"ok": true, "data": items}))
+                .with("x-total-count", total.to_string());
+            if let Some((_, link)) = links.headers.iter().find(|(k, _)| *k == "link") {
+                r = r.with("link", link.clone());
+            }
+            r
+        }
+        Err(e) => ctx.app.internal(&e),
+    }
 }
 
 /// `GET /user/repos`: every repository the caller can read.
@@ -426,6 +479,11 @@ pub fn put_collaborator(ctx: &mut Ctx) -> Resp {
         Err(r) => return r,
     };
     let base = ctx.app.base.clone();
+    if b.get("permission")
+        .is_some_and(|v| !v.is_string() && !v.is_null())
+    {
+        return error(&base, 422, "[Permission]: invalid permission");
+    }
     let mode = match str_field(&b, "permission") {
         None => Perm::Write,
         Some(m) => match Perm::from_mode(&m) {
@@ -492,7 +550,7 @@ pub fn collaborator_permission(ctx: &mut Ctx) -> Resp {
 fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Resp> {
     let dir = ctx.app.life.repo_dir(a.repo.id);
     let c = gitread::commit(&ctx.app.life.git, &dir, &br.oid)
-        .map_err(|e| ctx.app.internal(&e))?
+        .map_err(|e| git_read_err(ctx.app, ctx.conn, a.repo.id, e))?
         .ok_or_else(|| ctx.app.internal(&"branch points at no commit"))?;
     let who = |p: &gitread::Person| json!({"name": p.name, "email": p.email, "username": ""});
     let full = format!("{}/{}", a.repo.owner, a.repo.name);
@@ -520,6 +578,16 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
     }))
 }
 
+/// Run a read of the repository on disk under its shared lock, answering as for a missing
+/// repository when it is no longer live by the time the lock is held.
+fn read_locked(ctx: &Ctx, a: &Access, f: impl FnOnce(&Ctx) -> Resp) -> Resp {
+    match ctx.app.life.with_read(ctx.conn, a.repo.id, || f(ctx)) {
+        Ok(Some(r)) => r,
+        Ok(None) => not_found(&ctx.app.base, "The target couldn't be found.", None),
+        Err(e) => ctx.app.internal(&e),
+    }
+}
+
 fn no_branch(ctx: &Ctx, name: &str) -> Resp {
     not_found(
         &ctx.app.base,
@@ -534,9 +602,13 @@ pub fn list_branches(ctx: &mut Ctx) -> Resp {
         Ok(a) => a.clone(),
         Err(r) => return r,
     };
+    read_locked(ctx, &a, |ctx| list_branches_inner(ctx, &a))
+}
+
+fn list_branches_inner(ctx: &Ctx, a: &Access) -> Resp {
     let all = match gitread::list_branches(&ctx.app.life.git, &ctx.app.life.repo_dir(a.repo.id)) {
         Ok(b) => b,
-        Err(e) => return ctx.app.internal(&e),
+        Err(e) => return git_read_err(ctx.app, ctx.conn, a.repo.id, e),
     };
     if all.is_empty() {
         return Resp::json(200, &Value::Null).with("x-total-count", "0".into());
@@ -545,7 +617,7 @@ pub fn list_branches(ctx: &mut Ctx) -> Resp {
     let total = all.len() as i64;
     let start = (((page - 1) * limit) as usize).min(all.len());
     let rows = &all[start..(start + limit as usize).min(all.len())];
-    let items: Result<Vec<Value>, Resp> = rows.iter().map(|b| branch_json(ctx, &a, b)).collect();
+    let items: Result<Vec<Value>, Resp> = rows.iter().map(|b| branch_json(ctx, a, b)).collect();
     match items {
         Ok(items) => paged(
             ctx,
@@ -565,14 +637,18 @@ pub fn get_branch(ctx: &mut Ctx) -> Resp {
         Ok(a) => a.clone(),
         Err(r) => return r,
     };
+    read_locked(ctx, &a, |ctx| get_branch_inner(ctx, &a))
+}
+
+fn get_branch_inner(ctx: &Ctx, a: &Access) -> Resp {
     let name = ctx.param("b").to_string();
     match gitread::branch_oid(&ctx.app.life.git, &ctx.app.life.repo_dir(a.repo.id), &name) {
-        Ok(Some(oid)) => match branch_json(ctx, &a, &gitread::Branch { name, oid }) {
+        Ok(Some(oid)) => match branch_json(ctx, a, &gitread::Branch { name, oid }) {
             Ok(v) => Resp::json(200, &v),
             Err(r) => r,
         },
         Ok(None) => no_branch(ctx, &name),
-        Err(e) => ctx.app.internal(&e),
+        Err(e) => git_read_err(ctx.app, ctx.conn, a.repo.id, e),
     }
 }
 
@@ -586,7 +662,7 @@ pub fn delete_branch(ctx: &mut Ctx) -> Resp {
     if !refname::valid_branch(&name) {
         return no_branch(ctx, &name);
     }
-    if name == a.repo.default_branch {
+    if name.eq_ignore_ascii_case(&a.repo.default_branch) {
         return error(&ctx.app.base, 403, "can not delete default branch");
     }
     match ctx.app.life.delete_branch(ctx.conn, &a.repo, &name) {
