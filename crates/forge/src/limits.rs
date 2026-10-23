@@ -86,7 +86,9 @@ fn bound<K>(m: &mut HashMap<K, Vec<Instant>>, window: Duration) {
 /// IPv6 sources are keyed by their /64, since one host usually holds a whole
 /// /64 and could otherwise mint endless distinct keys.
 fn source_key(ip: IpAddr) -> IpAddr {
-    match ip {
+    // A dual-stack socket reports IPv4 clients as ::ffff:a.b.c.d; treat those as
+    // the IPv4 address they are, or every one of them would share one /64 key.
+    match ip.to_canonical() {
         IpAddr::V6(a) => IpAddr::V6((u128::from(a) & (u128::MAX << 64)).into()),
         v4 => v4,
     }
@@ -263,6 +265,20 @@ mod tests {
         assert!(b.begin(ip("2001:db8::1")) && b.begin(ip("2001:db8::2")));
         assert!(!b.begin(ip("2001:db8::ffff:1")), "same /64");
         assert!(b.begin(ip("2001:db8:0:1::1")), "a different /64");
+    }
+
+    #[test]
+    fn ipv4_mapped_addresses_keep_their_own_budget() {
+        let b = Backoff::new(1, Duration::ZERO);
+        assert!(b.begin(ip("::ffff:1.2.3.4")));
+        assert!(
+            b.begin(ip("::ffff:5.6.7.8")),
+            "a different IPv4 client is a different source"
+        );
+        assert!(
+            !b.begin(ip("1.2.3.4")),
+            "mapped and plain forms of one client share a budget"
+        );
     }
 
     #[test]
