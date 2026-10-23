@@ -728,7 +728,7 @@ pub fn delete_branch(ctx: &mut Ctx) -> Resp {
     if !refname::valid_branch(&name) {
         return no_branch(ctx, &name);
     }
-    if name.eq_ignore_ascii_case(&a.repo.default_branch) {
+    if crate::policy::same_branch_name(&name, &a.repo.default_branch) {
         return error(&ctx.app.base, 403, "can not delete default branch");
     }
     match ctx.app.life.delete_branch(ctx.conn, &a.repo, &name) {

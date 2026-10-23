@@ -9,8 +9,23 @@
 //! are created without a hooks directory), and it trusts nothing from git but the three stdin fields.
 
 use crate::{db, policy, repos};
-use std::io::BufRead;
+use std::io::Read;
 use std::path::Path;
+
+/// Read git's update lines from `r` as raw bytes. Any read error or any line that is not valid UTF-8
+/// refuses the whole push: stopping at the first bad line would leave the rest unchecked (fail open).
+pub fn read_updates(mut r: impl Read) -> Result<Vec<String>, String> {
+    let mut raw = Vec::new();
+    r.read_to_end(&mut raw)
+        .map_err(|e| format!("cannot read the update lines: {e}"))?;
+    raw.split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            String::from_utf8(l.to_vec())
+                .map_err(|_| "an update line is not valid UTF-8".to_string())
+        })
+        .collect()
+}
 
 /// Decide a whole push. `lines` are git's `<old> <new> <ref>` records; returns every refusal text.
 pub fn decide(lines: &[String], default_branch: &str, live: bool) -> Vec<String> {
@@ -54,11 +69,13 @@ pub fn run() -> i32 {
         );
         return 1;
     };
-    let lines: Vec<String> = std::io::stdin()
-        .lock()
-        .lines()
-        .map_while(Result::ok)
-        .collect();
+    let lines = match read_updates(std::io::stdin().lock()) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("sc-forge pre-receive: refusing the push: {e}");
+            return 1;
+        }
+    };
     let (default_branch, live) = match lookup(Path::new(&data), id) {
         Ok(x) => x,
         Err(e) => {
@@ -124,6 +141,28 @@ mod tests {
         for bad in ["", "onlyone", "a b", "a b "] {
             assert_eq!(decide(&[bad.to_string()], "main", true).len(), 1, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn unreadable_or_non_utf8_update_lines_refuse_the_whole_push() {
+        assert_eq!(
+            read_updates(&b"a b refs/heads/x\nc d refs/tags/y\n"[..])
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            read_updates(&b"a b refs/heads/ok\na b refs/replace/\xff\n"[..]).is_err(),
+            "a bad line must not hide the lines after it"
+        );
+        assert!(read_updates(&b"\xff\na b refs/replace/x\n"[..]).is_err());
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("boom"))
+            }
+        }
+        assert!(read_updates(Broken).is_err());
     }
 
     #[test]

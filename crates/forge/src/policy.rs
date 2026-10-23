@@ -10,6 +10,14 @@ pub fn is_delete(new: &str) -> bool {
     !new.is_empty() && new.bytes().all(|b| b == b'0')
 }
 
+/// Do two branch names name the same branch on a case-insensitive filesystem? Compared by Unicode
+/// lowercase (there, `MAIN` and `Ünï` alias their lowercase forms).
+/// shortcut: Unicode normalization (NFC vs NFD) aliasing on APFS/HFS+ is not handled; production is
+/// Linux (case- and normalization-sensitive), macOS is development only.
+pub fn same_branch_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
 /// May a client push `name` (`old` -> `new`) to a repository whose default branch is
 /// `default_branch`? Only `refs/heads/*` and `refs/tags/*` are writable; `refs/replace/*`,
 /// `refs/forge/*`, `refs/pull/*`, `refs/notes/*` and anything else is refused. The default branch
@@ -17,7 +25,7 @@ pub fn is_delete(new: &str) -> bool {
 /// the loose ref `main`).
 pub fn check_update(name: &str, new: &str, default_branch: &str) -> Result<(), Refusal> {
     if let Some(branch) = name.strip_prefix("refs/heads/") {
-        if is_delete(new) && branch.eq_ignore_ascii_case(default_branch) {
+        if is_delete(new) && same_branch_name(branch, default_branch) {
             return Err(format!("refusing to delete the default branch {branch}"));
         }
         return Ok(());

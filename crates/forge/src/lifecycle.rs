@@ -414,7 +414,7 @@ impl Lifecycle {
             .filter(|r| r.state == "live")
             .ok_or(LifecycleError::Gone)?;
         // Case-insensitive: on a case-insensitive filesystem `MAIN` aliases the loose ref `main`.
-        if current.default_branch.eq_ignore_ascii_case(branch) {
+        if crate::policy::same_branch_name(&current.default_branch, branch) {
             return Err(LifecycleError::GitFailed(
                 "refusing to delete the default branch".into(),
             ));

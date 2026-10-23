@@ -23,6 +23,7 @@ scl-crypto = { path = "../crypto" }
 # these out of other targets stops the Windows workspace check from compiling
 # bundled SQLite for an empty crate.
 [target.'cfg(unix)'.dependencies]
+flate2 = "1.1.10"
 http-body-util = "0.1.5"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server"] }
