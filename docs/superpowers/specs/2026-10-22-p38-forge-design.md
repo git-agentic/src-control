@@ -326,8 +326,13 @@ line (`Status:` and headers), then the body is streamed.
   lock.
 - **Admission control** before any git process: global and per-repo limits on
   concurrent git children, per-process wall-clock timeout, per-process
-  `RLIMIT_CPU`/`RLIMIT_FSIZE`, a free-space reserve checked before accepting a
-  push, and a per-owner byte quota (default off). `receive.maxInputSize` bounds
+  `RLIMIT_CPU`/`RLIMIT_FSIZE`, a free-space **reservation** (not a bare check) and a
+  per-owner byte quota (default off). Before spawning `receive-pack`, admission
+  reserves `min(Content-Length, --max-pack-size)` (the pack cap when the body is
+  chunked) against free space minus the configured reserve, and against the owner
+  quota; it releases the reservation when the push ends and answers 507 `Insufficient
+  Storage` when it cannot reserve, so concurrent pushes cannot each pass a check that
+  together overcommit the disk. `receive.maxInputSize` bounds
   the incoming pack only, so expansion is bounded by the quota and the disk
   reserve; the container applies cgroup memory and PID limits.
 - **Process ownership:** each child runs in its own process group; cancellation,
@@ -350,7 +355,10 @@ Minimum `git` 2.40 in tests; the container pins a current release
   treated as literals with NUL-delimited output (`-z`). Output is size-capped.
 - **Reads:** `for-each-ref`, `rev-parse`, `log`/`rev-list` with a fixed `-z`
   format, `cat-file`, `ls-tree -r -z`, `diff-tree`, `archive --format=zip|tar.gz`.
-- **Contents write** (POST/PUT): validate the path (reject empty, `.`, `..`,
+- **Contents write** (POST/PUT): with `new_branch`, the protection policy applies to the
+  **target** branch (a new branch has no rule), creating it from a protected base is
+  allowed (recorded: 201 with `new_branch` where a write to the protected branch is
+  403), and the base ref is read once and used as the CAS old value. Validate the path (reject empty, `.`, `..`,
   `.git` and its NTFS/HFS aliases, absolute paths; mode 100644 only), `hash-object
   -w`, a temp `GIT_INDEX_FILE` (`read-tree`, `update-index --cacheinfo`,
   `write-tree`), `commit-tree`, then `update-ref <ref> <new> <old>` (zero old id
@@ -465,8 +473,9 @@ unknown sha is 404 (1.26.2). Each has an entry in `departures.json`.
   removal) is removed; and a `deleting` row with neither directory is deleted.
   A repository name is reusable as soon as its row is gone, because directories
   are addressed by immutable id.
-- **Default branch:** PATCH updates the row and bare `HEAD` together; the
-  reconciler repairs a mismatch. A repo is `empty` when `HEAD` does not resolve
+- **Default branch:** PATCH writes bare `HEAD` first, then the row; on a mismatch at
+  startup **the row is the authority** and the reconciler resets `HEAD` from it. A first
+  push to a branch other than the default leaves `empty: true` (recorded). A repo is `empty` when `HEAD` does not resolve
   (computed live). **Repository names** follow the recorded Gitea rules: pattern
   `[A-Za-z0-9._-]`, at most 100 characters, case-insensitive uniqueness per owner
   (a database index on the lower-cased name), `.` and `..` reserved, and the
