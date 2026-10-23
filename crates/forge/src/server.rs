@@ -147,7 +147,9 @@ pub fn validate_public_url(url: &str) -> Result<(), String> {
         .and_then(|r| r.split(['/', '?', '#']).next())
         .unwrap_or("");
     // A host must come first: not empty, and not just a port or user-info.
-    let host_ok = !host.is_empty() && !host.starts_with([':', '@']);
+    // No user-info: credentials in a base URL would leak into every Link header, and the
+    // host after an `@` is easy to get empty.
+    let host_ok = !host.is_empty() && !host.starts_with(':') && !host.contains('@');
     match rest {
         Some(r) if host_ok && r.bytes().all(|b| b.is_ascii_graphic()) => Ok(()),
         _ => Err(format!(
