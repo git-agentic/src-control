@@ -10,8 +10,11 @@
 pub mod admin;
 pub mod api;
 pub mod auth;
+pub mod b64;
 pub mod cgi;
+pub mod content_api;
 pub mod db;
+pub mod gitobj;
 pub mod gitproc;
 pub mod gitread;
 pub mod hook;

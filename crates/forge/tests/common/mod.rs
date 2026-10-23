@@ -261,6 +261,7 @@ impl Srv {
                 args,
                 stdin,
                 identity: Some(&id_),
+                ..Default::default()
             })
             .unwrap();
         assert!(

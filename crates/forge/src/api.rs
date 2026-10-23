@@ -172,6 +172,56 @@ pub(crate) fn paged_with(
     r
 }
 
+/// Like [`paged`], but a page link repeats *every* request parameter, alphabetically by name (what
+/// Gitea does for the commits listing), with `limit` and `page` set to the link's own values.
+pub(crate) fn paged_sorted(
+    ctx: &Ctx,
+    path: &str,
+    total: i64,
+    page: i64,
+    limit: i64,
+    items: Vec<Value>,
+) -> Resp {
+    let mut q: std::collections::BTreeMap<String, String> = ctx
+        .req
+        .query
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (k.to_string(), v.to_string())
+        })
+        .collect();
+    q.insert("limit".into(), limit.to_string());
+    let last = ((total + limit - 1) / limit).max(1);
+    // Gitea builds the links from the clamped page: asking past the end still points `prev` at the
+    // page before the last.
+    let page = page.min(last);
+    let mut url = |p: i64, rel: &str| {
+        q.insert("page".into(), p.to_string());
+        let query: Vec<String> = q.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        format!(
+            "<{}/api/v1{path}?{}>; rel=\"{rel}\"",
+            ctx.app.base,
+            query.join("&")
+        )
+    };
+    let mut links = Vec::new();
+    if page < last {
+        links.push(url(page + 1, "next"));
+        links.push(url(last, "last"));
+    }
+    if page > 1 {
+        links.push(url(1, "first"));
+        links.push(url(page - 1, "prev"));
+    }
+    let mut r = Resp::json(200, &Value::Array(items)).with("x-total-count", total.to_string());
+    if !links.is_empty() {
+        r = r.with("link", links.join(","));
+    }
+    r
+}
+
 /// `GET /version`: the Gitea release whose behaviour this server reproduces.
 pub fn version(_: &mut Ctx) -> Resp {
     Resp::json(200, &json!({"version": GITEA_VERSION}))

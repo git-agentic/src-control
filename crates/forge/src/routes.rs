@@ -9,7 +9,7 @@ use crate::lifecycle::Lifecycle;
 use crate::limits::{Backoff, Gate, Proxies};
 use crate::repos::{self, Access, Perm};
 use crate::scope::{self, Cat, Level, Need};
-use crate::{api, db, repo_api, store};
+use crate::{api, content_api, db, repo_api, store};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -354,6 +354,96 @@ pub static ROUTES: &[Route] = &[
         n(Cat::Repository, Level::Write),
         Repo(Perm::Write),
         repo_api::delete_branch,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/git/refs",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        content_api::list_git_refs,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/git/refs/{ref..}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        content_api::get_git_refs,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/tags",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        content_api::list_tags,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/commits",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        content_api::list_commits,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/git/commits/{sha}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        content_api::get_git_commit,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/git/trees/{sha..}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        content_api::get_git_tree,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/contents",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        content_api::get_contents,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/contents/{p..}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        content_api::get_contents,
+    ),
+    // F3b builds the writes; until then they answer 501 after the scope and permission checks, so
+    // a read-only token still gets its recorded 403.
+    r(
+        "POST",
+        "/repos/{o}/{r}/contents/{p..}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Write),
+        api::not_implemented,
+    ),
+    r(
+        "PUT",
+        "/repos/{o}/{r}/contents/{p..}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Write),
+        api::not_implemented,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/archive/{a..}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        content_api::get_archive,
     ),
 ];
 

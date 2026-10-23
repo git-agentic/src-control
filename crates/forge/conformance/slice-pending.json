@@ -1,6 +1,62 @@
 {
- "B": [25, "GET /api/v1/repos/alice/scoped/contents/README.md"],
- "J": {"defer": [[56, "GET /api/v1/repos/acme/smart/tags"], [57, "GET /api/v1/repos/acme/smart/git/refs/tags"], [59, "GET /api/v1/repos/acme/smart/tags"]]},
- "K": {"defer": [[21, "GET /api/v1/repos/acme/vis/contents"], [26, "GET /api/v1/repos/acme/ghost/contents"], [31, "GET /api/v1/repos/acme/vis/contents"], [36, "GET /api/v1/repos/acme/ghost/contents"], [55, "GET /api/v1/orgs/acme/repos"], [56, "GET /api/v1/orgs/acme/repos?limit=50"]]},
- "N": {"defer": [[6, "GET /api/v1/repos/acme/dflt/contents"]]}
+ "B": {
+  "defer": [
+   [
+    30,
+    "POST /api/v1/repos/alice/scoped/statuses/<sha#2>"
+   ]
+  ]
+ },
+ "D": {
+  "defer": [
+   [
+    13,
+    "GET /api/v1/repos/acme/blank/pulls?state=all"
+   ]
+  ]
+ },
+ "E": {
+  "stop": [
+   42,
+   "KeyError: 'sha'"
+  ],
+  "defer": [
+   [
+    36,
+    "POST /api/v1/repos/acme/hist/contents/new.txt"
+   ],
+   [
+    37,
+    "POST /api/v1/repos/acme/hist/contents/new.txt"
+   ],
+   [
+    38,
+    "PUT /api/v1/repos/acme/hist/contents/README.md"
+   ],
+   [
+    39,
+    "PUT /api/v1/repos/acme/hist/contents/README.md"
+   ],
+   [
+    40,
+    "PUT /api/v1/repos/acme/hist/contents/README.md"
+   ],
+   [
+    41,
+    "POST /api/v1/repos/acme/hist/contents/branch-file.txt"
+   ]
+  ]
+ },
+ "K": {
+  "defer": [
+   [
+    55,
+    "GET /api/v1/orgs/acme/repos"
+   ],
+   [
+    56,
+    "GET /api/v1/orgs/acme/repos?limit=50"
+   ]
+  ]
+ }
 }
