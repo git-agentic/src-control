@@ -22,6 +22,7 @@ pub struct Srv {
     pub base: String,
     /// All-scope token of the site admin `siteadmin`.
     pub admin: String,
+    _data_lock: scl_forge::lifecycle::DirLock,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -106,7 +107,13 @@ impl Srv {
         std_l.set_nonblocking(true).unwrap();
         let addr = std_l.local_addr().unwrap();
         let base = format!("http://{addr}");
-        let mut app = scl_forge::routes::App::new(dir.clone(), &base, Proxies::default(), 4);
+        let data_lock = scl_forge::lifecycle::DirLock::acquire(&dir).unwrap();
+        let git = std::sync::Arc::new(
+            scl_forge::gitproc::Git::new(&dir, scl_forge::gitproc::find_git().expect("git"), 8)
+                .unwrap(),
+        );
+        let life = scl_forge::lifecycle::Lifecycle::new(&dir, git).unwrap();
+        let mut app = scl_forge::routes::App::new(dir.clone(), &base, Proxies::default(), 4, life);
         if let Some(b) = backoff {
             app.backoff = b;
         }
@@ -133,6 +140,7 @@ impl Srv {
             });
         });
         Srv {
+            _data_lock: data_lock,
             addr,
             dir,
             base,

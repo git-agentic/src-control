@@ -16,7 +16,7 @@ pub const GITEA_VERSION: &str = "1.22.6";
 const DEFAULT_PAGE: i64 = 30;
 const MAX_PAGE: i64 = 50;
 
-fn user_json(base: &str, u: &User) -> Value {
+pub(crate) fn user_json(base: &str, u: &User) -> Value {
     json!({
         "id": u.id,
         "login": u.login,
@@ -44,7 +44,7 @@ fn user_json(base: &str, u: &User) -> Value {
     })
 }
 
-fn org_json(base: &str, o: &User) -> Value {
+pub(crate) fn org_json(base: &str, o: &User) -> Value {
     json!({
         "id": o.id,
         "name": o.login,
@@ -60,7 +60,7 @@ fn org_json(base: &str, o: &User) -> Value {
     })
 }
 
-fn no_such_user(ctx: &Ctx, name: &str) -> Resp {
+pub(crate) fn no_such_user(ctx: &Ctx, name: &str) -> Resp {
     error(
         &ctx.app.base,
         404,
@@ -77,12 +77,12 @@ pub fn org_missing(app: &crate::routes::App, name: &str) -> Resp {
     )
 }
 
-fn no_such_org(ctx: &Ctx, name: &str) -> Resp {
+pub(crate) fn no_such_org(ctx: &Ctx, name: &str) -> Resp {
     org_missing(ctx.app, name)
 }
 
 /// A JSON object body; an empty body is `{}`.
-fn body(ctx: &Ctx) -> Result<Value, Resp> {
+pub(crate) fn body(ctx: &Ctx) -> Result<Value, Resp> {
     if ctx.req.body.is_empty() {
         return Ok(json!({}));
     }
@@ -92,11 +92,11 @@ fn body(ctx: &Ctx) -> Result<Value, Resp> {
     }
 }
 
-fn str_field(v: &Value, key: &str) -> Option<String> {
+pub(crate) fn str_field(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(String::from)
 }
 
-fn page_params(ctx: &Ctx) -> (i64, i64) {
+pub(crate) fn page_params(ctx: &Ctx) -> (i64, i64) {
     let num = |k: &str| ctx.req.param(k).and_then(|v| v.parse::<i64>().ok());
     // Page is clamped so offset arithmetic cannot overflow.
     let page = num("page")
@@ -111,7 +111,14 @@ fn page_params(ctx: &Ctx) -> (i64, i64) {
 }
 
 /// 200 with `X-Total-Count` and Gitea's `Link` header.
-fn paged(ctx: &Ctx, path: &str, total: i64, page: i64, limit: i64, items: Vec<Value>) -> Resp {
+pub(crate) fn paged(
+    ctx: &Ctx,
+    path: &str,
+    total: i64,
+    page: i64,
+    limit: i64,
+    items: Vec<Value>,
+) -> Resp {
     let last = ((total + limit - 1) / limit).max(1);
     let url = |p: i64, rel: &str| {
         format!(
@@ -168,7 +175,7 @@ pub fn get_user(ctx: &mut Ctx) -> Resp {
 
 /// Visible to the caller: public and limited organizations to any signed-in
 /// caller, private ones to owners and site admins.
-fn org_visible(ctx: &Ctx, org: &User) -> rusqlite::Result<bool> {
+pub(crate) fn org_visible(ctx: &Ctx, org: &User) -> rusqlite::Result<bool> {
     let me = &ctx.who.user;
     Ok(org.visibility != "private" || me.is_admin || store::is_org_owner(ctx.conn, org.id, me.id)?)
 }
@@ -236,7 +243,7 @@ fn name_error(label: &str, name: &str, e: NameError) -> String {
     }
 }
 
-fn valid_visibility(v: &str) -> bool {
+pub(crate) fn valid_visibility(v: &str) -> bool {
     matches!(v, "public" | "limited" | "private")
 }
 

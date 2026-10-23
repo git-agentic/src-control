@@ -53,6 +53,9 @@ struct ServeArgs {
     /// Largest JSON request body, in bytes.
     #[arg(long, default_value_t = 1 << 20)]
     max_body_bytes: usize,
+    /// Concurrent `git` child processes (a busy server answers 503 rather than queueing).
+    #[arg(long, default_value_t = 8)]
+    git_concurrency: usize,
     /// Concurrent password verifications (Argon2 is memory-hard).
     #[arg(long, default_value_t = 4)]
     argon2_concurrency: usize,
@@ -226,7 +229,25 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         cidrs,
     };
     db::open_for_serve(&a.data_dir)?;
-    let app = make_app(a.data_dir, &public_url, proxies, a.argon2_concurrency);
+    // One server per data directory: the lock is held until this function returns.
+    let _data_lock =
+        scl_forge::lifecycle::DirLock::acquire(&a.data_dir).map_err(anyhow::Error::msg)?;
+    let git_bin =
+        scl_forge::gitproc::find_git().context("git not found: install git or set SC_FORGE_GIT")?;
+    let git = std::sync::Arc::new(scl_forge::gitproc::Git::new(
+        &a.data_dir,
+        git_bin,
+        a.git_concurrency,
+    )?);
+    let git_version = scl_forge::gitproc::check_version(&git).map_err(anyhow::Error::msg)?;
+    eprintln!("sc-forge: {git_version}");
+    let life = scl_forge::lifecycle::Lifecycle::new(&a.data_dir, git)?;
+    // Resolve whatever a crash left, before the listener is bound.
+    let report = life.reconcile(&db::connect(&a.data_dir)?, scl_forge::timefmt::now())?;
+    if report != scl_forge::lifecycle::Report::default() {
+        eprintln!("sc-forge: reconciled {report:?}");
+    }
+    let app = make_app(a.data_dir, &public_url, proxies, a.argon2_concurrency, life);
     let limits = Limits {
         max_body: a.max_body_bytes,
         max_connections: a.max_connections,

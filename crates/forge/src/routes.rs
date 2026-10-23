@@ -5,9 +5,11 @@
 
 use crate::auth::{self, Authed};
 use crate::http::{error, not_found, Req, Resp};
+use crate::lifecycle::Lifecycle;
 use crate::limits::{Backoff, Gate, Proxies};
+use crate::repos::{self, Access, Perm};
 use crate::scope::{self, Cat, Level, Need};
-use crate::{api, db, store};
+use crate::{api, db, repo_api, store};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -19,11 +21,19 @@ pub struct App {
     pub backoff: Backoff,
     pub gate: Gate,
     pub proxies: Proxies,
+    /// Repository directories, the git runner and per-repository serialization.
+    pub life: Lifecycle,
 }
 
 impl App {
     /// Build the shared state; also computes the dummy password hash so the first unknown login is not slower.
-    pub fn new(data_dir: PathBuf, public_url: &str, proxies: Proxies, argon_slots: usize) -> App {
+    pub fn new(
+        data_dir: PathBuf,
+        public_url: &str,
+        proxies: Proxies,
+        argon_slots: usize,
+        life: Lifecycle,
+    ) -> App {
         scl_crypto::warm_up();
         App {
             data_dir,
@@ -31,6 +41,7 @@ impl App {
             backoff: Backoff::default(),
             gate: Gate::new(argon_slots),
             proxies,
+            life,
         }
     }
 
@@ -60,6 +71,13 @@ pub enum Actor {
     /// The caller must own the organization named by this path parameter, or be a
     /// site admin; a missing organization is a 404.
     OrgOwnerOrSiteAdmin(&'static str),
+    /// A repository route (`{o}`/`{r}`): the caller needs at least this permission. Resolved by
+    /// `repos::resolve`, so a missing, not-live or invisible repository is one 404, and a token
+    /// restricted to public repositories is refused before any existence is revealed.
+    Repo(Perm),
+    /// Like `Repo(Admin)`, but only the owning user, an owner of the owning organization or a
+    /// site admin (not an admin collaborator): deleting the repository.
+    RepoOwner,
 }
 
 /// What a handler receives; authentication and policy already passed.
@@ -68,6 +86,8 @@ pub struct Ctx<'a> {
     pub req: &'a Req,
     pub conn: &'a mut Connection,
     pub who: &'a Authed,
+    /// The caller's standing, set for `Actor::Repo` / `Actor::RepoOwner` routes.
+    pub access: Option<Access>,
     params: Params,
 }
 
@@ -117,7 +137,7 @@ const fn n(cat: Cat, level: Level) -> Option<Need> {
     Some(Need(cat, level))
 }
 
-use Actor::{Any, OrgOwnerOrSiteAdmin, SelfOrSiteAdmin, SiteAdmin};
+use Actor::{Any, OrgOwnerOrSiteAdmin, Repo, RepoOwner, SelfOrSiteAdmin, SiteAdmin};
 use Class::{Password, Token};
 
 /// The route table. F2 onward append rows; a row cannot omit its class,
@@ -212,14 +232,21 @@ pub static ROUTES: &[Route] = &[
         Any,
         api::get_org,
     ),
-    // Declared now so scope and actor checks apply; the handlers arrive with F2.
     r(
-        "POST",
-        "/orgs/{o}/repos",
+        "GET",
+        "/repos/search",
         Token,
-        n(Cat::Organization, Level::Write),
-        OrgOwnerOrSiteAdmin("o"),
-        api::not_implemented,
+        n(Cat::Repository, Level::Read),
+        Any,
+        repo_api::search,
+    ),
+    r(
+        "GET",
+        "/user/repos",
+        Token,
+        n(Cat::User, Level::Read),
+        Any,
+        repo_api::list_user_repos,
     ),
     r(
         "POST",
@@ -227,7 +254,103 @@ pub static ROUTES: &[Route] = &[
         Token,
         n(Cat::User, Level::Write),
         Any,
-        api::not_implemented,
+        repo_api::create_user_repo,
+    ),
+    r(
+        "GET",
+        "/orgs/{o}/repos",
+        Token,
+        n(Cat::Organization, Level::Read),
+        Any,
+        repo_api::list_org_repos,
+    ),
+    r(
+        "POST",
+        "/orgs/{o}/repos",
+        Token,
+        n(Cat::Organization, Level::Write),
+        OrgOwnerOrSiteAdmin("o"),
+        repo_api::create_org_repo,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        repo_api::get_repo,
+    ),
+    r(
+        "PATCH",
+        "/repos/{o}/{r}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Admin),
+        repo_api::patch_repo,
+    ),
+    r(
+        "DELETE",
+        "/repos/{o}/{r}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        RepoOwner,
+        repo_api::delete_repo,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/collaborators",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Admin),
+        repo_api::list_collaborators,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/collaborators/{u}/permission",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Admin),
+        repo_api::collaborator_permission,
+    ),
+    r(
+        "PUT",
+        "/repos/{o}/{r}/collaborators/{u}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Admin),
+        repo_api::put_collaborator,
+    ),
+    r(
+        "DELETE",
+        "/repos/{o}/{r}/collaborators/{u}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Admin),
+        repo_api::delete_collaborator,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/branches",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        repo_api::list_branches,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/branches/{b..}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        repo_api::get_branch,
+    ),
+    r(
+        "DELETE",
+        "/repos/{o}/{r}/branches/{b..}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Write),
+        repo_api::delete_branch,
     ),
 ];
 
@@ -259,7 +382,18 @@ fn match_pattern(pattern: &'static str, path: &str) -> Option<Params> {
         match (ps.next(), xs.next()) {
             (None, None) => return Some(caps),
             (Some(p), Some(x)) => {
-                if let Some(name) = p.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                if let Some(name) = p.strip_prefix('{').and_then(|s| s.strip_suffix("..}")) {
+                    // Tail capture: the rest of the path, which may contain `/` (branch names).
+                    let mut parts = vec![x];
+                    parts.extend(xs.by_ref());
+                    if ps.next().is_some() || parts.iter().any(|p| p.is_empty()) {
+                        return None;
+                    }
+                    let decoded: Option<Vec<String>> =
+                        parts.into_iter().map(percent_decode).collect();
+                    caps.push((name, decoded?.join("/")));
+                    return Some(caps);
+                } else if let Some(name) = p.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
                     if x.is_empty() {
                         return None;
                     }
@@ -327,6 +461,38 @@ fn healthz(app: &App) -> Resp {
     r
 }
 
+/// Resolve the repository a route names and check the caller's standing, in the one order every
+/// repository route follows: a token restricted to public repositories is refused (nothing is
+/// revealed), a missing or invisible repository is the same 404, an insufficient permission is
+/// a 403.
+fn resolve_repo(
+    app: &App,
+    conn: &Connection,
+    who: &Authed,
+    owner: &str,
+    name: &str,
+    min: Perm,
+    owner_only: bool,
+) -> Result<Access, Resp> {
+    if who.scopes.as_deref().is_some_and(scope::public_only) {
+        return Err(error(
+            &app.base,
+            403,
+            "token scope is limited to public repos",
+        ));
+    }
+    match repos::resolve(conn, &who.user, owner, name) {
+        Err(e) => Err(app.internal(&e)),
+        Ok(None) => Err(not_found(&app.base, "The target couldn't be found.", None)),
+        Ok(Some(a)) if a.perm < min || (owner_only && !a.is_owner) => Err(error(
+            &app.base,
+            403,
+            "You do not have permission to perform this action",
+        )),
+        Ok(Some(a)) => Ok(a),
+    }
+}
+
 /// Handle one request end to end. Blocking (SQLite, Argon2): the server runs it
 /// on a blocking thread.
 pub fn dispatch(app: &App, req: &Req) -> Resp {
@@ -388,6 +554,7 @@ pub fn dispatch(app: &App, req: &Req) -> Resp {
             .map(|(_, v)| v.as_str())
             .unwrap_or("")
     };
+    let mut access: Option<Access> = None;
     let denied = match route.actor {
         Actor::Any => None,
         Actor::SiteAdmin => {
@@ -396,6 +563,19 @@ pub fn dispatch(app: &App, req: &Req) -> Resp {
         Actor::SelfOrSiteAdmin(p) => (!who.user.is_admin
             && !who.user.login.eq_ignore_ascii_case(param(p)))
         .then_some("doer should be the site admin or be same as the contextUser"),
+        Actor::Repo(_) | Actor::RepoOwner => {
+            let (min, owner_only) = match route.actor {
+                Actor::Repo(m) => (m, false),
+                _ => (Perm::Admin, true),
+            };
+            match resolve_repo(app, &conn, &who, param("o"), param("r"), min, owner_only) {
+                Ok(a) => {
+                    access = Some(a);
+                    None
+                }
+                Err(resp) => return resp,
+            }
+        }
         Actor::OrgOwnerOrSiteAdmin(p) => match store::find_by_login(&conn, param(p)) {
             Ok(Some(org)) if org.is_org => match store::is_org_owner(&conn, org.id, who.user.id) {
                 Ok(true) => None,
@@ -419,6 +599,7 @@ pub fn dispatch(app: &App, req: &Req) -> Resp {
         req,
         conn: &mut conn,
         who: &who,
+        access,
         params,
     })
 }

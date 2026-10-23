@@ -231,8 +231,9 @@ pub fn make_app(
     public_url: &str,
     proxies: Proxies,
     argon_slots: usize,
+    life: crate::lifecycle::Lifecycle,
 ) -> Arc<App> {
-    Arc::new(App::new(data_dir, public_url, proxies, argon_slots))
+    Arc::new(App::new(data_dir, public_url, proxies, argon_slots, life))
 }
 
 #[cfg(test)]
