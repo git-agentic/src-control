@@ -910,6 +910,16 @@ def scan_fixtures(out, secret_values):
     return hits
 
 
+def dump_fixture(obj, f):
+    """Write a scenario fixture compactly: the header keys on one line, then one exchange per line, so a
+    diff still reads per exchange but the file is roughly half the size of indented JSON."""
+    head = {k: v for k, v in obj.items() if k != "exchanges"}
+    h = J.dumps(head, separators=(",", ":"))[:-1]
+    f.write(h + (',' if head else '') + '"exchanges":[\n')
+    f.write(",\n".join(J.dumps(e, separators=(",", ":")) for e in obj["exchanges"]))
+    f.write("\n]}\n")
+
+
 def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
     """Run every scenario in order (they read earlier state); `only` filters what is reported/written.
 
@@ -983,8 +993,7 @@ def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
         if c.mode == "record":
             os.makedirs(out, exist_ok=True)
             with open(os.path.join(out, fname), "w") as f:
-                J.dump({"scenario": sid, "title": slug, "error": err, "exchanges": c.ex}, f, indent=2)
-                f.write("\n")
+                dump_fixture({"scenario": sid, "title": slug, "error": err, "exchanges": c.ex}, f)
             summary.append((sid, slug, "ERROR" if err else "ok", [err] if err else [], len(c.ex), dt))
             continue
         lines, nfail = [], 0
@@ -1136,6 +1145,41 @@ def cmd_show(a):
     return 0
 
 
+def cmd_selftest(a):
+    """Offline checks of the fixture writer: it round-trips awkward values, and every stored fixture is exactly
+    what `dump_fixture` would write (so a hand-edited or re-indented file is caught)."""
+    import io
+    sample = {"scenario": "Z", "title": "t", "error": "line1\nline2 \u00e4 \"q\"", "exchanges": [
+        {"kind": "http", "method": "GET", "path": "/a?b=1&c=\u00e4", "status": 200, "body": {"k": [1, 2.5, None, True, "x\ty"]}},
+        {"kind": "note", "key": "n", "value": {"nested": {"a": []}}}]}
+    for obj in (sample, dict(sample, exchanges=[])):
+        buf = io.StringIO()
+        dump_fixture(obj, buf)
+        text = buf.getvalue()
+        assert J.loads(text) == obj, "round trip"
+        assert text.endswith("]}\n"), "ends the object on its own line"
+        n = len(obj["exchanges"])
+        assert text.count("\n") == (n + 2 if n else 3), "header line, one line per exchange, closing line"
+        assert all("\n" not in J.dumps(e) for e in obj["exchanges"])
+    bad = []
+    for d in sorted(os.listdir(a.fixtures_root)):
+        full = os.path.join(a.fixtures_root, d)
+        if not os.path.isdir(full):
+            continue
+        for fn in sorted(os.listdir(full)):
+            if not fn.endswith(".json") or fn == "meta.json":
+                continue
+            raw = open(os.path.join(full, fn)).read()
+            buf = io.StringIO()
+            dump_fixture(J.loads(raw), buf)
+            if buf.getvalue() != raw:
+                bad.append(f"{d}/{fn}")
+    for b in bad:
+        print(f"not in canonical compact form: {b}")
+    print("selftest ok" if not bad else f"selftest FAILED: {len(bad)} file(s)")
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="run.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1158,13 +1202,15 @@ def main():
     p = sub.add_parser("diff")
     p.add_argument("a")
     p.add_argument("b")
+    p = sub.add_parser("selftest", help="offline checks of the fixture writer and the stored fixtures")
+    p.add_argument("--fixtures-root", dest="fixtures_root", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
     p = sub.add_parser("show")
     p.add_argument("dir")
     p.add_argument("--only")
     p.add_argument("--body", action="store_true")
     p.add_argument("--limit", type=int, default=600)
     a = ap.parse_args()
-    sys.exit({"record": cmd_run, "check": cmd_run, "diff": cmd_diff, "show": cmd_show}[a.cmd](a))
+    sys.exit({"record": cmd_run, "check": cmd_run, "diff": cmd_diff, "show": cmd_show, "selftest": cmd_selftest}[a.cmd](a))
 
 
 # =========================================================================== scenarios

@@ -7,7 +7,8 @@ serves, **recorded from real Gitea** rather than written by hand. A scenario run
 - `check` runs the same scenarios against any server and compares the result with the fixtures.
 - `diff` compares two fixture directories offline, for example `1.22.6` against `1.26.2`.
 
-`show` prints a readable digest of a fixture directory. Everything is Python 3 standard library plus
+`show` prints a readable digest of a fixture directory. `selftest` (offline, run by `forge-check.sh`) checks that the compact fixture writer round-trips and that
+every stored fixture is exactly what it would write. Everything is Python 3 standard library plus
 `git` and (for recording) Docker. Always run Python as `python3 -I`.
 
 ## Record against real Gitea

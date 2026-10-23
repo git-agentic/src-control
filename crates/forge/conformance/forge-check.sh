@@ -5,6 +5,8 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
+# Offline: the fixture writer round-trips and every stored fixture is in canonical compact form.
+python3 -I "$here/run.py" selftest
 cargo build --quiet --manifest-path "$root/Cargo.toml" -p scl-forge
 bin="${CARGO_TARGET_DIR:-$root/target}/debug/sc-forge"
 data="$(mktemp -d)"
