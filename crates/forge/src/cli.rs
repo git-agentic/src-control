@@ -18,6 +18,11 @@ struct Cli {
 enum Cmd {
     /// Run the HTTP server.
     Serve(ServeArgs),
+    /// Internal: run a git hook (`pre-receive`); normally reached through the hooks symlink.
+    Hook {
+        #[arg(value_parser = ["pre-receive"])]
+        name: String,
+    },
     /// Operate on the data directory directly (no network).
     Admin {
         #[command(subcommand)]
@@ -129,8 +134,18 @@ enum OrgCmd {
 
 /// Parse the command line and run `serve` or an `admin` command.
 pub fn run() -> Result<()> {
+    // git runs `<data>/hooks/pre-receive`, a symlink to this binary: dispatch on argv[0] before any
+    // argument parsing, so the hook needs no shell and no quoting.
+    if std::env::args_os().next().is_some_and(|a| {
+        std::path::Path::new(&a)
+            .file_name()
+            .is_some_and(|n| n == "pre-receive")
+    }) {
+        std::process::exit(scl_forge::hook::run());
+    }
     match Cli::parse().cmd {
         Cmd::Serve(a) => run_serve(a),
+        Cmd::Hook { .. } => std::process::exit(scl_forge::hook::run()),
         Cmd::Admin { cmd } => run_admin(cmd),
     }
 }
