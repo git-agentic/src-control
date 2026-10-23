@@ -35,9 +35,15 @@ fn web_base(ctx: &Ctx, a: &Access) -> String {
     format!("{}/{}/{}", ctx.app.base, a.repo.owner, a.repo.name)
 }
 
-/// A query parameter, percent-decoded.
-fn param(ctx: &Ctx, k: &str) -> Option<String> {
-    ctx.req.param(k).and_then(percent_decode)
+/// Like [`param`], but a value that is not valid percent-encoded UTF-8 is a 400, not "absent": a
+/// client that named a revision must not be served the default branch instead.
+fn named_param(ctx: &Ctx, k: &str) -> Result<Option<String>, Resp> {
+    match ctx.req.param(k) {
+        None => Ok(None),
+        Some(v) => percent_decode(v)
+            .map(Some)
+            .ok_or_else(|| error(&ctx.app.base, 400, &format!("invalid encoding of `{k}`"))),
+    }
 }
 
 fn flag(ctx: &Ctx, k: &str, default: bool) -> bool {
@@ -159,6 +165,7 @@ fn commit_json(
         },
         "author": users.actor(&c.author.email)?,
         "committer": users.actor(&c.committer.email)?,
+        // Recorded Gitea quirk: a parent's `created` is the child's committer time.
         "parents": c.parents.iter().map(|p| commit_meta(ctx, a, p, c.committer.when)).collect::<Vec<_>>(),
         "files": files.map(|fs| fs.iter().map(|f| json!({"filename": f.name, "status": f.status})).collect::<Vec<_>>()),
         "stats": stats.map(|s| json!({"total": s.additions + s.deletions, "additions": s.additions, "deletions": s.deletions})),
@@ -190,14 +197,26 @@ fn load_changes(
 
 fn ref_json(ctx: &Ctx, a: &Access, r: &RefRow) -> Value {
     let api = api_base(ctx, a);
-    let tag = r.kind == "tag";
+    let seg = match r.kind.as_str() {
+        "tag" => "tags",
+        "tree" => "trees",
+        "blob" => "blobs",
+        _ => "commits",
+    };
+    // A ref name may hold characters that are special in a URL (`#`, `%`, `?`).
+    let name = r
+        .name
+        .split('/')
+        .map(pct_encode)
+        .collect::<Vec<_>>()
+        .join("/");
     json!({
         "ref": r.name,
-        "url": format!("{api}/git/{}", r.name),
+        "url": format!("{api}/git/{name}"),
         "object": {
             "type": r.kind,
             "sha": r.oid,
-            "url": format!("{api}/git/{}/{}", if tag { "tags" } else { "commits" }, r.oid),
+            "url": format!("{api}/git/{seg}/{}", r.oid),
         },
     })
 }
@@ -316,12 +335,18 @@ pub fn list_commits(ctx: &mut Ctx) -> Resp {
     read_locked(ctx, &a, |ctx| list_commits_inner(ctx, &a))
 }
 
+/// Changed files one `commits` response may carry in total (a few hundred bytes of JSON each).
+const MAX_PAGE_FILES: usize = 50_000;
+
 fn list_commits_inner(ctx: &Ctx, a: &Access) -> Resp {
-    if param(ctx, "not").is_some() {
+    if ctx.req.param("not").is_some() {
         // Recorded Gitea filters by it; ignoring it would serve unfiltered history.
         return error(&ctx.app.base, 400, "the `not` parameter is not supported");
     }
-    let named = param(ctx, "sha").filter(|v| !v.is_empty());
+    let named = match named_param(ctx, "sha") {
+        Ok(v) => v.filter(|v| !v.is_empty()),
+        Err(r) => return r,
+    };
     let empty = || error(&ctx.app.base, 409, "Git Repository is empty.");
     if named.is_none() {
         match is_empty(ctx, a) {
@@ -331,7 +356,10 @@ fn list_commits_inner(ctx: &Ctx, a: &Access) -> Resp {
         }
     }
     let rev = named.unwrap_or_else(|| a.repo.default_branch.clone());
-    let path = param(ctx, "path").filter(|p| !p.is_empty());
+    let path = match named_param(ctx, "path") {
+        Ok(v) => v.filter(|p| !p.is_empty()),
+        Err(r) => return r,
+    };
     if let Some(p) = &path {
         if !gitobj::valid_path(p) {
             return error(&ctx.app.base, 422, "invalid path");
@@ -377,11 +405,26 @@ fn list_commits_inner(ctx: &Ctx, a: &Access) -> Resp {
     );
     let mut users = Users::new(ctx);
     let mut items = Vec::with_capacity(commits.len());
+    // The per-command output cap does not bound a page of up to 50 commits that each list a huge
+    // change set, so the files kept for one response are bounded as a whole.
+    let mut files_left = MAX_PAGE_FILES;
     for c in &commits {
         let changes = match load_changes(ctx, a, c, want_files, want_stat) {
             Ok(c) => c,
             Err(r) => return r,
         };
+        let n = changes
+            .as_ref()
+            .and_then(|c| c.0.as_ref())
+            .map_or(0, Vec::len);
+        if n > files_left {
+            return error(
+                &ctx.app.base,
+                413,
+                "the changed files of this page are too many",
+            );
+        }
+        files_left -= n;
         match commit_json(ctx, a, &mut users, c, want_verif, changes) {
             Ok(v) => items.push(v),
             Err(r) => return r,
@@ -629,7 +672,10 @@ pub fn get_contents(ctx: &mut Ctx) -> Resp {
     read_locked(ctx, &a, |ctx| {
         // Recorded: an empty repository lists nothing and answers `[]` for any path. A named ref
         // that exists wins over an unborn default branch (a repository holding only `feat`).
-        let named = param(ctx, "ref").filter(|v| !v.is_empty());
+        let named = match named_param(ctx, "ref") {
+            Ok(v) => v.filter(|v| !v.is_empty()),
+            Err(r) => return r,
+        };
         if named.is_none() {
             match is_empty(ctx, &a) {
                 Ok(true) => return Resp::json(200, &json!([])),

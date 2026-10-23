@@ -846,6 +846,8 @@ gets its recorded 403.
   would otherwise be ignored silently). A file name that is not valid UTF-8 is listed with U+FFFD in place of the bad
   bytes and cannot be fetched by that name; names with a control character are listed but their URL is 404.
   The `.patch` of a merge commit is its diff against the first parent in mailbox form (`format-patch` skips merges).
+  A `commits` page may carry at most 50,000 changed files in total (413 over). `submodule_git_url` is always `null`
+  (Gitea reads it from `.gitmodules`; not built). A parent's `created` is the child's committer time, as recorded.
 - **Empty repositories.** "Empty" is "the default branch does not resolve", as for the `empty` field. An unnamed read of an
   unborn default is the recorded empty answer even when other branches exist (Gitea would have adopted the first pushed
   branch as default, see N#13); a *named* `sha`/`ref` that exists is served, and a named one that does not is 404 unless the

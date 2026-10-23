@@ -462,6 +462,48 @@ fn an_unborn_default_branch_does_not_hide_a_pushed_branch_and_a_busy_runner_is_5
 }
 
 #[test]
+fn malformed_encodings_are_400_and_ref_urls_follow_the_object_type() {
+    let w = world();
+    for p in ["/commits?sha=%FF", "/contents?ref=%FF", "/commits?path=%FF"] {
+        assert_eq!(w.get(p).status, 400, "{p}");
+    }
+    // a lightweight tag on a tree, and a branch whose name needs escaping
+    let work = w.dir.join("w");
+    let tree = git(&work, &["rev-parse", "main^{tree}"]);
+    git(&work, &["tag", "treetag", &tree]);
+    git(&work, &["branch", "rel#1", "main"]);
+    let url = format!("{}/siteadmin/smart.git", w.s.base);
+    let h = format!("http.extraHeader=Authorization: {}", w.auth);
+    git(&work, &["-c", &h, "push", "-q", &url, "rel#1", "treetag"]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while w.s.app.life.registry.live() != 0 && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let refs = w.json("/git/refs");
+    let by = |name: &str| {
+        refs.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["ref"] == name)
+            .unwrap_or_else(|| panic!("{name} in {refs}"))
+            .clone()
+    };
+    let t = by("refs/tags/treetag");
+    assert_eq!(t["object"]["type"], "tree");
+    assert!(
+        t["object"]["url"].as_str().unwrap().contains("/git/trees/"),
+        "{t}"
+    );
+    assert!(
+        by("refs/heads/rel#1")["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/git/refs/heads/rel%231"),
+        "{refs}"
+    );
+}
+
+#[test]
 fn a_reader_without_access_gets_the_same_404_as_for_a_missing_repository() {
     let w = world();
     let pw = w.s.mk_user("mallory");
