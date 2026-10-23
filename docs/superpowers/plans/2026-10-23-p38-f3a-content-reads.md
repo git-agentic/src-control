@@ -9,7 +9,7 @@ plan, review and PR. Spec: "Server-side Git operations". Shapes are the recorded
 
 | Route | Recorded in | Notes |
 |---|---|---|
-| `GET /repos/{o}/{r}/git/refs`, `git/refs/{heads|tags}[/{name}]` | D, E, J | list of `{ref, url, object{type,sha,url}}`; a missing exact ref is 404 `The target couldn't be found.`; an empty repo 404 on the list |
+| `GET /repos/{o}/{r}/git/refs`, `git/refs/{heads\|tags}[/{name}]` | D, E, J | list of `{ref, url, object{type,sha,url}}`; a missing exact ref is 404 `The target couldn't be found.`; an empty repo 404 on the list |
 | `GET /tags` | D, J | tag objects (name, message, id, commit, zipball/tarball urls); `X-Total-Count`, paging |
 | `GET /commits` (`sha`, `path`, `stat`, `files`, `verification`, `not`, paging) | D, E | `X-Total-Count`, 409 `Git Repository is empty.` for an empty repo, 500 `object does not exist [id: nope, rel_path: ]` for an unknown ref (recorded) |
 | `GET /git/commits/{sha}`, `.diff`, `.patch` | D, E | `files`/`stats` filled, `verification` object; `.diff`/`.patch` are `text/plain` git output |
