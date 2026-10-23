@@ -49,6 +49,27 @@ const MIGRATIONS: &[&str] = &[
         expires_unix INTEGER,
         UNIQUE (user_id, name)
     );",
+    // 2: repositories (named by immutable id on disk) and collaborators. `private` is not
+    // stored: every repository is private.
+    "CREATE TABLE repos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER NOT NULL REFERENCES users(id),
+        name TEXT NOT NULL,
+        lower_name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        website TEXT NOT NULL DEFAULT '',
+        default_branch TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('creating', 'live', 'deleting')),
+        created_unix INTEGER NOT NULL,
+        updated_unix INTEGER NOT NULL,
+        UNIQUE (owner_id, lower_name)
+    );
+    CREATE TABLE collaborators (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        mode TEXT NOT NULL CHECK (mode IN ('read', 'write', 'admin')),
+        PRIMARY KEY (repo_id, user_id)
+    );",
 ];
 
 /// Database failures a caller reports to the operator.

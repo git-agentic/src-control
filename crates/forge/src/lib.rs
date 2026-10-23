@@ -12,6 +12,8 @@ pub mod db;
 pub mod http;
 pub mod limits;
 pub mod names;
+pub mod refname;
+pub mod repos;
 pub mod routes;
 pub mod scope;
 pub mod server;

@@ -96,3 +96,96 @@ mod tests {
         assert!(check(&"x".repeat(40)).is_ok());
     }
 }
+
+/// Why a repository name was refused (Gitea's texts are built by the caller).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RepoNameError {
+    Empty,
+    /// `.` or `..`.
+    Reserved,
+    /// A forbidden suffix such as `*.git`.
+    Pattern(&'static str),
+    /// A character outside `[A-Za-z0-9._-]`.
+    BadChars,
+    TooLong,
+}
+
+const REPO_MAX_LEN: usize = 100;
+const REPO_SUFFIXES: [&str; 4] = [".git", ".wiki", ".rss", ".atom"];
+
+/// Validate a repository name by the recorded Gitea rules: `[A-Za-z0-9._-]`, at most 100
+/// characters, `.` and `..` reserved, and the suffixes `.git`, `.wiki`, `.rss`, `.atom` refused.
+/// A leading `.` or `-`, `a..b` and words like `api` or `admin` are accepted (recorded 201):
+/// repositories live on disk under their immutable id, never under their name.
+pub fn check_repo(name: &str) -> Result<(), RepoNameError> {
+    if name.is_empty() {
+        return Err(RepoNameError::Empty);
+    }
+    if name.chars().count() > REPO_MAX_LEN {
+        return Err(RepoNameError::TooLong);
+    }
+    if name == "." || name == ".." {
+        return Err(RepoNameError::Reserved);
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(RepoNameError::BadChars);
+    }
+    let lower = name.to_ascii_lowercase();
+    for suffix in REPO_SUFFIXES {
+        if lower.ends_with(suffix) {
+            return Err(RepoNameError::Pattern(match suffix {
+                ".git" => "*.git",
+                ".wiki" => "*.wiki",
+                ".rss" => "*.rss",
+                _ => "*.atom",
+            }));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod repo_tests {
+    use super::*;
+
+    #[test]
+    fn follows_the_recorded_repo_rules() {
+        // Recorded 201 (scenario M): these names are accepted.
+        for ok in [
+            "Mixed",
+            ".hidden",
+            "-dash",
+            "a..b",
+            "api",
+            "admin",
+            "user",
+            "assets",
+            "ok_name-1.x",
+        ] {
+            assert_eq!(check_repo(ok), Ok(()), "{ok}");
+        }
+        assert_eq!(check_repo("."), Err(RepoNameError::Reserved));
+        assert_eq!(check_repo(".."), Err(RepoNameError::Reserved));
+        assert_eq!(
+            check_repo("trail.git"),
+            Err(RepoNameError::Pattern("*.git"))
+        );
+        assert_eq!(
+            check_repo("wiki.wiki"),
+            Err(RepoNameError::Pattern("*.wiki"))
+        );
+        assert_eq!(check_repo("feed.RSS"), Err(RepoNameError::Pattern("*.rss")));
+        assert_eq!(
+            check_repo("feed.atom"),
+            Err(RepoNameError::Pattern("*.atom"))
+        );
+        assert_eq!(check_repo("a b"), Err(RepoNameError::BadChars));
+        assert_eq!(check_repo("\u{fc}n\u{ef}"), Err(RepoNameError::BadChars));
+        assert_eq!(check_repo(&"x".repeat(101)), Err(RepoNameError::TooLong));
+        assert_eq!(check_repo(&"x".repeat(100)), Ok(()));
+        assert_eq!(check_repo(""), Err(RepoNameError::Empty));
+    }
+}
