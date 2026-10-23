@@ -200,7 +200,8 @@ fn run_admin(cmd: AdminCmd) -> Result<()> {
 }
 
 fn run_serve(a: ServeArgs) -> Result<()> {
-    scl_forge::server::validate_public_url(&a.public_url).map_err(anyhow::Error::msg)?;
+    let public_url =
+        scl_forge::server::validate_public_url(&a.public_url).map_err(anyhow::Error::msg)?;
     if a.max_connections == 0 {
         bail!("--max-connections must be at least 1");
     }
@@ -225,7 +226,7 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         cidrs,
     };
     db::open_for_serve(&a.data_dir)?;
-    let app = make_app(a.data_dir, &a.public_url, proxies, a.argon2_concurrency);
+    let app = make_app(a.data_dir, &public_url, proxies, a.argon2_concurrency);
     let limits = Limits {
         max_body: a.max_body_bytes,
         max_connections: a.max_connections,
