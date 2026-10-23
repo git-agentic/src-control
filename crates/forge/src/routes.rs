@@ -23,6 +23,8 @@ pub struct App {
     pub proxies: Proxies,
     /// Repository directories, the git runner and per-repository serialization.
     pub life: Lifecycle,
+    /// Admission and limits of the git transport.
+    pub transports: crate::cgi::Transports,
 }
 
 impl App {
@@ -42,6 +44,7 @@ impl App {
             gate: Gate::new(argon_slots),
             proxies,
             life,
+            transports: crate::cgi::Transports::new(crate::cgi::Cfg::default()),
         }
     }
 

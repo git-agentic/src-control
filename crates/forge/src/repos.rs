@@ -139,6 +139,15 @@ pub fn set_state(
     )? > 0)
 }
 
+/// Stamp `updated_unix` after a push (the server does it itself; no post-receive hook exists).
+pub fn touch(conn: &Connection, id: i64, now: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE repos SET updated_unix = ?2 WHERE id = ?1 AND state = 'live'",
+        params![id, now],
+    )?;
+    Ok(())
+}
+
 /// Delete the row (collaborators cascade).
 pub fn delete_row(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM repos WHERE id = ?1", [id])?;

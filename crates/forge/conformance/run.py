@@ -369,7 +369,7 @@ def dep_indexes(spec, expected):
 EXPECT_KEYS = {
     "http": {"status", "message_contains", "fields", "ignore_fields", "ignore_headers", "ignore_body", "skip"},
     "git": {"ok", "message_contains", "skip"},
-    "note": {"value", "skip"},
+    "note": {"value", "value_prefix", "skip"},
 }
 
 
@@ -461,7 +461,13 @@ def apply_override(exp, act, ov, bij, match=None):
     if act["kind"] == "note":
         if "value" in e and not eq_val(e["value"], act["value"], bij):
             d.append(("fail", f"unexpected: note {act['key']} {e['value']!r} expected, got {act['value']!r}"))
+        if "value_prefix" in e and not (isinstance(act["value"], str) and act["value"].startswith(e["value_prefix"])):
+            d.append(("fail", f"unexpected: note {act['key']} should start with {e['value_prefix']!r}, got {act['value']!r}"))
     elif act["kind"] == "git":
+        # a departure replaces the outcome, never the command: the step must still run the recorded line
+        bij.new_exchange()
+        if exp.get("cmd") is not None and not eq_str(exp["cmd"], act["cmd"], bij, [], ""):
+            return [("fail", f"git command {exp['cmd']!r} expected, got {act['cmd']!r}")]
         if "ok" in e and act["ok"] != e["ok"]:
             d.append(("fail", f"unexpected: git ok={e['ok']} expected, got {act['ok']}: {act['output'][:160]!r}"))
         txt = act["output"].lower()
@@ -525,6 +531,7 @@ class Ctx:
         self.cursor = 0
         self.diffs = []  # (scenario, index, label, [(level, text)])
         self.overrides = {}  # fixture index -> departure entry, check mode only
+        self.defers = {}  # fixture index -> exchange identity: runs, but a mismatch waits for a later slice
         self.verbose = False
         self.base_ready = False
         self.first_read = None
@@ -560,7 +567,7 @@ class Ctx:
         return re.sub(r"\b%s\b" % re.escape(self.admin_user), "<admin>", s)
 
     def ns(self, s):
-        s = re.sub(r"(://)[^/@\s\"':]*:[^/@\s\"']*@", r"\1<creds>@", self.scrub(s))  # user:password@ only (ssh://git@ stays)
+        s = re.sub(r"https?(://)[^/@\s\"':?#]*:[^/@\s\"'?#]*@", r"http\1<creds>@", self.scrub(s))  # user:password@ only (ssh://git@ stays); https checks like http
         # pkt-line adverts glue a 4-hex length in front of the id ("0146<sha> HEAD"), so \b misses it
         s = re.sub(r"[0-9a-f]{40}(?= (?:HEAD|refs/|capabilities))", lambda m: self.sha_ph(m.group(0)), s)
         s = SHA_RE.sub(lambda m: self.sha_ph(m.group(0)), s)
@@ -620,6 +627,14 @@ class Ctx:
                     ds = apply_override(exp, ex, self.overrides[i], self.bij)
                 else:
                     ds = cmp_exchange(exp, ex, self.bij)
+                if i in self.defers:
+                    bad = [x for x in ds if x[0] == "fail"]
+                    if ex_ident(exp) != ex_ident(ex) or exp["kind"] != ex["kind"]:
+                        # a deferral waits for a later slice's *answer*; the call itself stays pinned
+                        ds = [("fail", f"deferred exchange is {ex_ident(exp)!r} in the fixture but the scenario made {ex_ident(ex)!r}")]
+                    else:
+                        ds = ([("honoured", "deferred: this route belongs to a later slice")] if bad else
+                              [("fail", "deferred exchange now passes: remove it from the pending file")])
                 self.diffs.append((i, ex_label(ex), ds))
 
     def note(self, key, value, strict=True):
@@ -938,7 +953,7 @@ def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
         c.ex, c.cursor, c.diffs = [], 0, []
         c.reset_scenario()
         c.expected, skip, stale, deferred, ndeferred, stop = [], None, [], None, 0, None
-        c.overrides, c.web_skipped = {}, 0
+        c.overrides, c.web_skipped, c.defers = {}, 0, {}
         if c.mode == "check" and selected:
             fp = os.path.join(fixtures, fname)
             if not os.path.exists(fp):
@@ -973,8 +988,17 @@ def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
                                      f"cannot match the recorded one, so it needs ignore_body with a reason")
                         continue
                     c.overrides[i] = dict(dep, match=matches[k] or got)
-            if sid in pending:
-                deferred, stop = pending[sid] if isinstance(pending[sid], list) else (pending[sid], None)
+            for i, ident in (pending.get(sid) or {}).get("defer", []) if isinstance(pending.get(sid), dict) else []:
+                if not 0 <= i < len(c.expected) or ex_ident(c.expected[i]) != ident:
+                    stale.append(f"stale defer #{i}: {fname} has {ex_ident(c.expected[i])!r} there, the pending file says {ident!r}"
+                                 if 0 <= i < len(c.expected) else f"stale defer #{i}: {fname} has no such exchange")
+                else:
+                    c.defers[i] = ident
+            spec = pending.get(sid)
+            if isinstance(spec, dict):  # {"stop": [N, text], "defer": [[index, "METHOD /path"], ...]}
+                spec = spec.get("stop")
+            if spec is not None:
+                deferred, stop = spec if isinstance(spec, list) else (spec, None)
                 ndeferred = max(0, len(c.expected) - deferred)
                 if not 0 <= deferred < len(c.expected):
                     # nothing is deferred: the entry is stale (the scenario is whole) and must not hide an error

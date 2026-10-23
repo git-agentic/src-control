@@ -24,6 +24,8 @@ pub struct Srv {
     pub admin: String,
     /// The runner the server uses (tests occupy its slots to stage a busy server).
     pub runner: std::sync::Arc<scl_forge::gitproc::Git>,
+    /// The shared server state (tests read the transport registry).
+    pub app: std::sync::Arc<scl_forge::routes::App>,
     _data_lock: scl_forge::lifecycle::DirLock,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -87,17 +89,23 @@ impl Srv {
 
     /// Start with a runner of `slots` concurrent git children and the given admission deadline.
     pub fn start_git(slots: usize, admission: std::time::Duration) -> Srv {
-        Srv::start_full(Limits::default(), None, Some((slots, admission)))
+        Srv::start_full(Limits::default(), None, Some((slots, admission)), None)
     }
 
     fn start_cfg(limits: Limits, backoff: Option<scl_forge::limits::Backoff>) -> Srv {
-        Srv::start_full(limits, backoff, None)
+        Srv::start_full(limits, backoff, None, None)
+    }
+
+    /// Start with custom git transport limits.
+    pub fn start_transport(cfg: scl_forge::cgi::Cfg) -> Srv {
+        Srv::start_full(Limits::default(), None, None, Some(cfg))
     }
 
     fn start_full(
         limits: Limits,
         backoff: Option<scl_forge::limits::Backoff>,
         git_cfg: Option<(usize, std::time::Duration)>,
+        tcfg: Option<scl_forge::cgi::Cfg>,
     ) -> Srv {
         let dir = std::env::temp_dir().join(format!(
             "scl-forge-e2e-{}-{}",
@@ -129,12 +137,21 @@ impl Srv {
                 .unwrap()
                 .with_limits(std::time::Duration::from_secs(30), admission, 16 << 20),
         );
+        scl_forge::hook::install(
+            git.data_dir(),
+            std::path::Path::new(env!("CARGO_BIN_EXE_sc-forge")),
+        )
+        .unwrap();
         let life = scl_forge::lifecycle::Lifecycle::new(&dir, git.clone()).unwrap();
         let mut app = scl_forge::routes::App::new(dir.clone(), &base, Proxies::default(), 4, life);
         if let Some(b) = backoff {
             app.backoff = b;
         }
+        if let Some(c) = tcfg {
+            app.transports = scl_forge::cgi::Transports::new(c);
+        }
         let app = std::sync::Arc::new(app);
+        let app_handle = app.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -158,6 +175,7 @@ impl Srv {
         });
         Srv {
             runner: git,
+            app: app_handle,
             _data_lock: data_lock,
             addr,
             dir,

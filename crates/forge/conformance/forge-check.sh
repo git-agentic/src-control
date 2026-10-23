@@ -25,4 +25,4 @@ for _ in $(seq 50); do
 done
 python3 -I "$here/run.py" check --base-url "http://127.0.0.1:$port" --admin-token "$token" \
   --fixtures "$here/fixtures/1.22.6" --departures "$here/departures.json" --pending "$here/slice-pending.json" \
-  --only A,B,C,L,N,R "$@" || { echo "--- server log"; cat "$data/serve.log"; exit 1; }
+  --only A,B,C,J,K,L,M,N,R,V "$@" || { echo "--- server log"; cat "$data/serve.log"; exit 1; }

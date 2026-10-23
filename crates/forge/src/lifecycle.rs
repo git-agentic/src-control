@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 /// Exclusive hold on the data directory for the life of the process.
 pub struct DirLock(#[allow(dead_code)] File);
@@ -88,6 +89,8 @@ pub struct Report {
 pub struct Lifecycle {
     data_dir: PathBuf,
     pub git: Arc<Git>,
+    /// Live git transports by repository, cancelled by `delete` and at shutdown.
+    pub registry: Arc<crate::registry::Registry>,
     locks: Mutex<HashMap<i64, Arc<RwLock<()>>>>,
     #[cfg(test)]
     crash_at: Mutex<Option<&'static str>>,
@@ -108,6 +111,7 @@ impl Lifecycle {
         Ok(Lifecycle {
             data_dir,
             git,
+            registry: Arc::default(),
             locks: Mutex::default(),
             #[cfg(test)]
             crash_at: Mutex::default(),
@@ -326,9 +330,18 @@ impl Lifecycle {
             return Err(LifecycleError::Gone);
         }
         self.step("marked")?;
+        // The row says `deleting`, so no new transport registers; end the ones running and wait for
+        // them to let go before the directory moves. One that will not end keeps the repository.
+        self.registry.close(repo.id);
+        if !self.registry.wait_idle(repo.id, Duration::from_secs(10)) {
+            self.registry.reopen(repo.id);
+            let _ = repos::set_state(conn, repo.id, "deleting", "live", now);
+            return Err(LifecycleError::Git(GitError::Busy));
+        }
         let (from, to) = (self.repo_dir(repo.id), self.trash_dir(repo.id));
         if let Err(e) = std::fs::rename(&from, &to) {
             // Nothing moved: put the row back so the repository is usable again.
+            self.registry.reopen(repo.id);
             let _ = repos::set_state(conn, repo.id, "deleting", "live", now);
             return Err(e.into());
         }
@@ -343,6 +356,7 @@ impl Lifecycle {
                 repo.id
             );
         }
+        self.registry.forget(repo.id);
         self.locks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -414,7 +428,7 @@ impl Lifecycle {
             .filter(|r| r.state == "live")
             .ok_or(LifecycleError::Gone)?;
         // Case-insensitive: on a case-insensitive filesystem `MAIN` aliases the loose ref `main`.
-        if current.default_branch.eq_ignore_ascii_case(branch) {
+        if crate::policy::same_branch_name(&current.default_branch, branch) {
             return Err(LifecycleError::GitFailed(
                 "refusing to delete the default branch".into(),
             ));

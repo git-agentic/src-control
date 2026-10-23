@@ -18,6 +18,11 @@ struct Cli {
 enum Cmd {
     /// Run the HTTP server.
     Serve(ServeArgs),
+    /// Internal: run a git hook (`pre-receive`); normally reached through the hooks symlink.
+    Hook {
+        #[arg(value_parser = ["pre-receive"])]
+        name: String,
+    },
     /// Operate on the data directory directly (no network).
     Admin {
         #[command(subcommand)]
@@ -56,6 +61,36 @@ struct ServeArgs {
     /// Concurrent `git` child processes (a busy server answers 503 rather than queueing).
     #[arg(long, default_value_t = 8)]
     git_concurrency: usize,
+    /// Git transports (clone, fetch, push) in flight at once, all repositories.
+    #[arg(long, default_value_t = 64)]
+    max_transports: usize,
+    /// Git transports in flight on one repository.
+    #[arg(long, default_value_t = 16)]
+    max_transports_per_repo: usize,
+    /// Seconds a git request waits for a transport slot before 503.
+    #[arg(long, default_value_t = 30)]
+    admission_wait: u64,
+    /// Wall-clock limit of one git transport, seconds.
+    #[arg(long, default_value_t = 1800)]
+    git_timeout: u64,
+    /// Seconds a git transport may wait on a stalled client.
+    #[arg(long, default_value_t = 120)]
+    git_idle_timeout: u64,
+    /// Largest push, bytes (also git's `receive.maxInputSize`).
+    #[arg(long, default_value_t = 2 << 30)]
+    max_pack_size: u64,
+    /// Largest fetch request, bytes, compressed and inflated.
+    #[arg(long, default_value_t = 16 << 20)]
+    max_request_bytes: u64,
+    /// Disk that must stay free beyond what pushes in flight have reserved, bytes.
+    #[arg(long, default_value_t = 1 << 30)]
+    min_free_bytes: u64,
+    /// Disk reserved up front for a push whose size is not announced, bytes.
+    #[arg(long, default_value_t = 256 << 20)]
+    push_reserve: u64,
+    /// Memory limit of each git transport child, bytes, Linux only (0 = none).
+    #[arg(long, default_value_t = 8 << 30)]
+    git_memory_limit: u64,
     /// Concurrent password verifications (Argon2 is memory-hard).
     #[arg(long, default_value_t = 4)]
     argon2_concurrency: usize,
@@ -129,8 +164,18 @@ enum OrgCmd {
 
 /// Parse the command line and run `serve` or an `admin` command.
 pub fn run() -> Result<()> {
+    // git runs `<data>/hooks/pre-receive`, a symlink to this binary: dispatch on argv[0] before any
+    // argument parsing, so the hook needs no shell and no quoting.
+    if std::env::args_os().next().is_some_and(|a| {
+        std::path::Path::new(&a)
+            .file_name()
+            .is_some_and(|n| n == "pre-receive")
+    }) {
+        std::process::exit(scl_forge::hook::run());
+    }
     match Cli::parse().cmd {
         Cmd::Serve(a) => run_serve(a),
+        Cmd::Hook { .. } => std::process::exit(scl_forge::hook::run()),
         Cmd::Admin { cmd } => run_admin(cmd),
     }
 }
@@ -208,6 +253,22 @@ fn run_serve(a: ServeArgs) -> Result<()> {
     if a.max_connections == 0 {
         bail!("--max-connections must be at least 1");
     }
+    for (flag, v) in [
+        ("--max-transports", a.max_transports as u64),
+        (
+            "--max-transports-per-repo",
+            a.max_transports_per_repo as u64,
+        ),
+        ("--admission-wait", a.admission_wait),
+        ("--git-timeout", a.git_timeout),
+        ("--git-idle-timeout", a.git_idle_timeout),
+        ("--max-pack-size", a.max_pack_size),
+        ("--max-request-bytes", a.max_request_bytes),
+    ] {
+        if v == 0 {
+            bail!("{flag} must be at least 1");
+        }
+    }
     bind_gate(&a.listen, a.behind_proxy, a.allow_plaintext).map_err(anyhow::Error::msg)?;
     let cidrs = a
         .trusted_proxies
@@ -242,13 +303,33 @@ fn run_serve(a: ServeArgs) -> Result<()> {
     )?);
     let git_version = scl_forge::gitproc::check_version(&git).map_err(anyhow::Error::msg)?;
     eprintln!("sc-forge: {git_version}");
+    scl_forge::hook::install(
+        &std::fs::canonicalize(&a.data_dir)?,
+        &std::env::current_exe().context("cannot find the sc-forge binary")?,
+    )?;
     let life = scl_forge::lifecycle::Lifecycle::new(&a.data_dir, git)?;
     // Resolve whatever a crash left, before the listener is bound.
     let report = life.reconcile(&db::connect(&a.data_dir)?, scl_forge::timefmt::now())?;
     if report != scl_forge::lifecycle::Report::default() {
         eprintln!("sc-forge: reconciled {report:?}");
     }
-    let app = make_app(a.data_dir, &public_url, proxies, a.argon2_concurrency, life);
+    let tcfg = scl_forge::cgi::Cfg {
+        max_transports: a.max_transports,
+        per_repo: a.max_transports_per_repo,
+        admission_wait: Duration::from_secs(a.admission_wait),
+        timeout: Duration::from_secs(a.git_timeout),
+        idle: Duration::from_secs(a.git_idle_timeout),
+        max_pack: a.max_pack_size,
+        max_request: a.max_request_bytes,
+        min_free: a.min_free_bytes,
+        push_reserve: a.push_reserve,
+        git_memory: a.git_memory_limit,
+        ..Default::default()
+    };
+    let mut app = make_app(a.data_dir, &public_url, proxies, a.argon2_concurrency, life);
+    std::sync::Arc::get_mut(&mut app)
+        .expect("the app has no other owner yet")
+        .transports = scl_forge::cgi::Transports::new(tcfg);
     let limits = Limits {
         max_body: a.max_body_bytes,
         max_connections: a.max_connections,

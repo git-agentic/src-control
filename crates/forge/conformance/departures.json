@@ -890,7 +890,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "couldn't be found"
    ],
    "ignore_body": true
   },
@@ -904,7 +904,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "couldn't be found"
    ],
    "ignore_body": true,
    "ignore_headers": [
@@ -950,7 +950,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "couldn't be found"
    ]
   },
   "reason": "the new name does not exist"
@@ -963,7 +963,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "couldn't be found"
    ],
    "ignore_body": true
   },
@@ -977,7 +977,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "couldn't be found"
    ],
    "ignore_body": true
   },
@@ -1336,5 +1336,110 @@
    ]
   },
   "reason": "the health body names this server and reports only the checks it has (database), not Gitea's description or cache check; status and content type stay compared"
+ },
+ {
+  "scenario": "C",
+  "exchange": 30,
+  "kind": "git",
+  "match": "push-read-collab",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "forbidden"
+   ]
+  },
+  "reason": "sc-forge refuses a read-only collaborator's push at the advertisement with 403 Forbidden; Gitea advertises and then declines in pre-receive"
+ },
+ {
+  "scenario": "J",
+  "exchange": 62,
+  "kind": "git",
+  "match": "delete-default-branch-by-push",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "default branch",
+    "pre-receive hook declined"
+   ]
+  },
+  "reason": "sc-forge's hook words the refusal 'refusing to delete the default branch'; Gitea says 'gitea: branch main is the default branch and cannot be deleted'. Both end in 'pre-receive hook declined'"
+ },
+ {
+  "scenario": "K",
+  "exchange": 34,
+  "kind": "http",
+  "match": "GET /acme/vis.git/info/refs?service=git-receive-pack",
+  "expect": {
+   "status": 403,
+   "message_contains": [
+    "forbidden"
+   ],
+   "ignore_body": true,
+   "ignore_headers": [
+    "content-type"
+   ]
+  },
+  "reason": "sc-forge refuses a read-only collaborator's receive-pack advertisement with 403; Gitea advertises (200) and declines the push in pre-receive [ignore_body: the recorded 200 body is the advertisement]"
+ },
+ {
+  "scenario": "V",
+  "exchange": 5,
+  "kind": "note",
+  "match": "v2_advert_first_bytes",
+  "expect": {
+   "value_prefix": "000eversion 2\\n"
+  },
+  "reason": "stock git's protocol v2 advertisement has no '# service=' preamble; Gitea prepends one. Git clients accept both (the rest of the note carries the git version and is not pinned)"
+ },
+ {
+  "scenario": "N",
+  "exchange": 13,
+  "kind": "http",
+  "expect": {
+   "status": 200,
+   "fields": {
+    "empty": true,
+    "default_branch": "main"
+   }
+  },
+  "reason": "the row is the authority for the default branch: sc-forge never moves HEAD or the default on a push, so a default that was unborn stays unborn (Gitea's first-push heuristic is not copied)",
+  "match": "GET /api/v1/repos/acme/fresh1"
+ },
+ {
+  "scenario": "N",
+  "exchange": 22,
+  "kind": "http",
+  "expect": {
+   "status": 200,
+   "fields": {
+    "empty": true,
+    "default_branch": "develop"
+   }
+  },
+  "reason": "the row is the authority for the default branch: sc-forge never moves HEAD or the default on a push, so a default that was unborn stays unborn (Gitea's first-push heuristic is not copied)",
+  "match": "GET /api/v1/repos/acme/fresh3"
+ },
+ {
+  "scenario": "N",
+  "exchange": 26,
+  "kind": "http",
+  "expect": {
+   "status": 200,
+   "fields": {
+    "default_branch": "develop"
+   }
+  },
+  "reason": "the row is the authority for the default branch: sc-forge never moves HEAD or the default on a push, so a default that was unborn stays unborn (Gitea's first-push heuristic is not copied)",
+  "match": "GET /api/v1/repos/acme/fresh3"
+ },
+ {
+  "scenario": "N",
+  "exchange": 16,
+  "kind": "note",
+  "match": "ls-remote-symref-trunk-first_stdout",
+  "expect": {
+   "value": ""
+  },
+  "reason": "HEAD stays on the unborn default branch, so ls-remote --symref HEAD prints nothing (Gitea moved HEAD to the first pushed branch)"
  }
 ]

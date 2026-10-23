@@ -139,6 +139,16 @@ impl Git {
 
     /// The environment of every spawn: built from scratch, nothing inherited.
     pub fn env(&self, identity: Option<&Identity>) -> Vec<(String, String)> {
+        self.env_with(identity, &[])
+    }
+
+    /// Like [`Git::env`], plus per-spawn git config entries (`key`, `value`) appended to the
+    /// pinned ones (the transport adds its upload/receive settings this way).
+    pub fn env_with(
+        &self,
+        identity: Option<&Identity>,
+        extra: &[(&str, String)],
+    ) -> Vec<(String, String)> {
         let d = self.data_dir.display().to_string();
         let mut env: Vec<(String, String)> = vec![
             ("PATH".into(), "/usr/bin:/bin".into()),
@@ -151,17 +161,18 @@ impl Git {
             ("GIT_TERMINAL_PROMPT".into(), "0".into()),
             ("GIT_CEILING_DIRECTORIES".into(), d.clone()),
         ];
-        let config = [
-            ("core.hooksPath", format!("{d}/hooks")),
-            ("core.fsync", "all".to_string()),
-            ("core.fsyncMethod", "fsync".to_string()),
-            ("core.useReplaceRefs", "false".to_string()),
-            ("gc.auto", "0".to_string()),
-            ("receive.fsckObjects", "true".to_string()),
+        let mut config: Vec<(String, String)> = vec![
+            ("core.hooksPath".into(), format!("{d}/hooks")),
+            ("core.fsync".into(), "all".into()),
+            ("core.fsyncMethod".into(), "fsync".into()),
+            ("core.useReplaceRefs".into(), "false".into()),
+            ("gc.auto".into(), "0".into()),
+            ("receive.fsckObjects".into(), "true".into()),
         ];
+        config.extend(extra.iter().map(|(k, v)| (k.to_string(), v.clone())));
         env.push(("GIT_CONFIG_COUNT".into(), config.len().to_string()));
         for (i, (k, v)) in config.into_iter().enumerate() {
-            env.push((format!("GIT_CONFIG_KEY_{i}"), k.into()));
+            env.push((format!("GIT_CONFIG_KEY_{i}"), k));
             env.push((format!("GIT_CONFIG_VALUE_{i}"), v));
         }
         if let Some(id) = identity {
@@ -171,6 +182,11 @@ impl Git {
             }
         }
         env
+    }
+
+    /// The git executable (absolute).
+    pub fn bin(&self) -> &Path {
+        &self.bin
     }
 
     /// Run git as described by `spec`.
@@ -290,7 +306,7 @@ impl Git {
 
 /// Has child `pid` exited? Uses `waitid(WEXITED | WNOHANG | WNOWAIT)`, which reports exit
 /// without reaping, so the pid stays reserved until the caller waits on the child.
-fn exited_unreaped(pid: i32) -> std::io::Result<bool> {
+pub(crate) fn exited_unreaped(pid: i32) -> std::io::Result<bool> {
     // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill in.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a valid out-pointer; the options only observe, never reap.

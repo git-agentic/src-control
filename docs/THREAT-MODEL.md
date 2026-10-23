@@ -837,6 +837,111 @@ protected paths, plaintext.
   - The ceiling (1 GiB) is compile-time, so no configuration can make a length
     claim unbounded.
 
+## sc-forge: authentication, tenancy, transport, resources — P38 F1/F2
+
+`sc-forge serve` is a separate trust domain from the `.sc/` features above: hosted repositories are plain
+Git, there is no per-file encryption, and the boundary is the server's authentication and its process
+isolation. This is threat-model pass #1 (auth, tenancy, transport, resources); passes on the content API
+and on merge/protection come with F3 and F4. Each line names the test that pins it (`crates/forge/tests/e2e_git.rs`
+unless said otherwise).
+
+- **Credentials.** Git transport accepts access tokens only, in every recorded form (`token`/`Bearer`, Basic with
+  the token as the password under any user name, or as the user name with an empty password); a user password is
+  never a git credential (`a_password_is_never_a_git_credential`). Failures answer the recorded texts:
+  401 `Unauthorized`/`Verify`, 403 `Forbidden`, 404 `Repository not found`
+  (`every_credential_form_is_accepted_and_each_failure_has_its_recorded_text`). Authorization is evaluated once, at
+  the start of the request: revoking a token or a collaborator does not cancel a push already running (it is bounded
+  by `--git-timeout`, 30 minutes by default).
+- **Existence oracles.** A repository the caller may not see, one that does not exist, and one being deleted give the
+  same 404 body on both services (`missing_and_invisible_repositories_answer_identically`); a token restricted to
+  public repositories is refused before the repository is looked up, and a read-only collaborator is refused at the
+  `receive-pack` advertisement (`scopes_and_permissions_gate_each_service`).
+- **Tenant isolation.** The directory a transport can reach is built from the integer repository id
+  (`GIT_PROJECT_ROOT=<data>/repos`, `PATH_INFO=/<id>.git/...`), never from client text, and git is told the repository
+  explicitly (no discovery). Owner and repository segments must be plain name characters after percent-decoding
+  (`.`/`..` are refused); the rest of the path must match a whitelist byte for byte, and the sub-path handed to the CGI
+  is rebuilt from it (`only_the_whitelisted_shapes_and_methods_are_served`, `transport::tests`). `.git/config`, hooks,
+  `objects/info/alternates` and every other file are 404. Objects of a deleted branch stay readable by anyone with read
+  access to *that* repository (`uploadpack.allowAnySHA1InWant=true` is what makes fetch by id work; it is not a
+  cross-tenant read, since each repository is a separate object store and no alternates exist).
+- **Ref namespace.** Only `refs/heads/*` and `refs/tags/*` are writable: `refs/replace/*`, `refs/pull/*`, `refs/notes/*`,
+  `refs/changes/*` and everything else are refused by the `pre-receive` hook
+  (`the_ref_policy_is_enforced_for_every_unwritable_namespace_and_the_default_branch`); `refs/forge/` (reserved for the
+  server) is hidden from both services (`transfer.hideRefs`) and cannot be fetched by name
+  (`refs_forge_is_hidden_from_both_services_even_when_it_exists`); replace refs are ignored on every spawn
+  (`GIT_NO_REPLACE_OBJECTS`, `core.useReplaceRefs=false`). The default branch cannot be deleted, compared by Unicode
+  lower case so a case alias does not slip past (`policy::tests`; the hook binary test
+  `the_hook_binary_fails_closed`). Known gap: NFC/NFD-equivalent spellings of a non-ASCII default branch are not
+  folded (a macOS-filesystem quirk; marked `shortcut:` in `policy.rs`).
+- **Hook integrity.** `core.hooksPath` is pinned on every spawn to `<data>/hooks`, whose `pre-receive` is a symlink to
+  the `sc-forge` binary, re-pointed at every start; repositories are created with `--template=` and carry no hooks of
+  their own. The hook reads the database through a read-only opener (no create, `query_only`, schema version checked),
+  never takes the data-directory lock, and **fails closed**: a database error, a missing repository, a repository that
+  is not `live`, a malformed or non-UTF-8 update line, or a missing environment refuses the push
+  (`the_hook_binary_fails_closed`, `hook::tests`). Authorization of branch protection (F4) plugs into the same
+  `policy::check_update` function.
+- **Environment and config injection.** The CGI environment is built from scratch (`env_clear`): fixed `PATH`, a scratch
+  `HOME`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL=/dev/null`, per-spawn config through `GIT_CONFIG_COUNT`. Of the
+  request only these reach the child: a rebuilt `PATH_INFO`, the method, `service=` rebuilt from the parsed service,
+  `Content-Length`, a printable `Content-Type` of at most 128 bytes, and `Git-Protocol` only when it matches
+  `version=N[:key=value...]` of safe characters (`transport::tests`). `REMOTE_USER` is set only after the write check, so
+  `http-backend` enables `receive-pack` for that request alone. The advertisement carries the server's git
+  version and platform (`agent=git/2.x-<os>`), as stock git does.
+- **Request framing.** Plain request bodies are never buffered: they stream through a bounded channel to the child. A
+  gzip `upload-pack` request is read (within 5 minutes in total) and inflated **by the server before any process starts**, under a cap on both the
+  compressed and the *inflated* size (`--max-request-bytes`, 16 MiB), because `git http-backend` has no counter on
+  expanded bytes; the child gets the plain bytes with an exact `Content-Length` and never sees `Content-Encoding`. A bomb
+  or bad gzip is therefore a deterministic 413/400 and never gets a process
+  (`gzip_request_bodies_are_inflated_by_the_server_under_a_cap`; other encodings and gzip on a push are 415). Server
+  memory is bounded per transport by about twice the cap while a gzip body is inflated (the buffer plus its chunked
+  copy) and a few fixed channel buffers otherwise; with `--max-transports` 64 the worst case is the product.
+- **Cache policy.** Everything served is authenticated, so nothing may be cached publicly: git's `public,
+  max-age=31536000` on loose objects and packs is replaced with Gitea's private policy and its `Expires` dropped, and RPC
+  results and 401s carry the same private policy (`authenticated_object_reads_are_never_publicly_cacheable`).
+- **Resource exhaustion.** Admission before any process exists: a per-repository slot, then a global slot, both under one
+  `--admission-wait` deadline (503 + `Retry-After`; per-repository first so a flood on one repository cannot hold global
+  slots while it waits). Pushes reserve disk (`--min-free-bytes` floor, `--push-reserve` up front, grown in 64 MiB
+  steps as bytes arrive); an unreservable push is 507 before it starts, or aborted mid-stream. The reservation is
+  accounting, not enforcement: a push can write more than it reserved up to `--max-pack-size`
+  (`receive.maxInputSize`, `RLIMIT_FSIZE`); a hard guarantee needs filesystem quotas or the container's cgroup limits.
+  The child runs with `RLIMIT_CPU` (900 s), `RLIMIT_FSIZE`, `RLIMIT_CORE=0` and, on Linux, `RLIMIT_DATA`
+  (`--git-memory-limit`, 8 GiB per child, so the host-wide bound is `--max-transports` times that; anonymous memory,
+  which stops a pack declaring a huge compressed object from growing one child without limit;
+  not enforced on macOS and untested in CI: a cgroup limit on the service is the real bound), a wall-clock limit
+  (`--git-timeout`) and directional stall deadlines (`--git-idle-timeout`: no request bytes while git waits for them, or
+  no room in the response because the client does not read), all of which end the transport
+  (`slots_are_bounded_then_released_when_the_client_disconnects`, `a_stalled_upload_is_cut_off_by_the_idle_deadline`,
+  `the_wall_clock_limit_ends_a_transport`, `a_push_over_the_size_cap_fails_and_changes_nothing`,
+  `a_full_disk_reserve_refuses_pushes_with_507_but_not_reads`). Remaining exposure: any authenticated user with read
+  access can hold transport slots, for `--git-timeout` (30 minutes) each by trickling a byte just inside the idle
+  deadline, and a user who can create repositories gets 16 slots per repository, so one account can fill the 64 global
+  slots and make everyone else wait out `--admission-wait` (503). There are no per-user quotas yet (F5; a per-user
+  limit would also throttle Engine, whose clones come from one service account, so it needs a deliberate budget).
+  A push's growth check credits its own written bytes back, but other pushes in flight are still counted twice (free space has dropped and they still hold the bytes), so it
+  errs on the side of refusing. A killed push gets SIGTERM first (git removes its lock files and quarantine directory
+  from its signal handlers; we wait up to one second for the leader to exit and stderr to close, not tested) and then SIGKILL; a server killed outright can still leave a stale
+  `refs/heads/<x>.lock` or `objects/incoming-*` behind (cleanup is F5).
+- **Process control.** One supervisor thread owns each child and its process group and signals the group while the
+  leader is still an unreaped zombie (so a reused group id cannot be hit); the registry holds a cancel flag, never a
+  group id. A client that hangs up ends the child (`a_large_push_and_clone_stream_and_a_vanished_client_ends_the_child`);
+  deleting a repository first closes its registry slot, cancels and waits for every transport on it, and refuses to
+  rename the directory while one survives (`deleting_a_repository_ends_its_running_transports_first`); shutdown
+  cancels what is left after the drain deadline and refuses to register anything new, so a request still queued for a slot
+  cannot start git afterwards (`shutdown_ends_a_running_transport`,
+  `a_request_queued_for_a_slot_does_not_start_git_after_shutdown`). A server killed outright
+  (SIGKILL, OOM) leaves children running until the container's PID namespace or the service manager's cgroup ends them.
+- **Response integrity.** The CGI header block is parsed and only a whitelist of headers (content type, cache and
+  validator headers) is forwarded, each validated against control characters; a child that fails after the response head
+  was sent ends the stream with an error so the connection drops instead of finishing a truncated body with a clean
+  terminator: the response body ends only with an explicit end marker from the supervisor's clean verdict, so a closed
+  channel is an error (`a_stalled_upload_is_cut_off_by_the_idle_deadline`). Behind a proxy that speaks HTTP/1.0 to its
+  upstream (nginx's default) a cut stream can look like a clean end; git's own pkt-line framing still detects most
+  truncations, and the deployment should set `proxy_http_version 1.1`. Because `git http-backend` writes its response head
+  before it reads the request, an aborted push is visible to the client as a broken connection, not as a 408/413 status.
+- **Transport security.** The server speaks plaintext HTTP and refuses a non-loopback bind unless told that a TLS proxy
+  fronts it (`--behind-proxy`) or plaintext is wanted (`--allow-plaintext`); tokens cross this socket. No TLS and no SSH
+  in sc-forge itself.
+
 ## Reporting
 
 Security reports go to **toni@git-agentic.com** or GitHub private vulnerability

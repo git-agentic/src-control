@@ -147,6 +147,25 @@ fn ensure_dir(data_dir: &Path) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Open the existing database read-only, for the `pre-receive` hook: never creates the file, never
+/// migrates, never takes the data-directory lock, and refuses unless the schema is exactly this
+/// binary's (a binary replaced in place without a restart fails closed).
+pub fn open_readonly(data_dir: &Path) -> Result<Connection, DbError> {
+    let conn = Connection::open_with_flags(
+        db_path(data_dir),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    let have = version(&conn)?;
+    if have != SCHEMA_VERSION {
+        return Err(DbError::Schema(format!(
+            "database schema {have} differs from this binary's {SCHEMA_VERSION}"
+        )));
+    }
+    Ok(conn)
+}
+
 /// Open for `serve`: migrate forward, refuse a newer schema.
 pub fn open_for_serve(data_dir: &Path) -> Result<(), DbError> {
     ensure_dir(data_dir)?;
@@ -197,6 +216,29 @@ mod tests {
         open_for_serve(&d).unwrap();
         let _ = std::fs::remove_dir_all(&d);
         assert!(!d.exists());
+    }
+
+    #[test]
+    fn the_readonly_opener_never_creates_migrates_or_writes() {
+        let d = tmp("readonly");
+        assert!(
+            open_readonly(&d).is_err(),
+            "no database: nothing is created"
+        );
+        assert!(!db_path(&d).exists());
+        drop(open_for_admin(&d).unwrap());
+        let ro = open_readonly(&d).unwrap();
+        assert!(ro.execute("INSERT INTO users (login, lower_login, kind, created_unix) VALUES ('x','x','user',1)", []).is_err(), "writes are refused");
+        drop(ro);
+        let c = connect(&d).unwrap();
+        c.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(c);
+        assert!(
+            matches!(open_readonly(&d), Err(DbError::Schema(_))),
+            "a schema that is not this binary's fails closed"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

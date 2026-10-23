@@ -753,10 +753,65 @@ the smart-HTTP transport, hooks, ref policy, admission control and threat-model 
   every repository directory to `orphans/` (safe, and recoverable by restoring the database).
   Not verified against Gitea's source: `/user/repos` is scoped `write:user`/`read:user` as
   recorded (B#26, B#34); whether Gitea also requires a repository scope there is open.
-- **Conformance gate.** `forge-check.sh` replays `A`, `B`, `C`, `L`, `N` and `R`; `B` stops at
-  its first contents call (F3), `C` and `N` at their first `git clone` (F2b), and `X`, `D`,
-  `K`, `M` stay out until their routes exist (they make recorded calls to unbuilt routes, which
-  `--pending` cannot hide). 97 recorded exchanges are verified for real.
+- **Conformance gate.** (F2a; superseded by the F2b gate below.) `forge-check.sh` replayed `A`, `B`, `C`, `L`, `N` and `R`,
+  with `C` and `N` stopping at their first `git clone`.
+
+### F2b decisions (as built)
+
+F2b is the git half of F2 (plan: `docs/superpowers/plans/2026-10-23-p38-f2b-git-transport.md`, with its
+"Decisions after independent review"). Differences from the plan are listed last.
+
+- **Routes.** `/{o}/{r}.git/{info/refs, git-upload-pack, git-receive-pack, HEAD, objects/info/packs, objects/xx/<38 hex>,
+  objects/pack/pack-<hex>.{pack,idx}}` only, served by `git http-backend` run as a CGI; everything else under `.git/` is
+  404, a wrong method 405, a dumb `info/refs` (no `service=`) 404 (git's dumb listing ignores `hideRefs`). The transport
+  has its own whitelist (`transport::parse`) beside `routes::ROUTES`: an explicit, recorded exception to "every route is in
+  the table". Gitea also serves the path without `.git`; sc-forge does not.
+- **Order of checks** on a git request: credentials (401), method (405), scope (403), repository and existence (404),
+  permission (403), then encoding (415), declared body size (413), admission (503), gzip inflation (400/413), disk
+  reservation (507), process start.
+  Answers are the recorded Gitea texts; the realm is `Gitea`, and 401s and RPC results carry Gitea's
+  `Cache-Control: max-age=0, private, must-revalidate, no-transform`.
+- **Process model.** `server::handle` routes git paths before the bounded body read. A transport is a child
+  (`std::process`, own group) with a supervisor thread (exit detection by `waitid(WNOWAIT)`, `killpg` before reaping,
+  deadline, cancel flag), a stdin writer, a stdout reader that parses the CGI head then streams, and a stderr tail that is
+  logged when the child fails. A gzip request body is inflated whole before the spawn (cap on compressed and inflated
+  bytes); other bodies go through a bounded channel fed by an async pump (size cap, idle deadline, reservation
+  growth). The response body is a channel read by hyper that ends only on an explicit marker from a clean exit, and
+  dropping it cancels the transport. A transport we end gets SIGTERM, then SIGKILL after 1 s. `Lifecycle::registry` maps repository id to cancel
+  handles; `delete` closes the slot, cancels, waits up to 10 s and refuses to rename while a transport survives.
+- **Hook.** `pre-receive` is a symlink `<data>/hooks/pre-receive` to the `sc-forge` binary (argv[0] dispatch, no shell);
+  there is no post-receive hook, the server stamps `updated_unix` itself after `receive-pack` exits 0.
+  `core.hooksPath` is pinned per spawn.
+- **Ref policy** (`policy.rs`, shared by the hook and F2a's branch deletes): only `refs/heads/*` and `refs/tags/*` are
+  writable; the default branch cannot be deleted (Unicode lower case compare); a repository that is not `live` refuses
+  everything. Push options are advertised and ignored. HEAD never moves on a push: the row is the authority, an unborn
+  default stays unborn (departures N#13/16/22/26).
+- **Known race.** The hook reads the default branch without the per-repository lock (a push can run for 30 minutes), so a
+  `PATCH default_branch` racing a push that deletes the new default can leave `HEAD` and the row naming a branch that
+  no longer exists (`empty: true` until the next push or PATCH). The row stays the authority; closing it needs a
+  lease between receive-pack and the PATCH, which F4's branch protection will need anyway.
+- **Flags.** `--max-transports` (64), `--max-transports-per-repo` (16), `--admission-wait` (30 s), `--git-timeout`
+  (1800 s), `--git-idle-timeout` (120 s), `--max-pack-size` (2 GiB), `--max-request-bytes` (16 MiB),
+  `--min-free-bytes` (1 GiB), `--push-reserve` (256 MiB), `--git-memory-limit` (8 GiB, Linux). CPU limit 900 s is a constant. The F2a runner gate
+  (`--git-concurrency`) is separate and governs the API's own git calls.
+- **Commit authors.** A branch's `commit.author.username`/`committer.username` is the login of the one user whose email
+  matches the commit's address, empty if none or ambiguous (recorded K#32, N#5).
+- **Departures** (all in `departures.json` with reasons): read-only collaborator pushes are 403 at the advertisement
+  (C#30, K#34; Gitea declines in pre-receive), the default-branch delete message (J#62), protocol v2 advertisements have no
+  `# service=` preamble (V#5), the unborn-default behaviour above (N). Gitea's behaviour that the tests cannot reproduce
+  and sc-forge does not copy: moving HEAD to the first pushed branch.
+- **Conformance gate.** `forge-check.sh` replays `A B C J K L M N R V` (10 scenarios). `slice-pending.json` now has
+  `{"stop": [N, text], "defer": [[index, "METHOD /path"], ...]}` entries: a deferred exchange still runs and must be the
+  recorded call, but its mismatch waits for a later slice, and it fails the run when it starts passing. `B` stops at its
+  first contents call; J's `/tags` and `/git/refs/tags`, K's and N's `/contents`, and K's org listing counts (which depend
+  on scenarios that need F3/F4 routes) are deferred. `S` needs a PR (F4); `X`, `D`, `E`-`I`, `O`-`Q`, `T`, `U`, `W` stay out.
+  A departed git step still has its command line compared; credentialed URLs compare equal under `http` and `https`.
+- **Differences from the plan.** Admission takes the per-repository slot first (the plan said global first, which lets a
+  flood on one repository hold global slots while waiting); the realm and RPC cache policy are Gitea's (the plan departed
+  from both); fetch-by-id of a deleted branch tip works for anyone with read access to that repository, as stated in the
+  threat model. Not built: a test that asserts memory is bounded by blocking the child's stdin (the bounded channels are
+  the mechanism; the 20 MiB push/clone test exercises the streaming path), per-owner quotas, `gc` of killed pushes' quarantine
+  directories (F5).
 
 ## Open questions
 

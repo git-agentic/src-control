@@ -2,9 +2,11 @@
 //! timeout and connection cap here; routing, SQLite and Argon2 run on blocking
 //! threads in `routes::dispatch`.
 
+use crate::cgi::{self, RespBody};
 use crate::http::{Req, Resp};
 use crate::limits::Proxies;
 use crate::routes::{dispatch, App};
+use crate::transport;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -63,13 +65,35 @@ async fn handle(
     limits: Limits,
     peer: IpAddr,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+) -> Result<Response<RespBody>, std::convert::Infallible> {
     let (parts, body) = req.into_parts();
     let headers = parts
         .headers
         .iter()
         .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
         .collect::<std::collections::HashMap<_, _>>();
+    // Git transport paths stream their body: route them before the bounded read below.
+    match transport::parse(parts.uri.path()) {
+        transport::Route::NotGit => {}
+        transport::Route::Unknown => return Ok(cgi::answer(transport::not_found())),
+        transport::Route::Git(g) => {
+            let source = app.proxies.resolve(
+                peer,
+                headers
+                    .get(app.proxies.header.as_deref().unwrap_or(""))
+                    .map(String::as_str),
+            );
+            let r = Req {
+                method: parts.method.as_str().to_string(),
+                path: parts.uri.path().to_string(),
+                query: parts.uri.query().unwrap_or("").to_string(),
+                headers,
+                body: Vec::new(),
+                source,
+            };
+            return Ok(cgi::handle(app, r, body, g).await);
+        }
+    }
     let body = match tokio::time::timeout(
         limits.body_timeout,
         Limited::new(body, limits.max_body).collect(),
@@ -120,7 +144,7 @@ async fn handle(
     Ok(to_response(resp))
 }
 
-fn to_response(r: Resp) -> Response<Full<Bytes>> {
+fn to_response(r: Resp) -> Response<RespBody> {
     let mut b = Response::builder()
         .status(r.status)
         .header("server", SERVER);
@@ -128,13 +152,17 @@ fn to_response(r: Resp) -> Response<Full<Bytes>> {
         b = b.header(k, v);
     }
     // A header value hyper refuses must not panic the connection task: answer 500.
-    b.body(Full::new(Bytes::from(r.body))).unwrap_or_else(|_| {
-        let mut e = Response::new(Full::new(Bytes::from_static(
+    b.body(full(Bytes::from(r.body))).unwrap_or_else(|_| {
+        let mut e = Response::new(full(Bytes::from_static(
             b"{\"message\":\"internal server error\"}",
         )));
         *e.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
         e
     })
+}
+
+fn full(b: Bytes) -> RespBody {
+    Full::new(b).map_err(|e| match e {}).boxed()
 }
 
 /// Parse and normalize `--public-url`: `http(s)://host[:port][/path]` with a real host,
@@ -223,6 +251,11 @@ pub async fn serve(
         }
     }
     let _ = tokio::time::timeout(drain, async { while conns.join_next().await.is_some() {} }).await;
+    // Whatever git is still running at the deadline ends now; wait for the children to be reaped.
+    let registry = app.life.registry.clone();
+    registry.cancel_all();
+    let _ =
+        tokio::task::spawn_blocking(move || registry.wait_all_idle(Duration::from_secs(10))).await;
 }
 
 /// Build the shared state from CLI inputs.

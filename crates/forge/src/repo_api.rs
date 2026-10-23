@@ -618,7 +618,11 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
     let c = gitread::commit(&ctx.app.life.git, &dir, &br.oid)
         .map_err(|e| git_read_err(ctx.app, ctx.conn, a.repo.id, e))?
         .ok_or_else(|| ctx.app.internal(&"branch points at no commit"))?;
-    let who = |p: &gitread::Person| json!({"name": p.name, "email": p.email, "username": ""});
+    let login = |p: &gitread::Person| {
+        store::login_by_email(ctx.conn, &p.email).map_err(|e| ctx.app.internal(&e))
+    };
+    let (author_login, committer_login) = (login(&c.author)?, login(&c.committer)?);
+    let who = |p: &gitread::Person, login: Option<String>| json!({"name": p.name, "email": p.email, "username": login.unwrap_or_default()});
     let full = format!("{}/{}", a.repo.owner, a.repo.name);
     Ok(json!({
         "name": br.name,
@@ -626,8 +630,8 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
             "id": c.oid,
             "message": c.message,
             "url": format!("{}/{full}/commit/{}", ctx.app.base, c.oid),
-            "author": who(&c.author),
-            "committer": who(&c.committer),
+            "author": who(&c.author, author_login),
+            "committer": who(&c.committer, committer_login),
             "verification": {"verified": false, "reason": "gpg.error.not_signed_commit", "signature": "", "signer": null, "payload": ""},
             "timestamp": rfc3339(c.committer.when),
             "added": null,
@@ -728,7 +732,7 @@ pub fn delete_branch(ctx: &mut Ctx) -> Resp {
     if !refname::valid_branch(&name) {
         return no_branch(ctx, &name);
     }
-    if name.eq_ignore_ascii_case(&a.repo.default_branch) {
+    if crate::policy::same_branch_name(&name, &a.repo.default_branch) {
         return error(&ctx.app.base, 403, "can not delete default branch");
     }
     match ctx.app.life.delete_branch(ctx.conn, &a.repo, &name) {
