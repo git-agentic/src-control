@@ -9,6 +9,7 @@ pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod db;
+pub mod gitproc;
 pub mod http;
 pub mod limits;
 pub mod names;
