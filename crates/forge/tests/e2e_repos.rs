@@ -924,6 +924,29 @@ fn search_decodes_q_and_page_links_repeat_the_query() {
         link.contains("limit=2&page=2&q=hello%20world&sort=alpha>; rel=\"next\""),
         "{link}"
     );
+
+    // a hostile q cannot break out of the link target or forge another Link entry
+    let evil = "x%3E%3B%20rel%3D%22next%22%2C%20%3Chttp%3A%2F%2Fevil.invalid%2F";
+    let r =
+        w.s.get(&format!("/api/v1/repos/search?q={evil}&limit=1"), &w.adm);
+    assert_eq!(r.status, 200);
+    let link = r.headers.get("link").cloned().unwrap_or_default();
+    assert!(
+        !link.contains("evil.invalid/") && !link.contains(", <http://evil"),
+        "{link}"
+    );
+    assert_eq!(
+        link.matches('<').count(),
+        link.matches('>').count(),
+        "{link}"
+    );
+    // the same text sent raw (unencoded) is never echoed
+    let r = w.s.get(
+        "/api/v1/repos/search?q=x>;rel=\"next\",<http://evil.invalid/&limit=1",
+        &w.adm,
+    );
+    let link = r.headers.get("link").cloned().unwrap_or_default();
+    assert!(!link.contains("http://evil.invalid"), "{link}");
 }
 
 #[test]

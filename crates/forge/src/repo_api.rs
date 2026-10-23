@@ -1,7 +1,7 @@
 //! F2a handlers: repositories, search and lists, collaborators, branches. Authentication, scope
 //! and the repository permission check already passed in `routes::dispatch` (`ctx.access`).
 
-use crate::api::{body, page_params, paged, paged_with, str_field, user_json};
+use crate::api::{body, page_params, paged, paged_with, pct_encode, str_field, user_json};
 use crate::gitproc::GitError;
 use crate::gitread;
 use crate::http::{error, not_found, Resp};
@@ -368,8 +368,10 @@ pub fn search(ctx: &mut Ctx) -> Resp {
     };
     // Page links repeat the query, in the recorded order (alphabetical after limit and page).
     let mut extra: Vec<(&str, String)> = Vec::new();
-    if let Some(raw) = ctx.req.param("q") {
-        extra.push(("q", raw.to_string()));
+    if let Some(decoded) = &q {
+        // Re-encoded strictly from the decoded value, never echoed from the raw query: a raw
+        // `>` or `"` must not be able to close the link target or start another entry.
+        extra.push(("q", pct_encode(decoded)));
     }
     if ctx.req.param("sort") == Some("alpha") {
         extra.push(("sort", "alpha".to_string()));

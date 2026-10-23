@@ -122,7 +122,21 @@ pub(crate) fn paged(
     paged_with(ctx, path, total, page, limit, &[], items)
 }
 
-/// Like [`paged`], carrying `extra` query parameters (already percent-encoded, in the order
+/// Percent-encode everything except the RFC 3986 unreserved characters, so a value can sit inside
+/// a `<...>` link target without being able to close it or start another entry.
+pub(crate) fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Like [`paged`], carrying `extra` query parameters (already strictly percent-encoded with [`pct_encode`], in the order
 /// Gitea emits them: alphabetical after `limit` and `page`) into every `Link` URL, so following
 /// a page link repeats the same query.
 pub(crate) fn paged_with(
