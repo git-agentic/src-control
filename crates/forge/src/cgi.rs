@@ -323,7 +323,7 @@ impl Pump {
                 let free = transport::free_bytes(&r.data_dir).unwrap_or(0);
                 let ok = r.held.lock().unwrap_or_else(|e| e.into_inner()).grow(
                     // free space already lost this push's own bytes, which `held` still counts
-                    free.saturating_add(forwarded),
+                    free.saturating_add(forwarded.min(r.reserved)),
                     r.floor,
                     GROW_STEP,
                 );
@@ -554,6 +554,8 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
             Ok(())
         });
     }
+    // A marker left by a killed server must not pass for this push's acceptance.
+    let _ = std::fs::remove_file(&marker);
     if cancel.is_set() {
         return Err(if l.app.life.registry.is_stopped() {
             LaunchError::Stopped
@@ -689,6 +691,7 @@ fn read_out(
     loop {
         match out.read(&mut chunk) {
             Ok(0) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 // A read error is not an end of file: the client must see the cut, whatever git's
                 // exit status turns out to be.

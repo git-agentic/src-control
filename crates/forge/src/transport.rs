@@ -249,8 +249,8 @@ pub struct Plan {
 }
 
 /// Authenticate, check scope, resolve the repository and the caller's permission, in the one order
-/// every git request follows: credentials (401), method (405), scope (403), repository and
-/// existence (404 for missing, not-live or invisible alike), permission (403).
+/// every git request follows: credentials (401), method (405), a valid smart service (404), scope
+/// (403), repository and existence (404 for missing, not-live or invisible alike), permission (403).
 pub fn authorize(app: &App, req: &Req, path: GitPath) -> Result<Plan, Resp> {
     let conn = crate::db::connect(&app.data_dir).map_err(|e| internal(app, &e))?;
     let cred = auth::parse(req);

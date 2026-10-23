@@ -786,6 +786,10 @@ F2b is the git half of F2 (plan: `docs/superpowers/plans/2026-10-23-p38-f2b-git-
   writable; the default branch cannot be deleted (Unicode lower case compare); a repository that is not `live` refuses
   everything. Push options are advertised and ignored. HEAD never moves on a push: the row is the authority, an unborn
   default stays unborn (departures N#13/16/22/26).
+- **Known race.** The hook reads the default branch without the per-repository lock (a push can run for 30 minutes), so a
+  `PATCH default_branch` racing a push that deletes the new default can leave `HEAD` and the row naming a branch that
+  no longer exists (`empty: true` until the next push or PATCH). The row stays the authority; closing it needs a
+  lease between receive-pack and the PATCH, which F4's branch protection will need anyway.
 - **Flags.** `--max-transports` (64), `--max-transports-per-repo` (16), `--admission-wait` (30 s), `--git-timeout`
   (1800 s), `--git-idle-timeout` (120 s), `--max-pack-size` (2 GiB), `--max-request-bytes` (16 MiB),
   `--min-free-bytes` (1 GiB), `--push-reserve` (256 MiB), `--git-memory-limit` (8 GiB, Linux). CPU limit 900 s is a constant. The F2a runner gate

@@ -958,7 +958,12 @@ fn a_request_queued_for_a_slot_does_not_start_git_after_shutdown() {
     std::thread::sleep(std::time::Duration::from_millis(300)); // let it reach the admission queue
     drop(s);
     let reply = queued.join().unwrap();
-    assert!(!reply.starts_with("HTTP/1.1 200"), "{reply}");
+    // Either the 503 reaches the client, or the runtime is already gone and the connection just
+    // closes; what must never happen is git starting and answering.
+    assert!(
+        reply.is_empty() || reply.starts_with("HTTP/1.1 503"),
+        "{reply}"
+    );
     assert_eq!(app.life.registry.live(), 0);
     drop(held);
 }
@@ -975,8 +980,9 @@ fn only_a_push_the_hook_accepted_stamps_the_repository() {
         s.app.life.registry.live() == 0
     });
     let t0 = stamp();
-    std::thread::sleep(std::time::Duration::from_millis(1200)); // timestamps have second resolution
-                                                                // an advertisement and a push the hook rejects (git still exits 0 after reporting `ng`)
+    // timestamps have second resolution
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    // an advertisement and a push the hook rejects (git still exits 0 after reporting `ng`)
     s.send(
         "GET",
         &format!("/siteadmin/smart.git{RP}"),
