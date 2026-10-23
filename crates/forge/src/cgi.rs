@@ -808,7 +808,9 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
     // From here, dropping this guard (the client went away, or we return an error) ends the child.
     let guard = cancel.on_drop();
     let abort = Arc::new(AtomicU16::new(0));
-    if has_body {
+    if !has_body {
+        drop(stdin); // nothing to send: the child sees EOF at once
+    } else {
         tokio::spawn(
             Pump {
                 body,

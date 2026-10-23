@@ -777,3 +777,121 @@ fn the_hook_binary_fails_closed() {
     }
     assert_eq!(run("x", &s.dir, &ok_line).0, Some(1), "bad id");
 }
+
+// ---- streaming and process control, continued ----
+
+/// 20 MiB that does not compress.
+fn noise(len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn a_large_push_and_clone_stream_and_a_vanished_client_ends_the_child() {
+    use std::io::{Read, Write};
+    let s = Srv::start();
+    let c = Client::new("big");
+    let url = repo(&s, "smart");
+    let auth = token(&s.admin);
+    let work = seeded(&c, &url, &auth);
+    std::fs::write(work.join("big.bin"), noise(20 << 20)).unwrap();
+    c.ok(&work, None, &["add", "."]);
+    c.ok(&work, None, &["commit", "-q", "-m", "big"]);
+    c.ok(&work, Some(&auth), &["push", "-q", &url, "main"]);
+    let tip = c.ok(&work, None, &["rev-parse", "HEAD"]).trim().to_string();
+    let dst = c.dir.join("dst");
+    c.ok(
+        &c.dir,
+        Some(&auth),
+        &["clone", "-q", &url, dst.to_str().unwrap()],
+    );
+    assert_eq!(
+        std::fs::metadata(dst.join("big.bin")).unwrap().len(),
+        20 << 20
+    );
+
+    // Ask for the whole pack (protocol v0) and hang up after the first bytes.
+    let want = format!("want {tip} ofs-delta\n");
+    let body = format!("{:04x}{want}0000{:04x}done\n", want.len() + 4, 9);
+    let head = format!(
+        "POST /siteadmin/smart.git/git-upload-pack HTTP/1.1\r\nHost: x\r\nAuthorization: {auth}\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut sock = std::net::TcpStream::connect(s.addr).unwrap();
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    sock.write_all(head.as_bytes()).unwrap();
+    sock.write_all(body.as_bytes()).unwrap();
+    let mut first = [0u8; 4096];
+    let n = sock.read(&mut first).unwrap();
+    assert!(String::from_utf8_lossy(&first[..n]).starts_with("HTTP/1.1 200"));
+    drop(sock);
+    wait_for("the child to be ended after the hang-up", || {
+        s.app.life.registry.live() == 0
+    });
+    // and the server still serves
+    assert_eq!(
+        s.send(
+            "GET",
+            &format!("/siteadmin/smart.git{UP}"),
+            Some(&auth),
+            None
+        )
+        .status,
+        200
+    );
+}
+
+#[test]
+fn concurrent_pushes_to_one_new_branch_let_exactly_one_win() {
+    let s = Srv::start();
+    let c = Client::new("race");
+    let url = repo(&s, "smart");
+    let auth = token(&s.admin);
+    seeded(&c, &url, &auth);
+    let mk = |name: &str| {
+        let w = c.dir.join(name);
+        c.ok(
+            &c.dir,
+            None,
+            &["init", "-q", "-b", "x", w.to_str().unwrap()],
+        );
+        put_commit(&c, &w, &format!("{name}.txt"), name);
+        w
+    };
+    let (a, b) = (mk("a"), mk("b"));
+    let results: Vec<bool> = std::thread::scope(|sc| {
+        let hs: Vec<_> = [&a, &b]
+            .into_iter()
+            .map(|w| {
+                sc.spawn(|| {
+                    c.git_in(w, Some(&auth), &["push", "-q", &url, "x:refs/heads/race"])
+                        .0
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(results.iter().filter(|ok| **ok).count(), 1, "{results:?}");
+    s.git(1, &["fsck", "--no-progress"], None);
+}
+
+#[test]
+fn shutdown_ends_a_running_transport() {
+    let s = Srv::start();
+    let auth = token(&s.admin);
+    repo(&s, "smart");
+    let held = stalled_push(&s, &auth, "smart");
+    wait_for("the transport", || s.app.life.registry.live() == 1);
+    let app = s.app.clone();
+    drop(s); // stops the server: the drain deadline passes, then stragglers are cancelled
+    assert_eq!(app.life.registry.live(), 0);
+    drop(held);
+}

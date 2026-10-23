@@ -702,8 +702,9 @@ a Gitea-compatible Git forge (bare repos over smart HTTP, a recorded subset of
 config. Design:
 `docs/superpowers/specs/2026-10-22-p38-forge-design.md`. Slices F0 (contract
 capture) through F6 (acceptance on the first deployment); F0, F1 (server
-skeleton, users, organizations, tokens, `admin` CLI) and F2a (repositories API, lifecycle
-and reconciler, collaborators, branches) are built. Hosted repos are
+skeleton, users, organizations, tokens, `admin` CLI), F2a (repositories API, lifecycle
+and reconciler, collaborators, branches) and F2b (smart-HTTP git transport via `git http-backend`,
+`pre-receive` ref policy, admission control, threat-model pass #1) are built. Hosted repos are
 bare Git and get none of the `.sc/` features.
 
 Other follow-up work is tracked as GitHub issues and listed under Deferred
