@@ -629,8 +629,12 @@ class Ctx:
                     ds = cmp_exchange(exp, ex, self.bij)
                 if i in self.defers:
                     bad = [x for x in ds if x[0] == "fail"]
-                    ds = ([("honoured", "deferred: this route belongs to a later slice")] if bad else
-                          [("fail", "deferred exchange now passes: remove it from the pending file")])
+                    if ex_ident(exp) != ex_ident(ex) or exp["kind"] != ex["kind"]:
+                        # a deferral waits for a later slice's *answer*; the call itself stays pinned
+                        ds = [("fail", f"deferred exchange is {ex_ident(exp)!r} in the fixture but the scenario made {ex_ident(ex)!r}")]
+                    else:
+                        ds = ([("honoured", "deferred: this route belongs to a later slice")] if bad else
+                              [("fail", "deferred exchange now passes: remove it from the pending file")])
                 self.diffs.append((i, ex_label(ex), ds))
 
     def note(self, key, value, strict=True):

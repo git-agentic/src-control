@@ -618,10 +618,11 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
     let c = gitread::commit(&ctx.app.life.git, &dir, &br.oid)
         .map_err(|e| git_read_err(ctx.app, ctx.conn, a.repo.id, e))?
         .ok_or_else(|| ctx.app.internal(&"branch points at no commit"))?;
-    let who = |p: &gitread::Person| {
-        let login = store::login_by_email(ctx.conn, &p.email).unwrap_or(None);
-        json!({"name": p.name, "email": p.email, "username": login.unwrap_or_default()})
+    let login = |p: &gitread::Person| {
+        store::login_by_email(ctx.conn, &p.email).map_err(|e| ctx.app.internal(&e))
     };
+    let (author_login, committer_login) = (login(&c.author)?, login(&c.committer)?);
+    let who = |p: &gitread::Person, login: Option<String>| json!({"name": p.name, "email": p.email, "username": login.unwrap_or_default()});
     let full = format!("{}/{}", a.repo.owner, a.repo.name);
     Ok(json!({
         "name": br.name,
@@ -629,8 +630,8 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
             "id": c.oid,
             "message": c.message,
             "url": format!("{}/{full}/commit/{}", ctx.app.base, c.oid),
-            "author": who(&c.author),
-            "committer": who(&c.committer),
+            "author": who(&c.author, author_login),
+            "committer": who(&c.committer, committer_login),
             "verification": {"verified": false, "reason": "gpg.error.not_signed_commit", "signature": "", "signer": null, "payload": ""},
             "timestamp": rfc3339(c.committer.when),
             "added": null,

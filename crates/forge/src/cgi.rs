@@ -579,7 +579,8 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
         timeout: cfg.timeout,
         app: l.app.clone(),
         repo_id,
-        receive: l.plan.service == Some(Service::Receive),
+        // Only the push itself stamps the repository, not the advertisement that precedes it.
+        receive: l.plan.path.sub == transport::Sub::ReceivePack,
     };
     if let Err(e) = std::thread::Builder::new()
         .name("forge-supervise".into())
@@ -678,7 +679,13 @@ fn read_out(
     }
     loop {
         match out.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(e) => {
+                // A read error is not an end of file: the client must see the cut, whatever git's
+                // exit status turns out to be.
+                let _ = forward(Err(e));
+                return cancel.cancel();
+            }
             Ok(n) => {
                 if !forward(Ok(Bytes::copy_from_slice(&chunk[..n]))) {
                     return cancel.cancel(); // client gone or stalled
