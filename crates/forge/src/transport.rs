@@ -155,17 +155,21 @@ impl Service {
     }
 }
 
+/// An `info/refs` request without a valid smart `service` parameter.
+#[derive(Debug, PartialEq, Eq)]
+pub struct NotSmart;
+
 /// The service a path asks for: from the sub-path, or for `info/refs` from `?service=`. A smart
 /// `info/refs` without a valid `service` (git's dumb listing) is not served: it would ignore
 /// `transfer.hideRefs`.
-pub fn service_of(sub: &Sub, query_service: Option<&str>) -> Result<Option<Service>, ()> {
+pub fn service_of(sub: &Sub, query_service: Option<&str>) -> Result<Option<Service>, NotSmart> {
     match sub {
         Sub::UploadPack => Ok(Some(Service::Upload)),
         Sub::ReceivePack => Ok(Some(Service::Receive)),
         Sub::InfoRefs => match query_service {
             Some("git-upload-pack") => Ok(Some(Service::Upload)),
             Some("git-receive-pack") => Ok(Some(Service::Receive)),
-            _ => Err(()),
+            _ => Err(NotSmart),
         },
         _ => Ok(None),
     }
@@ -244,7 +248,7 @@ pub struct Plan {
 /// every git request follows: credentials (401), method (405), scope (403), repository and
 /// existence (404 for missing, not-live or invisible alike), permission (403).
 pub fn authorize(app: &App, req: &Req, path: GitPath) -> Result<Plan, Resp> {
-    let service = service_of(&path.sub, req.param("service")).map_err(|()| not_found())?;
+    let service = service_of(&path.sub, req.param("service")).map_err(|NotSmart| not_found())?;
     let conn = crate::db::connect(&app.data_dir).map_err(|e| internal(app, &e))?;
     let cred = auth::parse(req);
     let Some(secret) = credential(&cred) else {
@@ -426,7 +430,8 @@ impl Reserve {
 
     /// Reserve `need` bytes for a push, or `None` when the disk cannot promise it (507).
     pub fn reserve(&self, free: u64, floor: u64, need: u64) -> Option<Held<'_>> {
-        self.try_hold(free, floor, need).then_some(Held {
+        // lazy `then`: a refused reservation must not build a guard whose drop returns bytes never held
+        self.try_hold(free, floor, need).then(|| Held {
             pool: self,
             bytes: need,
         })
@@ -576,12 +581,12 @@ mod tests {
         );
         assert_eq!(
             service_of(&Sub::InfoRefs, None),
-            Err(()),
+            Err(NotSmart),
             "git's dumb listing ignores hideRefs"
         );
         assert_eq!(
             service_of(&Sub::InfoRefs, Some("git-upload-archive")),
-            Err(())
+            Err(NotSmart)
         );
         assert_eq!(
             service_of(&Sub::UploadPack, None),
