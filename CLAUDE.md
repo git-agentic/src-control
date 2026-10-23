@@ -49,7 +49,10 @@ reaching for TLS elsewhere, add a function to `tlsio` instead. **Object-store
 SDKs must stay quarantined in `objio`** — if you find yourself reaching for
 S3 elsewhere, add a function to `objio` instead. **`repo` must not depend on
 `gitio`** — `cli` links both and passes imported snapshots down; `repo` stays
-Git-agnostic.
+Git-agnostic. **`forge` (the `sc-forge` Git forge, P38, unix-only) is a third top-level adapter
+and may link only `{crypto, core}`** — never `repo`, `vfs` or `gitio` (hosted
+repositories are plain Git); HTTP, SQLite and process supervision stay confined
+to it, and password hashing and token generation live in `crypto`.
 
 ## Core invariants (do not break)
 
