@@ -1,7 +1,7 @@
 //! F2a handlers: repositories, search and lists, collaborators, branches. Authentication, scope
 //! and the repository permission check already passed in `routes::dispatch` (`ctx.access`).
 
-use crate::api::{body, org_visible, page_params, paged, str_field, user_json};
+use crate::api::{body, page_params, paged, str_field, user_json};
 use crate::gitread;
 use crate::http::{error, not_found, Resp};
 use crate::lifecycle::LifecycleError;
@@ -56,6 +56,8 @@ fn repo_json(app: &App, conn: &rusqlite::Connection, r: &Repo, perm: Perm) -> Re
         gitread::is_empty(&app.life.git, &app.life.repo_dir(r.id)).map_err(|e| app.internal(&e))?;
     let mut owner_json = user_json(&app.base, &owner);
     owner_json["active"] = json!(false); // recorded: the owner object inside a repository reads inactive
+    owner_json["login_name"] = json!(""); // recorded: the nested owner never carries the login_name
+    owner_json["is_admin"] = json!(false); // recorded: nor does it ever read as a site admin
     let (b, full) = (&app.base, format!("{}/{}", r.owner, r.name));
     Ok(json!({
         "id": r.id,
@@ -147,6 +149,11 @@ fn name_error(e: RepoNameError, name: &str) -> String {
 
 /// Create a repository owned by `owner` for the caller (shared by the org and user routes).
 fn create_for(ctx: &mut Ctx, owner: &User) -> Resp {
+    // Every repository is private, so a token restricted to public repositories may not create
+    // one; refused before the name or any existence is looked at (as `resolve_repo` does).
+    if token_public_only(ctx) {
+        return error(&ctx.app.base, 403, "token scope is limited to public repos");
+    }
     let b = match body(ctx) {
         Ok(b) => b,
         Err(r) => return r,
@@ -351,9 +358,9 @@ pub fn list_org_repos(ctx: &mut Ctx) -> Resp {
     let name = ctx.param("o").to_string();
     match store::find_by_login(ctx.conn, &name) {
         Ok(Some(org)) if org.is_org => {
-            // Whether the caller may see the organization itself does not change the answer: the
-            // list is filtered by repository access either way (the counts are the visible count).
-            let _ = org_visible(ctx, &org);
+            // The list is filtered by repository access whether or not the organization itself is
+            // visible: a collaborator of a repository inside a private organization still sees it
+            // (recorded K#55), and the counts are the visible count.
             let path = format!("/orgs/{}/repos", org.login);
             query_list(
                 ctx,

@@ -237,7 +237,7 @@ pub struct Filter {
 pub enum Sort {
     /// By id (creation order).
     Id,
-    /// By name.
+    /// By full name, `owner/name`.
     Alpha,
 }
 
@@ -292,7 +292,8 @@ pub fn list_visible(
     )?;
     let order = match sort {
         Sort::Id => "r.id",
-        Sort::Alpha => "r.lower_name, r.id",
+        // recorded: `sort=alpha` orders by the full name `owner/name`
+        Sort::Alpha => "u.lower_login, r.lower_name, r.id",
     };
     args.push(Value::Integer(limit));
     args.push(Value::Integer((page - 1) * limit));
@@ -543,11 +544,11 @@ mod tests {
         assert_eq!(
             names(&admin, false, &all),
             (
-                // `sort=alpha` orders by repository name, not by owner
+                // `sort=alpha` orders by the full name `owner/name`
                 vec![
+                    "acme/gamma".into(),
                     "owner/alpha".into(),
-                    "owner/beta".into(),
-                    "acme/gamma".into()
+                    "owner/beta".into()
                 ],
                 3
             )

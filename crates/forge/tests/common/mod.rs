@@ -208,6 +208,49 @@ impl Srv {
         self.send("POST", path, Some(auth), Some(&body))
     }
 
+    /// Run git directly against repository `id`'s bare directory (the test's stand-in for a push,
+    /// which F2b serves over HTTP).
+    pub fn git(&self, id: i64, args: &[&str], stdin: Option<&[u8]>) -> String {
+        let g = scl_forge::gitproc::Git::new(
+            &self.dir,
+            scl_forge::gitproc::find_git().expect("git"),
+            4,
+        )
+        .unwrap();
+        let dir = self.dir.join("repos").join(format!("{id}.git"));
+        let id_ = scl_forge::gitproc::Identity::new("T", "t@example.invalid").unwrap();
+        let out = g
+            .run(&scl_forge::gitproc::Spec {
+                repo: Some(&dir),
+                args,
+                stdin,
+                identity: Some(&id_),
+            })
+            .unwrap();
+        assert!(
+            out.ok(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.text()
+    }
+
+    /// Make branch `name` in repository `id` point at a new empty commit on top of `parent` (or a root).
+    pub fn commit_on(&self, id: i64, name: &str, parent: Option<&str>) -> String {
+        let tree = self.git(id, &["mktree"], Some(b""));
+        let mut args = vec!["commit-tree", tree.as_str()];
+        if let Some(p) = parent {
+            args.extend(["-p", p]);
+        }
+        let oid = self.git(id, &args, Some(b"msg\n"));
+        self.git(
+            id,
+            &["update-ref", &format!("refs/heads/{name}"), &oid],
+            None,
+        );
+        oid
+    }
+
     /// Create a user through the admin API, returning (login, password).
     pub fn mk_user(&self, login: &str) -> String {
         let pw = format!("pw-{login}-0123456789");
