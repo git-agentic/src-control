@@ -190,6 +190,12 @@ pub fn org_permissions(ctx: &mut Ctx) -> Resp {
         Ok(_) => return no_such_user(ctx, &uname),
         Err(e) => return ctx.app.internal(&e),
     };
+    // A hidden subject answers like a missing one, before the organization is
+    // resolved, so the two cannot be told apart.
+    let me = &ctx.who.user;
+    if subject.visibility == "private" && subject.id != me.id && !me.is_admin {
+        return no_such_user(ctx, &uname);
+    }
     let org = match store::find_by_login(ctx.conn, &oname) {
         Ok(Some(o)) if o.is_org => o,
         Ok(_) => return no_such_org(ctx, &oname),
@@ -202,10 +208,6 @@ pub fn org_permissions(ctx: &mut Ctx) -> Resp {
         Ok(true) => {}
         Ok(false) => return not_found(&ctx.app.base, "HasOrgOrUserVisible", None),
         Err(e) => return ctx.app.internal(&e),
-    }
-    let me = &ctx.who.user;
-    if subject.visibility == "private" && subject.id != me.id && !me.is_admin {
-        return no_such_user(ctx, &uname);
     }
     let full = match store::is_org_owner(ctx.conn, org.id, subject.id) {
         Ok(owner) => owner || subject.is_admin,

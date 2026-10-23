@@ -355,8 +355,13 @@ pub fn dispatch(app: &App, req: &Req) -> Resp {
         .then_some("doer should be the site admin or be same as the contextUser"),
         Actor::OrgOwnerOrSiteAdmin(p) => match store::find_by_login(&conn, param(p)) {
             Ok(Some(org)) if org.is_org => match store::is_org_owner(&conn, org.id, who.user.id) {
-                Ok(owner) => (!owner && !who.user.is_admin)
-                    .then_some("Given user is not allowed to create repository in organization."),
+                Ok(true) => None,
+                Ok(false) if who.user.is_admin => None,
+                // A private organization is invisible to a non-owner: same answer as a missing one.
+                Ok(false) if org.visibility == "private" => return api::org_missing(app, param(p)),
+                Ok(false) => {
+                    Some("Given user is not allowed to create repository in organization.")
+                }
                 Err(e) => return app.internal(&e),
             },
             Ok(_) => return api::org_missing(app, param(p)),

@@ -83,6 +83,15 @@ fn bound<K>(m: &mut HashMap<K, Vec<Instant>>, window: Duration) {
     }
 }
 
+/// IPv6 sources are keyed by their /64, since one host usually holds a whole
+/// /64 and could otherwise mint endless distinct keys.
+fn source_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(a) => IpAddr::V6((u128::from(a) & (u128::MAX << 64)).into()),
+        v4 => v4,
+    }
+}
+
 impl Backoff {
     pub fn new(source_cap: usize, max_delay: Duration) -> Backoff {
         Backoff {
@@ -98,6 +107,7 @@ impl Backoff {
     /// concurrent requests cannot all slip under the cap. A failure keeps the
     /// reservation as its record; [`Backoff::success`] gives it back.
     pub fn begin(&self, ip: IpAddr) -> bool {
+        let ip = source_key(ip);
         let mut m = self.by_source.lock().unwrap_or_else(|e| e.into_inner());
         bound(&mut m, SOURCE_WINDOW);
         let v = m.entry(ip).or_default();
@@ -124,6 +134,7 @@ impl Backoff {
 
     /// A success clears the login's failures and returns the source's reservation.
     pub fn success(&self, login: &str, ip: IpAddr) {
+        let ip = source_key(ip);
         let key: String = login.to_lowercase().chars().take(MAX_KEY).collect();
         self.by_login
             .lock()
@@ -244,6 +255,14 @@ mod tests {
         assert!(b.begin(ip("8.8.8.8")), "other sources are unaffected");
         b.success("u", ip("9.9.9.9")); // a success gives its reservation back
         assert!(b.begin(ip("9.9.9.9")));
+    }
+
+    #[test]
+    fn one_ipv6_64_shares_a_budget() {
+        let b = Backoff::new(2, Duration::ZERO);
+        assert!(b.begin(ip("2001:db8::1")) && b.begin(ip("2001:db8::2")));
+        assert!(!b.begin(ip("2001:db8::ffff:1")), "same /64");
+        assert!(b.begin(ip("2001:db8:0:1::1")), "a different /64");
     }
 
     #[test]
