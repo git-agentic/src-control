@@ -905,7 +905,8 @@ unless said otherwise).
   accounting, not enforcement: a push can write more than it reserved up to `--max-pack-size`
   (`receive.maxInputSize`, `RLIMIT_FSIZE`); a hard guarantee needs filesystem quotas or the container's cgroup limits.
   The child runs with `RLIMIT_CPU` (900 s), `RLIMIT_FSIZE`, `RLIMIT_CORE=0` and, on Linux, `RLIMIT_DATA`
-  (`--git-memory-limit`, 8 GiB; anonymous memory, so a pack declaring a huge compressed object cannot take the host;
+  (`--git-memory-limit`, 8 GiB per child, so the host-wide bound is `--max-transports` times that; anonymous memory,
+  which stops a pack declaring a huge compressed object from growing one child without limit;
   not enforced on macOS and untested in CI: a cgroup limit on the service is the real bound), a wall-clock limit
   (`--git-timeout`) and directional stall deadlines (`--git-idle-timeout`: no request bytes while git waits for them, or
   no room in the response because the client does not read), all of which end the transport
@@ -918,7 +919,7 @@ unless said otherwise).
   limit would also throttle Engine, whose clones come from one service account, so it needs a deliberate budget).
   The disk reservation counts bytes already written twice (free space has dropped and the push still holds them), so it
   errs on the side of refusing. A killed push gets SIGTERM first (git removes its lock files and quarantine directory
-  from its signal handlers) and SIGKILL after one second; a server killed outright can still leave a stale
+  from its signal handlers; we wait up to one second for the leader to exit and stderr to close, not tested) and then SIGKILL; a server killed outright can still leave a stale
   `refs/heads/<x>.lock` or `objects/incoming-*` behind (cleanup is F5).
 - **Process control.** One supervisor thread owns each child and its process group and signals the group while the
   leader is still an unreaped zombie (so a reused group id cannot be hit); the registry holds a cancel flag, never a

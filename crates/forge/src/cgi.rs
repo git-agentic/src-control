@@ -413,6 +413,8 @@ struct Launch {
 enum LaunchError {
     /// The repository is gone or closing (delete): answer as for a missing repository.
     Gone,
+    /// The server is shutting down: retry elsewhere or later.
+    Stopped,
     Io(std::io::Error),
 }
 
@@ -492,7 +494,13 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
             repo_id,
             || matches!(repos::find_by_id(&conn, repo_id), Ok(Some(r)) if r.state == "live"),
         )
-        .ok_or(LaunchError::Gone)?;
+        .ok_or_else(|| {
+            if l.app.life.registry.is_stopped() {
+                LaunchError::Stopped
+            } else {
+                LaunchError::Gone
+            }
+        })?;
     let cancel = reg.cancel.clone();
 
     let git = &l.app.life.git;
@@ -539,7 +547,11 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
         });
     }
     if cancel.is_set() {
-        return Err(LaunchError::Gone);
+        return Err(if l.app.life.registry.is_stopped() {
+            LaunchError::Stopped
+        } else {
+            LaunchError::Gone
+        });
     }
     let mut child = cmd.spawn()?;
     let pgid = child.id() as i32;
@@ -746,8 +758,11 @@ impl Supervise {
         if reason != "exited" {
             unsafe { libc::killpg(pgid, libc::SIGTERM) };
             let until = Instant::now() + Duration::from_secs(1);
+            // Until the leader is gone and stderr has closed (every group member that inherited it
+            // has exited, so git's children have finished their own cleanup), at most one second.
             while Instant::now() < until
-                && matches!(crate::gitproc::exited_unreaped(pgid), Ok(false))
+                && (matches!(crate::gitproc::exited_unreaped(pgid), Ok(false))
+                    || tail.as_ref().is_some_and(|t| !t.is_finished()))
             {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -897,6 +912,9 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
     let started = match tokio::task::spawn_blocking(move || launch(launch_args)).await {
         Ok(Ok(s)) => s,
         Ok(Err(LaunchError::Gone)) => return buffered(transport::repo_not_found()),
+        Ok(Err(LaunchError::Stopped)) => {
+            return buffered(text(503, "Service Unavailable\n").with("retry-after", "5".into()))
+        }
         Ok(Err(LaunchError::Io(e))) => {
             eprintln!("sc-forge: could not start git: {e}");
             return buffered(text(500, "internal server error\n"));
@@ -943,7 +961,8 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
         }
     };
     // git marks loose objects and packs `public, max-age=31536000`; behind a shared cache that would
-    // serve an authorized object to anyone. Everything authenticated is private.
+    // serve an authorized object to anyone. Those and the RPC results get the private policy; git's
+    // own `no-cache, must-revalidate` on the dumb reads already forbids reuse without revalidation.
     let public = head
         .headers
         .iter()

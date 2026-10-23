@@ -159,6 +159,11 @@ impl Registry {
         self.lock().remove(&repo);
     }
 
+    /// Has shutdown begun?
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
     /// Cancel every live transport and refuse new ones (shutdown): a request still queued for
     /// admission must not start a child after the sweep.
     pub fn cancel_all(&self) {
