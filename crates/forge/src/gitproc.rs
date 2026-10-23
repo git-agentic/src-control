@@ -225,25 +225,32 @@ impl Git {
             })
         });
 
+        // Detect the leader's exit without reaping it (`waitid` with WNOWAIT): while the leader is
+        // an unreaped zombie its pid, and so the process-group id, cannot be reused, so the group
+        // signal below can never reach an unrelated group. Reap only after signalling.
         let deadline = Instant::now() + self.timeout;
-        let status = loop {
-            if let Some(st) = child.try_wait()? {
-                break Ok(st);
+        let outcome = loop {
+            match exited_unreaped(pgid) {
+                Ok(true) => break None,
+                Ok(false) => {}
+                Err(e) => {
+                    kill_group();
+                    let _ = child.wait();
+                    return Err(e.into());
+                }
             }
             if over.load(Ordering::SeqCst) {
-                kill_group();
-                let _ = child.wait();
-                break Err(GitError::OutputTooLarge);
+                break Some(GitError::OutputTooLarge);
             }
             if Instant::now() >= deadline {
-                kill_group();
-                let _ = child.wait();
-                break Err(GitError::Timeout { stdout: Vec::new() });
+                break Some(GitError::Timeout { stdout: Vec::new() });
             }
             std::thread::sleep(Duration::from_millis(2));
         };
-        // The group may outlive the leader (a hook's background child): end it on every path.
+        // Whatever the reason we stopped, end the whole group (a hook's background child may
+        // outlive the leader) while the leader still holds the group id, then reap it.
         kill_group();
+        let status = child.wait()?;
         if let Some(t) = t_in {
             let _ = t.join();
         }
@@ -251,17 +258,43 @@ impl Git {
             t_out.join().unwrap_or_default(),
             t_err.join().unwrap_or_default(),
         );
-        match status {
-            Ok(status) if !over.load(Ordering::SeqCst) => Ok(Out {
+        match outcome {
+            None if !over.load(Ordering::SeqCst) => Ok(Out {
                 status,
                 stdout,
                 stderr,
             }),
-            Ok(_) => Err(GitError::OutputTooLarge),
-            Err(GitError::Timeout { .. }) => Err(GitError::Timeout { stdout }),
-            Err(e) => Err(e),
+            None | Some(GitError::OutputTooLarge) => Err(GitError::OutputTooLarge),
+            Some(GitError::Timeout { .. }) => Err(GitError::Timeout { stdout }),
+            Some(e) => Err(e),
         }
     }
+}
+
+/// Has child `pid` exited? Uses `waitid(WEXITED | WNOHANG | WNOWAIT)`, which reports exit
+/// without reaping, so the pid stays reserved until the caller waits on the child.
+fn exited_unreaped(pid: i32) -> std::io::Result<bool> {
+    // SAFETY: an all-zero siginfo_t is a valid value for waitid to fill in.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid out-pointer; the options only observe, never reap.
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // With WNOHANG, si_pid stays 0 when no child has changed state.
+    #[cfg(target_os = "linux")]
+    // SAFETY: waitid filled the siginfo for a SIGCHLD-class report.
+    let pid_set = unsafe { info.si_pid() } != 0;
+    #[cfg(not(target_os = "linux"))]
+    let pid_set = info.si_pid != 0;
+    Ok(pid_set)
 }
 
 /// Find `git`: `SC_FORGE_GIT` if set, else the first `git` on the server's own `PATH`.
@@ -496,6 +529,30 @@ mod tests {
         // SAFETY: signal 0 only probes for existence.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "the grandchild {pid} must be killed with its group");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_normal_exit_still_ends_a_lingering_background_child() {
+        let (g, d) = git("linger");
+        // The leader exits at once, leaving a grandchild that would run for a minute.
+        let out = g
+            .run_program(
+                OsStr::new("/bin/sh"),
+                &Spec {
+                    args: &["-c", "sleep 60 & echo $!"],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(out.ok());
+        let pid: i32 = out.text().parse().expect("grandchild pid");
+        std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: signal 0 only probes for existence.
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "the grandchild {pid} must not outlive a run"
+        );
         let _ = std::fs::remove_dir_all(d);
     }
 

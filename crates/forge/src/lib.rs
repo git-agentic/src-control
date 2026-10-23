@@ -11,6 +11,7 @@ pub mod auth;
 pub mod db;
 pub mod gitproc;
 pub mod http;
+pub mod lifecycle;
 pub mod limits;
 pub mod names;
 pub mod refname;
