@@ -68,12 +68,17 @@ fn no_such_user(ctx: &Ctx, name: &str) -> Resp {
     )
 }
 
-fn no_such_org(ctx: &Ctx, name: &str) -> Resp {
+/// The recorded 404 for an organization that does not exist.
+pub fn org_missing(app: &crate::routes::App, name: &str) -> Resp {
     not_found(
-        &ctx.app.base,
+        &app.base,
         "GetOrgByName",
         Some(&format!("user redirect does not exist [name: {name}]")),
     )
+}
+
+fn no_such_org(ctx: &Ctx, name: &str) -> Resp {
+    org_missing(ctx.app, name)
 }
 
 /// A JSON object body; an empty body is `{}`.
@@ -93,7 +98,11 @@ fn str_field(v: &Value, key: &str) -> Option<String> {
 
 fn page_params(ctx: &Ctx) -> (i64, i64) {
     let num = |k: &str| ctx.req.param(k).and_then(|v| v.parse::<i64>().ok());
-    let page = num("page").filter(|p| *p >= 1).unwrap_or(1);
+    // Page is clamped so offset arithmetic cannot overflow.
+    let page = num("page")
+        .filter(|p| *p >= 1)
+        .unwrap_or(1)
+        .min(1_000_000_000);
     let limit = num("limit")
         .filter(|l| *l >= 1)
         .unwrap_or(DEFAULT_PAGE)
@@ -186,6 +195,18 @@ pub fn org_permissions(ctx: &mut Ctx) -> Resp {
         Ok(_) => return no_such_org(ctx, &oname),
         Err(e) => return ctx.app.internal(&e),
     };
+    // The caller must be able to see the organization at all (a private one is
+    // hidden from outsiders, whoever the subject is), and a private subject is
+    // hidden like on `GET /users/{u}`.
+    match org_visible(ctx, &org) {
+        Ok(true) => {}
+        Ok(false) => return not_found(&ctx.app.base, "HasOrgOrUserVisible", None),
+        Err(e) => return ctx.app.internal(&e),
+    }
+    let me = &ctx.who.user;
+    if subject.visibility == "private" && subject.id != me.id && !me.is_admin {
+        return no_such_user(ctx, &uname);
+    }
     let full = match store::is_org_owner(ctx.conn, org.id, subject.id) {
         Ok(owner) => owner || subject.is_admin,
         Err(e) => return ctx.app.internal(&e),

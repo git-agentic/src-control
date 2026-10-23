@@ -645,9 +645,22 @@ header. Decisions drawn from it, beyond those stated in the sections above:
   readonly-token-as-password note (X#32) is a departure: 401, not Gitea's 403.
 - **Ordinary routes.** A Basic password that is not a token gets 401 `auth required:
   this route accepts access tokens only`; a bad `token`/`Bearer` or token-as-username
-  gets the recorded `user does not exist [uid: 0, name: ...]` (name capped at 80
-  characters). Every `/api/v1/*` path, declared or not, authenticates before the
+  gets the recorded `user does not exist [uid: 0, name: ...]` (the `[uid: 0, name: ...]`
+  suffix is Gitea's own and kept; name capped at 80 characters). Every `/api/v1/*` path, declared or not, authenticates before the
   route lookup, so an unauthenticated caller learns nothing about the API surface.
+- **Budget and limits.** The per-source budget (30 password attempts a minute) is
+  reserved before verification, so concurrent requests cannot slip under it, and a
+  success returns its unit. The failure delay is applied on the async runtime, not on a
+  blocking thread. A request body must arrive within 30 s of its headers (408), headers
+  within 10 s, at most 1 MiB (413), at most 512 connections. The data directory is made
+  `0700` and `forge.db` `0600` at creation, also for a pre-existing directory. Token
+  lists are newest first (Gitea's order), ties by id. `PATCH /admin/users/{u}` writes
+  only the supplied columns, so concurrent patches cannot restore an old admin flag or
+  password hash. `--behind-proxy` without trusted proxies warns that all clients then
+  share one failure budget.
+- **Organization permissions.** `GET /users/{u}/orgs/{o}/permissions` requires that the
+  caller can see the organization (a private one answers `HasOrgOrUserVisible` to
+  outsiders whoever the subject is) and hides a private subject like `GET /users/{u}`.
 - **`must_change_password`** (the default for `admin/users` POST, as in Gitea) refuses
   password authentication on token routes with 403; tokens are unaffected.
 - **Site-admin tokens.** A token with `write:admin` can `PATCH /admin/users/{u}`

@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use scl_forge::limits::Proxies;
-use scl_forge::server::{make_app, serve, Limits};
+use scl_forge::server::{serve, Limits};
 use scl_forge::{admin, db};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -74,6 +74,15 @@ impl Srv {
     }
 
     pub fn start_with(limits: Limits) -> Srv {
+        Srv::start_cfg(limits, None)
+    }
+
+    /// Start with a custom password-failure policy.
+    pub fn start_backoff(b: scl_forge::limits::Backoff) -> Srv {
+        Srv::start_cfg(Limits::default(), Some(b))
+    }
+
+    fn start_cfg(limits: Limits, backoff: Option<scl_forge::limits::Backoff>) -> Srv {
         let dir = std::env::temp_dir().join(format!(
             "scl-forge-e2e-{}-{}",
             std::process::id(),
@@ -97,7 +106,11 @@ impl Srv {
         std_l.set_nonblocking(true).unwrap();
         let addr = std_l.local_addr().unwrap();
         let base = format!("http://{addr}");
-        let app = make_app(dir.clone(), &base, Proxies::default(), 4);
+        let mut app = scl_forge::routes::App::new(dir.clone(), &base, Proxies::default(), 4);
+        if let Some(b) = backoff {
+            app.backoff = b;
+        }
+        let app = std::sync::Arc::new(app);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()

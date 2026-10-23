@@ -27,6 +27,8 @@ pub struct Limits {
     pub max_body: usize,
     pub max_connections: usize,
     pub header_timeout: Duration,
+    /// Time allowed to receive a request body once its headers arrived.
+    pub body_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -35,6 +37,7 @@ impl Default for Limits {
             max_body: 1 << 20,
             max_connections: 512,
             header_timeout: Duration::from_secs(10),
+            body_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -67,11 +70,26 @@ async fn handle(
         .iter()
         .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
         .collect::<std::collections::HashMap<_, _>>();
-    let body = match Limited::new(body, limits.max_body).collect().await {
-        Ok(b) => b.to_bytes().to_vec(),
+    let body = match tokio::time::timeout(
+        limits.body_timeout,
+        Limited::new(body, limits.max_body).collect(),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b.to_bytes().to_vec(),
+        Ok(Err(_)) => {
+            return Ok(to_response(crate::http::error(
+                &app.base,
+                413,
+                "request body too large",
+            )))
+        }
         Err(_) => {
-            let r = crate::http::error(&app.base, 413, "request body too large");
-            return Ok(to_response(r));
+            return Ok(to_response(crate::http::error(
+                &app.base,
+                408,
+                "request body timed out",
+            )))
         }
     };
     let source = app.proxies.resolve(
@@ -96,6 +114,9 @@ async fn handle(
                 &serde_json::json!({"message": "internal server error"}),
             )
         });
+    if !resp.delay.is_zero() {
+        tokio::time::sleep(resp.delay).await;
+    }
     Ok(to_response(resp))
 }
 

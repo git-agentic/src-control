@@ -1,4 +1,4 @@
 {
- "A": 6,
- "B": 25
+ "A": [6, "POST /api/v1/user/repos"],
+ "B": [25, "POST /api/v1/user/repos"]
 }

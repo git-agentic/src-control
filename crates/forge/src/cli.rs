@@ -209,6 +209,12 @@ fn run_serve(a: ServeArgs) -> Result<()> {
     if a.trusted_proxy_header.is_some() != !cidrs.is_empty() {
         bail!("--trusted-proxy-header and --trusted-proxies must be given together");
     }
+    if a.behind_proxy && cidrs.is_empty() {
+        eprintln!(
+            "sc-forge: warning: --behind-proxy without --trusted-proxy-header/--trusted-proxies: every client shares the proxy's address, \
+             so the per-source password-failure budget (30/min) applies to all of them together"
+        );
+    }
     let proxies = Proxies {
         header: a.trusted_proxy_header.map(|h| h.to_ascii_lowercase()),
         cidrs,

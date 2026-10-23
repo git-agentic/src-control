@@ -139,7 +139,7 @@ pub fn by_password(app: &App, conn: &Connection, req: &Req, cred: &Cred) -> Resu
         )
         .with("www-authenticate", "Basic realm=\"sc-forge\"".into()));
     };
-    if app.backoff.source_blocked(req.source) {
+    if !app.backoff.begin(req.source) {
         return Err(error(
             &app.base,
             429,
@@ -157,7 +157,7 @@ pub fn by_password(app: &App, conn: &Connection, req: &Req, cred: &Cred) -> Resu
     };
     match (ok, found) {
         (true, Some(user)) => {
-            app.backoff.record_success(login);
+            app.backoff.success(login, req.source);
             if user.must_change_password {
                 return Err(error(
                     &app.base,
@@ -168,8 +168,8 @@ pub fn by_password(app: &App, conn: &Connection, req: &Req, cred: &Cred) -> Resu
             Ok(Authed { user, scopes: None })
         }
         _ => {
-            std::thread::sleep(app.backoff.record_failure(login, req.source));
-            Err(error(&app.base, 401, "invalid username or password"))
+            let delay = app.backoff.failure(login, req.source);
+            Err(error(&app.base, 401, "invalid username or password").delayed(delay))
         }
     }
 }

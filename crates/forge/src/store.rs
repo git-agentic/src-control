@@ -155,27 +155,46 @@ pub struct UserPatch {
     pub location: Option<String>,
 }
 
-/// Apply `p` to user `id`.
+/// Apply `p` to user `id`. Only the supplied columns are written, in one
+/// statement, so two concurrent patches of different fields cannot undo each
+/// other (a stale read-modify-write could restore a revoked admin flag or an
+/// old password hash).
 pub fn update_user(conn: &Connection, id: i64, p: &UserPatch) -> Result<User, StoreError> {
-    let cur = find_by_id(conn, id)?.ok_or(StoreError::NotFound)?;
-    conn.execute(
-        "UPDATE users SET login_name=?1, full_name=?2, email=?3, password_hash=?4, \
-         must_change_password=?5, is_admin=?6, visibility=?7, description=?8, website=?9, \
-         location=?10 WHERE id=?11",
-        params![
-            p.login_name.clone().unwrap_or(cur.login_name),
-            p.full_name.clone().unwrap_or(cur.full_name),
-            p.email.clone().unwrap_or(cur.email),
-            p.password_hash.clone().unwrap_or(cur.password_hash),
-            p.must_change_password.unwrap_or(cur.must_change_password),
-            p.is_admin.unwrap_or(cur.is_admin),
-            p.visibility.clone().unwrap_or(cur.visibility),
-            p.description.clone().unwrap_or(cur.description),
-            p.website.clone().unwrap_or(cur.website),
-            p.location.clone().unwrap_or(cur.location),
-            id
-        ],
-    )?;
+    use rusqlite::types::Value;
+    let text = |v: &Option<String>| v.clone().map(Value::Text);
+    let flag = |v: Option<bool>| v.map(|b| Value::Integer(i64::from(b)));
+    let cols: Vec<(&str, Value)> = [
+        ("login_name", text(&p.login_name)),
+        ("full_name", text(&p.full_name)),
+        ("email", text(&p.email)),
+        ("password_hash", text(&p.password_hash)),
+        ("must_change_password", flag(p.must_change_password)),
+        ("is_admin", flag(p.is_admin)),
+        ("visibility", text(&p.visibility)),
+        ("description", text(&p.description)),
+        ("website", text(&p.website)),
+        ("location", text(&p.location)),
+    ]
+    .into_iter()
+    .filter_map(|(c, v)| v.map(|v| (c, v)))
+    .collect();
+    if !cols.is_empty() {
+        let set = cols
+            .iter()
+            .map(|(c, _)| format!("{c} = ?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut args: Vec<Value> = cols.into_iter().map(|(_, v)| v).collect();
+        args.push(Value::Integer(id));
+        // Column names above are literals; only values are bound.
+        if conn.execute(
+            &format!("UPDATE users SET {set} WHERE id = ?"),
+            rusqlite::params_from_iter(args),
+        )? == 0
+        {
+            return Err(StoreError::NotFound);
+        }
+    }
     find_by_id(conn, id)?.ok_or(StoreError::NotFound)
 }
 
@@ -270,7 +289,7 @@ pub fn create_token(
     }
 }
 
-/// Page of `user`'s tokens and the total, ordered by id.
+/// Page of `user`'s tokens and the total, newest first (Gitea's order; ties by id).
 pub fn list_tokens(
     conn: &Connection,
     user: i64,
@@ -284,7 +303,7 @@ pub fn list_tokens(
     )?;
     let mut st = conn.prepare(
         "SELECT id, name, last_eight, scopes, expires_unix FROM tokens WHERE user_id = ?1 \
-         ORDER BY id LIMIT ?2 OFFSET ?3",
+         ORDER BY created_unix DESC, id ASC LIMIT ?2 OFFSET ?3",
     )?;
     let rows = st.query_map(params![user, limit, (page - 1) * limit], token_row)?;
     Ok((rows.collect::<Result<_, _>>()?, total))

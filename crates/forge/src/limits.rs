@@ -43,18 +43,24 @@ impl Drop for Permit<'_> {
 
 const WINDOW: Duration = Duration::from_secs(600);
 const SOURCE_WINDOW: Duration = Duration::from_secs(60);
-/// Failed attempts one source may make per minute before it is refused.
-const SOURCE_CAP: usize = 30;
-const MAX_DELAY: Duration = Duration::from_secs(2);
 const MAX_ENTRIES: usize = 10_000;
+const MAX_KEY: usize = 128;
 
 /// Failure bookkeeping for password logins. Not a lockout: a stranger failing
 /// against `alice` slows other *wrong* guesses but never blocks alice's right
 /// one, and a flooding source is refused alone.
-#[derive(Default)]
 pub struct Backoff {
+    source_cap: usize,
+    max_delay: Duration,
     by_login: Mutex<HashMap<String, Vec<Instant>>>,
     by_source: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+}
+
+impl Default for Backoff {
+    /// 30 attempts per source per minute, delays doubling from 50 ms to 2 s.
+    fn default() -> Backoff {
+        Backoff::new(30, Duration::from_secs(2))
+    }
 }
 
 fn prune(v: &mut Vec<Instant>, window: Duration) {
@@ -62,54 +68,75 @@ fn prune(v: &mut Vec<Instant>, window: Duration) {
     v.retain(|t| now.duration_since(*t) < window);
 }
 
-impl Backoff {
-    /// Has this source exhausted its per-minute failure budget?
-    pub fn source_blocked(&self, ip: IpAddr) -> bool {
-        let mut m = self.by_source.lock().unwrap_or_else(|e| e.into_inner());
-        match m.get_mut(&ip) {
-            Some(v) => {
-                prune(v, SOURCE_WINDOW);
-                v.len() >= SOURCE_CAP
-            }
-            None => false,
+/// Keep a map bounded: drop expired entries, and if it is still over budget
+/// start over. shortcut: a distributed flood of more than MAX_ENTRIES live
+/// sources resets everyone's counters; move to an LRU if that is ever seen.
+fn bound<K>(m: &mut HashMap<K, Vec<Instant>>, window: Duration) {
+    if m.len() > MAX_ENTRIES {
+        m.retain(|_, v| {
+            prune(v, window);
+            !v.is_empty()
+        });
+        if m.len() > MAX_ENTRIES {
+            m.clear();
         }
+    }
+}
+
+impl Backoff {
+    pub fn new(source_cap: usize, max_delay: Duration) -> Backoff {
+        Backoff {
+            source_cap,
+            max_delay,
+            by_login: Mutex::default(),
+            by_source: Mutex::default(),
+        }
+    }
+
+    /// Reserve one password attempt for `ip`. `false` when the source has used
+    /// its per-minute budget; the check and the reservation are one step, so
+    /// concurrent requests cannot all slip under the cap. A failure keeps the
+    /// reservation as its record; [`Backoff::success`] gives it back.
+    pub fn begin(&self, ip: IpAddr) -> bool {
+        let mut m = self.by_source.lock().unwrap_or_else(|e| e.into_inner());
+        bound(&mut m, SOURCE_WINDOW);
+        let v = m.entry(ip).or_default();
+        prune(v, SOURCE_WINDOW);
+        if v.len() >= self.source_cap {
+            return false;
+        }
+        v.push(Instant::now());
+        true
     }
 
     /// Record a failed attempt; returns how long to delay the failure response
-    /// (doubling from 50 ms, capped at 2 s).
-    pub fn record_failure(&self, login: &str, ip: IpAddr) -> Duration {
-        let n = {
-            let mut m = self.by_login.lock().unwrap_or_else(|e| e.into_inner());
-            if m.len() > MAX_ENTRIES {
-                m.retain(|_, v| {
-                    prune(v, WINDOW);
-                    !v.is_empty()
-                });
-            }
-            let v = m.entry(login.to_lowercase()).or_default();
-            prune(v, WINDOW);
-            v.push(Instant::now());
-            v.len() as u32
-        };
-        {
-            let mut m = self.by_source.lock().unwrap_or_else(|e| e.into_inner());
-            if m.len() > MAX_ENTRIES {
-                m.retain(|_, v| {
-                    prune(v, SOURCE_WINDOW);
-                    !v.is_empty()
-                });
-            }
-            m.entry(ip).or_default().push(Instant::now());
-        }
-        Duration::from_millis(50u64.saturating_mul(1u64 << (n - 1).min(16))).min(MAX_DELAY)
+    /// (doubling from 50 ms, capped).
+    pub fn failure(&self, login: &str, _ip: IpAddr) -> Duration {
+        let mut m = self.by_login.lock().unwrap_or_else(|e| e.into_inner());
+        bound(&mut m, WINDOW);
+        let key: String = login.to_lowercase().chars().take(MAX_KEY).collect();
+        let v = m.entry(key).or_default();
+        prune(v, WINDOW);
+        v.push(Instant::now());
+        let n = v.len() as u32;
+        Duration::from_millis(50u64.saturating_mul(1u64 << (n - 1).min(16))).min(self.max_delay)
     }
 
-    /// A success clears the login's failures.
-    pub fn record_success(&self, login: &str) {
+    /// A success clears the login's failures and returns the source's reservation.
+    pub fn success(&self, login: &str, ip: IpAddr) {
+        let key: String = login.to_lowercase().chars().take(MAX_KEY).collect();
         self.by_login
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&login.to_lowercase());
+            .remove(&key);
+        if let Some(v) = self
+            .by_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&ip)
+        {
+            v.pop();
+        }
     }
 }
 
@@ -193,22 +220,45 @@ mod tests {
     fn delay_doubles_and_caps_and_success_resets() {
         let b = Backoff::default();
         let d: Vec<u128> = (0..8)
-            .map(|_| b.record_failure("Alice", ip("1.1.1.1")).as_millis())
+            .map(|_| b.failure("Alice", ip("1.1.1.1")).as_millis())
             .collect();
         assert_eq!(d, vec![50, 100, 200, 400, 800, 1600, 2000, 2000]);
-        b.record_success("alice"); // case-insensitive key
-        assert_eq!(b.record_failure("alice", ip("1.1.1.1")).as_millis(), 50);
+        b.success("alice", ip("1.1.1.1")); // case-insensitive key
+        assert_eq!(b.failure("alice", ip("1.1.1.1")).as_millis(), 50);
     }
 
     #[test]
-    fn a_flooding_source_is_blocked_but_others_are_not() {
+    fn the_source_budget_is_reserved_atomically_and_per_source() {
+        let b = Backoff::new(3, Duration::ZERO);
+        assert!([
+            b.begin(ip("9.9.9.9")),
+            b.begin(ip("9.9.9.9")),
+            b.begin(ip("9.9.9.9"))
+        ]
+        .iter()
+        .all(|x| *x));
+        assert!(
+            !b.begin(ip("9.9.9.9")),
+            "the fourth attempt is refused before any verification ran"
+        );
+        assert!(b.begin(ip("8.8.8.8")), "other sources are unaffected");
+        b.success("u", ip("9.9.9.9")); // a success gives its reservation back
+        assert!(b.begin(ip("9.9.9.9")));
+    }
+
+    #[test]
+    fn maps_stay_bounded_under_a_flood_of_distinct_keys() {
         let b = Backoff::default();
-        for i in 0..SOURCE_CAP {
-            assert!(!b.source_blocked(ip("9.9.9.9")), "attempt {i}");
-            b.record_failure(&format!("u{i}"), ip("9.9.9.9"));
+        for i in 0..(MAX_ENTRIES + 50) {
+            b.failure(&format!("login-{i}-{}", "x".repeat(500)), ip("1.1.1.1"));
         }
-        assert!(b.source_blocked(ip("9.9.9.9")));
-        assert!(!b.source_blocked(ip("8.8.8.8")));
+        assert!(b.by_login.lock().unwrap().len() <= MAX_ENTRIES + 1);
+        assert!(b
+            .by_login
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|k| k.len() <= MAX_KEY));
     }
 
     #[test]

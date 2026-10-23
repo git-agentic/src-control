@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::Duration;
 
 /// A fully read request, handed to the synchronous router.
 pub struct Req {
@@ -37,6 +38,9 @@ pub struct Resp {
     pub status: u16,
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
+    /// Held back by the server before writing (failed-login backoff), on the
+    /// async runtime so it occupies no blocking thread.
+    pub delay: Duration,
 }
 
 const JSON_CT: &str = "application/json;charset=utf-8";
@@ -47,6 +51,7 @@ impl Resp {
             status,
             headers: vec![("content-type", JSON_CT.into())],
             body: serde_json::to_vec(v).expect("serializing a Value cannot fail"),
+            delay: Duration::ZERO,
         }
     }
 
@@ -55,7 +60,13 @@ impl Resp {
             status: 204,
             headers: vec![],
             body: vec![],
+            delay: Duration::ZERO,
         }
+    }
+
+    pub fn delayed(mut self, d: Duration) -> Resp {
+        self.delay = d;
+        self
     }
 
     pub fn with(mut self, name: &'static str, value: String) -> Resp {

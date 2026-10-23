@@ -7,7 +7,7 @@ use crate::auth::{self, Authed};
 use crate::http::{error, not_found, Req, Resp};
 use crate::limits::{Backoff, Gate, Proxies};
 use crate::scope::{self, Cat, Level, Need};
-use crate::{api, db};
+use crate::{api, db, store};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -55,6 +55,9 @@ pub enum Actor {
     SiteAdmin,
     /// The caller must be the user named by this path parameter, or a site admin.
     SelfOrSiteAdmin(&'static str),
+    /// The caller must own the organization named by this path parameter, or be a
+    /// site admin; a missing organization is a 404.
+    OrgOwnerOrSiteAdmin(&'static str),
 }
 
 /// What a handler receives; authentication and policy already passed.
@@ -111,7 +114,7 @@ const fn n(cat: Cat, level: Level) -> Option<Need> {
     Some(Need(cat, level))
 }
 
-use Actor::{Any, SelfOrSiteAdmin, SiteAdmin};
+use Actor::{Any, OrgOwnerOrSiteAdmin, SelfOrSiteAdmin, SiteAdmin};
 use Class::{Password, Token};
 
 /// The route table. F2 onward append rows; a row cannot omit its class,
@@ -206,12 +209,20 @@ pub static ROUTES: &[Route] = &[
         Any,
         api::get_org,
     ),
-    // Declared now so the scope check applies; the handler arrives with F2.
+    // Declared now so scope and actor checks apply; the handlers arrive with F2.
     r(
         "POST",
         "/orgs/{o}/repos",
         Token,
         n(Cat::Organization, Level::Write),
+        OrgOwnerOrSiteAdmin("o"),
+        api::not_implemented,
+    ),
+    r(
+        "POST",
+        "/user/repos",
+        Token,
+        n(Cat::User, Level::Write),
         Any,
         api::not_implemented,
     ),
@@ -327,23 +338,32 @@ pub fn dispatch(app: &App, req: &Req) -> Resp {
             );
         }
     }
-    let denied = match route.actor {
-        Actor::Any => false,
-        Actor::SiteAdmin => !who.user.is_admin,
-        Actor::SelfOrSiteAdmin(p) => {
-            let target = params
-                .iter()
-                .find(|(k, _)| *k == p)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("");
-            !who.user.is_admin && !who.user.login.eq_ignore_ascii_case(target)
-        }
+    let param = |p: &str| {
+        params
+            .iter()
+            .find(|(k, _)| *k == p)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
     };
-    if denied {
-        let msg = match route.actor {
-            Actor::SiteAdmin => "You must be a site admin to use this route",
-            _ => "doer should be the site admin or be same as the contextUser",
-        };
+    let denied = match route.actor {
+        Actor::Any => None,
+        Actor::SiteAdmin => {
+            (!who.user.is_admin).then_some("You must be a site admin to use this route")
+        }
+        Actor::SelfOrSiteAdmin(p) => (!who.user.is_admin
+            && !who.user.login.eq_ignore_ascii_case(param(p)))
+        .then_some("doer should be the site admin or be same as the contextUser"),
+        Actor::OrgOwnerOrSiteAdmin(p) => match store::find_by_login(&conn, param(p)) {
+            Ok(Some(org)) if org.is_org => match store::is_org_owner(&conn, org.id, who.user.id) {
+                Ok(owner) => (!owner && !who.user.is_admin)
+                    .then_some("Given user is not allowed to create repository in organization."),
+                Err(e) => return app.internal(&e),
+            },
+            Ok(_) => return api::org_missing(app, param(p)),
+            Err(e) => return app.internal(&e),
+        },
+    };
+    if let Some(msg) = denied {
         return error(&app.base, 403, msg);
     }
     (route.handler)(&mut Ctx {

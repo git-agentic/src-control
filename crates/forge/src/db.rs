@@ -70,7 +70,13 @@ pub fn db_path(data_dir: &Path) -> PathBuf {
 /// Open a connection with the durability and integrity settings every
 /// connection needs (WAL, `synchronous=FULL`, foreign keys, a busy timeout).
 pub fn connect(data_dir: &Path) -> Result<Connection, DbError> {
-    let conn = Connection::open(db_path(data_dir))?;
+    let path = db_path(data_dir);
+    let fresh = !path.exists();
+    let conn = Connection::open(&path)?;
+    if fresh {
+        // Owner-only before WAL creates its siblings, which copy this mode.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
@@ -93,12 +99,11 @@ fn migrate(conn: &mut Connection) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Create the data directory (owner-only: the database holds password hashes).
+/// Create the data directory and make it owner-only: the database holds
+/// password and token hashes, so a pre-existing directory is tightened too.
 fn ensure_dir(data_dir: &Path) -> Result<(), DbError> {
-    if !data_dir.exists() {
-        std::fs::create_dir_all(data_dir)?;
-        std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+    std::fs::create_dir_all(data_dir)?;
+    std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
@@ -147,6 +152,8 @@ mod tests {
         assert_eq!(version(&conn).unwrap(), SCHEMA_VERSION);
         let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "data dir holds password hashes");
+        let dbmode = std::fs::metadata(db_path(&d)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dbmode, 0o600);
         open_for_serve(&d).unwrap();
         let _ = std::fs::remove_dir_all(&d);
         assert!(!d.exists());
@@ -180,6 +187,25 @@ mod tests {
         drop(conn);
         assert!(matches!(open_for_admin(&d), Err(DbError::Schema(_))));
         assert!(matches!(open_for_serve(&d), Err(DbError::Schema(_))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod perm_tests {
+    use super::*;
+
+    #[test]
+    fn an_existing_world_readable_dir_is_tightened() {
+        let d = std::env::temp_dir().join(format!("scl-forge-db-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(open_for_admin(&d).unwrap());
+        assert_eq!(
+            std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }

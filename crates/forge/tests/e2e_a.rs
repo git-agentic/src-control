@@ -488,31 +488,111 @@ fn alices_password_cannot_mint_bobs_tokens_but_a_site_admins_can() {
 }
 
 #[test]
-fn wrong_passwords_are_indistinguishable_and_unknown_users_cost_the_same() {
+fn wrong_passwords_are_indistinguishable_and_never_reveal_what_the_secret_was() {
     let s = Srv::start();
     let pw = s.mk_user("alice");
-    let wrong = s.post(
-        "/api/v1/users/alice/tokens",
-        &basic("alice", "nope"),
-        json!({"name": "a", "scopes": ["all"]}),
+    let org = s.post(
+        "/api/v1/orgs",
+        &token(&s.admin),
+        json!({"username": "acme"}),
     );
-    let unknown = s.post(
-        "/api/v1/users/nobody/tokens",
-        &basic("nobody", "nope"),
-        json!({"name": "a", "scopes": ["all"]}),
-    );
-    assert_eq!((wrong.status, unknown.status), (401, 401));
-    assert_eq!(wrong.raw, unknown.raw, "same body: no account enumeration");
+    assert_eq!(org.status, 201);
+    let ro = s.mk_token("alice", &pw, "ro", &["read:repository"]);
+    let body = json!({"name": "a", "scopes": ["all"]});
+    let attempts = [
+        s.post(
+            "/api/v1/users/alice/tokens",
+            &basic("alice", "nope"),
+            body.clone(),
+        ),
+        s.post(
+            "/api/v1/users/nobody/tokens",
+            &basic("nobody", "nope"),
+            body.clone(),
+        ),
+        s.post(
+            "/api/v1/users/acme/tokens",
+            &basic("acme", "nope"),
+            body.clone(),
+        ), // an organization name
+        s.post(
+            "/api/v1/users/alice/tokens",
+            &basic("alice", &ro),
+            body.clone(),
+        ), // a valid token as the password
+        s.post(
+            "/api/v1/users/alice/tokens",
+            &basic("alice", &s.admin),
+            body.clone(),
+        ), // someone else's token
+    ];
+    for a in &attempts {
+        assert_eq!(a.status, 401);
+        assert_eq!(
+            a.raw, attempts[0].raw,
+            "same body whatever the credential was: no account or token oracle"
+        );
+    }
     // The right password still works straight after failures (backoff is not a lockout).
+    assert_eq!(
+        s.post("/api/v1/users/alice/tokens", &basic("alice", &pw), body)
+            .status,
+        201
+    );
+}
+
+#[test]
+fn failed_passwords_are_delayed_and_a_flooding_source_is_refused() {
+    use std::time::{Duration, Instant};
+    let s = Srv::start_backoff(scl_forge::limits::Backoff::new(
+        4,
+        Duration::from_millis(400),
+    ));
+    let pw = s.mk_user("alice");
+    let body = json!({"name": "a", "scopes": ["all"]});
+    let t = Instant::now();
+    for _ in 0..3 {
+        assert_eq!(
+            s.post(
+                "/api/v1/users/alice/tokens",
+                &basic("alice", "bad"),
+                body.clone()
+            )
+            .status,
+            401
+        );
+    }
+    assert!(
+        t.elapsed() >= Duration::from_millis(50 + 100 + 200),
+        "delays double per failure: {:?}",
+        t.elapsed()
+    );
+    // The fourth attempt uses the last unit of the budget; the fifth is refused before any verification.
     assert_eq!(
         s.post(
             "/api/v1/users/alice/tokens",
             &basic("alice", &pw),
-            json!({"name": "ok", "scopes": ["all"]})
+            body.clone()
         )
         .status,
         201
     );
+    for _ in 0..3 {
+        s.post(
+            "/api/v1/users/alice/tokens",
+            &basic("alice", "bad"),
+            body.clone(),
+        );
+    }
+    let r = s.post(
+        "/api/v1/users/alice/tokens",
+        &basic("alice", &pw),
+        body.clone(),
+    );
+    assert_eq!(r.status, 429);
+    assert_eq!(r.headers["retry-after"], "60");
+    // Token routes are the only place passwords are tried; ordinary routes stay open to tokens.
+    assert_eq!(s.get("/api/v1/user", &token(&s.admin)).status, 200);
 }
 
 #[test]
@@ -724,4 +804,305 @@ fn credentials_cli_forms_parse() {
         "duplicate refuses"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_stalled_request_body_is_cut_off() {
+    let s = Srv::start_with(scl_forge::server::Limits {
+        body_timeout: std::time::Duration::from_millis(300),
+        ..Default::default()
+    });
+    // Promise 10 bytes, send none: the server must answer 408 instead of holding the connection.
+    let head = format!("POST /api/v1/orgs HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: token {}\r\nContent-Length: 10\r\n\r\n", s.admin);
+    let r = s.raw(head.as_bytes(), b"");
+    assert_eq!(r.status, 408);
+}
+
+#[test]
+fn token_lists_are_newest_first() {
+    let s = Srv::start();
+    let pw = s.mk_user("alice");
+    for n in ["first", "second", "third"] {
+        s.mk_token("alice", &pw, n, &["read:user"]);
+    }
+    let conn = scl_forge::db::connect(&s.dir).unwrap();
+    for (n, t) in [("first", 100), ("second", 200), ("third", 300)] {
+        conn.execute(
+            "UPDATE tokens SET created_unix = ?1 WHERE name = ?2",
+            rusqlite::params![t, n],
+        )
+        .unwrap();
+    }
+    let names: Vec<_> = s
+        .get("/api/v1/users/alice/tokens", &basic("alice", &pw))
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        ["third", "second", "first"],
+        "recorded X#29/R#07 order"
+    );
+}
+
+#[test]
+fn user_and_org_repo_creation_routes_apply_scope_and_actor_rules() {
+    let s = Srv::start();
+    let adm = token(&s.admin);
+    let alice_pw = s.mk_user("alice");
+    let bot_pw = s.mk_user("bot");
+    let alice_all = s.mk_token("alice", &alice_pw, "all", &["all"]);
+    let alice_ro = s.mk_token("alice", &alice_pw, "ro", &["read:repository"]);
+    let bot_all = s.mk_token("bot", &bot_pw, "all", &["all"]);
+    // R#14: a non-admin creates an organization and becomes its owner.
+    let bo = s.post(
+        "/api/v1/orgs",
+        &token(&bot_all),
+        json!({"username": "botorg"}),
+    );
+    assert_eq!(bo.status, 201);
+    // B#26/B#34: scope is checked before the route is served.
+    let r = s.post(
+        "/api/v1/user/repos",
+        &token(&alice_ro),
+        json!({"name": "nope"}),
+    );
+    assert_eq!(
+        (r.status, r.msg().as_str()),
+        (
+            403,
+            "token does not have at least one of required scope(s): [write:user]"
+        )
+    );
+    // R#15/R#16: a non-owner is refused whatever the token's scope.
+    let wo = s.mk_token("alice", &alice_pw, "wo", &["write:organization"]);
+    for t in [&wo, &alice_all] {
+        let r = s.post(
+            "/api/v1/orgs/botorg/repos",
+            &token(t),
+            json!({"name": "intruder"}),
+        );
+        assert_eq!(
+            (r.status, r.msg().as_str()),
+            (
+                403,
+                "Given user is not allowed to create repository in organization."
+            )
+        );
+    }
+    // The owner and a site admin pass the policy (the handler itself arrives with F2).
+    assert_eq!(
+        s.post(
+            "/api/v1/orgs/botorg/repos",
+            &token(&bot_all),
+            json!({"name": "legit"})
+        )
+        .status,
+        501
+    );
+    assert_eq!(
+        s.post("/api/v1/orgs/botorg/repos", &adm, json!({"name": "legit"}))
+            .status,
+        501
+    );
+    let r = s.post("/api/v1/orgs/ghost/repos", &adm, json!({"name": "x"}));
+    assert_eq!(
+        (r.status, r.json()["message"].as_str()),
+        (404, Some("GetOrgByName"))
+    );
+    // R#18: a non-owner with a write:organization-only token reads a public org.
+    assert_eq!(s.get("/api/v1/orgs/botorg", &token(&wo)).status, 200);
+    // R#02: public-only tokens still need the scope.
+    let po = s.mk_token(
+        "alice",
+        &alice_pw,
+        "po",
+        &["public-only", "read:repository"],
+    );
+    let r = s.get("/api/v1/user", &token(&po));
+    assert_eq!(
+        (r.status, r.msg().as_str()),
+        (
+            403,
+            "token does not have at least one of required scope(s): [read:user]"
+        )
+    );
+}
+
+#[test]
+fn private_org_permissions_are_hidden_from_outsiders() {
+    let s = Srv::start();
+    let adm = token(&s.admin);
+    let pw = s.mk_user("eve");
+    let eve = s.mk_token("eve", &pw, "t", &["read:organization", "read:user"]);
+    s.post(
+        "/api/v1/orgs",
+        &adm,
+        json!({"username": "secret", "visibility": "private"}),
+    );
+    let r = s.get(
+        "/api/v1/users/siteadmin/orgs/secret/permissions",
+        &token(&eve),
+    );
+    assert_eq!(
+        (r.status, r.msg().as_str()),
+        (404, "HasOrgOrUserVisible"),
+        "no membership oracle for outsiders"
+    );
+    assert_eq!(
+        s.get("/api/v1/users/siteadmin/orgs/secret/permissions", &adm)
+            .status,
+        200
+    );
+}
+
+#[test]
+fn admin_lists_another_users_tokens_with_a_password_and_cannot_delete_across_users() {
+    let s = Srv::start();
+    let alice_pw = s.mk_user("alice");
+    let bob_pw = s.mk_user("bob");
+    let bob_tok = s.mk_token("bob", &bob_pw, "bobs", &["read:user"]);
+    let bobs_id = s
+        .get("/api/v1/users/bob/tokens", &basic("bob", &bob_pw))
+        .json()[0]["id"]
+        .clone();
+    // alice cannot reach bob's token through her own path: ids are scoped to the path user.
+    let r = s.send(
+        "DELETE",
+        &format!("/api/v1/users/alice/tokens/{bobs_id}"),
+        Some(&basic("alice", &alice_pw)),
+        None,
+    );
+    assert_eq!(r.status, 404);
+    assert_eq!(
+        s.get("/api/v1/user", &token(&bob_tok)).status,
+        200,
+        "bob's token survived"
+    );
+    // X#29: a site admin with a password lists another user's tokens.
+    s.post("/api/v1/admin/users", &token(&s.admin), json!({"username": "boss", "email": "b@example.invalid", "password": "boss-pw-1", "must_change_password": false}));
+    s.send(
+        "PATCH",
+        "/api/v1/admin/users/boss",
+        Some(&token(&s.admin)),
+        Some(&json!({"admin": true})),
+    );
+    let r = s.get("/api/v1/users/bob/tokens", &basic("boss", "boss-pw-1"));
+    assert_eq!((r.status, r.headers["x-total-count"].as_str()), (200, "1"));
+}
+
+#[test]
+fn password_change_flag_blocks_the_password_but_not_issued_tokens() {
+    let s = Srv::start();
+    let pw = s.mk_user("alice");
+    let t = s.mk_token("alice", &pw, "t", &["read:user"]);
+    s.send(
+        "PATCH",
+        "/api/v1/admin/users/alice",
+        Some(&token(&s.admin)),
+        Some(&json!({"must_change_password": true})),
+    );
+    assert_eq!(
+        s.post(
+            "/api/v1/users/alice/tokens",
+            &basic("alice", &pw),
+            json!({"name": "n", "scopes": ["all"]})
+        )
+        .status,
+        403
+    );
+    assert_eq!(s.get("/api/v1/user", &token(&t)).status, 200);
+}
+
+#[test]
+fn patching_one_field_never_rewrites_another() {
+    let s = Srv::start();
+    s.mk_user("alice");
+    let conn = scl_forge::db::connect(&s.dir).unwrap();
+    let alice = scl_forge::store::find_by_login(&conn, "alice")
+        .unwrap()
+        .unwrap();
+    // A stale snapshot of alice, then an admin grant and a password reset land...
+    let hash = scl_crypto::hash_password("fresh");
+    scl_forge::store::update_user(
+        &conn,
+        alice.id,
+        &scl_forge::store::UserPatch {
+            is_admin: Some(true),
+            password_hash: Some(hash.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // ...and a patch that only carries a description must not write the stale flag or hash back.
+    scl_forge::store::update_user(
+        &conn,
+        alice.id,
+        &scl_forge::store::UserPatch {
+            description: Some("hi".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let now = scl_forge::store::find_by_id(&conn, alice.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (now.is_admin, now.password_hash, now.description),
+        (true, hash, "hi".to_string())
+    );
+}
+
+#[test]
+fn huge_page_numbers_do_not_overflow() {
+    let s = Srv::start();
+    let r = s.get(
+        "/api/v1/admin/users?page=9223372036854775807&limit=50",
+        &token(&s.admin),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json(), json!([]));
+}
+
+#[test]
+fn concurrent_patches_of_different_fields_both_land() {
+    let s = Srv::start();
+    s.mk_user("alice");
+    let id = scl_forge::store::find_by_login(&scl_forge::db::connect(&s.dir).unwrap(), "alice")
+        .unwrap()
+        .unwrap()
+        .id;
+    let dir = s.dir.clone();
+    let writer = std::thread::spawn(move || {
+        let c = scl_forge::db::connect(&dir).unwrap();
+        for i in 0..300 {
+            let p = scl_forge::store::UserPatch {
+                description: Some(format!("d{i}")),
+                ..Default::default()
+            };
+            scl_forge::store::update_user(&c, id, &p).unwrap();
+        }
+    });
+    let c = scl_forge::db::connect(&s.dir).unwrap();
+    for _ in 0..300 {
+        scl_forge::store::update_user(
+            &c,
+            id,
+            &scl_forge::store::UserPatch {
+                is_admin: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    writer.join().unwrap();
+    let u = scl_forge::store::find_by_id(&c, id).unwrap().unwrap();
+    assert!(
+        u.is_admin,
+        "a concurrent description patch must not write a stale is_admin back"
+    );
+    assert_eq!(u.description, "d299");
 }

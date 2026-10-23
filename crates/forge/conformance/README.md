@@ -47,9 +47,9 @@ python3 -I run.py show fixtures/1.26.2 --only G --body    # what was recorded
 
 Against the in-tree server use `./forge-check.sh` (it bootstraps an empty data directory with the `admin` CLI,
 starts `sc-forge serve` on a free loopback port, runs `check` with the departures and `slice-pending.json`, and
-stops the server; CI runs it). `check --pending FILE` takes a JSON map `{scenario: N}`: the server is expected to
-answer the first N exchanges of that scenario, the scenario must then stop at its next setup call (a route from a
-later slice), and the rest are reported as pending. A server that answers more than N, or a scenario that
+stops the server; CI runs it). `check --pending FILE` takes a JSON map `{scenario: [N, "METHOD /path"]}` (a bare `N` is also accepted): the
+server is expected to answer the first N exchanges of that scenario, the scenario must then stop at the named setup
+call (a route from a later slice), and the rest are reported as pending. A server that answers more than N, or a scenario that
 completes, fails the run, so the file shrinks as slices land and is empty when the contract is whole. It is for the
 in-tree build only; never pass it when checking real Gitea.
 

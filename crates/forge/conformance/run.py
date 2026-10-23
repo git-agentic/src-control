@@ -914,7 +914,8 @@ def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
     """Run every scenario in order (they read earlier state); `only` filters what is reported/written.
 
     `pending` (check only) maps a scenario id to the number of leading exchanges the server under test is expected
-    to answer; later exchanges need routes from a slice that is not built yet. The run must stop exactly there."""
+    to answer, or to [number, text]; later exchanges need routes from a slice that is not built yet. The run must stop
+    exactly there, and with a text the stop error must contain it (so an F1 step failing at the same index is not hidden)."""
     summary = []
     pending = pending or {}
     for sid, slug, needs_base, fn in SCENARIOS:
@@ -922,7 +923,7 @@ def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
         fname = f"{sid}-{slug}.json"
         c.ex, c.cursor, c.diffs = [], 0, []
         c.reset_scenario()
-        c.expected, skip, stale, deferred, ndeferred = [], None, [], None, 0
+        c.expected, skip, stale, deferred, ndeferred, stop = [], None, [], None, 0, None
         c.overrides, c.web_skipped = {}, 0
         if c.mode == "check" and selected:
             fp = os.path.join(fixtures, fname)
@@ -959,7 +960,7 @@ def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
                         continue
                     c.overrides[i] = dict(dep, match=matches[k] or got)
             if sid in pending:
-                deferred = pending[sid]
+                deferred, stop = pending[sid] if isinstance(pending[sid], list) else (pending[sid], None)
                 ndeferred = max(0, len(c.expected) - deferred)
                 c.expected = c.expected[:deferred]
         t0 = time.time()
@@ -991,7 +992,7 @@ def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
                 lines += [f"       {'expected difference honoured' if lv == 'honoured' else lv}: {t}" for lv, t in ds]
         # unpaired exchanges and errors: each counts as a failed exchange
         missing = len(c.expected) - len(c.ex)
-        if err and deferred is not None and len(c.ex) == deferred:
+        if err and deferred is not None and len(c.ex) == deferred and (stop is None or stop in err):
             lines.append(f"  (pending: {ndeferred} later exchange(s) need a later slice; the scenario stopped at #{deferred}: {err[:100]})")
         elif err:
             if skip and norm_msg(skip) == norm_msg(err):
