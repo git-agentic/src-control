@@ -236,7 +236,18 @@ const ABORT_NO_SPACE: u16 = 507;
 /// Read a gzip request body completely and inflate it, before any process exists: a bad or
 /// oversized body is then a plain 400/413, never a race with the response head `git http-backend`
 /// writes before it reads its input. `cap` bounds both the compressed and the inflated size.
-async fn inflate_body(mut body: Incoming, cap: u64, idle: Duration) -> Result<Vec<u8>, u16> {
+async fn inflate_body(body: Incoming, cap: u64, idle: Duration) -> Result<Vec<u8>, u16> {
+    // The per-frame idle deadline alone lets a client that trickles a byte per interval hold the
+    // admission slots for as long as it likes; the whole read gets a deadline too.
+    tokio::time::timeout(PRELOAD_DEADLINE, inflate_frames(body, cap, idle))
+        .await
+        .unwrap_or(Err(ABORT_TIMEOUT))
+}
+
+/// Longest a gzip request body may take to arrive in full.
+const PRELOAD_DEADLINE: Duration = Duration::from_secs(300);
+
+async fn inflate_frames(mut body: Incoming, cap: u64, idle: Duration) -> Result<Vec<u8>, u16> {
     let mut dec = flate2::write::GzDecoder::new(Sink {
         buf: Vec::new(),
         total: 0,
@@ -502,22 +513,21 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
     // SAFETY: the closure runs between fork and exec and only calls setrlimit (async-signal-safe).
     unsafe {
         cmd.pre_exec(move || {
-            #[allow(unused_mut)]
-            let mut limits = vec![
-                (libc::RLIMIT_CPU, cpu),
-                (libc::RLIMIT_FSIZE, fsize),
-                (libc::RLIMIT_CORE, 0),
-            ];
             // Heap and anonymous mappings (file-backed pack mappings are not counted): a crafted
             // pack declaring a huge compressed object cannot take the host's memory. Linux only,
             // where RLIMIT_DATA covers mmap since 4.7; macOS does not enforce it usefully.
-            #[cfg(target_os = "linux")]
-            if mem > 0 {
-                limits.push((libc::RLIMIT_DATA, mem));
-            }
-            #[cfg(not(target_os = "linux"))]
-            let _ = mem;
+            // (A fixed array: nothing may allocate between fork and exec.)
+            let data = if cfg!(target_os = "linux") { mem } else { 0 };
+            let limits = [
+                (libc::RLIMIT_CPU, cpu),
+                (libc::RLIMIT_FSIZE, fsize),
+                (libc::RLIMIT_CORE, 0),
+                (libc::RLIMIT_DATA, data),
+            ];
             for (res, v) in limits {
+                if res == libc::RLIMIT_DATA && v == 0 {
+                    continue;
+                }
                 let lim = libc::rlimit {
                     rlim_cur: v as libc::rlim_t,
                     rlim_max: v as libc::rlim_t,

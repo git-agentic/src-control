@@ -888,7 +888,7 @@ unless said otherwise).
   `http-backend` enables `receive-pack` for that request alone. The advertisement carries the server's git
   version and platform (`agent=git/2.x-<os>`), as stock git does.
 - **Request framing.** Plain request bodies are never buffered: they stream through a bounded channel to the child. A
-  gzip `upload-pack` request is read and inflated **by the server before any process starts**, under a cap on both the
+  gzip `upload-pack` request is read (within 5 minutes in total) and inflated **by the server before any process starts**, under a cap on both the
   compressed and the *inflated* size (`--max-request-bytes`, 16 MiB), because `git http-backend` has no counter on
   expanded bytes; the child gets the plain bytes with an exact `Content-Length` and never sees `Content-Encoding`. A bomb
   or bad gzip is therefore a deterministic 413/400 and never gets a process
