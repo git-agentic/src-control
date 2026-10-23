@@ -265,8 +265,8 @@ pub fn list_tags(ctx: &mut Ctx) -> Resp {
             Ok(r) => r,
             Err(r) => return r,
         };
-        // Newest first, as Gitea lists them (ties keep name order).
-        rows.sort_by_key(|r| std::cmp::Reverse(r.created));
+        // Newest first, as Gitea lists them; ties (a second's resolution) by name, descending.
+        rows.sort_by(|x, y| (y.created, &y.name).cmp(&(x.created, &x.name)));
         let (page, limit) = page_params(ctx);
         let total = rows.len() as i64;
         let start = (((page - 1) * limit) as usize).min(rows.len());
