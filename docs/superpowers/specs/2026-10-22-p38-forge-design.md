@@ -684,6 +684,60 @@ header. Decisions drawn from it, beyond those stated in the sections above:
   until F2. `GET /api/healthz` and `GET /healthz` both answer. Only owners exist in
   `org_members` (no member roles, no teams).
 
+### F2a decisions (as built)
+
+F2a is the repository half of F2 (plan: `docs/superpowers/plans/2026-10-23-p38-f2a-repos-api.md`);
+the smart-HTTP transport, hooks, ref policy, admission control and threat-model pass #1 are F2b.
+
+- **Access.** One function, `repos::resolve`, turns (caller, repository) into a permission
+  (site admin or owner or org owner = Admin and owner; collaborator = its mode; else none) and
+  is the only place that does; F2b's git path calls it too. A missing, not-`live` or invisible
+  repository is one 404; a token restricted to `public-only` is refused 403 `token scope is
+  limited to public repos` before any existence is revealed, on every repository route and on
+  creation; below the route's minimum is 403. `DELETE` needs owner-level authority (an admin
+  collaborator cannot delete), `PATCH` and the collaborator routes need Admin, branch delete
+  needs Write.
+- **Collaborators.** Only an Admin manages them; an admin collaborator may grant any mode
+  including `admin`; the owner (or an owner of the owning organization) cannot be added (422);
+  the target must be a user (422 `user does not exist [uid: 0, name: x]` also for an
+  organization); `permission` is `read|write|admin`, default `write`. Listed in the order added.
+- **Listings** (`/repos/search`, `/user/repos`, `/orgs/{o}/repos`) filter in SQL by the same
+  rule; a `public-only` token sees an empty 200 with `X-Total-Count: 0`; `X-Total-Count` is the
+  visible count (recorded K#55-56 counted repositories the caller cannot see; a reviewed
+  departure once K runs). `sort=alpha` orders by the full name `owner/name`. An existing
+  organization the caller cannot see still answers 200 with what the caller can read (a
+  collaborator of a repository inside it sees it).
+- **PATCH.** `description`, `website` and `default_branch` apply; `name` other than the current
+  one is 422 `repository rename is not supported`; a default branch that does not exist (or is
+  not a valid branch name, e.g. `main~1`) is 422; `private`, `has_*`, `allow_*` and the other
+  Gitea fields are accepted, ignored and answered with fixed values. The repository object keeps
+  `private: true` and `internal: false` (recorded Gitea flips both on `private:false`).
+- **Object quirks kept.** The owner object nested in a repository has `active: false`,
+  `login_name: ""` and `is_admin: false` (recorded), `size` is 0, `empty` is computed live from
+  `HEAD`, a repository's initial commit has the message `Initial commit` and the author the
+  creating user, and `README.md` is `# <name>` plus two newlines.
+- **Branches.** `{b..}` is a tail capture (names contain `/`). Branch names are validated as git
+  would (`refname::valid_branch`) and addressed only as `refs/heads/<name>`; deleting the default
+  branch is 403 `can not delete default branch`; an empty repository lists branches as `null`.
+- **Lifecycle.** `serve` holds an exclusive `flock` on `<data>/.lock`, requires git 2.40 or
+  newer, then reconciles once before binding the listener. Per-repository mutexes serialize
+  create-finalize, delete, default-branch change and branch delete, each re-checking `live`
+  under the lock with conditional SQL. Creation fsyncs the whole new tree and `repos/`; any
+  failure before `live` rolls back in-process; **every `creating` row is rolled back at
+  startup** (the row does not record `auto_init`); a directory in `repos/` with no row at all is
+  **moved to `orphans/`, never deleted**, so a restored or recreated database cannot erase
+  repositories; a `live` row whose directory is missing is reported, never dropped.
+- **Git runner.** Every spawn is `env_clear` with an explicit `--git-dir` (never discovery),
+  `GIT_CEILING_DIRECTORIES`, pinned per-spawn config, its own process group (signalled while the
+  leader is still an unreaped zombie, so the group id cannot be reused), a deadline, capped
+  output drained by dedicated threads, and an admission slot with a deadline (503 when busy,
+  `--git-concurrency`, default 8). Commit identity values containing control characters or
+  angle brackets are refused.
+- **Conformance gate.** `forge-check.sh` replays `A`, `B`, `C`, `L`, `N` and `R`; `B` stops at
+  its first contents call (F3), `C` and `N` at their first `git clone` (F2b), and `X`, `D`,
+  `K`, `M` stay out until their routes exist (they make recorded calls to unbuilt routes, which
+  `--pending` cannot hide). 97 recorded exchanges are verified for real.
+
 ## Open questions
 
 1. The merge of a PR whose head is already in base (recorded: 405 `try again later`,
