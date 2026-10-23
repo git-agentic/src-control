@@ -1176,24 +1176,42 @@ fn a_database_with_the_right_version_but_no_tables_is_not_ready() {
 fn serve_refuses_unusable_settings_at_startup() {
     let dir = std::env::temp_dir().join(format!("scl-forge-serve-args-{}", std::process::id()));
     let bin = env!("CARGO_BIN_EXE_sc-forge");
+    // Bounded wait: if a bad setting were accepted the server would run until a signal,
+    // so kill and reap it instead of stalling the suite.
     let run = |extra: &[&str]| {
-        std::process::Command::new(bin)
+        let mut child = std::process::Command::new(bin)
             .args(["serve", "--listen", "127.0.0.1:0", "--data-dir"])
             .arg(&dir)
             .args(extra)
-            .output()
-            .unwrap()
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break Some(st);
+            }
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut err = String::new();
+        std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut err).unwrap();
+        (status.is_some_and(|s| !s.success()), err)
     };
-    let o = run(&[
+    let (refused, err) = run(&[
         "--public-url",
         "http://127.0.0.1:1",
         "--max-connections",
         "0",
     ]);
-    assert!(
-        !o.status.success() && String::from_utf8_lossy(&o.stderr).contains("--max-connections")
-    );
-    let o = run(&["--public-url", "http://exämple.com"]);
-    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("--public-url"));
+    assert!(refused && err.contains("--max-connections"), "{err}");
+    for bad in ["http://exämple.com", "http:///forge"] {
+        let (refused, err) = run(&["--public-url", bad]);
+        assert!(refused && err.contains("--public-url"), "{bad}: {err}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -143,10 +143,15 @@ pub fn validate_public_url(url: &str) -> Result<(), String> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"));
+    let host = rest
+        .and_then(|r| r.split(['/', '?', '#']).next())
+        .unwrap_or("");
+    // A host must come first: not empty, and not just a port or user-info.
+    let host_ok = !host.is_empty() && !host.starts_with([':', '@']);
     match rest {
-        Some(r) if !r.is_empty() && r.bytes().all(|b| b.is_ascii_graphic()) => Ok(()),
+        Some(r) if host_ok && r.bytes().all(|b| b.is_ascii_graphic()) => Ok(()),
         _ => Err(format!(
-            "--public-url {url:?} must be an http:// or https:// URL of visible ASCII characters (percent-encode anything else)"
+            "--public-url {url:?} must be an http:// or https:// URL with a host, of visible ASCII characters (percent-encode anything else)"
         )),
     }
 }
