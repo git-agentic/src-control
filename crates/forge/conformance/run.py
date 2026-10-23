@@ -567,7 +567,7 @@ class Ctx:
         return re.sub(r"\b%s\b" % re.escape(self.admin_user), "<admin>", s)
 
     def ns(self, s):
-        s = re.sub(r"https?(://)[^/@\s\"':]*:[^/@\s\"']*@", r"http\1<creds>@", self.scrub(s))  # user:password@ only (ssh://git@ stays); https checks like http
+        s = re.sub(r"https?(://)[^/@\s\"':?#]*:[^/@\s\"'?#]*@", r"http\1<creds>@", self.scrub(s))  # user:password@ only (ssh://git@ stays); https checks like http
         # pkt-line adverts glue a 4-hex length in front of the id ("0146<sha> HEAD"), so \b misses it
         s = re.sub(r"[0-9a-f]{40}(?= (?:HEAD|refs/|capabilities))", lambda m: self.sha_ph(m.group(0)), s)
         s = SHA_RE.sub(lambda m: self.sha_ph(m.group(0)), s)

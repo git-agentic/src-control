@@ -917,7 +917,7 @@ unless said otherwise).
   deadline, and a user who can create repositories gets 16 slots per repository, so one account can fill the 64 global
   slots and make everyone else wait out `--admission-wait` (503). There are no per-user quotas yet (F5; a per-user
   limit would also throttle Engine, whose clones come from one service account, so it needs a deliberate budget).
-  The disk reservation counts bytes already written twice (free space has dropped and the push still holds them), so it
+  A push's growth check credits its own written bytes back, but other pushes in flight are still counted twice (free space has dropped and they still hold the bytes), so it
   errs on the side of refusing. A killed push gets SIGTERM first (git removes its lock files and quarantine directory
   from its signal handlers; we wait up to one second for the leader to exit and stderr to close, not tested) and then SIGKILL; a server killed outright can still leave a stale
   `refs/heads/<x>.lock` or `objects/incoming-*` behind (cleanup is F5).

@@ -321,11 +321,12 @@ impl Pump {
         if let Some(r) = &mut self.reservation {
             while forwarded > r.reserved {
                 let free = transport::free_bytes(&r.data_dir).unwrap_or(0);
-                let ok = r
-                    .held
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .grow(free, r.floor, GROW_STEP);
+                let ok = r.held.lock().unwrap_or_else(|e| e.into_inner()).grow(
+                    // free space already lost this push's own bytes, which `held` still counts
+                    free.saturating_add(forwarded),
+                    r.floor,
+                    GROW_STEP,
+                );
                 if !ok {
                     eprintln!("sc-forge: push aborted: the disk reserve cannot cover it");
                     self.stop(ABORT_NO_SPACE);
