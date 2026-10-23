@@ -206,7 +206,7 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         .map(|c| Cidr::parse(c))
         .collect::<Result<Vec<_>, _>>()
         .map_err(anyhow::Error::msg)?;
-    if a.trusted_proxy_header.is_some() != !cidrs.is_empty() {
+    if a.trusted_proxy_header.is_some() == cidrs.is_empty() {
         bail!("--trusted-proxy-header and --trusted-proxies must be given together");
     }
     if a.behind_proxy && cidrs.is_empty() {
