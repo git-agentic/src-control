@@ -179,6 +179,10 @@ pub fn service_of(sub: &Sub, query_service: Option<&str>) -> Result<Option<Servi
 
 const TEXT: &str = "text/plain;charset=utf-8";
 
+/// The `Cache-Control` Gitea sends on its 401s and on the results of the RPC endpoints (recorded
+/// V#1/3/16/18/20/21).
+pub const PRIVATE_CACHE: &str = "max-age=0, private, must-revalidate, no-transform";
+
 fn text(status: u16, body: &str) -> Resp {
     Resp {
         status,
@@ -191,13 +195,13 @@ fn text(status: u16, body: &str) -> Resp {
 /// 401 for a request with no credentials: asks the client to authenticate.
 pub fn unauthorized() -> Resp {
     text(401, "Unauthorized\n")
-        .with("www-authenticate", "Basic realm=\"sc-forge\"".into())
-        .with("cache-control", "no-store".into())
+        .with("www-authenticate", "Basic realm=\"Gitea\"".into())
+        .with("cache-control", PRIVATE_CACHE.into())
 }
 
 /// 401 for a credential that does not verify (unknown, expired, or a password).
 pub fn bad_credentials() -> Resp {
-    text(401, "Verify\n").with("cache-control", "no-store".into())
+    text(401, "Verify\n").with("cache-control", PRIVATE_CACHE.into())
 }
 
 /// 403: authenticated, but the token's scope or the caller's permission is not enough.

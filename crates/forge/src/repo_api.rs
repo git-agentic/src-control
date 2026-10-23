@@ -618,7 +618,10 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
     let c = gitread::commit(&ctx.app.life.git, &dir, &br.oid)
         .map_err(|e| git_read_err(ctx.app, ctx.conn, a.repo.id, e))?
         .ok_or_else(|| ctx.app.internal(&"branch points at no commit"))?;
-    let who = |p: &gitread::Person| json!({"name": p.name, "email": p.email, "username": ""});
+    let who = |p: &gitread::Person| {
+        let login = store::login_by_email(ctx.conn, &p.email).unwrap_or(None);
+        json!({"name": p.name, "email": p.email, "username": login.unwrap_or_default()})
+    };
     let full = format!("{}/{}", a.repo.owner, a.repo.name);
     Ok(json!({
         "name": br.name,

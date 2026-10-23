@@ -142,6 +142,23 @@ pub fn list_users(conn: &Connection, page: i64, limit: i64) -> rusqlite::Result<
     Ok((rows.collect::<Result<_, _>>()?, total))
 }
 
+/// The login of the one user whose email is `email` (case-insensitive), as Gitea resolves a commit
+/// author to an account. `None` for an empty address, no match, or an address shared by several
+/// accounts (ambiguous: attribute to nobody).
+pub fn login_by_email(conn: &Connection, email: &str) -> rusqlite::Result<Option<String>> {
+    if email.is_empty() {
+        return Ok(None);
+    }
+    let mut st = conn.prepare("SELECT login FROM users WHERE lower(email) = lower(?1) LIMIT 2")?;
+    let found = st
+        .query_map([email], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(match found.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    })
+}
+
 /// Partial update of a user; `None` leaves a field alone.
 #[derive(Default)]
 pub struct UserPatch {

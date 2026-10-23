@@ -726,6 +726,7 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
     let service = plan.service;
     let is_receive = service == Some(Service::Receive);
     let has_body = plan.path.sub.method() == "POST";
+    let is_rpc = has_body;
     let content_length = match req
         .header("content-length")
         .map(|v| v.trim().parse::<u64>())
@@ -835,6 +836,12 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
     };
     let mut b = Response::builder().status(head.status);
     for (k, v) in head.headers {
+        // The RPC endpoints answer with Gitea's cache policy (recorded), not git's no-cache one.
+        let v = if is_rpc && k == "cache-control" {
+            transport::PRIVATE_CACHE.to_string()
+        } else {
+            v
+        };
         b = b.header(k, v);
     }
     b.body(
