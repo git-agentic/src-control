@@ -72,6 +72,10 @@ const MIGRATIONS: &[&str] = &[
     );",
 ];
 
+/// Every table the current schema creates; `/healthz` probes each, so a missing or unreadable one
+/// (whatever the recorded version says) reads as not ready.
+pub const TABLES: &[&str] = &["users", "org_members", "tokens", "repos", "collaborators"];
+
 /// Database failures a caller reports to the operator.
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -102,6 +106,14 @@ pub fn connect(data_dir: &Path) -> Result<Connection, DbError> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // SQLite's built-in lower() folds ASCII only; searches need Unicode-aware case folding.
+    conn.create_scalar_function(
+        "ulower",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| Ok(ctx.get::<String>(0)?.to_lowercase()),
+    )?;
     Ok(conn)
 }
 

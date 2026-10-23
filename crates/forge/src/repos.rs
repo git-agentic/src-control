@@ -273,7 +273,7 @@ pub fn list_visible(
     }
     if let Some(q) = filter.q.as_deref().filter(|q| !q.is_empty()) {
         wheres.push(
-            "(r.lower_name LIKE ? ESCAPE '\\' OR lower(r.description) LIKE ? ESCAPE '\\')".into(),
+            "(r.lower_name LIKE ? ESCAPE '\\' OR ulower(r.description) LIKE ? ESCAPE '\\')".into(),
         );
         let pat = format!(
             "%{}%",
@@ -615,6 +615,47 @@ mod tests {
         // paging keeps the visible total
         let (rs, total) = list_visible(&e.conn, &admin, false, &all, Sort::Id, 2, 2).unwrap();
         assert_eq!((rs.len(), total), (1, 3));
+    }
+
+    #[test]
+    fn search_folds_case_for_non_ascii_descriptions_too() {
+        let e = env("unicode-q");
+        let owner = user(&e.conn, "owner", false);
+        let r = live(&e.conn, &owner, "pastry");
+        update_live(
+            &e.conn,
+            r.id,
+            &RepoPatch {
+                description: Some("Éclair and STRÜDEL".into()),
+                ..Default::default()
+            },
+            3,
+        )
+        .unwrap();
+        for q in [
+            "éclair",
+            "ÉCLAIR",
+            "strüdel",
+            "Strüdel",
+            "ECLAIR".to_lowercase().as_str(),
+        ] {
+            let hit = list_visible(
+                &e.conn,
+                &owner,
+                false,
+                &Filter {
+                    q: Some(q.into()),
+                    ..Default::default()
+                },
+                Sort::Id,
+                1,
+                50,
+            )
+            .unwrap()
+            .1;
+            // "eclair" (no accent) is a different word, so it correctly finds nothing
+            assert_eq!(hit, i64::from(q != "eclair"), "{q}");
+        }
     }
 
     #[test]

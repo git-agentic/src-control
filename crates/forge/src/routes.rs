@@ -437,7 +437,7 @@ fn database_ready(app: &App) -> bool {
     let version = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0));
     // The version alone can be forged by a replacement file; the tables must answer too.
     version.is_ok_and(|v| v == db::SCHEMA_VERSION)
-        && ["users", "org_members", "tokens"].iter().all(|t| {
+        && db::TABLES.iter().all(|t| {
             conn.query_row(&format!("SELECT 1 FROM {t} LIMIT 1"), [], |_| Ok(()))
                 .map_or_else(
                     |e| matches!(e, rusqlite::Error::QueryReturnedNoRows),

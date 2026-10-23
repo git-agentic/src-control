@@ -314,14 +314,26 @@ fn exited_unreaped(pid: i32) -> std::io::Result<bool> {
     Ok(pid_set)
 }
 
-/// Find `git`: `SC_FORGE_GIT` if set, else the first `git` on the server's own `PATH`.
-pub fn find_git() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("SC_FORGE_GIT") {
-        return Some(PathBuf::from(p));
+/// Resolve where `git` is: `configured` (the `SC_FORGE_GIT` value) if given, else `git` on `path`.
+/// The result is always absolute: every spawn runs with the data directory as its working
+/// directory, so a relative path (or a relative `PATH` entry) would be looked up there instead of
+/// where the operator started the server.
+pub fn resolve_git(configured: Option<&OsStr>, path: Option<&OsStr>) -> Option<PathBuf> {
+    let name: &OsStr = configured.unwrap_or_else(|| OsStr::new("git"));
+    if Path::new(name).components().count() > 1 {
+        return std::path::absolute(name).ok().filter(|p| p.is_file());
     }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join("git"))
+    std::env::split_paths(path?)
+        .filter_map(|d| std::path::absolute(d.join(name)).ok())
         .find(|p| p.is_file())
+}
+
+/// Find `git` from the server's own environment (`SC_FORGE_GIT`, then `PATH`), as an absolute path.
+pub fn find_git() -> Option<PathBuf> {
+    resolve_git(
+        std::env::var_os("SC_FORGE_GIT").as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
 }
 
 /// `(major, minor)` from `git version 2.54.0 (Apple Git-157)`.
@@ -482,6 +494,37 @@ mod tests {
         assert!(
             text.contains("GIT_NO_REPLACE_OBJECTS=1") && text.contains("GIT_CEILING_DIRECTORIES=")
         );
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn the_git_path_is_always_absolute() {
+        let d = tmp("resolve-git");
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::write(d.join("bin").join("mygit"), b"#!/bin/sh\n").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        // a slash-containing relative value is made absolute against the current directory
+        let rel = d
+            .strip_prefix(&cwd)
+            .map(|p| p.join("bin/mygit"))
+            .unwrap_or_else(|_| d.join("bin/mygit"));
+        let got = resolve_git(Some(rel.as_os_str()), None).expect("resolved");
+        assert!(got.is_absolute() && got.ends_with("bin/mygit"), "{got:?}");
+        // a bare name is searched on PATH, and a relative PATH entry is made absolute too
+        let path = std::env::join_paths([d.join("bin")]).unwrap();
+        assert!(resolve_git(Some(OsStr::new("mygit")), Some(&path))
+            .unwrap()
+            .is_absolute());
+        let rel_dir = d
+            .join("bin")
+            .strip_prefix(&cwd)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| d.join("bin"));
+        let rel_path = std::env::join_paths([rel_dir]).unwrap();
+        assert!(resolve_git(Some(OsStr::new("mygit")), Some(&rel_path))
+            .unwrap()
+            .is_absolute());
+        assert!(resolve_git(Some(OsStr::new("nope-not-here")), Some(&path)).is_none());
         let _ = std::fs::remove_dir_all(d);
     }
 

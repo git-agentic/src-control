@@ -168,9 +168,14 @@ fn repo_json_known(
 fn listed(ctx: &Ctx, rows: &[Repo]) -> Result<Vec<Value>, Resp> {
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        let perm = repos::resolve(ctx.conn, &ctx.who.user, &r.owner, &r.name)
+        // Access is re-resolved per row; a row the caller can no longer read (revoked, deleted or
+        // being deleted since the query ran) is skipped, never shown with a default permission.
+        let Some(perm) = repos::resolve(ctx.conn, &ctx.who.user, &r.owner, &r.name)
             .map_err(|e| ctx.app.internal(&e))?
-            .map_or(Perm::Read, |a| a.perm);
+            .map(|a| a.perm)
+        else {
+            continue;
+        };
         let read = ctx.app.life.with_read(ctx.conn, r.id, || {
             gitread::is_empty(&ctx.app.life.git, &ctx.app.life.repo_dir(r.id))
         });

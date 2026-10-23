@@ -1199,3 +1199,21 @@ fn a_second_server_on_the_same_data_directory_exits_on_the_lock_before_touching_
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn readiness_covers_the_repository_tables_too() {
+    for table in ["repos", "collaborators"] {
+        let (w, _) = world();
+        assert_eq!(w.s.send("GET", "/api/healthz", None, None).status, 200);
+        let conn = scl_forge::db::connect(&w.s.dir).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF; ALTER TABLE {table} RENAME TO {table}_gone;"
+        ))
+        .unwrap();
+        assert_eq!(
+            w.s.send("GET", "/api/healthz", None, None).status,
+            503,
+            "without {table} the server is not ready"
+        );
+    }
+}

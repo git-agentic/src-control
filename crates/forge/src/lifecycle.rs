@@ -350,6 +350,24 @@ impl Lifecycle {
         Ok(())
     }
 
+    /// Does branch ref `full` exist? `show-ref --verify` exits 1 for "no such ref"; any other
+    /// failure (128: the directory is missing or corrupt) is the repository's damage and must
+    /// not read as bad user input.
+    fn branch_exists(&self, dir: &Path, full: &str) -> Result<bool, LifecycleError> {
+        let out = self.git.run(&Spec {
+            repo: Some(dir),
+            args: &["show-ref", "--verify", "--quiet", full],
+            ..Default::default()
+        })?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(LifecycleError::GitFailed(
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            )),
+        }
+    }
+
     /// Make `branch` the default: it must exist; bare `HEAD` is written first, then the row.
     pub fn set_default_branch(
         &self,
@@ -368,12 +386,7 @@ impl Lifecycle {
         }
         let dir = self.repo_dir(current.id);
         let full = refname::branch_ref(branch);
-        let exists = self.git.run(&Spec {
-            repo: Some(&dir),
-            args: &["show-ref", "--verify", "--quiet", &full],
-            ..Default::default()
-        })?;
-        if !exists.ok() {
+        if !self.branch_exists(&dir, &full)? {
             return Err(LifecycleError::NoSuchBranch);
         }
         self.run(&dir, &["symbolic-ref", "HEAD", &full], None, None)?;
@@ -408,12 +421,7 @@ impl Lifecycle {
         }
         let dir = self.repo_dir(current.id);
         let full = refname::branch_ref(branch);
-        let exists = self.git.run(&Spec {
-            repo: Some(&dir),
-            args: &["show-ref", "--verify", "--quiet", &full],
-            ..Default::default()
-        })?;
-        if !exists.ok() {
+        if !self.branch_exists(&dir, &full)? {
             return Err(LifecycleError::NoSuchBranch);
         }
         self.run(&dir, &["update-ref", "-d", &full], None, None)?;
@@ -1101,6 +1109,17 @@ mod tests {
                 .default_branch,
             "main"
         );
+    }
+
+    #[test]
+    fn a_damaged_repository_is_a_failure_not_a_missing_branch() {
+        let e = env("damaged-branch");
+        let r = make(&e, "alpha", true).unwrap();
+        std::fs::remove_file(e.lc.repo_dir(r.id).join("HEAD")).unwrap(); // no longer a repository
+        let a = e.lc.set_default_branch(&e.conn, &r, "dev", 20);
+        assert!(matches!(a, Err(LifecycleError::GitFailed(_))), "{a:?}");
+        let b = e.lc.delete_branch(&e.conn, &r, "dev");
+        assert!(matches!(b, Err(LifecycleError::GitFailed(_))), "{b:?}");
     }
 
     #[test]
