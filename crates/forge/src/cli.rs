@@ -228,10 +228,11 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         header: a.trusted_proxy_header.map(|h| h.to_ascii_lowercase()),
         cidrs,
     };
-    db::open_for_serve(&a.data_dir)?;
-    // One server per data directory: the lock is held until this function returns.
+    // One server per data directory, taken before anything touches it (migrations included): the
+    // lock is held until this function returns.
     let _data_lock =
         scl_forge::lifecycle::DirLock::acquire(&a.data_dir).map_err(anyhow::Error::msg)?;
+    db::open_for_serve(&a.data_dir)?;
     let git_bin =
         scl_forge::gitproc::find_git().context("git not found: install git or set SC_FORGE_GIT")?;
     let git = std::sync::Arc::new(scl_forge::gitproc::Git::new(

@@ -61,20 +61,39 @@ fn ssh_authority(base: &str) -> String {
         .to_string()
 }
 
-/// The ~70-key repository object recorded from Gitea. `perm` is the *caller's* standing.
+/// Is the repository empty (`HEAD` does not resolve)? A live read of the repository on disk, under
+/// the shared lock; `Err` is the response to send (404 if it is gone, 503 if the runner is busy).
+fn compute_empty(app: &App, conn: &rusqlite::Connection, r: &Repo) -> Result<bool, Resp> {
+    // Under the shared repository lock, and only while the repository is still live: a read must
+    // never straddle a delete's rename and see a half-vanished repository as an empty one.
+    match app.life.with_read(conn, r.id, || {
+        gitread::is_empty(&app.life.git, &app.life.repo_dir(r.id))
+    }) {
+        Err(e) => Err(app.internal(&e)),
+        Ok(None) => Err(not_found(&app.base, "The target couldn't be found.", None)),
+        Ok(Some(res)) => res.map_err(|e| git_read_err(app, conn, r.id, e)),
+    }
+}
+
+/// The repository object with a live read of `empty`.
 fn repo_json(app: &App, conn: &rusqlite::Connection, r: &Repo, perm: Perm) -> Result<Value, Resp> {
+    let empty = compute_empty(app, conn, r)?;
+    repo_json_known(app, conn, r, perm, empty)
+}
+
+/// The ~70-key repository object recorded from Gitea, with `empty` already known (a create or
+/// PATCH that has committed must not be reported as failed by a later git read). `perm` is the
+/// *caller's* standing.
+fn repo_json_known(
+    app: &App,
+    conn: &rusqlite::Connection,
+    r: &Repo,
+    perm: Perm,
+    empty: bool,
+) -> Result<Value, Resp> {
     let owner = store::find_by_id(conn, r.owner_id)
         .map_err(|e| app.internal(&e))?
         .ok_or_else(|| app.internal(&"repo without owner"))?;
-    // Under the shared repository lock, and only while the repository is still live: a read must
-    // never straddle a delete's rename and see a half-vanished repository as an empty one.
-    let empty = match app.life.with_read(conn, r.id, || {
-        gitread::is_empty(&app.life.git, &app.life.repo_dir(r.id))
-    }) {
-        Err(e) => return Err(app.internal(&e)),
-        Ok(None) => return Err(not_found(&app.base, "The target couldn't be found.", None)),
-        Ok(Some(res)) => res.map_err(|e| git_read_err(app, conn, r.id, e))?,
-    };
     let mut owner_json = user_json(&app.base, &owner);
     owner_json["active"] = json!(false); // recorded: the owner object inside a repository reads inactive
     owner_json["login_name"] = json!(""); // recorded: the nested owner never carries the login_name
@@ -142,16 +161,41 @@ fn repo_json(app: &App, conn: &rusqlite::Connection, r: &Repo, perm: Perm) -> Re
     }))
 }
 
-/// A listed repository with the caller's standing computed per row.
+/// The listed repositories with the caller's standing computed per row. One row never fails the
+/// page: a repository deleted after the query ran is skipped, and one whose directory cannot be
+/// read (a `live` row whose directory is missing, which the reconciler reports) is listed as
+/// empty, since `HEAD` does not resolve there. A busy runner is still a 503 for the whole page.
 fn listed(ctx: &Ctx, rows: &[Repo]) -> Result<Vec<Value>, Resp> {
-    rows.iter()
-        .map(|r| {
-            let perm = repos::resolve(ctx.conn, &ctx.who.user, &r.owner, &r.name)
-                .map_err(|e| ctx.app.internal(&e))?
-                .map_or(Perm::Read, |a| a.perm);
-            repo_json(ctx.app, ctx.conn, r, perm)
-        })
-        .collect()
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let perm = repos::resolve(ctx.conn, &ctx.who.user, &r.owner, &r.name)
+            .map_err(|e| ctx.app.internal(&e))?
+            .map_or(Perm::Read, |a| a.perm);
+        let read = ctx.app.life.with_read(ctx.conn, r.id, || {
+            gitread::is_empty(&ctx.app.life.git, &ctx.app.life.repo_dir(r.id))
+        });
+        let empty = match read {
+            Err(e) => return Err(ctx.app.internal(&e)),
+            Ok(None) => continue, // deleted since the query
+            Ok(Some(Ok(empty))) => empty,
+            Ok(Some(Err(GitError::Busy))) => {
+                return Err(error(
+                    &ctx.app.base,
+                    503,
+                    "too many git operations in flight",
+                ))
+            }
+            Ok(Some(Err(e))) => {
+                eprintln!(
+                    "sc-forge: cannot read {}/{} (id {}): {e}; listed as empty",
+                    r.owner, r.name, r.id
+                );
+                true
+            }
+        };
+        out.push(repo_json_known(ctx.app, ctx.conn, r, perm, empty)?);
+    }
+    Ok(out)
 }
 
 fn token_public_only(ctx: &Ctx) -> bool {
@@ -205,7 +249,8 @@ fn create_for(ctx: &mut Ctx, owner: &User) -> Resp {
         now(),
     );
     match created {
-        Ok(r) => match repo_json(ctx.app, ctx.conn, &r, Perm::Admin) {
+        // `empty` is known: only an auto_init create has a commit. No git read after committing.
+        Ok(r) => match repo_json_known(ctx.app, ctx.conn, &r, Perm::Admin, !auto_init) {
             Ok(v) => Resp::json(201, &v),
             Err(resp) => resp,
         },
@@ -256,6 +301,14 @@ pub fn patch_repo(ctx: &mut Ctx) -> Resp {
     if str_field(&b, "name").is_some_and(|n| n != a.repo.name) {
         return error(&base, 422, "repository rename is not supported");
     }
+    // Read `empty` before anything is changed: once the patch has committed, a later failing git
+    // read must not report it as failed. Making an existing branch the default means HEAD
+    // resolves, so a changed default is never empty.
+    let empty_before = match compute_empty(ctx.app, ctx.conn, &a.repo) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let mut default_changed = false;
     // Always handed to the locked operation, which compares against the row under the lock (a
     // snapshot taken before the lock could be stale).
     if let Some(branch) = str_field(&b, "default_branch") {
@@ -267,7 +320,7 @@ pub fn patch_repo(ctx: &mut Ctx) -> Resp {
             .life
             .set_default_branch(ctx.conn, &a.repo, &branch, now())
         {
-            Ok(()) => {}
+            Ok(()) => default_changed = branch != a.repo.default_branch,
             Err(LifecycleError::NoSuchBranch) => {
                 return error(
                     &base,
@@ -289,7 +342,13 @@ pub fn patch_repo(ctx: &mut Ctx) -> Resp {
         Err(e) => return ctx.app.internal(&e),
     }
     match repos::find_by_id(ctx.conn, a.repo.id) {
-        Ok(Some(r)) => match repo_json(ctx.app, ctx.conn, &r, a.perm) {
+        Ok(Some(r)) => match repo_json_known(
+            ctx.app,
+            ctx.conn,
+            &r,
+            a.perm,
+            !default_changed && empty_before,
+        ) {
             Ok(v) => Resp::json(200, &v),
             Err(resp) => resp,
         },

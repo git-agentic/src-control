@@ -1039,3 +1039,163 @@ fn a_saturated_runner_answers_503_on_reads_and_writes_not_500() {
         201
     );
 }
+
+#[test]
+fn one_repository_with_a_missing_directory_does_not_fail_the_listing() {
+    let (w, _) = world();
+    let healthy = w.mk("healthy", true);
+    let lost = w.mk("lost", true);
+    std::fs::remove_dir_all(w.s.dir.join("repos").join(format!("{}.git", lost["id"]))).unwrap();
+    for path in [
+        "/api/v1/repos/search?sort=alpha",
+        "/api/v1/user/repos",
+        "/api/v1/orgs/acme/repos",
+    ] {
+        let r = w.s.get(path, &w.adm);
+        assert_eq!(r.status, 200, "{path}: {}", String::from_utf8_lossy(&r.raw));
+        let v = r.json();
+        let items = v.get("data").cloned().unwrap_or(v);
+        let by_name: std::collections::HashMap<String, bool> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| {
+                (
+                    x["name"].as_str().unwrap().to_string(),
+                    x["empty"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_name.get("healthy"),
+            Some(&false),
+            "{path}: the healthy repo is listed normally"
+        );
+        assert_eq!(
+            by_name.get("lost"),
+            Some(&true),
+            "{path}: the damaged one is listed as empty, not a 500 for the page"
+        );
+    }
+    assert_eq!(w.s.get("/api/v1/repos/acme/healthy", &w.adm).status, 200);
+    let _ = healthy;
+}
+
+#[test]
+fn a_create_and_a_patch_report_success_from_what_they_committed() {
+    let (w, _) = world();
+    let r = w.s.post(
+        "/api/v1/orgs/acme/repos",
+        &w.adm,
+        json!({"name": "fresh", "auto_init": false}),
+    );
+    assert_eq!((r.status, r.json()["empty"].as_bool()), (201, Some(true)));
+    let r = w.s.post(
+        "/api/v1/orgs/acme/repos",
+        &w.adm,
+        json!({"name": "seeded", "auto_init": true}),
+    );
+    assert_eq!((r.status, r.json()["empty"].as_bool()), (201, Some(false)));
+    // PATCH keeps `empty` and, when the default becomes an existing branch, reports not empty
+    let id = r.json()["id"].as_i64().unwrap();
+    let main = w.s.git(id, &["rev-parse", "main"], None);
+    w.s.git(id, &["update-ref", "refs/heads/dev", &main], None);
+    let p = w.s.send(
+        "PATCH",
+        "/api/v1/repos/acme/seeded",
+        Some(&w.adm),
+        Some(&json!({"default_branch": "dev", "description": "d"})),
+    );
+    assert_eq!(
+        (
+            p.status,
+            p.json()["empty"].as_bool(),
+            p.json()["default_branch"].as_str()
+        ),
+        (200, Some(false), Some("dev"))
+    );
+    let id2 = w.s.get("/api/v1/repos/acme/fresh", &w.adm).json()["id"]
+        .as_i64()
+        .unwrap();
+    w.s.commit_on(id2, "other", None); // branches exist but HEAD (main) is still unborn
+    let p = w.s.send(
+        "PATCH",
+        "/api/v1/repos/acme/fresh",
+        Some(&w.adm),
+        Some(&json!({"description": "x"})),
+    );
+    assert_eq!(
+        p.json()["empty"].as_bool(),
+        Some(true),
+        "HEAD still does not resolve"
+    );
+    let p = w.s.send(
+        "PATCH",
+        "/api/v1/repos/acme/fresh",
+        Some(&w.adm),
+        Some(&json!({"default_branch": "other"})),
+    );
+    assert_eq!(
+        p.json()["empty"].as_bool(),
+        Some(false),
+        "an existing branch as default resolves"
+    );
+}
+
+#[test]
+fn a_second_server_on_the_same_data_directory_exits_on_the_lock_before_touching_the_schema() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let dir = std::env::temp_dir().join(format!("scl-forge-two-servers-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let bin = env!("CARGO_BIN_EXE_sc-forge");
+    let serve = || {
+        let mut c = Command::new(bin);
+        c.args([
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+            "--public-url",
+            "http://127.0.0.1:1",
+            "--data-dir",
+        ])
+        .arg(&dir)
+        .stderr(Stdio::piped());
+        c
+    };
+    let mut first = serve().spawn().unwrap();
+    let mut lines = BufReader::new(first.stderr.take().unwrap()).lines();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut listening = false;
+    while std::time::Instant::now() < deadline {
+        match lines.next() {
+            Some(Ok(l)) if l.contains("listening on") => {
+                listening = true;
+                break;
+            }
+            Some(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(listening, "the first server must start");
+    // Make the schema newer than the second binary could migrate: if it migrated before the lock,
+    // it would fail on the schema; failing on the lock proves the lock comes first.
+    let c = scl_forge::db::connect(&dir).unwrap();
+    c.pragma_update(None, "user_version", scl_forge::db::SCHEMA_VERSION + 1)
+        .unwrap();
+    drop(c);
+    let out = serve().output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let _ = first.kill();
+    let _ = first.wait();
+    assert!(!out.status.success());
+    assert!(
+        err.contains("another sc-forge process"),
+        "the lock is refused first: {err}"
+    );
+    assert!(
+        !err.contains("newer than"),
+        "the second server never reached the schema check: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

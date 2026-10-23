@@ -88,7 +88,7 @@ pub fn insert_creating(
     match r {
         Ok(_) => find_by_id(conn, conn.last_insert_rowid())?.ok_or(StoreError::NotFound),
         Err(rusqlite::Error::SqliteFailure(f, _))
-            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
         {
             Err(StoreError::Exists)
         }
@@ -435,6 +435,28 @@ mod tests {
             insert_creating(&e.conn, bob.id, "mixed", "main", "", "", 1).is_ok(),
             "another owner may reuse the name"
         );
+    }
+
+    #[test]
+    fn only_a_unique_violation_means_the_name_exists() {
+        let e = env("unique-only");
+        let owner = user(&e.conn, "alice", false);
+        insert_creating(&e.conn, owner.id, "a", "main", "", "", 1).unwrap();
+        assert!(matches!(
+            insert_creating(&e.conn, owner.id, "A", "main", "", "", 1),
+            Err(StoreError::Exists)
+        ));
+        // a foreign-key failure (no such owner) is a database error, never "already exists"
+        assert!(matches!(
+            insert_creating(&e.conn, 9_999, "b", "main", "", "", 1),
+            Err(StoreError::Db(_))
+        ));
+        // so is a CHECK failure
+        let bad = e.conn.execute(
+            "INSERT INTO repos (owner_id, name, lower_name, default_branch, state, created_unix, updated_unix) VALUES (?1, 'c', 'c', 'main', 'bogus', 1, 1)",
+            [owner.id],
+        );
+        assert!(bad.is_err());
     }
 
     #[test]
