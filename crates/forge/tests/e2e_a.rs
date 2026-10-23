@@ -235,7 +235,15 @@ fn token_lifecycle_with_the_users_password() {
 
     let l = s.get("/api/v1/users/alice/tokens", &basic_alice);
     assert_eq!((l.status, l.headers["x-total-count"].as_str()), (200, "3"));
-    assert_eq!(l.json()[0]["name"], "ci");
+    let mut names: Vec<String> = l
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort(); // order is covered by token_lists_are_newest_first; same-second creations tie
+    assert_eq!(names, ["ci", "ord", "tmp"]);
     assert_eq!(
         l.json()[0]["sha1"],
         "",
@@ -1115,4 +1123,36 @@ fn login_name_is_stored_by_the_create_itself() {
         (r.status, r.json()["login_name"].as_str()),
         (201, Some("lena-ldap"))
     );
+}
+
+#[test]
+fn healthz_reports_a_missing_database_and_token_names_may_need_escaping() {
+    let s = Srv::start();
+    assert_eq!(s.send("GET", "/api/healthz", None, None).status, 200);
+    let pw = s.mk_user("alice");
+    let basic_alice = basic("alice", &pw);
+    s.mk_token("alice", &pw, "release bot", &["read:user"]);
+    let del = s.send(
+        "DELETE",
+        "/api/v1/users/alice/tokens/release%20bot",
+        Some(&basic_alice),
+        None,
+    );
+    assert_eq!(
+        del.status, 204,
+        "an escaped name is decoded before the lookup"
+    );
+    assert_eq!(
+        s.get("/api/v1/users/al%69ce/tokens", &basic_alice).status,
+        200,
+        "escaped path parameters are decoded"
+    );
+    assert_eq!(
+        s.get("/api/v1/users/%zz/tokens", &token(&s.admin)).status,
+        404,
+        "malformed escapes match no route"
+    );
+    // A deleted database must not read as healthy (connect would silently recreate it empty).
+    std::fs::remove_file(scl_forge::db::db_path(&s.dir)).unwrap();
+    assert_eq!(s.send("GET", "/api/healthz", None, None).status, 503);
 }

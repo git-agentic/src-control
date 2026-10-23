@@ -135,18 +135,22 @@ fn paged(ctx: &Ctx, path: &str, total: i64, page: i64, limit: i64, items: Vec<Va
     r
 }
 
+/// `GET /version`: the Gitea release whose behaviour this server reproduces.
 pub fn version(_: &mut Ctx) -> Resp {
     Resp::json(200, &json!({"version": GITEA_VERSION}))
 }
 
+/// Handler for routes whose policy is declared but whose slice has not landed: 501 after authentication, scope and actor checks.
 pub fn not_implemented(ctx: &mut Ctx) -> Resp {
     error(&ctx.app.base, 501, "not implemented yet")
 }
 
+/// `GET /user`: the authenticated caller.
 pub fn current_user(ctx: &mut Ctx) -> Resp {
     Resp::json(200, &user_json(&ctx.app.base, &ctx.who.user))
 }
 
+/// `GET /users/{u}`: a user (or organization) by login; private users are visible to themselves and site admins only.
 pub fn get_user(ctx: &mut Ctx) -> Resp {
     let name = ctx.param("u").to_string();
     match store::find_by_login(ctx.conn, &name) {
@@ -169,6 +173,7 @@ fn org_visible(ctx: &Ctx, org: &User) -> rusqlite::Result<bool> {
     Ok(org.visibility != "private" || me.is_admin || store::is_org_owner(ctx.conn, org.id, me.id)?)
 }
 
+/// `GET /orgs/{o}`: an organization, subject to its visibility.
 pub fn get_org(ctx: &mut Ctx) -> Resp {
     let name = ctx.param("o").to_string();
     let org = match store::find_by_login(ctx.conn, &name) {
@@ -183,6 +188,7 @@ pub fn get_org(ctx: &mut Ctx) -> Resp {
     }
 }
 
+/// `GET /users/{u}/orgs/{o}/permissions`: what `{u}` may do in `{o}`; hides private organizations and users from callers who cannot see them.
 pub fn org_permissions(ctx: &mut Ctx) -> Resp {
     let (uname, oname) = (ctx.param("u").to_string(), ctx.param("o").to_string());
     let subject = match store::find_by_login(ctx.conn, &uname) {
@@ -234,6 +240,7 @@ fn valid_visibility(v: &str) -> bool {
     matches!(v, "public" | "limited" | "private")
 }
 
+/// `POST /orgs`: create an organization owned by the caller.
 pub fn create_org(ctx: &mut Ctx) -> Resp {
     let b = match body(ctx) {
         Ok(b) => b,
@@ -273,6 +280,7 @@ pub fn create_org(ctx: &mut Ctx) -> Resp {
     }
 }
 
+/// `GET /admin/users`: every user (not organizations), paged.
 pub fn admin_list_users(ctx: &mut Ctx) -> Resp {
     let (page, limit) = page_params(ctx);
     match store::list_users(ctx.conn, page, limit) {
@@ -284,6 +292,7 @@ pub fn admin_list_users(ctx: &mut Ctx) -> Resp {
     }
 }
 
+/// `POST /admin/users`: create a user; `must_change_password` defaults to true as in Gitea, and `admin` is ignored (set it with PATCH).
 pub fn admin_create_user(ctx: &mut Ctx) -> Resp {
     let b = match body(ctx) {
         Ok(b) => b,
@@ -338,6 +347,7 @@ pub fn admin_create_user(ctx: &mut Ctx) -> Resp {
     }
 }
 
+/// `PATCH /admin/users/{u}`: update only the supplied fields of a user.
 pub fn admin_patch_user(ctx: &mut Ctx) -> Resp {
     let b = match body(ctx) {
         Ok(b) => b,
@@ -405,6 +415,7 @@ fn token_owner(ctx: &Ctx) -> Result<User, Resp> {
     }
 }
 
+/// `GET /users/{u}/tokens`: the user's tokens, newest first, without their secrets.
 pub fn list_tokens(ctx: &mut Ctx) -> Resp {
     let owner = match token_owner(ctx) {
         Ok(o) => o,
@@ -421,6 +432,7 @@ pub fn list_tokens(ctx: &mut Ctx) -> Resp {
     }
 }
 
+/// `POST /users/{u}/tokens`: mint a token; the secret is returned once, in `sha1`.
 pub fn create_token(ctx: &mut Ctx) -> Resp {
     let owner = match token_owner(ctx) {
         Ok(o) => o,
@@ -461,6 +473,7 @@ pub fn create_token(ctx: &mut Ctx) -> Resp {
     }
 }
 
+/// `DELETE /users/{u}/tokens/{id}`: delete one of the user's tokens by id or name.
 pub fn delete_token(ctx: &mut Ctx) -> Resp {
     let owner = match token_owner(ctx) {
         Ok(o) => o,

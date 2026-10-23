@@ -124,6 +124,7 @@ enum OrgCmd {
     },
 }
 
+/// Parse the command line and run `serve` or an `admin` command.
 pub fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Serve(a) => run_serve(a),

@@ -18,6 +18,7 @@ pub struct Req {
 }
 
 impl Req {
+    /// The request header `name` (lower case), if present.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).map(String::as_str)
     }
@@ -46,6 +47,7 @@ pub struct Resp {
 const JSON_CT: &str = "application/json;charset=utf-8";
 
 impl Resp {
+    /// A JSON response with Gitea's content type.
     pub fn json(status: u16, v: &Value) -> Resp {
         Resp {
             status,
@@ -55,6 +57,7 @@ impl Resp {
         }
     }
 
+    /// An empty 204.
     pub fn no_content() -> Resp {
         Resp {
             status: 204,
@@ -64,11 +67,13 @@ impl Resp {
         }
     }
 
+    /// Hold the response back by `d` before it is written.
     pub fn delayed(mut self, d: Duration) -> Resp {
         self.delay = d;
         self
     }
 
+    /// Add a response header.
     pub fn with(mut self, name: &'static str, value: String) -> Resp {
         self.headers.push((name, value));
         self

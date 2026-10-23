@@ -22,6 +22,7 @@ pub struct App {
 }
 
 impl App {
+    /// Build the shared state; also computes the dummy password hash so the first unknown login is not slower.
     pub fn new(data_dir: PathBuf, public_url: &str, proxies: Proxies, argon_slots: usize) -> App {
         scl_crypto::warm_up();
         App {
@@ -71,6 +72,7 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// The captured path parameter `name` (percent-decoded), or empty if the route has none by that name.
     pub fn param(&self, name: &str) -> &str {
         self.params
             .iter()
@@ -232,6 +234,24 @@ pub static ROUTES: &[Route] = &[
 /// Captured path parameters, in pattern order.
 type Params = Vec<(&'static str, String)>;
 
+/// Decode `%XX` escapes in a path segment; `None` when malformed or not UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let h = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(h, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 fn match_pattern(pattern: &'static str, path: &str) -> Option<Params> {
     let (mut ps, mut xs) = (pattern.split('/'), path.split('/'));
     let mut caps = Vec::new();
@@ -243,7 +263,9 @@ fn match_pattern(pattern: &'static str, path: &str) -> Option<Params> {
                     if x.is_empty() {
                         return None;
                     }
-                    caps.push((name, x.to_string()));
+                    // Captures are percent-decoded (a token named `release bot` is
+                    // addressed as `release%20bot`); undecodable input matches nothing.
+                    caps.push((name, percent_decode(x)?));
                 } else if p != x {
                     return None;
                 }
@@ -268,10 +290,18 @@ pub fn resolve(method: &str, path: &str) -> Result<(&'static Route, Params), boo
     Err(path_known)
 }
 
+/// Ready only when the database file exists at this binary's schema version: a
+/// deleted or replaced `forge.db` (which `connect` would recreate empty) is
+/// reported as down rather than as a healthy server whose routes all fail.
+fn database_ready(app: &App) -> bool {
+    db::db_path(&app.data_dir).exists()
+        && db::connect(&app.data_dir)
+            .and_then(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?))
+            .is_ok_and(|v| v == db::SCHEMA_VERSION)
+}
+
 fn healthz(app: &App) -> Resp {
-    let ok = db::connect(&app.data_dir)
-        .and_then(|c| Ok(c.query_row("SELECT 1", [], |_| Ok(()))?))
-        .is_ok();
+    let ok = database_ready(app);
     let now = crate::timefmt::rfc3339(crate::timefmt::now());
     let mut r = Resp::json(
         if ok { 200 } else { 503 },

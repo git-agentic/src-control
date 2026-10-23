@@ -230,6 +230,12 @@ impl Drop for Srv {
         if let Some(h) = self.thread.take() {
             let _ = h.join();
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        std::fs::remove_dir_all(&self.dir).expect("test data dir must be removable");
+        if !std::thread::panicking() {
+            assert!(
+                !self.dir.exists(),
+                "test data dir must be gone after teardown"
+            );
+        }
     }
 }

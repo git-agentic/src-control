@@ -16,6 +16,7 @@ pub struct Gate {
 pub struct Permit<'a>(&'a Gate);
 
 impl Gate {
+    /// A gate with `slots` concurrent permits.
     pub fn new(slots: usize) -> Gate {
         Gate {
             free: Mutex::new(slots.max(1)),
@@ -95,6 +96,7 @@ fn source_key(ip: IpAddr) -> IpAddr {
 }
 
 impl Backoff {
+    /// A policy allowing `source_cap` attempts per source per minute, with failure delays capped at `max_delay`.
     pub fn new(source_cap: usize, max_delay: Duration) -> Backoff {
         Backoff {
             source_cap,
@@ -161,6 +163,7 @@ pub struct Cidr {
 }
 
 impl Cidr {
+    /// Parse `addr` or `addr/bits`.
     pub fn parse(s: &str) -> Result<Cidr, String> {
         let (addr, bits) = s.split_once('/').unwrap_or((s, ""));
         let net: IpAddr = addr
@@ -179,6 +182,7 @@ impl Cidr {
         Ok(Cidr { net, bits })
     }
 
+    /// Is `ip` inside this block? IPv4-mapped IPv6 addresses are matched as the IPv4 they are.
     pub fn contains(&self, ip: IpAddr) -> bool {
         fn v(ip: IpAddr) -> u128 {
             match ip {
