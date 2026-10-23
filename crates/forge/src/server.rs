@@ -137,18 +137,55 @@ fn to_response(r: Resp) -> Response<Full<Bytes>> {
     })
 }
 
-/// Check `--public-url` at startup: an `http(s)://` URL of visible ASCII only, so
-/// it can be placed in `Link` headers and bodies without surprises.
-pub fn validate_public_url(url: &str) -> Result<(), String> {
-    let rest = url
+/// Parse and normalize `--public-url`: `http(s)://host[:port][/path]` with a real host,
+/// no user-info, no query or fragment. Returns the normalized base (percent-encoded,
+/// no trailing slash) that every URL in a body or `Link` header is built from, so a
+/// raw space or angle bracket in the path can never reach a header.
+pub fn validate_public_url(input: &str) -> Result<String, String> {
+    let bad = |why: &str| format!("--public-url {input:?} is not usable: {why}");
+    // WHATWG parsing forgives extra or backward slashes (`http:///x` becomes host `x`);
+    // an operator typing that made a mistake, so require the literal `scheme://host` shape.
+    let after = input
         .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"));
-    match rest {
-        Some(r) if !r.is_empty() && r.bytes().all(|b| b.is_ascii_graphic()) => Ok(()),
-        _ => Err(format!(
-            "--public-url {url:?} must be an http:// or https:// URL of visible ASCII characters (percent-encode anything else)"
-        )),
+        .or_else(|| input.strip_prefix("https://"));
+    if after.is_none_or(|r| r.starts_with(['/', '\\'])) {
+        return Err(bad(
+            "it must start with http:// or https:// followed by a host",
+        ));
     }
+    // `http://@host` parses as an empty user name; any `@` before the path is user-info.
+    let authority = after
+        .and_then(|r| r.split(['/', '?', '#']).next())
+        .unwrap_or("");
+    if authority.contains('@') {
+        return Err(bad("it must not contain user-info"));
+    }
+    if authority.ends_with(':') {
+        return Err(bad("the port after ':' is empty"));
+    }
+    let url = url::Url::parse(input).map_err(|e| bad(&e.to_string()))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(bad("the scheme must be http or https"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(bad("it must not contain user-info"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(bad("it must not contain a query or fragment"));
+    }
+    match url.host() {
+        Some(url::Host::Domain(d)) => {
+            // WHATWG parsing tolerates empty labels and edge hyphens; a base URL should not.
+            if d.split('.')
+                .any(|l| l.is_empty() || l.starts_with('-') || l.ends_with('-'))
+            {
+                return Err(bad("the host has an empty or hyphen-edged label"));
+            }
+        }
+        Some(_) => {}
+        None => return Err(bad("it has no host")),
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 /// Serve until `shutdown` resolves, then wait up to `drain` for in-flight
@@ -203,18 +240,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_url_must_be_header_safe() {
-        assert!(validate_public_url("http://127.0.0.1:3000").is_ok());
-        assert!(validate_public_url("https://git.example.com/forge").is_ok());
+    fn public_url_is_parsed_and_normalized() {
+        for ok in [
+            "http://127.0.0.1:3000",
+            "https://git.example.com/forge",
+            "http://[::1]:3000",
+            "http://[2001:db8::1]/forge",
+            "http://localhost",
+        ] {
+            assert!(validate_public_url(ok).is_ok(), "{ok}");
+        }
+        assert_eq!(
+            validate_public_url("https://git.example.com/forge/").unwrap(),
+            "https://git.example.com/forge"
+        );
+        assert_eq!(
+            validate_public_url("http://h/a b<c>").unwrap(),
+            "http://h/a%20b%3Cc%3E",
+            "raw characters are encoded, not passed through"
+        );
+        assert_eq!(validate_public_url("http://h").unwrap(), "http://h");
+        assert_eq!(
+            validate_public_url("http://exämple.com").unwrap(),
+            "http://xn--exmple-cua.com",
+            "unicode hosts become their ASCII form"
+        );
         for bad in [
             "",
             "ftp://x",
             "http://",
+            "http:///forge",
+            "http://:3000",
+            "http://@host",
+            "http://user@/forge",
+            "http://user:pw@example.com",
+            "http://[]/forge",
+            "http://[::1/forge",
+            "http://host:",
+            "http://host:abc",
+            "http://host:70000",
+            "http://host:65536",
+            "http://h?x",
+            "http://h/p#f",
+            "http://h#f",
+            "http://api..example.com",
+            "http://api.-example.com",
+            "http://-a.example.com",
+            "http://a-.example.com",
             "http://ex ample",
-            "http://exämple.com",
             "http://x\r\nSet-Cookie: a",
         ] {
             assert!(validate_public_url(bad).is_err(), "{bad:?}");
         }
+        assert!(validate_public_url("http://host:65535").is_ok());
     }
 }
