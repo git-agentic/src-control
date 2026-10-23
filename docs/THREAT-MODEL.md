@@ -942,6 +942,24 @@ unless said otherwise).
   fronts it (`--behind-proxy`) or plaintext is wanted (`--allow-plaintext`); tokens cross this socket. No TLS and no SSH
   in sc-forge itself.
 
+### Content API reads (F3a)
+
+Threat-model pass #2 for the read endpoints. Tests are in `crates/forge/tests/e2e_content.rs`.
+
+- **Revision and path injection.** A client string never reaches git as a revision or pathspec: revisions go through a
+  grammar that yields a ref name or an object id, paths are literal (`--literal-pathspecs`, `--`), so `--output=`,
+  `:/x`, `main^{/x}`, `@{0}`, glob and pathspec magic and `refs/forge/*` are 404 or 422
+  (`revisions_are_names_or_ids_never_git_syntax`, `paths_are_literals_not_patterns`).
+- **Hidden refs.** Only `refs/heads` and `refs/tags` are listed or resolvable; `refs/forge` and any future `refs/pull`
+  are not (`refs_tags_and_trees`).
+- **Visibility parity.** A repository a caller cannot read answers the same 404 as a missing one on every content route
+  (`a_reader_without_access_gets_the_same_404_as_for_a_missing_repository`).
+- **Resource use.** Every read is a bounded child process (output cap, 120 s timeout, runner gate, 503 when busy) under the
+  repository read lock. An archive is held in RAM up to 128 MiB per request and the runner gate bounds the number at
+  once, so peak memory is the gate size times that cap. Lower `--git-concurrency` on small hosts.
+- **Not covered.** Content is served as stored: a file in a repository is returned base64-encoded in JSON, and raw/web
+  URLs are not served, so no response is rendered as HTML.
+
 ## Reporting
 
 Security reports go to **toni@git-agentic.com** or GitHub private vulnerability
