@@ -79,8 +79,9 @@ CGI environment is built from scratch (`env_clear`), reusing `Git::env` plus: `G
 
 ## Hooks and ref policy
 
-`<data>/hooks/pre-receive` and `post-receive` are shell shims (`exec '<current exe>' hook <name>`) rewritten at
-every start (the binary path can change); `core.hooksPath` is pinned on every spawn, repository-local hooks
+`<data>/hooks/pre-receive` is a **symlink to the `sc-forge` binary** (no shell, no quoting; `main` dispatches on
+argv[0] being `pre-receive`), re-pointed at every start (the binary path can change; the e2e harness passes the real
+binary path, never the test executable); `core.hooksPath` is pinned on every spawn, repository-local hooks
 do not exist (`--template=`). `sc-forge hook pre-receive` reads `old new ref` lines, opens the database
 read-only, and refuses (exit 1, one `refusing ...` line per ref on stderr, which git shows as `remote: ...`):
 
@@ -92,8 +93,9 @@ read-only, and refuses (exit 1, one `refusing ...` line per ref on stderr, which
 
 Authorization is evaluated once at the start of the request (a revocation does not cancel an in-flight push);
 branch protection is evaluated at the ref update, i.e. in this hook, through one policy function that F4
-extends (no rules exist yet). `post-receive` only stamps `updated_unix`. The hook never trusts git's quarantine
-or env beyond `FORGE_*`; a hook failure to open the database refuses the push.
+extends (no rules exist yet). There is **no post-receive hook**: the server stamps `updated_unix` itself after receive-pack exits 0. The hook opens the
+database through a purpose-built read-only opener (`db::open_readonly`: no create, `query_only`, refuses unless
+`user_version == SCHEMA_VERSION`, never takes `<data>/.lock`); a failure to open or read refuses the push (fail closed).
 
 ## Process ownership, delete, shutdown
 
@@ -107,8 +109,8 @@ existing drain deadline), then closes the database. Client disconnect kills the 
 
 `--max-transports` (default 32), `--max-transports-per-repo` (8), `--git-timeout` (default 1800 s wall clock),
 `--git-idle-timeout` (120 s without bytes in either direction), `--max-pack-size` (receive: default 2 GiB,
-also `receive.maxInputSize`), `--max-request-bytes` for upload-pack bodies (default 64 MiB), `--min-free-bytes`
-(default 1 GiB reserve), CPU limit seconds (`--git-cpu-seconds`, 900). Admission happens before any process:
+also `receive.maxInputSize`), `--max-request-bytes` for upload-pack bodies, compressed and inflated (default 16 MiB), `--min-free-bytes`
+(default 1 GiB reserve), CPU limit seconds (a fixed 900 s CPU limit (a constant, not a flag)). Admission happens before any process:
 slot acquisition has a deadline (503 + `Retry-After: 5`); the disk reservation is released when the push ends.
 The inflated size of a gzip request body is bounded by `RLIMIT_FSIZE`/memory limits of the child plus the
 timeouts; the container's cgroup limits (F5) are the hard bound and the threat model says so.
@@ -163,3 +165,69 @@ stated, not hidden).
 - The hook runs a second `sc-forge` process per push; its startup cost is paid on every push (one SQLite open).
 - Disk reservation is accounting, not enforcement: a push can still exceed its reservation (bounded by
   `RLIMIT_FSIZE` and `receive.maxInputSize`); a hard guarantee needs filesystem quotas (F5).
+
+## Decisions after independent review (Opus and Sol; these supersede any conflicting text above)
+
+1. **Gzip.** `git http-backend` buffers an upload-pack request in RAM (`GIT_HTTP_MAX_REQUEST_BUFFER`, default
+   10 MiB) and its inflate path has no expanded-byte counter, and `RLIMIT_FSIZE` does not bound pipes or heap. So
+   the **server inflates gzip request bodies itself** with a hard cap on *inflated* bytes (`--max-request-bytes`),
+   streams the plain bytes to the CGI and never passes `Content-Encoding`; the CGI also gets
+   `GIT_HTTP_MAX_REQUEST_BUFFER` set from the flag. Gzip on `git-receive-pack` is 415 (git never gzips pushes).
+2. **No post-receive; read-only hook DB** (above). The hook is a symlink; paths need no quoting; hook compares the
+   default branch **case-insensitively** (as F2a's `delete_branch`) and detects a delete by an all-zero new id of any
+   length; tests cover mixed-case deletion in atomic and ordinary batches with every ref asserted unchanged.
+3. **Process ownership.** Each transport has exactly one supervisor thread that owns the child and signals its group
+   while the leader is still an unreaped zombie (the F2a `waitid(WNOWAIT)` ordering). The registry holds a
+   **cancel handle** (an atomic flag the supervisor polls, backoff 2 ms to 50 ms), never a pgid, so no one can signal a
+   reused group. Registration, spawn and cancellation are serialized per transport; a cancel requested before spawn
+   prevents the spawn.
+4. **Registry vs delete.** Registry: `Mutex<HashMap<repo id, Slot{closed, children}>>`. `delete` (already under the
+   per-repo write lock) sets `deleting`, `close(id)`, cancels every child, waits (bounded 10 s) for them to
+   unregister, and **refuses to rename while any survives** (reopens the slot and reports an error). `register`
+   refuses a closed slot and re-reads the row's state under the registry mutex. Transports do **not** hold the shared
+   `with_read` lock (a 30-minute push would block default-branch changes and branch deletes). A push that deletes a
+   branch while a PATCH makes it the default can leave `HEAD` dangling (`empty: true`); the row stays authoritative.
+5. **Shutdown.** `serve` cancels every registered transport and reaps it before returning; a server killed outright
+   (SIGKILL, OOM) leaves children until the next start or the container's PID namespace / systemd cgroup ends them
+   (stated in the threat model).
+6. **Backpressure and slow clients.** Directional progress deadlines: no request bytes for `--git-idle-timeout` while
+   the child waits for input, or no response progress (the channel to the client stays full) for the same time, cancels
+   the transport. Pumps are `std::thread`s using `try_send` loops that also watch the cancel flag, so a stalled reader
+   cannot pin a thread past cancellation. Thread count is bounded by admission.
+7. **Admission, defined.** Order: global transport slot, then per-repo slot, one `--admission-wait` deadline for both
+   (default 30 s, so an agent cloning one repo many times queues instead of failing at the 9th clone; limits 64 global,
+   16 per repo), then (receive-pack only) the disk reservation; slot exhaustion is 503 + `Retry-After`, reserve
+   exhaustion is 507. The F2a API git gate is separate (documented). git sends pushes larger than `http.postBuffer` as
+   chunked, so most pushes have no `Content-Length`: reservation starts at `--push-reserve` (default 256 MiB) and grows
+   in 64 MiB steps as bytes are forwarded up to `--max-pack-size`; a step that cannot be reserved aborts the push
+   (logged; the client sees a dropped connection, since the response cannot be rewritten after the upload started).
+   The reservation is accounting, not enforcement (a hard guarantee needs filesystem quotas, F5).
+8. **Config.** `receive.advertisePushOptions=true` (recorded V#12); push options are accepted and ignored (never
+   exposed to the hook as authority). `GIT_HTTP_MAX_REQUEST_BUFFER` as above.
+9. **Recorded behaviours that need departures** (added with the code): v2 advertisement has no `# service=` preamble in
+   stock git (V#5 note, J#35 body); Gitea's private `cache-control` on POST results and 401s (V#16/18/1/3/20/21);
+   realm text; read-only collaborator pushes (C#30, S#13) are 403 at the advertisement; **HEAD never moves on a push
+   and an unborn default stays unborn after a first push to another branch** (N#15-16, N#24-28 notes: the row is the
+   authority and the first-push heuristic of Gitea is not copied).
+10. **Gate mechanics.** `--pending` only tolerates a SetupError at the pinned stop; recorded calls to unbuilt routes
+    (J#56-57 `/tags`, K `/contents`, N#6 `/contents`) cannot be hidden. The pending file gains **`defer`** entries per
+    scenario (`{"J": {"defer": [[56, "GET /api/v1/repos/acme/smart/tags"], ...]}}`): the named exchanges are executed
+    but not compared (reported as deferred, identity pinned by method and path, a changed recorded call fails the
+    run); an exchange that starts passing is reported so the entry can be removed. Supported scenarios and prefixes are
+    decided from a raw run before coding the gate and listed in the spec; S needs an unrecorded PR creation before
+    exchange 0 (F4) and stays out.
+11. **`check` git-command comparison (#297)** is independent tooling and ships as its own small PR first.
+12. **Spec drift and exceptions.** `FORGE_GENERATION` is replaced by the immutable id (AUTOINCREMENT, never reused);
+    the spec's "as built" says so. The transport sits beside the router table: it has its own declared table
+    (`transport::ROUTES`, class/scope/permission per sub-path) enumerated by a test, an explicit, recorded exception to
+    "every route in `routes::ROUTES`". Only `/{o}/{r}.git/...` is served (Gitea also serves it without `.git`; Engine's
+    recorded clients use `.git`). Dumb `info/refs` without `service=` is pinned 404 (git's dumb listing ignores
+    `hideRefs`).
+13. **Test mechanics.** No fixed sleeps: readiness barriers and bounded polling; "no stray git" asserts
+    `kill(-pgid, 0) == ESRCH`; memory-boundedness is asserted by blocking the child's stdin and checking the sender
+    blocks (channel bound), not RSS; real binary (not the test harness) for hook tests; explicit gzip, chunked and
+    EOF-delimited request cases; run on Linux and macOS CI with git >= 2.40.
+14. **Order of work (revised).** 0) `check` git-command comparison as its own PR; 1) departures + gate from a raw run;
+    2) whitelist + git credential/answer layer; 3) hook + opener + symlink; 4a) minimal CGI spawn and streaming with a
+    real-git clone/push e2e before anything else is built on it; 4b) registry, delete integration, shutdown; 4c)
+    admission, reservation, limits, rlimits; 5) full e2e, threat model, spec, README; 6) reviews; PR.
