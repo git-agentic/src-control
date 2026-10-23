@@ -1,0 +1,1306 @@
+[
+ {
+  "scenario": "G",
+  "exchange": 38,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#8>/merge",
+  "expect": {
+   "status": 409,
+   "message_contains": [
+    "conflict"
+   ]
+  },
+  "reason": "sc-forge answers a conflicting merge with 409 and a conflict message; Gitea answers 405 'Please try again later'"
+ },
+ {
+  "scenario": "T",
+  "exchange": 19,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#6>/merge",
+  "expect": {
+   "status": 409,
+   "message_contains": [
+    "conflict"
+   ]
+  },
+  "reason": "sc-forge answers a conflicting merge with 409 and a conflict message; Gitea answers 405 'Please try again later'"
+ },
+ {
+  "scenario": "G",
+  "exchange": 42,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#10>/merge",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "merge"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge supports only Do=merge, not squash (reword message_contains once sc-forge's text is fixed) [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "G",
+  "exchange": 43,
+  "kind": "note",
+  "match": "squash_merged_immediately_after_merge_call",
+  "expect": {
+   "value": false
+  },
+  "reason": "nothing was merged, squash is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 44,
+  "kind": "note",
+  "match": "squash_merged_within_10s",
+  "expect": {
+   "value": false
+  },
+  "reason": "nothing was merged, squash is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 46,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#10>",
+  "expect": {
+   "ignore_body": true,
+   "fields": {
+    "merged": false,
+    "state": "open"
+   }
+  },
+  "reason": "the PR stays open because squash is refused (the recorded body is the merged PR)"
+ },
+ {
+  "scenario": "G",
+  "exchange": 47,
+  "kind": "note",
+  "match": "squash_parent_count",
+  "expect": {
+   "value": -1
+  },
+  "reason": "no merge commit exists, squash is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 48,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#11>/merge",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "merge"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge supports only Do=merge, not rebase (reword message_contains once sc-forge's text is fixed) [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "G",
+  "exchange": 49,
+  "kind": "note",
+  "match": "rebase_merged_immediately_after_merge_call",
+  "expect": {
+   "value": false
+  },
+  "reason": "nothing was merged, rebase is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 50,
+  "kind": "note",
+  "match": "rebase_merged_within_10s",
+  "expect": {
+   "value": false
+  },
+  "reason": "nothing was merged, rebase is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 52,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#11>",
+  "expect": {
+   "ignore_body": true,
+   "fields": {
+    "merged": false,
+    "state": "open"
+   }
+  },
+  "reason": "the PR stays open because rebase is refused (the recorded body is the merged PR)"
+ },
+ {
+  "scenario": "G",
+  "exchange": 53,
+  "kind": "note",
+  "match": "rebase_parent_count",
+  "expect": {
+   "value": -1
+  },
+  "reason": "no merge commit exists, rebase is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 54,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#12>/merge",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "merge"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge supports only Do=merge, not rebase-merge (reword message_contains once sc-forge's text is fixed) [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "G",
+  "exchange": 55,
+  "kind": "note",
+  "match": "rebase_merge_merged_immediately_after_merge_call",
+  "expect": {
+   "value": false
+  },
+  "reason": "nothing was merged, rebase-merge is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 56,
+  "kind": "note",
+  "match": "rebase_merge_merged_within_10s",
+  "expect": {
+   "value": false
+  },
+  "reason": "nothing was merged, rebase-merge is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 58,
+  "kind": "note",
+  "match": "rebase_merge_parent_count",
+  "expect": {
+   "value": -1
+  },
+  "reason": "no merge commit exists, rebase-merge is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 59,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#13>/merge",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "merge"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge supports only Do=merge, not fast-forward-only (reword message_contains once sc-forge's text is fixed) [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "G",
+  "exchange": 60,
+  "kind": "note",
+  "match": "ff_only_merged_immediately_after_merge_call",
+  "expect": {
+   "value": false
+  },
+  "reason": "nothing was merged, fast-forward-only is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 61,
+  "kind": "note",
+  "match": "ff_only_merged_within_10s",
+  "expect": {
+   "value": false
+  },
+  "reason": "nothing was merged, fast-forward-only is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 63,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#13>",
+  "expect": {
+   "ignore_body": true,
+   "fields": {
+    "merged": false,
+    "state": "open"
+   }
+  },
+  "reason": "the PR stays open because fast-forward-only is refused (the recorded body is the merged PR)"
+ },
+ {
+  "scenario": "G",
+  "exchange": 64,
+  "kind": "note",
+  "match": "ff_only_parent_count",
+  "expect": {
+   "value": -1
+  },
+  "reason": "no merge commit exists, fast-forward-only is refused"
+ },
+ {
+  "scenario": "G",
+  "exchange": 65,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#14>/merge",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "merge"
+   ]
+  },
+  "reason": "sc-forge supports only Do=merge, not fast-forward-only (reword message_contains once sc-forge's text is fixed)"
+ },
+ {
+  "scenario": "G",
+  "exchange": 3,
+  "kind": "note",
+  "match": "merge_merged_immediately_after_merge_call",
+  "expect": {
+   "value": true
+  },
+  "reason": "sc-forge merges synchronously: merged is true on the read right after the merge call"
+ },
+ {
+  "scenario": "G",
+  "exchange": 13,
+  "kind": "note",
+  "match": "immediate_merge_status",
+  "expect": {
+   "value": 200
+  },
+  "reason": "sc-forge never answers 'checking': an immediate merge succeeds"
+ },
+ {
+  "scenario": "G",
+  "exchange": 14,
+  "kind": "note",
+  "match": "immediate_merge_message",
+  "expect": {
+   "value": ""
+  },
+  "reason": "no message on a successful merge"
+ },
+ {
+  "scenario": "G",
+  "exchange": 15,
+  "kind": "note",
+  "match": "immediate_merged_immediately_after_merge_call",
+  "expect": {
+   "value": true
+  },
+  "reason": "sc-forge merges synchronously: merged is true on the read right after the merge call"
+ },
+ {
+  "scenario": "G",
+  "exchange": 20,
+  "kind": "note",
+  "match": "headid_merged_immediately_after_merge_call",
+  "expect": {
+   "value": true
+  },
+  "reason": "sc-forge merges synchronously: merged is true on the read right after the merge call"
+ },
+ {
+  "scenario": "G",
+  "exchange": 27,
+  "kind": "note",
+  "match": "wrongid_then_right_merged_immediately_after_merge_call",
+  "expect": {
+   "value": true
+  },
+  "reason": "sc-forge merges synchronously: merged is true on the read right after the merge call"
+ },
+ {
+  "scenario": "G",
+  "exchange": 72,
+  "kind": "note",
+  "match": "status_gated_merged_immediately_after_merge_call",
+  "expect": {
+   "value": true
+  },
+  "reason": "sc-forge merges synchronously: merged is true on the read right after the merge call"
+ },
+ {
+  "scenario": "T",
+  "exchange": 2,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#1>/merge",
+  "expect": {
+   "status": 409,
+   "message_contains": [
+    "conflict",
+    "unrelated"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge sends {\"message\":\"Merge conflict: unrelated histories\"}; Gitea sends a {Style,StdOut,StdErr,Err} body (1.26.2 truncates it)"
+ },
+ {
+  "scenario": "H",
+  "exchange": 39,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/<sha#5>",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ]
+  },
+  "reason": "Gitea answers 500 for an unknown sha; sc-forge answers 404"
+ },
+ {
+  "scenario": "H",
+  "exchange": 40,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/nope",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ]
+  },
+  "reason": "Gitea answers 500 for an unknown sha; sc-forge answers 404"
+ },
+ {
+  "scenario": "S",
+  "exchange": 0,
+  "kind": "git",
+  "match": "bot-push-replace-ref",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "only refs/heads/",
+    "refs/tags/"
+   ]
+  },
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 1,
+  "kind": "git",
+  "match": "bot-push-pull-1-head",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "only refs/heads/",
+    "refs/tags/"
+   ]
+  },
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 2,
+  "kind": "git",
+  "match": "bot-push-pull-1-head-forced",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "only refs/heads/",
+    "refs/tags/"
+   ]
+  },
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 3,
+  "kind": "git",
+  "match": "bot-push-pull-999-head",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "only refs/heads/",
+    "refs/tags/"
+   ]
+  },
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 7,
+  "kind": "git",
+  "match": "bot-push-notes-ref",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "only refs/heads/",
+    "refs/tags/"
+   ]
+  },
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 8,
+  "kind": "git",
+  "match": "bot-push-for-ref",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "only refs/heads/",
+    "refs/tags/"
+   ]
+  },
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 9,
+  "kind": "git",
+  "match": "bot-push-changes-ref",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "only refs/heads/",
+    "refs/tags/"
+   ]
+  },
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 10,
+  "kind": "git",
+  "match": "bot-push-keep-around-ref",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "only refs/heads/",
+    "refs/tags/"
+   ]
+  },
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 11,
+  "kind": "git",
+  "match": "bot-push-arbitrary-ref",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "only refs/heads/",
+    "refs/tags/"
+   ]
+  },
+  "reason": "sc-forge's pre-receive refuses every ref outside refs/heads/* and refs/tags/*: 'refusing to update <ref>: only refs/heads/* and refs/tags/* are writable'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 20,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/refs/git/refs",
+  "expect": {
+   "ignore_body": true,
+   "fields": {
+    "$len": 4
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "the ref list holds only refs/heads and refs/tags in sc-forge (4 of 10 recorded refs); the elements differ with the refused refs"
+ },
+ {
+  "scenario": "X",
+  "exchange": 31,
+  "kind": "http",
+  "match": "POST /api/v1/users/alice/tokens",
+  "expect": {
+   "status": 403,
+   "message_contains": [
+    "scope",
+    "write:user"
+   ]
+  },
+  "reason": "scope-error text differs by version; sc-forge names the scope"
+ },
+ {
+  "scenario": "X",
+  "exchange": 33,
+  "kind": "http",
+  "match": "GET /api/v1/users/alice/tokens",
+  "expect": {
+   "status": 403,
+   "message_contains": [
+    "scope",
+    "read:user"
+   ]
+  },
+  "reason": "scope-error text differs by version; sc-forge names the scope"
+ },
+ {
+  "scenario": "B",
+  "exchange": 19,
+  "kind": "http",
+  "match": "GET /api/v1/users/alice/tokens",
+  "expect": {
+   "status": [
+    401,
+    403
+   ],
+   "message_contains": [
+    "password"
+   ]
+  },
+  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
+ },
+ {
+  "scenario": "R",
+  "exchange": 4,
+  "kind": "http",
+  "match": "POST /api/v1/users/alice/tokens",
+  "expect": {
+   "status": [
+    401,
+    403
+   ],
+   "message_contains": [
+    "password"
+   ]
+  },
+  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
+ },
+ {
+  "scenario": "R",
+  "exchange": 5,
+  "kind": "http",
+  "match": "POST /api/v1/users/alice/tokens",
+  "expect": {
+   "status": [
+    401,
+    403
+   ],
+   "message_contains": [
+    "password"
+   ]
+  },
+  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
+ },
+ {
+  "scenario": "R",
+  "exchange": 6,
+  "kind": "http",
+  "match": "POST /api/v1/users/alice/tokens",
+  "expect": {
+   "status": [
+    401,
+    403
+   ],
+   "message_contains": [
+    "password"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused [ignore_body: the recorded 201 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "R",
+  "exchange": 7,
+  "kind": "http",
+  "match": "GET /api/v1/users/alice/tokens",
+  "expect": {
+   "status": [
+    401,
+    403
+   ],
+   "message_contains": [
+    "password"
+   ],
+   "ignore_body": true,
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "X",
+  "exchange": 30,
+  "kind": "http",
+  "match": "POST /api/v1/users/bot/tokens",
+  "expect": {
+   "status": [
+    401,
+    403
+   ],
+   "message_contains": [
+    "password"
+   ]
+  },
+  "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
+ },
+ {
+  "scenario": "E",
+  "exchange": 19,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/hist/commits?sha=nope&limit=50&stat=false&files=false&verification=false",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ]
+  },
+  "reason": "1.22.6 answers 500; version rule follows 1.26.2 (404)"
+ },
+ {
+  "scenario": "G",
+  "exchange": 12,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/merges/pulls/<id:path:pulls#1>/merge",
+  "expect": {
+   "status": 405,
+   "message_contains": [
+    "already merged"
+   ]
+  },
+  "reason": "1.22.6 answers an empty message; version rule follows 1.26.2 'The PR is already merged'"
+ },
+ {
+  "scenario": "T",
+  "exchange": 16,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/outcomes/pulls/<id:path:pulls#4>/merge",
+  "expect": {
+   "status": 405,
+   "message_contains": [
+    "already merged"
+   ]
+  },
+  "reason": "1.22.6 answers an empty message; version rule follows 1.26.2 'The PR is already merged'"
+ },
+ {
+  "scenario": "L",
+  "exchange": 2,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/pub1",
+  "expect": {
+   "ignore_fields": [
+    "private"
+   ],
+   "fields": {
+    "private": true
+   }
+  },
+  "reason": "sc-forge keeps private:true; only `private` may differ"
+ },
+ {
+  "scenario": "L",
+  "exchange": 5,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/pub1",
+  "expect": {
+   "ignore_fields": [
+    "private"
+   ],
+   "fields": {
+    "private": true
+   }
+  },
+  "reason": "sc-forge keeps private:true; only `private` may differ"
+ },
+ {
+  "scenario": "L",
+  "exchange": 3,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/pub1",
+  "expect": {
+   "ignore_fields": [
+    "private"
+   ],
+   "fields": {
+    "private": true
+   }
+  },
+  "reason": "GET after PATCH private:false still reports private:true"
+ },
+ {
+  "scenario": "H",
+  "exchange": 33,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/<sha#4>",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "state"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge rejects the unknown status state 'bogus' [ignore_body: the recorded 201 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "H",
+  "exchange": 34,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/<sha#4>",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "state"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge rejects the unknown status state '' [ignore_body: the recorded 201 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "H",
+  "exchange": 43,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/<sha#7>",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "state"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge rejects the unknown status state 'bogus' [ignore_body: the recorded 201 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "H",
+  "exchange": 35,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/<sha#4>/status?limit=50",
+  "expect": {
+   "ignore_fields": [
+    "total_count",
+    "statuses"
+   ],
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "total_count and the status list include the two states sc-forge refuses; the combined `state` is still compared"
+ },
+ {
+  "scenario": "H",
+  "exchange": 44,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/<sha#7>/status?limit=50",
+  "expect": {
+   "status": 200,
+   "ignore_body": true,
+   "fields": {
+    "state": "pending",
+    "total_count": 0
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "the only status on this commit was refused: no statuses, combined state pending (1.26.2 behaviour); ignore_body: the recorded body lists that status"
+ },
+ {
+  "scenario": "H",
+  "exchange": 45,
+  "kind": "note",
+  "match": "combined_state_only_bogus",
+  "expect": {
+   "value": "pending"
+  },
+  "reason": "no statuses: combined state pending (1.26.2 behaviour)"
+ },
+ {
+  "scenario": "H",
+  "exchange": 46,
+  "kind": "note",
+  "match": "combined_total_only_bogus",
+  "expect": {
+   "value": 0
+  },
+  "reason": "the bogus status was refused, so total_count is 0"
+ },
+ {
+  "scenario": "H",
+  "exchange": 47,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/statuses/<sha#7>?limit=100",
+  "expect": {
+   "status": 200,
+   "ignore_body": true,
+   "fields": {
+    "$len": 0
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "the status list is empty because the bogus state was refused; ignore_body: the recorded body is a one-element list"
+ },
+ {
+  "scenario": "M",
+  "exchange": 42,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/rename-me",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "rename"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge does not rename repos [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "M",
+  "exchange": 43,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/rename-me",
+  "expect": {
+   "status": 200,
+   "ignore_body": true,
+   "fields": {
+    "name": "rename-me"
+   },
+   "ignore_headers": [
+    "location",
+    "content-type"
+   ]
+  },
+  "reason": "the old name still resolves (no rename) [ignore_body: the recorded 307 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "M",
+  "exchange": 44,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/renamed",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ],
+   "ignore_body": true
+  },
+  "reason": "the new name does not exist [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "M",
+  "exchange": 45,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/rename-me",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ],
+   "ignore_body": true,
+   "ignore_headers": [
+    "location",
+    "content-type"
+   ]
+  },
+  "reason": "no access, no redirect: 404 as for any private repo [ignore_body: the recorded 307 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "M",
+  "exchange": 46,
+  "kind": "http",
+  "match": "GET /acme/rename-me.git/info/refs?service=git-upload-pack",
+  "expect": {
+   "status": 200,
+   "ignore_body": true,
+   "ignore_headers": [
+    "location",
+    "content-type"
+   ]
+  },
+  "reason": "info/refs of the old name works directly (no redirect) [ignore_body: the recorded 307 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "M",
+  "exchange": 48,
+  "kind": "git",
+  "match": "ls-remote-new-name",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "not found"
+   ]
+  },
+  "reason": "the new name does not exist"
+ },
+ {
+  "scenario": "M",
+  "exchange": 49,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/renamed",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ]
+  },
+  "reason": "the new name does not exist"
+ },
+ {
+  "scenario": "M",
+  "exchange": 50,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/renamed",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ],
+   "ignore_body": true
+  },
+  "reason": "the new name does not exist [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "M",
+  "exchange": 51,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/Renamed",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ],
+   "ignore_body": true
+  },
+  "reason": "the new name does not exist [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "N",
+  "exchange": 0,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/dflt",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "branch"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge rejects a default branch that does not exist [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "O",
+  "exchange": 20,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/life/pulls/<id:path:pulls#3>",
+  "expect": {
+   "ignore_fields": [
+    "head.sha"
+   ]
+  },
+  "reason": "head.sha is the frozen merge-time sha in sc-forge; the notes below pin that"
+ },
+ {
+  "scenario": "O",
+  "exchange": 21,
+  "kind": "note",
+  "match": "merged_pr_head_sha_frozen",
+  "expect": {
+   "value": true
+  },
+  "reason": "sc-forge freezes head.sha at merge"
+ },
+ {
+  "scenario": "O",
+  "exchange": 22,
+  "kind": "note",
+  "match": "merged_pr_head_sha_follows_new_branch",
+  "expect": {
+   "value": false
+  },
+  "reason": "sc-forge does not follow a recreated branch after merge"
+ },
+ {
+  "scenario": "K",
+  "exchange": 29,
+  "kind": "http",
+  "match": "GET /acme/ghost.git/info/refs?service=git-receive-pack",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ]
+  },
+  "reason": "sc-forge answers 404, not Gitea's 403 'Push to create is not enabled'"
+ },
+ {
+  "scenario": "K",
+  "exchange": 39,
+  "kind": "http",
+  "match": "GET /acme/ghost.git/info/refs?service=git-receive-pack",
+  "expect": {
+   "status": 404,
+   "message_contains": [
+    "not found"
+   ]
+  },
+  "reason": "sc-forge answers 404, not Gitea's 403 'Push to create is not enabled'"
+ },
+ {
+  "scenario": "O",
+  "exchange": 5,
+  "kind": "note",
+  "match": "ls-remote-pull-refs_stdout",
+  "expect": {
+   "value": ""
+  },
+  "reason": "no refs/pull/* is advertised by sc-forge (it keeps refs/forge/pull/*, hidden). sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "O",
+  "exchange": 12,
+  "kind": "note",
+  "match": "ls-remote-pull-refs-after-delete_stdout",
+  "expect": {
+   "value": ""
+  },
+  "reason": "no refs/pull/* is advertised by sc-forge (it keeps refs/forge/pull/*, hidden). sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "O",
+  "exchange": 14,
+  "kind": "note",
+  "match": "life_advertised_refs_upload_pack",
+  "expect": {
+   "value": [
+    "HEAD",
+    "refs/heads/l1",
+    "refs/heads/main"
+   ]
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "O",
+  "exchange": 16,
+  "kind": "note",
+  "match": "life_advertised_refs_receive_pack",
+  "expect": {
+   "value": [
+    "refs/heads/l1",
+    "refs/heads/main"
+   ]
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "S",
+  "exchange": 15,
+  "kind": "note",
+  "match": "ls-remote-all-refs_stdout",
+  "expect": {
+   "value": "<sha#3>\tHEAD\n<sha#3>\trefs/heads/main\n<sha#1>\trefs/heads/pull/1/head\n<sha#2>\trefs/heads/r1\n<sha#4>\trefs/tags/annot\n<sha#1>\trefs/tags/annot^{}"
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "S",
+  "exchange": 17,
+  "kind": "note",
+  "match": "refs_advertised_refs_upload_pack",
+  "expect": {
+   "value": [
+    "HEAD",
+    "refs/heads/main",
+    "refs/heads/pull/1/head",
+    "refs/heads/r1",
+    "refs/tags/annot",
+    "refs/tags/annot^{}"
+   ]
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "S",
+  "exchange": 19,
+  "kind": "note",
+  "match": "refs_advertised_refs_receive_pack",
+  "expect": {
+   "value": [
+    "refs/heads/main",
+    "refs/heads/pull/1/head",
+    "refs/heads/r1",
+    "refs/tags/annot"
+   ]
+  },
+  "reason": "sc-forge advertises only HEAD, refs/heads/* and refs/tags/* (refs/forge/* is hidden by transfer.hideRefs on both services); Gitea also advertises refs/pull/*, refs/replace/*, refs/notes/*, refs/changes/*, refs/keep-around/*, refs/custom/*"
+ },
+ {
+  "scenario": "B",
+  "exchange": 13,
+  "kind": "http",
+  "match": "POST /api/v1/orgs/acme/teams",
+  "expect": {
+   "status": [
+    404,
+    405,
+    501
+   ],
+   "message_contains": [
+    "not"
+   ],
+   "ignore_body": true
+  },
+  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text) [ignore_body: the recorded 201 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "B",
+  "exchange": 14,
+  "kind": "http",
+  "match": "PUT /api/v1/teams/<id:path:teams#1>/members/carol",
+  "expect": {
+   "status": [
+    404,
+    405,
+    501
+   ],
+   "message_contains": [
+    "not"
+   ],
+   "ignore_body": true
+  },
+  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text) [ignore_body: the recorded 204 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "B",
+  "exchange": 15,
+  "kind": "http",
+  "match": "GET /api/v1/users/carol/orgs/acme/permissions",
+  "expect": {
+   "status": [
+    200,
+    404
+   ],
+   "message_contains": [
+    "not found"
+   ],
+   "fields": {
+    "can_read": false
+   },
+   "ignore_body": true
+  },
+  "reason": "carol is not a team member without teams: no read permission via the org (200 all false or 404). teams are a non-goal in sc-forge (words in message_contains are placeholders for its text) [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "X",
+  "exchange": 18,
+  "kind": "http",
+  "match": "GET /api/v1/user",
+  "expect": {
+   "status": 401,
+   "message_contains": [
+    "auth"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "X",
+  "exchange": 19,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/authrepo",
+  "expect": {
+   "status": 401,
+   "message_contains": [
+    "auth"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "X",
+  "exchange": 20,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/authrepo/statuses/<sha#1>",
+  "expect": {
+   "status": 401,
+   "message_contains": [
+    "auth"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 201 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "X",
+  "exchange": 27,
+  "kind": "http",
+  "match": "GET /api/v1/user",
+  "expect": {
+   "status": 401,
+   "message_contains": [
+    "auth"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "H",
+  "exchange": 0,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/<sha#1>/status?limit=50",
+  "expect": {
+   "ignore_fields": [
+    "state",
+    "sha"
+   ],
+   "fields": {
+    "state": "pending"
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "existing commit with no statuses: sc-forge answers state pending with the real sha (1.26.2); 1.22.6's state '' and sha '' is an empty answer, so the version rule picks 1.26.2"
+ },
+ {
+  "scenario": "H",
+  "exchange": 48,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/<sha#5>/status?limit=50",
+  "expect": {
+   "status": 404,
+   "ignore_body": true,
+   "message_contains": [
+    "not found"
+   ],
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "combined status of an unknown sha: 404 (1.26.2); 1.22.6's 200 with empty fields is an empty answer, so the version rule picks 1.26.2. 'not found' is a placeholder word for sc-forge's text"
+ },
+ {
+  "scenario": "H",
+  "exchange": 49,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/commits/main/status?limit=50",
+  "expect": {
+   "status": 200,
+   "ignore_body": true,
+   "fields": {
+    "state": "pending",
+    "total_count": 0
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "the only status on this commit was the refused bogus state: no statuses, combined state pending; ignore_body: the recorded body lists that status"
+ }
+]

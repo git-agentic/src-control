@@ -68,6 +68,7 @@ supersedes the old one and update the **Status** line of the superseded record.
 | [0055](0055-blob-size-clone-filter.md) | Blob-size clone filter (`--filter blob:limit=<size>`) | Accepted (built) | 27 |
 | [0056](0056-named-concurrent-ws-sessions.md) | Named and concurrent `sc ws` sessions and `sc ws refresh` | Accepted (built, including `sc ws refresh`) | 20 |
 | [0057](0057-bucket-compaction.md) | Bucket remote compaction and gc (`sc remote compact`) | Accepted | 36 |
+| [0058](0058-sc-forge-gitea-compatible-git-forge.md) | sc-forge: a Gitea-compatible Git forge (bare Git, recorded API subset) | Proposed | 38 |
 
 See [`ROADMAP.md`](../../ROADMAP.md) for the phase sequence. ADR numbers are
 assigned in creation order, so 0017 — the secret scanner — sequences as phase P5,
