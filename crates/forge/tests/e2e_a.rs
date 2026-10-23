@@ -1106,3 +1106,13 @@ fn concurrent_patches_of_different_fields_both_land() {
     );
     assert_eq!(u.description, "d299");
 }
+
+#[test]
+fn login_name_is_stored_by_the_create_itself() {
+    let s = Srv::start();
+    let r = s.post("/api/v1/admin/users", &token(&s.admin), json!({"username": "lena", "email": "l@example.invalid", "password": "pw", "login_name": "lena-ldap"}));
+    assert_eq!(
+        (r.status, r.json()["login_name"].as_str()),
+        (201, Some("lena-ldap"))
+    );
+}

@@ -23,6 +23,7 @@ pub struct App {
 
 impl App {
     pub fn new(data_dir: PathBuf, public_url: &str, proxies: Proxies, argon_slots: usize) -> App {
+        scl_crypto::warm_up();
         App {
             data_dir,
             base: public_url.trim_end_matches('/').to_string(),

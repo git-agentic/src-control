@@ -962,7 +962,13 @@ def run_all(c, only, out=None, fixtures=None, departures=(), pending=None):
             if sid in pending:
                 deferred, stop = pending[sid] if isinstance(pending[sid], list) else (pending[sid], None)
                 ndeferred = max(0, len(c.expected) - deferred)
-                c.expected = c.expected[:deferred]
+                if not 0 <= deferred < len(c.expected):
+                    # nothing is deferred: the entry is stale (the scenario is whole) and must not hide an error
+                    stale.append(f"stale pending entry {deferred}: {fname} has {len(c.expected)} exchanges, "
+                                 f"so nothing is deferred; remove the entry")
+                    deferred = None
+                else:
+                    c.expected = c.expected[:deferred]
         t0 = time.time()
         err = None
         try:

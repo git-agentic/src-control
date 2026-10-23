@@ -18,11 +18,19 @@ pub fn hash_password(password: &str) -> String {
         .to_string()
 }
 
+static DUMMY: OnceLock<String> = OnceLock::new();
+
+/// Compute the dummy hash now. Call once at startup so the first unknown-login
+/// attempt does not pay for hashing on top of verifying, which would make it
+/// measurably slower than a wrong password for a real account.
+pub fn warm_up() {
+    DUMMY.get_or_init(|| hash_password("sc-forge-dummy"));
+}
+
 /// Verify `password` against a PHC `stored` hash. With `None` (no such account)
 /// it still spends one full verification against a fixed dummy hash and returns
 /// `false`, so response time does not reveal whether the login exists.
 pub fn verify_password(password: &str, stored: Option<&str>) -> bool {
-    static DUMMY: OnceLock<String> = OnceLock::new();
     // An empty or unparsable stored hash (an organization row, a damaged row)
     // takes the same dummy-verification path as a missing account, so it costs
     // the same time and cannot be told apart.

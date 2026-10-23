@@ -52,6 +52,7 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
 pub struct NewAccount {
     pub login: String,
     pub is_org: bool,
+    pub login_name: String,
     pub full_name: String,
     pub email: String,
     pub description: String,
@@ -82,13 +83,14 @@ fn is_unique(e: &rusqlite::Error) -> bool {
 /// Insert a user or organization. `Exists` when the lower-cased login is taken.
 pub fn create_account(conn: &Connection, a: &NewAccount, now: i64) -> Result<User, StoreError> {
     let r = conn.execute(
-        "INSERT INTO users (login, lower_login, kind, full_name, email, description, website, \
-         location, password_hash, must_change_password, is_admin, visibility, created_unix) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO users (login, lower_login, kind, login_name, full_name, email, description, \
+         website, location, password_hash, must_change_password, is_admin, visibility, created_unix) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             a.login,
             a.login.to_lowercase(),
             if a.is_org { "org" } else { "user" },
+            a.login_name,
             a.full_name,
             a.email,
             a.description,

@@ -17,7 +17,7 @@ pub mod private;
 pub mod provider;
 pub mod signing;
 
-pub use credentials::{ct_eq, generate_token, hash_password, hash_token, verify_password};
+pub use credentials::{ct_eq, generate_token, hash_password, hash_token, verify_password, warm_up};
 pub use envelope::{
     decrypt_path, encrypt_path, encrypt_path_randomized, encrypt_path_randomized_with_rng, open,
     revoke, rewrap_for, seal, unwrap_dek_with, wrap_dek_for,

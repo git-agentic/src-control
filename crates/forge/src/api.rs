@@ -318,6 +318,7 @@ pub fn admin_create_user(ctx: &mut Ctx) -> Resp {
     };
     let acct = NewAccount {
         login: name.clone(),
+        login_name: str_field(&b, "login_name").unwrap_or_default(),
         full_name: str_field(&b, "full_name").unwrap_or_default(),
         email,
         password_hash: hash,
@@ -329,23 +330,7 @@ pub fn admin_create_user(ctx: &mut Ctx) -> Resp {
         ..Default::default()
     };
     match store::create_account(ctx.conn, &acct, now()) {
-        Ok(u) => {
-            if let Some(ln) = str_field(&b, "login_name").filter(|s| !s.is_empty()) {
-                let _ = store::update_user(
-                    ctx.conn,
-                    u.id,
-                    &UserPatch {
-                        login_name: Some(ln),
-                        ..Default::default()
-                    },
-                );
-            }
-            match store::find_by_id(ctx.conn, u.id) {
-                Ok(Some(u)) => Resp::json(201, &user_json(&base, &u)),
-                Ok(None) => ctx.app.internal(&"created user vanished"),
-                Err(e) => ctx.app.internal(&e),
-            }
-        }
+        Ok(u) => Resp::json(201, &user_json(&base, &u)),
         Err(StoreError::Exists) => {
             error(&base, 422, &format!("user already exists [name: {name}]"))
         }
