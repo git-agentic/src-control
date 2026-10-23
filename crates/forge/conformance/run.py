@@ -267,6 +267,10 @@ def cmp_exchange(exp, act, bij, extra_volatile=(), status_override=None, skip_he
     if exp["kind"] == "git":
         if exp["name"] != act["name"]:
             return [("fail", f"git step {exp['name']} expected, got {act['name']}")]
+        # the command line too: a scenario that keeps its step name but changes the arguments (or the
+        # credentials form) must not keep matching its fixture; placeholders keep shas and hosts by identity
+        if exp.get("cmd") is not None and not eq_str(exp["cmd"], act["cmd"], bij, [], ""):
+            return [("fail", f"git command {exp['cmd']!r} expected, got {act['cmd']!r}")]
         if exp["ok"] != act["ok"]:
             d.append(("fail", f"git ok={exp['ok']} expected, got {act['ok']}: {act['output'][:200]!r}"))
         elif not exp["ok"]:
@@ -1161,6 +1165,11 @@ def cmd_selftest(a):
         n = len(obj["exchanges"])
         assert text.count("\n") == (n + 2 if n else 3), "header line, one line per exchange, closing line"
         assert all("\n" not in J.dumps(e) for e in obj["exchanges"])
+    # git steps compare the command line too, by placeholder identity
+    step = {"kind": "git", "name": "clone", "cmd": "git clone http://<creds>@<host>/acme/a.git <tmp>/w", "ok": True, "output": ""}
+    assert not cmp_exchange(step, dict(step), Bij()), "an identical git step matches"
+    other = dict(step, cmd="git clone --depth=1 http://<creds>@<host>/acme/a.git <tmp>/w")
+    assert any("git command" in t for _, t in cmp_exchange(step, other, Bij())), "changed arguments must fail"
     bad = []
     for d in sorted(os.listdir(a.fixtures_root)):
         full = os.path.join(a.fixtures_root, d)

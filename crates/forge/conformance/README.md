@@ -95,7 +95,7 @@ observations called notes). Exchange N of the run is compared with exchange N of
 - Text bodies (diffs, patches) are compared exactly unless the call marks `volatile=["$text"]`.
 - Archives (`binary=True` calls answered 200): the zip or tar.gz is parsed and its entries are compared by
   normalized name, size and SHA-256 of the content, so a server that only sends the 4-byte signature fails.
-- git commands: exit status (ok or not) and, for a failing step, the refusal text: the recorded
+- git commands: the command line (placeholders keep shas, hosts and temp dirs by identity, so changed arguments fail), exit status (ok or not) and, for a failing step, the refusal text: the recorded
   `remote:`/`fatal:`/`error:`/`!` lines (normalized, without hosts and ids) must all appear in the actual
   output, so a push refused for another reason fails. `must_contain` words are checked too.
 - `ls-remote --symref` steps record their normalized stdout as a strict note (`<step>_stdout`).
