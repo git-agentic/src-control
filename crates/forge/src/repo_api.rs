@@ -31,6 +31,7 @@ fn life_err(app: &App, e: LifecycleError) -> Resp {
         ),
         LifecycleError::BadBranch => error(&app.base, 422, "[DefaultBranch]: invalid branch name"),
         LifecycleError::Protected(m) => error(&app.base, 403, &m),
+        LifecycleError::Conflict(m) => error(&app.base, 409, &m),
         LifecycleError::Gone => not_found(&app.base, "The target couldn't be found.", None),
         LifecycleError::Git(crate::gitproc::GitError::Busy) => {
             error(&app.base, 503, "too many git operations in flight")

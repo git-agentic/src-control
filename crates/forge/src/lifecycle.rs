@@ -75,6 +75,9 @@ pub enum LifecycleError {
     /// A branch protection rule forbids the operation.
     #[error("{0}")]
     Protected(String),
+    /// A concurrent change kept winning; the caller may retry.
+    #[error("{0}")]
+    Conflict(String),
     /// A git command that must succeed failed.
     #[error("git failed: {0}")]
     GitFailed(String),
@@ -520,8 +523,8 @@ impl Lifecycle {
                 return Ok(());
             }
         }
-        Err(LifecycleError::GitFailed(
-            "the branch kept changing while it was being deleted".into(),
+        Err(LifecycleError::Conflict(
+            "the branch was changed concurrently, try again".into(),
         ))
     }
 
