@@ -399,11 +399,21 @@ fn a_writer_moving_the_base_during_merges_loses_nothing() {
     w.no_leftovers();
 }
 
-// ---- crash recovery: the journal decides, not the branch ----
+// ---- crash recovery: the journal decides, not guesswork ----
 
-/// Do by hand what the handler does up to and including the ref transaction, then "crash": the
-/// intent is pending, and the receipt exists iff `publish`.
-fn crashed_merge(w: &W, n: i64, head: &str, publish: bool) -> (i64, String, String) {
+/// How far a hand-built merge got before the "crash".
+#[derive(Clone, Copy, PartialEq)]
+enum Crash {
+    /// The intent row exists; the base never moved.
+    NotPublished,
+    /// The base moved; the `landed` marker was not written.
+    PublishedOnly,
+    /// The base moved and the marker exists.
+    PublishedMarked,
+}
+
+/// Do by hand what the handler does, up to the crash point.
+fn crashed_merge(w: &W, n: i64, head: &str, how: Crash) -> (i64, String, String) {
     let base = w.tip("main");
     let tree = w.git(&["merge-tree", "--write-tree", &base, head]);
     let tree = tree.lines().next().unwrap().to_string();
@@ -425,10 +435,20 @@ fn crashed_merge(w: &W, n: i64, head: &str, publish: bool) -> (i64, String, Stri
     )
     .unwrap();
     let id = conn.last_insert_rowid();
-    if publish {
-        let zero = "0".repeat(40);
-        let script = format!("start\nverify refs/heads/f {head}\nupdate refs/heads/main {merge} {base}\nupdate refs/forge/merge/{id} {merge} {zero}\nprepare\ncommit\n");
+    if how != Crash::NotPublished {
+        let script = format!(
+            "start\nverify refs/heads/f {head}\nupdate refs/heads/main {merge} {base}\nprepare\ncommit\n"
+        );
         w.s.git(w.id, &["update-ref", "--stdin"], Some(script.as_bytes()));
+    }
+    if how == Crash::PublishedMarked {
+        let zero = "0".repeat(40);
+        w.git(&[
+            "update-ref",
+            &format!("refs/forge/merge/{id}/landed"),
+            &merge,
+            &zero,
+        ]);
     }
     (id, base, merge)
 }
@@ -440,19 +460,29 @@ fn recover(w: &W) {
     scl_forge::merges::drop_stale_receipts(&conn, &w.s.runner, &dir, w.id).unwrap();
 }
 
+fn pull_state(w: &W, n: i64) -> String {
+    let conn = scl_forge::db::connect(&w.s.dir).unwrap();
+    conn.query_row("SELECT state FROM pulls WHERE number = ?1", [n], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+fn intent_state(w: &W, id: i64) -> String {
+    let conn = scl_forge::db::connect(&w.s.dir).unwrap();
+    conn.query_row("SELECT state FROM merge_intents WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
 #[test]
 fn a_merge_that_landed_before_the_crash_is_finalized_with_every_field() {
     let w = world();
     let head = w.commit("f", "f.txt", "f\n", Some("main"));
     let n = w.open("f", "main");
-    let (_, _, merge) = crashed_merge(&w, n, &head, true);
-    let conn = scl_forge::db::connect(&w.s.dir).unwrap();
-    let state: String = conn
-        .query_row("SELECT state FROM pulls WHERE number = ?1", [n], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(state, "open", "the database does not know yet");
+    let (_, _, merge) = crashed_merge(&w, n, &head, Crash::PublishedMarked);
+    assert_eq!(pull_state(&w, n), "open", "the database does not know yet");
     recover(&w);
     let pr = w.api("GET", &format!("/pulls/{n}"), None).json();
     assert_eq!(pr["merged"], true);
@@ -469,12 +499,29 @@ fn a_merge_that_landed_before_the_crash_is_finalized_with_every_field() {
 }
 
 #[test]
-fn a_landed_merge_is_still_merged_after_the_base_was_force_pushed_away() {
+fn a_crash_between_the_base_moving_and_its_marker_is_recognized_by_the_base_history() {
     let w = world();
     let head = w.commit("f", "f.txt", "f\n", Some("main"));
     let n = w.open("f", "main");
-    let (_, base, merge) = crashed_merge(&w, n, &head, true);
-    // an unprotected base may be rewritten before recovery runs: the receipt, not ancestry, decides
+    let (id, _, merge) = crashed_merge(&w, n, &head, Crash::PublishedOnly);
+    assert_eq!(w.git(&["for-each-ref", "refs/forge/merge"]), "");
+    recover(&w);
+    assert_eq!(intent_state(&w, id), "done");
+    let pr = w.api("GET", &format!("/pulls/{n}"), None).json();
+    assert_eq!(
+        (pr["merged"].clone(), pr["merge_commit_sha"].clone()),
+        (json!(true), json!(merge))
+    );
+    w.no_leftovers();
+}
+
+#[test]
+fn a_landed_merge_with_its_marker_is_still_merged_after_the_base_was_force_pushed_away() {
+    let w = world();
+    let head = w.commit("f", "f.txt", "f\n", Some("main"));
+    let n = w.open("f", "main");
+    let (_, base, merge) = crashed_merge(&w, n, &head, Crash::PublishedMarked);
+    // an unprotected base may be rewritten before recovery runs: the marker, not ancestry, decides
     w.git(&["update-ref", "refs/heads/main", &base]);
     assert!(w
         .git_try(&["merge-base", "--is-ancestor", &merge, "main"])
@@ -487,34 +534,74 @@ fn a_landed_merge_is_still_merged_after_the_base_was_force_pushed_away() {
 }
 
 #[test]
-fn an_intent_without_a_receipt_is_aborted_and_the_pull_can_merge_again() {
+fn an_intent_that_never_published_is_aborted_and_the_pull_can_merge_again() {
     let w = world();
     let head = w.commit("f", "f.txt", "f\n", Some("main"));
     let n = w.open("f", "main");
-    let (id, base, _) = crashed_merge(&w, n, &head, false);
+    let (id, base, _) = crashed_merge(&w, n, &head, Crash::NotPublished);
     assert_eq!(w.tip("main"), base, "nothing was published");
     recover(&w);
-    let conn = scl_forge::db::connect(&w.s.dir).unwrap();
-    let state: String = conn
-        .query_row("SELECT state FROM merge_intents WHERE id = ?1", [id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(state, "aborted");
-    assert_eq!(
-        w.api("GET", &format!("/pulls/{n}"), None).json()["state"],
-        "open"
-    );
+    assert_eq!(intent_state(&w, id), "aborted");
+    assert_eq!(pull_state(&w, n), "open");
     assert_eq!(w.merge(n, json!({"Do": "merge"})).status, 200);
     w.no_leftovers();
 }
 
 #[test]
-fn a_read_or_the_next_merge_completes_an_unfinished_one() {
+fn a_git_writer_still_holding_the_base_keeps_the_intent_pending() {
     let w = world();
     let head = w.commit("f", "f.txt", "f\n", Some("main"));
     let n = w.open("f", "main");
-    let (_, _, merge) = crashed_merge(&w, n, &head, true);
+    let (id, _, _) = crashed_merge(&w, n, &head, Crash::NotPublished);
+    // an orphan `update-ref` from before a crash would hold this lock while it finishes
+    let lock =
+        w.s.dir
+            .join("repos")
+            .join(format!("{}.git", w.id))
+            .join("refs/heads/main.lock");
+    std::fs::write(&lock, b"").unwrap();
+    recover(&w);
+    assert_eq!(
+        intent_state(&w, id),
+        "pending",
+        "not judged while the base is held"
+    );
+    // and nothing may change the pull request meanwhile
+    let r = w.api(
+        "PATCH",
+        &format!("/pulls/{n}"),
+        Some(json!({"state": "closed"})),
+    );
+    assert_eq!(r.status, 503, "{}", r.msg());
+    assert_eq!(pull_state(&w, n), "open");
+    std::fs::remove_file(&lock).unwrap();
+    recover(&w);
+    assert_eq!(intent_state(&w, id), "aborted");
+}
+
+#[test]
+fn a_close_cannot_overtake_a_landed_merge() {
+    let w = world();
+    let head = w.commit("f", "f.txt", "f\n", Some("main"));
+    let n = w.open("f", "main");
+    crashed_merge(&w, n, &head, Crash::PublishedMarked);
+    // the pull request is still open in the database; the PATCH settles the merge first
+    let r = w.api(
+        "PATCH",
+        &format!("/pulls/{n}"),
+        Some(json!({"state": "closed"})),
+    );
+    assert_eq!(r.status, 422, "{}", r.msg());
+    assert_eq!(pull_state(&w, n), "merged");
+    w.no_leftovers();
+}
+
+#[test]
+fn a_read_settles_an_unfinished_merge() {
+    let w = world();
+    let head = w.commit("f", "f.txt", "f\n", Some("main"));
+    let n = w.open("f", "main");
+    let (_, _, merge) = crashed_merge(&w, n, &head, Crash::PublishedOnly);
     // the next read of the pull settles it (the gate is free)
     let pr = w.api("GET", &format!("/pulls/{n}"), None).json();
     assert_eq!(pr["merged"], true, "{pr}");
@@ -523,10 +610,51 @@ fn a_read_or_the_next_merge_completes_an_unfinished_one() {
 }
 
 #[test]
-fn stray_receipts_are_removed_by_the_startup_repair() {
+fn stray_markers_are_removed_by_the_startup_repair() {
     let w = world();
     let tip = w.tip("main");
-    w.git(&["update-ref", "refs/forge/merge/77", &tip]);
+    w.git(&["update-ref", "refs/forge/merge/77/landed", &tip]);
     recover(&w);
     assert_eq!(w.git(&["for-each-ref", "refs/forge/merge"]), "");
+}
+
+#[test]
+fn a_hostile_title_cannot_add_lines_to_the_merge_commit() {
+    let w = world();
+    w.commit("t", "t.txt", "t\n", Some("main"));
+    let r = w.api(
+        "POST",
+        "/pulls",
+        Some(json!({"title": "x\n\nSigned-off-by: Eve <eve@example.invalid>\u{1}", "head": "t", "base": "main"})),
+    );
+    assert_eq!(r.status, 201, "{}", r.msg());
+    assert_eq!(w.merge(1, json!({"Do": "merge"})).status, 200);
+    let m = w.tip("main");
+    let body = w.git(&["log", "-1", "--format=%B", &m]);
+    assert_eq!(body.lines().count(), 1, "{body:?}");
+    assert!(!body.contains("\n"), "{body:?}");
+}
+
+#[test]
+fn a_stale_lock_on_the_base_does_not_freeze_recovery() {
+    let w = world();
+    let head = w.commit("f", "f.txt", "f\n", Some("main"));
+    let n = w.open("f", "main");
+    let (id, _, _) = crashed_merge(&w, n, &head, Crash::NotPublished);
+    let lock =
+        w.s.dir
+            .join("repos")
+            .join(format!("{}.git", w.id))
+            .join("refs/heads/main.lock");
+    std::fs::write(&lock, b"").unwrap();
+    // a lock that has stood for years belongs to a killed writer
+    let touched = std::process::Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(&lock)
+        .status()
+        .unwrap();
+    assert!(touched.success());
+    recover(&w);
+    assert_eq!(intent_state(&w, id), "aborted");
+    assert!(!lock.exists(), "the stale lock was removed");
 }

@@ -736,6 +736,7 @@ fn matrix(push: bool, who: &str) {
         nb.msg()
     );
     // a merge is the one way in when pushes are off; it works for both settings
+    let tip = w.git(&["rev-parse", "refs/heads/rel"]);
     let m = w.as_(
         &auth,
         "POST",

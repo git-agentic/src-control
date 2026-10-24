@@ -243,8 +243,23 @@ pub(crate) fn gated(ctx: &Ctx, a: &Access, f: impl FnOnce() -> Resp) -> Resp {
     match ctx
         .app
         .life
-        .with_write_row(ctx.conn, a.repo.id, GATE_WAIT, |_| f())
-    {
+        .with_write_row(ctx.conn, a.repo.id, GATE_WAIT, |_| {
+            // A merge that landed but was not finalized is settled before anything else may change
+            // the pull request (a close or retarget would otherwise outrun its finalization). If it
+            // cannot be settled right now, nothing proceeds.
+            let (git, dir) = (&ctx.app.life.git, dir(ctx, a));
+            let settled = crate::merges::recover_locked(ctx.conn, git, &dir, a.repo.id)
+                .map(|_| !crate::merges::has_pending(ctx.conn, a.repo.id));
+            match settled {
+                Ok(true) => f(),
+                Ok(false) => error(
+                    &ctx.app.base,
+                    503,
+                    "a merge of this repository is still being settled, try again",
+                ),
+                Err(e) => ctx.app.internal(&e),
+            }
+        }) {
         Ok(WriteRun::Ran(r)) => r,
         Ok(WriteRun::Busy) => error(
             &ctx.app.base,

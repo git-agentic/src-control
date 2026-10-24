@@ -920,18 +920,27 @@ steps of "Merge" and "Crash recovery" above where they differ (plan decisions R1
   the check cannot be overtaken; statuses do not take the gate and count as of the read. Only `Do: merge` is supported (other
   styles 422 `only Do=merge is supported`, unknown 422 `[Do]: In`, missing `[Do]: Required`). A merge ignores `enable_push`.
 - **The journal.** A `pending` `merge_intents` row (PR, branch names, base/head/merge ids, merge base, the three stats, the merger,
-  the merge time) is written before anything is published, and rewritten (`base_oid`, `merge_oid`) before each retry. The merge
+  the merge time) is written before anything is published, and rewritten in full before each retry. The merge
   commit is `commit-tree -p base -p head` on the `merge-tree` tree, authored and committed by the merging user at the intent's
   time, message `Merge pull request '<title>' (#<n>) from <head> into <base>`.
-- **One ref transaction** (`update-ref --stdin`: `verify` head, `update` base compare-and-swap, create the receipt
-  `refs/forge/merge/<intent id>`, `prepare`, `commit`). The receipt, not the exit status, decides whether it committed. Not
-  published: a moved head answers 409 `head out of date` (never silently substituted), a moved base rebuilds on the new tip (3
-  rounds, then 405 `Please try again later`).
-- **Recovery** asks one question of a pending intent: does its receipt exist? Yes: finalize from the row (the PR is merged with
-  every field a normal merge writes, the head retained, the receipt dropped), whatever happened to the base branch since, a
-  later force push included; no: aborted. It runs at the start of every merge, at startup before the listener is bound, and
-  inline on a read of the repository when the gate is free (never waited for). Stray receipts of finished or aborted intents are
-  removed at startup. (The F0 text recovered by ancestry of the current base; a permitted force push breaks that.)
+- **Publication** is one `update-ref --stdin` transaction that `verify`s the head and moves the base compare-and-swap (one ref
+  changes, so it is atomic on Git's files backend; a transaction that also created a marker would not be, since the files backend
+  commits refs one after another), followed by the marker `refs/forge/merge/<id>/landed`. Whether the transaction committed is asked of
+  Git (marker, then ancestry), never read off an exit status. Not published: a moved head answers 409 `head out of date` (never
+  silently substituted), a moved base rebuilds on the new tip (3 rounds, then 405 `Please try again later`); every retry
+  rewrites the whole intent row (merge commit, merge base, stats, time) first.
+- **Recovery** judges a pending intent in this order: marker present = landed (even if the base was force-pushed away
+  afterwards); else the merge commit being an ancestor of the base = landed (the crash fell between the transaction and the
+  marker; at startup nobody can have rewritten the base yet); else, if a lock file shows a git writer still holding the base ref, the
+  intent stays pending (an orphan `update-ref` that outlived a crashed server); else aborted. An answer git cannot give never
+  aborts. Landed means finalized from the row (the PR merged with every field a normal merge writes, the head retained, the marker
+  dropped); finalization refuses to run against a PR that is not open (the evidence is kept pending). Recovery runs before every
+  gated pull-request operation and sync (a close, a retarget or a head-deletion sync cannot overtake a landed merge; if the
+  intent cannot be settled the operation answers 503), at startup before the listener is bound, and inline on a read when the gate
+  is free (never waited for). Stray markers are removed at startup. The only unresolvable case is a crash between the transaction
+  and the marker combined with a rewrite of the base before recovery, which would read as "not landed" (the PR stays open, the base
+  does not contain the merge: consistent, if surprising). (The F0 text recovered by ancestry alone; an earlier draft of this section
+  put a receipt into the transaction, which the files backend cannot make atomic.)
 - **Merged pulls** read `state: closed, merged: true`, `merge_commit_sha`, `merged_by` (nested account form), `head.sha` and the
   stats frozen at merge, `base.sha` the merge commit, `mergeable: false`. `GET /pulls/{n}/merge` is 204. `delete_branch_after_merge`
   is ignored.

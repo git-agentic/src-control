@@ -1,15 +1,22 @@
 //! Merging a pull request: `POST /pulls/{n}/merge`, the merge journal and its crash recovery.
 //!
 //! Git and SQLite cannot commit together, so a merge is journaled. Under the repository's write
-//! gate the handler (1) recovers any pending intent, (2) re-reads the PR, the protection rules and
+//! gate the handler (1) settles any pending intent, (2) re-reads the PR, the protection rules and
 //! the required statuses, (3) computes the merge commit with `merge-tree --write-tree` and
 //! `commit-tree`, (4) writes a `pending` intent row, (5) runs ONE `update-ref --stdin` transaction
-//! that verifies the head, moves the base branch compare-and-swap and creates the receipt ref
-//! `refs/forge/merge/<intent>`, and (6) marks the intent done and the PR merged in one SQLite
-//! transaction. Recovery asks one question of a pending intent: does its receipt exist? If so the
-//! transaction committed (whatever happened to the base branch since, a later force push
-//! included) and the PR is finalized from the intent row, which carries everything a normal merge
-//! writes; if not, nothing was published and the intent is aborted.
+//! that `verify`s the head and moves the base branch compare-and-swap, (6) records the landing in
+//! `refs/forge/merge/<intent>/landed`, and (7) marks the intent done and the PR merged in one
+//! SQLite transaction.
+//!
+//! Git's files backend commits several refs one after another, so no single transaction can both
+//! move the base and create a marker crash-atomically. The protocol is therefore built from steps
+//! that are each atomic and from evidence that survives a crash between them. A pending intent
+//! has landed when (a) its `landed` marker exists (definitive, even if the base was rewritten
+//! afterwards), or (b) its merge commit is an ancestor of the base branch (the crash fell between
+//! (5) and (6); at startup nobody can have rewritten the base yet). Otherwise it did not land, and
+//! is aborted unless a lock file shows a git writer still holding the base ref (the intent then
+//! stays pending until that writer is gone). An unreadable answer never aborts: the intent stays
+//! pending.
 
 use crate::api::{body, str_field};
 use crate::gitproc::{Git, GitError, Identity, Spec};
@@ -32,9 +39,9 @@ const ATTEMPTS: usize = 3;
 /// Conflicting paths named in a refusal.
 const NAMED_PATHS: usize = 10;
 
-/// The receipt ref of intent `id`.
-pub fn receipt_ref(id: i64) -> String {
-    format!("refs/forge/merge/{id}")
+/// The marker ref that says intent `id` landed.
+pub fn landed_ref(id: i64) -> String {
+    format!("refs/forge/merge/{id}/landed")
 }
 
 /// One journal row.
@@ -125,11 +132,23 @@ fn insert(conn: &Connection, i: &Intent, now: i64) -> rusqlite::Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
-/// A retry builds a new merge commit on the new base: the journal says so before the ref moves.
-fn retarget(conn: &Connection, id: i64, base_oid: &str, merge_oid: &str) -> rusqlite::Result<()> {
+/// A retry builds a new merge commit on the new base, with its own merge base, statistics and
+/// time: the journal says all of it before the ref moves, so recovery writes exactly what a
+/// normal completion would.
+fn retarget(conn: &Connection, i: &Intent) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE merge_intents SET base_oid = ?1, merge_oid = ?2 WHERE id = ?3 AND state = 'pending'",
-        params![base_oid, merge_oid, id],
+        "UPDATE merge_intents SET base_oid = ?1, merge_oid = ?2, merge_base = ?3, changed_files = ?4, \
+         additions = ?5, deletions = ?6, merged_unix = ?7 WHERE id = ?8 AND state = 'pending'",
+        params![
+            i.base_oid,
+            i.merge_oid,
+            i.merge_base,
+            i.changed_files,
+            i.additions,
+            i.deletions,
+            i.merged_unix,
+            i.id
+        ],
     )?;
     Ok(())
 }
@@ -142,14 +161,16 @@ fn abort(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// The merge landed: the PR becomes merged and the intent done, in one transaction. Idempotent.
-fn finalize_rows(conn: &Connection, i: &Intent) -> rusqlite::Result<()> {
+/// The merge landed: the PR becomes merged and the intent done, in one transaction. Idempotent: a
+/// PR already merged by this very commit is fine. A PR in any other state is an inconsistency and
+/// fails the transaction, so the intent (and its evidence) stays pending instead of being consumed.
+fn finalize_rows(conn: &Connection, i: &Intent, recovered: bool) -> rusqlite::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    tx.execute(
+    let changed = tx.execute(
         "UPDATE pulls SET state = 'merged', merge_commit_sha = ?1, final_head_sha = ?2, head_sha = ?2, \
          base_sha = ?3, merged_unix = ?4, closed_unix = ?4, updated_unix = ?4, merged_by = ?5, \
          merge_base = ?6, changed_files = ?7, additions = ?8, deletions = ?9, head_gone = 0 \
-         WHERE repo_id = ?10 AND number = ?11 AND state = 'open'",
+         WHERE repo_id = ?10 AND number = ?11 AND state = 'open' AND base_ref = ?12 AND head_ref = ?13",
         params![
             i.merge_oid,
             i.head_oid,
@@ -161,20 +182,41 @@ fn finalize_rows(conn: &Connection, i: &Intent) -> rusqlite::Result<()> {
             i.additions,
             i.deletions,
             i.repo_id,
-            i.pull_number
+            i.pull_number,
+            i.base_ref,
+            i.head_ref
         ],
     )?;
+    if changed == 0 {
+        let same: bool = tx
+            .query_row(
+                "SELECT 1 FROM pulls WHERE repo_id = ?1 AND number = ?2 AND state = 'merged' AND merge_commit_sha = ?3",
+                params![i.repo_id, i.pull_number, i.merge_oid],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !same {
+            return Err(rusqlite::Error::StatementChangedRows(0));
+        }
+    }
     tx.execute(
-        "UPDATE merge_intents SET state = 'done' WHERE id = ?1 AND state = 'pending'",
-        [i.id],
+        "UPDATE merge_intents SET state = 'done', recovered = ?2 WHERE id = ?1 AND state = 'pending'",
+        params![i.id, recovered],
     )?;
     tx.commit()
 }
 
-/// Finish a landed merge: keep the head reachable, mark the rows, drop the receipt. The SQLite step
+/// Finish a landed merge: keep the head reachable, mark the rows, drop the marker. The SQLite step
 /// is retried a few times while the caller still holds the gate; if it still fails the intent stays
-/// pending (its receipt exists) and the next gated operation or read completes it.
-fn finish(conn: &Connection, git: &Git, dir: &Path, i: &Intent) -> Result<(), ComputeError> {
+/// pending (its evidence is intact) and the next gated operation or read completes it.
+fn finish(
+    conn: &Connection,
+    git: &Git,
+    dir: &Path,
+    i: &Intent,
+    recovered: bool,
+) -> Result<(), ComputeError> {
     if let Err(e) = pulls::retain(git, dir, i.pull_number, &i.head_oid) {
         eprintln!(
             "sc-forge: could not retain the head of merged pull request {}: {e}",
@@ -183,7 +225,7 @@ fn finish(conn: &Connection, git: &Git, dir: &Path, i: &Intent) -> Result<(), Co
     }
     let mut last = None;
     for k in 0..3 {
-        match finalize_rows(conn, i) {
+        match finalize_rows(conn, i, recovered) {
             Ok(()) => {
                 last = None;
                 break;
@@ -198,18 +240,86 @@ fn finish(conn: &Connection, git: &Git, dir: &Path, i: &Intent) -> Result<(), Co
         return Err(e.into());
     }
     let _ = crate::repos::touch(conn, i.repo_id, i.merged_unix);
-    // The receipt has done its job.
+    // The marker has done its job.
     let _ = git.run(&Spec {
         repo: Some(dir),
-        args: &["update-ref", "-d", &receipt_ref(i.id)],
+        args: &["update-ref", "-d", &landed_ref(i.id)],
         ..Default::default()
     });
     Ok(())
 }
 
-/// Resolve the pending intents of the repository, with the write gate held (or at startup, when
-/// nothing else runs): a receipt means the merge committed, no receipt means it never did. Returns
-/// how many were finalized.
+/// Does the commit exist in the repository?
+fn commit_exists(git: &Git, dir: &Path, oid: &str) -> Result<bool, GitError> {
+    let out = git.run(&Spec {
+        repo: Some(dir),
+        args: &["cat-file", "-e", &format!("{oid}^{{commit}}")],
+        ..Default::default()
+    })?;
+    Ok(out.status.code() == Some(0))
+}
+
+/// Has the intent's merge landed? The marker says so definitively; failing that, the merge commit
+/// being part of the base branch's history does. `Err` is "could not tell", never "no".
+fn is_landed(git: &Git, dir: &Path, i: &Intent) -> Result<bool, GitError> {
+    if gw::read_ref(git, dir, &landed_ref(i.id))?.is_some() {
+        return Ok(true);
+    }
+    let Some(tip) = gw::read_ref(git, dir, &refname::branch_ref(&i.base_ref))? else {
+        return Ok(false);
+    };
+    if !commit_exists(git, dir, &i.merge_oid)? {
+        return Ok(false);
+    }
+    gw::is_ancestor(git, dir, &i.merge_oid, &tip)
+}
+
+/// Record that the intent landed. Best effort: ancestry carries the same fact until it is written.
+fn mark_landed(git: &Git, dir: &Path, i: &Intent) {
+    let zero = "0".repeat(i.merge_oid.len());
+    let _ = git.run(&Spec {
+        repo: Some(dir),
+        args: &["update-ref", &landed_ref(i.id), &i.merge_oid, &zero],
+        ..Default::default()
+    });
+}
+
+/// A lock file older than this is a dead writer's (git holds one for milliseconds; our own helper
+/// is killed after at most a minute).
+const STALE_LOCK: Duration = Duration::from_secs(120);
+
+/// Is a git writer holding the base ref right now (its lock file exists)? An orphan `update-ref`
+/// that outlived a crashed server shows up here; judging "not landed" before it finishes would be
+/// wrong, so the intent waits. A lock that has stood for [`STALE_LOCK`] belongs to a writer that was
+/// killed mid-update (a timed-out helper): it is removed, since it would freeze the branch for
+/// every push and merge until an operator noticed.
+fn base_is_locked(dir: &Path, base_ref: &str) -> bool {
+    let lock = dir
+        .join("refs")
+        .join("heads")
+        .join(format!("{base_ref}.lock"));
+    let Ok(meta) = std::fs::metadata(&lock) else {
+        return false;
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .unwrap_or_default();
+    if age > STALE_LOCK {
+        eprintln!(
+            "sc-forge: removing the stale lock {} left by a killed git writer",
+            lock.display()
+        );
+        return std::fs::remove_file(&lock).is_err();
+    }
+    true
+}
+
+/// Settle the pending intents of the repository, with the write gate held (or at startup, when
+/// nothing else runs). Landed ones are finalized from the journal; ones that did not land are
+/// aborted; ones whose outcome cannot be told yet (a git writer holds the base, or git failed) stay
+/// pending. Returns how many were finalized.
 pub fn recover_locked(
     conn: &Connection,
     git: &Git,
@@ -218,18 +328,18 @@ pub fn recover_locked(
 ) -> Result<usize, ComputeError> {
     let mut done = 0;
     for i in pending(conn, repo_id)? {
-        match gw::read_ref(git, dir, &receipt_ref(i.id))? {
-            Some(_) => {
-                finish(conn, git, dir, &i)?;
-                done += 1;
-            }
-            None => abort(conn, i.id)?,
+        if is_landed(git, dir, &i)? {
+            mark_landed(git, dir, &i);
+            finish(conn, git, dir, &i, true)?;
+            done += 1;
+        } else if !base_is_locked(dir, &i.base_ref) {
+            abort(conn, i.id)?;
         }
     }
     Ok(done)
 }
 
-/// Remove receipt refs that belong to no pending intent (a finished merge whose cleanup was lost).
+/// Remove marker refs that belong to no pending intent (a finished merge whose cleanup was lost).
 pub fn drop_stale_receipts(
     conn: &Connection,
     git: &Git,
@@ -238,7 +348,7 @@ pub fn drop_stale_receipts(
 ) -> Result<(), ComputeError> {
     let live: Vec<String> = pending(conn, repo_id)?
         .iter()
-        .map(|i| receipt_ref(i.id))
+        .map(|i| landed_ref(i.id))
         .collect();
     for name in pulls::refs_under(git, dir, "refs/forge/merge")?.keys() {
         if !live.contains(name) {
@@ -323,30 +433,39 @@ fn commit_tree(
     }
 }
 
-/// The one ref transaction: the head is verified, the base moves compare-and-swap, the receipt is
-/// created. All or nothing.
+/// The ref transaction: the head is verified and the base moves compare-and-swap, together. One
+/// ref changes, so it commits or it does not. `Ok(false)`: it did not commit, or we cannot tell
+/// (a timeout); the caller asks [`is_landed`].
 fn publish(git: &Git, dir: &Path, i: &Intent) -> Result<bool, GitError> {
-    let zero = "0".repeat(i.merge_oid.len());
     let script = format!(
-        "start\nverify {head} {head_oid}\nupdate {base} {merge} {base_oid}\nupdate {receipt} {merge} {zero}\nprepare\ncommit\n",
+        "start\nverify {head} {head_oid}\nupdate {base} {merge} {base_oid}\nprepare\ncommit\n",
         head = refname::branch_ref(&i.head_ref),
         head_oid = i.head_oid,
         base = refname::branch_ref(&i.base_ref),
         merge = i.merge_oid,
         base_oid = i.base_oid,
-        receipt = receipt_ref(i.id),
     );
-    let out = git.run(&Spec {
+    match git.run(&Spec {
         repo: Some(dir),
         args: &["update-ref", "--stdin"],
         stdin: Some(script.as_bytes()),
         ..Default::default()
-    });
-    match out {
+    }) {
         Ok(o) => Ok(o.ok()),
-        // Killed or timed out: whether it committed is for the receipt to say.
         Err(GitError::Timeout { .. }) => Ok(false),
         Err(e) => Err(e),
+    }
+}
+
+/// Test-only knob: `SC_FORGE_MERGE_PAUSE_MS` stretches the two crash windows of a merge (after the
+/// journal row, and after the base moved) so a test can SIGKILL the server inside them. Unset in
+/// production.
+fn pause_for_tests() {
+    if let Some(ms) = std::env::var("SC_FORGE_MERGE_PAUSE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
     }
 }
 
@@ -403,21 +522,18 @@ pub fn merge_pull(ctx: &mut Ctx) -> Resp {
 }
 
 fn run(ctx: &Ctx, a: &Access, n: i64, want_head: Option<&str>) -> Resp {
-    let (git, dir) = (&ctx.app.life.git, ctx.app.life.repo_dir(a.repo.id));
-    // Whatever an earlier merge left is settled before anything is judged.
-    if let Err(e) = recover_locked(ctx.conn, git, &dir, a.repo.id) {
-        return internal(ctx, e);
-    }
+    // `gated` has settled whatever an earlier merge left; nothing else can be pending now.
     let mut intent_id: Option<i64> = None;
     let outcome = attempt_loop(ctx, a, n, want_head, &mut intent_id);
-    // Any exit with the intent still pending and no receipt is an abort.
-    if let Some(id) = intent_id {
-        if gw::read_ref(git, &dir, &receipt_ref(id))
-            .ok()
-            .flatten()
-            .is_none()
-        {
-            let _ = abort(ctx.conn, id);
+    // Any exit that did not land leaves the intent for the same judgement recovery makes; a
+    // landed one is already done, an unknown one stays pending.
+    if intent_id.is_some() {
+        let (git, dir) = (&ctx.app.life.git, ctx.app.life.repo_dir(a.repo.id));
+        if let Err(e) = recover_locked(ctx.conn, git, &dir, a.repo.id) {
+            eprintln!(
+                "sc-forge: could not settle a merge of repository {}: {e}",
+                a.repo.id
+            );
         }
     }
     outcome
@@ -494,9 +610,17 @@ fn attempt_loop(
         let Some(identity) = Identity::new(&user.login, &email).map(|i| i.at(when)) else {
             return internal(ctx, "unusable commit identity");
         };
+        // One line, whatever the title holds: a newline would add body or trailer lines (a fake
+        // `Signed-off-by`) to a commit written under the merger's identity, and a NUL would make
+        // `commit-tree` fail for good.
+        let title: String = p
+            .title
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
         let message = format!(
             "Merge pull request '{}' (#{}) from {} into {}\n",
-            p.title, p.number, p.head_ref, p.base_ref
+            title, p.number, p.head_ref, p.base_ref
         );
         let merge_oid =
             match commit_tree(git, &dir, &tree, &base_oid, &head_oid, &message, &identity) {
@@ -519,34 +643,35 @@ fn attempt_loop(
             merger_id: user.id,
             merged_unix: when,
         };
-        // The journal first, and again whenever the merge commit changes.
-        intent.id = match *intent_id {
+        // The journal first, and again (every field) whenever the merge commit changes.
+        match *intent_id {
             None => match insert(ctx.conn, &intent, when) {
                 Ok(id) => {
                     *intent_id = Some(id);
-                    id
+                    intent.id = id;
                 }
                 Err(e) => return internal(ctx, e),
             },
             Some(id) => {
-                if let Err(e) = retarget(ctx.conn, id, &base_oid, &merge_oid) {
+                intent.id = id;
+                if let Err(e) = retarget(ctx.conn, &intent) {
                     return internal(ctx, e);
                 }
-                id
             }
-        };
-        let committed = match publish(git, &dir, &intent) {
-            Ok(c) => c,
-            Err(e) => return crate::content_api::read_err(ctx, a, e),
-        };
-        // The receipt, not the exit status, says whether the transaction committed.
+        }
+        pause_for_tests();
+        // Whether the transaction committed is asked of git, not read off an exit status; an
+        // answer that cannot be had leaves the intent pending and the request failed.
+        let committed = publish(git, &dir, &intent).unwrap_or(false);
         let landed = committed
-            || gw::read_ref(git, &dir, &receipt_ref(intent.id))
-                .ok()
-                .flatten()
-                .is_some();
+            || match is_landed(git, &dir, &intent) {
+                Ok(l) => l,
+                Err(e) => return crate::content_api::read_err(ctx, a, e),
+            };
         if landed {
-            return match finish(ctx.conn, git, &dir, &intent) {
+            mark_landed(git, &dir, &intent);
+            pause_for_tests();
+            return match finish(ctx.conn, git, &dir, &intent, false) {
                 Ok(()) => {
                     let mut r = Resp::json(200, &serde_json::Value::Null);
                     r.body = Vec::new();
@@ -625,8 +750,8 @@ mod tests {
         assert!(has_pending(&c, repo));
         let mut i = intent(repo, user, 1);
         i.id = id;
-        finalize_rows(&c, &i).unwrap();
-        finalize_rows(&c, &i).unwrap();
+        finalize_rows(&c, &i, false).unwrap();
+        finalize_rows(&c, &i, false).unwrap();
         let p = pulls::find(&c, repo, 1).unwrap().unwrap();
         assert_eq!(p.state, "merged");
         assert_eq!(p.merge_commit.as_deref(), Some(i.merge_oid.as_str()));
@@ -651,11 +776,32 @@ mod tests {
         pulls::insert(&c, repo, "f", "main", "b", "h", "t", "", user, 5).unwrap();
         let id = insert(&c, &intent(repo, user, 1), 6).unwrap();
         assert!(insert(&c, &intent(repo, user, 1), 7).is_err());
-        retarget(&c, id, &"e".repeat(40), &"f".repeat(40)).unwrap();
+        let mut again = intent(repo, user, 1);
+        again.id = id;
+        again.base_oid = "e".repeat(40);
+        again.merge_oid = "f".repeat(40);
+        again.merge_base = "9".repeat(40);
+        (again.changed_files, again.additions, again.deletions) = (5, 6, 7);
+        again.merged_unix = 99;
+        retarget(&c, &again).unwrap();
         let p = pending(&c, repo).unwrap();
         assert_eq!(
-            (p[0].base_oid.clone(), p[0].merge_oid.clone()),
-            ("e".repeat(40), "f".repeat(40))
+            (
+                p[0].base_oid.clone(),
+                p[0].merge_oid.clone(),
+                p[0].merge_base.clone()
+            ),
+            ("e".repeat(40), "f".repeat(40), "9".repeat(40))
+        );
+        assert_eq!(
+            (
+                p[0].changed_files,
+                p[0].additions,
+                p[0].deletions,
+                p[0].merged_unix
+            ),
+            (5, 6, 7, 99),
+            "a retry persists every fact it recomputed"
         );
         abort(&c, id).unwrap();
         assert!(

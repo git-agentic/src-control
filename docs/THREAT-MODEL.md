@@ -1066,12 +1066,20 @@ SIGKILL during merges, restarted and checked), and the `bypass_matrix_*` tests i
 - **A merge cannot publish a stale decision.** Rule changes, PR changes and merges serialize on the gate and every merge round
   re-reads the PR, rules, both tips and the statuses. The head is `verify`d inside the same ref transaction that moves the base,
   so "the head I checked is the head I merged" is atomic; a head that moved answers 409 and is never substituted.
-- **Crash consistency.** Git and SQLite cannot commit together, so the journal row precedes the ref transaction and the receipt ref
-  is part of it. After SIGKILL at any point the receipt says whether the merge committed; recovery then finalizes or aborts, never
-  guesses from where the base branch is (a landed merge stays merged after a force push of an unprotected base:
-  `a_landed_merge_is_still_merged_after_the_base_was_force_pushed_away`). `kill_nine_during_merges_leaves_a_consistent_forge`
-  kills a real server at delays that sweep a merge, five times, and asserts after each restart: no pending intent, no receipt, every
-  pull request merged with a two-parent commit on the base or open with its head not on the base.
+- **Crash consistency.** Git and SQLite cannot commit together, and Git's files backend commits several refs one after another, so
+  the protocol uses only single-ref atomic steps and evidence that survives a crash between them: the journal row precedes the
+  base compare-and-swap (one ref, with the head `verify`d in the same transaction), the `landed` marker follows it, and recovery
+  trusts, in order, the marker, the merge commit being in the base's history, and a lock file on the base (an orphan git writer
+  still holding it keeps the intent pending); only a definite "no" aborts, and a git error leaves the intent pending. Recovery also
+  runs before any pull-request mutation or sync, so a close cannot overtake a landed merge, and finalization never runs against a
+  pull request that is not open (`a_close_cannot_overtake_a_landed_merge`,
+  `a_git_writer_still_holding_the_base_keeps_the_intent_pending`,
+  `a_crash_between_the_base_moving_and_its_marker_is_recognized_by_the_base_history`,
+  `a_landed_merge_with_its_marker_is_still_merged_after_the_base_was_force_pushed_away`). `kill_nine_during_merges_leaves_a_consistent_forge`
+  SIGKILLs a real server inside the merge windows (a test-only environment knob, `SC_FORGE_MERGE_PAUSE_MS`, stretches the two windows
+  that matter), restarts it, and asserts after every restart: no pending intent, no marker, every pull request merged with a
+  two-parent commit on the base or open with its head not on the base; it keeps going until the database shows an intent aborted
+  by recovery and one finished by recovery.
 - **Known windows.** A rule created while a push is between `pre-receive` and its ref update is not stopped (the push does not
   take the gate). A merge computes its tree before it takes the base lock in git, so a base that moves under it only costs a retry,
   not a wrong merge (the compare-and-swap refuses). Objects of aborted or lost merges stay unreferenced until F5's gc.

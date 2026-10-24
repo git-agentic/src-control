@@ -531,6 +531,12 @@ pub fn sync_locked(
     repo_id: i64,
     now: i64,
 ) -> Result<usize, ComputeError> {
+    // A merge that landed is finalized before any pull request is closed or moved on; one that
+    // cannot be settled yet (a git writer still holds its base) blocks the sync.
+    crate::merges::recover_locked(conn, git, dir, repo_id)?;
+    if crate::merges::has_pending(conn, repo_id) {
+        return Ok(0);
+    }
     let open = open_pulls(conn, repo_id)?;
     if open.is_empty() {
         return Ok(0);

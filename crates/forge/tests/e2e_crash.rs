@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sc-forge");
 /// Pull requests opened per round.
-const PRS: i64 = 4;
+const PRS: i64 = 3;
 
 struct Server {
     child: Option<Child>,
@@ -32,6 +32,8 @@ impl Server {
                 "--public-url",
                 &format!("http://127.0.0.1:{port}"),
             ])
+            // stretch the two crash windows of a merge so the kills can land inside them
+            .env("SC_FORGE_MERGE_PAUSE_MS", "300")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -207,11 +209,15 @@ fn kill_nine_during_merges_leaves_a_consistent_forge() {
         .unwrap();
 
     // Each round: open fresh pull requests, merge them all at once, kill the server after a delay
-    // that lands somewhere inside the merges, restart, and check. The delays sweep the merge's
-    // duration (a merge is a dozen git processes, about a second with the durable fsync settings), so some kills hit before the ref transaction,
-    // some after it and before the database write.
+    // that lands somewhere inside the merges, restart, and check. The merge is paused for 300 ms
+    // after its journal row and again after the base moved, so kills land inside both windows
+    // often; rounds go on until the database shows that both kinds of interruption really
+    // happened (an intent aborted by recovery, an intent finished by recovery), at least five
+    // rounds and at most sixteen.
+    let delays = [250u64, 600, 950, 1300, 1700, 2100];
     let mut total = 0;
-    for (round, delay_ms) in [150u64, 500, 900, 1300, 1800].into_iter().enumerate() {
+    let (mut aborted, mut recovered) = (0, 0);
+    for round in 0..16 {
         let first = total + 1;
         for _ in 0..PRS {
             let i = total;
@@ -248,13 +254,30 @@ fn kill_nine_during_merges_leaves_a_consistent_forge() {
                     );
                 });
             }
-            std::thread::sleep(Duration::from_millis(delay_ms));
+            std::thread::sleep(Duration::from_millis(delays[round % delays.len()]));
             srv.kill9();
         });
         // restart: `serve` repairs the journal before it accepts anything
         srv = Server::start(&data, free_port());
         check(&srv, tok, &data, repo, total);
+        let conn = scl_forge::db::connect(&data).unwrap();
+        aborted = count(
+            &conn,
+            "SELECT COUNT(*) FROM merge_intents WHERE state = 'aborted'",
+        );
+        recovered = count(
+            &conn,
+            "SELECT COUNT(*) FROM merge_intents WHERE state = 'done' AND recovered = 1",
+        );
+        eprintln!("round {round}: {aborted} intents aborted by recovery, {recovered} finished by recovery so far");
+        if round >= 4 && aborted >= 1 && recovered >= 1 {
+            break;
+        }
     }
+    assert!(
+        aborted >= 1 && recovered >= 1,
+        "the kills never interrupted a merge inside the journal windows ({aborted} aborted, {recovered} recovered): the test proved nothing"
+    );
 
     // whatever is still open merges normally now
     for n in 1..=total {
@@ -290,6 +313,10 @@ fn kill_nine_during_merges_leaves_a_consistent_forge() {
             "m{i}.txt is on main at the end"
         );
     }
+}
+
+fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
 /// The invariants after a restart.

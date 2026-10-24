@@ -163,9 +163,10 @@ const MIGRATIONS: &[&str] = &[
         updated_unix INTEGER NOT NULL
     );
     CREATE INDEX issue_comments_by_issue ON issue_comments (repo_id, number, id);",
-    // 5: the merge journal. A row is written before the base branch moves; the ref transaction that
-    // moves it also creates `refs/forge/merge/<id>` (the receipt), so a crash is resolved by asking
-    // whether the receipt exists, never by looking at where the base is now.
+    // 5: the merge journal. A row is written before the base branch moves; `refs/forge/merge/<id>/landed`
+    // is written right after, and a crash is resolved from the marker or, failing that, from the merge
+    // commit being part of the base's history (see `merges.rs`). `recovered` marks a row finished by
+    // recovery rather than by the request that started it.
     "CREATE TABLE merge_intents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
@@ -181,6 +182,7 @@ const MIGRATIONS: &[&str] = &[
         deletions INTEGER NOT NULL,
         merger_id INTEGER NOT NULL REFERENCES users(id),
         merged_unix INTEGER NOT NULL,
+        recovered INTEGER NOT NULL DEFAULT 0,
         state TEXT NOT NULL CHECK (state IN ('pending', 'done', 'aborted')),
         created_unix INTEGER NOT NULL
     );
