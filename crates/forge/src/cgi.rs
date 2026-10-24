@@ -193,6 +193,11 @@ fn buffered(r: crate::http::Resp) -> Response<RespBody> {
     .unwrap_or_else(|_| fallback(500))
 }
 
+/// The answer to a request that meets the server's shutdown.
+fn shutting_down() -> crate::http::Resp {
+    text(503, "Service Unavailable\n").with("retry-after", "5".into())
+}
+
 fn fallback(status: u16) -> Response<RespBody> {
     let mut r = Response::new(
         http_body_util::Full::new(Bytes::from_static(b"internal server error\n"))
@@ -851,7 +856,8 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
         match tokio::task::spawn_blocking(move || transport::authorize(&app, &req, path)).await {
             Ok(Ok(p)) => p,
             Ok(Err(r)) => return buffered(r),
-            Err(_) => return buffered(text(500, "internal server error\n")),
+            // A cancelled blocking task means the runtime is shutting down: not an internal error.
+            Err(_) => return buffered(shutting_down()),
         }
     };
     let t = &app.transports;
@@ -947,14 +953,12 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
     let started = match tokio::task::spawn_blocking(move || launch(launch_args)).await {
         Ok(Ok(s)) => s,
         Ok(Err(LaunchError::Gone)) => return buffered(transport::repo_not_found()),
-        Ok(Err(LaunchError::Stopped)) => {
-            return buffered(text(503, "Service Unavailable\n").with("retry-after", "5".into()))
-        }
+        Ok(Err(LaunchError::Stopped)) => return buffered(shutting_down()),
         Ok(Err(LaunchError::Io(e))) => {
             eprintln!("sc-forge: could not start git: {e}");
             return buffered(text(500, "internal server error\n"));
         }
-        Err(_) => return buffered(text(500, "internal server error\n")),
+        Err(_) => return buffered(shutting_down()),
     };
     let Started {
         head,
