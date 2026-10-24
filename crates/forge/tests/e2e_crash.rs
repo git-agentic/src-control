@@ -463,6 +463,21 @@ fn a_restart_kills_an_orphaned_git_writer_and_clears_its_lock() {
     pipe.write_all(format!("start\nupdate refs/heads/zz {main} {zero}\nprepare\n").as_bytes())
         .unwrap();
     pipe.flush().unwrap();
+    // and the writer behind an HTTP push: `receive-pack --stateless-rpc .` in the repository, named
+    // by nothing on its command line, but carrying the transport's FORGE_DATA_DIR
+    let mut http_orphan = Command::new("git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("HOME", &canon)
+        .env("FORGE_DATA_DIR", &canon)
+        .args(["receive-pack", "--stateless-rpc", "."])
+        .current_dir(&repo_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _http_pipe = http_orphan.stdin.take().unwrap();
     let lock = repo_dir.join("refs/heads/zz.lock");
     let t0 = Instant::now();
     while !lock.exists() && t0.elapsed() < Duration::from_secs(10) {
@@ -485,6 +500,14 @@ fn a_restart_kills_an_orphaned_git_writer_and_clears_its_lock() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(!status.success());
+    let t0 = Instant::now();
+    while http_orphan.try_wait().unwrap().is_none() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the HTTP writer was not killed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(!lock.exists(), "its lock was removed");
     assert!(
         git(

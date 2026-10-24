@@ -20,7 +20,11 @@ pub struct Swept {
     pub locks: usize,
 }
 
-/// `(pid, argv joined by spaces)` of every process, from `/proc` where it exists, else `ps`.
+/// `(pid, argv and environment joined by spaces)` of every process, from `/proc` where it exists,
+/// else from BSD `ps` (whose `-E` flag appends the environment of the caller's own processes). The
+/// environment matters: the writer behind an HTTP push is `git receive-pack --stateless-rpc .`
+/// run in the repository's directory, named by nothing on its command line, but it inherited the
+/// `FORGE_DATA_DIR` the transport sets.
 fn processes() -> Vec<(i32, String)> {
     if Path::new("/proc/self").exists() {
         let mut out = Vec::new();
@@ -29,12 +33,18 @@ fn processes() -> Vec<(i32, String)> {
                 let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
                     continue;
                 };
-                if let Ok(raw) = std::fs::read(e.path().join("cmdline")) {
-                    let cmd = raw
-                        .split(|b| *b == 0)
+                let join = |raw: Vec<u8>| {
+                    raw.split(|b| *b == 0)
                         .map(|a| String::from_utf8_lossy(a).to_string())
                         .collect::<Vec<_>>()
-                        .join(" ");
+                        .join(" ")
+                };
+                if let Ok(raw) = std::fs::read(e.path().join("cmdline")) {
+                    let mut cmd = join(raw);
+                    if let Ok(env) = std::fs::read(e.path().join("environ")) {
+                        cmd.push(' ');
+                        cmd.push_str(&join(env));
+                    }
                     out.push((pid, cmd));
                 }
             }
@@ -48,7 +58,7 @@ fn processes() -> Vec<(i32, String)> {
         return Vec::new();
     };
     let Ok(o) = std::process::Command::new(ps)
-        .args(["-axo", "pid=,command="])
+        .args(["-axEww", "-o", "pid=,command="])
         .output()
     else {
         return Vec::new();
@@ -110,13 +120,19 @@ fn alive(pid: i32) -> bool {
 /// Kill git processes that work on this data directory's repositories (not ours: `me`), then wait
 /// briefly for them to be gone. Returns `(killed, survivors)`. The match is on the command line
 /// (`--git-dir=<data>/repos/...` for our `update-ref`s, the repository path for `receive-pack` and
-/// `upload-pack`): the processes that can move a ref. Helpers that only read or write objects
+/// `upload-pack`), or by the `FORGE_DATA_DIR` they inherited from the HTTP transport: the processes
+/// that can move a ref. Helpers that only read or write objects
 /// (`index-pack`, `unpack-objects`) are not named by path and are left to finish and exit.
 pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> (usize, usize) {
     let needle = format!("{}/repos/", data_dir.display());
+    let env_needle = format!("FORGE_DATA_DIR={}", data_dir.display());
     let doomed: Vec<i32> = processes()
         .into_iter()
-        .filter(|(pid, cmd)| *pid != me && cmd.contains(&needle) && is_git(cmd, git_bin))
+        .filter(|(pid, cmd)| {
+            *pid != me
+                && (cmd.contains(&needle) || cmd.contains(&env_needle))
+                && is_git(cmd, git_bin)
+        })
         .map(|(pid, _)| pid)
         .collect();
     for pid in &doomed {

@@ -167,7 +167,10 @@ const MIGRATIONS: &[&str] = &[
     // is written right after, and a crash is resolved from the marker or, failing that, from the merge
     // commit being part of the base's history (see `merges.rs`). `recovered` marks a row finished by
     // recovery rather than by the request that started it.
-    "CREATE TABLE merge_intents (
+    // The first statement drops cached PR statistics computed before unrelated histories were
+    // compared against the base tip (they are derived data and are recomputed on demand).
+    "DELETE FROM mergeability_cache;
+    CREATE TABLE merge_intents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
         pull_number INTEGER NOT NULL,
