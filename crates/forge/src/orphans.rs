@@ -63,9 +63,13 @@ fn processes() -> Vec<(i32, String)> {
         .collect()
 }
 
-/// Is `cmd` a git invocation (the executable's file name starts with `git`)?
-fn is_git(cmd: &str) -> bool {
+/// Is `cmd` a git invocation: the configured git executable (`SC_FORGE_GIT` may name it anything),
+/// or an executable called `git` or `git-*` (what git itself spawns, `git-receive-pack` and the like)?
+fn is_git(cmd: &str, configured: Option<&Path>) -> bool {
     let exe = cmd.split(' ').next().unwrap_or("");
+    if configured.is_some_and(|c| c == Path::new(exe)) {
+        return true;
+    }
     Path::new(exe)
         .file_name()
         .and_then(|n| n.to_str())
@@ -108,11 +112,11 @@ fn alive(pid: i32) -> bool {
 /// (`--git-dir=<data>/repos/...` for our `update-ref`s, the repository path for `receive-pack` and
 /// `upload-pack`): the processes that can move a ref. Helpers that only read or write objects
 /// (`index-pack`, `unpack-objects`) are not named by path and are left to finish and exit.
-pub fn kill_orphan_git(data_dir: &Path, me: i32) -> (usize, usize) {
+pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> (usize, usize) {
     let needle = format!("{}/repos/", data_dir.display());
     let doomed: Vec<i32> = processes()
         .into_iter()
-        .filter(|(pid, cmd)| *pid != me && cmd.contains(&needle) && is_git(cmd))
+        .filter(|(pid, cmd)| *pid != me && cmd.contains(&needle) && is_git(cmd, git_bin))
         .map(|(pid, _)| pid)
         .collect();
     for pid in &doomed {
@@ -172,11 +176,12 @@ pub fn remove_stale_locks(data_dir: &Path) -> usize {
     n
 }
 
-/// The startup cleanup. `data_dir` must be the canonical data directory. Locks are removed only
+/// The startup cleanup. `data_dir` must be the canonical data directory; `git_bin` is the git
+/// executable the server runs. Locks are removed only
 /// when no matching process is left alive: a lock of a writer that could not be killed is not ours
 /// to take.
-pub fn sweep(data_dir: &Path) -> Swept {
-    let (killed, survivors) = kill_orphan_git(data_dir, std::process::id() as i32);
+pub fn sweep(data_dir: &Path, git_bin: Option<&Path>) -> Swept {
+    let (killed, survivors) = kill_orphan_git(data_dir, std::process::id() as i32, git_bin);
     let locks = if survivors == 0 {
         remove_stale_locks(data_dir)
     } else {
@@ -198,11 +203,22 @@ mod tests {
     #[test]
     fn only_git_executables_count() {
         assert!(is_git(
-            "/usr/bin/git --git-dir=/d/repos/1.git update-ref --stdin"
+            "/usr/bin/git --git-dir=/d/repos/1.git update-ref --stdin",
+            None
         ));
-        assert!(is_git("git-receive-pack /d/repos/1.git"));
-        assert!(!is_git("/bin/sleep 100 /d/repos/1.git"));
-        assert!(!is_git("/usr/bin/gitk /d/repos/1.git"));
+        assert!(is_git("git-receive-pack /d/repos/1.git", None));
+        assert!(!is_git("/bin/sleep 100 /d/repos/1.git", None));
+        assert!(!is_git("/usr/bin/gitk /d/repos/1.git", None));
+        // a differently named git, configured through SC_FORGE_GIT, counts too
+        let custom = Path::new("/opt/vcs/bin/scm");
+        assert!(is_git(
+            "/opt/vcs/bin/scm --git-dir=/d/repos/1.git update-ref",
+            Some(custom)
+        ));
+        assert!(!is_git(
+            "/opt/vcs/bin/scm --git-dir=/d/repos/1.git update-ref",
+            None
+        ));
     }
 
     #[test]

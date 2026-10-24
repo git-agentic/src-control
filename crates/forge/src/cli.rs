@@ -310,7 +310,7 @@ fn run_serve(a: ServeArgs) -> Result<()> {
     let life = scl_forge::lifecycle::Lifecycle::new(&a.data_dir, git)?;
     // A killed predecessor may have left git children running and their ref locks behind; they
     // go before anything below looks at a repository (we hold the data-directory lock).
-    scl_forge::orphans::sweep(&std::fs::canonicalize(&a.data_dir)?);
+    scl_forge::orphans::sweep(&std::fs::canonicalize(&a.data_dir)?, Some(life.git.bin()));
     // Resolve whatever a crash left, before the listener is bound.
     let report = life.reconcile(&db::connect(&a.data_dir)?, scl_forge::timefmt::now())?;
     if report != scl_forge::lifecycle::Report::default() {
