@@ -184,7 +184,18 @@ pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> Opti
     }
 }
 
-fn remove_locks(dir: &Path, depth: usize) -> usize {
+/// Is `p` at least `min_age` old (by modification time)? No age means "always"; an unreadable
+/// time counts as young, so a runtime cleanup leaves it alone.
+fn old_enough(p: &Path, min_age: Option<Duration>) -> bool {
+    let Some(min) = min_age else { return true };
+    std::fs::symlink_metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age >= min)
+}
+
+fn remove_locks(dir: &Path, depth: usize, min_age: Option<Duration>) -> usize {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -193,9 +204,10 @@ fn remove_locks(dir: &Path, depth: usize) -> usize {
         let p = e.path();
         let Ok(t) = e.file_type() else { continue };
         if t.is_dir() && depth < 32 {
-            n += remove_locks(&p, depth + 1);
+            n += remove_locks(&p, depth + 1, min_age);
         } else if t.is_file()
             && p.extension().is_some_and(|x| x == "lock")
+            && old_enough(&p, min_age)
             && std::fs::remove_file(&p).is_ok()
         {
             eprintln!(
@@ -208,26 +220,50 @@ fn remove_locks(dir: &Path, depth: usize) -> usize {
     n
 }
 
-/// Remove the leftover ref locks of every repository (`refs/**/*.lock`, `packed-refs.lock`,
-/// `HEAD.lock`). Only after [`kill_orphan_git`], and only at startup.
-pub fn remove_stale_locks(data_dir: &Path) -> usize {
-    let mut n = 0;
-    let Ok(rd) = std::fs::read_dir(data_dir.join("repos")) else {
-        return 0;
-    };
-    for e in rd.flatten() {
-        let repo = e.path();
-        if !repo.is_dir() {
-            continue;
+/// Remove what a killed git writer left in one repository: ref locks (`refs/**/*.lock`,
+/// `packed-refs.lock`, `HEAD.lock`) and receive-pack's `objects/incoming-*` quarantine directories.
+/// With `min_age` only items at least that old go. The caller must know no git writer of the
+/// repository is alive (startup: after [`kill_orphan_git`]; at run time: the write gate is held and
+/// no transport is registered).
+pub fn clean_repo(repo: &Path, min_age: Option<Duration>) -> usize {
+    let mut n = remove_locks(&repo.join("refs"), 0, min_age);
+    for f in ["packed-refs.lock", "HEAD.lock"] {
+        let p = repo.join(f);
+        if old_enough(&p, min_age) && std::fs::remove_file(&p).is_ok() {
+            n += 1;
         }
-        n += remove_locks(&repo.join("refs"), 0);
-        for f in ["packed-refs.lock", "HEAD.lock"] {
-            if std::fs::remove_file(repo.join(f)).is_ok() {
+    }
+    if let Ok(rd) = std::fs::read_dir(repo.join("objects")) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let named = e.file_name().to_string_lossy().starts_with("incoming-");
+            if named
+                && e.file_type().is_ok_and(|t| t.is_dir())
+                && old_enough(&p, min_age)
+                && std::fs::remove_dir_all(&p).is_ok()
+            {
+                eprintln!(
+                    "sc-forge: removed the quarantine {} left by a killed git",
+                    p.display()
+                );
                 n += 1;
             }
         }
     }
     n
+}
+
+/// [`clean_repo`] for every repository, regardless of age. Only after [`kill_orphan_git`], and
+/// only at startup.
+pub fn remove_stale_locks(data_dir: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(data_dir.join("repos")) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .map(|p| clean_repo(&p, None))
+        .sum()
 }
 
 /// The startup cleanup. `data_dir` must be the canonical data directory; `git_bin` is the git
@@ -352,6 +388,29 @@ mod tests {
         assert!(repo.join("refs/heads/main").exists() && repo.join("config.lock").exists());
         assert!(
             !repo.join("refs/heads/main.lock").exists() && !repo.join("packed-refs.lock").exists()
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn quarantine_directories_go_with_the_locks_and_age_is_honoured() {
+        let d = std::env::temp_dir().join(format!("scl-forge-orphans-q-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let repo = d.join("repos").join("1.git");
+        std::fs::create_dir_all(repo.join("objects/incoming-aB3xYz/pack")).unwrap();
+        std::fs::create_dir_all(repo.join("objects/pack")).unwrap();
+        std::fs::create_dir_all(repo.join("refs/heads")).unwrap();
+        std::fs::write(repo.join("objects/incoming-aB3xYz/pack/tmp"), b"x").unwrap();
+        std::fs::write(repo.join("refs/heads/a.lock"), b"").unwrap();
+        // Young items stay when an age is given; the unconditional startup form removes them.
+        assert_eq!(clean_repo(&repo, Some(Duration::from_secs(3600))), 0);
+        assert!(repo.join("objects/incoming-aB3xYz").exists());
+        assert_eq!(remove_stale_locks(&d), 2);
+        assert!(!repo.join("objects/incoming-aB3xYz").exists());
+        assert!(
+            repo.join("objects/pack").exists(),
+            "only incoming-* directories go"
         );
         std::fs::remove_dir_all(&d).unwrap();
         assert!(!d.exists());

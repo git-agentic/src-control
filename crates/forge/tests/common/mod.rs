@@ -31,6 +31,13 @@ pub struct Srv {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Optional extras of a test server.
+#[derive(Default)]
+pub struct Extra {
+    pub maint: Option<scl_forge::maintenance::Cfg>,
+    pub git_bin: Option<PathBuf>,
+}
+
 pub struct Resp {
     pub status: u16,
     pub headers: HashMap<String, String>,
@@ -97,16 +104,32 @@ impl Srv {
 
     /// Start with a runner of `slots` concurrent git children and the given admission deadline.
     pub fn start_git(slots: usize, admission: std::time::Duration) -> Srv {
-        Srv::start_full(Limits::default(), None, Some((slots, admission)), None)
+        Srv::start_full(
+            Limits::default(),
+            None,
+            Some((slots, admission)),
+            None,
+            Extra::default(),
+        )
     }
 
     fn start_cfg(limits: Limits, backoff: Option<scl_forge::limits::Backoff>) -> Srv {
-        Srv::start_full(limits, backoff, None, None)
+        Srv::start_full(limits, backoff, None, None, Extra::default())
     }
 
     /// Start with custom git transport limits.
     pub fn start_transport(cfg: scl_forge::cgi::Cfg) -> Srv {
-        Srv::start_full(Limits::default(), None, None, Some(cfg))
+        Srv::start_full(Limits::default(), None, None, Some(cfg), Extra::default())
+    }
+
+    /// Start with the maintenance runner (timer off, passes on request) and, optionally, a
+    /// different git executable (a wrapper that slows chosen subcommands).
+    pub fn start_maint(cfg: scl_forge::maintenance::Cfg, git_bin: Option<PathBuf>) -> Srv {
+        let extra = Extra {
+            maint: Some(cfg),
+            git_bin,
+        };
+        Srv::start_full(Limits::default(), None, None, None, extra)
     }
 
     fn start_full(
@@ -114,6 +137,7 @@ impl Srv {
         backoff: Option<scl_forge::limits::Backoff>,
         git_cfg: Option<(usize, std::time::Duration)>,
         tcfg: Option<scl_forge::cgi::Cfg>,
+        extra: Extra,
     ) -> Srv {
         let dir = std::env::temp_dir().join(format!(
             "scl-forge-e2e-{}-{}",
@@ -141,9 +165,16 @@ impl Srv {
         let data_lock = scl_forge::lifecycle::DirLock::acquire(&dir).unwrap();
         let (slots, admission) = git_cfg.unwrap_or((8, std::time::Duration::from_secs(5)));
         let git = std::sync::Arc::new(
-            scl_forge::gitproc::Git::new(&dir, scl_forge::gitproc::find_git().expect("git"), slots)
-                .unwrap()
-                .with_limits(std::time::Duration::from_secs(30), admission, 16 << 20),
+            scl_forge::gitproc::Git::new(
+                &dir,
+                extra
+                    .git_bin
+                    .clone()
+                    .unwrap_or_else(|| scl_forge::gitproc::find_git().expect("git")),
+                slots,
+            )
+            .unwrap()
+            .with_limits(std::time::Duration::from_secs(30), admission, 16 << 20),
         );
         scl_forge::hook::install(
             git.data_dir(),
@@ -158,8 +189,16 @@ impl Srv {
         if let Some(c) = tcfg {
             app.transports = scl_forge::cgi::Transports::new(c);
         }
+        let with_runner = extra.maint.is_some();
+        if let Some(c) = extra.maint {
+            app.maint = scl_forge::maintenance::Maintenance::new(c);
+        }
         let app = std::sync::Arc::new(app);
         let app_handle = app.clone();
+        if with_runner {
+            // The runner thread lives until the registry stops (server drop).
+            let _ = scl_forge::maintenance::spawn(app.clone());
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()

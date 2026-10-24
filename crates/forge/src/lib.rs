@@ -23,6 +23,7 @@ pub mod hook;
 pub mod http;
 pub mod lifecycle;
 pub mod limits;
+pub mod maintenance;
 pub mod merges;
 pub mod names;
 pub mod orphans;

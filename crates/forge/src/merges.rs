@@ -225,6 +225,14 @@ fn finish(
             i.pull_number
         );
     }
+    // The marker goes below; from here on this ref is what keeps the merge commit alive when the
+    // base is rewritten away from it.
+    if let Err(e) = pulls::retain_at(git, dir, &pulls::merge_ref(i.pull_number), &i.merge_oid) {
+        eprintln!(
+            "sc-forge: could not retain the merge commit of pull request {}: {e}",
+            i.pull_number
+        );
+    }
     let mut last = None;
     for k in 0..3 {
         match finalize_rows(conn, i, recovered) {

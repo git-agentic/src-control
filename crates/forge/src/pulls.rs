@@ -23,6 +23,12 @@ pub fn retention_ref(n: i64) -> String {
     format!("refs/forge/pull/{n}/head")
 }
 
+/// The ref that keeps the merge commit of merged pull request `n` alive after the base moves on
+/// (the landing marker is retired once the merge is final).
+pub fn merge_ref(n: i64) -> String {
+    format!("refs/forge/pull/{n}/merge")
+}
+
 /// A stored pull request.
 #[derive(Clone, Debug)]
 pub struct Pull {
@@ -398,10 +404,14 @@ pub fn refs_under(
 /// Point PR `n`'s retention ref at `oid` (a commit that exists), whatever it holds now. For the
 /// authoritative writers: PR creation, close, and the record of a head that is about to be deleted.
 pub fn retain(git: &Git, dir: &Path, n: i64, oid: &str) -> Result<(), GitError> {
-    let r = retention_ref(n);
+    retain_at(git, dir, &retention_ref(n), oid)
+}
+
+/// Point `r` (one of the `refs/forge/pull/<n>/…` refs) at `oid`, whatever it holds now.
+pub fn retain_at(git: &Git, dir: &Path, r: &str, oid: &str) -> Result<(), GitError> {
     let out = git.run(&Spec {
         repo: Some(dir),
-        args: &["update-ref", &r, oid],
+        args: &["update-ref", r, oid],
         ..Default::default()
     })?;
     if out.ok() {
@@ -573,13 +583,26 @@ pub fn reconcile_repo(
     crate::merges::drop_stale_receipts(conn, git, dir, repo_id)?;
     sync_locked(conn, git, dir, repo_id, now)?;
     let kept = refs_under(git, dir, "refs/forge/pull")?;
-    let mut st =
-        conn.prepare("SELECT number, state, final_head_sha FROM pulls WHERE repo_id = ?1")?;
-    let rows: Vec<(i64, String, Option<String>)> = st
-        .query_map([repo_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let mut st = conn.prepare(
+        "SELECT number, state, final_head_sha, merge_commit_sha FROM pulls WHERE repo_id = ?1",
+    )?;
+    let rows: Vec<(i64, String, Option<String>, Option<String>)> = st
+        .query_map([repo_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
-    let known: HashMap<i64, (String, Option<String>)> =
-        rows.into_iter().map(|(n, s, h)| (n, (s, h))).collect();
+    let known: HashMap<i64, (String, Option<String>)> = rows
+        .iter()
+        .map(|(n, s, h, _)| (*n, (s.clone(), h.clone())))
+        .collect();
+    // A merged pull request's merge commit stays reachable even after the base is rewritten.
+    for (n, state, _, merge) in &rows {
+        if let (true, Some(m)) = (state == "merged", merge) {
+            if kept.get(&merge_ref(*n)) != Some(m) {
+                retain_at(git, dir, &merge_ref(*n), m)?;
+            }
+        }
+    }
     for p in open_pulls(conn, repo_id)? {
         // Reopened without its branch: the stored head is the only anchor left.
         if p.head_gone && kept.get(&retention_ref(p.number)) != Some(&p.head_sha) {
@@ -598,7 +621,7 @@ pub fn reconcile_repo(
     for name in kept.keys() {
         let n = name
             .strip_prefix("refs/forge/pull/")
-            .and_then(|r| r.strip_suffix("/head"))
+            .and_then(|r| r.strip_suffix("/head").or_else(|| r.strip_suffix("/merge")))
             .and_then(|n| n.parse::<i64>().ok());
         if n.is_some_and(|n| !known.contains_key(&n)) {
             let _ = git.run(&Spec {

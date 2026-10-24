@@ -189,6 +189,21 @@ impl Lifecycle {
         })
     }
 
+    /// Run `f` as the only server-side writer of repository `id`: the write gate only, not the
+    /// lifecycle lock, so a `delete` is never held up behind it (maintenance cancels itself through
+    /// the registry instead). `None`: the gate stayed taken for `wait`.
+    pub fn with_gate<T>(&self, id: i64, wait: Duration, f: impl FnOnce() -> T) -> Option<T> {
+        let gate = self
+            .gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id)
+            .or_insert_with(|| Arc::new(crate::limits::Gate::new(1)))
+            .clone();
+        let _writer = gate.acquire_timeout(wait)?;
+        Some(f())
+    }
+
     /// `repos/<id>.git`: always built from the integer id.
     pub fn repo_dir(&self, id: i64) -> PathBuf {
         self.data_dir.join("repos").join(format!("{id}.git"))

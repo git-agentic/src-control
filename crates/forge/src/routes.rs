@@ -28,6 +28,8 @@ pub struct App {
     pub life: Lifecycle,
     /// Admission and limits of the git transport.
     pub transports: crate::cgi::Transports,
+    /// Garbage collection and cleanup; the runner thread is started by `serve`.
+    pub maint: crate::maintenance::Maintenance,
 }
 
 impl App {
@@ -48,6 +50,7 @@ impl App {
             proxies,
             life,
             transports: crate::cgi::Transports::new(crate::cgi::Cfg::default()),
+            maint: crate::maintenance::Maintenance::new(crate::maintenance::Cfg::default()),
         }
     }
 
@@ -221,6 +224,14 @@ pub static ROUTES: &[Route] = &[
         n(Cat::Admin, Level::Write),
         SiteAdmin,
         api::admin_patch_user,
+    ),
+    r(
+        "POST",
+        "/admin/cron/{task}",
+        Token,
+        n(Cat::Admin, Level::Write),
+        SiteAdmin,
+        api::admin_cron,
     ),
     r(
         "POST",

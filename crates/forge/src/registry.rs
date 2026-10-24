@@ -154,6 +154,19 @@ impl Registry {
         true
     }
 
+    /// Run `f` only if `mine` is the only registration on its repository and the slot is open,
+    /// holding the registry lock for the duration, so no transport can register meanwhile. `f`
+    /// must be short (file system calls only) and must not call back into the registry.
+    pub fn with_only<T>(&self, mine: &Registration, f: impl FnOnce() -> T) -> Option<T> {
+        let slots = self.lock();
+        match slots.get(&mine.repo) {
+            Some(s) if !s.closed && s.live.len() == 1 && s.live.contains_key(&mine.key) => {
+                Some(f())
+            }
+            _ => None,
+        }
+    }
+
     /// Drop the (closed) slot of a repository that no longer exists.
     pub fn forget(&self, repo: i64) {
         self.lock().remove(&repo);

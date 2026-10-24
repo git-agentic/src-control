@@ -8,6 +8,7 @@
 //! through [`Identity::new`]); this module never builds a revision from client text.
 
 use crate::limits::Gate;
+use crate::registry::Cancel;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
@@ -32,6 +33,9 @@ pub enum GitError {
     /// More output than the cap; the process group was killed.
     #[error("git produced too much output")]
     OutputTooLarge,
+    /// The caller's [`Cancel`] was set; the process group was killed.
+    #[error("git was cancelled")]
+    Cancelled,
     #[error("could not run git: {0}")]
     Spawn(#[from] std::io::Error),
     /// git ran and failed in a way that means "something is wrong", not "not found".
@@ -105,6 +109,9 @@ pub struct Spec<'a> {
     /// Extra environment for this spawn, added after the pinned one (the `pre-receive` hook passes
     /// the object directories of git's quarantine this way).
     pub extra_env: &'a [(&'a str, &'a str)],
+    /// Ends the spawn (group killed, [`GitError::Cancelled`]) once set; checked before the spawn
+    /// and on every poll.
+    pub cancel: Option<&'a Cancel>,
 }
 
 /// The runner.
@@ -219,6 +226,9 @@ impl Git {
             .gate
             .acquire_timeout(self.admission)
             .ok_or(GitError::Busy)?;
+        if spec.cancel.is_some_and(Cancel::is_set) {
+            return Err(GitError::Cancelled);
+        }
         let mut cmd = Command::new(program);
         cmd.env_clear()
             .envs(self.env(spec.identity))
@@ -297,6 +307,9 @@ impl Git {
             }
             if over.load(Ordering::SeqCst) {
                 break Some(GitError::OutputTooLarge);
+            }
+            if spec.cancel.is_some_and(Cancel::is_set) {
+                break Some(GitError::Cancelled);
             }
             if Instant::now() >= deadline {
                 break Some(GitError::Timeout { stdout: Vec::new() });
@@ -676,6 +689,44 @@ mod tests {
         // SAFETY: signal 0 only probes for existence.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "the grandchild {pid} must be killed with its group");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_cancel_kills_the_group_and_a_set_one_prevents_the_spawn() {
+        let (g, d) = git("cancel");
+        let cancel = Cancel::default();
+        let setter = cancel.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            setter.cancel();
+        });
+        let started = Instant::now();
+        let err = g
+            .run_program(
+                OsStr::new("/bin/sh"),
+                &Spec {
+                    args: &["-c", "sleep 60 & echo $!; wait"],
+                    cancel: Some(&cancel),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        t.join().unwrap();
+        assert!(matches!(err, GitError::Cancelled), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // Already set: nothing starts (the marker file would exist if it had).
+        let marker = d.join("started");
+        let again = g.run_program(
+            OsStr::new("/bin/sh"),
+            &Spec {
+                args: &["-c", &format!("touch {}", marker.display())],
+                cancel: Some(&cancel),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(again, Err(GitError::Cancelled)));
+        assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(d);
     }
 
