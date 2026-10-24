@@ -138,6 +138,15 @@ fn b64(s: &str) -> String {
     out
 }
 
+/// Kills a process on every exit of a test (panic included), so an orphan stand-in never outlives it.
+struct KillOnDrop(i32);
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: SIGKILL to a child this test spawned.
+        unsafe { libc::kill(self.0, libc::SIGKILL) };
+    }
+}
+
 struct Tmp(PathBuf);
 impl Drop for Tmp {
     fn drop(&mut self) {
@@ -458,6 +467,7 @@ fn a_restart_kills_an_orphaned_git_writer_and_clears_its_lock() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    let _orphan_guard = KillOnDrop(orphan.id() as i32);
     let mut pipe = orphan.stdin.take().unwrap();
     let zero = "0".repeat(main.len());
     pipe.write_all(format!("start\nupdate refs/heads/zz {main} {zero}\nprepare\n").as_bytes())
@@ -478,6 +488,7 @@ fn a_restart_kills_an_orphaned_git_writer_and_clears_its_lock() {
         .spawn()
         .unwrap();
     let _http_pipe = http_orphan.stdin.take().unwrap();
+    let _http_guard = KillOnDrop(http_orphan.id() as i32);
     let lock = repo_dir.join("refs/heads/zz.lock");
     let t0 = Instant::now();
     while !lock.exists() && t0.elapsed() < Duration::from_secs(10) {
@@ -520,4 +531,6 @@ fn a_restart_kills_an_orphaned_git_writer_and_clears_its_lock() {
     );
     drop(pipe);
     drop(srv);
+    std::fs::remove_dir_all(&data).unwrap();
+    assert!(!data.exists());
 }
