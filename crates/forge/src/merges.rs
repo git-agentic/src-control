@@ -320,7 +320,15 @@ pub fn recover_locked(
             finish(conn, git, dir, &i, true)?;
             done += 1;
         } else if !base_is_locked(dir, &i.base_ref) {
-            abort(conn, i.id)?;
+            // A writer that committed between the first look and the lock check has also dropped its
+            // lock: look once more before an abort is final.
+            if is_landed(git, dir, &i)? {
+                mark_landed(git, dir, &i);
+                finish(conn, git, dir, &i, true)?;
+                done += 1;
+            } else {
+                abort(conn, i.id)?;
+            }
         }
     }
     Ok(done)

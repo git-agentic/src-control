@@ -86,6 +86,25 @@ fn is_git(cmd: &str, configured: Option<&Path>) -> bool {
         .is_some_and(|n| n == "git" || n.starts_with("git-"))
 }
 
+/// Does `cmd` (arguments and environment entries joined by spaces) contain `needle` as a whole token
+/// start: preceded by a space, `=` or the start, and, for an environment value (`exact_end`), followed
+/// by a space or the end? Another instance's `/srv/forge-secondary` must not match `/srv/forge`, nor
+/// `/mnt/srv/forge/repos/` match `/srv/forge/repos/`.
+fn mentions(cmd: &str, needle: &str, exact_end: bool) -> bool {
+    let mut from = 0;
+    while let Some(i) = cmd[from..].find(needle) {
+        let at = from + i;
+        let end = at + needle.len();
+        let before_ok = at == 0 || matches!(cmd.as_bytes()[at - 1], b' ' | b'=');
+        let after_ok = !exact_end || end == cmd.len() || cmd.as_bytes()[end] == b' ';
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + cmd[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
 /// Dead but not yet reaped by its parent (a zombie holds nothing, least of all a lock).
 fn is_zombie(pid: i32) -> bool {
     if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -130,7 +149,7 @@ pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> (usi
         .into_iter()
         .filter(|(pid, cmd)| {
             *pid != me
-                && (cmd.contains(&needle) || cmd.contains(&env_needle))
+                && (mentions(cmd, &needle, false) || mentions(cmd, &env_needle, true))
                 && is_git(cmd, git_bin)
         })
         .map(|(pid, _)| pid)
@@ -259,5 +278,38 @@ mod tests {
         );
         std::fs::remove_dir_all(&d).unwrap();
         assert!(!d.exists());
+    }
+
+    #[test]
+    fn a_data_directory_matches_only_as_a_whole_token() {
+        let env = "FORGE_DATA_DIR=/srv/forge";
+        assert!(mentions(
+            "git receive-pack . HOME=/h FORGE_DATA_DIR=/srv/forge PATH=/bin",
+            env,
+            true
+        ));
+        assert!(mentions("FORGE_DATA_DIR=/srv/forge", env, true));
+        assert!(!mentions(
+            "git x FORGE_DATA_DIR=/srv/forge-secondary PATH=/bin",
+            env,
+            true
+        ));
+        assert!(!mentions("git x XFORGE_DATA_DIR=/srv/forge", env, true));
+        let repos = "/srv/forge/repos/";
+        assert!(mentions(
+            "git --git-dir=/srv/forge/repos/7.git update-ref",
+            repos,
+            false
+        ));
+        assert!(!mentions(
+            "git --git-dir=/mnt/srv/forge/repos/7.git update-ref",
+            repos,
+            false
+        ));
+        assert!(!mentions(
+            "git --git-dir=/srv/forge-secondary/repos/7.git x",
+            repos,
+            false
+        ));
     }
 }

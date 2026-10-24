@@ -634,3 +634,13 @@ fn a_hostile_title_cannot_add_lines_to_the_merge_commit() {
     assert_eq!(body.lines().count(), 1, "{body:?}");
     assert!(!body.contains("\n"), "{body:?}");
 }
+
+#[test]
+fn the_merge_status_probe_settles_an_unfinished_merge() {
+    let w = world();
+    let head = w.commit("f", "f.txt", "f\n", Some("main"));
+    let n = w.open("f", "main");
+    crashed_merge(&w, n, &head, Crash::PublishedMarked);
+    assert_eq!(w.api("GET", &format!("/pulls/{n}/merge"), None).status, 204);
+    w.no_leftovers();
+}

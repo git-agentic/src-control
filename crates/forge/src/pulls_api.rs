@@ -681,6 +681,8 @@ pub fn is_merged(ctx: &mut Ctx) -> Resp {
         Ok(a) => a.clone(),
         Err(r) => return r,
     };
+    // An unfinished merge is settled before the answer, so a poller sees it.
+    converge(ctx, &a);
     let Some(n) = number(ctx.param("n")) else {
         return missing(ctx);
     };
