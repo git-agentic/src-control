@@ -309,4 +309,49 @@ mod tests {
         );
         assert!(person("garbage").is_none());
     }
+
+    #[test]
+    fn branches_list_newest_commit_first_with_ties_by_name() {
+        let (g, d, dir) = repo("order");
+        let id_at = |t: i64| Identity::new("T", "t@example.invalid").unwrap().at(t);
+        let tree = g
+            .run(&Spec {
+                repo: Some(&dir),
+                args: &["mktree"],
+                stdin: Some(b""),
+                ..Default::default()
+            })
+            .unwrap()
+            .text();
+        // alphabetical order (aaa, bbb, mmm, zzz) conflicts with the date order below
+        for (branch, when) in [("aaa", 100), ("mmm", 200), ("zzz", 300), ("bbb", 300)] {
+            let id = id_at(when);
+            let oid = g
+                .run(&Spec {
+                    repo: Some(&dir),
+                    args: &["commit-tree", &tree],
+                    stdin: Some(b"m"),
+                    identity: Some(&id),
+                    ..Default::default()
+                })
+                .unwrap()
+                .text();
+            assert!(g
+                .run(&Spec {
+                    repo: Some(&dir),
+                    args: &["update-ref", &refname::branch_ref(branch), &oid],
+                    ..Default::default()
+                })
+                .unwrap()
+                .ok());
+        }
+        let names: Vec<String> = list_branches(&g, &dir)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(names, ["bbb", "zzz", "mmm", "aaa"]);
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(!d.exists());
+    }
 }
