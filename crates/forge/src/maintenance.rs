@@ -162,7 +162,7 @@ pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
                 continue;
             }
             let pass = run_pass(&app);
-            eprintln!("sc-forge: maintenance pass finished: {pass:?} (requested: {requested})");
+            crate::log::info!("maintenance pass finished: {pass:?} (requested: {requested})");
             // Not running again before the count moves, so a request that follows an observed
             // increment is always accepted.
             m.state().running = false;
@@ -178,14 +178,14 @@ pub fn run_pass(app: &App) -> Pass {
     let conn = match db::connect(&app.data_dir) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("sc-forge: maintenance cannot open the database: {e}");
+            crate::log::warning!("maintenance cannot open the database: {e}");
             return pass;
         }
     };
     let ids: Vec<i64> = match repos::list_in_state(&conn, "live") {
         Ok(r) => r.into_iter().map(|r| r.id).collect(),
         Err(e) => {
-            eprintln!("sc-forge: maintenance cannot list the repositories: {e}");
+            crate::log::warning!("maintenance cannot list the repositories: {e}");
             return pass;
         }
     };
@@ -200,18 +200,18 @@ pub fn run_pass(app: &App) -> Pass {
                 after_kib,
             } => {
                 pass.done += 1;
-                eprintln!(
-                    "sc-forge: maintenance of repository {id}: {before_kib} KiB -> {after_kib} KiB"
+                crate::log::info!(
+                    "maintenance of repository {id}: {before_kib} KiB -> {after_kib} KiB"
                 );
             }
             Outcome::Skipped(why) => {
                 pass.skipped += 1;
-                eprintln!("sc-forge: maintenance of repository {id} skipped: {why}");
+                crate::log::warning!("maintenance of repository {id} skipped: {why}");
             }
             Outcome::Gone => {}
             Outcome::Failed(e) => {
                 pass.failed += 1;
-                eprintln!("sc-forge: maintenance of repository {id} failed: {e}");
+                crate::log::warning!("maintenance of repository {id} failed: {e}");
             }
         }
     }
@@ -290,8 +290,8 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
         Ok(Some(Some(_))) => {
             orphans::remove_dead(&dir);
         }
-        Ok(_) => eprintln!(
-            "sc-forge: repository {id}: stale lock cleanup deferred (a writer may be running)"
+        Ok(_) => crate::log::warning!(
+            "repository {id}: stale lock cleanup deferred (a writer may be running)"
         ),
         // Optional work: a busy gate must not cost the repository its gc.
         Err(Outcome::Gone) => return Outcome::Gone,
@@ -329,7 +329,7 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
             return o;
         }
         // Stage 2 does not depend on stage 1: it only removes aged loose objects.
-        eprintln!("sc-forge: gc of repository {id} failed: {o:?}");
+        crate::log::warning!("gc of repository {id} failed: {o:?}");
         note = Some("gc failed");
     }
 
@@ -337,7 +337,7 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
     if let Some(n) = note {
         // Without a completed stage 1 reachable objects may still be loose and old; git's own gc
         // does not prune after a failed repack either.
-        eprintln!("sc-forge: repository {id}: stage 1 did not complete ({n}); nothing pruned");
+        crate::log::warning!("repository {id}: stage 1 did not complete ({n}); nothing pruned");
         return Outcome::Skipped("stage 1 did not complete");
     }
     let stage2 = || -> Outcome {
@@ -358,7 +358,9 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
         };
         if let Err(e) = roots {
             // Without every retention ref confirmed, deleting could destroy the only copy.
-            eprintln!("sc-forge: repository {id}: retention refs could not be reconciled ({e}); nothing pruned");
+            crate::log::warning!(
+                "repository {id}: retention refs could not be reconciled ({e}); nothing pruned"
+            );
             return Outcome::Skipped("retention refs could not be reconciled");
         }
         // A merge intent still pending after the reconcile has a commit only the journal names.

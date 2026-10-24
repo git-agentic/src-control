@@ -60,7 +60,47 @@ pub fn bind_gate(
     ))
 }
 
+/// Answer one request and write its access-log line: method, path without the query (a query may
+/// carry anything), status, time to the response head (a git transfer streams after that), and the
+/// client address. Never a header or a body. Successful health probes are not logged.
 async fn handle(
+    app: Arc<App>,
+    limits: Limits,
+    peer: IpAddr,
+    req: Request<Incoming>,
+) -> Result<Response<RespBody>, std::convert::Infallible> {
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let source = app.proxies.resolve(
+        peer,
+        app.proxies
+            .header
+            .as_deref()
+            .and_then(|h| req.headers().get(h))
+            .and_then(|v| v.to_str().ok()),
+    );
+    let resp = handle_request(app, limits, peer, req).await;
+    if let Ok(r) = &resp {
+        let status = r.status().as_u16();
+        if !(status == 200 && matches!(path.as_str(), "/healthz" | "/api/healthz")) {
+            crate::log::emit(
+                if status >= 500 { "ERROR" } else { "INFO" },
+                "request",
+                Some(serde_json::json!({
+                    "method": method,
+                    "path": path,
+                    "status": status,
+                    "ms": started.elapsed().as_millis() as u64,
+                    "source": source.to_string(),
+                })),
+            );
+        }
+    }
+    resp
+}
+
+async fn handle_request(
     app: Arc<App>,
     limits: Limits,
     peer: IpAddr,
@@ -262,6 +302,7 @@ pub async fn serve(
 ) {
     let slots = Arc::new(Semaphore::new(limits.max_connections));
     let mut conns = JoinSet::new();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -275,16 +316,29 @@ pub async fn serve(
                 let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
                 let (app, limits) = (app.clone(), limits.clone());
                 let header_timeout = limits.header_timeout;
+                let mut stop = stop_rx.clone();
                 conns.spawn(async move {
                     let svc = service_fn(move |req| handle(app.clone(), limits.clone(), peer.ip(), req));
                     let mut http = hyper::server::conn::http1::Builder::new();
                     http.timer(TokioTimer::new()).header_read_timeout(header_timeout);
-                    let _ = http.serve_connection(TokioIo::new(stream), svc).await;
+                    let conn = http.serve_connection(TokioIo::new(stream), svc);
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        _ = conn.as_mut() => {}
+                        _ = stop.changed() => {
+                            // Finish the request in flight, close an idle keep-alive at once.
+                            conn.as_mut().graceful_shutdown();
+                            let _ = conn.await;
+                        }
+                    }
                     drop(permit);
                 });
             }
         }
     }
+    // No new connection from here on: the listening socket closes now, not when the drain ends.
+    drop(listener);
+    let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(drain, async { while conns.join_next().await.is_some() {} }).await;
     // Whatever git is still running at the deadline ends now; wait for the children to be reaped.
     let registry = app.life.registry.clone();

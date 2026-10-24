@@ -271,8 +271,8 @@ fn ensure_dir(data_dir: &Path) -> Result<(), DbError> {
     std::fs::create_dir_all(data_dir)?;
     let mode = std::fs::metadata(data_dir)?.permissions().mode() & 0o777;
     if mode != 0o700 {
-        eprintln!(
-            "sc-forge: tightening {} from {mode:o} to 700: it holds password and token hashes",
+        crate::log::warning!(
+            "tightening {} from {mode:o} to 700: it holds password and token hashes",
             data_dir.display()
         );
         std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;

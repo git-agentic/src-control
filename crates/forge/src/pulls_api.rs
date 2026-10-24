@@ -292,10 +292,7 @@ fn converge(ctx: &Ctx, a: &Access) {
 pub(crate) fn sync_held(ctx: &Ctx, a: &Access) {
     if let Err(e) = pulls::sync_locked(ctx.conn, &ctx.app.life.git, &dir(ctx, a), a.repo.id, now())
     {
-        eprintln!(
-            "sc-forge: pull request sync of repository {} failed: {e}",
-            a.repo.id
-        );
+        crate::log::warning!("pull request sync of repository {} failed: {e}", a.repo.id);
     }
 }
 

@@ -1144,6 +1144,29 @@ why each deletion is safe:
   `--min-free-bytes` plus that size). Writers to a repository wait on the gate (10 s) while stage 2 runs and see 503 if it
   outlasts that; stage 2 is a reachability walk and a scan of loose objects, not a repack.
 
+### Operating surface: logs, shutdown, bind gate, image (F5b)
+
+- **Logs carry no secret by construction.** `log.rs` writes JSON lines; the access log records method, path without query, status,
+  duration and client address, never a header, body or query (a query could carry a token a client wrongly sends). Strings are cut
+  at 512 bytes and JSON-escaped, so a hostile path or branch name cannot forge a line or grow one. A test sends a wrong password, a
+  token in the query and in the clone URL, and asserts none of them appears in the output, that every line parses, and that
+  health probes stay out. Limits: an error text from SQLite or git is logged as it comes (they have not been seen to echo
+  credentials); a repository, branch or user name appears in paths and messages by design.
+- **Shutdown.** SIGTERM closes the listening socket first (a restarting service is refused rather than left hanging in the backlog),
+  closes idle keep-alive connections at once (they used to hold the drain for the whole deadline), lets requests in flight finish up
+  to `--shutdown-timeout`, then cancels the git processes still running. The signal handlers are installed before the "listening"
+  line, so a supervisor that stops the service as soon as it is up still gets the drain. A stalled request does not hold the exit past
+  the deadline plus up to ten seconds for the cancelled git processes to be reaped and the runtime's two-second teardown. Log
+  writes cannot hold it either: they go through a bounded queue and a writer thread, and a stderr nobody reads costs dropped lines,
+  not a frozen server (a test fills a pipe with 6400 requests). Not covered by a test: a git transfer in flight across SIGTERM
+  (the order `drop(listener)`, stop signal, drain, `cancel_all` is source-reviewed).
+- **Bind gate.** Process tests pin it: `0.0.0.0`, `[::]`, a private address and a v4-mapped loopback are refused without
+  `--behind-proxy` or `--allow-plaintext`; loopback needs no flag. Fail-closed on an address it cannot classify.
+- **Image.** Base images pinned by digest; trixie git (2.47) because the server needs 2.40 and bookworm has 2.39; runs as uid 10001; no
+  sshd or shell tooling added. The image build is an advisory CI job with a smoke test, not a required check. Not done: scanning
+  the image for known vulnerabilities, signing it, a read-only root filesystem (the server writes only under `/data` and, through
+  git, `/data/tmp`; untested with a read-only root).
+
 ## Reporting
 
 Security reports go to **toni@git-agentic.com** or GitHub private vulnerability

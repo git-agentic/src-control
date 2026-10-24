@@ -104,6 +104,9 @@ struct ServeArgs {
     /// Wall-clock limit of the garbage collection of one repository, seconds.
     #[arg(long, default_value_t = 3_600)]
     gc_timeout: u64,
+    /// Seconds a SIGTERM waits for requests in flight before it ends the git processes still running.
+    #[arg(long, default_value_t = 30)]
+    shutdown_timeout: u64,
     /// Concurrent password verifications (Argon2 is memory-hard).
     #[arg(long, default_value_t = 4)]
     argon2_concurrency: usize,
@@ -278,6 +281,7 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         ("--max-pack-size", a.max_pack_size),
         ("--max-request-bytes", a.max_request_bytes),
         ("--gc-timeout", a.gc_timeout),
+        ("--shutdown-timeout", a.shutdown_timeout),
     ] {
         if v == 0 {
             bail!("{flag} must be at least 1");
@@ -312,9 +316,9 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         bail!("--trusted-proxy-header and --trusted-proxies must be given together");
     }
     if a.behind_proxy && cidrs.is_empty() {
-        eprintln!(
-            "sc-forge: warning: --behind-proxy without --trusted-proxy-header/--trusted-proxies: every client shares the proxy's address, \
-             so the per-source password-failure budget (30/min) applies to all of them together"
+        scl_forge::log::warning_line(
+            "warning: --behind-proxy without --trusted-proxy-header/--trusted-proxies: every client shares the proxy's address, \
+             so the per-source password-failure budget (30/min) applies to all of them together",
         );
     }
     let proxies = Proxies {
@@ -334,7 +338,7 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         a.git_concurrency,
     )?);
     let git_version = scl_forge::gitproc::check_version(&git).map_err(anyhow::Error::msg)?;
-    eprintln!("sc-forge: {git_version}");
+    scl_forge::log::info_line(&git_version);
     scl_forge::hook::install(
         &std::fs::canonicalize(&a.data_dir)?,
         &std::env::current_exe().context("cannot find the sc-forge binary")?,
@@ -346,7 +350,7 @@ fn run_serve(a: ServeArgs) -> Result<()> {
     // Resolve whatever a crash left, before the listener is bound.
     let report = life.reconcile(&db::connect(&a.data_dir)?, scl_forge::timefmt::now())?;
     if report != scl_forge::lifecycle::Report::default() {
-        eprintln!("sc-forge: reconciled {report:?}");
+        scl_forge::log::info_line(&format!("reconciled {report:?}"));
     }
     // Pull request refs and rows agree again before anything is served.
     scl_forge::pulls::reconcile_all(&life, &db::connect(&a.data_dir)?, scl_forge::timefmt::now());
@@ -389,16 +393,25 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(a.listen)
             .await
             .with_context(|| format!("bind {}", a.listen))?;
-        eprintln!("sc-forge: listening on {}", listener.local_addr()?);
+        // Handlers first, announcement second: a SIGTERM that follows the "listening" line (a
+        // supervisor that stops a service the moment it is up) must drain, not kill the process.
+        use tokio::signal::unix::{signal, SignalKind};
+        let (mut term, mut int) = (
+            signal(SignalKind::terminate()).context("install the SIGTERM handler")?,
+            signal(SignalKind::interrupt()).context("install the SIGINT handler")?,
+        );
+        scl_forge::log::info_line(&format!("listening on {}", listener.local_addr()?));
         let stop = async {
-            use tokio::signal::unix::{signal, SignalKind};
-            let (mut term, mut int) = (
-                signal(SignalKind::terminate()).expect("signal"),
-                signal(SignalKind::interrupt()).expect("signal"),
-            );
             tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
         };
-        serve(listener, app, limits, stop, Duration::from_secs(30)).await;
+        serve(
+            listener,
+            app,
+            limits,
+            stop,
+            Duration::from_secs(a.shutdown_timeout),
+        )
+        .await;
         Ok(())
     });
     // Queued password verifications run on blocking threads that the drain deadline

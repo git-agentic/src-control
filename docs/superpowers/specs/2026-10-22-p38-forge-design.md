@@ -905,6 +905,18 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
   deterministic interfering writer); the F4 `refs/forge/pull/<n>/head` refresh for a contents write to a PR branch;
   portable-name collision rules; a disk reservation sized to the exact rebuilt trees.
 
+### F5b decisions (as built)
+
+The operating half of F5 (guide: `docs/FORGE-OPERATIONS.md`; threat model: "Operating surface").
+
+- **Logs.** JSON lines on stderr with `time`, `severity`, `message` (Cloud Logging keys), an access log line per request and no
+  headers, bodies or query strings. Hook messages for a pushing client and operator CLI output are not logs and stay plain text.
+- **Shutdown.** `--shutdown-timeout` (default 30). The listener closes first, idle keep-alives close at once (hyper graceful
+  shutdown), requests in flight finish, the rest is cancelled; exit 0.
+- **Image.** `crates/forge/Dockerfile` (trixie, digest-pinned bases, uid 10001), `crates/forge/docker/smoke.sh`, advisory CI job.
+- **Not built.** Per-owner quotas and per-user transport limits (#297); a free-space admission test for contents writes and merges
+  (pushes have one, `a_full_disk_reserve_refuses_pushes_with_507_but_not_reads`); image scanning and signing.
+
 ### F5a decisions (as built)
 
 F5a is the maintenance half of F5 (plan: `docs/superpowers/plans/2026-10-24-p38-f5a-maintenance.md`); logs, drain, the bind-gate

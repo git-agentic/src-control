@@ -203,9 +203,11 @@ fn listed(ctx: &Ctx, rows: &[Repo]) -> Result<Vec<Value>, Resp> {
                 ))
             }
             Ok(Some(Err(e))) => {
-                eprintln!(
-                    "sc-forge: cannot read {}/{} (id {}): {e}; listed as empty",
-                    r.owner, r.name, r.id
+                crate::log::warning!(
+                    "cannot read {}/{} (id {}): {e}; listed as empty",
+                    r.owner,
+                    r.name,
+                    r.id
                 );
                 true
             }
