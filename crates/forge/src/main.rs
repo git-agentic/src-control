@@ -12,8 +12,13 @@ mod cli;
 #[cfg(unix)]
 fn main() {
     if let Err(e) = cli::run() {
-        // A command-line failure is for the operator at a terminal, not a server log line.
-        eprintln!("sc-forge: {e:#}");
+        // `serve` failing (a bind error, a second server, a migration) is a service event: log it
+        // as one so an alert on severity sees a crash loop. Other commands answer a terminal.
+        if std::env::args().nth(1).as_deref() == Some("serve") {
+            scl_forge::log::emit("ERROR", &format!("{e:#}"), None);
+        } else {
+            eprintln!("sc-forge: {e:#}");
+        }
         std::process::exit(1);
     }
 }

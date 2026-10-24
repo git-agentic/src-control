@@ -12,8 +12,8 @@ bash crates/forge/docker/smoke.sh sc-forge                   # boot, healthz, cr
 ```
 
 Debian trixie with git 2.47 or newer (the server needs 2.40: `merge-tree --write-tree`, and it refuses to start on older git), no
-sshd, runs as uid 10001 with `/data` as the only writable volume. Base images are pinned by digest in the Dockerfile. There is no
-default command: pass `serve ...` (below). A Debian security update of git reaches you by rebuilding the image.
+sshd, `tini` as PID 1 (without an init process, git children that outlive a killed transport stay zombies and use up `pids.max`; outside this image use `docker run --init` or your orchestrator's equivalent), runs as uid 10001 with `/data` as the only writable volume. Base images are pinned by digest in the Dockerfile. The default command only
+prints help: pass `serve ...` (below). A Debian security update of git reaches you by rebuilding the image.
 
 Bootstrap, as Engine does it:
 
@@ -45,16 +45,19 @@ sc-forge serve --data-dir /data --listen 0.0.0.0:3000 --behind-proxy \
 ## Stopping
 
 SIGTERM (or SIGINT) closes the listening socket, closes idle keep-alive connections, lets requests in flight finish for up to
-`--shutdown-timeout` seconds (default 30), then cancels the git processes still running (SIGTERM, then SIGKILL after a second) and
-waits up to 10 s for them to be reaped. Exit code 0. Set the orchestrator's grace period to `--shutdown-timeout` plus about 15 s
-(Kubernetes `terminationGracePeriodSeconds`, `docker stop -t`). A SIGKILL is also safe: the next start kills orphaned git processes
+`--shutdown-timeout` seconds (default 30), then cancels the git transports and maintenance runs still going (SIGTERM, then SIGKILL after a second) and
+waits up to 10 s for them to be reaped. Exit code 0. A second signal is ignored (only SIGKILL ends the drain early); the longest
+stop is `--shutdown-timeout` + 12 s. API-side git (contents writes, merges) is not cancelled; merges are journalled and settle at the next start. Set the orchestrator's grace period to `--shutdown-timeout` plus about 15 s
+(Kubernetes `terminationGracePeriodSeconds`, `docker stop -t`). The listening socket closes at once, while a load balancer
+or Service takes a few seconds to stop sending traffic: add a `preStop` sleep of a few seconds. A SIGKILL is also safe: the next start kills orphaned git processes
 of the data directory, removes their ref locks and quarantine directories, and settles interrupted creates, deletes and merges
 (`docs/THREAT-MODEL.md`, F2a and F4c).
 
 ## Logs
 
 One JSON object per line on stderr, shaped for Cloud Logging: `time` (RFC 3339 UTC), `severity` (`INFO`, `WARNING`, `ERROR`) and
-`message`, plus fields. Every request except a successful health probe logs `message: "request"` with `method`, `path` (no query
+`message`, plus fields. A `serve` that fails to start (bind, second server, migration) logs its error the same way; a Rust panic
+still prints plain text. Every request except a successful health probe logs `message: "request"` with `method`, `path` (no query
 string), `status`, `ms` (to the response head; a git transfer streams after it) and `source` (the client address after the trusted-proxy
 rule). Headers, bodies, credentials and query strings are never logged, and a string longer than 512 bytes is cut. Operator
 commands (`admin ...`) print plain text to stdout and stderr, not log lines.
@@ -81,12 +84,13 @@ Linux only). Those are per-process; the hard bound for the whole service is the 
 
 | Limit | Basis | Starting value |
 |---|---|---|
-| `pids.max` | per transport about 8 processes (http-backend, upload-pack or receive-pack, pack-objects or index-pack, the hook, helpers), `--git-concurrency` x 4 for API-side git, up to `--max-connections` request threads, 64 spare | `8 x max_transports + 4 x git_concurrency + max_connections + 64` = 1120 with the defaults |
+| `pids.max` | per transport about 8 processes (http-backend, upload-pack or receive-pack, pack-objects or index-pack, the hook, helpers) plus up to 4 pack threads each (`pack.threads` is pinned to 4 for transports; maintenance uses 2), `--git-concurrency` x 4 for API-side git, up to `--max-connections` request threads, 64 spare | `12 x max_transports + 4 x git_concurrency + max_connections + 64` = 1376 with the defaults |
 | `memory.max` | a transport needs a few hundred MiB for a large repository, a maintenance pass about 0.5 GiB more (`pack.windowMemory` 256 MiB x 2 threads), each password check holds the Argon2 memory (about 19 MiB with the crate defaults) x `--argon2-concurrency`, the server itself under 100 MiB | 4 GiB with `--max-transports 16`; scale the transports with the memory, not the other way round |
 | `cpu.max` | git packing is CPU bound; no hard need | 2 to 4 CPUs |
 | disk | repositories grow without a quota (per-owner quotas are not built); `--min-free-bytes` and `--push-reserve` refuse pushes before the disk fills | a volume you can grow; alert at 80% |
 
-Keep `--git-memory-limit` below `memory.max / max_transports` or the cgroup OOM-kills first. A cgroup OOM kill of a git child
+The default `--git-memory-limit` (8 GiB per child) is far above any sensible `memory.max / max_transports`: set it explicitly
+below that quotient or the cgroup OOM-kills first. A cgroup OOM kill of a git child
 behaves like any killed git process (the transfer fails, the next maintenance pass or start cleans up).
 
 ## Backup and restore

@@ -80,7 +80,7 @@ jobs:
         id: changed
         run: |
           base="${{ github.event.pull_request.base.sha || github.event.before }}"
-          if [ -z "$base" ] || ! git diff --quiet "$base" HEAD -- crates/forge Cargo.lock .dockerignore rust-toolchain.toml 2>/dev/null; then
+          if [ -z "$base" ] || ! git diff --quiet "$base" HEAD -- crates/forge crates/core crates/crypto Cargo.toml Cargo.lock .dockerignore rust-toolchain.toml 2>/dev/null; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"

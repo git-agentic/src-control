@@ -11,7 +11,7 @@ RUN cargo build --release --locked -p scl-forge --bin sc-forge
 # naming) and bookworm ships 2.39. No sshd, no shell tooling beyond the base.
 FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates tini \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin forge \
  && mkdir /data && chown forge:forge /data
@@ -21,5 +21,7 @@ VOLUME /data
 EXPOSE 3000
 # SIGTERM drains (see docs/FORGE-OPERATIONS.md); give the orchestrator longer than --shutdown-timeout.
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/usr/local/bin/sc-forge"]
+# tini is PID 1: it reaps the git processes that outlive a killed transport (orphans are re-parented
+# to PID 1 and would otherwise stay zombies until pids.max runs out) and forwards SIGTERM.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sc-forge"]
 CMD ["--help"]

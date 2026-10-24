@@ -453,6 +453,9 @@ fn environment(l: &Launch, marker: &std::path::Path) -> Vec<(String, String)> {
         ("uploadpackfilter.allow", "false".into()),
         ("uploadpackfilter.blob:none.allow", "true".into()),
         ("receive.maxInputSize", cfg.max_pack.to_string()),
+        // git sizes its pack threads by the host's CPUs, which a container does not narrow: bound
+        // them, or one transport on a big node starts dozens of threads (see FORGE-OPERATIONS.md).
+        ("pack.threads", "4".into()),
         ("receive.autogc", "false".into()),
         ("receive.advertisePushOptions", "true".into()),
     ];

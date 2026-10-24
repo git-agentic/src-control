@@ -150,7 +150,7 @@ fn bootstrap(root: &Path) -> String {
 #[test]
 fn sigterm_closes_idle_connections_refuses_new_ones_and_exits_zero() {
     let root = tmp("idle");
-    let mut p = Proc::start(&root.0, &[]);
+    let mut p = Proc::start(&root.0, &["--shutdown-timeout", "3"]);
     // A keep-alive client that went idle after its request.
     let mut idle = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
     idle.write_all(b"GET /api/healthz HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -158,8 +158,16 @@ fn sigterm_closes_idle_connections_refuses_new_ones_and_exits_zero() {
     idle.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut buf = [0u8; 1024];
     assert!(idle.read(&mut buf).unwrap() > 0, "the first response");
+    // A stalled request keeps the drain open, so what follows is observed while the server is still up.
+    let mut stalled = TcpStream::connect(("127.0.0.1", p.port)).unwrap();
+    stalled
+        .write_all(
+            b"POST /api/v1/user/repos HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
     p.sigterm();
-    // Closed by the server at once, not after the drain deadline (30 s by default).
+    // Closed by the server at once, not after the drain deadline.
     let t0 = Instant::now();
     let mut rest = Vec::new();
     let _ = idle.read_to_end(&mut rest);
@@ -172,8 +180,13 @@ fn sigterm_closes_idle_connections_refuses_new_ones_and_exits_zero() {
         TcpStream::connect(("127.0.0.1", p.port)).is_err()
     });
     assert!(refused, "the listening socket closes when the drain starts");
-    let st = p.wait(Duration::from_secs(10)).expect("exits");
+    assert!(
+        p.child.try_wait().unwrap().is_none(),
+        "the server is still draining the stalled request"
+    );
+    let st = p.wait(Duration::from_secs(20)).expect("exits");
     assert!(st.success(), "{st:?}");
+    drop(stalled);
 }
 
 #[test]
@@ -277,7 +290,18 @@ fn the_flags_that_allow_a_public_bind_do_start_the_server() {
         assert!(seen.contains("listening on"), "{flags:?}: {seen}");
         // SAFETY: SIGTERM to the child this test spawned.
         unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-        assert!(child.wait().unwrap().success());
+        let t0 = Instant::now();
+        let st = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(20),
+                "no exit after SIGTERM"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(st.success(), "{flags:?}: {st:?}");
         drop(root);
     }
 }
