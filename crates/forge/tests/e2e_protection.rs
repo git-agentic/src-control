@@ -632,3 +632,142 @@ fn combined_status_does_not_deadlock_against_exclusive_repository_operations() {
         );
     });
 }
+
+// ---- the bypass matrix: every write path against every rule setting and role ----
+
+impl W {
+    fn as_(&self, auth: &str, method: &str, path: &str, body: Option<Value>) -> Resp {
+        self.s.send(
+            method,
+            &format!("/api/v1/repos/siteadmin/w{path}"),
+            Some(auth),
+            body.as_ref(),
+        )
+    }
+}
+
+/// One cell group of the matrix: a protected non-default branch `rel` with `enable_push = push`,
+/// and `who` (an administrator or a write collaborator) trying each way to move or remove it.
+fn matrix(push: bool, who: &str) {
+    let w = world();
+    let c = Client::new(&format!("matrix-{push}-{who}"));
+    let auth = if who == "admin" {
+        w.auth.clone()
+    } else {
+        let pw = w.s.mk_user("writer");
+        let t = token(&w.s.mk_token("writer", &pw, "t", &["all"]));
+        let r = w.api(
+            "PUT",
+            "/collaborators/writer",
+            Some(json!({"permission": "write"})),
+        );
+        assert_eq!(r.status, 204);
+        t
+    };
+    let work = c.dir.join("work");
+    c.ok(
+        &c.dir,
+        Some(&w.auth),
+        &["clone", "-q", &w.url(), work.to_str().unwrap()],
+    );
+    c.ok(&work, None, &["checkout", "-q", "-b", "rel"]);
+    c.ok(&work, Some(&w.auth), &["push", "-q", "origin", "rel"]);
+    w.rule("rel", push);
+    let tag = format!("[push={push} who={who}]");
+
+    // a pull request into `rel`, opened before any of the attempts
+    let r = w.api(
+        "POST",
+        "/contents/t.txt",
+        Some(
+            json!({"content": b64s("t\n"), "message": "m", "branch": "rel", "new_branch": "topic"}),
+        ),
+    );
+    assert_eq!(r.status, 201, "{tag} {}", r.msg());
+    let pr = w.as_(
+        &auth,
+        "POST",
+        "/pulls",
+        Some(json!({"title": "t", "head": "topic", "base": "rel"})),
+    );
+    assert_eq!(pr.status, 201, "{tag} {}", pr.msg());
+    let n = pr.json()["number"].as_i64().unwrap();
+
+    let write = |path: &str| {
+        w.as_(
+            &auth,
+            "POST",
+            &format!("/contents/{path}"),
+            Some(json!({"content": b64s("x\n"), "message": "m", "branch": "rel"})),
+        )
+        .status
+    };
+    // direct pushes
+    c.commit(&work, "a.txt", "a\n");
+    let (ff_ok, _) = c.git_in(&work, Some(&auth), &["push", "origin", "rel"]);
+    assert_eq!(ff_ok, push, "{tag} fast-forward push");
+    let tip = w.git(&["rev-parse", "refs/heads/rel"]);
+    if push {
+        assert_ne!(tip, w.git(&["rev-parse", "refs/heads/main"]));
+    }
+    c.ok(&work, None, &["reset", "-q", "--hard", "HEAD~1"]);
+    c.commit(&work, "b.txt", "b\n");
+    let (force_ok, _) = c.git_in(&work, Some(&auth), &["push", "-f", "origin", "rel"]);
+    assert!(!force_ok, "{tag} force push");
+    let (del_ok, _) = c.git_in(&work, Some(&auth), &["push", "origin", ":rel"]);
+    assert!(!del_ok, "{tag} push delete");
+    assert_eq!(
+        w.git(&["rev-parse", "refs/heads/rel"]),
+        tip,
+        "{tag} neither refused push moved rel"
+    );
+    // the API
+    assert_eq!(write("c.txt") == 201, push, "{tag} contents write");
+    assert_eq!(
+        w.as_(&auth, "DELETE", "/branches/rel", None).status,
+        403,
+        "{tag} branch delete"
+    );
+    let nb = w.as_(&auth, "POST", "/contents/d.txt", Some(json!({"content": b64s("d\n"), "message": "m", "branch": "rel", "new_branch": "off-rel"})));
+    assert_eq!(
+        nb.status,
+        201,
+        "{tag} a new branch cut from a protected one is allowed: {}",
+        nb.msg()
+    );
+    // a merge is the one way in when pushes are off; it works for both settings
+    let tip = w.git(&["rev-parse", "refs/heads/rel"]);
+    let m = w.as_(
+        &auth,
+        "POST",
+        &format!("/pulls/{n}/merge"),
+        Some(json!({"Do": "merge"})),
+    );
+    assert_eq!(m.status, 200, "{tag} merge: {}", m.msg());
+    assert_ne!(
+        w.git(&["rev-parse", "refs/heads/rel"]),
+        tip,
+        "{tag} the merge moved rel"
+    );
+    assert_eq!(w.git(&["for-each-ref", "refs/forge/merge"]), "", "{tag}");
+}
+
+#[test]
+fn bypass_matrix_pushes_off_administrator() {
+    matrix(false, "admin");
+}
+
+#[test]
+fn bypass_matrix_pushes_off_writer() {
+    matrix(false, "writer");
+}
+
+#[test]
+fn bypass_matrix_pushes_on_administrator() {
+    matrix(true, "admin");
+}
+
+#[test]
+fn bypass_matrix_pushes_on_writer() {
+    matrix(true, "writer");
+}

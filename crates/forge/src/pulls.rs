@@ -324,7 +324,8 @@ pub fn compute(
         return Ok(c);
     }
     let mb = merge_base(git, dir, base, head)?;
-    let (files, stats) = gitobj::changes(git, dir, mb.as_deref(), head)?;
+    // Unrelated histories: the changes are counted against the base tip (recorded T#0).
+    let (files, stats) = gitobj::changes(git, dir, Some(mb.as_deref().unwrap_or(base)), head)?;
     // Unrelated histories cannot merge; `merge-tree` would die on them.
     let mergeable = mb.is_some() && merges_cleanly(git, dir, base, head)?;
     let c = Compute {
@@ -530,6 +531,12 @@ pub fn sync_locked(
     repo_id: i64,
     now: i64,
 ) -> Result<usize, ComputeError> {
+    // A merge that landed is finalized before any pull request is closed or moved on; one that
+    // cannot be settled yet (a git writer still holds its base) blocks the sync.
+    crate::merges::recover_locked(conn, git, dir, repo_id)?;
+    if crate::merges::has_pending(conn, repo_id) {
+        return Ok(0);
+    }
     let open = open_pulls(conn, repo_id)?;
     if open.is_empty() {
         return Ok(0);
@@ -561,6 +568,9 @@ pub fn reconcile_repo(
     repo_id: i64,
     now: i64,
 ) -> Result<(), ComputeError> {
+    // A merge a crash interrupted is settled first: its receipt decides, then stray receipts go.
+    crate::merges::recover_locked(conn, git, dir, repo_id)?;
+    crate::merges::drop_stale_receipts(conn, git, dir, repo_id)?;
     sync_locked(conn, git, dir, repo_id, now)?;
     let kept = refs_under(git, dir, "refs/forge/pull")?;
     let mut st =

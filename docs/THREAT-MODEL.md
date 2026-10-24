@@ -1050,6 +1050,53 @@ and the `pulls` unit tests.
 - **Cost.** Mergeability and diff statistics run `git` per PR on a cache miss; a page lists at most 50 PRs. A repository with
   many open PRs and a huge history makes a list slow, not wrong; the runner's concurrency and timeouts bound it.
 
+### Merge, recovery and the protection matrix (F4c)
+
+Threat-model pass #2, last part. Tests: `crates/forge/tests/e2e_merge.rs`, `e2e_crash.rs` (a real `sc-forge serve` killed with
+SIGKILL during merges, restarted and checked), and the `bypass_matrix_*` tests in `e2e_protection.rs`.
+
+- **The matrix.** Against a protected non-default branch, for `enable_push` off and on and for an administrator and a write
+  collaborator: a fast-forward push and a contents write succeed only with pushes on; a forced push, a push deletion and the
+  API branch delete never do; a new branch cut from the protected one is allowed; a pull request merge into it works under both
+  settings and is the only way in when pushes are off. Receive-pack, the contents API and the branch API go through the
+  same `policy` functions on rules read from SQLite; the merge deliberately does not (it ignores `enable_push`) and reads the same rules
+  only for the required status contexts.
+- **Required checks gate the merge, not a push** (recorded, W#8). They are read for the head commit under the write gate
+  immediately before the intent is written; a status posted by a repository writer for that commit counts (statuses are not
+  attestations). There is no administrator override. A rule that requires checks but lists none refuses every merge.
+- **A merge cannot publish a stale decision.** Rule changes, PR changes and merges serialize on the gate and every merge round
+  re-reads the PR, rules, both tips and the statuses. The head is `verify`d inside the same ref transaction that moves the base,
+  so "the head I checked is the head I merged" is atomic; a head that moved answers 409 and is never substituted.
+- **Crash consistency.** Git and SQLite cannot commit together, and Git's files backend commits several refs one after another, so
+  the protocol uses only single-ref atomic steps and evidence that survives a crash between them: the journal row precedes the
+  base compare-and-swap (one ref, with the head `verify`d in the same transaction), the `landed` marker follows it, and recovery
+  trusts, in order, the marker, the merge commit being in the base's history, and a lock file on the base (a live writer holding it
+  keeps the intent pending; git children that outlived a SIGKILLed server are killed, and their locks removed, by the startup
+  cleanup before any recovery runs, `startup_cleanup`/`a_restart_kills_an_orphaned_git_writer_and_clears_its_lock`); only a definite "no" aborts, and a git error leaves the intent pending. Recovery also
+  runs before any pull-request mutation or sync, so a close cannot overtake a landed merge, and finalization never runs against a
+  pull request that is not open (`a_close_cannot_overtake_a_landed_merge`,
+  `a_git_writer_still_holding_the_base_keeps_the_intent_pending`,
+  `a_crash_between_the_base_moving_and_its_marker_is_recognized_by_the_base_history`,
+  `a_landed_merge_with_its_marker_is_still_merged_after_the_base_was_force_pushed_away`). `kill_nine_during_merges_leaves_a_consistent_forge`
+  SIGKILLs a real server inside the merge windows (a test-only environment knob, `SC_FORGE_MERGE_PAUSE_MS`, stretches the two windows
+  that matter), restarts it, and asserts after every restart: no pending intent, no marker, every pull request merged with a
+  two-parent commit on the base or open with its head not on the base; it keeps going until the database shows an intent aborted
+  by recovery and one finished by recovery.
+- **Operator note.** A merge's `update-ref` killed by the runner's deadline can leave `refs/heads/<base>.lock` and `refs/heads/<head>.lock`
+  (the transaction locks the verified head as well as the base). Nothing removes a lock at run time, because a lock cannot be told from
+  a live push's: the intent stays pending while the base is locked, pushes and merges to those branches wait, and the next restart's
+  startup cleanup removes every `refs/**/*.lock` once no matching git process is left alive (it leaves them, and says so, if one cannot
+  be killed). That cleanup passes over the process table repeatedly until it finds nothing new (an `http-backend` can fork a
+  `receive-pack` while it is being killed), and matches git processes by command line (`--git-dir=<data>/repos/...`) or by the
+  `FORGE_DATA_DIR` the HTTP transport sets, on whole tokens (another instance's `/srv/forge-secondary` is not `/srv/forge`; on Linux a
+  space inside a value is not a boundary). Migration 5 was rewritten while the feature was unreleased (no database at version 5 exists outside
+  CI); a later change to it needs a new migration.
+- **Known windows.** A rule created while a push is between `pre-receive` and its ref update is not stopped (the push does not
+  take the gate). A merge computes its tree before it takes the base lock in git, so a base that moves under it only costs a retry,
+  not a wrong merge (the compare-and-swap refuses). Objects of aborted or lost merges stay unreferenced until F5's gc.
+- **Identity.** The merge commit is authored and committed by the authenticated user (name and stored email, or
+  `<login>@noreply.localhost`), as for contents writes; a client cannot choose it.
+
 ## Reporting
 
 Security reports go to **toni@git-agentic.com** or GitHub private vulnerability

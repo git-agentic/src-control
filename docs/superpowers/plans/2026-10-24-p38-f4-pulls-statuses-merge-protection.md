@@ -317,3 +317,16 @@ and the base`; PR object keys `additions`, `deletions`, `merge_base`, `comments`
 200; other users' PENDING reviews are hidden from lists but counted in `X-Total-Count`; `official` follows the recorded
 transitions (F#28 vs F#33), computed at read time; list `sort=oldest|newest|recentupdate` and `Link` headers (P#0-4,
 P#16-18).
+
+## Amendment after the F4c diff review (Sol and Codex; supersedes R2 where they differ)
+
+R2 put the receipt ref into the same `update-ref --stdin` transaction as the base move. Git's files backend commits the refs of a
+transaction one after another, so a crash or a killed helper between two of them leaves the base moved without its receipt (or the
+reverse): the receipt predicate alone then aborts a landed merge or finalizes one that never landed. The as-built protocol uses only
+atomic single-ref steps: the transaction `verify`s the head and moves the base (one ref), then `refs/forge/merge/<id>/landed` is
+written; recovery trusts the marker, then the merge commit being an ancestor of the base, and keeps an intent pending while a lock
+file shows a git writer holding the base; startup first kills orphaned git children of the data directory and removes their ref locks
+(`orphans.rs`), so nothing can publish after recovery has judged. Also changed: every retry persists all
+recomputed facts (R3 parity), recovery runs before pull-request mutations and syncs and finalization refuses to consume a pending
+intent against a PR that is not open, an unreadable git answer never aborts an intent, and the kill -9 test must witness an aborted
+and a recovered intent.

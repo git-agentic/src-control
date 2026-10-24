@@ -905,6 +905,52 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
   deterministic interfering writer); the F4 `refs/forge/pull/<n>/head` refresh for a contents write to a PR branch;
   portable-name collision rules; a disk reservation sized to the exact rebuilt trees.
 
+### F4c decisions (as built)
+
+F4c adds migration 5 (`merge_intents`) and `POST /pulls/{n}/merge`; the gate now replays G, T, U, O and Q completely (the F4
+slices together leave only K's two deferred org-listing exchanges pending). The merge below replaces the corresponding
+steps of "Merge" and "Crash recovery" above where they differ (plan decisions R1-R5 after the Opus and Sol review).
+
+- **Order, all under the repository's write gate.** Settle any pending intent; re-read the PR (merged: 405 `The PR is
+  already merged`; closed: 404), both branch tips (a missing one: 404), the protection rules and the required statuses; refuse a
+  stale `head_commit_id` (409 `head out of date`), a head already contained in the base (405 `Please try again later`), unmet
+  required contexts (405 `not allowed to merge [reason: Not all required status checks successful]`; a rule that requires
+  checks but names none refuses), unrelated histories (409 `Merge conflict: unrelated histories`) and conflicts (409 `Merge
+  conflict: <paths>`, from `merge-tree --write-tree --name-only -z`). Rule changes, PR changes and merges are all gate-ordered, so
+  the check cannot be overtaken; statuses do not take the gate and count as of the read. Only `Do: merge` is supported (other
+  styles 422 `only Do=merge is supported`, unknown 422 `[Do]: In`, missing `[Do]: Required`). A merge ignores `enable_push`.
+- **The journal.** A `pending` `merge_intents` row (PR, branch names, base/head/merge ids, merge base, the three stats, the merger,
+  the merge time) is written before anything is published, and rewritten in full before each retry. The merge
+  commit is `commit-tree -p base -p head` on the `merge-tree` tree, authored and committed by the merging user at the intent's
+  time, message `Merge pull request '<title>' (#<n>) from <head> into <base>`.
+- **Publication** is one `update-ref --stdin` transaction that `verify`s the head and moves the base compare-and-swap (one ref
+  changes, so it is atomic on Git's files backend; a transaction that also created a marker would not be, since the files backend
+  commits refs one after another), followed by the marker `refs/forge/merge/<id>/landed`. Whether the transaction committed is asked of
+  Git (marker, then ancestry), never read off an exit status. Not published: a moved head answers 409 `head out of date` (never
+  silently substituted), a moved base rebuilds on the new tip (3 rounds, then 405 `Please try again later`); every retry
+  rewrites the whole intent row (merge commit, merge base, stats, time) first.
+- **Recovery** judges a pending intent in this order: marker present = landed (even if the base was force-pushed away
+  afterwards); else the merge commit being an ancestor of the base = landed (the crash fell between the transaction and the
+  marker; at startup nobody can have rewritten the base yet); else, if a lock file shows a git writer holding the base ref, the
+  intent stays pending (at run time that is a live writer); else aborted. Git children run in their own process groups and outlive a
+  SIGKILLed server, so startup, which holds the exclusive data-directory lock, first kills every git process that names a path under
+  this data directory's `repos/` and removes the ref locks they left (`orphans.rs`), before any recovery runs; an orphan therefore
+  cannot publish after recovery has judged. An answer git cannot give never
+  aborts. Landed means finalized from the row (the PR merged with every field a normal merge writes, the head retained, the marker
+  dropped); finalization refuses to run against a PR that is not open (the evidence is kept pending). Recovery runs before every
+  gated pull-request operation and sync (a close, a retarget or a head-deletion sync cannot overtake a landed merge; if the
+  intent cannot be settled the operation answers 503), at startup before the listener is bound, and inline on a read when the gate
+  is free (never waited for). Stray markers are removed at startup. The only unresolvable case is a crash between the transaction
+  and the marker combined with a rewrite of the base before recovery, which would read as "not landed" (the PR stays open, the base
+  does not contain the merge: consistent, if surprising). (The F0 text recovered by ancestry alone; an earlier draft of this section
+  put a receipt into the transaction, which the files backend cannot make atomic.)
+- **Merged pulls** read `state: closed, merged: true`, `merge_commit_sha`, `merged_by` (nested account form), `head.sha` and the
+  stats frozen at merge, `base.sha` the merge commit, `mergeable: false`. `GET /pulls/{n}/merge` is 204. `delete_branch_after_merge`
+  is ignored.
+- **Not built.** Squash, rebase and fast-forward merges; merge messages and `force_merge` options; merging a PR whose base branch is
+  gone (404). Review state does not gate a merge (only required status contexts do). Under a base that moves faster than a merge
+  round (about a second with durable fsync settings) a merge can starve and answer 405; the client retries.
+
 ### F4b decisions (as built)
 
 F4b adds migration 4 (`pulls`, `mergeability_cache`, `reviews`, `issue_comments`) and gates F, O (the merge-dependent exchanges

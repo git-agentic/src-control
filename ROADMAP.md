@@ -707,7 +707,7 @@ and reconciler, collaborators, branches) and F2b (smart-HTTP git transport via `
 `pre-receive` ref policy, admission control, threat-model pass #1) and F3a (content reads: refs, tags, commits,
 trees, contents, archives) and F3b (contents writes: create, update, delete as server-made commits) and F4a (branch protection
 enforced on push, contents API and branch delete; commit statuses) and F4b (pull requests, reviews, comments, retention
-refs) are built. Hosted repos are
+refs) and F4c (merge with a crash-safe journal, required-check gating, kill -9 and protection-matrix tests) are built. Hosted repos are
 bare Git and get none of the `.sc/` features.
 
 Other follow-up work is tracked as GitHub issues and listed under Deferred

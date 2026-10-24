@@ -1004,10 +1004,12 @@
   "match": "GET /api/v1/repos/acme/life/pulls/<id:path:pulls#3>",
   "expect": {
    "ignore_fields": [
-    "head.sha"
+    "head.sha",
+    "additions",
+    "changed_files"
    ]
   },
-  "reason": "head.sha is the frozen merge-time sha in sc-forge; the notes below pin that"
+  "reason": "head.sha is the frozen merge-time sha in sc-forge; the notes below pin that; additions and changed_files are those frozen at merge (Gitea follows the recreated branch)"
  },
  {
   "scenario": "O",
@@ -1517,6 +1519,48 @@
   "exchange": 10,
   "kind": "git",
   "match": "delete-protected-by-push",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "default branch",
+    "pre-receive hook declined"
+   ]
+  },
+  "reason": "sc-forge's hook words the refusal 'refusing to delete the default branch'; Gitea says 'gitea: branch main is the default branch and cannot be deleted'. Both end in 'pre-receive hook declined'"
+ },
+ {
+  "scenario": "Q",
+  "exchange": 11,
+  "kind": "git",
+  "match": "force-protected-push-enabled",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "force-push",
+    "pre-receive hook declined"
+   ]
+  },
+  "reason": "sc-forge's hook words the refusal 'refusing to force-push protected branch <b>'; Gitea says 'gitea: branch main is protected from force push'. Both end in 'pre-receive hook declined'"
+ },
+ {
+  "scenario": "Q",
+  "exchange": 12,
+  "kind": "git",
+  "match": "delete-protected-push-enabled",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "default branch",
+    "pre-receive hook declined"
+   ]
+  },
+  "reason": "sc-forge's hook words the refusal 'refusing to delete the default branch'; Gitea says 'gitea: branch main is the default branch and cannot be deleted'. Both end in 'pre-receive hook declined'"
+ },
+ {
+  "scenario": "Q",
+  "exchange": 14,
+  "kind": "git",
+  "match": "delete-protected-push-disabled",
   "expect": {
    "ok": false,
    "message_contains": [
