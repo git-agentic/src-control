@@ -1156,7 +1156,10 @@ why each deletion is safe:
   closes idle keep-alive connections at once (they used to hold the drain for the whole deadline), lets requests in flight finish up
   to `--shutdown-timeout`, then cancels the git processes still running. The signal handlers are installed before the "listening"
   line, so a supervisor that stops the service as soon as it is up still gets the drain. A stalled request does not hold the exit past
-  the deadline plus the runtime's two-second teardown.
+  the deadline plus up to ten seconds for the cancelled git processes to be reaped and the runtime's two-second teardown. Log
+  writes cannot hold it either: they go through a bounded queue and a writer thread, and a stderr nobody reads costs dropped lines,
+  not a frozen server (a test fills a pipe with 6400 requests). Not covered by a test: a git transfer in flight across SIGTERM
+  (the order `drop(listener)`, stop signal, drain, `cancel_all` is source-reviewed).
 - **Bind gate.** Process tests pin it: `0.0.0.0`, `[::]`, a private address and a v4-mapped loopback are refused without
   `--behind-proxy` or `--allow-plaintext`; loopback needs no flag. Fail-closed on an address it cannot classify.
 - **Image.** Base images pinned by digest; trixie git (2.47) because the server needs 2.40 and bookworm has 2.39; runs as uid 10001; no

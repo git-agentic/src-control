@@ -19,6 +19,8 @@ fn main() {
         } else {
             eprintln!("sc-forge: {e:#}");
         }
+        scl_forge::log::flush();
         std::process::exit(1);
     }
+    scl_forge::log::flush();
 }

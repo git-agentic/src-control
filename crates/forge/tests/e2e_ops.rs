@@ -273,49 +273,149 @@ fn a_public_plaintext_bind_is_refused_unless_the_operator_says_otherwise() {
     }
 }
 
+/// Start `serve` with its stderr in a file; returns once it logs "listening on" (or fails the test).
+fn serve_to_file(tag: &str, listen: &str, extra: &[&str]) -> (Child, PathBuf, Tmp) {
+    let root = tmp(tag);
+    let log = root.0.join("stderr.log");
+    let mut child = Command::new(BIN)
+        .args(["serve", "--data-dir"])
+        .arg(root.0.join("data"))
+        .args([
+            "--listen",
+            listen,
+            "--public-url",
+            "https://git.example.test",
+        ])
+        .args(extra)
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let t0 = Instant::now();
+    loop {
+        if std::fs::read_to_string(&log).is_ok_and(|t| t.contains("listening on")) {
+            return (child, log, root);
+        }
+        if let Some(st) = child.try_wait().unwrap() {
+            panic!(
+                "{listen} {extra:?} exited early ({st:?}): {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "{listen} never listened"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn stop(mut child: Child) -> ExitStatus {
+    // SAFETY: SIGTERM to the child this test spawned.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let t0 = Instant::now();
+    loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            return st;
+        }
+        if t0.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("no exit after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn the_flags_that_allow_a_public_bind_do_start_the_server() {
-    for flags in [&["--behind-proxy"][..], &["--allow-plaintext"][..]] {
-        let (mut child, root) = serve_with("allowed", "0.0.0.0:0", flags);
-        // Up when it logs that it listens; then stop it.
-        let mut err = child.stderr.take().unwrap();
-        let t0 = Instant::now();
-        let mut seen = String::new();
-        let mut buf = [0u8; 4096];
-        while !seen.contains("listening on") && t0.elapsed() < Duration::from_secs(30) {
-            let n = err.read(&mut buf).unwrap();
-            assert!(n > 0, "the server exited early: {seen}");
-            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
-        }
-        assert!(seen.contains("listening on"), "{flags:?}: {seen}");
-        // SAFETY: SIGTERM to the child this test spawned.
-        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-        let t0 = Instant::now();
-        let st = loop {
-            if let Some(st) = child.try_wait().unwrap() {
-                break st;
-            }
-            assert!(
-                t0.elapsed() < Duration::from_secs(20),
-                "no exit after SIGTERM"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        };
+    for (i, flags) in [&["--behind-proxy"][..], &["--allow-plaintext"][..]]
+        .into_iter()
+        .enumerate()
+    {
+        let (child, _log, _root) = serve_to_file(&format!("allowed{i}"), "0.0.0.0:0", flags);
+        let st = stop(child);
         assert!(st.success(), "{flags:?}: {st:?}");
-        drop(root);
     }
 }
 
 #[test]
 fn loopback_binds_need_no_flag() {
-    for listen in ["127.0.0.1:0", "[::1]:0"] {
-        let (mut child, _root) = serve_with("loopback", listen, &[]);
-        std::thread::sleep(Duration::from_millis(1500));
-        let still_running = child.try_wait().unwrap().is_none();
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(still_running, "{listen} was refused");
+    let mut addrs = vec!["127.0.0.1:0"];
+    // A host without IPv6 cannot bind [::1] whatever the gate says.
+    if std::net::TcpListener::bind("[::1]:0").is_ok() {
+        addrs.push("[::1]:0");
     }
+    for (i, listen) in addrs.into_iter().enumerate() {
+        let (child, _log, _root) = serve_to_file(&format!("loop{i}"), listen, &[]);
+        assert!(stop(child).success(), "{listen}");
+    }
+}
+
+#[test]
+fn a_log_consumer_that_stops_reading_does_not_stall_the_server() {
+    let root = tmp("stuck");
+    let data = root.0.join("data");
+    let port = free_port();
+    // stderr is a pipe nobody reads: once it is full, log writes block.
+    let mut child = Command::new(BIN)
+        .args(["serve", "--data-dir"])
+        .arg(&data)
+        .args([
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--public-url",
+            &format!("http://127.0.0.1:{port}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let get = |path: &str| -> Option<u16> {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+        s.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .ok()?;
+        let mut b = String::new();
+        s.read_to_string(&mut b).ok()?;
+        b.split(' ').nth(1)?.parse().ok()
+    };
+    let t0 = Instant::now();
+    while get("/api/healthz") != Some(200) {
+        assert!(t0.elapsed() < Duration::from_secs(30), "no start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Far more request lines than a pipe (64 KiB) plus the log queue (4096 lines) can hold.
+    std::thread::scope(|sc| {
+        for _ in 0..8 {
+            sc.spawn(|| {
+                for _ in 0..800 {
+                    let _ = get("/nope");
+                }
+            });
+        }
+    });
+    assert_eq!(
+        get("/api/healthz"),
+        Some(200),
+        "the server must still answer"
+    );
+    // SAFETY: SIGTERM to the child this test spawned.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let t0 = Instant::now();
+    let st = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if t0.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            panic!("the drain hung behind a blocked log pipe");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(st.success(), "{st:?}");
 }
 
 #[test]

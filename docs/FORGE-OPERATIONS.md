@@ -13,7 +13,7 @@ bash crates/forge/docker/smoke.sh sc-forge                   # boot, healthz, cr
 
 Debian trixie with git 2.47 or newer (the server needs 2.40: `merge-tree --write-tree`, and it refuses to start on older git), no
 sshd, `tini` as PID 1 (without an init process, git children that outlive a killed transport stay zombies and use up `pids.max`; outside this image use `docker run --init` or your orchestrator's equivalent), runs as uid 10001 with `/data` as the only writable volume. Base images are pinned by digest in the Dockerfile. The default command only
-prints help: pass `serve ...` (below). A Debian security update of git reaches you by rebuilding the image.
+prints help: pass `serve ...` (below). A Debian security update of git reaches you by rebuilding without the layer cache: `docker build --pull --no-cache ...`.
 
 Bootstrap, as Engine does it:
 
@@ -59,7 +59,8 @@ One JSON object per line on stderr, shaped for Cloud Logging: `time` (RFC 3339 U
 `message`, plus fields. A `serve` that fails to start (bind, second server, migration) logs its error the same way; a Rust panic
 still prints plain text. Every request except a successful health probe logs `message: "request"` with `method`, `path` (no query
 string), `status`, `ms` (to the response head; a git transfer streams after it) and `source` (the client address after the trusted-proxy
-rule). Headers, bodies, credentials and query strings are never logged, and a string longer than 512 bytes is cut. Operator
+rule). Lines go through a bounded queue to one writer thread: if nothing reads stderr, lines are dropped (and counted in the next
+line that fits) rather than stalling requests. Headers, bodies, credentials and query strings are never logged, and a string longer than 512 bytes is cut. Operator
 commands (`admin ...`) print plain text to stdout and stderr, not log lines.
 
 ## Maintenance (garbage collection)
