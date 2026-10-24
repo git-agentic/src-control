@@ -1,12 +1,4 @@
 {
- "D": {
-  "defer": [
-   [
-    13,
-    "GET /api/v1/repos/acme/blank/pulls?state=all"
-   ]
-  ]
- },
  "K": {
   "defer": [
    [
@@ -21,8 +13,54 @@
  },
  "Q": {
   "stop": [
-   5,
-   "expected [201]"
+   8,
+   "origin/main~1"
+  ],
+  "defer": [
+   [
+    5,
+    "POST /api/v1/repos/acme/bypass/pulls/<id:path:pulls#1>/merge"
+   ]
+  ]
+ },
+ "O": {
+  "defer": [
+   [
+    9,
+    "POST /api/v1/repos/acme/life/pulls/<id:path:pulls#2>/merge"
+   ],
+   [
+    19,
+    "POST /api/v1/repos/acme/life/pulls/<id:path:pulls#3>/merge"
+   ],
+   [
+    20,
+    "GET /api/v1/repos/acme/life/pulls/<id:path:pulls#3>"
+   ],
+   [
+    21,
+    "merged_pr_head_sha_frozen"
+   ],
+   [
+    22,
+    "merged_pr_head_sha_follows_new_branch"
+   ],
+   [
+    23,
+    "PATCH /api/v1/repos/acme/life/pulls/<id:path:pulls#4>"
+   ],
+   [
+    25,
+    "GET /api/v1/repos/acme/life/pulls/<id:path:pulls#4>"
+   ],
+   [
+    26,
+    "PATCH /api/v1/repos/acme/life/pulls/<id:path:pulls#4>"
+   ],
+   [
+    27,
+    "GET /api/v1/repos/acme/life/pulls/<id:path:pulls#4>"
+   ]
   ]
  }
 }

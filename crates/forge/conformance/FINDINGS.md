@@ -99,7 +99,7 @@ every failure is a difference listed in the last table.
   An empty repo whose first push is a branch other than the default still reports `empty:true`.
 
 **O and P (PR lifecycle, pagination)**
-- Force-pushing the head moves `head.sha`. Deleting the head branch leaves the PR open;
+- Force-pushing the head moves `head.sha`. Deleting the head branch **closes the PR** (O#6-O#10: `state:"closed"`, `head.ref:"refs/pull/N/head"`);
   `refs/pull/N/head` stays visible and merge is 404. A merged PR's `head.sha` is **not** frozen: it
   follows a recreated branch. Pushing the head commit straight into base does **not** mark the PR
   merged (still open after 15 s). Default page size is 30, max 50; `limit=0`, `-1` and `abc` fall back

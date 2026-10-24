@@ -9,7 +9,9 @@ use crate::lifecycle::Lifecycle;
 use crate::limits::{Backoff, Gate, Proxies};
 use crate::repos::{self, Access, Perm};
 use crate::scope::{self, Cat, Level, Need};
-use crate::{api, content_api, content_write, db, protection, repo_api, statuses, store};
+use crate::{
+    api, content_api, content_write, db, protection, pulls_api, repo_api, reviews, statuses, store,
+};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -523,6 +525,110 @@ pub static ROUTES: &[Route] = &[
         n(Cat::Repository, Level::Read),
         Repo(Perm::Read),
         statuses::combined_status,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/pulls",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        pulls_api::list_pulls,
+    ),
+    r(
+        "POST",
+        "/repos/{o}/{r}/pulls",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Read),
+        pulls_api::create_pull,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/pulls/{n}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        pulls_api::get_pull,
+    ),
+    r(
+        "PATCH",
+        "/repos/{o}/{r}/pulls/{n}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Read),
+        pulls_api::patch_pull,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/pulls/{n}/merge",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        pulls_api::is_merged,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/pulls/{n}/commits",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        pulls_api::pull_commits,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/pulls/{n}/files",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        pulls_api::pull_files,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/pulls/{n}/reviews",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        reviews::list_reviews,
+    ),
+    r(
+        "POST",
+        "/repos/{o}/{r}/pulls/{n}/reviews",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Read),
+        reviews::create_review,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/pulls/{n}/reviews/{id}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        reviews::get_review,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/pulls/{n}/reviews/{id}/comments",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        reviews::review_comments,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/issues/{n}/comments",
+        Token,
+        n(Cat::Issue, Level::Read),
+        Repo(Perm::Read),
+        reviews::list_comments,
+    ),
+    r(
+        "POST",
+        "/repos/{o}/{r}/issues/{n}/comments",
+        Token,
+        n(Cat::Issue, Level::Write),
+        Repo(Perm::Read),
+        reviews::create_comment,
     ),
 ];
 

@@ -1023,6 +1023,33 @@ Tests: `crates/forge/tests/e2e_protection.rs`, the `policy`, `hook`, `protection
 - **Branch delete.** The API refuses a protected branch and deletes with compare-and-swap on the observed tip, so a concurrent
   push is not erased by a stale delete.
 
+### Pull requests, reviews and retention refs (F4b)
+
+Threat-model pass #2, third part; merge races and the protection bypass matrix come with F4c. Tests: `crates/forge/tests/e2e_pulls.rs`
+and the `pulls` unit tests.
+
+- **Who can do what.** Opening a PR needs write access (Gitea allows readers); changing one needs write access or being its
+  creator; reviews and comments need read access, and a reviewer without write access cannot make a review `official`. Reviews
+  and comments are bounded (64 KiB each; 1000 reviews and 5000 comments per PR). Inline review comments are refused rather than
+  dropped.
+- **Retention refs.** `refs/forge/pull/<n>/head` is server-only: pushes to the namespace are refused (F2b), reads hide it. Every
+  write to it happens under the repository's write gate, except the `pre-receive` hook's record of a deleted head's tip, which
+  runs without git's quarantine variables, validates the object id as hex, and refuses the push if it fails. The ref is written
+  before the PR row, so a crash leaves an orphan ref (removed at startup), never a PR whose head can be pruned. Deleting a PR head
+  branch (API or push) closes the PR and keeps the commit reachable (`deleting_the_head_branch_closes_the_pull_and_keeps_its_head`,
+  `a_push_that_deletes_or_rewrites_the_head_keeps_it_reachable`); the startup reconcile repairs any disagreement
+  (`startup_reconcile_restores_retention_refs_and_closes_vanished_heads`). Unreferenced objects are not collected until F5's gc.
+- **Fetch by id.** `uploadpack.allowAnySHA1InWant` stays on, so a commit kept only by a hidden PR ref is fetchable by anyone who
+  can read the repository and knows its id (as for any object over protocol v2); a PR head is no more secret than a branch.
+- **Locks.** PR reads take the shared lifecycle lock once and never call `repo_json` (which takes it again); a read that finds a
+  vanished head runs the sync before taking the lock (`reads_do_not_deadlock_against_exclusive_repository_operations`).
+- **Account objects.** A PR's `user` and `merged_by` carry the full account object (stored email, admin flag), as recorded
+  from Gitea and as `GET /users/{u}` already shows to any signed-in caller; only the objects Gitea itself nests in statuses,
+  comments are masked (login-derived email, no admin flag), and a review list shows the stored email, as recorded (F#33). Anyone with read access to a repository can
+  therefore see the stored email of its PR authors. Accounts that must not be identifiable should use a placeholder email.
+- **Cost.** Mergeability and diff statistics run `git` per PR on a cache miss; a page lists at most 50 PRs. A repository with
+  many open PRs and a huge history makes a list slow, not wrong; the runner's concurrency and timeouts bound it.
+
 ## Reporting
 
 Security reports go to **toni@git-agentic.com** or GitHub private vulnerability

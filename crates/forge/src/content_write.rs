@@ -486,6 +486,8 @@ fn published(ctx: &Ctx, a: &Access, resp: Resp) -> Resp {
             a.repo.id
         );
     }
+    // The branch moved: PRs on it follow (the write gate is held).
+    crate::pulls_api::sync_held(ctx, a);
     resp
 }
 

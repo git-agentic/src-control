@@ -158,6 +158,45 @@ pub fn install(data_dir: &Path, exe: &Path) -> std::io::Result<()> {
     std::fs::rename(&tmp, hooks.join("pre-receive"))
 }
 
+/// Before a push deletes the head branch of an open pull request, record the branch's tip in the
+/// PR's retention ref (`old` is the tip the push deletes). The spawn has no quarantine variables,
+/// so git accepts the ref update; `old` already exists in the repository. A failure refuses the
+/// push: deleting the branch would otherwise lose the only reference to that commit.
+fn retain_deleted_heads(
+    data_dir: &Path,
+    repo_id: i64,
+    git_bin: Option<&Path>,
+    lines: &[String],
+) -> Result<(), String> {
+    let deletes: Vec<(&str, &str)> = lines
+        .iter()
+        .filter_map(|l| {
+            let mut it = l.splitn(3, ' ');
+            let (old, new, name) = (it.next()?, it.next()?, it.next()?);
+            (policy::is_delete(new) && !policy::is_delete(old))
+                .then(|| name.strip_prefix("refs/heads/").map(|b| (old, b)))
+                .flatten()
+        })
+        .collect();
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    let git_bin = git_bin.ok_or("FORGE_GIT_BIN is not set")?;
+    let conn = db::open_readonly(data_dir).map_err(|e| e.to_string())?;
+    let open = crate::pulls::open_pulls(&conn, repo_id).map_err(|e| e.to_string())?;
+    let git = Git::new(data_dir, git_bin.to_path_buf(), 1).map_err(|e| e.to_string())?;
+    let repo = git.data_dir().join("repos").join(format!("{repo_id}.git"));
+    for (old, branch) in deletes {
+        for p in open.iter().filter(|p| p.head_ref == branch) {
+            if !full_id(old) {
+                return Err("malformed object id".into());
+            }
+            crate::pulls::retain(&git, &repo, p.number, old).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// Entry point: returns the process exit code.
 pub fn run() -> i32 {
     let (Some(data), Some(id)) = (
@@ -191,6 +230,16 @@ pub fn run() -> i32 {
         None => Err("FORGE_GIT_BIN is not set".into()),
     };
     let refusals = decide(&lines, &info.default_branch, info.live, &info.rules, &is_ff);
+    let refusals = if refusals.is_empty() {
+        match retain_deleted_heads(Path::new(&data), id, git_bin.as_deref(), &lines) {
+            Ok(()) => refusals,
+            Err(e) => vec![format!(
+                "refusing the push: cannot keep the head of a pull request ({e})"
+            )],
+        }
+    } else {
+        refusals
+    };
     for r in &refusals {
         eprintln!("{r}");
     }

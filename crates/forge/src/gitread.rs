@@ -33,13 +33,15 @@ pub struct CommitInfo {
     pub committer: Person,
 }
 
-/// All branches, sorted by name.
+/// All branches, newest commit first, ties by name (recorded P#19-22: Gitea lists the branch that was
+/// committed to last first).
 pub fn list_branches(git: &Git, dir: &Path) -> Result<Vec<Branch>, GitError> {
     let out = git.run(&Spec {
         repo: Some(dir),
         args: &[
             "for-each-ref",
             "--sort=refname",
+            "--sort=-committerdate",
             "--format=%(refname)%00%(objectname)",
             "refs/heads",
         ],
@@ -306,5 +308,55 @@ mod tests {
             }
         );
         assert!(person("garbage").is_none());
+    }
+
+    #[test]
+    fn branches_list_newest_commit_first_with_ties_by_name() {
+        let (g, d, dir) = repo("order");
+        let id_at = |t: i64| Identity::new("T", "t@example.invalid").unwrap().at(t);
+        let tree = g
+            .run(&Spec {
+                repo: Some(&dir),
+                args: &["mktree"],
+                stdin: Some(b""),
+                ..Default::default()
+            })
+            .unwrap()
+            .text();
+        // alphabetical order (aaa, bbb, mmm, zzz) conflicts with the date order below
+        for (branch, when) in [
+            ("aaa", 1_700_000_100),
+            ("mmm", 1_700_000_200),
+            ("zzz", 1_700_000_300),
+            ("bbb", 1_700_000_300),
+        ] {
+            let id = id_at(when);
+            let oid = g
+                .run(&Spec {
+                    repo: Some(&dir),
+                    args: &["commit-tree", &tree],
+                    stdin: Some(b"m"),
+                    identity: Some(&id),
+                    ..Default::default()
+                })
+                .unwrap()
+                .text();
+            assert!(g
+                .run(&Spec {
+                    repo: Some(&dir),
+                    args: &["update-ref", &refname::branch_ref(branch), &oid],
+                    ..Default::default()
+                })
+                .unwrap()
+                .ok());
+        }
+        let names: Vec<String> = list_branches(&g, &dir)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(names, ["bbb", "zzz", "mmm", "aaa"]);
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(!d.exists());
     }
 }
