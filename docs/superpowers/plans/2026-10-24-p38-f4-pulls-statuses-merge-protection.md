@@ -235,3 +235,85 @@ status checks). Plan-level decisions beyond the spec:
 3. Is bounding status history per context (100) acceptable, or does some client need the whole history?
 4. Retention-ref writing in `pre-receive` for pushed deletes: acceptable, or should deletions of an open PR's head be refused/handled elsewhere?
 5. Slicing: is moving the status gate into F4c (needs F4a statuses + F4b PRs) the right order?
+
+## Decisions after independent review (Opus + Sol; this section overrides earlier text where they differ)
+
+Both reviewers confirmed the protection semantics table (I, Q, W), exact-name matching with globs refused, the hook's
+`merge-base --is-ancestor` check (with the conditions in R9) and the slicing order. Findings that changed the plan:
+
+**Merge (F4c)**
+
+* **R1. Revalidate under the gate.** Merge takes the gate first, then: run recovery for pending intents of this repository,
+  re-read the PR (state, base, head ref), the protection rules and the required statuses, and only then insert the intent.
+  Rule CRUD, PR PATCH and merges all hold the gate, so they are totally ordered; statuses do not take the gate, so the
+  status check linearizes at its read inside the gate (a status posted after it is not counted). Rule CRUD answers 503
+  while a merge holds the gate (documented).
+* **R2. Durable receipt.** The step-6 `update-ref --stdin` transaction also creates `refs/forge/merge/<intent id>` =
+  `merge_oid` (server-only namespace, already hidden and refused to clients). Recovery tests for the receipt, not for
+  ancestry of the current base: receipt present = the transaction committed (finalize, even when the base was force-pushed
+  away or deleted afterwards); receipt absent and intent pending = aborted. The receipt is deleted after the SQLite
+  finalization (and by recovery). The kill -9 invariant is "no pending intent survives reconcile, `merged` ⇔ intent done,
+  no receipt without a done intent", not "merge_oid is an ancestor of base" (a permitted force push breaks that).
+* **R3. Complete intent row.** `merge_intents` also stores `merger_id`, `merged_unix`, `changed_files`, `additions`,
+  `deletions`; `(base_oid, merge_oid)` is rewritten in a committed transaction before every `update-ref` attempt (a
+  recompute changes `merge_oid`); recovery finalizes with exactly the fields a normal merge writes; the retention-ref write
+  in finalization is idempotent; the table cascades on repository delete.
+* **R4. Stale-head classification is merge's own.** `gitwrite::classify` is single-ref. The merge uses its own outcome
+  function: reconcile the receipt first, then re-read head and base separately; changed head → 409 `head out of date`
+  (never silently substituted), changed base → bounded recompute, then 405 `try again later`.
+* **R5. Step 7 failure.** If the SQLite finalization fails after the ref landed, retry inside the gate; a read that finds a
+  pending intent runs recovery inline when it can take the gate without waiting (otherwise reports not merged and leaves
+  the intent), so the next request converges.
+
+**Pull requests (F4b)**
+
+* **R6. Deleting the head branch closes the PR** (fixtures O#6-O#10, O#24-O#25, both Gitea versions; the spec's and
+  FINDINGS' "leaves the PR open" is wrong and is corrected in F4b's docs). Retention ref is written first, the PR is
+  closed, `head.ref` reads `refs/pull/<n>/head` with `head.label` the branch name. Reopen is allowed (201) even when the
+  branch is gone (O#26). Merge of such a PR is 404.
+* **R7. Retention without a second writer process.** Instead of a `post-receive` hook doing database writes (the hook has a
+  read-only handle), the server runs `pulls::sync(repo)` under the gate after every accepted push (accept marker, but
+  refs are compared, not the marker trusted), contents write, branch API delete and at startup reconcile: for each open PR
+  it CAS-updates `refs/forge/pull/<n>/head` to the head branch tip, or, when the branch is gone, keeps the retained head,
+  closes the PR and records `final_head_sha`; for closed/merged PRs it repairs the ref to `final_head_sha`. The spec's
+  `freezing` state is unnecessary because refresh and freeze are both gate-ordered in one process; spec updated when built.
+  The `pre-receive` hook still records `old` into the retention ref (scrubbed env, quarantine variables removed, no object
+  from the push is referenced) when a push deletes the head of an open PR, so a crash before `sync` cannot lose the tip;
+  startup reconcile repairs any disagreement. Create writes the ref before inserting the row.
+* **R8. Branch delete is a CAS.** `delete_branch` reads the tip, retains it, then deletes with expected old id; on mismatch it
+  re-reads and retries (≤3) or answers 409. It reads protection rules under the exclusive lifecycle lock it already holds
+  (never `with_write_row` from inside it: self-deadlock).
+
+**Protection and hook (F4a)**
+
+* **R9. Hook conditions.** Environment from `Git::env_with` (keeps `GIT_NO_REPLACE_OBJECTS`, `core.useReplaceRefs=false`);
+  git binary path passed explicitly (the pinned `PATH` may not contain it); repository directory derived from
+  `FORGE_DATA_DIR` + repo id, never from `GIT_DIR`; only `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` are
+  taken from the inherited environment and must lie under that repository; `old`/`new` validated as hex before argv;
+  `GIT_PUSH_OPTION_*` and everything else scrubbed. Git refuses ref updates while `GIT_QUARANTINE_PATH` is set, so the
+  retention write in R7 spawns without any `GIT_QUARANTINE_PATH`/object-dir variables.
+* **R10. Refusal texts and departures.** The gate compares the refusal lines. Use the recorded text where it is ours to say
+  (`not allowed to push to protected branch <b>`, `branch <b> is protected from force push`) and add a departure entry for
+  the dropped `gitea:` prefix and for the default-branch delete wording (like the existing J#62 entry); every text that
+  differs gets an entry, decided by running the gate.
+* **R11. Protection tests use a non-default protected branch** for delete and force-push cases (Q#12/Q#15-16 target
+  `main`, where the default-branch rule fires first); also creation of a previously absent protected name and contents
+  `new_branch` targeting a protected name (stricter than Gitea, which checks only the old branch: departure note).
+* **R12. Rule body.** `status_check_contexts`/`rule_name` handling per the fixtures: a branch with no rule reports
+  `status_check_contexts: null`, a rule without contexts reports what Q#0/W#0 show (the gate decides; the column is
+  nullable so the distinction survives); conflicting `branch_name` vs `rule_name` → 422; glob metacharacters refused in
+  rule names on create and PATCH and in context names. `enable_status_check` with no contexts → 422 (departure; a gate that
+  requires nothing would fail open).
+* **R13. Statuses.** Cap distinct contexts per sha (100, 422 above) besides the 100-row history per context, so the table is
+  bounded per commit; the merge gate reads the table directly, never the paged combined view (P#40-41: combined is paged,
+  `X-Total-Count` is the full count). A POST without `state` is 422 (H#37 recorded 201: add the departure entry).
+* **R14. Gate mechanics.** F4a adds `"Q": {"stop": [5, "expected [201]"]}` to `slice-pending.json` (gating the contents-API
+  protection contract Q#0-4 now); F4b derives O's `defer` list by running the scenario (a deferred exchange that passes
+  is reported FAIL).
+
+**Contract details F4b must cover** (from Opus's fixture pass): PR create is allowed unless head sha equals base sha (G#35,
+T#5, T#9: contained or same-tree heads still get 201); 422 text `Invalid PullRequest: There are no changes between the head
+and the base`; PR object keys `additions`, `deletions`, `merge_base`, `comments`, `review_comments`; review POST answers
+200; other users' PENDING reviews are hidden from lists but counted in `X-Total-Count`; `official` follows the recorded
+transitions (F#28 vs F#33), computed at read time; list `sort=oldest|newest|recentupdate` and `Link` headers (P#0-4,
+P#16-18).
