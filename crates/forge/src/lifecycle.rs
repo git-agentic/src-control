@@ -188,6 +188,7 @@ impl Lifecycle {
             args,
             stdin,
             identity: id,
+            ..Default::default()
         })?;
         if out.ok() {
             Ok(out.text())

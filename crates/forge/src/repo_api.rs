@@ -15,7 +15,7 @@ use crate::store::{self, User};
 use crate::timefmt::{now, rfc3339};
 use serde_json::{json, Value};
 
-fn acc<'a>(ctx: &'a Ctx) -> Result<&'a Access, Resp> {
+pub(crate) fn acc<'a>(ctx: &'a Ctx) -> Result<&'a Access, Resp> {
     ctx.access.as_ref().ok_or_else(|| {
         ctx.app
             .internal(&"repository route without a resolved repository")
@@ -41,7 +41,12 @@ fn life_err(app: &App, e: LifecycleError) -> Resp {
 /// The one mapping of a failed read of a repository: busy is 503; a repository that is no
 /// longer `live` (a read that raced its delete) is the same 404 as a missing one; anything else
 /// is a 500.
-fn git_read_err(app: &App, conn: &rusqlite::Connection, repo_id: i64, e: GitError) -> Resp {
+pub(crate) fn git_read_err(
+    app: &App,
+    conn: &rusqlite::Connection,
+    repo_id: i64,
+    e: GitError,
+) -> Resp {
     if matches!(e, GitError::Busy) {
         return error(&app.base, 503, "too many git operations in flight");
     }
@@ -650,7 +655,7 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
 
 /// Run a read of the repository on disk under its shared lock, answering as for a missing
 /// repository when it is no longer live by the time the lock is held.
-fn read_locked(ctx: &Ctx, a: &Access, f: impl FnOnce(&Ctx) -> Resp) -> Resp {
+pub(crate) fn read_locked(ctx: &Ctx, a: &Access, f: impl FnOnce(&Ctx) -> Resp) -> Resp {
     match ctx.app.life.with_read(ctx.conn, a.repo.id, || f(ctx)) {
         Ok(Some(r)) => r,
         Ok(None) => not_found(&ctx.app.base, "The target couldn't be found.", None),

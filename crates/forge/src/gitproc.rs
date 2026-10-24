@@ -88,6 +88,10 @@ pub struct Spec<'a> {
     pub args: &'a [&'a str],
     pub stdin: Option<&'a [u8]>,
     pub identity: Option<&'a Identity>,
+    /// Larger output cap than the runner's default (archives, diffs, big listings).
+    pub max_output: Option<usize>,
+    /// Longer deadline than the runner's default.
+    pub timeout: Option<Duration>,
 }
 
 /// The runner.
@@ -240,9 +244,10 @@ impl Git {
                 out
             })
         };
+        let cap = spec.max_output.unwrap_or(self.max_output);
         let t_out = drain(
             Box::new(child.stdout.take().expect("piped")),
-            self.max_output,
+            cap,
             over.clone(),
         );
         let t_err = drain(
@@ -261,7 +266,7 @@ impl Git {
         // Detect the leader's exit without reaping it (`waitid` with WNOWAIT): while the leader is
         // an unreaped zombie its pid, and so the process-group id, cannot be reused, so the group
         // signal below can never reach an unrelated group. Reap only after signalling.
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + spec.timeout.unwrap_or(self.timeout);
         let outcome = loop {
             match exited_unreaped(pgid) {
                 Ok(true) => break None,

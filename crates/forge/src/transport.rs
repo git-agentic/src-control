@@ -189,6 +189,7 @@ fn text(status: u16, body: &str) -> Resp {
         headers: vec![("content-type", TEXT.into())],
         body: body.as_bytes().to_vec(),
         delay: std::time::Duration::ZERO,
+        hold: None,
     }
 }
 

@@ -813,6 +813,51 @@ F2b is the git half of F2 (plan: `docs/superpowers/plans/2026-10-23-p38-f2b-git-
   the mechanism; the 20 MiB push/clone test exercises the streaming path), per-owner quotas, `gc` of killed pushes' quarantine
   directories (F5).
 
+### F3a decisions (as built)
+
+F3a is the read half of the content API (plan: `docs/superpowers/plans/2026-10-23-p38-f3a-content-reads.md`). The
+write half (`POST`/`PUT` contents) is F3b; until then both answer 501 after the auth checks, so a read-only token still
+gets its recorded 403.
+
+- **Routes.** `git/refs`, `git/refs/{ref..}`, `tags`, `commits`, `git/commits/{sha}` (+ `.diff`/`.patch`),
+  `git/trees/{sha..}`, `contents`, `contents/{path..}`, `archive/{name..}` under `/repos/{o}/{r}` (read scope, read
+  permission). Only `refs/heads` and `refs/tags` are listed; `refs/forge` and `refs/pull` are never visible.
+- **Revisions are a grammar, not git syntax.** `HEAD` is the default branch; a valid branch name is tried as
+  `refs/heads/` then `refs/tags/`; 4 to 64 hex digits are an object id. Nothing else reaches git (`:/x`, `main^{/x}`,
+  `@{0}`, `--output=`, `HEAD~1` are all 404). Only resolved object ids are passed to later commands.
+- **Paths are literals.** `--literal-pathspecs` and `--` on every command that takes one; output is NUL-delimited.
+  `..`, NUL and an absolute path are 422 on `commits?path=`; on `contents` a leading `/` is trimmed and the rest is a
+  literal lookup (404 when absent).
+- **Output caps.** Listings and diffs 64 MiB, a blob read 16 MiB (a larger file answers with `content: null`), 120 s for
+  each capped command (the rest use the runner's 30 s). The operator's runner output cap does not apply to these. Over the cap is 413, a timeout 504, a saturated runner 503. All reads run under the repository's read lock.
+- **Archives are buffered in RAM**, capped at 128 MiB (413 over); `tar.gz` is built from the tar in the server. At most
+  four exist at once (`ArchiveSlot`, a fifth is 503), each until its body is written: `Resp::hold` carries the slot to the
+  end of the response. A streamed archive needs a pipe stage and is deferred.
+- **`last_commit_sha` in a contents listing** costs one git process per entry, so it is exact for the first 100 entries
+  only; later entries carry the commit id that was read. Recorded Gitea does the exact walk for all of them. A symlink
+  target is read for the first 100 entries of a listing and only when the link blob is at most 4 KiB.
+- **Recorded Gitea quirks reproduced:** a commit's `tree.sha`/`url` carry the commit id; `git/trees/{x}` answers `sha` =
+  commit id when a commit or branch is named; a directory's `git_url` uses `git/blobs/<tree id>`; the archive `Link`
+  names `.tar.gz?rev=` even for a zip; a tag's `commit.url` uses the tag object id while `sha` is the peeled commit;
+  `/tags` is newest first; an empty repository answers `contents` with `200 []` for any path, commits with 409, `git/refs`
+  with 404, `git/trees/main` with 400; a contents 404 carries the "GetContentsOrList" message; the commits `Link` header
+  is alphabetical over all parameters with the page clamped to the last.
+- **Departures.** An unknown ref on `commits` is 404 (E#19; Gitea 1.22.6 answered 500). `commits?not=` is 400 (it
+  would otherwise be ignored silently). A file name that is not valid UTF-8 is listed with U+FFFD in place of the bad
+  bytes and cannot be fetched by that name; names with a control character are listed but their URL is 404.
+  The `.patch` of a merge commit is its diff against the first parent in mailbox form (`format-patch` skips merges).
+  A `commits` page may carry at most 50,000 changed files in total (413 over). `submodule_git_url` is always `null`
+  (Gitea reads it from `.gitmodules`; not built). A parent's `created` is the child's committer time, as recorded.
+- **Empty repositories.** "Empty" is "the default branch does not resolve", as for the `empty` field. An unnamed read of an
+  unborn default is the recorded empty answer even when other branches exist (Gitea would have adopted the first pushed
+  branch as default, see N#13); a *named* `sha`/`ref` that exists is served, and a named one that does not is 404 unless the
+  repository has no branch or tag at all.
+- **Not served.** `git/blobs`, `git/tags` and web `raw` URLs appear in response bodies as Gitea writes them but are not
+  routes.
+- **Conformance gate.** `forge-check.sh` now replays `A B C D E J K L M N R V` (12 scenarios). `E` stops at its first
+  contents write (`[42, KeyError: 'sha']`) with E#36 to #41 deferred to F3b; `D` defers its PR listing and `B` its status
+  post (F4).
+
 ## Open questions
 
 1. The merge of a PR whose head is already in base (recorded: 405 `try again later`,

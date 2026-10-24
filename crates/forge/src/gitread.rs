@@ -190,6 +190,7 @@ mod tests {
                 args: &["commit-tree", &tree],
                 stdin: Some(msg.as_bytes()),
                 identity: Some(&id),
+                ..Default::default()
             })
             .unwrap()
             .text();
