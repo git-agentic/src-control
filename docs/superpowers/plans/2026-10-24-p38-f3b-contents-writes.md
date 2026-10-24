@@ -48,7 +48,7 @@ review" at the end, which supersedes anything earlier in this file that it contr
   `<login>@noreply.localhost`; dates are one server timestamp passed to git explicitly so the response matches the
   commit exactly.
 - **Size.** The JSON body limit (`--max-body-bytes`, 1 MiB) bounds the content. Operation limits: at most 64 path
-  levels, 16 MiB of raw tree listing per level and 64 MiB cumulative, 60 s for the whole operation (checked between
+  levels, 16 MiB of raw tree listing per level and 32 MiB cumulative, 60 s for the whole operation (checked between
   steps), 3 publication attempts. Free disk is checked against the same floor as pushes (`--min-free-bytes`) with a
   reservation for the content plus rebuilt trees.
 

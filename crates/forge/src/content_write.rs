@@ -6,7 +6,7 @@
 use crate::api::body;
 use crate::b64;
 use crate::content_api::{api_base, content_value, dir, read_err, verification, web_base};
-use crate::gitobj::{self, RefKind, TreeEntry};
+use crate::gitobj::{RefKind, TreeEntry};
 use crate::gitproc::Identity;
 use crate::gitwrite::{self as gw, Op, Outcome, Refuse, WriteErr};
 use crate::http::{error, not_found, Resp};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 /// Publication attempts before the write answers 409.
 const ATTEMPTS: usize = 3;
-/// How long the whole operation may take, checked between steps.
+/// How long the whole operation may take, checked between attempts and between the walk, the rewrite and the commit.
 const DEADLINE: Duration = Duration::from_secs(60);
 /// How long a write waits for the repository's write gate.
 const GATE_WAIT: Duration = Duration::from_secs(10);
@@ -73,10 +73,10 @@ fn opt_str(ctx: &Ctx, b: &Value, key: &str) -> Result<Option<String>, Resp> {
 
 fn parse(ctx: &Ctx, verb: Verb) -> Result<Write, Resp> {
     let b = body(ctx)?;
-    if opt_str(ctx, &b, "from_path")?.is_some() {
+    let path = ctx.param("p").to_string();
+    if opt_str(ctx, &b, "from_path")?.is_some_and(|f| f != path) {
         return Err(unprocessable(ctx, "from_path (rename) is not supported"));
     }
-    let path = ctx.param("p").to_string();
     if !gw::write_path_ok(&path) {
         return Err(unprocessable(
             ctx,
@@ -184,6 +184,17 @@ pub fn write_contents(ctx: &mut Ctx) -> Resp {
     }
 }
 
+/// The address git will record: surrounding blanks are stripped by git, so strip them here too and the
+/// response matches the commit.
+fn commit_email(user: &crate::store::User) -> String {
+    let e = user.email.trim();
+    if e.is_empty() {
+        format!("{}@noreply.localhost", user.login)
+    } else {
+        e.to_string()
+    }
+}
+
 fn refuse(ctx: &Ctx, path: &str, r: Refuse) -> Resp {
     match r {
         Refuse::AlreadyExists => unprocessable(
@@ -217,9 +228,8 @@ fn denied(ctx: &Ctx) -> Resp {
 }
 
 /// A branch name that equals, contains or lies under an existing branch name.
-fn collides(existing: &[gitobj::RefRow], new: &str) -> Option<bool> {
-    for r in existing {
-        let n = r.name.strip_prefix("refs/heads/").unwrap_or(&r.name);
+fn collides(existing: &[String], new: &str) -> Option<bool> {
+    for n in existing {
         if n == new {
             return Some(true);
         }
@@ -237,9 +247,10 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
     let user = &ctx.who.user;
     let default = row.default_branch.clone();
     let base_name = w.branch.clone().unwrap_or_else(|| default.clone());
-    let target_name = w.new_branch.clone().unwrap_or_else(|| base_name.clone());
+    let new_branch = w.new_branch.clone().filter(|n| *n != base_name);
+    let target_name = new_branch.clone().unwrap_or_else(|| base_name.clone());
     // Gitea checks protection before it looks at the tree.
-    if policy::check_contents_write(&target_name, w.new_branch.is_some()).is_err() {
+    if policy::check_contents_write(&target_name, new_branch.is_some()).is_err() {
         return denied(ctx);
     }
     let comps: Vec<&str> = w.path.split('/').collect();
@@ -249,11 +260,7 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
         (Verb::Delete, Some(s)) => Op::Delete(s.clone()),
         _ => return unprocessable(ctx, "[SHA]: Required"),
     };
-    let email = if user.email.is_empty() {
-        format!("{}@noreply.localhost", user.login)
-    } else {
-        user.email.clone()
-    };
+    let email = commit_email(user);
     let when = now();
     let Some(identity) = Identity::new(&user.login, &email).map(|i| i.at(when)) else {
         return ctx.app.internal(&"unusable commit identity");
@@ -266,15 +273,10 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
         Some(h) => h,
         None => return error(&ctx.app.base, 507, "insufficient storage"),
     };
-    let blob = if w.verb == Verb::Delete {
-        None
-    } else {
-        match gw::hash_blob(git, &d, &w.bytes) {
-            Ok(b) => Some(b),
-            Err(e) => return read_err(ctx, a, e),
-        }
-    };
+    // Written after the first successful precondition check, so a refused request stores nothing.
+    let mut blob: Option<String> = None;
     let base_ref = refname::branch_ref(&base_name);
+    let mut locked = false;
     for attempt in 0..ATTEMPTS {
         if started.elapsed() > DEADLINE {
             return error(&ctx.app.base, 503, "the write took too long, try again");
@@ -285,11 +287,11 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
         };
         // An unborn default branch is where a repository's first commit goes.
         let bootstrap =
-            old.is_none() && w.verb == Verb::Post && w.new_branch.is_none() && base_name == default;
+            old.is_none() && w.verb == Verb::Post && new_branch.is_none() && base_name == default;
         if old.is_none() && !bootstrap {
             return no_branch(ctx, &base_name);
         }
-        if let Some(n) = &w.new_branch {
+        if let Some(n) = &new_branch {
             match gobj_branches(ctx, a) {
                 Ok(rows) => match collides(&rows, n) {
                     Some(true) => {
@@ -314,27 +316,47 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
             },
             None => None,
         };
-        let mut budget = gw::TOTAL_LISTING;
+        let mut budget = gw::Budget::new(started + DEADLINE);
         let walk = match gw::walk(git, &d, root.as_deref(), &comps, &mut budget) {
             Ok(w) => w,
             Err(e) => return write_err(ctx, a, e),
         };
+        if started.elapsed() > DEADLINE {
+            return error(&ctx.app.base, 503, "the write took too long, try again");
+        }
         let prev_mode = match gw::check(&op, &comps, &walk) {
             Ok(m) => m,
             Err(r) => return refuse(ctx, &w.path, r),
         };
+        if blob.is_none() && w.verb != Verb::Delete {
+            match gw::hash_blob(git, &d, &w.bytes, started + DEADLINE) {
+                Ok(b) => blob = Some(b),
+                Err(e) => return read_err(ctx, a, e),
+            }
+        }
         let mode = prev_mode.unwrap_or_else(|| "100644".to_string());
         let file = blob.as_deref().map(|b| (mode.as_str(), b));
-        let tree = match gw::rebuild(git, &d, &walk, &comps, file) {
+        let tree = match gw::rebuild(git, &d, &walk, &comps, file, started + DEADLINE) {
             Ok(t) => t,
             Err(e) => return write_err(ctx, a, e),
         };
-        let commit = match gw::commit_tree(git, &d, &tree, old.as_deref(), &w.message, &identity) {
+        if started.elapsed() > DEADLINE {
+            return error(&ctx.app.base, 503, "the write took too long, try again");
+        }
+        let commit = match gw::commit_tree(
+            git,
+            &d,
+            &tree,
+            old.as_deref(),
+            &w.message,
+            &identity,
+            started + DEADLINE,
+        ) {
             Ok(c) => c,
             Err(e) => return read_err(ctx, a, e),
         };
-        let creating = w.new_branch.is_some() || bootstrap;
-        let (full, expected) = if w.new_branch.is_some() || bootstrap {
+        let creating = new_branch.is_some() || bootstrap;
+        let (full, expected) = if creating {
             (refname::branch_ref(&target_name), gw::ZERO.to_string())
         } else {
             (base_ref.clone(), old.clone().unwrap_or_default())
@@ -351,6 +373,9 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
             &mode,
             when,
         );
+        if started.elapsed() > DEADLINE {
+            return error(&ctx.app.base, 503, "the write took too long, try again");
+        }
         // The linearization point of branch protection: just before the ref moves.
         if policy::check_contents_write(&target_name, creating).is_err() {
             return denied(ctx);
@@ -365,19 +390,37 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
             Err(e) => return read_err(ctx, a, e),
         };
         let expected_old = if creating { None } else { old.as_deref() };
-        match gw::classify(
-            expected_old,
-            bootstrap,
-            &commit,
-            now_tip.as_deref(),
-            &failure,
-        ) {
+        // A killed update-ref may have landed and been built on by a push before the re-read: our
+        // commit is then an ancestor of the tip, and the write succeeded.
+        let landed = match &now_tip {
+            Some(t) if *t != commit => match gw::is_ancestor(git, &d, &commit, t) {
+                Ok(b) => b,
+                Err(e) => return read_err(ctx, a, e),
+            },
+            _ => false,
+        };
+        let seen = if landed {
+            Some(commit.as_str())
+        } else {
+            now_tip.as_deref()
+        };
+        match gw::classify(expected_old, bootstrap, &commit, seen, &failure) {
             Outcome::Done => return published(ctx, a, resp),
-            Outcome::Lost => {}
-            Outcome::LostAfterBackoff => std::thread::sleep(BACKOFF),
+            Outcome::Lost => locked = false,
+            Outcome::LostAfterBackoff => {
+                locked = true;
+                std::thread::sleep(BACKOFF);
+                continue;
+            }
             Outcome::Gone => return no_branch(ctx, &base_name),
-            Outcome::Exists | Outcome::DfConflict => {
+            Outcome::Exists => {
                 return unprocessable(ctx, &format!("branch already exists [name: {target_name}]"))
+            }
+            Outcome::DfConflict => {
+                return unprocessable(
+                    ctx,
+                    &format!("branch name conflicts with an existing branch [name: {target_name}]"),
+                )
             }
             Outcome::Fatal => {
                 eprintln!("sc-forge: update-ref {full} failed on attempt {attempt}: {failure}");
@@ -386,6 +429,15 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
         }
         eprintln!("sc-forge: contents write to {full} lost round {attempt}: {failure}");
     }
+    if locked {
+        // Three rounds against a ref lock that never cleared: nothing changed the branch. A killed
+        // git can leave `refs/heads/<branch>.lock` behind; it blocks pushes as well.
+        eprintln!(
+            "sc-forge: refs/heads/{target_name} of repository {} stayed locked; if no git process is running, remove its .lock file",
+            a.repo.id
+        );
+        return error(&ctx.app.base, 503, "the branch is locked, try again later");
+    }
     error(
         &ctx.app.base,
         409,
@@ -393,9 +445,8 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
     )
 }
 
-fn gobj_branches(ctx: &Ctx, a: &Access) -> Result<Vec<gitobj::RefRow>, Resp> {
-    gitobj::list_refs(&ctx.app.life.git, &dir(ctx, a), "refs/heads")
-        .map_err(|e| read_err(ctx, a, e))
+fn gobj_branches(ctx: &Ctx, a: &Access) -> Result<Vec<String>, Resp> {
+    gw::branch_names(&ctx.app.life.git, &dir(ctx, a)).map_err(|e| read_err(ctx, a, e))
 }
 
 fn write_err(ctx: &Ctx, a: &Access, e: WriteErr) -> Resp {
@@ -435,11 +486,7 @@ fn response(
 ) -> Resp {
     let (api, web) = (api_base(ctx, a), web_base(ctx, a));
     let user = &ctx.who.user;
-    let email = if user.email.is_empty() {
-        format!("{}@noreply.localhost", user.login)
-    } else {
-        user.email.clone()
-    };
+    let email = commit_email(user);
     let person = json!({"name": user.login, "email": email, "date": rfc3339(when)});
     let content = match blob {
         Some(oid) => {

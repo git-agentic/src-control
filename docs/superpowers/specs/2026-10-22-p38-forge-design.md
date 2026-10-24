@@ -872,7 +872,7 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
 - **Path rules** (`gitwrite::write_path_ok`): `valid_path`, no `\`, no trailing `/`, at most 64 components of at most 255
   bytes, no `.git` alias (case, trailing dots and spaces, `:stream`, `git~1`, HFS-ignorable code points) and no
   `.gitmodules` alias: **`.gitmodules` cannot be written through the API** (its URL/path/name checks run only in
-  `receive.fsckObjects`). A `.gitattributes` line over 2048 bytes is refused. Windows device names, `:` in a name and
+  `receive.fsckObjects`). A `.gitattributes` line of 2048 bytes or more is refused, under every NTFS/HFS alias of the name; `.gitmodules` is refused under every alias including the `gitmod~N` and `gi7eba~N` short names. Windows device names, `:` in a name and
   case-fold sibling collisions are not prevented.
 - **Semantics.** New files are `100644`; PUT keeps `100755` (and normalises legacy modes such as `100664` in the directories
   it rebuilds; untouched subtrees keep their ids); a symlink, gitlink or directory at the path is 422 for PUT/DELETE, and
@@ -886,10 +886,11 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
 - **Publication.** Objects first, the ref last by `update-ref` CAS. After any failure the ref is re-read and the outcome
   decided by `gitwrite::classify` (landed, lost round, lock held with a 50 ms pause, branch gone 404, `new_branch` exists
   422, ref D/F conflict 422, anything else 500, logged); three lost rounds is 409 `the branch was changed concurrently,
-  try again`. The response is built before the ref moves and nothing is read from git afterwards; the repository's
+  try again`, or 503 `the branch is locked` when every round met a held ref lock (a killed git can leave a stale
+  `refs/heads/<b>.lock`; the log then tells the operator to remove it). The response is built before the ref moves and nothing is read from git afterwards; the repository's
   `updated_unix` stamp after a successful write is log-only on failure.
-- **Limits.** Body (`--max-body-bytes`, 1 MiB) bounds content; 64 levels, 16 MiB per raw listing and 64 MiB cumulative
-  listing per attempt, 60 s for the operation, free disk against `--min-free-bytes` through the same reservation pool as
+- **Limits.** Body (`--max-body-bytes`, 1 MiB) bounds content; 64 levels, 16 MiB per raw listing and 32 MiB cumulative
+  listing per attempt, 60 s for the operation (checked between attempts and between the walk, the rewrite and the commit; one git command may still run up to its own limit), free disk against `--min-free-bytes` through the same reservation pool as
   pushes (content plus 8 MiB).
 - **Protection seam.** `policy::check_contents_write(target, creating)` is evaluated early (Gitea checks protection first)
   and again immediately before the ref update on every attempt, including for `new_branch`; it permits everything until

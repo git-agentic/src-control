@@ -245,6 +245,34 @@ fn new_branch_leaves_the_base_alone_and_collisions_are_422() {
         under.msg()
     );
     // new_branch equal to branch, or empty, is the branch itself
+    let rel = w.write(
+        "POST",
+        "r.txt",
+        json!({"content": enc("r\n"), "branch": "main", "new_branch": "rel/1"}),
+    );
+    assert_eq!(rel.status, 201, "{}", rel.msg());
+    let above = w.write(
+        "POST",
+        "s.txt",
+        json!({"content": enc("s\n"), "branch": "main", "new_branch": "rel"}),
+    );
+    assert_eq!(
+        above.status,
+        422,
+        "rel is a directory of rel/1: {}",
+        above.msg()
+    );
+    let dflt = w.write(
+        "POST",
+        "t.txt",
+        json!({"content": enc("t\n"), "new_branch": "main"}),
+    );
+    assert_eq!(
+        dflt.status,
+        201,
+        "new_branch equal to the default is the default: {}",
+        dflt.msg()
+    );
     let same = w.write(
         "POST",
         "j.txt",
@@ -346,12 +374,13 @@ fn directories_files_and_modes_are_respected() {
         &["mktree"],
         Some(format!("100644 blob {blob}\tinner\n").as_bytes()),
     );
+    let gitlink = "9".repeat(40);
     let tree = w.s.git(
         w.id,
         &["mktree"],
         Some(
             format!(
-                "100755 blob {blob}\trun.sh\n120000 blob {link}\tlink\n040000 tree {sub}\tdir\n"
+                "100755 blob {blob}\trun.sh\n120000 blob {link}\tlink\n040000 tree {sub}\tdir\n160000 commit {gitlink}\tsm\n"
             )
             .as_bytes(),
         ),
@@ -376,6 +405,23 @@ fn directories_files_and_modes_are_respected() {
     let r = w.write("PUT", "dir", json!({"content": enc("x"), "sha": sub}));
     assert_eq!(r.status, 422, "{}", r.msg());
     assert_eq!(w.write("DELETE", "link", json!({"sha": link})).status, 422);
+    assert_eq!(
+        w.write("PUT", "sm", json!({"content": enc("x"), "sha": gitlink}))
+            .status,
+        422,
+        "submodule"
+    );
+    assert_eq!(w.write("DELETE", "sm", json!({"sha": gitlink})).status, 422);
+    assert_eq!(
+        w.write("POST", "sm/x", json!({"content": enc("x")})).status,
+        422,
+        "under a submodule"
+    );
+    assert_eq!(
+        w.git(&["ls-tree", "main", "sm"]),
+        format!("160000 commit {gitlink}\tsm"),
+        "gitlink kept"
+    );
     // exists as a directory / a file is a parent
     assert_eq!(
         w.write("POST", "dir", json!({"content": enc("x")})).status,
@@ -591,11 +637,21 @@ fn concurrent_api_writers_and_an_independent_ref_writer_lose_nothing() {
     let racer = {
         let w = w.clone();
         std::thread::spawn(move || {
-            // an independent writer (a stand-in for a push): empty commits on top of the tip, by CAS
+            // an independent writer (a stand-in for a push): adds a file on top of the tip, by CAS
             let mut landed = Vec::new();
             for i in 0..15 {
                 let tip = w.tip("main");
-                let tree = w.blob(&format!("{tip}^{{tree}}"));
+                let listing = w.git(&["ls-tree", &format!("{tip}^{{tree}}")]);
+                let blob = w.s.git(
+                    w.id,
+                    &["hash-object", "-w", "--stdin"],
+                    Some(format!("ext {i}\n").as_bytes()),
+                );
+                let tree = w.s.git(
+                    w.id,
+                    &["mktree"],
+                    Some(format!("{listing}\n100644 blob {blob}\text{i}.txt\n").as_bytes()),
+                );
                 let c = w.s.git(
                     w.id,
                     &["commit-tree", &tree, "-p", &tip],
@@ -617,7 +673,7 @@ fn concurrent_api_writers_and_an_independent_ref_writer_lose_nothing() {
                     .output()
                     .unwrap();
                 if out.status.success() {
-                    landed.push(c);
+                    landed.push((c, format!("ext{i}.txt")));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(3));
             }
@@ -654,7 +710,15 @@ fn concurrent_api_writers_and_an_independent_ref_writer_lose_nothing() {
         results.iter().filter(|(_, s)| *s == 201).count() >= 6,
         "most writers land: {results:?}"
     );
-    for c in landed {
+    assert!(
+        !landed.is_empty(),
+        "the independent writer landed something"
+    );
+    for (c, file) in landed {
+        assert!(
+            files.contains(&file),
+            "{file} written outside the API survived the API's rebuilds"
+        );
         let out = std::process::Command::new("git")
             .args([
                 "--git-dir",

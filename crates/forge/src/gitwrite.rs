@@ -5,14 +5,14 @@
 
 use crate::gitproc::{Git, GitError, Identity, Spec};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Most path components a write may have (each level costs a few git processes).
 pub const MAX_DEPTH: usize = 64;
 /// Largest raw listing of one directory read for a write.
 pub const MAX_LISTING: usize = 16 << 20;
 /// Cumulative raw listings of one write attempt.
-pub const TOTAL_LISTING: usize = 64 << 20;
+pub const TOTAL_LISTING: usize = 32 << 20;
 /// The all-zero id: "the ref must not exist".
 pub const ZERO: &str = "0000000000000000000000000000000000000000";
 /// Longest line `fsck` accepts in a `.gitattributes`.
@@ -23,36 +23,59 @@ fn hfs_ignorable(c: char) -> bool {
     matches!(c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}')
 }
 
-/// Whether a path component names `dot` (like `.git`) or its 8.3 short name `short` on any
-/// filesystem git runs on.
-fn is_alias(component: &str, dot: &str, short: &str) -> bool {
+/// The names `fsck` treats as the special file `.<name>`: the dotted name, and on NTFS the 8.3 short
+/// names `<first six>~1` to `~4` and `<hash prefix>~1` to `~9`. `hash` is NTFS's fall-back short-name
+/// prefix for that file (`gi7eba` for `.gitmodules`).
+fn special_names(name: &str, hash: Option<&str>) -> Vec<String> {
+    let mut v = vec![format!(".{name}")];
+    v.extend((1..=4).map(|n| format!("{}~{n}", &name[..6])));
+    if let Some(h) = hash {
+        v.extend((1..=9).map(|n| format!("{h}~{n}")));
+    }
+    v
+}
+
+/// Whether a path component is one of `names` on any filesystem git runs on.
+fn is_alias(component: &str, names: &[String]) -> bool {
     let c: String = component.chars().filter(|c| !hfs_ignorable(*c)).collect();
     // NTFS ignores trailing dots and spaces and treats `name:stream` as the file `name`.
     let c = c.split(':').next().unwrap_or("");
     let c = c.trim_end_matches([' ', '.']).to_ascii_lowercase();
-    c == dot || c == short
+    names.contains(&c)
+}
+
+fn git_names() -> Vec<String> {
+    vec![".git".into(), "git~1".into()]
+}
+
+fn modules_names() -> Vec<String> {
+    special_names("gitmodules", Some("gi7eba"))
+}
+
+fn attributes_names() -> Vec<String> {
+    special_names("gitattributes", Some("gi7d29"))
 }
 
 /// Whether a client may create or change `path` through the API. Stricter than the read rules: a path a
 /// checkout on macOS or Windows would resolve into `.git`, and `.gitmodules` (whose content `fsck`
 /// checks only on pushes), can never be written here.
 pub fn write_path_ok(path: &str) -> bool {
+    let (git, modules) = (git_names(), modules_names());
     crate::gitobj::valid_path(path)
         && !path.ends_with('/')
         && !path.contains('\\')
         && path.split('/').count() <= MAX_DEPTH
-        && path.split('/').all(|c| {
-            c.len() <= 255
-                && !is_alias(c, ".git", "git~1")
-                && !is_alias(c, ".gitmodules", "gitmod~1")
-        })
+        && path
+            .split('/')
+            .all(|c| c.len() <= 255 && !is_alias(c, &git) && !is_alias(c, &modules))
 }
 
-/// Whether `content` may be stored at `path`: `fsck` rejects a `.gitattributes` with an over-long line,
-/// so a server-made commit must not carry one either.
+/// Whether `content` may be stored at `path`: `fsck` rejects a `.gitattributes` (by any of its aliases)
+/// with a line of 2048 bytes or more, so a server-made commit must not carry one either.
 pub fn content_ok(path: &str, content: &[u8]) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    name != ".gitattributes" || content.split(|b| *b == b'\n').all(|l| l.len() <= ATTR_LINE)
+    !is_alias(name, &attributes_names())
+        || content.split(|b| *b == b'\n').all(|l| l.len() < ATTR_LINE)
 }
 
 /// One raw tree entry.
@@ -112,6 +135,22 @@ impl From<GitError> for WriteErr {
     }
 }
 
+/// What one write attempt may still use: listing bytes and time. Every git command gets what is left
+/// of the time (at most 60 s), so a deep path on slow storage cannot outlive the operation's deadline.
+pub struct Budget {
+    pub listing: usize,
+    pub end: Instant,
+}
+
+impl Budget {
+    pub fn new(end: Instant) -> Budget {
+        Budget {
+            listing: TOTAL_LISTING,
+            end,
+        }
+    }
+}
+
 fn run(
     git: &Git,
     dir: &Path,
@@ -119,14 +158,19 @@ fn run(
     stdin: Option<&[u8]>,
     id: Option<&Identity>,
     cap: usize,
+    end: Instant,
 ) -> Result<Vec<u8>, GitError> {
+    let left = end.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(GitError::Timeout { stdout: Vec::new() });
+    }
     let out = git.run(&Spec {
         repo: Some(dir),
         args,
         stdin,
         identity: id,
         max_output: Some(cap),
-        timeout: Some(Duration::from_secs(60)),
+        timeout: Some(left.min(Duration::from_secs(60))),
     })?;
     if out.ok() {
         Ok(out.stdout)
@@ -137,10 +181,23 @@ fn run(
     }
 }
 
-fn read_tree(git: &Git, dir: &Path, oid: &str, budget: &mut usize) -> Result<Vec<Entry>, WriteErr> {
-    let cap = MAX_LISTING.min(*budget);
-    let raw = run(git, dir, &["ls-tree", "-z", oid], None, None, cap)?;
-    *budget -= raw.len().min(*budget);
+fn read_tree(
+    git: &Git,
+    dir: &Path,
+    oid: &str,
+    budget: &mut Budget,
+) -> Result<Vec<Entry>, WriteErr> {
+    let cap = MAX_LISTING.min(budget.listing);
+    let raw = run(
+        git,
+        dir,
+        &["ls-tree", "-z", oid],
+        None,
+        None,
+        cap,
+        budget.end,
+    )?;
+    budget.listing -= raw.len().min(budget.listing);
     parse_tree(&raw).ok_or_else(|| WriteErr::Rewrite(format!("unreadable tree {oid}")))
 }
 
@@ -170,7 +227,7 @@ pub fn walk(
     dir: &Path,
     root: Option<&str>,
     comps: &[&str],
-    budget: &mut usize,
+    budget: &mut Budget,
 ) -> Result<Walk, WriteErr> {
     let mut levels = vec![match root {
         Some(t) => read_tree(git, dir, t, budget)?,
@@ -245,9 +302,9 @@ pub fn check(op: &Op, comps: &[&str], walk: &Walk) -> Result<Option<String>, Ref
     }
 }
 
-fn mktree(git: &Git, dir: &Path, entries: &[Entry]) -> Result<String, WriteErr> {
+fn mktree(git: &Git, dir: &Path, entries: &[Entry], end: Instant) -> Result<String, WriteErr> {
     let input = mktree_input(entries);
-    match run(git, dir, &["mktree", "-z"], Some(&input), None, 4096) {
+    match run(git, dir, &["mktree", "-z"], Some(&input), None, 4096, end) {
         Ok(o) => Ok(String::from_utf8_lossy(&o).trim().to_string()),
         Err(GitError::Failed(m)) => Err(WriteErr::Rewrite(m)),
         Err(e) => Err(e.into()),
@@ -262,6 +319,7 @@ pub fn rebuild(
     walk: &Walk,
     comps: &[&str],
     file: Option<(&str, &str)>,
+    end: Instant,
 ) -> Result<String, WriteErr> {
     let n = comps.len();
     let mut child: Option<Entry> = file.map(|(mode, oid)| Entry {
@@ -278,7 +336,7 @@ pub fn rebuild(
         if entries.is_empty() && i > 0 {
             continue;
         }
-        let oid = mktree(git, dir, &entries)?;
+        let oid = mktree(git, dir, &entries, end)?;
         if i == 0 {
             root = oid;
         } else {
@@ -294,7 +352,7 @@ pub fn rebuild(
 }
 
 /// Store `bytes` as a blob.
-pub fn hash_blob(git: &Git, dir: &Path, bytes: &[u8]) -> Result<String, GitError> {
+pub fn hash_blob(git: &Git, dir: &Path, bytes: &[u8], end: Instant) -> Result<String, GitError> {
     let o = run(
         git,
         dir,
@@ -302,6 +360,7 @@ pub fn hash_blob(git: &Git, dir: &Path, bytes: &[u8]) -> Result<String, GitError
         Some(bytes),
         None,
         4096,
+        end,
     )?;
     Ok(String::from_utf8_lossy(&o).trim().to_string())
 }
@@ -314,13 +373,56 @@ pub fn commit_tree(
     parent: Option<&str>,
     message: &str,
     id: &Identity,
+    end: Instant,
 ) -> Result<String, GitError> {
     let mut args = vec!["commit-tree", tree];
     if let Some(p) = parent {
         args.extend(["-p", p]);
     }
-    let o = run(git, dir, &args, Some(message.as_bytes()), Some(id), 4096)?;
+    let o = run(
+        git,
+        dir,
+        &args,
+        Some(message.as_bytes()),
+        Some(id),
+        4096,
+        end,
+    )?;
     Ok(String::from_utf8_lossy(&o).trim().to_string())
+}
+
+/// Is commit `a` reachable from commit `b`? (A write that landed and was then built on by someone else.)
+pub fn is_ancestor(git: &Git, dir: &Path, a: &str, b: &str) -> Result<bool, GitError> {
+    let out = git.run(&Spec {
+        repo: Some(dir),
+        args: &["merge-base", "--is-ancestor", a, b],
+        ..Default::default()
+    })?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::Failed(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        )),
+    }
+}
+
+/// Every branch name (without `refs/heads/`), for the collision check of a new branch.
+pub fn branch_names(git: &Git, dir: &Path) -> Result<Vec<String>, GitError> {
+    let args = ["for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads"];
+    let raw = run(
+        git,
+        dir,
+        &args,
+        None,
+        None,
+        MAX_LISTING,
+        Instant::now() + Duration::from_secs(60),
+    )?;
+    Ok(String::from_utf8_lossy(&raw)
+        .lines()
+        .map(String::from)
+        .collect())
 }
 
 /// The commit `full` (a `refs/heads/...` name) points at, `None` when it does not exist.
@@ -437,6 +539,10 @@ mod tests {
         (g, d, dir)
     }
 
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
     fn entry(mode: &str, kind: &str, oid: &str, name: &[u8]) -> Entry {
         Entry {
             mode: mode.into(),
@@ -494,6 +600,11 @@ mod tests {
             "gitmod~1",
             ".gitmodules::$DATA",
             ".gitm\u{200d}odules",
+            "gitmod~2",
+            "GITMOD~4",
+            "gi7eba~1",
+            "gi7eba~9",
+            "d/gi7eba~5",
         ] {
             assert!(!write_path_ok(p), "{p:?}");
         }
@@ -505,8 +616,22 @@ mod tests {
 
     #[test]
     fn gitattributes_lines_are_bounded() {
-        assert!(content_ok("a/.gitattributes", &[b'x'; ATTR_LINE]));
+        assert!(content_ok("a/.gitattributes", &[b'x'; ATTR_LINE - 1]));
+        assert!(!content_ok("a/.gitattributes", &[b'x'; ATTR_LINE]));
         assert!(!content_ok("a/.gitattributes", &[b'x'; ATTR_LINE + 1]));
+        for alias in [
+            ".GITATTRIBUTES",
+            ".gitattributes.",
+            ".gitattributes ",
+            "gitatt~1",
+            "GITATT~4",
+            "gi7d29~1",
+            "gi7d29~9",
+        ] {
+            assert!(!content_ok(&format!("d/{alias}"), &[b'x'; 3000]), "{alias}");
+            assert!(content_ok(&format!("d/{alias}"), b"ok\n"), "{alias}");
+        }
+        assert!(content_ok("d/gitatt~5", &[b'x'; 3000]), "not an alias");
         assert!(content_ok("a/readme", &[b'x'; 10_000]));
     }
 
@@ -638,25 +763,25 @@ mod tests {
     #[test]
     fn a_rewrite_keeps_every_untouched_entry_byte_for_byte() {
         let (g, d, dir) = repo("rewrite");
-        let blob = hash_blob(&g, &dir, b"old\n").unwrap();
-        let other = hash_blob(&g, &dir, b"other\n").unwrap();
+        let blob = hash_blob(&g, &dir, b"old\n", far()).unwrap();
+        let other = hash_blob(&g, &dir, b"other\n", far()).unwrap();
         let odd: [&[u8]; 3] = [b"bad\xff\x01name", b"tab\tnl\nname", b"z"];
         let mut dir_entries = vec![entry("100644", "blob", &blob, b"edit.txt")];
         dir_entries.extend(odd.iter().map(|n| entry("100755", "blob", &other, n)));
-        let sub = mktree(&g, &dir, &dir_entries).unwrap();
+        let sub = mktree(&g, &dir, &dir_entries, far()).unwrap();
         let root_entries = vec![
             entry("040000", "tree", &sub, b"d"),
             entry("100644", "blob", &other, b"top"),
         ];
-        let root = mktree(&g, &dir, &root_entries).unwrap();
+        let root = mktree(&g, &dir, &root_entries, far()).unwrap();
 
-        let mut budget = TOTAL_LISTING;
+        let mut budget = Budget::new(far());
         let comps = ["d", "edit.txt"];
         let w = walk(&g, &dir, Some(&root), &comps, &mut budget).unwrap();
         assert!(check(&Op::Update(blob.clone()), &comps, &w).is_ok());
-        let new_blob = hash_blob(&g, &dir, b"new\n").unwrap();
-        let new_root = rebuild(&g, &dir, &w, &comps, Some(("100644", &new_blob))).unwrap();
-        let mut budget = TOTAL_LISTING;
+        let new_blob = hash_blob(&g, &dir, b"new\n", far()).unwrap();
+        let new_root = rebuild(&g, &dir, &w, &comps, Some(("100644", &new_blob)), far()).unwrap();
+        let mut budget = Budget::new(far());
         let w2 = walk(&g, &dir, Some(&new_root), &comps, &mut budget).unwrap();
         let listing = &w2.levels[1];
         for n in odd {
@@ -680,29 +805,41 @@ mod tests {
                 entry(
                     "040000",
                     "tree",
-                    &mktree(&g, &dir, &[entry("100644", "blob", &blob, b"only")]).unwrap(),
+                    &mktree(&g, &dir, &[entry("100644", "blob", &blob, b"only")], far()).unwrap(),
                     b"solo",
                 ),
                 entry("100644", "blob", &other, b"keep"),
             ],
+            far(),
         )
         .unwrap();
         let comps = ["solo", "only"];
-        let mut budget = TOTAL_LISTING;
+        let mut budget = Budget::new(far());
         let w = walk(&g, &dir, Some(&root2), &comps, &mut budget).unwrap();
-        let after = rebuild(&g, &dir, &w, &comps, None).unwrap();
-        let top = parse_tree(&run(&g, &dir, &["ls-tree", "-z", &after], None, None, 4096).unwrap())
-            .unwrap();
+        let after = rebuild(&g, &dir, &w, &comps, None, far()).unwrap();
+        let top = parse_tree(
+            &run(
+                &g,
+                &dir,
+                &["ls-tree", "-z", &after],
+                None,
+                None,
+                4096,
+                far(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             top.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
             vec![b"keep".to_vec()]
         );
         // an unborn branch is an empty root; a new nested file builds its directories
         let comps = ["a", "b", "c.txt"];
-        let mut budget = TOTAL_LISTING;
+        let mut budget = Budget::new(far());
         let w = walk(&g, &dir, None, &comps, &mut budget).unwrap();
         assert_eq!(check(&Op::Create, &comps, &w), Ok(None));
-        let t = rebuild(&g, &dir, &w, &comps, Some(("100644", &blob))).unwrap();
+        let t = rebuild(&g, &dir, &w, &comps, Some(("100644", &blob)), far()).unwrap();
         let listed = run(
             &g,
             &dir,
@@ -710,6 +847,7 @@ mod tests {
             None,
             None,
             4096,
+            far(),
         )
         .unwrap();
         assert_eq!(listed, b"a/b/c.txt\0");
@@ -719,13 +857,13 @@ mod tests {
     #[test]
     fn refs_move_only_from_the_expected_tip() {
         let (g, d, dir) = repo("refs");
-        let blob = hash_blob(&g, &dir, b"x").unwrap();
-        let tree = mktree(&g, &dir, &[entry("100644", "blob", &blob, b"f")]).unwrap();
+        let blob = hash_blob(&g, &dir, b"x", far()).unwrap();
+        let tree = mktree(&g, &dir, &[entry("100644", "blob", &blob, b"f")], far()).unwrap();
         let id = Identity::new("u", "u@example.invalid")
             .unwrap()
             .at(1_700_000_000);
-        let c1 = commit_tree(&g, &dir, &tree, None, "one\n", &id).unwrap();
-        let c2 = commit_tree(&g, &dir, &tree, Some(&c1), "two\n", &id).unwrap();
+        let c1 = commit_tree(&g, &dir, &tree, None, "one\n", &id, far()).unwrap();
+        let c2 = commit_tree(&g, &dir, &tree, Some(&c1), "two\n", &id, far()).unwrap();
         assert_eq!(read_ref(&g, &dir, "refs/heads/m").unwrap(), None);
         assert_eq!(
             update_ref(&g, &dir, "refs/heads/m", &c1, ZERO).unwrap(),
@@ -751,6 +889,8 @@ mod tests {
             read_ref(&g, &dir, "refs/heads/m").unwrap(),
             Some(c2.clone())
         );
+        assert!(is_ancestor(&g, &dir, &c1, &c2).unwrap());
+        assert!(!is_ancestor(&g, &dir, &c2, &c1).unwrap());
         let msg = run(
             &g,
             &dir,
@@ -758,6 +898,7 @@ mod tests {
             None,
             None,
             4096,
+            far(),
         )
         .unwrap();
         assert_eq!(
