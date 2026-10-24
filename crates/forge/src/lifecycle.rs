@@ -204,6 +204,21 @@ impl Lifecycle {
         Some(f())
     }
 
+    /// Run `f` (a server-made write) under the shared lifecycle lock if it can be had right now,
+    /// never waiting: a delete queued for the exclusive lock would otherwise wait for a caller that
+    /// is itself waiting for the lock. Take the gate first. `None`: the lock was not free.
+    pub fn try_shared<T>(&self, id: i64, f: impl FnOnce() -> T) -> Option<T> {
+        let lock = self.lock_for(id);
+        let held = match lock.try_read() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let r = f();
+        drop(held);
+        Some(r)
+    }
+
     /// Run `f` while holding the repository's exclusive lifecycle lock, if it is free right now
     /// (never waits): default-branch changes and branch deletes write refs under that lock alone,
     /// so a cleanup that unlinks lock files needs it too. Take the gate first (see the lock order).

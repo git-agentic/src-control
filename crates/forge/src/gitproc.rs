@@ -191,6 +191,9 @@ impl Git {
             ("core.fsyncMethod".into(), "fsync".into()),
             ("core.useReplaceRefs".into(), "false".into()),
             ("gc.auto".into(), "0".into()),
+            // A maintenance `pack-refs` holds `packed-refs.lock` for a moment; a ref delete waits
+            // for it (git's default is one second).
+            ("core.packedRefsTimeout".into(), "5000".into()),
             ("receive.fsckObjects".into(), "true".into()),
         ];
         config.extend(extra.iter().map(|(k, v)| (k.to_string(), v.clone())));

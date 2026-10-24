@@ -16,7 +16,7 @@
 use crate::gitproc::{GitError, Spec};
 use crate::registry::Cancel;
 use crate::routes::App;
-use crate::{db, orphans, pulls, repos, timefmt, transport};
+use crate::{db, merges, orphans, pulls, repos, timefmt, transport};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -30,6 +30,8 @@ pub struct Cfg {
     pub prune_expire: Duration,
     /// Wall-clock limit of the gc of one repository.
     pub gc_timeout: Duration,
+    /// Wall-clock limit of the prune, which holds the write gate (API writers wait on it).
+    pub prune_timeout: Duration,
     /// Free disk that must remain beyond what a repack needs.
     pub min_free: u64,
     /// How long stage 2 waits for the repository's write gate before skipping the repository.
@@ -44,6 +46,7 @@ impl Default for Cfg {
             interval: Duration::from_secs(86_400),
             prune_expire: Duration::from_secs(14 * 86_400),
             gc_timeout: Duration::from_secs(3_600),
+            prune_timeout: Duration::from_secs(600),
             min_free: 1 << 30,
             gate_wait: Duration::from_secs(30),
             stale_age: Duration::from_secs(600),
@@ -160,8 +163,10 @@ pub fn spawn(app: Arc<App>) -> std::thread::JoinHandle<()> {
             }
             let pass = run_pass(&app);
             eprintln!("sc-forge: maintenance pass finished: {pass:?} (requested: {requested})");
-            m.passes.fetch_add(1, Ordering::SeqCst);
+            // Not running again before the count moves, so a request that follows an observed
+            // increment is always accepted.
             m.state().running = false;
+            m.passes.fetch_add(1, Ordering::SeqCst);
             next = (!m.cfg.interval.is_zero()).then(|| Instant::now() + m.cfg.interval);
         }
     })
@@ -248,7 +253,7 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
     let cfg = &app.maint.cfg;
     let dir = life.repo_dir(id);
     let live = || matches!(repos::find_by_id(conn, id), Ok(Some(r)) if r.state == "live");
-    let Some(reg) = life.registry.register(id, live) else {
+    let Some(reg) = life.registry.register(id, true, live) else {
         return Outcome::Gone;
     };
     let cancel = reg.cancel.clone();
@@ -325,19 +330,34 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
             return Outcome::Gone;
         }
         let now = timefmt::now();
+        // The reconcile writes refs and rows as a gated writer, so it holds the shared lifecycle
+        // lock like every other one (`delete_branch` relies on that); it never waits for it.
         // A sync logs and skips a pull request it cannot repair, so success of the reconcile is not
         // enough: the roots are verified separately.
-        let roots = pulls::reconcile_repo(conn, &life.git, &dir, id, now)
-            .map_err(|e| e.to_string())
-            .and_then(|()| pulls::verify_roots(conn, &life.git, &dir, id));
+        let Some(roots) = life.try_shared(id, || {
+            pulls::reconcile_repo(conn, &life.git, &dir, id, now)
+                .map_err(|e| e.to_string())
+                .and_then(|()| pulls::verify_roots(conn, &life.git, &dir, id))
+        }) else {
+            return Outcome::Skipped("the repository is being changed (delete, default branch)");
+        };
         if let Err(e) = roots {
             // Without every retention ref confirmed, deleting could destroy the only copy.
             eprintln!("sc-forge: repository {id}: retention refs could not be reconciled ({e}); nothing pruned");
             return Outcome::Skipped("retention refs could not be reconciled");
         }
-        let cutoff = now - cfg.prune_expire.as_secs() as i64;
+        // A merge intent still pending after the reconcile has a commit only the journal names.
+        if merges::has_pending(conn, id) {
+            return Outcome::Skipped("a merge is still pending");
+        }
+        // Saturating, and never a cutoff in the future: an absurd window must not prune everything.
+        let window = i64::try_from(cfg.prune_expire.as_secs()).unwrap_or(i64::MAX);
+        let cutoff = now.saturating_sub(window);
+        if cutoff < 1 {
+            return Outcome::Skipped("the prune window reaches before the epoch");
+        }
         let expire = format!("--expire={cutoff}");
-        if let Err(o) = check(run(&["prune", &expire], Some(cfg.gc_timeout))) {
+        if let Err(o) = check(run(&["prune", &expire], Some(cfg.prune_timeout))) {
             return o;
         }
         match usage_kib(app, &dir, &cancel) {

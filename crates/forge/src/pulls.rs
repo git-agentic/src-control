@@ -595,11 +595,15 @@ pub fn reconcile_repo(
         .iter()
         .map(|(n, s, h, _)| (*n, (s.clone(), h.clone())))
         .collect();
-    // A merged pull request's merge commit stays reachable even after the base is rewritten.
+    // A merged pull request's merge commit stays reachable even after the base is rewritten. A
+    // repair that fails is remembered, not returned at once: the other repairs still run.
+    let mut failed = None;
     for (n, state, _, merge) in &rows {
         if let (true, Some(m)) = (state == "merged", merge) {
             if kept.get(&merge_ref(*n)) != Some(m) {
-                retain_at(git, dir, &merge_ref(*n), m)?;
+                if let Err(e) = retain_at(git, dir, &merge_ref(*n), m) {
+                    failed.get_or_insert(e);
+                }
             }
         }
     }
@@ -631,7 +635,10 @@ pub fn reconcile_repo(
             });
         }
     }
-    Ok(())
+    match failed {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
 }
 
 /// Does a ref still hold every commit a pull request row names? The check before anything is

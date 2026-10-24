@@ -62,7 +62,8 @@ impl Drop for CancelOnDrop {
 #[derive(Default)]
 struct Slot {
     closed: bool,
-    live: HashMap<u64, Cancel>,
+    /// Cancel handle and whether the run may write (a push, a maintenance pass).
+    live: HashMap<u64, (Cancel, bool)>,
 }
 
 /// Live transports by repository id.
@@ -94,6 +95,7 @@ impl Registry {
     pub fn register(
         self: &Arc<Self>,
         repo: i64,
+        writes: bool,
         still_live: impl FnOnce() -> bool,
     ) -> Option<Registration> {
         let mut slots = self.lock();
@@ -109,7 +111,7 @@ impl Registry {
             .entry(repo)
             .or_default()
             .live
-            .insert(key, cancel.clone());
+            .insert(key, (cancel.clone(), writes));
         Some(Registration {
             reg: self.clone(),
             repo,
@@ -123,7 +125,7 @@ impl Registry {
         let mut slots = self.lock();
         let slot = slots.entry(repo).or_default();
         slot.closed = true;
-        slot.live.values().for_each(Cancel::cancel);
+        slot.live.values().for_each(|(c, _)| c.cancel());
     }
 
     /// Allow transports on `repo` again (a delete that did not go through).
@@ -154,13 +156,18 @@ impl Registry {
         true
     }
 
-    /// Run `f` only if `mine` is the only registration on its repository and the slot is open,
-    /// holding the registry lock for the duration, so no transport can register meanwhile. `f`
-    /// must be short (file system calls only) and must not call back into the registry.
+    /// Run `f` only if every other registration on `mine`'s repository is read-only (an upload-pack
+    /// writes no locks and no quarantine) and the slot is open, holding the registry lock for the
+    /// duration, so no writer can register meanwhile. `f` must be short (file system calls only)
+    /// and must not call back into the registry.
     pub fn with_only<T>(&self, mine: &Registration, f: impl FnOnce() -> T) -> Option<T> {
         let slots = self.lock();
         match slots.get(&mine.repo) {
-            Some(s) if !s.closed && s.live.len() == 1 && s.live.contains_key(&mine.key) => {
+            Some(s)
+                if !s.closed
+                    && s.live.contains_key(&mine.key)
+                    && s.live.iter().all(|(k, (_, w))| *k == mine.key || !*w) =>
+            {
                 Some(f())
             }
             _ => None,
@@ -185,7 +192,7 @@ impl Registry {
         slots
             .values()
             .flat_map(|s| s.live.values())
-            .for_each(Cancel::cancel);
+            .for_each(|(c, _)| c.cancel());
     }
 
     /// Wait up to `limit` until no transport at all is registered.
@@ -231,13 +238,13 @@ mod tests {
     #[test]
     fn a_closed_slot_refuses_and_cancels() {
         let r = Arc::new(Registry::default());
-        let a = r.register(1, || true).expect("open");
+        let a = r.register(1, true, || true).expect("open");
         assert!(!a.cancel.is_set());
         r.close(1);
         assert!(a.cancel.is_set(), "close cancels what is live");
-        assert!(r.register(1, || true).is_none(), "closed refuses");
+        assert!(r.register(1, true, || true).is_none(), "closed refuses");
         assert!(
-            r.register(2, || true).is_some(),
+            r.register(2, true, || true).is_some(),
             "other repositories are unaffected"
         );
         assert!(
@@ -247,20 +254,20 @@ mod tests {
         drop(a);
         assert!(r.wait_idle(1, Duration::from_millis(20)));
         r.reopen(1);
-        assert!(r.register(1, || true).is_some());
+        assert!(r.register(1, true, || true).is_some());
     }
 
     #[test]
     fn the_liveness_check_runs_under_the_lock_and_can_refuse() {
         let r = Arc::new(Registry::default());
-        assert!(r.register(1, || false).is_none());
+        assert!(r.register(1, true, || false).is_none());
         assert_eq!(r.live(), 0);
     }
 
     #[test]
     fn wait_idle_wakes_when_the_last_transport_leaves() {
         let r = Arc::new(Registry::default());
-        let a = r.register(7, || true).unwrap();
+        let a = r.register(7, true, || true).unwrap();
         r.close(7);
         let t = std::thread::spawn({
             let r = r.clone();
@@ -274,8 +281,8 @@ mod tests {
     #[test]
     fn shutdown_cancels_everything() {
         let r = Arc::new(Registry::default());
-        let a = r.register(1, || true).unwrap();
-        let b = r.register(2, || true).unwrap();
+        let a = r.register(1, true, || true).unwrap();
+        let b = r.register(2, true, || true).unwrap();
         r.cancel_all();
         assert!(a.cancel.is_set() && b.cancel.is_set());
         assert!(!r.wait_all_idle(Duration::from_millis(10)));

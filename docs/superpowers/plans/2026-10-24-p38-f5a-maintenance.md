@@ -97,6 +97,18 @@ if gc failed (the failure may be caused by such a lock). Startup keeps removing 
   repair, so reconcile success alone proved nothing).
 - The cancel flag is checked after the gate is taken; the reconcile does not carry it (short commands, a slow delete answers 503).
 
+### 4b. Additions after the Opus review
+
+- git names the quarantine `objects/tmp_objdir-incoming-XXXXXX` (since 2.35), not `incoming-*`; the first cut matched nothing. A test
+  pins the prefix against a real push.
+- A killed gc leaves `objects/info/commit-graph.lock` (and the chain lock), which fails every later gc: `clean_repo` removes them.
+- Stage 1 depends on `gc.cruftPacks=false` (see the threat model). Cleanup runs before stage 1 (a stale `packed-refs.lock` makes gc
+  print an error and still exit 0).
+- Registrations carry a `writes` flag; fetches do not defer the cleanup. The reconcile holds the shared lifecycle lock (`try_read`).
+  A pending merge intent skips the prune. The prune has its own 10-minute limit. `core.packedRefsTimeout` is 5 s so a ref delete
+  survives a concurrent `pack-refs`. The reconcile finishes its other repairs when the merge-ref repair fails.
+- Stage 2 is not purely file-system work: the reconcile can finalize or abort merge intents and close pull requests.
+
 ### 5. Failure and recovery
 
 gc killed at any point: stage 1 leaves the old packs until the new one is complete; git's temp files

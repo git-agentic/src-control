@@ -512,6 +512,8 @@ fn launch(l: Launch) -> Result<Started, LaunchError> {
         .registry
         .register(
             repo_id,
+            // Only a fetch is known to write no lock and no quarantine directory.
+            l.plan.service != Some(Service::Upload),
             || matches!(repos::find_by_id(&conn, repo_id), Ok(Some(r)) if r.state == "live"),
         )
         .ok_or_else(|| {

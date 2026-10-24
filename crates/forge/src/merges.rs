@@ -303,7 +303,8 @@ fn mark_landed(git: &Git, dir: &Path, i: &Intent) {
 
 /// Is a git writer holding the base ref right now (its lock file exists)? At run time that is a
 /// live writer (a push, or our own publish): the intent waits rather than being judged under it.
-/// The lock of a *dead* writer is cleared at startup (`orphans::sweep`), not guessed at here.
+/// The lock of a *dead* writer is cleared at startup (`orphans::sweep`) or by the maintenance pass
+/// once its writers are excluded (`orphans::clean_repo`), not guessed at here.
 fn base_is_locked(dir: &Path, base_ref: &str) -> bool {
     dir.join("refs")
         .join("heads")
@@ -456,8 +457,8 @@ fn publish(git: &Git, dir: &Path, i: &Intent) -> Result<bool, GitError> {
     }) {
         Ok(o) => Ok(o.ok()),
         // Killed by the runner's deadline. SIGKILL leaves the locks of the refs it had prepared; they
-        // stay until the next restart's cleanup, because a lock cannot be told from a live writer's
-        // at run time (the intent stays pending while the base is locked).
+        // stay until the next restart or maintenance pass cleans them, because a lock cannot be told
+        // from a live writer's here (the intent stays pending while the base is locked).
         Err(GitError::Timeout { .. }) => Ok(false),
         Err(e) => Err(e),
     }

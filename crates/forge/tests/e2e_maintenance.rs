@@ -395,7 +395,7 @@ fn a_running_transport_defers_the_cleanup_and_age_keeps_young_leftovers() {
     let w = world();
     let stale = w.repo().join("refs/heads/zz.lock");
     let young = w.repo().join("refs/heads/yy.lock");
-    let quarantine = w.repo().join("objects/incoming-abc123");
+    let quarantine = w.repo().join("objects/tmp_objdir-incoming-abc123");
     std::fs::write(&stale, "x").unwrap();
     std::fs::write(&young, "x").unwrap();
     std::fs::create_dir_all(quarantine.join("pack")).unwrap();
@@ -407,7 +407,7 @@ fn a_running_transport_defers_the_cleanup_and_age_keeps_young_leftovers() {
             w.s.app
                 .life
                 .registry
-                .register(w.id, || true)
+                .register(w.id, true, || true)
                 .expect("registers");
         assert!(matches!(w.maintain(), Outcome::Done { .. }));
         assert!(stale.exists() && quarantine.exists(), "an owner may exist");
@@ -589,7 +589,8 @@ fn a_branch_or_default_branch_writer_defers_the_cleanup() {
         // The exclusive lifecycle lock is what default-branch changes and branch deletes hold.
         let lock = w.s.app.life.lock_for(w.id);
         let _writer = lock.write().unwrap();
-        assert!(matches!(w.maintain(), Outcome::Done { .. }));
+        // Neither the cleanup nor the reconcile (a gated writer) runs beside it.
+        assert!(matches!(w.maintain(), Outcome::Skipped(_)));
         assert!(stale.exists(), "a lifecycle writer may own that lock");
     }
     assert!(matches!(w.maintain(), Outcome::Done { .. }));
@@ -617,5 +618,96 @@ fn an_open_pull_with_no_branch_and_no_retention_ref_stops_the_prune() {
     age(&w.loose_path(&junk), 30);
     let o = w.maintain();
     assert!(matches!(o, Outcome::Skipped(_)), "{o:?}");
+    assert!(w.exists(&junk));
+}
+
+#[test]
+fn a_fetch_does_not_defer_the_cleanup_but_a_push_does() {
+    let w = world();
+    let stale = w.repo().join("refs/heads/zz.lock");
+    std::fs::write(&stale, "x").unwrap();
+    age(&stale, 1);
+    let reg = &w.s.app.life.registry;
+    let push = reg.register(w.id, true, || true).expect("registers");
+    assert!(matches!(w.maintain(), Outcome::Done { .. }));
+    assert!(stale.exists(), "a push may own the lock");
+    drop(push);
+    let _fetch = reg.register(w.id, false, || true).expect("registers");
+    assert!(matches!(w.maintain(), Outcome::Done { .. }));
+    assert!(!stale.exists(), "a read-only run owns no lock");
+}
+
+#[test]
+fn the_quarantine_name_matches_what_git_really_creates() {
+    use scl_forge::orphans::QUARANTINE_PREFIX;
+    let w = world();
+    let hook = w.repo().join("hooks");
+    std::fs::create_dir_all(&hook).unwrap();
+    let seen = w.s.dir.join("seen");
+    // A pre-receive hook sees the quarantine: record what lives under objects/ at that moment.
+    let script = format!("#!/bin/sh\nls \"$GIT_DIR/objects\" > {}\n", seen.display());
+    // The server's own hooks directory is configured globally; use a per-repository override.
+    let own = w.s.dir.join("own-hooks");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join("pre-receive"), script).unwrap();
+    std::fs::set_permissions(
+        own.join("pre-receive"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let work = w.s.dir.join("work");
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    std::fs::write(work.join("a"), "a").unwrap();
+    git(&work, &["add", "a"]);
+    git(
+        &work,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@x",
+            "commit",
+            "-qm",
+            "m",
+        ],
+    );
+    let bare = w.s.dir.join("q.git");
+    git(&w.s.dir, &["init", "-q", "--bare", bare.to_str().unwrap()]);
+    git(&bare, &["config", "core.hooksPath", own.to_str().unwrap()]);
+    git(&work, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    let listing = std::fs::read_to_string(&seen).unwrap();
+    assert!(
+        listing.lines().any(|l| l.starts_with(QUARANTINE_PREFIX)),
+        "git names its quarantine differently now: {listing}"
+    );
+}
+
+#[test]
+fn an_absurd_prune_window_prunes_nothing() {
+    let w = world_with(
+        Cfg {
+            prune_expire: Duration::from_secs(u64::MAX),
+            ..cfg()
+        },
+        None,
+    );
+    let junk = w.loose("junk");
+    age(&w.loose_path(&junk), 30);
+    assert!(matches!(w.maintain(), Outcome::Skipped(_)));
     assert!(w.exists(&junk));
 }

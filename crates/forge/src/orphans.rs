@@ -7,8 +7,8 @@
 //! server (see `lifecycle::DirLock`), so at startup every git process that names a path under this
 //! data directory's `repos/` belongs to a dead predecessor; they are killed, and the `*.lock` files
 //! a killed git leaves in `refs/` (nothing else holds them now) are removed, before any recovery
-//! looks at the repositories. At run time nothing here runs: a live lock then belongs to a live
-//! writer.
+//! looks at the repositories. At run time only `clean_repo` runs, from the maintenance pass, and
+//! only when the repository's writers are excluded (see `maintenance.rs`).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -220,14 +220,24 @@ fn remove_locks(dir: &Path, depth: usize, min_age: Option<Duration>) -> usize {
     n
 }
 
+/// The name receive-pack gives its quarantine directory under `objects/` (git 2.35 and later;
+/// `MIN_GIT` is 2.40): `tmp_objdir-incoming-XXXXXX`. A test pins it against a real push.
+pub const QUARANTINE_PREFIX: &str = "tmp_objdir-incoming-";
+
 /// Remove what a killed git writer left in one repository: ref locks (`refs/**/*.lock`,
-/// `packed-refs.lock`, `HEAD.lock`) and receive-pack's `objects/incoming-*` quarantine directories.
+/// `packed-refs.lock`, `HEAD.lock`), the commit-graph locks a killed `gc` leaves (every later gc
+/// fails on them) and receive-pack's quarantine directories.
 /// With `min_age` only items at least that old go. The caller must know no git writer of the
 /// repository is alive (startup: after [`kill_orphan_git`]; at run time: the write gate is held and
 /// no transport is registered).
 pub fn clean_repo(repo: &Path, min_age: Option<Duration>) -> usize {
     let mut n = remove_locks(&repo.join("refs"), 0, min_age);
-    for f in ["packed-refs.lock", "HEAD.lock"] {
+    for f in [
+        "packed-refs.lock",
+        "HEAD.lock",
+        "objects/info/commit-graph.lock",
+        "objects/info/commit-graphs/commit-graph-chain.lock",
+    ] {
         let p = repo.join(f);
         if old_enough(&p, min_age) && std::fs::remove_file(&p).is_ok() {
             n += 1;
@@ -236,7 +246,10 @@ pub fn clean_repo(repo: &Path, min_age: Option<Duration>) -> usize {
     if let Ok(rd) = std::fs::read_dir(repo.join("objects")) {
         for e in rd.flatten() {
             let p = e.path();
-            let named = e.file_name().to_string_lossy().starts_with("incoming-");
+            let named = e
+                .file_name()
+                .to_string_lossy()
+                .starts_with(QUARANTINE_PREFIX);
             if named
                 && e.file_type().is_ok_and(|t| t.is_dir())
                 && old_enough(&p, min_age)
@@ -398,19 +411,25 @@ mod tests {
         let d = std::env::temp_dir().join(format!("scl-forge-orphans-q-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let repo = d.join("repos").join("1.git");
-        std::fs::create_dir_all(repo.join("objects/incoming-aB3xYz/pack")).unwrap();
+        std::fs::create_dir_all(repo.join("objects/tmp_objdir-incoming-aB3xYz/pack")).unwrap();
         std::fs::create_dir_all(repo.join("objects/pack")).unwrap();
         std::fs::create_dir_all(repo.join("refs/heads")).unwrap();
-        std::fs::write(repo.join("objects/incoming-aB3xYz/pack/tmp"), b"x").unwrap();
+        std::fs::write(
+            repo.join("objects/tmp_objdir-incoming-aB3xYz/pack/tmp"),
+            b"x",
+        )
+        .unwrap();
         std::fs::write(repo.join("refs/heads/a.lock"), b"").unwrap();
+        std::fs::create_dir_all(repo.join("objects/info/commit-graphs")).unwrap();
+        std::fs::write(repo.join("objects/info/commit-graph.lock"), b"").unwrap();
         // Young items stay when an age is given; the unconditional startup form removes them.
         assert_eq!(clean_repo(&repo, Some(Duration::from_secs(3600))), 0);
-        assert!(repo.join("objects/incoming-aB3xYz").exists());
-        assert_eq!(remove_stale_locks(&d), 2);
-        assert!(!repo.join("objects/incoming-aB3xYz").exists());
+        assert!(repo.join("objects/tmp_objdir-incoming-aB3xYz").exists());
+        assert_eq!(remove_stale_locks(&d), 3);
+        assert!(!repo.join("objects/tmp_objdir-incoming-aB3xYz").exists());
         assert!(
             repo.join("objects/pack").exists(),
-            "only incoming-* directories go"
+            "only quarantine directories go"
         );
         std::fs::remove_dir_all(&d).unwrap();
         assert!(!d.exists());
