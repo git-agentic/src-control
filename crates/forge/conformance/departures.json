@@ -349,7 +349,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "couldn't be found"
    ]
   },
   "reason": "Gitea answers 500 for an unknown sha; sc-forge answers 404"
@@ -362,7 +362,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "couldn't be found"
    ]
   },
   "reason": "Gitea answers 500 for an unknown sha; sc-forge answers 404"
@@ -1285,7 +1285,7 @@
    "status": 404,
    "ignore_body": true,
    "message_contains": [
-    "not found"
+    "couldn't be found"
    ],
    "ignore_headers": [
     "link",
@@ -1441,5 +1441,89 @@
    "value": ""
   },
   "reason": "HEAD stays on the unborn default branch, so ls-remote --symref HEAD prints nothing (Gitea moved HEAD to the first pushed branch)"
+ },
+ {
+  "scenario": "H",
+  "exchange": 37,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/status/statuses/<sha#4>",
+  "expect": {
+   "status": 422,
+   "message_contains": [
+    "state"
+   ],
+   "ignore_body": true
+  },
+  "reason": "sc-forge requires a state: a status without one is 422 [ignore_body: the recorded 201 body has another shape than the departed answer]"
+ },
+ {
+  "scenario": "H",
+  "exchange": 50,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/status/statuses/main?limit=100",
+  "expect": {
+   "status": 200,
+   "ignore_body": true,
+   "fields": {
+    "$len": 0
+   },
+   "ignore_headers": [
+    "link",
+    "x-total-count"
+   ]
+  },
+  "reason": "the only status on this commit was the refused bogus state, so the list is empty; ignore_body: the recorded body is a one-element list"
+ },
+ {
+  "scenario": "H",
+  "exchange": 1,
+  "kind": "note",
+  "match": "combined_state_no_statuses",
+  "expect": {
+   "value": "pending"
+  },
+  "reason": "existing commit with no statuses: combined state pending (1.26.2 behaviour); 1.22.6's empty string is an empty answer"
+ },
+ {
+  "scenario": "I",
+  "exchange": 7,
+  "kind": "git",
+  "match": "push-protected-write-collab",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "protected branch",
+    "pre-receive hook declined"
+   ]
+  },
+  "reason": "sc-forge's pre-receive words the refusal 'refusing to update protected branch <b>: direct pushes are not allowed'; Gitea says 'gitea: not allowed to push to protected branch <b>'. Both end in 'pre-receive hook declined'"
+ },
+ {
+  "scenario": "I",
+  "exchange": 8,
+  "kind": "git",
+  "match": "push-protected-admin",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "protected branch",
+    "pre-receive hook declined"
+   ]
+  },
+  "reason": "sc-forge's pre-receive words the refusal 'refusing to update protected branch <b>: direct pushes are not allowed'; Gitea says 'gitea: not allowed to push to protected branch <b>'. Both end in 'pre-receive hook declined'"
+ },
+ {
+  "scenario": "I",
+  "exchange": 10,
+  "kind": "git",
+  "match": "delete-protected-by-push",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "default branch",
+    "pre-receive hook declined"
+   ]
+  },
+  "reason": "sc-forge's hook words the refusal 'refusing to delete the default branch'; Gitea says 'gitea: branch main is the default branch and cannot be deleted'. Both end in 'pre-receive hook declined'"
  }
 ]

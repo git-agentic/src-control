@@ -901,6 +901,46 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
   deterministic interfering writer); the F4 `refs/forge/pull/<n>/head` refresh for a contents write to a PR branch;
   portable-name collision rules; a disk reservation sized to the exact rebuilt trees.
 
+### F4a decisions (as built)
+
+F4 ships as three PRs (F4a protection and statuses, F4b pulls, reviews and comments, F4c merge and recovery; plan:
+`docs/superpowers/plans/2026-10-24-p38-f4-pulls-statuses-merge-protection.md` with its "Decisions after independent
+review"). F4a adds migration 3 (`branch_protections`, `commit_statuses`) and gates scenarios H, I, W and the first five
+exchanges of Q.
+
+- **Rules.** `/branch_protections` CRUD (admin to write, read to read). A rule names one branch, compared
+  case-insensitively like `same_branch_name`; glob names and glob context names are refused (422), as is any setting
+  `sc-forge` does not enforce when set to a non-default value (`required_approvals`, whitelists, `block_on_*`,
+  `require_signed_commits`, `protected_file_patterns`, the 1.26.2 force-push keys). `enable_status_check` needs a
+  non-empty `status_check_contexts` (a gate that requires nothing would fail open). Responses carry the recorded key set;
+  a rule created without contexts reports `status_check_contexts: null`, a branch with no rule reports `[]` on the
+  branch object. Rule changes run under the write gate, so they are ordered against contents writes.
+- **`enable_push` false:** no push (administrators included), no contents write, no deletion; the rule also reserves
+  its name, so a push or a contents `new_branch` cannot create the branch (stricter than Gitea, which checks only an
+  existing branch). **True:** a fast-forward push and a contents write are allowed (even with required checks unmet,
+  W#8); a non-fast-forward push and a deletion are refused for everyone. A merge is not subject to `enable_push`.
+- **One policy.** `policy::{check_protected_push, check_contents_write, check_branch_delete}` take the loaded `Rules`;
+  the `pre-receive` hook, the contents API (twice per attempt, the second read immediately before `update-ref`, under
+  the gate) and the branch DELETE call them. The hook decides fast-forward with `git merge-base --is-ancestor` under the
+  runner's sanitized environment plus the quarantine's `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES`
+  (each must lie under the repository's own `objects/`), the git binary from `FORGE_GIT_BIN`; any doubt refuses.
+  A push is not excluded by the gate, so a rule created while a push is in flight can be bypassed by that one push.
+- **Branch DELETE** refuses a protected branch (403 `branch <b> is protected and cannot be deleted`) and deletes with
+  the observed tip as the expected old id (retrying a few times), so a push that lands between the read and the delete
+  is not deleted with it.
+- **Statuses.** `POST /statuses/{sha..}` (write; the sha may be a branch, tag, `HEAD` or id, resolved to a commit),
+  `GET /statuses/{ref..}` and `GET /commits/{ref}/statuses` (history, newest first, paged), `GET /commits/{ref}/status`
+  (latest per context, oldest first, paged; `total_count` is the page, `X-Total-Count` the whole). Unknown state or a
+  missing `state` is 422, unknown commit 404 (departures); `context` up to 1024 bytes and not defaulted (recorded H#36),
+  `description` up to 1024 characters, `target_url` empty or plain `http(s)`. The combined state is `failure` for any
+  `error`/`failure`, else `pending`, `warning`, `success`, `skipped` (only the first three are recorded). A commit with
+  no statuses reads `pending` with the real sha and `repository: null`. The creator object shows
+  `<login>@noreply.localhost`, never the stored address, and `is_admin: false`. Storage is bounded per commit: 100
+  distinct contexts and 100 rows per context (oldest dropped; a departure from Gitea, which keeps everything).
+- **Refusal texts.** Pushes are refused with `refusing to update protected branch <b>: direct pushes are not allowed`,
+  `refusing to force-push protected branch <b>` and `refusing to delete protected branch <b>` (departure entries for
+  I#7, I#8 and I#10; the default branch keeps F2b's wording and is checked first).
+
 ## Open questions
 
 1. The merge of a PR whose head is already in base (recorded: 405 `try again later`,

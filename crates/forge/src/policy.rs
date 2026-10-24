@@ -38,12 +38,85 @@ pub fn check_update(name: &str, new: &str, default_branch: &str) -> Result<(), R
     ))
 }
 
+/// One branch protection rule: exact branch name (compared like [`same_branch_name`]), whether
+/// direct updates are allowed at all (`enable_push`), and the status contexts a merge needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub branch: String,
+    pub enable_push: bool,
+    pub enable_status_check: bool,
+    /// `None` when the request gave none (recorded: the API then reports `null`).
+    pub contexts: Option<Vec<String>>,
+}
+
+/// The protection rules of one repository.
+#[derive(Clone, Debug, Default)]
+pub struct Rules(pub Vec<Rule>);
+
+impl Rules {
+    /// The rule that protects `name`, if any.
+    pub fn for_branch(&self, name: &str) -> Option<&Rule> {
+        self.0.iter().find(|r| same_branch_name(&r.branch, name))
+    }
+}
+
+/// May a client push `old` -> `new` to `refs/heads/<branch>` under `rules`? Applied after
+/// [`check_update`]. A rule with `enable_push` off refuses every update (the branch can only move
+/// through a merge), administrators included; with it on, a fast-forward is fine and a deletion
+/// or a non-fast-forward update is refused for everyone. `is_ff` runs only when it matters
+/// (an update of an existing branch under a rule that allows pushes) and any failure to decide
+/// refuses the update.
+pub fn check_protected_push(
+    rules: &Rules,
+    branch: &str,
+    old: &str,
+    new: &str,
+    is_ff: impl FnOnce() -> Result<bool, String>,
+) -> Result<(), Refusal> {
+    let Some(rule) = rules.for_branch(branch) else {
+        return Ok(());
+    };
+    if !rule.enable_push {
+        return Err(format!(
+            "refusing to update protected branch {branch}: direct pushes are not allowed"
+        ));
+    }
+    if is_delete(new) {
+        return Err(format!("refusing to delete protected branch {branch}"));
+    }
+    if is_delete(old) {
+        return Ok(());
+    }
+    match is_ff() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("refusing to force-push protected branch {branch}")),
+        Err(e) => Err(format!(
+            "refusing to update protected branch {branch}: cannot tell whether it is a fast-forward ({e})"
+        )),
+    }
+}
+
 /// May a contents write put a commit on branch `target`? `creating` is true when the write creates
 /// the branch (`new_branch`, or the first commit of an unborn default). Called before the objects
-/// are built and again immediately before the ref update, on every attempt, so a rule added in F4
-/// is evaluated at the moment the ref moves (the spec's linearization point).
-pub fn check_contents_write(_target: &str, _creating: bool) -> Result<(), Refusal> {
-    Ok(())
+/// are built and again immediately before the ref update, on every attempt, with the rules read
+/// under the repository's write gate, so a rule change is ordered against the write (the spec's
+/// linearization point). Rules refuse when `enable_push` is off, whether or not the branch
+/// exists yet: a rule reserves its name (stricter than Gitea, which checks only an existing
+/// branch).
+pub fn check_contents_write(rules: &Rules, target: &str, _creating: bool) -> Result<(), Refusal> {
+    match rules.for_branch(target) {
+        Some(r) if !r.enable_push => Err(format!("branch {target} is protected")),
+        _ => Ok(()),
+    }
+}
+
+/// May the API delete branch `name`? A protected branch is never deleted by the API (the default
+/// branch is refused before this is asked).
+pub fn check_branch_delete(rules: &Rules, name: &str) -> Result<(), Refusal> {
+    match rules.for_branch(name) {
+        Some(_) => Err(format!("branch {name} is protected and cannot be deleted")),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -129,5 +202,56 @@ mod tests {
                 && !is_delete(A)
                 && !is_delete("0000000000000000000000000000000000000001")
         );
+    }
+
+    fn rules(push: bool) -> Rules {
+        Rules(vec![Rule {
+            branch: "Release".into(),
+            enable_push: push,
+            enable_status_check: false,
+            contexts: None,
+        }])
+    }
+
+    #[test]
+    fn a_rule_with_pushes_off_refuses_every_update_including_creation() {
+        let r = rules(false);
+        for (old, new) in [(A, A), (Z, A), (A, Z)] {
+            assert!(
+                check_protected_push(&r, "release", old, new, || Ok(true)).is_err(),
+                "{old} {new}"
+            );
+        }
+        assert!(check_contents_write(&r, "RELEASE", true).is_err());
+        assert!(check_contents_write(&r, "other", true).is_ok());
+    }
+
+    #[test]
+    fn a_rule_with_pushes_on_allows_fast_forwards_only() {
+        let r = rules(true);
+        assert!(check_protected_push(&r, "release", A, A, || Ok(true)).is_ok());
+        assert!(
+            check_protected_push(&r, "release", Z, A, || panic!("creation needs no ancestry"))
+                .is_ok()
+        );
+        let e = check_protected_push(&r, "release", A, A, || Ok(false)).unwrap_err();
+        assert!(e.contains("force-push"), "{e}");
+        let e = check_protected_push(&r, "release", A, Z, || panic!("deletion needs no ancestry"))
+            .unwrap_err();
+        assert!(e.contains("delete"), "{e}");
+        assert!(
+            check_protected_push(&r, "release", A, A, || Err("boom".into())).is_err(),
+            "a failure to decide refuses"
+        );
+        assert!(check_contents_write(&r, "release", false).is_ok());
+    }
+
+    #[test]
+    fn unruled_branches_and_branch_delete() {
+        let r = rules(true);
+        assert!(check_protected_push(&r, "dev", A, Z, || Ok(false)).is_ok());
+        assert!(check_branch_delete(&r, "RELEASE").is_err());
+        assert!(check_branch_delete(&r, "dev").is_ok());
+        assert!(check_branch_delete(&Rules::default(), "release").is_ok());
     }
 }

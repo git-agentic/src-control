@@ -30,6 +30,8 @@ fn life_err(app: &App, e: LifecycleError) -> Resp {
             "The repository with the same name already exists.",
         ),
         LifecycleError::BadBranch => error(&app.base, 422, "[DefaultBranch]: invalid branch name"),
+        LifecycleError::Protected(m) => error(&app.base, 403, &m),
+        LifecycleError::Conflict(m) => error(&app.base, 409, &m),
         LifecycleError::Gone => not_found(&app.base, "The target couldn't be found.", None),
         LifecycleError::Git(crate::gitproc::GitError::Busy) => {
             error(&app.base, 503, "too many git operations in flight")
@@ -81,7 +83,12 @@ fn compute_empty(app: &App, conn: &rusqlite::Connection, r: &Repo) -> Result<boo
 }
 
 /// The repository object with a live read of `empty`.
-fn repo_json(app: &App, conn: &rusqlite::Connection, r: &Repo, perm: Perm) -> Result<Value, Resp> {
+pub(crate) fn repo_json(
+    app: &App,
+    conn: &rusqlite::Connection,
+    r: &Repo,
+    perm: Perm,
+) -> Result<Value, Resp> {
     let empty = compute_empty(app, conn, r)?;
     repo_json_known(app, conn, r, perm, empty)
 }
@@ -618,7 +625,12 @@ pub fn collaborator_permission(ctx: &mut Ctx) -> Resp {
     )
 }
 
-fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Resp> {
+fn branch_json(
+    ctx: &Ctx,
+    a: &Access,
+    br: &gitread::Branch,
+    rules: &crate::policy::Rules,
+) -> Result<Value, Resp> {
     let dir = ctx.app.life.repo_dir(a.repo.id);
     let c = gitread::commit(&ctx.app.life.git, &dir, &br.oid)
         .map_err(|e| git_read_err(ctx.app, ctx.conn, a.repo.id, e))?
@@ -629,6 +641,7 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
     let (author_login, committer_login) = (login(&c.author)?, login(&c.committer)?);
     let who = |p: &gitread::Person, login: Option<String>| json!({"name": p.name, "email": p.email, "username": login.unwrap_or_default()});
     let full = format!("{}/{}", a.repo.owner, a.repo.name);
+    let rule = rules.for_branch(&br.name);
     Ok(json!({
         "name": br.name,
         "commit": {
@@ -643,13 +656,13 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
             "removed": null,
             "modified": null,
         },
-        "protected": false,
+        "protected": rule.is_some(),
         "required_approvals": 0,
-        "enable_status_check": false,
-        "status_check_contexts": [],
-        "user_can_push": a.perm >= Perm::Write,
+        "enable_status_check": rule.is_some_and(|r| r.enable_status_check),
+        "status_check_contexts": rule.map_or_else(|| json!([]), |r| json!(r.contexts)),
+        "user_can_push": a.perm >= Perm::Write && rule.is_none_or(|r| r.enable_push),
         "user_can_merge": a.perm >= Perm::Write,
-        "effective_branch_protection_name": "",
+        "effective_branch_protection_name": rule.map_or("", |r| r.branch.as_str()),
     }))
 }
 
@@ -692,7 +705,14 @@ fn list_branches_inner(ctx: &Ctx, a: &Access) -> Resp {
     let total = all.len() as i64;
     let start = (((page - 1) * limit) as usize).min(all.len());
     let rows = &all[start..(start + limit as usize).min(all.len())];
-    let items: Result<Vec<Value>, Resp> = rows.iter().map(|b| branch_json(ctx, a, b)).collect();
+    let rules = match crate::protection::load(ctx.conn, a.repo.id) {
+        Ok(r) => r,
+        Err(e) => return ctx.app.internal(&e),
+    };
+    let items: Result<Vec<Value>, Resp> = rows
+        .iter()
+        .map(|b| branch_json(ctx, a, b, &rules))
+        .collect();
     match items {
         Ok(items) => paged(
             ctx,
@@ -718,7 +738,10 @@ pub fn get_branch(ctx: &mut Ctx) -> Resp {
 fn get_branch_inner(ctx: &Ctx, a: &Access) -> Resp {
     let name = ctx.param("b").to_string();
     match gitread::branch_oid(&ctx.app.life.git, &ctx.app.life.repo_dir(a.repo.id), &name) {
-        Ok(Some(oid)) => match branch_json(ctx, a, &gitread::Branch { name, oid }) {
+        Ok(Some(oid)) => match crate::protection::load(ctx.conn, a.repo.id)
+            .map_err(|e| ctx.app.internal(&e))
+            .and_then(|rules| branch_json(ctx, a, &gitread::Branch { name, oid }, &rules))
+        {
             Ok(v) => Resp::json(200, &v),
             Err(r) => r,
         },

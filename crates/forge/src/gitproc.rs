@@ -102,6 +102,9 @@ pub struct Spec<'a> {
     pub max_output: Option<usize>,
     /// Longer deadline than the runner's default.
     pub timeout: Option<Duration>,
+    /// Extra environment for this spawn, added after the pinned one (the `pre-receive` hook passes
+    /// the object directories of git's quarantine this way).
+    pub extra_env: &'a [(&'a str, &'a str)],
 }
 
 /// The runner.
@@ -217,7 +220,9 @@ impl Git {
             .acquire_timeout(self.admission)
             .ok_or(GitError::Busy)?;
         let mut cmd = Command::new(program);
-        cmd.env_clear().envs(self.env(spec.identity));
+        cmd.env_clear()
+            .envs(self.env(spec.identity))
+            .envs(spec.extra_env.iter().copied());
         if let Some(repo) = spec.repo {
             cmd.arg(format!("--git-dir={}", repo.display()));
         }

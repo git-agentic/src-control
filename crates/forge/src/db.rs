@@ -70,11 +70,49 @@ const MIGRATIONS: &[&str] = &[
         mode TEXT NOT NULL CHECK (mode IN ('read', 'write', 'admin')),
         PRIMARY KEY (repo_id, user_id)
     );",
+    // 3: branch protection rules (exact branch names; `lower_branch` is the Unicode-lowercased
+    // name the case-insensitive uniqueness and matching use; `status_check_contexts` is a JSON
+    // array, NULL when the request gave none) and commit statuses (latest per context is the
+    // highest id).
+    "CREATE TABLE branch_protections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        branch TEXT NOT NULL,
+        lower_branch TEXT NOT NULL,
+        enable_push INTEGER NOT NULL DEFAULT 0,
+        enable_status_check INTEGER NOT NULL DEFAULT 0,
+        status_check_contexts TEXT,
+        created_unix INTEGER NOT NULL,
+        updated_unix INTEGER NOT NULL,
+        UNIQUE (repo_id, lower_branch)
+    );
+    CREATE TABLE commit_statuses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        sha TEXT NOT NULL,
+        context TEXT NOT NULL,
+        state TEXT NOT NULL
+            CHECK (state IN ('pending', 'success', 'error', 'failure', 'warning', 'skipped')),
+        description TEXT NOT NULL DEFAULT '',
+        target_url TEXT NOT NULL DEFAULT '',
+        creator_id INTEGER NOT NULL REFERENCES users(id),
+        created_unix INTEGER NOT NULL,
+        updated_unix INTEGER NOT NULL
+    );
+    CREATE INDEX commit_statuses_by_sha ON commit_statuses (repo_id, sha, context, id);",
 ];
 
 /// Every table the current schema creates; `/healthz` probes each, so a missing or unreadable one
 /// (whatever the recorded version says) reads as not ready.
-pub const TABLES: &[&str] = &["users", "org_members", "tokens", "repos", "collaborators"];
+pub const TABLES: &[&str] = &[
+    "users",
+    "org_members",
+    "tokens",
+    "repos",
+    "collaborators",
+    "branch_protections",
+    "commit_statuses",
+];
 
 /// Database failures a caller reports to the operator.
 #[derive(Debug, thiserror::Error)]

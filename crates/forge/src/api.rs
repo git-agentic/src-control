@@ -148,6 +148,22 @@ pub(crate) fn paged_with(
     extra: &[(&str, String)],
     items: Vec<Value>,
 ) -> Resp {
+    let mut r = Resp::json(200, &Value::Array(items)).with("x-total-count", total.to_string());
+    if let Some(l) = link_header(ctx, path, total, page, limit, extra) {
+        r = r.with("link", l);
+    }
+    r
+}
+
+/// Gitea's `Link` header value for page `page` of `total` rows, or `None` when there is one page.
+pub(crate) fn link_header(
+    ctx: &Ctx,
+    path: &str,
+    total: i64,
+    page: i64,
+    limit: i64,
+    extra: &[(&str, String)],
+) -> Option<String> {
     let tail: String = extra.iter().map(|(k, v)| format!("&{k}={v}")).collect();
     let last = ((total + limit - 1) / limit).max(1);
     let url = |p: i64, rel: &str| {
@@ -165,11 +181,7 @@ pub(crate) fn paged_with(
         links.push(url(1, "first"));
         links.push(url(page - 1, "prev"));
     }
-    let mut r = Resp::json(200, &Value::Array(items)).with("x-total-count", total.to_string());
-    if !links.is_empty() {
-        r = r.with("link", links.join(","));
-    }
-    r
+    (!links.is_empty()).then(|| links.join(","))
 }
 
 /// Like [`paged`], but a page link repeats *every* request parameter, alphabetically by name (what

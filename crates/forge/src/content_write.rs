@@ -250,7 +250,12 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
     let new_branch = w.new_branch.clone().filter(|n| *n != base_name);
     let target_name = new_branch.clone().unwrap_or_else(|| base_name.clone());
     // Gitea checks protection before it looks at the tree.
-    if policy::check_contents_write(&target_name, new_branch.is_some()).is_err() {
+    // The rules are read here, under the write gate, so a rule change is ordered against this write.
+    let rules = match crate::protection::load(ctx.conn, a.repo.id) {
+        Ok(r) => r,
+        Err(e) => return ctx.app.internal(&e),
+    };
+    if policy::check_contents_write(&rules, &target_name, new_branch.is_some()).is_err() {
         return denied(ctx);
     }
     let comps: Vec<&str> = w.path.split('/').collect();
@@ -387,7 +392,11 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
             return error(&ctx.app.base, 503, "the write took too long, try again");
         }
         // The linearization point of branch protection: just before the ref moves.
-        if policy::check_contents_write(&target_name, creating).is_err() {
+        let rules = match crate::protection::load(ctx.conn, a.repo.id) {
+            Ok(r) => r,
+            Err(e) => return ctx.app.internal(&e),
+        };
+        if policy::check_contents_write(&rules, &target_name, creating).is_err() {
             return denied(ctx);
         }
         let failure = match gw::update_ref(git, &d, &full, &commit, &expected) {
