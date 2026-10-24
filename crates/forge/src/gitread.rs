@@ -324,7 +324,12 @@ mod tests {
             .unwrap()
             .text();
         // alphabetical order (aaa, bbb, mmm, zzz) conflicts with the date order below
-        for (branch, when) in [("aaa", 100), ("mmm", 200), ("zzz", 300), ("bbb", 300)] {
+        for (branch, when) in [
+            ("aaa", 1_700_000_100),
+            ("mmm", 1_700_000_200),
+            ("zzz", 1_700_000_300),
+            ("bbb", 1_700_000_300),
+        ] {
             let id = id_at(when);
             let oid = g
                 .run(&Spec {
