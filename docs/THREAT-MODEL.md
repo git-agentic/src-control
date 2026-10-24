@@ -1082,8 +1082,12 @@ SIGKILL during merges, restarted and checked), and the `bypass_matrix_*` tests i
   that matter), restarts it, and asserts after every restart: no pending intent, no marker, every pull request merged with a
   two-parent commit on the base or open with its head not on the base; it keeps going until the database shows an intent aborted
   by recovery and one finished by recovery.
-- **Operator note.** A git writer killed at run time (the runner's timeout) can leave `refs/heads/<base>.lock`; pushes and merges to that branch
-  then wait until the next restart clears it. Migration 5 was rewritten while the feature was unreleased (no database at version 5 exists outside
+- **Operator note.** A merge's `update-ref` killed by the runner's deadline can leave `refs/heads/<base>.lock` and `refs/heads/<head>.lock`
+  (the transaction locks the verified head as well as the base); the merge clears the locks younger than its own helper right after (an
+  older lock is somebody else's), and the startup cleanup removes every `refs/**/*.lock` once no matching git process is left alive (it
+  leaves them, and says so, if one cannot be killed). Locks of other writers killed at run time wait for the next restart. The cleanup
+  matches git processes by command line (`--git-dir=<data>/repos/...`, `receive-pack`/`upload-pack <repo path>`), which are the ones
+  that can move a ref. Migration 5 was rewritten while the feature was unreleased (no database at version 5 exists outside
   CI); a later change to it needs a new migration.
 - **Known windows.** A rule created while a push is between `pre-receive` and its ref update is not stopped (the push does not
   take the gate). A merge computes its tree before it takes the base lock in git, so a base that moves under it only costs a retry,

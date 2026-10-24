@@ -432,6 +432,7 @@ fn publish(git: &Git, dir: &Path, i: &Intent) -> Result<bool, GitError> {
         merge = i.merge_oid,
         base_oid = i.base_oid,
     );
+    let started = std::time::SystemTime::now();
     match git.run(&Spec {
         repo: Some(dir),
         args: &["update-ref", "--stdin"],
@@ -439,8 +440,32 @@ fn publish(git: &Git, dir: &Path, i: &Intent) -> Result<bool, GitError> {
         ..Default::default()
     }) {
         Ok(o) => Ok(o.ok()),
-        Err(GitError::Timeout { .. }) => Ok(false),
+        // Killed by the runner's deadline: SIGKILL leaves the locks of the refs it had prepared.
+        Err(GitError::Timeout { .. }) => {
+            clear_own_locks(dir, &[&i.head_ref, &i.base_ref], started);
+            Ok(false)
+        }
         Err(e) => Err(e),
+    }
+}
+
+/// After our own `update-ref` was killed on a timeout, remove the ref locks it left. Only locks
+/// created since `since` (the helper's start) are touched: a helper stuck that long had long since
+/// taken its locks (git gives up on a lock held by someone else within 100 ms), so a lock younger
+/// than the helper is its own, and an older one belongs to somebody else.
+fn clear_own_locks(dir: &Path, branches: &[&str], since: std::time::SystemTime) {
+    let slack = Duration::from_secs(1);
+    for b in branches {
+        let lock = dir.join("refs").join("heads").join(format!("{b}.lock"));
+        let ours = std::fs::metadata(&lock)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t + slack >= since);
+        if ours && std::fs::remove_file(&lock).is_ok() {
+            eprintln!(
+                "sc-forge: removed the ref lock {} left by a publication that timed out",
+                lock.display()
+            );
+        }
     }
 }
 
@@ -797,6 +822,31 @@ mod tests {
             insert(&c, &intent(repo, user, 1), 8).is_ok(),
             "an aborted intent frees the slot"
         );
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn a_timed_out_publication_clears_only_locks_younger_than_itself() {
+        let d = std::env::temp_dir().join(format!("scl-forge-ownlocks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("refs/heads")).unwrap();
+        let old = d.join("refs/heads/old.lock");
+        let fresh = d.join("refs/heads/fresh.lock");
+        std::fs::write(&old, b"").unwrap();
+        std::fs::write(&fresh, b"").unwrap();
+        // pretend the helper started after `old` was created and before `fresh` was
+        let long_ago = std::fs::File::options().write(true).open(&old).unwrap();
+        long_ago
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+        clear_own_locks(
+            &d,
+            &["old", "fresh", "absent"],
+            std::time::SystemTime::now() - Duration::from_secs(5),
+        );
+        assert!(old.exists(), "an older lock is somebody else's");
+        assert!(!fresh.exists(), "a younger one is the helper's own");
         std::fs::remove_dir_all(&d).unwrap();
         assert!(!d.exists());
     }
