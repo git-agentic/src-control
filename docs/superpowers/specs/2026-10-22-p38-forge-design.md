@@ -884,7 +884,7 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
   lifecycle lock, each once (`Lifecycle::with_write_row`, which hands over the fresh row); documented in
   `lifecycle.rs` as the order F4 must follow. The runner gate applies to every git command.
 - **Publication.** Objects first, the ref last by `update-ref` CAS. After any failure the ref is re-read and the outcome
-  decided by `gitwrite::classify` (landed, lost round, lock held with a 50 ms pause, branch gone 404, `new_branch` exists
+  decided by `gitwrite::classify` (landed, which includes a tip that has our commit as an ancestor, as when a push built on a killed `update-ref` that had succeeded; lost round, lock held with a 50 ms pause, branch gone 404, `new_branch` exists
   422, ref D/F conflict 422, anything else 500, logged); three lost rounds is 409 `the branch was changed concurrently,
   try again`, or 503 `the branch is locked` when every round met a held ref lock (a killed git can leave a stale
   `refs/heads/<b>.lock`; the log then tells the operator to remove it). The response is built before the ref moves and nothing is read from git afterwards; the repository's

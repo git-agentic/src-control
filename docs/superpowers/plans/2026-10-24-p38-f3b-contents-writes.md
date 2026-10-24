@@ -78,7 +78,8 @@ re-acquired beneath it and never upgraded; helpers below this boundary use no `r
 7. `update-ref refs/heads/<target> <new> <expected>` (`expected` is `old`, or the zero id to create). **Outcome table**
    (re-read of the target ref after any failure; a re-read that itself fails is 500, never "missing"; every failure is
    logged with stderr, and a message naming a `.lock` file gets an operator hint):
-   - ref now equals `new`: success (covers a killed process whose update landed);
+   - ref now equals `new`, or has `new` as an ancestor: success (a killed process whose update landed, even if a
+     push has built on it since);
    - advance, ref gone: 404 `branch does not exist`;
    - advance, ref changed: lost round, back to step 2 for the new tip (preconditions re-evaluated: the PUT/DELETE
      `sha` must still match, a POST path must still be absent; the blob is reused);
