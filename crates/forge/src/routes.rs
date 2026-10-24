@@ -10,7 +10,8 @@ use crate::limits::{Backoff, Gate, Proxies};
 use crate::repos::{self, Access, Perm};
 use crate::scope::{self, Cat, Level, Need};
 use crate::{
-    api, content_api, content_write, db, protection, pulls_api, repo_api, reviews, statuses, store,
+    api, content_api, content_write, db, merges, protection, pulls_api, repo_api, reviews,
+    statuses, store,
 };
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -629,6 +630,14 @@ pub static ROUTES: &[Route] = &[
         n(Cat::Issue, Level::Write),
         Repo(Perm::Read),
         reviews::create_comment,
+    ),
+    r(
+        "POST",
+        "/repos/{o}/{r}/pulls/{n}/merge",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Read),
+        merges::merge_pull,
     ),
 ];
 

@@ -186,7 +186,7 @@ pub fn write_contents(ctx: &mut Ctx) -> Resp {
 
 /// The address git will record: surrounding blanks are stripped by git, so strip them here too and the
 /// response matches the commit.
-fn commit_email(user: &crate::store::User) -> String {
+pub(crate) fn commit_email(user: &crate::store::User) -> String {
     let e = user.email.trim();
     if e.is_empty() {
         format!("{}@noreply.localhost", user.login)

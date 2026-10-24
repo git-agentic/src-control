@@ -35,11 +35,11 @@ fn enc_path(p: &str) -> String {
         .join("/")
 }
 
-fn missing(ctx: &Ctx) -> Resp {
+pub(crate) fn missing(ctx: &Ctx) -> Resp {
     not_found(&ctx.app.base, "The target couldn't be found.", None)
 }
 
-fn needs_write(ctx: &Ctx) -> Resp {
+pub(crate) fn needs_write(ctx: &Ctx) -> Resp {
     error(
         &ctx.app.base,
         403,
@@ -48,11 +48,11 @@ fn needs_write(ctx: &Ctx) -> Resp {
 }
 
 /// The PR number out of a path parameter (`12`, or `12.diff` / `12.patch` where allowed).
-fn number(raw: &str) -> Option<i64> {
+pub(crate) fn number(raw: &str) -> Option<i64> {
     raw.parse::<i64>().ok().filter(|n| *n >= 1)
 }
 
-fn tip(ctx: &Ctx, a: &Access, branch: &str) -> Result<Option<String>, Resp> {
+pub(crate) fn tip(ctx: &Ctx, a: &Access, branch: &str) -> Result<Option<String>, Resp> {
     if !refname::valid_branch(branch) {
         return Ok(None);
     }
@@ -128,13 +128,15 @@ fn live(ctx: &Ctx, a: &Access, p: &Pull) -> Result<Live, Resp> {
         pulls::ComputeError::Db(e) => ctx.app.internal(&e),
         pulls::ComputeError::Git(e) => read_err(ctx, a, e),
     })?;
+    let merge_base = c.merge_base.or_else(|| Some(base_sha.clone()));
     Ok(Live {
         base_sha,
         head_sha,
         head_ref,
         // Recorded: a closed PR keeps reading mergeable.
         mergeable: p.state != "open" || c.mergeable,
-        merge_base: c.merge_base,
+        // Unrelated histories have no merge base; Gitea names the base tip (recorded T#0) and so do the diffs.
+        merge_base,
         changed_files: c.changed_files,
         additions: c.additions,
         deletions: c.deletions,
@@ -191,7 +193,7 @@ fn pull_json(
         "merged": merged,
         "merged_at": p.merged.filter(|_| merged).map(rfc3339),
         "merge_commit_sha": if merged { json!(p.merge_commit) } else { Value::Null },
-        "merged_by": match p.merged_by.filter(|_| merged) { Some(id) => user(id)?, None => Value::Null },
+        "merged_by": match p.merged_by.filter(|_| merged) { Some(id) => nested_user(ctx, id)?, None => Value::Null },
         "allow_maintainer_edit": false,
         "base": {"label": p.base_ref, "ref": p.base_ref, "sha": l.base_sha, "repo_id": a.repo.id, "repo": repo},
         "head": {"label": p.head_ref, "ref": l.head_ref, "sha": l.head_sha, "repo_id": a.repo.id, "repo": repo},
@@ -202,6 +204,14 @@ fn pull_json(
         "closed_at": p.closed.map(rfc3339),
         "pin_order": 0,
     }))
+}
+
+/// The account in `merged_by`: the nested form Gitea shows there (login-derived email, inactive).
+fn nested_user(ctx: &Ctx, id: i64) -> Result<Value, Resp> {
+    let u = store::find_by_id(ctx.conn, id)
+        .map_err(|e| ctx.app.internal(&e))?
+        .ok_or_else(|| ctx.app.internal(&"pull request without merger"))?;
+    Ok(crate::api::nested_user_json(&ctx.app.base, &u, true))
 }
 
 fn repo_value(ctx: &Ctx, a: &Access) -> Result<Value, Resp> {
@@ -220,7 +230,7 @@ pub(crate) fn head_of(ctx: &Ctx, a: &Access, p: &Pull) -> Result<String, Resp> {
     live(ctx, a, p).map(|l| l.head_sha)
 }
 
-fn find(ctx: &Ctx, a: &Access, n: i64) -> Result<Pull, Resp> {
+pub(crate) fn find(ctx: &Ctx, a: &Access, n: i64) -> Result<Pull, Resp> {
     match pulls::find(ctx.conn, a.repo.id, n) {
         Ok(Some(p)) => Ok(p),
         Ok(None) => Err(missing(ctx)),
@@ -229,7 +239,7 @@ fn find(ctx: &Ctx, a: &Access, n: i64) -> Result<Pull, Resp> {
 }
 
 /// Run `f` under the write gate.
-fn gated(ctx: &Ctx, a: &Access, f: impl FnOnce() -> Resp) -> Resp {
+pub(crate) fn gated(ctx: &Ctx, a: &Access, f: impl FnOnce() -> Resp) -> Resp {
     match ctx
         .app
         .life
@@ -249,6 +259,15 @@ fn gated(ctx: &Ctx, a: &Access, f: impl FnOnce() -> Resp) -> Resp {
 /// Before a read: if a push deleted the head of an open PR and its own sync has not run yet,
 /// run it now (outside any lifecycle lock; the sync takes the write gate).
 fn converge(ctx: &Ctx, a: &Access) {
+    // An unfinished merge is completed if the gate is free right now (never waited for).
+    if crate::merges::has_pending(ctx.conn, a.repo.id) {
+        let _ = ctx
+            .app
+            .life
+            .with_write_row(ctx.conn, a.repo.id, Duration::from_millis(50), |_| {
+                crate::merges::recover_locked(ctx.conn, &ctx.app.life.git, &dir(ctx, a), a.repo.id)
+            });
+    }
     if pulls::has_vanished_head(ctx.conn, &ctx.app.life.git, &dir(ctx, a), a.repo.id) {
         pulls::sync(&ctx.app.life, ctx.conn, a.repo.id, now());
     }
@@ -333,7 +352,9 @@ pub fn create_pull(ctx: &mut Ctx) -> Resp {
             Ok(None) => {}
             Err(e) => return ctx.app.internal(&e),
         }
-        if head_tip == base_tip {
+        // Recorded: a head already contained in the base (even the same commit) is accepted; only a
+        // branch compared with itself has "no changes".
+        if head == base {
             return error(
                 &ctx.app.base,
                 422,

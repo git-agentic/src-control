@@ -324,7 +324,8 @@ pub fn compute(
         return Ok(c);
     }
     let mb = merge_base(git, dir, base, head)?;
-    let (files, stats) = gitobj::changes(git, dir, mb.as_deref(), head)?;
+    // Unrelated histories: the changes are counted against the base tip (recorded T#0).
+    let (files, stats) = gitobj::changes(git, dir, Some(mb.as_deref().unwrap_or(base)), head)?;
     // Unrelated histories cannot merge; `merge-tree` would die on them.
     let mergeable = mb.is_some() && merges_cleanly(git, dir, base, head)?;
     let c = Compute {
@@ -561,6 +562,9 @@ pub fn reconcile_repo(
     repo_id: i64,
     now: i64,
 ) -> Result<(), ComputeError> {
+    // A merge a crash interrupted is settled first: its receipt decides, then stray receipts go.
+    crate::merges::recover_locked(conn, git, dir, repo_id)?;
+    crate::merges::drop_stale_receipts(conn, git, dir, repo_id)?;
     sync_locked(conn, git, dir, repo_id, now)?;
     let kept = refs_under(git, dir, "refs/forge/pull")?;
     let mut st =

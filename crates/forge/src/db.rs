@@ -163,6 +163,28 @@ const MIGRATIONS: &[&str] = &[
         updated_unix INTEGER NOT NULL
     );
     CREATE INDEX issue_comments_by_issue ON issue_comments (repo_id, number, id);",
+    // 5: the merge journal. A row is written before the base branch moves; the ref transaction that
+    // moves it also creates `refs/forge/merge/<id>` (the receipt), so a crash is resolved by asking
+    // whether the receipt exists, never by looking at where the base is now.
+    "CREATE TABLE merge_intents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        pull_number INTEGER NOT NULL,
+        base_ref TEXT NOT NULL,
+        head_ref TEXT NOT NULL,
+        base_oid TEXT NOT NULL,
+        head_oid TEXT NOT NULL,
+        merge_oid TEXT NOT NULL,
+        merge_base TEXT NOT NULL DEFAULT '',
+        changed_files INTEGER NOT NULL,
+        additions INTEGER NOT NULL,
+        deletions INTEGER NOT NULL,
+        merger_id INTEGER NOT NULL REFERENCES users(id),
+        merged_unix INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'done', 'aborted')),
+        created_unix INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX merge_intents_one_pending ON merge_intents (repo_id, pull_number) WHERE state = 'pending';",
 ];
 
 /// Every table the current schema creates; `/healthz` probes each, so a missing or unreadable one
@@ -179,6 +201,7 @@ pub const TABLES: &[&str] = &[
     "mergeability_cache",
     "reviews",
     "issue_comments",
+    "merge_intents",
 ];
 
 /// Database failures a caller reports to the operator.

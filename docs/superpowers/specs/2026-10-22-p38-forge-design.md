@@ -905,6 +905,40 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
   deterministic interfering writer); the F4 `refs/forge/pull/<n>/head` refresh for a contents write to a PR branch;
   portable-name collision rules; a disk reservation sized to the exact rebuilt trees.
 
+### F4c decisions (as built)
+
+F4c adds migration 5 (`merge_intents`) and `POST /pulls/{n}/merge`; the gate now replays G, T, U, O and Q completely (the F4
+slices together leave only K's two deferred org-listing exchanges pending). The merge below replaces the corresponding
+steps of "Merge" and "Crash recovery" above where they differ (plan decisions R1-R5 after the Opus and Sol review).
+
+- **Order, all under the repository's write gate.** Settle any pending intent; re-read the PR (merged: 405 `The PR is
+  already merged`; closed: 404), both branch tips (a missing one: 404), the protection rules and the required statuses; refuse a
+  stale `head_commit_id` (409 `head out of date`), a head already contained in the base (405 `Please try again later`), unmet
+  required contexts (405 `not allowed to merge [reason: Not all required status checks successful]`; a rule that requires
+  checks but names none refuses), unrelated histories (409 `Merge conflict: unrelated histories`) and conflicts (409 `Merge
+  conflict: <paths>`, from `merge-tree --write-tree --name-only -z`). Rule changes, PR changes and merges are all gate-ordered, so
+  the check cannot be overtaken; statuses do not take the gate and count as of the read. Only `Do: merge` is supported (other
+  styles 422 `only Do=merge is supported`, unknown 422 `[Do]: In`, missing `[Do]: Required`). A merge ignores `enable_push`.
+- **The journal.** A `pending` `merge_intents` row (PR, branch names, base/head/merge ids, merge base, the three stats, the merger,
+  the merge time) is written before anything is published, and rewritten (`base_oid`, `merge_oid`) before each retry. The merge
+  commit is `commit-tree -p base -p head` on the `merge-tree` tree, authored and committed by the merging user at the intent's
+  time, message `Merge pull request '<title>' (#<n>) from <head> into <base>`.
+- **One ref transaction** (`update-ref --stdin`: `verify` head, `update` base compare-and-swap, create the receipt
+  `refs/forge/merge/<intent id>`, `prepare`, `commit`). The receipt, not the exit status, decides whether it committed. Not
+  published: a moved head answers 409 `head out of date` (never silently substituted), a moved base rebuilds on the new tip (3
+  rounds, then 405 `Please try again later`).
+- **Recovery** asks one question of a pending intent: does its receipt exist? Yes: finalize from the row (the PR is merged with
+  every field a normal merge writes, the head retained, the receipt dropped), whatever happened to the base branch since, a
+  later force push included; no: aborted. It runs at the start of every merge, at startup before the listener is bound, and
+  inline on a read of the repository when the gate is free (never waited for). Stray receipts of finished or aborted intents are
+  removed at startup. (The F0 text recovered by ancestry of the current base; a permitted force push breaks that.)
+- **Merged pulls** read `state: closed, merged: true`, `merge_commit_sha`, `merged_by` (nested account form), `head.sha` and the
+  stats frozen at merge, `base.sha` the merge commit, `mergeable: false`. `GET /pulls/{n}/merge` is 204. `delete_branch_after_merge`
+  is ignored.
+- **Not built.** Squash, rebase and fast-forward merges; merge messages and `force_merge` options; merging a PR whose base branch is
+  gone (404). Review state does not gate a merge (only required status contexts do). Under a base that moves faster than a merge
+  round (about a second with durable fsync settings) a merge can starve and answer 405; the client retries.
+
 ### F4b decisions (as built)
 
 F4b adds migration 4 (`pulls`, `mergeability_cache`, `reviews`, `issue_comments`) and gates F, O (the merge-dependent exchanges
