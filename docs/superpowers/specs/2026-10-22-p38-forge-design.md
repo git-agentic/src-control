@@ -905,6 +905,27 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
   deterministic interfering writer); the F4 `refs/forge/pull/<n>/head` refresh for a contents write to a PR branch;
   portable-name collision rules; a disk reservation sized to the exact rebuilt trees.
 
+### F5a decisions (as built)
+
+F5a is the maintenance half of F5 (plan: `docs/superpowers/plans/2026-10-24-p38-f5a-maintenance.md`); logs, drain, the bind-gate
+tests, the image and the operations guide are F5b.
+
+- **Two-stage gc** (`maintenance.rs`): `git gc --prune=never` without the gate, then under the write gate the retention refs are
+  reconciled and `git prune --expire=<--gc-prune-expire>` runs. The spec said "under the repo lock" for the whole gc; holding the
+  gate through a repack would answer 503 to every merge and contents write for minutes, and the unguarded `--prune` draft
+  could drop an old object a writer was about to reference, so the prune alone holds the gate. One pass at a time, repositories in
+  turn; a failure is logged and the pass continues.
+- **Triggers.** `--maintenance-interval` (default 86400 s, 0 = off) and `POST /api/v1/admin/cron/git_gc_repos` (Gitea's route;
+  204 at once, site admin, `admin` write scope, 404 for any other task). Both wake one runner thread; a request during a queued or
+  running pass starts nothing more.
+- **Retention.** Merged pull requests keep `refs/forge/pull/<n>/merge`; the reconciler recreates it from `merge_commit_sha`.
+- **Cleanup.** Stale ref locks and `objects/incoming-*` are removed at startup unconditionally and at run time only with the gate
+  held, no other registered run on the repository and an age over 10 minutes. This closes the "lock left by a git writer killed at
+  run time" gap.
+- **Not built.** Per-owner byte quotas and per-user transport limits (they need a budget decision first; Engine's clones come from
+  one service account; #297). No last-gc state: an idle repository is collected every interval. `Git::run` gained `Spec::cancel`
+  but still sets no `RLIMIT`s (only transports do).
+
 ### F4c decisions (as built)
 
 F4c adds migration 5 (`merge_intents`) and `POST /pulls/{n}/merge`; the gate now replays G, T, U, O and Q completely (the F4
