@@ -23,6 +23,12 @@ pub fn retention_ref(n: i64) -> String {
     format!("refs/forge/pull/{n}/head")
 }
 
+/// The ref that keeps the base commit a pull request was last opened or retargeted against, for
+/// when its base branch is gone and the stored commit is all that remains.
+pub fn base_ref(n: i64) -> String {
+    format!("refs/forge/pull/{n}/base")
+}
+
 /// The ref that keeps the merge commit of merged pull request `n` alive after the base moves on
 /// (the landing marker is retired once the merge is final).
 pub fn merge_ref(n: i64) -> String {
@@ -584,24 +590,41 @@ pub fn reconcile_repo(
     sync_locked(conn, git, dir, repo_id, now)?;
     let kept = refs_under(git, dir, "refs/forge/pull")?;
     let mut st = conn.prepare(
-        "SELECT number, state, final_head_sha, merge_commit_sha FROM pulls WHERE repo_id = ?1",
+        "SELECT number, state, final_head_sha, merge_commit_sha, base_sha FROM pulls WHERE repo_id = ?1",
     )?;
-    let rows: Vec<(i64, String, Option<String>, Option<String>)> = st
+    // (number, state, final head, merge commit, base)
+    type Row = (i64, String, Option<String>, Option<String>, String);
+    let rows: Vec<Row> = st
         .query_map([repo_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let known: HashMap<i64, (String, Option<String>)> = rows
         .iter()
-        .map(|(n, s, h, _)| (*n, (s.clone(), h.clone())))
+        .map(|(n, s, h, _, _)| (*n, (s.clone(), h.clone())))
         .collect();
     // A merged pull request's merge commit stays reachable even after the base is rewritten. A
     // repair that fails is remembered, not returned at once: the other repairs still run.
     let mut failed = None;
-    for (n, state, _, merge) in &rows {
+    for (n, state, _, merge, base) in &rows {
         if let (true, Some(m)) = (state == "merged", merge) {
             if kept.get(&merge_ref(*n)) != Some(m) {
                 if let Err(e) = retain_at(git, dir, &merge_ref(*n), m) {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        // The stored base is what an unmerged PR shows once its base branch is gone. A commit that
+        // no longer exists cannot be kept (and nothing is lost by not keeping it).
+        if state != "merged" && kept.get(&base_ref(*n)) != Some(base) {
+            match crate::merges::commit_exists(git, dir, base) {
+                Ok(true) => {
+                    if let Err(e) = retain_at(git, dir, &base_ref(*n), base) {
+                        failed.get_or_insert(e);
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
                     failed.get_or_insert(e);
                 }
             }
@@ -625,7 +648,11 @@ pub fn reconcile_repo(
     for name in kept.keys() {
         let n = name
             .strip_prefix("refs/forge/pull/")
-            .and_then(|r| r.strip_suffix("/head").or_else(|| r.strip_suffix("/merge")))
+            .and_then(|r| {
+                r.strip_suffix("/head")
+                    .or_else(|| r.strip_suffix("/merge"))
+                    .or_else(|| r.strip_suffix("/base"))
+            })
             .and_then(|n| n.parse::<i64>().ok());
         if n.is_some_and(|n| !known.contains_key(&n)) {
             let _ = git.run(&Spec {
@@ -676,7 +703,11 @@ pub fn verify_roots(conn: &Connection, git: &Git, dir: &Path, repo_id: i64) -> R
             || p.merge_commit
                 .as_deref()
                 .is_none_or(|m| held(merge_ref(n), m));
-        if !ok || !merge_ok {
+        // A base commit that exists must be held; one that is already gone cannot be.
+        let base_ok = p.state == "merged"
+            || held(base_ref(n), &p.base_sha)
+            || !crate::merges::commit_exists(git, dir, &p.base_sha).map_err(|x| e(&x))?;
+        if !ok || !merge_ok || !base_ok {
             return Err(format!("pull request {n} is not held by a ref"));
         }
     }

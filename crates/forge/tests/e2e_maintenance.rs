@@ -419,7 +419,7 @@ fn a_running_transport_defers_the_cleanup_and_age_keeps_young_leftovers() {
 }
 
 #[test]
-fn too_little_free_disk_skips_the_repack_but_not_the_prune() {
+fn too_little_free_disk_skips_the_repack_and_so_the_prune() {
     let wrap = Wrap::new("none");
     let w = world_with(
         Cfg {
@@ -430,14 +430,14 @@ fn too_little_free_disk_skips_the_repack_but_not_the_prune() {
     );
     let junk = w.loose("junk");
     age(&w.loose_path(&junk), 30);
-    assert!(matches!(w.maintain(), Outcome::Done { .. }));
+    assert!(matches!(w.maintain(), Outcome::Skipped(_)));
     let log = wrap.log();
     assert!(!log.split_whitespace().any(|a| a == "gc"), "gc ran: {log}");
     assert!(
-        log.split_whitespace().any(|a| a == "prune"),
-        "no prune: {log}"
+        !log.split_whitespace().any(|a| a == "prune"),
+        "pruned without a stage 1: {log}"
     );
-    assert!(!w.exists(&junk));
+    assert!(w.exists(&junk));
 }
 
 #[test]
@@ -710,4 +710,59 @@ fn an_absurd_prune_window_prunes_nothing() {
     age(&w.loose_path(&junk), 30);
     assert!(matches!(w.maintain(), Outcome::Skipped(_)));
     assert!(w.exists(&junk));
+}
+
+#[test]
+fn duration_flags_beyond_ten_years_are_refused() {
+    for (flag, value) in [
+        ("--gc-prune-expire", "9999999999"),
+        ("--maintenance-interval", "18446744073709551615"),
+        ("--gc-timeout", "9999999999"),
+    ] {
+        let dir = std::env::temp_dir().join(format!("scl-maint-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_sc-forge"))
+            .args(["serve", "--data-dir"])
+            .arg(&dir)
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--public-url",
+                "http://127.0.0.1:1",
+            ])
+            .args([flag, value])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!out.status.success(), "{flag}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("at most"), "{flag}: {err}");
+    }
+}
+
+#[test]
+fn a_base_branch_deleted_under_an_open_pull_keeps_its_last_commit() {
+    let w = world();
+    let base_tip = w.commit("b", "b.txt", "b\n", Some("main"));
+    w.commit("f", "f.txt", "f\n", Some("main"));
+    let r = w.api(
+        "POST",
+        "/pulls",
+        Some(json!({"title": "PR f", "head": "f", "base": "b"})),
+    );
+    assert_eq!(r.status, 201, "{}", r.msg());
+    let n = r.json()["number"].as_i64().unwrap();
+    w.git(&["update-ref", "-d", "refs/heads/b"]);
+    let tree = w.git(&["rev-parse", &format!("{base_tip}^{{tree}}")]);
+    for oid in [&base_tip, &tree] {
+        age(&w.loose_path(oid), 30);
+    }
+    w.pass();
+    assert!(w.exists(&base_tip), "the stored base must survive");
+    assert_eq!(
+        w.git(&["rev-parse", &format!("refs/forge/pull/{n}/base")]),
+        base_tip
+    );
+    let r = w.api("GET", &format!("/pulls/{n}"), None);
+    assert_eq!(r.status, 200, "{}", r.msg());
 }

@@ -231,6 +231,29 @@ pub const QUARANTINE_PREFIX: &str = "tmp_objdir-incoming-";
 /// repository is alive (startup: after [`kill_orphan_git`]; at run time: the write gate is held and
 /// no transport is registered).
 pub fn clean_repo(repo: &Path, min_age: Option<Duration>) -> usize {
+    let n = clean_inner(repo, min_age, false);
+    n + remove_dead(repo)
+}
+
+/// [`clean_repo`] for a caller that holds a server-wide lock: quarantine directories (which can be
+/// gigabytes) are only renamed to `objects/dead-*`, and [`remove_dead`] deletes them afterwards.
+pub fn clean_repo_deferred(repo: &Path, min_age: Option<Duration>) -> usize {
+    clean_inner(repo, min_age, true)
+}
+
+/// Delete the directories [`clean_repo_deferred`] set aside.
+pub fn remove_dead(repo: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(repo.join("objects")) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("dead-"))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| std::fs::remove_dir_all(e.path()).is_ok())
+        .count()
+}
+
+fn clean_inner(repo: &Path, min_age: Option<Duration>, rename_only: bool) -> usize {
     let mut n = remove_locks(&repo.join("refs"), 0, min_age);
     for f in [
         "packed-refs.lock",
@@ -253,7 +276,14 @@ pub fn clean_repo(repo: &Path, min_age: Option<Duration>) -> usize {
             if named
                 && e.file_type().is_ok_and(|t| t.is_dir())
                 && old_enough(&p, min_age)
-                && std::fs::remove_dir_all(&p).is_ok()
+                && if rename_only {
+                    let to = repo
+                        .join("objects")
+                        .join(format!("dead-{}", e.file_name().to_string_lossy()));
+                    std::fs::rename(&p, to).is_ok()
+                } else {
+                    std::fs::remove_dir_all(&p).is_ok()
+                }
             {
                 eprintln!(
                     "sc-forge: removed the quarantine {} left by a killed git",
@@ -425,8 +455,20 @@ mod tests {
         // Young items stay when an age is given; the unconditional startup form removes them.
         assert_eq!(clean_repo(&repo, Some(Duration::from_secs(3600))), 0);
         assert!(repo.join("objects/tmp_objdir-incoming-aB3xYz").exists());
-        assert_eq!(remove_stale_locks(&d), 3);
+        // The deferred form only sets the quarantine aside; removing what it set aside is separate.
+        assert_eq!(clean_repo_deferred(&repo, None), 3);
         assert!(!repo.join("objects/tmp_objdir-incoming-aB3xYz").exists());
+        assert!(repo
+            .join("objects/dead-tmp_objdir-incoming-aB3xYz")
+            .exists());
+        assert_eq!(remove_dead(&repo), 1);
+        assert!(!repo
+            .join("objects/dead-tmp_objdir-incoming-aB3xYz")
+            .exists());
+        std::fs::create_dir_all(repo.join("objects/tmp_objdir-incoming-q2/pack")).unwrap();
+        std::fs::write(repo.join("refs/heads/a.lock"), b"").unwrap();
+        assert_eq!(remove_stale_locks(&d), 2);
+        assert!(!repo.join("objects/tmp_objdir-incoming-q2").exists());
         assert!(
             repo.join("objects/pack").exists(),
             "only quarantine directories go"

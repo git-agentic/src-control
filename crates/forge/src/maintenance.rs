@@ -281,12 +281,21 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
         // branch-delete writers hold only the exclusive lifecycle lock, so take that too (gate
         // first, as everywhere). Anything still running means the leftovers wait for the next pass.
         life.try_exclusive(id, || {
-            life.registry
-                .with_only(&reg, || orphans::clean_repo(&dir, Some(cfg.stale_age)))
+            life.registry.with_only(&reg, || {
+                // Under the registry's server-wide lock: rename only, delete below.
+                orphans::clean_repo_deferred(&dir, Some(cfg.stale_age))
+            })
         })
     }) {
-        Ok(_) => {}
-        Err(o) => return o,
+        Ok(Some(Some(_))) => {
+            orphans::remove_dead(&dir);
+        }
+        Ok(_) => eprintln!(
+            "sc-forge: repository {id}: stale lock cleanup deferred (a writer may be running)"
+        ),
+        // Optional work: a busy gate must not cost the repository its gc.
+        Err(Outcome::Gone) => return Outcome::Gone,
+        Err(_) => {}
     }
 
     let before = match usage_kib(app, &dir, &cancel) {
@@ -325,6 +334,12 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
     }
 
     // Stage 2, under the write gate.
+    if let Some(n) = note {
+        // Without a completed stage 1 reachable objects may still be loose and old; git's own gc
+        // does not prune after a failed repack either.
+        eprintln!("sc-forge: repository {id}: stage 1 did not complete ({n}); nothing pruned");
+        return Outcome::Skipped("stage 1 did not complete");
+    }
     let stage2 = || -> Outcome {
         if cancel.is_set() {
             return Outcome::Gone;
@@ -370,12 +385,7 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
         }
     };
     match in_gate(life, id, &cancel, cfg.gate_wait, stage2) {
-        Ok(o) => {
-            if let (Outcome::Done { .. }, Some(n)) = (&o, note) {
-                eprintln!("sc-forge: repository {id}: stage 1 did not run ({n}); aged loose objects were still pruned");
-            }
-            o
-        }
+        Ok(o) => o,
         Err(o) => o,
     }
 }

@@ -7,6 +7,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// The largest duration flag accepted: ten years, far beyond any sensible window.
+const MAX_DURATION_SECS: u64 = 10 * 365 * 86_400;
+
 #[derive(Parser)]
 #[command(name = "sc-forge", version, about = "A Gitea-compatible Git forge")]
 struct Cli {
@@ -286,6 +289,17 @@ fn run_serve(a: ServeArgs) -> Result<()> {
             "--gc-prune-expire must be at least {} seconds (twice --git-timeout, and an hour): a shorter window can delete objects an operation in flight still needs",
             min_expire.as_secs()
         );
+    }
+    // Durations are added to `Instant::now()` and subtracted from a unix time: an absurd value
+    // would panic the runner or, worse, turn a long prune window into "prune now".
+    for (flag, v) in [
+        ("--maintenance-interval", a.maintenance_interval),
+        ("--gc-prune-expire", a.gc_prune_expire),
+        ("--gc-timeout", a.gc_timeout),
+    ] {
+        if v > MAX_DURATION_SECS {
+            bail!("{flag} must be at most {MAX_DURATION_SECS} seconds (ten years)");
+        }
     }
     bind_gate(&a.listen, a.behind_proxy, a.allow_plaintext).map_err(anyhow::Error::msg)?;
     let cidrs = a

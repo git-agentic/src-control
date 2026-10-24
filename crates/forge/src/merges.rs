@@ -265,7 +265,7 @@ fn finish(
 }
 
 /// Does the commit exist in the repository?
-fn commit_exists(git: &Git, dir: &Path, oid: &str) -> Result<bool, GitError> {
+pub(crate) fn commit_exists(git: &Git, dir: &Path, oid: &str) -> Result<bool, GitError> {
     let out = git.run(&Spec {
         repo: Some(dir),
         args: &["cat-file", "-e", &format!("{oid}^{{commit}}")],
