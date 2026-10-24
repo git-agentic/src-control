@@ -761,3 +761,22 @@ fn deleting_the_repository_while_writes_are_queued_does_not_hang() {
         assert!(matches!(st, 201 | 404 | 503), "{st}");
     }
 }
+
+#[test]
+fn a_directory_cannot_take_a_name_that_must_be_a_blob() {
+    let w = world();
+    for p in [".gitattributes/x", "d/.GITATTRIBUTES/y", "gitatt~1/z"] {
+        let r = w.write("POST", p, json!({"content": enc("x\n")}));
+        assert_eq!(r.status, 422, "{p}: {}", r.msg());
+    }
+    assert_eq!(
+        w.write(
+            "POST",
+            "d/.gitattributes",
+            json!({"content": enc("*.rs text\n")})
+        )
+        .status,
+        201
+    );
+    w.fsck();
+}

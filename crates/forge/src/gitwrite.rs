@@ -60,14 +60,19 @@ fn attributes_names() -> Vec<String> {
 /// checkout on macOS or Windows would resolve into `.git`, and `.gitmodules` (whose content `fsck`
 /// checks only on pushes), can never be written here.
 pub fn write_path_ok(path: &str) -> bool {
-    let (git, modules) = (git_names(), modules_names());
+    let (git, modules, attrs) = (git_names(), modules_names(), attributes_names());
+    let comps: Vec<&str> = path.split('/').collect();
     crate::gitobj::valid_path(path)
         && !path.ends_with('/')
         && !path.contains('\\')
-        && path.split('/').count() <= MAX_DEPTH
-        && path
-            .split('/')
-            .all(|c| c.len() <= 255 && !is_alias(c, &git) && !is_alias(c, &modules))
+        && comps.len() <= MAX_DEPTH
+        && comps.iter().enumerate().all(|(i, c)| {
+            c.len() <= 255
+                && !is_alias(c, &git)
+                && !is_alias(c, &modules)
+                // fsck requires `.gitattributes` to be a blob, so it cannot be a directory
+                && (i + 1 == comps.len() || !is_alias(c, &attrs))
+        })
 }
 
 /// Whether `content` may be stored at `path`: `fsck` rejects a `.gitattributes` (by any of its aliases)
@@ -617,6 +622,10 @@ mod tests {
             "gi7eba~1",
             "gi7eba~9",
             "d/gi7eba~5",
+            ".gitattributes/x",
+            "a/.GITATTRIBUTES/b",
+            "gitatt~1/f",
+            "gi7d29~3/f",
         ] {
             assert!(!write_path_ok(p), "{p:?}");
         }

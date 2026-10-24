@@ -28,7 +28,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 const GATE_WAIT: Duration = Duration::from_secs(10);
 /// Pause before rebuilding after a ref lock was held.
 const BACKOFF: Duration = Duration::from_millis(50);
-/// Disk promised beyond the content itself: the rebuilt trees, the commit, and slack.
+/// Disk promised beyond the content itself, up front; each attempt then reserves the tree bytes it read.
 const RESERVE_SLACK: u64 = 8 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -324,6 +324,12 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
         if started.elapsed() > DEADLINE {
             return error(&ctx.app.base, 503, "the write took too long, try again");
         }
+        // The rewrite stores about as many bytes of trees as the walk read: promise them for this attempt.
+        let trees = (gw::TOTAL_LISTING - budget.listing) as u64 + (1 << 20);
+        let _trees_held = match ctx.app.transports.reserve_disk(&ctx.app.data_dir, trees) {
+            Some(h) => h,
+            None => return error(&ctx.app.base, 507, "insufficient storage"),
+        };
         let prev_mode = match gw::check(&op, &comps, &walk) {
             Ok(m) => m,
             Err(r) => return refuse(ctx, &w.path, r),

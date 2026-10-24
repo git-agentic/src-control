@@ -891,7 +891,7 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
   `updated_unix` stamp after a successful write is log-only on failure.
 - **Limits.** Body (`--max-body-bytes`, 1 MiB) bounds content; 64 levels, 16 MiB per raw listing and 32 MiB cumulative
   listing per attempt, 60 s for the operation (checked between attempts and between the walk, the rewrite and the commit; one git command may still run up to its own limit), free disk against `--min-free-bytes` through the same reservation pool as
-  pushes (content plus 8 MiB).
+  pushes (content plus 8 MiB, and per attempt the tree bytes it read).
 - **Protection seam.** `policy::check_contents_write(target, creating)` is evaluated early (Gitea checks protection first)
   and again immediately before the ref update on every attempt, including for `new_branch`; it permits everything until
   F4 adds rules, in the same module as the pre-receive policy.

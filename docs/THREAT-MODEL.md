@@ -986,7 +986,7 @@ Tests are in `crates/forge/tests/e2e_write.rs` and the `gitwrite` unit tests.
   twelve API writers and loses no commit). A push is not excluded by the write gate, so a writer can get 409 under sustained
   pushes.
 - **Resource use.** One write at a time per repository (503 after 10 s); at most 3 attempts, 64 levels and 32 MiB of listings
-  per attempt, and 60 s for the whole operation; disk is reserved from the push pool. A write holds the shared lifecycle lock, so a delete waits for it
+  per attempt, and 60 s for the whole operation; disk is reserved from the push pool (the content plus slack up front, then per attempt the bytes of the tree listings read). A write holds the shared lifecycle lock, so a delete waits for it
   (`deleting_the_repository_while_writes_are_queued_does_not_hang`).
 - **Identity cannot be chosen.** `author`, `committer` and `dates` in a request are ignored; the commit is the
   authenticated user's. A write collaborator can still push any identity over git, as in Gitea.
