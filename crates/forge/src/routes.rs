@@ -56,7 +56,7 @@ impl App {
 
     /// Log the detail, answer a bare 500: database errors never reach clients.
     pub fn internal(&self, e: &dyn std::fmt::Display) -> Resp {
-        eprintln!("sc-forge: internal error: {e}");
+        crate::log::error!("internal error: {e}");
         error(&self.base, 500, "internal server error")
     }
 }

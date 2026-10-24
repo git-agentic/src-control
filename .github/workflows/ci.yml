@@ -66,6 +66,32 @@ jobs:
       - name: check
         run: bash crates/forge/conformance/forge-check.sh
 
+  # Advisory (not a required context): the sc-forge container image builds and works (git new
+  # enough, boots, serves, clones, and exits 0 on SIGTERM). Only runs when the forge, its image
+  # or the lockfile changed.
+  forge-image:
+    name: sc-forge image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: changed?
+        id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$base" ] || ! git diff --quiet "$base" HEAD -- crates/forge Cargo.lock .dockerignore rust-toolchain.toml 2>/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: build
+        if: steps.changed.outputs.run == 'true'
+        run: docker build -f crates/forge/Dockerfile -t sc-forge:ci .
+      - name: smoke
+        if: steps.changed.outputs.run == 'true'
+        run: bash crates/forge/docker/smoke.sh sc-forge:ci
+
   # Advisory (not a required context): proves the Windows build and the owner-only
   # ACL on .sc/local-key, the `sc keygen` identity and the TLS serve key (#214,
   # #281). Deliberately not `cargo test --workspace`; the wider suite still has

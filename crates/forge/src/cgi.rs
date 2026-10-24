@@ -345,7 +345,7 @@ impl Pump {
                     GROW_STEP,
                 );
                 if !ok {
-                    eprintln!("sc-forge: push aborted: the disk reserve cannot cover it");
+                    crate::log::warning!("push aborted: the disk reserve cannot cover it");
                     self.stop(ABORT_NO_SPACE);
                     return false;
                 }
@@ -815,8 +815,8 @@ impl Supervise {
         let _ = verdict.send(ok);
         let err = tail.and_then(|t| t.join().ok()).unwrap_or_default();
         if !ok {
-            eprintln!(
-                "sc-forge: git transport on repository {repo_id} ended ({reason}, {}): {}",
+            crate::log::warning!(
+                "git transport on repository {repo_id} ended ({reason}, {}): {}",
                 status.map_or_else(|e| e.to_string(), |s| s.to_string()),
                 String::from_utf8_lossy(&err).trim()
             );
@@ -964,7 +964,7 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
         Ok(Err(LaunchError::Gone)) => return buffered(transport::repo_not_found()),
         Ok(Err(LaunchError::Stopped)) => return buffered(shutting_down()),
         Ok(Err(LaunchError::Io(e))) => {
-            eprintln!("sc-forge: could not start git: {e}");
+            crate::log::warning!("could not start git: {e}");
             return buffered(text(500, "internal server error\n"));
         }
         Err(e) if e.is_cancelled() => return buffered(shutting_down()),
@@ -1004,7 +1004,7 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
             let why = abort.load(Ordering::SeqCst);
             let status = if why != 0 { why } else { 502 };
             if let Ok(Err(e)) = other {
-                eprintln!("sc-forge: git transport failed before answering: {e}");
+                crate::log::warning!("git transport failed before answering: {e}");
             }
             return buffered(text(status, "git transport failed\n"));
         }

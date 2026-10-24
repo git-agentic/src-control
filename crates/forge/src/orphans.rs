@@ -210,10 +210,7 @@ fn remove_locks(dir: &Path, depth: usize, min_age: Option<Duration>) -> usize {
             && old_enough(&p, min_age)
             && std::fs::remove_file(&p).is_ok()
         {
-            eprintln!(
-                "sc-forge: removed the ref lock {} left by a killed git",
-                p.display()
-            );
+            crate::log::info!("removed the ref lock {} left by a killed git", p.display());
             n += 1;
         }
     }
@@ -285,8 +282,8 @@ fn clean_inner(repo: &Path, min_age: Option<Duration>, rename_only: bool) -> usi
                     std::fs::remove_dir_all(&p).is_ok()
                 }
             {
-                eprintln!(
-                    "sc-forge: removed the quarantine {} left by a killed git",
+                crate::log::info!(
+                    "removed the quarantine {} left by a killed git",
                     p.display()
                 );
                 n += 1;
@@ -316,21 +313,21 @@ pub fn remove_stale_locks(data_dir: &Path) -> usize {
 pub fn sweep(data_dir: &Path, git_bin: Option<&Path>) -> Swept {
     let Some((killed, survivors)) = kill_orphan_git(data_dir, std::process::id() as i32, git_bin)
     else {
-        eprintln!(
-            "sc-forge: could not read the process table; leaving any orphaned git writers and ref locks alone"
+        crate::log::warning!(
+            "could not read the process table; leaving any orphaned git writers and ref locks alone"
         );
         return Swept::default();
     };
     let locks = if survivors == 0 {
         remove_stale_locks(data_dir)
     } else {
-        eprintln!(
-            "sc-forge: {survivors} orphaned git process(es) would not die; leaving the ref locks in place"
+        crate::log::warning!(
+            "{survivors} orphaned git process(es) would not die; leaving the ref locks in place"
         );
         0
     };
     if killed + locks > 0 {
-        eprintln!("sc-forge: startup cleanup killed {killed} orphaned git process(es) and removed {locks} stale lock(s)");
+        crate::log::info!("startup cleanup killed {killed} orphaned git process(es) and removed {locks} stale lock(s)");
     }
     Swept { killed, locks }
 }

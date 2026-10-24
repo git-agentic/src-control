@@ -301,7 +301,7 @@ pub fn authorize(app: &App, req: &Req, path: GitPath) -> Result<Plan, Resp> {
 }
 
 fn internal(app: &App, e: &dyn std::fmt::Display) -> Resp {
-    eprintln!("sc-forge: internal error: {e}");
+    crate::log::error!("internal error: {e}");
     let _ = app;
     text(500, "internal server error\n")
 }

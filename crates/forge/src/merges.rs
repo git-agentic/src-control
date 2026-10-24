@@ -225,16 +225,16 @@ fn finish(
     recovered: bool,
 ) -> Result<(), ComputeError> {
     if let Err(e) = pulls::retain(git, dir, i.pull_number, &i.head_oid) {
-        eprintln!(
-            "sc-forge: could not retain the head of merged pull request {}: {e}",
+        crate::log::warning!(
+            "could not retain the head of merged pull request {}: {e}",
             i.pull_number
         );
     }
     // The marker goes below; from here on this ref is what keeps the merge commit alive when the
     // base is rewritten away from it.
     if let Err(e) = pulls::retain_at(git, dir, &pulls::merge_ref(i.pull_number), &i.merge_oid) {
-        eprintln!(
-            "sc-forge: could not retain the merge commit of pull request {}: {e}",
+        crate::log::warning!(
+            "could not retain the merge commit of pull request {}: {e}",
             i.pull_number
         );
     }
@@ -542,10 +542,7 @@ fn run(ctx: &Ctx, a: &Access, n: i64, want_head: Option<&str>) -> Resp {
     if intent_id.is_some() {
         let (git, dir) = (&ctx.app.life.git, ctx.app.life.repo_dir(a.repo.id));
         if let Err(e) = recover_locked(ctx.conn, git, &dir, a.repo.id) {
-            eprintln!(
-                "sc-forge: could not settle a merge of repository {}: {e}",
-                a.repo.id
-            );
+            crate::log::warning!("could not settle a merge of repository {}: {e}", a.repo.id);
         }
     }
     outcome

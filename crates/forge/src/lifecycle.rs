@@ -332,8 +332,8 @@ impl Lifecycle {
                     Ok(()) => {
                         let _ = repos::delete_row(conn, row.id);
                     }
-                    Err(c) => eprintln!(
-                        "sc-forge: could not remove {} ({c}); the row stays `creating` for the next startup",
+                    Err(c) => crate::log::warning!(
+                        "could not remove {} ({c}); the row stays `creating` for the next startup",
                         self.repo_dir(row.id).display()
                     ),
                 }
@@ -450,8 +450,8 @@ impl Lifecycle {
         repos::delete_row(conn, repo.id)?;
         self.step("row-deleted")?;
         if let Err(e) = std::fs::remove_dir_all(&to) {
-            eprintln!(
-                "sc-forge: could not remove trash/{}.git ({e}); startup reconcile will",
+            crate::log::warning!(
+                "could not remove trash/{}.git ({e}); startup reconcile will",
                 repo.id
             );
         }
@@ -647,8 +647,8 @@ impl Lifecycle {
             };
             if !known {
                 let to = self.to_orphans(&p)?;
-                eprintln!(
-                    "sc-forge: {} has no repository row; moved to {}",
+                crate::log::warning!(
+                    "{} has no repository row; moved to {}",
                     p.display(),
                     to.display()
                 );
@@ -661,9 +661,11 @@ impl Lifecycle {
         for r in repos::list_in_state(conn, "live")? {
             let dir = self.repo_dir(r.id);
             if !dir.is_dir() {
-                eprintln!(
-                    "sc-forge: repository {}/{} (id {}) has no directory",
-                    r.owner, r.name, r.id
+                crate::log::warning!(
+                    "repository {}/{} (id {}) has no directory",
+                    r.owner,
+                    r.name,
+                    r.id
                 );
                 rep.missing_dirs += 1;
                 continue;
@@ -685,9 +687,11 @@ impl Lifecycle {
                 Ok(true) => rep.head_repaired += 1,
                 Ok(false) => {}
                 Err(e) => {
-                    eprintln!(
-                        "sc-forge: cannot repair HEAD of {}/{} (id {}): {e}",
-                        r.owner, r.name, r.id
+                    crate::log::warning!(
+                        "cannot repair HEAD of {}/{} (id {}): {e}",
+                        r.owner,
+                        r.name,
+                        r.id
                     );
                     rep.head_repair_failed += 1;
                 }

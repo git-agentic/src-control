@@ -442,17 +442,17 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
                 )
             }
             Outcome::Fatal => {
-                eprintln!("sc-forge: update-ref {full} failed on attempt {attempt}: {failure}");
+                crate::log::warning!("update-ref {full} failed on attempt {attempt}: {failure}");
                 return ctx.app.internal(&"could not update the branch");
             }
         }
-        eprintln!("sc-forge: contents write to {full} lost round {attempt}: {failure}");
+        crate::log::warning!("contents write to {full} lost round {attempt}: {failure}");
     }
     if locked {
         // Three rounds against a ref lock that never cleared: nothing changed the branch. A killed
         // git can leave `refs/heads/<branch>.lock` behind; it blocks pushes as well.
-        eprintln!(
-            "sc-forge: refs/heads/{target_name} of repository {} stayed locked; if no git process is running, remove its .lock file",
+        crate::log::warning!(
+            "refs/heads/{target_name} of repository {} stayed locked; if no git process is running, remove its .lock file",
             a.repo.id
         );
         return error(&ctx.app.base, 503, "the branch is locked, try again later");
@@ -472,7 +472,7 @@ fn write_err(ctx: &Ctx, a: &Access, e: WriteErr) -> Resp {
     match e {
         WriteErr::Git(e) => read_err(ctx, a, e),
         WriteErr::Rewrite(m) => {
-            eprintln!("sc-forge: contents write could not rewrite a directory: {m}");
+            crate::log::warning!("contents write could not rewrite a directory: {m}");
             unprocessable(ctx, "a directory on the path cannot be rewritten")
         }
     }
@@ -481,8 +481,8 @@ fn write_err(ctx: &Ctx, a: &Access, e: WriteErr) -> Resp {
 /// The ref moved: stamp the repository (log-only, the write is already public) and answer.
 fn published(ctx: &Ctx, a: &Access, resp: Resp) -> Resp {
     if let Err(e) = repos::touch(ctx.conn, a.repo.id, now()) {
-        eprintln!(
-            "sc-forge: could not stamp repository {} after a contents write: {e}",
+        crate::log::warning!(
+            "could not stamp repository {} after a contents write: {e}",
             a.repo.id
         );
     }

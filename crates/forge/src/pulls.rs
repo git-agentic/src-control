@@ -568,7 +568,7 @@ pub fn sync_locked(
         // One PR that cannot be synced (a git failure on its ref) must not keep the others from it.
         match sync_one(conn, git, dir, p, &kept, &heads, now) {
             Ok(c) => closed += usize::from(c),
-            Err(e) => eprintln!("sc-forge: could not sync pull request {number}: {e}"),
+            Err(e) => crate::log::warning!("could not sync pull request {number}: {e}"),
         }
     }
     Ok(closed)
@@ -722,14 +722,14 @@ pub fn sync(life: &Lifecycle, conn: &Connection, repo_id: i64, now: i64) {
     }) {
         Ok(WriteRun::Ran(Ok(_))) | Ok(WriteRun::Gone) => {}
         Ok(WriteRun::Ran(Err(e))) => {
-            eprintln!("sc-forge: pull request sync of repository {repo_id} failed: {e}")
+            crate::log::warning!("pull request sync of repository {repo_id} failed: {e}")
         }
         Ok(WriteRun::Busy) => {
-            eprintln!(
-                "sc-forge: pull request sync of repository {repo_id} skipped: repository busy"
+            crate::log::warning!(
+                "pull request sync of repository {repo_id} skipped: repository busy"
             )
         }
-        Err(e) => eprintln!("sc-forge: pull request sync of repository {repo_id} failed: {e}"),
+        Err(e) => crate::log::warning!("pull request sync of repository {repo_id} failed: {e}"),
     }
 }
 
@@ -741,16 +741,13 @@ pub fn reconcile_all(life: &Lifecycle, conn: &Connection, now: i64) {
     let repos = match crate::repos::list_in_state(conn, "live") {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("sc-forge: pull request reconcile could not list repositories: {e}");
+            crate::log::warning!("pull request reconcile could not list repositories: {e}");
             return;
         }
     };
     for r in repos {
         if let Err(e) = reconcile_repo(conn, &life.git, &life.repo_dir(r.id), r.id, now) {
-            eprintln!(
-                "sc-forge: pull request reconcile of repository {} failed: {e}",
-                r.id
-            );
+            crate::log::warning!("pull request reconcile of repository {} failed: {e}", r.id);
         }
     }
 }
