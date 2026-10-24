@@ -663,12 +663,12 @@ pub fn verify_roots(conn: &Connection, git: &Git, dir: &Path, repo_id: i64) -> R
             _ => p
                 .final_head
                 .as_deref()
-                .map_or(true, |h| held(retention_ref(n), h)),
+                .is_none_or(|h| held(retention_ref(n), h)),
         };
         let merge_ok = p.state != "merged"
             || p.merge_commit
                 .as_deref()
-                .map_or(true, |m| held(merge_ref(n), m));
+                .is_none_or(|m| held(merge_ref(n), m));
         if !ok || !merge_ok {
             return Err(format!("pull request {n} is not held by a ref"));
         }
