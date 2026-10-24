@@ -20,12 +20,17 @@ pub struct Swept {
     pub locks: usize,
 }
 
-/// `(pid, argv and environment joined by spaces)` of every process, from `/proc` where it exists,
-/// else from BSD `ps` (whose `-E` flag appends the environment of the caller's own processes). The
-/// environment matters: the writer behind an HTTP push is `git receive-pack --stateless-rpc .`
-/// run in the repository's directory, named by nothing on its command line, but it inherited the
-/// `FORGE_DATA_DIR` the transport sets.
-fn processes() -> Vec<(i32, String)> {
+/// Separates arguments and environment entries in what [`processes`] returns on Linux, where they
+/// are NUL-delimited and a value may hold spaces.
+const SEP: char = '\u{1f}';
+
+/// `(pid, argv and environment joined by the separator, the separator)` of every process, from
+/// `/proc` where it exists, else from BSD `ps` (whose `-E` flag appends the environment of the
+/// caller's own processes, space separated: a data directory with spaces cannot be told apart there,
+/// and development hosts are the only users). The environment matters: the writer behind an HTTP
+/// push is `git receive-pack --stateless-rpc .` run in the repository's directory, named by nothing
+/// on its command line, but it inherited the `FORGE_DATA_DIR` the transport sets.
+fn processes() -> Vec<(i32, String, char)> {
     if Path::new("/proc/self").exists() {
         let mut out = Vec::new();
         if let Ok(rd) = std::fs::read_dir("/proc") {
@@ -35,17 +40,18 @@ fn processes() -> Vec<(i32, String)> {
                 };
                 let join = |raw: Vec<u8>| {
                     raw.split(|b| *b == 0)
+                        .filter(|a| !a.is_empty())
                         .map(|a| String::from_utf8_lossy(a).to_string())
                         .collect::<Vec<_>>()
-                        .join(" ")
+                        .join(&SEP.to_string())
                 };
                 if let Ok(raw) = std::fs::read(e.path().join("cmdline")) {
                     let mut cmd = join(raw);
                     if let Ok(env) = std::fs::read(e.path().join("environ")) {
-                        cmd.push(' ');
+                        cmd.push(SEP);
                         cmd.push_str(&join(env));
                     }
-                    out.push((pid, cmd));
+                    out.push((pid, cmd, SEP));
                 }
             }
         }
@@ -68,15 +74,15 @@ fn processes() -> Vec<(i32, String)> {
         .filter_map(|l| {
             let l = l.trim_start();
             let (pid, cmd) = l.split_once(' ')?;
-            Some((pid.parse().ok()?, cmd.trim_start().to_string()))
+            Some((pid.parse().ok()?, cmd.trim_start().to_string(), ' '))
         })
         .collect()
 }
 
 /// Is `cmd` a git invocation: the configured git executable (`SC_FORGE_GIT` may name it anything),
 /// or an executable called `git` or `git-*` (what git itself spawns, `git-receive-pack` and the like)?
-fn is_git(cmd: &str, configured: Option<&Path>) -> bool {
-    let exe = cmd.split(' ').next().unwrap_or("");
+fn is_git(cmd: &str, sep: char, configured: Option<&Path>) -> bool {
+    let exe = cmd.split(sep).next().unwrap_or("");
     if configured.is_some_and(|c| c == Path::new(exe)) {
         return true;
     }
@@ -86,17 +92,18 @@ fn is_git(cmd: &str, configured: Option<&Path>) -> bool {
         .is_some_and(|n| n == "git" || n.starts_with("git-"))
 }
 
-/// Does `cmd` (arguments and environment entries joined by spaces) contain `needle` as a whole token
-/// start: preceded by a space, `=` or the start, and, for an environment value (`exact_end`), followed
-/// by a space or the end? Another instance's `/srv/forge-secondary` must not match `/srv/forge`, nor
-/// `/mnt/srv/forge/repos/` match `/srv/forge/repos/`.
-fn mentions(cmd: &str, needle: &str, exact_end: bool) -> bool {
+/// Does `cmd` (arguments and environment entries joined by `sep`) contain `needle` as a whole token
+/// start: preceded by the separator, `=` or the start, and, for an environment value (`exact_end`),
+/// followed by the separator or the end? Another instance's `/srv/forge-secondary` or
+/// `/srv/forge secondary` must not match `/srv/forge`, nor `/mnt/srv/forge/repos/` match
+/// `/srv/forge/repos/`.
+fn mentions(cmd: &str, needle: &str, exact_end: bool, sep: char) -> bool {
     let mut from = 0;
     while let Some(i) = cmd[from..].find(needle) {
         let at = from + i;
         let end = at + needle.len();
-        let before_ok = at == 0 || matches!(cmd.as_bytes()[at - 1], b' ' | b'=');
-        let after_ok = !exact_end || end == cmd.len() || cmd.as_bytes()[end] == b' ';
+        let before_ok = at == 0 || cmd[..at].ends_with(sep) || cmd[..at].ends_with('=');
+        let after_ok = !exact_end || end == cmd.len() || cmd[end..].starts_with(sep);
         if before_ok && after_ok {
             return true;
         }
@@ -145,24 +152,36 @@ fn alive(pid: i32) -> bool {
 pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> (usize, usize) {
     let needle = format!("{}/repos/", data_dir.display());
     let env_needle = format!("FORGE_DATA_DIR={}", data_dir.display());
-    let doomed: Vec<i32> = processes()
-        .into_iter()
-        .filter(|(pid, cmd)| {
-            *pid != me
-                && (mentions(cmd, &needle, false) || mentions(cmd, &env_needle, true))
-                && is_git(cmd, git_bin)
-        })
-        .map(|(pid, _)| pid)
-        .collect();
-    for pid in &doomed {
-        // SAFETY: SIGKILL to a process we just found by its command line.
-        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    let mut killed = std::collections::BTreeSet::new();
+    // A dying `http-backend` may have forked its `receive-pack` between two looks: pass until a
+    // look finds nothing alive (at most a few seconds).
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let found: Vec<i32> = processes()
+            .into_iter()
+            .filter(|(pid, cmd, sep)| {
+                *pid != me
+                    && (mentions(cmd, &needle, false, *sep)
+                        || mentions(cmd, &env_needle, true, *sep))
+                    && is_git(cmd, *sep, git_bin)
+                    && alive(*pid)
+            })
+            .map(|(pid, _, _)| pid)
+            .collect();
+        if found.is_empty() {
+            return (killed.len(), 0);
+        }
+        for pid in &found {
+            killed.insert(*pid);
+            // SAFETY: SIGKILL to a process we just found by its command line.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        if Instant::now() >= until {
+            let survivors = found.iter().filter(|p| alive(**p)).count();
+            return (killed.len(), survivors);
+        }
+        std::thread::sleep(Duration::from_millis(30));
     }
-    let until = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < until && doomed.iter().any(|p| alive(*p)) {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    (doomed.len(), doomed.iter().filter(|p| alive(**p)).count())
 }
 
 fn remove_locks(dir: &Path, depth: usize) -> usize {
@@ -237,23 +256,75 @@ mod tests {
 
     #[test]
     fn only_git_executables_count() {
+        let sp = ' ';
         assert!(is_git(
             "/usr/bin/git --git-dir=/d/repos/1.git update-ref --stdin",
+            sp,
             None
         ));
-        assert!(is_git("git-receive-pack /d/repos/1.git", None));
-        assert!(!is_git("/bin/sleep 100 /d/repos/1.git", None));
-        assert!(!is_git("/usr/bin/gitk /d/repos/1.git", None));
+        assert!(is_git("git-receive-pack /d/repos/1.git", sp, None));
+        assert!(!is_git("/bin/sleep 100 /d/repos/1.git", sp, None));
+        assert!(!is_git("/usr/bin/gitk /d/repos/1.git", sp, None));
         // a differently named git, configured through SC_FORGE_GIT, counts too
         let custom = Path::new("/opt/vcs/bin/scm");
         assert!(is_git(
             "/opt/vcs/bin/scm --git-dir=/d/repos/1.git update-ref",
+            sp,
             Some(custom)
         ));
         assert!(!is_git(
             "/opt/vcs/bin/scm --git-dir=/d/repos/1.git update-ref",
+            sp,
             None
         ));
+    }
+
+    #[test]
+    fn a_data_directory_matches_only_as_a_whole_token() {
+        let env = "FORGE_DATA_DIR=/srv/forge";
+        let sp = ' ';
+        assert!(mentions(
+            "git receive-pack . HOME=/h FORGE_DATA_DIR=/srv/forge PATH=/bin",
+            env,
+            true,
+            sp
+        ));
+        assert!(mentions("FORGE_DATA_DIR=/srv/forge", env, true, sp));
+        assert!(!mentions(
+            "git x FORGE_DATA_DIR=/srv/forge-secondary PATH=/bin",
+            env,
+            true,
+            sp
+        ));
+        assert!(!mentions("git x XFORGE_DATA_DIR=/srv/forge", env, true, sp));
+        let repos = "/srv/forge/repos/";
+        assert!(mentions(
+            "git --git-dir=/srv/forge/repos/7.git update-ref",
+            repos,
+            false,
+            sp
+        ));
+        assert!(!mentions(
+            "git --git-dir=/mnt/srv/forge/repos/7.git update-ref",
+            repos,
+            false,
+            sp
+        ));
+        assert!(!mentions(
+            "git --git-dir=/srv/forge-secondary/repos/7.git x",
+            repos,
+            false,
+            sp
+        ));
+        // with real separators (Linux), a space inside a value is not a boundary
+        let u = SEP;
+        let spaced = format!("git{u}x{u}FORGE_DATA_DIR=/srv/forge secondary{u}PATH=/bin");
+        assert!(
+            !mentions(&spaced, env, true, u),
+            "`/srv/forge secondary` is another directory"
+        );
+        let exact = format!("git{u}x{u}FORGE_DATA_DIR=/srv/forge{u}PATH=/bin");
+        assert!(mentions(&exact, env, true, u));
     }
 
     #[test]
@@ -278,38 +349,5 @@ mod tests {
         );
         std::fs::remove_dir_all(&d).unwrap();
         assert!(!d.exists());
-    }
-
-    #[test]
-    fn a_data_directory_matches_only_as_a_whole_token() {
-        let env = "FORGE_DATA_DIR=/srv/forge";
-        assert!(mentions(
-            "git receive-pack . HOME=/h FORGE_DATA_DIR=/srv/forge PATH=/bin",
-            env,
-            true
-        ));
-        assert!(mentions("FORGE_DATA_DIR=/srv/forge", env, true));
-        assert!(!mentions(
-            "git x FORGE_DATA_DIR=/srv/forge-secondary PATH=/bin",
-            env,
-            true
-        ));
-        assert!(!mentions("git x XFORGE_DATA_DIR=/srv/forge", env, true));
-        let repos = "/srv/forge/repos/";
-        assert!(mentions(
-            "git --git-dir=/srv/forge/repos/7.git update-ref",
-            repos,
-            false
-        ));
-        assert!(!mentions(
-            "git --git-dir=/mnt/srv/forge/repos/7.git update-ref",
-            repos,
-            false
-        ));
-        assert!(!mentions(
-            "git --git-dir=/srv/forge-secondary/repos/7.git x",
-            repos,
-            false
-        ));
     }
 }
