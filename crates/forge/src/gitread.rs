@@ -33,13 +33,15 @@ pub struct CommitInfo {
     pub committer: Person,
 }
 
-/// All branches, sorted by name.
+/// All branches, newest commit first, ties by name (recorded P#19-22: Gitea lists the branch that was
+/// committed to last first).
 pub fn list_branches(git: &Git, dir: &Path) -> Result<Vec<Branch>, GitError> {
     let out = git.run(&Spec {
         repo: Some(dir),
         args: &[
             "for-each-ref",
             "--sort=refname",
+            "--sort=-committerdate",
             "--format=%(refname)%00%(objectname)",
             "refs/heads",
         ],

@@ -100,6 +100,69 @@ const MIGRATIONS: &[&str] = &[
         updated_unix INTEGER NOT NULL
     );
     CREATE INDEX commit_statuses_by_sha ON commit_statuses (repo_id, sha, context, id);",
+    // 4: pull requests (one number sequence per repository, one open PR per head/base pair),
+    // the mergeability cache keyed by the two immutable object ids, reviews, and issue comments
+    // (the number of an issue comment is the PR number). `state` merged is set by F4c.
+    "CREATE TABLE pulls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        number INTEGER NOT NULL,
+        head_ref TEXT NOT NULL,
+        base_ref TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL CHECK (state IN ('open', 'closed', 'merged')),
+        creator_id INTEGER NOT NULL REFERENCES users(id),
+        created_unix INTEGER NOT NULL,
+        updated_unix INTEGER NOT NULL,
+        closed_unix INTEGER,
+        final_head_sha TEXT,
+        merge_commit_sha TEXT,
+        merged_unix INTEGER,
+        merged_by INTEGER REFERENCES users(id),
+        merge_base TEXT,
+        changed_files INTEGER,
+        additions INTEGER,
+        deletions INTEGER,
+        head_gone INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (repo_id, number)
+    );
+    CREATE UNIQUE INDEX pulls_one_open ON pulls (repo_id, head_ref, base_ref) WHERE state = 'open';
+    CREATE TABLE mergeability_cache (
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        base_sha TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        mergeable INTEGER NOT NULL,
+        merge_base TEXT NOT NULL DEFAULT '',
+        changed_files INTEGER NOT NULL,
+        additions INTEGER NOT NULL,
+        deletions INTEGER NOT NULL,
+        PRIMARY KEY (repo_id, base_sha, head_sha)
+    );
+    CREATE TABLE reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        pull_number INTEGER NOT NULL,
+        reviewer_id INTEGER NOT NULL REFERENCES users(id),
+        state TEXT NOT NULL CHECK (state IN ('APPROVED', 'REQUEST_CHANGES', 'COMMENT', 'PENDING')),
+        body TEXT NOT NULL,
+        commit_id TEXT NOT NULL,
+        official INTEGER NOT NULL,
+        created_unix INTEGER NOT NULL
+    );
+    CREATE INDEX reviews_by_pull ON reviews (repo_id, pull_number, id);
+    CREATE TABLE issue_comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+        number INTEGER NOT NULL,
+        author_id INTEGER NOT NULL REFERENCES users(id),
+        body TEXT NOT NULL,
+        created_unix INTEGER NOT NULL,
+        updated_unix INTEGER NOT NULL
+    );
+    CREATE INDEX issue_comments_by_issue ON issue_comments (repo_id, number, id);",
 ];
 
 /// Every table the current schema creates; `/healthz` probes each, so a missing or unreadable one
@@ -112,6 +175,10 @@ pub const TABLES: &[&str] = &[
     "collaborators",
     "branch_protections",
     "commit_statuses",
+    "pulls",
+    "mergeability_cache",
+    "reviews",
+    "issue_comments",
 ];
 
 /// Database failures a caller reports to the operator.

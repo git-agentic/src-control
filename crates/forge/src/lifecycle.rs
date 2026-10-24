@@ -514,6 +514,9 @@ impl Lifecycle {
                     ))
                 }
             };
+            // The head of an open PR is retained before its branch can go.
+            crate::pulls::retain_for_branch(conn, &self.git, &dir, current.id, branch, &tip)
+                .map_err(|e| LifecycleError::GitFailed(e.to_string()))?;
             let out = self.git.run(&Spec {
                 repo: Some(&dir),
                 args: &["update-ref", "-d", &full, &tip],

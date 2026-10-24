@@ -72,7 +72,12 @@ fn no_refs(ctx: &Ctx, a: &Access) -> Result<bool, Resp> {
     all_refs(ctx, a).map(|rows| rows.is_empty())
 }
 
-fn resolve(ctx: &Ctx, a: &Access, rev: &str, peel: Peel) -> Result<Option<Resolved>, Resp> {
+pub(crate) fn resolve(
+    ctx: &Ctx,
+    a: &Access,
+    rev: &str,
+    peel: Peel,
+) -> Result<Option<Resolved>, Resp> {
     gitobj::resolve(
         &ctx.app.life.git,
         &dir(ctx, a),
@@ -83,20 +88,20 @@ fn resolve(ctx: &Ctx, a: &Access, rev: &str, peel: Peel) -> Result<Option<Resolv
     .map_err(|e| read_err(ctx, a, e))
 }
 
-fn git_err<T>(ctx: &Ctx, a: &Access, r: Result<T, GitError>) -> Result<T, Resp> {
+pub(crate) fn git_err<T>(ctx: &Ctx, a: &Access, r: Result<T, GitError>) -> Result<T, Resp> {
     r.map_err(|e| read_err(ctx, a, e))
 }
 
 // ---- JSON pieces ----
 
 /// Commit authors resolved to accounts by email, once per request.
-struct Users<'a> {
+pub(crate) struct Users<'a> {
     ctx: &'a Ctx<'a>,
     cache: HashMap<String, Value>,
 }
 
 impl<'a> Users<'a> {
-    fn new(ctx: &'a Ctx<'a>) -> Self {
+    pub(crate) fn new(ctx: &'a Ctx<'a>) -> Self {
         Users {
             ctx,
             cache: HashMap::new(),
@@ -104,7 +109,7 @@ impl<'a> Users<'a> {
     }
 
     /// The account owning `email`, or `null` (recorded: commits by unknown addresses).
-    fn actor(&mut self, email: &str) -> Result<Value, Resp> {
+    pub(crate) fn actor(&mut self, email: &str) -> Result<Value, Resp> {
         if let Some(v) = self.cache.get(&email.to_lowercase()) {
             return Ok(v.clone());
         }
@@ -127,7 +132,7 @@ pub(crate) fn verification() -> Value {
     json!({"verified": false, "reason": "gpg.error.not_signed_commit", "signature": "", "signer": null, "payload": ""})
 }
 
-fn person_json(p: &gitread::Person) -> Value {
+pub(crate) fn person_json(p: &gitread::Person) -> Value {
     json!({"name": p.name, "email": p.email, "date": rfc3339(p.when)})
 }
 
@@ -136,10 +141,10 @@ fn commit_meta(ctx: &Ctx, a: &Access, sha: &str, when: i64) -> Value {
 }
 
 /// Files and line counts a commit response may carry (`None` for each the client did not ask for).
-type Changes = (Option<Vec<gitobj::FileChange>>, Option<gitobj::Stats>);
+pub(crate) type Changes = (Option<Vec<gitobj::FileChange>>, Option<gitobj::Stats>);
 
 /// The Gitea commit object. `changes` fills `files` and `stats` (`None` leaves them `null`).
-fn commit_json(
+pub(crate) fn commit_json(
     ctx: &Ctx,
     a: &Access,
     users: &mut Users,
@@ -318,7 +323,6 @@ pub fn list_tags(ctx: &mut Ctx) -> Resp {
             total,
             page,
             limit,
-            &[],
             items,
         )
     })

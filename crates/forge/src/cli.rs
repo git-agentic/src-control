@@ -313,6 +313,8 @@ fn run_serve(a: ServeArgs) -> Result<()> {
     if report != scl_forge::lifecycle::Report::default() {
         eprintln!("sc-forge: reconciled {report:?}");
     }
+    // Pull request refs and rows agree again before anything is served.
+    scl_forge::pulls::reconcile_all(&life, &db::connect(&a.data_dir)?, scl_forge::timefmt::now());
     let tcfg = scl_forge::cgi::Cfg {
         max_transports: a.max_transports,
         per_repo: a.max_transports_per_repo,

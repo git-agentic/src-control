@@ -445,6 +445,136 @@ pub fn patch_text(git: &Git, dir: &Path, oid: &str, merge: bool) -> Result<Vec<u
     must(run(git, dir, args, Some(BIG))?)
 }
 
+/// Commits reachable from `oid` but not from `exclude` (`exclude..oid`), newest first.
+pub fn range_log(
+    git: &Git,
+    dir: &Path,
+    exclude: Option<&str>,
+    oid: &str,
+    skip: usize,
+    limit: usize,
+) -> Result<Vec<LogCommit>, GitError> {
+    let (skip, limit) = (format!("--skip={skip}"), format!("--max-count={limit}"));
+    let not = exclude.map(|e| format!("^{e}"));
+    let mut args = vec!["log", "-z", LOG_FORMAT, skip.as_str(), limit.as_str()];
+    if let Some(n) = &not {
+        args.push(n.as_str());
+    }
+    args.extend(["--end-of-options", oid]);
+    Ok(parse_log(&must(run(git, dir, &args, Some(BIG))?)?))
+}
+
+/// How many commits `exclude..oid` holds.
+pub fn range_count(
+    git: &Git,
+    dir: &Path,
+    exclude: Option<&str>,
+    oid: &str,
+) -> Result<u64, GitError> {
+    let not = exclude.map(|e| format!("^{e}"));
+    let mut args = vec!["rev-list", "--count"];
+    if let Some(n) = &not {
+        args.push(n.as_str());
+    }
+    args.extend(["--end-of-options", oid]);
+    let out = must(run(git, dir, &args, None)?)?;
+    Ok(String::from_utf8_lossy(&out).trim().parse().unwrap_or(0))
+}
+
+/// A file changed between two trees, with its own line counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub name: String,
+    pub status: &'static str,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+/// Per-file changes from `base` (`None` = the empty tree) to `oid`.
+pub fn file_stats(
+    git: &Git,
+    dir: &Path,
+    base: Option<&str>,
+    oid: &str,
+) -> Result<Vec<FileStat>, GitError> {
+    let base = base.unwrap_or(EMPTY_TREE);
+    let out = must(run(
+        git,
+        dir,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            "--raw",
+            "--numstat",
+            "--end-of-options",
+            base,
+            oid,
+        ],
+        Some(BIG),
+    )?)?;
+    let text = String::from_utf8_lossy(&out);
+    let mut toks = text.split('\0');
+    let mut files: Vec<(String, &'static str)> = Vec::new();
+    let mut nums: Vec<(u64, u64)> = Vec::new();
+    while let Some(t) = toks.next() {
+        if let Some(meta) = t.strip_prefix(':') {
+            let status = meta.split_whitespace().last().unwrap_or("M");
+            let Some(name) = toks.next() else { break };
+            files.push((
+                name.to_string(),
+                match status.chars().next() {
+                    Some('A') => "added",
+                    Some('D') => "removed",
+                    _ => "modified",
+                },
+            ));
+        } else if let Some((a, rest)) = t.split_once('\t') {
+            if let Some((d, _path)) = rest.split_once('\t') {
+                nums.push((a.parse().unwrap_or(0), d.parse().unwrap_or(0)));
+            }
+        }
+    }
+    Ok(files
+        .into_iter()
+        .zip(nums.into_iter().chain(std::iter::repeat((0, 0))))
+        .map(|((name, status), (additions, deletions))| FileStat {
+            name,
+            status,
+            additions,
+            deletions,
+        })
+        .collect())
+}
+
+/// Mailbox patches of every commit in `exclude..oid` (`format-patch --stdout`), oldest first.
+pub fn range_patch(
+    git: &Git,
+    dir: &Path,
+    exclude: Option<&str>,
+    oid: &str,
+) -> Result<Vec<u8>, GitError> {
+    let range = exclude.map_or_else(|| oid.to_string(), |e| format!("{e}..{oid}"));
+    must(run(
+        git,
+        dir,
+        &[
+            "format-patch",
+            "--stdout",
+            "--root",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--end-of-options",
+            &range,
+        ],
+        Some(BIG),
+    )?)
+}
+
 /// One entry of a tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeEntry {

@@ -430,7 +430,11 @@ use the cache and compute misses under a small concurrency limit.
 
 **PR head lifecycle.** An open PR's `head.sha` is the live branch tip (a
 force-push shows immediately); a merged PR's `head.sha` is frozen at merge; a
-closed PR keeps its last head through `refs/forge/pull/<n>/head`. Pushing the
+closed PR keeps its last head through `refs/forge/pull/<n>/head`. **Deleting the head
+branch closes the PR** (recorded O#6-O#10 and O#24-O#25, both Gitea versions; an earlier
+version of this paragraph and of `FINDINGS.md` said the PR stays open, which the fixtures
+contradict); the PR then reads `head.ref: refs/pull/<n>/head` with `head.label` the branch
+name, and reopening it (201) works without the branch. Pushing the
 head commit straight into base does not mark the PR merged (recorded; the
 agent runtime's landing check handles a trunk that contains the commits).
 
@@ -900,6 +904,44 @@ F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-
 - **Not built / not tested.** The 409 exhaustion path has a unit-tested classifier but no end-to-end test (it needs a
   deterministic interfering writer); the F4 `refs/forge/pull/<n>/head` refresh for a contents write to a PR branch;
   portable-name collision rules; a disk reservation sized to the exact rebuilt trees.
+
+### F4b decisions (as built)
+
+F4b adds migration 4 (`pulls`, `mergeability_cache`, `reviews`, `issue_comments`) and gates F, O (the merge-dependent exchanges
+stay `defer`red until F4c), P and D#13.
+
+- **PR object.** The recorded 1.22.6 shape (`id` is the row id, `number` the per-repository index; `user` is the creator's full
+  account object; `base.repo`/`head.repo` are the repository object). Open PRs show the live tips; `mergeable`, `merge_base`,
+  `changed_files`, `additions`, `deletions` come from `merge-base`, `diff-tree --numstat` and `merge-tree --write-tree`, cached
+  by `(base_sha, head_sha)`; a closed PR reads `mergeable: true`; a merged PR is frozen (F4c). Create needs write access (Gitea
+  lets any reader open one; stricter here); another repository as head is 404 (forks are a non-goal). `head == base` as commits
+  is 422 `Invalid PullRequest: There are no changes between the head and the base`; a head contained in base is accepted.
+  PATCH answers 201 and takes `title`, `body`, `state` and `base`; the PR's creator or write access may use it.
+- **Lists.** `state` open (default), closed (closed and merged) or all; `sort` newest (default), oldest or recentupdate; the
+  `head` filter is ignored like Gitea's; 404 on a repository with no commits (D#13). `X-Total-Count` and `Link` follow the
+  request's own query (see below).
+- **Retention (differs from the F0 text).** No `post-receive` database write and no `freezing` state: refresh and freeze both
+  run in the server under the write gate. `pulls::sync_locked` follows every head branch with `refs/forge/pull/<n>/head` and
+  closes an open PR whose head branch is gone (keeping the retained head as `final_head_sha`); it runs after an accepted push,
+  a contents write, a branch DELETE and at startup, and reads converge by running it when an open PR's head is missing. The
+  ref is written before the PR row exists. Branch DELETE retains the tip (under the exclusive lock) before the CAS delete, and
+  the `pre-receive` hook records `old` into the ref of an open PR whose head branch a push deletes (no quarantine variables
+  in that spawn; any failure refuses the push). `head_gone` marks a PR reopened without its branch so a later sync leaves it
+  open (recorded O#26-O#27). The startup reconcile also restores the ref of closed and merged PRs from `final_head_sha` and
+  removes `refs/forge/pull/<n>/head` refs with no row.
+- **Reviews.** `event` APPROVED/APPROVE, REQUEST_CHANGES, COMMENT, anything else PENDING; approving or requesting changes on
+  your own PR is 422; `official` is stored at creation (write access and a deciding state) and a later deciding review by the
+  same reviewer marks the earlier one `dismissed` and not official; PENDING reviews are visible only to their author but
+  counted in `X-Total-Count` (recorded quirk); the POST answer carries the full reviewer account, reads the nested form.
+  Inline review `comments` are refused (422) and a review's comment list is always empty. Issue comments live under
+  `/issues/{n}/comments` where `n` is a PR number (`issue` scope), oldest first. Caps: 64 KiB of text, 1000 reviews and 5000
+  comments per PR.
+- **Links.** All paged lists repeat the request's own query parameters (sorted by name, first value of a repeated one,
+  re-encoded strictly), with `page` replaced and clamped to the last page, and `limit` only when the request sent one (recorded
+  P#19-P#32). The commits list keeps its always-`limit` form. Branches are listed newest commit first, ties by name (P#19-22).
+  The combined status pages from the newest end and lists each page oldest first (P#40-41); history links name the request path.
+- **Not built / departures.** Forks, labels, milestones, assignees, requested reviewers and inline review comments; a
+  list of up to 50 PRs computes its cache misses one after another.
 
 ### F4a decisions (as built)
 

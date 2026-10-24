@@ -96,7 +96,7 @@ pub(crate) fn repo_json(
 /// The ~70-key repository object recorded from Gitea, with `empty` already known (a create or
 /// PATCH that has committed must not be reported as failed by a later git read). `perm` is the
 /// *caller's* standing.
-fn repo_json_known(
+pub(crate) fn repo_json_known(
     app: &App,
     conn: &rusqlite::Connection,
     r: &Repo,
@@ -467,7 +467,7 @@ pub fn search(ctx: &mut Ctx) -> Resp {
                 Ok(i) => i,
                 Err(r) => return r,
             };
-            let links = paged_with(ctx, "/repos/search", total, page, limit, &extra, vec![]);
+            let links = paged_with(ctx, "/repos/search", total, page, limit, vec![]);
             let mut r = Resp::json(200, &json!({"ok": true, "data": items}))
                 .with("x-total-count", total.to_string());
             if let Some((_, link)) = links.headers.iter().find(|(k, _)| *k == "link") {
@@ -764,7 +764,11 @@ pub fn delete_branch(ctx: &mut Ctx) -> Resp {
         return error(&ctx.app.base, 403, "can not delete default branch");
     }
     match ctx.app.life.delete_branch(ctx.conn, &a.repo, &name) {
-        Ok(()) => Resp::no_content(),
+        Ok(()) => {
+            // Open PRs on the branch close (the head was retained before the delete).
+            crate::pulls::sync(&ctx.app.life, ctx.conn, a.repo.id, now());
+            Resp::no_content()
+        }
         Err(LifecycleError::NoSuchBranch) => no_branch(ctx, &name),
         Err(e) => life_err(ctx.app, e),
     }

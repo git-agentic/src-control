@@ -6,7 +6,7 @@
 //! context (the oldest rows go), a departure from Gitea, which keeps everything. The merge gate
 //! reads [`latest`] directly, never the paged combined view.
 
-use crate::api::{body, link_header, page_params, paged, user_json};
+use crate::api::{body, link_header, page_params, paged};
 use crate::content_api::{api_base, dir};
 use crate::gitobj::{self, Peel};
 use crate::http::{error, not_found, Resp};
@@ -186,13 +186,7 @@ fn status_json(
         let u = store::find_by_id(ctx.conn, s.creator_id)
             .map_err(|e| ctx.app.internal(&e))?
             .ok_or_else(|| ctx.app.internal(&"status without creator"))?;
-        let mut j = user_json(&ctx.app.base, &u);
-        // Recorded: the nested creator is the public view of the account. The stored address is
-        // never shown (a placeholder derived from the login stands in), nor the site-admin flag.
-        j["active"] = json!(false);
-        j["is_admin"] = json!(false);
-        j["login_name"] = json!("");
-        j["email"] = json!(format!("{}@noreply.localhost", u.login));
+        let j = crate::api::nested_user_json(&ctx.app.base, &u, true);
         slot.insert(j);
     }
     Ok(json!({
@@ -206,6 +200,14 @@ fn status_json(
         "created_at": rfc3339(s.created),
         "updated_at": rfc3339(s.updated),
     }))
+}
+
+/// The path of this request below `/api/v1`, as the client sent it: page links repeat it.
+fn request_path<'a>(ctx: &'a Ctx) -> &'a str {
+    ctx.req
+        .path
+        .strip_prefix("/api/v1")
+        .unwrap_or(&ctx.req.path)
 }
 
 fn no_commit(ctx: &Ctx) -> Resp {
@@ -342,19 +344,7 @@ pub fn list_statuses(ctx: &mut Ctx) -> Resp {
             .map(|s| status_json(ctx, &a, s, &mut creators))
             .collect();
         match items {
-            Ok(items) => paged(
-                ctx,
-                &format!(
-                    "/repos/{}/{}/commits/{}/statuses",
-                    a.repo.owner,
-                    a.repo.name,
-                    crate::api::pct_encode(&rev)
-                ),
-                all.len() as i64,
-                page,
-                limit,
-                items,
-            ),
+            Ok(items) => paged(ctx, request_path(ctx), all.len() as i64, page, limit, items),
             Err(r) => r,
         }
     })
@@ -388,10 +378,15 @@ pub fn combined_status(ctx: &mut Ctx) -> Resp {
     };
     let (page, limit) = page_params(ctx);
     let mut creators = HashMap::new();
+    // Recorded (P#40-41): the page is cut from the newest end and then listed oldest first.
     let shown: Result<Vec<Value>, Resp> = all
         .iter()
+        .rev()
         .skip(((page - 1) * limit) as usize)
         .take(limit as usize)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
         .map(|s| status_json(ctx, &a, s, &mut creators))
         .collect();
     let shown = match shown {
@@ -421,13 +416,8 @@ pub fn combined_status(ctx: &mut Ctx) -> Resp {
     if total > 0 {
         r = r.with("x-total-count", total.to_string());
     }
-    let path = format!(
-        "/repos/{}/{}/commits/{}/status",
-        a.repo.owner,
-        a.repo.name,
-        crate::api::pct_encode(&rev)
-    );
-    if let Some(l) = link_header(ctx, &path, total, page, limit, &[]) {
+    let path = request_path(ctx);
+    if let Some(l) = link_header(ctx, path, total, page, limit) {
         r = r.with("link", l);
     }
     r

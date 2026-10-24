@@ -44,6 +44,20 @@ pub(crate) fn user_json(base: &str, u: &User) -> Value {
     })
 }
 
+/// The user object Gitea nests inside statuses, reviews and comments: inactive, never a site
+/// admin, no login name. `mask_email` replaces the stored address with `<login>@noreply.localhost`
+/// (recorded for statuses and comments; reviews show the stored one).
+pub(crate) fn nested_user_json(base: &str, u: &User, mask_email: bool) -> Value {
+    let mut j = user_json(base, u);
+    j["active"] = json!(false);
+    j["is_admin"] = json!(false);
+    j["login_name"] = json!("");
+    if mask_email {
+        j["email"] = json!(format!("{}@noreply.localhost", u.login));
+    }
+    j
+}
+
 pub(crate) fn org_json(base: &str, o: &User) -> Value {
     json!({
         "id": o.id,
@@ -119,7 +133,7 @@ pub(crate) fn paged(
     limit: i64,
     items: Vec<Value>,
 ) -> Resp {
-    paged_with(ctx, path, total, page, limit, &[], items)
+    paged_with(ctx, path, total, page, limit, items)
 }
 
 /// Percent-encode everything except the RFC 3986 unreserved characters, so a value can sit inside
@@ -136,64 +150,45 @@ pub(crate) fn pct_encode(s: &str) -> String {
     out
 }
 
-/// Like [`paged`], carrying `extra` query parameters (already strictly percent-encoded with [`pct_encode`], in the order
-/// Gitea emits them: alphabetical after `limit` and `page`) into every `Link` URL, so following
-/// a page link repeats the same query.
+/// Like [`paged`]; the page links repeat the request's own query (see [`link_header`]).
 pub(crate) fn paged_with(
     ctx: &Ctx,
     path: &str,
     total: i64,
     page: i64,
     limit: i64,
-    extra: &[(&str, String)],
     items: Vec<Value>,
 ) -> Resp {
     let mut r = Resp::json(200, &Value::Array(items)).with("x-total-count", total.to_string());
-    if let Some(l) = link_header(ctx, path, total, page, limit, extra) {
+    if let Some(l) = link_header(ctx, path, total, page, limit) {
         r = r.with("link", l);
     }
     r
 }
 
 /// Gitea's `Link` header value for page `page` of `total` rows, or `None` when there is one page.
+/// Each link repeats the request's own query parameters (first value of a repeated one, sorted by
+/// name) with `page` replaced, and carries `limit` only when the request did (recorded P#19-32:
+/// `?page=2` for a bare request, `?limit=0&page=2` when the client sent `limit=0`). The page is
+/// clamped to the last one, as Gitea does when building the links.
 pub(crate) fn link_header(
     ctx: &Ctx,
     path: &str,
     total: i64,
     page: i64,
     limit: i64,
-    extra: &[(&str, String)],
 ) -> Option<String> {
-    let tail: String = extra.iter().map(|(k, v)| format!("&{k}={v}")).collect();
-    let last = ((total + limit - 1) / limit).max(1);
-    let url = |p: i64, rel: &str| {
-        format!(
-            "<{}/api/v1{path}?limit={limit}&page={p}{tail}>; rel=\"{rel}\"",
-            ctx.app.base
-        )
-    };
-    let mut links = Vec::new();
-    if page < last {
-        links.push(url(page + 1, "next"));
-        links.push(url(last, "last"));
-    }
-    if page > 1 {
-        links.push(url(1, "first"));
-        links.push(url(page - 1, "prev"));
-    }
-    (!links.is_empty()).then(|| links.join(","))
+    links(ctx, path, total, page, limit, false)
 }
 
-/// Like [`paged`], but a page link repeats *every* request parameter, alphabetically by name (what
-/// Gitea does for the commits listing), with `limit` and `page` set to the link's own values.
-pub(crate) fn paged_sorted(
+fn links(
     ctx: &Ctx,
     path: &str,
     total: i64,
     page: i64,
     limit: i64,
-    items: Vec<Value>,
-) -> Resp {
+    with_limit: bool,
+) -> Option<String> {
     let mut q: std::collections::BTreeMap<String, String> = ctx
         .req
         .query
@@ -201,14 +196,20 @@ pub(crate) fn paged_sorted(
         .filter(|kv| !kv.is_empty())
         .map(|kv| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (k.to_string(), v.to_string())
+            // Re-encoded strictly from the decoded text, never echoed raw: a `>` or `"` in the
+            // request must not close the link target or start another entry.
+            let enc = |t: &str| {
+                crate::routes::percent_decode(&t.replace('+', " "))
+                    .map_or_else(|| pct_encode(t), |d| pct_encode(&d))
+            };
+            (enc(k), enc(v))
         })
         .rev() // the request parser reads the first value of a repeated parameter; the last insert wins
         .collect();
-    q.insert("limit".into(), limit.to_string());
+    if with_limit {
+        q.insert("limit".into(), limit.to_string());
+    }
     let last = ((total + limit - 1) / limit).max(1);
-    // Gitea builds the links from the clamped page: asking past the end still points `prev` at the
-    // page before the last.
     let page = page.min(last);
     let mut url = |p: i64, rel: &str| {
         q.insert("page".into(), p.to_string());
@@ -228,9 +229,21 @@ pub(crate) fn paged_sorted(
         links.push(url(1, "first"));
         links.push(url(page - 1, "prev"));
     }
+    (!links.is_empty()).then(|| links.join(","))
+}
+
+/// Like [`paged`], but every link also carries `limit` (what Gitea does for the commits listing).
+pub(crate) fn paged_sorted(
+    ctx: &Ctx,
+    path: &str,
+    total: i64,
+    page: i64,
+    limit: i64,
+    items: Vec<Value>,
+) -> Resp {
     let mut r = Resp::json(200, &Value::Array(items)).with("x-total-count", total.to_string());
-    if !links.is_empty() {
-        r = r.with("link", links.join(","));
+    if let Some(l) = links(ctx, path, total, page, limit, true) {
+        r = r.with("link", l);
     }
     r
 }

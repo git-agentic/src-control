@@ -821,6 +821,7 @@ impl Supervise {
         } else if receive && marker.exists() {
             if let Ok(conn) = crate::db::connect(&app.data_dir) {
                 let _ = repos::touch(&conn, repo_id, crate::timefmt::now());
+                crate::pulls::sync(&app.life, &conn, repo_id, crate::timefmt::now());
             }
         }
         let _ = std::fs::remove_file(&marker);

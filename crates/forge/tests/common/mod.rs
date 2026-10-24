@@ -45,6 +45,14 @@ impl Resp {
     pub fn msg(&self) -> String {
         self.json()["message"].as_str().unwrap_or("").to_string()
     }
+    /// A response header by lowercase name.
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.headers.get(name).cloned()
+    }
+    /// The body as text.
+    pub fn s_text(&self) -> String {
+        String::from_utf8_lossy(&self.raw).to_string()
+    }
 }
 
 pub fn b64(s: &str) -> String {
@@ -270,6 +278,25 @@ impl Srv {
             String::from_utf8_lossy(&out.stderr)
         );
         out.text()
+    }
+
+    /// Like [`Srv::git`], but `None` when git exits non-zero.
+    pub fn git_try(&self, id: i64, args: &[&str]) -> Option<String> {
+        let g = scl_forge::gitproc::Git::new(
+            &self.dir,
+            scl_forge::gitproc::find_git().expect("git"),
+            4,
+        )
+        .unwrap();
+        let dir = self.dir.join("repos").join(format!("{id}.git"));
+        let out = g
+            .run(&scl_forge::gitproc::Spec {
+                repo: Some(&dir),
+                args,
+                ..Default::default()
+            })
+            .unwrap();
+        out.ok().then(|| out.text())
     }
 
     /// Make branch `name` in repository `id` point at a new empty commit on top of `parent` (or a root).
