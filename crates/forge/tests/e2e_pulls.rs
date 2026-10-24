@@ -749,7 +749,12 @@ fn branches_differing_only_in_case_are_two_heads_and_file_urls_are_encoded() {
     );
     assert_eq!(w.retained(1).as_deref(), Some(lower.as_str()));
     // URLs name the file, not a fragment
-    w.commit("u", "a#b.txt", Some("main"));
+    let r = w.api(
+        "POST",
+        "/contents/a%23b.txt",
+        Some(json!({"content": b64("x\n"), "message": "m", "branch": "main", "new_branch": "u"})),
+    );
+    assert_eq!(r.status, 201, "{}", r.msg());
     w.open("u");
     let f = w.api("GET", "/pulls/2/files", None).json();
     assert_eq!(f[0]["filename"], "a#b.txt");
