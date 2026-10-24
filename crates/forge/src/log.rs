@@ -82,6 +82,9 @@ fn sink() -> &'static Sink {
 pub fn emit(severity: &str, message: &str, fields: Option<Value>) {
     let sink = sink();
     let now = crate::timefmt::now();
+    let mut line = render(now, severity, message, fields);
+    // The note about lost lines travels in the same queue entry as the line that follows it, so
+    // reporting a loss can never use up the slot the current event needs.
     let lost = sink.dropped.swap(0, Ordering::SeqCst);
     if lost > 0 {
         let note = render(
@@ -90,12 +93,10 @@ pub fn emit(severity: &str, message: &str, fields: Option<Value>) {
             "log lines were dropped: stderr is not being read",
             Some(json!({ "dropped": lost })),
         );
-        if !enqueue(sink, note) {
-            sink.dropped.fetch_add(lost, Ordering::SeqCst);
-        }
+        line = format!("{note}\n{line}");
     }
-    if !enqueue(sink, render(now, severity, message, fields)) {
-        sink.dropped.fetch_add(1, Ordering::SeqCst);
+    if !enqueue(sink, line) {
+        sink.dropped.fetch_add(lost + 1, Ordering::SeqCst);
     }
 }
 
