@@ -698,16 +698,34 @@ pub fn pull_commits(ctx: &mut Ctx) -> Resp {
         };
         let mut users = Users::new(ctx);
         let mut items = Vec::new();
+        // The per-command output cap does not bound a page of up to 50 commits that each list a huge
+        // change set, so the files kept for one response are bounded as a whole.
+        let mut files_left = crate::content_api::MAX_PAGE_FILES;
         for c in &commits {
-            let ch = match git_err(
+            let (files, stats) = match git_err(
                 ctx,
                 &a,
                 gitobj::changes(git, &d, c.parents.first().map(String::as_str), &c.oid),
             ) {
-                Ok((f, s)) => Some((Some(f), Some(s))),
+                Ok(x) => x,
                 Err(r) => return r,
             };
-            match commit_json(ctx, &a, &mut users, c, true, ch) {
+            if files.len() > files_left {
+                return error(
+                    &ctx.app.base,
+                    413,
+                    "the changed files of this page are too many",
+                );
+            }
+            files_left -= files.len();
+            match commit_json(
+                ctx,
+                &a,
+                &mut users,
+                c,
+                true,
+                Some((Some(files), Some(stats))),
+            ) {
                 Ok(v) => items.push(v),
                 Err(r) => return r,
             }

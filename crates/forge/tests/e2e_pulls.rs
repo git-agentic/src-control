@@ -265,9 +265,18 @@ fn deleting_the_head_branch_closes_the_pull_and_keeps_its_head() {
 fn a_push_that_deletes_or_rewrites_the_head_keeps_it_reachable() {
     use std::process::Command;
     let w = world();
+    /// Removes the client directory when the test ends, however it ends.
+    struct Tmp(std::path::PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+            assert!(std::thread::panicking() || !self.0.exists());
+        }
+    }
     let c = std::env::temp_dir().join(format!("scl-forge-pulls-push-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&c);
     std::fs::create_dir_all(&c).unwrap();
+    let _guard = Tmp(c.clone());
     let run = |args: &[&str]| {
         let out = Command::new("git")
             .env_clear()
@@ -343,7 +352,6 @@ fn a_push_that_deletes_or_rewrites_the_head_keeps_it_reachable() {
     assert_eq!(pr["state"], "closed");
     assert_eq!(pr["head"]["sha"], second.as_str());
     assert_eq!(w.retained(1).as_deref(), Some(second.as_str()));
-    let _ = std::fs::remove_dir_all(&c);
 }
 
 #[test]

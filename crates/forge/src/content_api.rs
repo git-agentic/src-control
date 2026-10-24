@@ -340,7 +340,7 @@ pub fn list_commits(ctx: &mut Ctx) -> Resp {
 }
 
 /// Changed files one `commits` response may carry in total (a few hundred bytes of JSON each).
-const MAX_PAGE_FILES: usize = 50_000;
+pub(crate) const MAX_PAGE_FILES: usize = 50_000;
 
 fn list_commits_inner(ctx: &Ctx, a: &Access) -> Resp {
     if ctx.req.param("not").is_some() {

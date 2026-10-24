@@ -687,6 +687,7 @@ mod tests {
         assert_eq!(rows[0].number, 3);
         let (rows, _) = list(&c, repo, &["closed"], Sort::Oldest, 0, 10).unwrap();
         assert_eq!(rows.len(), 1);
-        let _ = std::fs::remove_dir_all(&d);
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(!d.exists());
     }
 }
