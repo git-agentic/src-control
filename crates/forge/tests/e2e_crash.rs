@@ -392,3 +392,109 @@ fn check(srv: &Server, tok: &str, data: &Path, repo: i64, total: i64) {
     }
     eprintln!("after the restart: {merged} of {total} merged, {aborted} intents aborted so far");
 }
+
+#[test]
+fn a_restart_kills_an_orphaned_git_writer_and_clears_its_lock() {
+    let data = std::env::temp_dir().join(format!("scl-forge-orphan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    let _tmp = Tmp(data.clone());
+    admin(
+        &data,
+        &[
+            "user",
+            "create",
+            "--username",
+            "siteadmin",
+            "--password",
+            &format!("pw-{}-0123456789", std::process::id()),
+            "--email",
+            "a@example.invalid",
+            "--admin",
+            "--must-change-password=false",
+        ],
+    );
+    let tok = admin(
+        &data,
+        &[
+            "user",
+            "generate-access-token",
+            "--username",
+            "siteadmin",
+            "--token-name",
+            "t",
+            "--scopes",
+            "all",
+            "--raw",
+        ],
+    );
+    let mut srv = Server::start(&data, free_port());
+    let (st, body) = srv
+        .req(
+            "POST",
+            "/api/v1/user/repos",
+            Some(&tok),
+            Some(&json!({"name": "c", "default_branch": "main", "auto_init": true})),
+        )
+        .unwrap();
+    assert_eq!(st, 201, "{body}");
+    let repo: i64 = serde_json::from_str::<Value>(&body).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let main = git(&data, repo, &["rev-parse", "refs/heads/main"]).unwrap();
+    srv.kill9();
+
+    // What a SIGKILLed server leaves: an `update-ref` that has locked its ref and waits for the
+    // rest of its script (its stdin stays open because this test holds the pipe).
+    let canon = std::fs::canonicalize(&data).unwrap();
+    let repo_dir = canon.join("repos").join(format!("{repo}.git"));
+    let mut orphan = Command::new("git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("HOME", &canon)
+        .arg(format!("--git-dir={}", repo_dir.display()))
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut pipe = orphan.stdin.take().unwrap();
+    let zero = "0".repeat(main.len());
+    pipe.write_all(format!("start\nupdate refs/heads/zz {main} {zero}\nprepare\n").as_bytes())
+        .unwrap();
+    pipe.flush().unwrap();
+    let lock = repo_dir.join("refs/heads/zz.lock");
+    let t0 = Instant::now();
+    while !lock.exists() && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(lock.exists(), "the orphan holds its lock");
+    assert!(orphan.try_wait().unwrap().is_none(), "and is still running");
+
+    // the restart's startup cleanup kills it and clears the lock, before recovery looks at anything
+    let srv = Server::start(&data, free_port());
+    let t0 = Instant::now();
+    let status = loop {
+        if let Some(s) = orphan.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the orphan was not killed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success());
+    assert!(!lock.exists(), "its lock was removed");
+    assert!(
+        git(
+            &data,
+            repo,
+            &["rev-parse", "--verify", "-q", "refs/heads/zz"]
+        )
+        .is_none(),
+        "and it published nothing"
+    );
+    drop(pipe);
+    drop(srv);
+}

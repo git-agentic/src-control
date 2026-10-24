@@ -634,27 +634,3 @@ fn a_hostile_title_cannot_add_lines_to_the_merge_commit() {
     assert_eq!(body.lines().count(), 1, "{body:?}");
     assert!(!body.contains("\n"), "{body:?}");
 }
-
-#[test]
-fn a_stale_lock_on_the_base_does_not_freeze_recovery() {
-    let w = world();
-    let head = w.commit("f", "f.txt", "f\n", Some("main"));
-    let n = w.open("f", "main");
-    let (id, _, _) = crashed_merge(&w, n, &head, Crash::NotPublished);
-    let lock =
-        w.s.dir
-            .join("repos")
-            .join(format!("{}.git", w.id))
-            .join("refs/heads/main.lock");
-    std::fs::write(&lock, b"").unwrap();
-    // a lock that has stood for years belongs to a killed writer
-    let touched = std::process::Command::new("touch")
-        .args(["-t", "202001010000"])
-        .arg(&lock)
-        .status()
-        .unwrap();
-    assert!(touched.success());
-    recover(&w);
-    assert_eq!(intent_state(&w, id), "aborted");
-    assert!(!lock.exists(), "the stale lock was removed");
-}

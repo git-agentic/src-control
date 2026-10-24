@@ -325,7 +325,8 @@ transaction one after another, so a crash or a killed helper between two of them
 reverse): the receipt predicate alone then aborts a landed merge or finalizes one that never landed. The as-built protocol uses only
 atomic single-ref steps: the transaction `verify`s the head and moves the base (one ref), then `refs/forge/merge/<id>/landed` is
 written; recovery trusts the marker, then the merge commit being an ancestor of the base, and keeps an intent pending while a lock
-file shows a git writer still holding the base (an orphan `update-ref` after a server crash). Also changed: every retry persists all
+file shows a git writer holding the base; startup first kills orphaned git children of the data directory and removes their ref locks
+(`orphans.rs`), so nothing can publish after recovery has judged. Also changed: every retry persists all
 recomputed facts (R3 parity), recovery runs before pull-request mutations and syncs and finalization refuses to consume a pending
 intent against a PR that is not open, an unreadable git answer never aborts an intent, and the kill -9 test must witness an aborted
 and a recovered intent.

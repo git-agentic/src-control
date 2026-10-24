@@ -25,6 +25,7 @@ pub mod lifecycle;
 pub mod limits;
 pub mod merges;
 pub mod names;
+pub mod orphans;
 pub mod policy;
 pub mod protection;
 pub mod pulls;

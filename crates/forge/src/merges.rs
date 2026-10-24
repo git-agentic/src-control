@@ -258,7 +258,14 @@ fn commit_exists(git: &Git, dir: &Path, oid: &str) -> Result<bool, GitError> {
         args: &["cat-file", "-e", &format!("{oid}^{{commit}}")],
         ..Default::default()
     })?;
-    Ok(out.status.code() == Some(0))
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        // Anything else is "could not tell", which never aborts an intent.
+        _ => Err(GitError::Failed(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        )),
+    }
 }
 
 /// Has the intent's merge landed? The marker says so definitively; failing that, the merge commit
@@ -286,36 +293,14 @@ fn mark_landed(git: &Git, dir: &Path, i: &Intent) {
     });
 }
 
-/// A lock file older than this is a dead writer's (git holds one for milliseconds; our own helper
-/// is killed after at most a minute).
-const STALE_LOCK: Duration = Duration::from_secs(120);
-
-/// Is a git writer holding the base ref right now (its lock file exists)? An orphan `update-ref`
-/// that outlived a crashed server shows up here; judging "not landed" before it finishes would be
-/// wrong, so the intent waits. A lock that has stood for [`STALE_LOCK`] belongs to a writer that was
-/// killed mid-update (a timed-out helper): it is removed, since it would freeze the branch for
-/// every push and merge until an operator noticed.
+/// Is a git writer holding the base ref right now (its lock file exists)? At run time that is a
+/// live writer (a push, or our own publish): the intent waits rather than being judged under it.
+/// The lock of a *dead* writer is cleared at startup (`orphans::sweep`), not guessed at here.
 fn base_is_locked(dir: &Path, base_ref: &str) -> bool {
-    let lock = dir
-        .join("refs")
+    dir.join("refs")
         .join("heads")
-        .join(format!("{base_ref}.lock"));
-    let Ok(meta) = std::fs::metadata(&lock) else {
-        return false;
-    };
-    let age = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.elapsed().ok())
-        .unwrap_or_default();
-    if age > STALE_LOCK {
-        eprintln!(
-            "sc-forge: removing the stale lock {} left by a killed git writer",
-            lock.display()
-        );
-        return std::fs::remove_file(&lock).is_err();
-    }
-    true
+        .join(format!("{base_ref}.lock"))
+        .exists()
 }
 
 /// Settle the pending intents of the repository, with the write gate held (or at startup, when
@@ -467,7 +452,7 @@ fn pause_for_tests() {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
-        std::thread::sleep(Duration::from_millis(ms));
+        std::thread::sleep(Duration::from_millis(ms.min(5_000)));
     }
 }
 

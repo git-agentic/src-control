@@ -931,8 +931,11 @@ steps of "Merge" and "Crash recovery" above where they differ (plan decisions R1
   rewrites the whole intent row (merge commit, merge base, stats, time) first.
 - **Recovery** judges a pending intent in this order: marker present = landed (even if the base was force-pushed away
   afterwards); else the merge commit being an ancestor of the base = landed (the crash fell between the transaction and the
-  marker; at startup nobody can have rewritten the base yet); else, if a lock file shows a git writer still holding the base ref, the
-  intent stays pending (an orphan `update-ref` that outlived a crashed server); else aborted. An answer git cannot give never
+  marker; at startup nobody can have rewritten the base yet); else, if a lock file shows a git writer holding the base ref, the
+  intent stays pending (at run time that is a live writer); else aborted. Git children run in their own process groups and outlive a
+  SIGKILLed server, so startup, which holds the exclusive data-directory lock, first kills every git process that names a path under
+  this data directory's `repos/` and removes the ref locks they left (`orphans.rs`), before any recovery runs; an orphan therefore
+  cannot publish after recovery has judged. An answer git cannot give never
   aborts. Landed means finalized from the row (the PR merged with every field a normal merge writes, the head retained, the marker
   dropped); finalization refuses to run against a PR that is not open (the evidence is kept pending). Recovery runs before every
   gated pull-request operation and sync (a close, a retarget or a head-deletion sync cannot overtake a landed merge; if the

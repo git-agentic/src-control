@@ -1070,8 +1070,9 @@ SIGKILL during merges, restarted and checked), and the `bypass_matrix_*` tests i
 - **Crash consistency.** Git and SQLite cannot commit together, and Git's files backend commits several refs one after another, so
   the protocol uses only single-ref atomic steps and evidence that survives a crash between them: the journal row precedes the
   base compare-and-swap (one ref, with the head `verify`d in the same transaction), the `landed` marker follows it, and recovery
-  trusts, in order, the marker, the merge commit being in the base's history, and a lock file on the base (an orphan git writer
-  still holding it keeps the intent pending); only a definite "no" aborts, and a git error leaves the intent pending. Recovery also
+  trusts, in order, the marker, the merge commit being in the base's history, and a lock file on the base (a live writer holding it
+  keeps the intent pending; git children that outlived a SIGKILLed server are killed, and their locks removed, by the startup
+  cleanup before any recovery runs, `startup_cleanup`/`a_restart_kills_an_orphaned_git_writer_and_clears_its_lock`); only a definite "no" aborts, and a git error leaves the intent pending. Recovery also
   runs before any pull-request mutation or sync, so a close cannot overtake a landed merge, and finalization never runs against a
   pull request that is not open (`a_close_cannot_overtake_a_landed_merge`,
   `a_git_writer_still_holding_the_base_keeps_the_intent_pending`,
@@ -1081,6 +1082,9 @@ SIGKILL during merges, restarted and checked), and the `bypass_matrix_*` tests i
   that matter), restarts it, and asserts after every restart: no pending intent, no marker, every pull request merged with a
   two-parent commit on the base or open with its head not on the base; it keeps going until the database shows an intent aborted
   by recovery and one finished by recovery.
+- **Operator note.** A git writer killed at run time (the runner's timeout) can leave `refs/heads/<base>.lock`; pushes and merges to that branch
+  then wait until the next restart clears it. Migration 5 was rewritten while the feature was unreleased (no database at version 5 exists outside
+  CI); a later change to it needs a new migration.
 - **Known windows.** A rule created while a push is between `pre-receive` and its ref update is not stopped (the push does not
   take the gate). A merge computes its tree before it takes the base lock in git, so a base that moves under it only costs a retry,
   not a wrong merge (the compare-and-swap refuses). Objects of aborted or lost merges stay unreferenced until F5's gc.
