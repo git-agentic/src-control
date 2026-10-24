@@ -272,8 +272,13 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
     // Leftovers of killed writers go first: a stale ref lock would fail the gc and the reconcile
     // below. Owners are excluded: the gate is held and ours is the only registration.
     match in_gate(life, id, &cancel, cfg.gate_wait, || {
-        life.registry
-            .with_only(&reg, || orphans::clean_repo(&dir, Some(cfg.stale_age)))
+        // The gate excludes the API writers and the registry the transports; default-branch and
+        // branch-delete writers hold only the exclusive lifecycle lock, so take that too (gate
+        // first, as everywhere). Anything still running means the leftovers wait for the next pass.
+        life.try_exclusive(id, || {
+            life.registry
+                .with_only(&reg, || orphans::clean_repo(&dir, Some(cfg.stale_age)))
+        })
     }) {
         Ok(_) => {}
         Err(o) => return o,
@@ -316,8 +321,16 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
 
     // Stage 2, under the write gate.
     let stage2 = || -> Outcome {
+        if cancel.is_set() {
+            return Outcome::Gone;
+        }
         let now = timefmt::now();
-        if let Err(e) = pulls::reconcile_repo(conn, &life.git, &dir, id, now) {
+        // A sync logs and skips a pull request it cannot repair, so success of the reconcile is not
+        // enough: the roots are verified separately.
+        let roots = pulls::reconcile_repo(conn, &life.git, &dir, id, now)
+            .map_err(|e| e.to_string())
+            .and_then(|()| pulls::verify_roots(conn, &life.git, &dir, id));
+        if let Err(e) = roots {
             // Without every retention ref confirmed, deleting could destroy the only copy.
             eprintln!("sc-forge: repository {id}: retention refs could not be reconciled ({e}); nothing pruned");
             return Outcome::Skipped("retention refs could not be reconciled");

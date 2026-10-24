@@ -1106,7 +1106,8 @@ why each deletion is safe:
 - **Unreferenced objects, in two stages.** Stage 1 (`git gc --prune=never --force`, no gate, `gc.cruftPacks=false` pinned) packs
   what refs reach and loosens unreachable packed objects with their old pack's mtime; it deletes nothing. Stage 2 runs under the
   repository's write gate: it first confirms every retention ref (`pulls::reconcile_repo` recreates a missing head, final-head or
-  merge-commit ref from the database; any error skips the prune), then `git prune --expire=<window>` removes loose unreachable
+  merge-commit ref from the database, and `pulls::verify_roots` then checks each pull request row independently, because a sync
+  logs and skips a PR it cannot repair; any error skips the prune), then `git prune --expire=<window>` removes loose unreachable
   objects older than the window (`--gc-prune-expire`, default 14 days, refused below twice `--git-timeout` and an hour). Holding the
   gate keeps the API writers away: a contents write or merge copies existing, possibly old, trees and blobs into new objects
   (`mktree` does not touch the referenced objects), and without the gate prune could unlink one between that read and the
@@ -1115,12 +1116,14 @@ why each deletion is safe:
   `merge_commit_sha` still names. `refs/forge/pull/<n>/merge` now holds it (written by `finish`, recreated by the reconciler).
 - **Leftover locks and quarantine directories.** `refs/**/*.lock`, `packed-refs.lock`, `HEAD.lock` and `objects/incoming-*` go at
   startup unconditionally (after orphaned git processes are killed) and at run time only when the write gate is held, the
+  exclusive lifecycle lock is free (default-branch changes and branch deletes write refs under that lock alone), the
   repository has no other registered git run (`Registry::with_only`, which holds the registry lock so none can register meanwhile)
   and the item is older than 10 minutes. Age alone is never enough: a stepped clock or a suspended host can make a live owner's file
   look old.
 - **Delete.** A run registers like a transport and carries the registry's cancel flag into every git spawn, so a repository delete
   cancels it (group kill) and waits for it before the rename. The run never takes the lifecycle lock; the gate wait is sliced so a
-  cancel is noticed.
+  cancel is noticed. The reconcile between the two does not carry the cancel flag; it is a handful of short git commands, and a
+  delete that outwaits it answers 503 and reopens the repository rather than renaming under it.
 - **Remaining exposure.** A push built on an object older than the window while a concurrent force-push has just unreferenced it
   and stage 2 runs, is not excluded (receive-pack does not take the gate); its objects would have to be older than 14 days and
   unreachable in that instant. A pending merge intent whose merge commit stays unreferenced for the whole window reads as "not

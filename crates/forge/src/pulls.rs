@@ -634,6 +634,48 @@ pub fn reconcile_repo(
     Ok(())
 }
 
+/// Does a ref still hold every commit a pull request row names? The check before anything is
+/// pruned, independent of how [`reconcile_repo`] went (a sync logs and skips a PR it cannot
+/// repair): an open PR needs its head branch or its retention ref at the stored head; a closed or
+/// merged one its retention ref at the final head; a merged one also its merge ref.
+pub fn verify_roots(conn: &Connection, git: &Git, dir: &Path, repo_id: i64) -> Result<(), String> {
+    let e = |e: &dyn std::fmt::Display| e.to_string();
+    let kept = refs_under(git, dir, "refs/forge/pull").map_err(|x| e(&x))?;
+    let heads = refs_under(git, dir, "refs/heads").map_err(|x| e(&x))?;
+    let mut st = conn
+        .prepare("SELECT number FROM pulls WHERE repo_id = ?1")
+        .map_err(|x| e(&x))?;
+    let numbers: Vec<i64> = st
+        .query_map([repo_id], |r| r.get(0))
+        .map_err(|x| e(&x))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|x| e(&x))?;
+    for n in numbers {
+        let Some(p) = find(conn, repo_id, n).map_err(|x| e(&x))? else {
+            continue;
+        };
+        let held = |r: String, want: &str| kept.get(&r).is_some_and(|have| have == want);
+        let ok = match p.state.as_str() {
+            "open" => {
+                (!p.head_gone && head_tip(&heads, &p.head_ref).is_some())
+                    || held(retention_ref(n), &p.head_sha)
+            }
+            _ => p
+                .final_head
+                .as_deref()
+                .map_or(true, |h| held(retention_ref(n), h)),
+        };
+        let merge_ok = p.state != "merged"
+            || p.merge_commit
+                .as_deref()
+                .map_or(true, |m| held(merge_ref(n), m));
+        if !ok || !merge_ok {
+            return Err(format!("pull request {n} is not held by a ref"));
+        }
+    }
+    Ok(())
+}
+
 /// Run [`sync_locked`] under the repository's write gate (for callers that do not hold it, such
 /// as the git transport after an accepted push). Failures are logged: the next sync repairs them.
 pub fn sync(life: &Lifecycle, conn: &Connection, repo_id: i64, now: i64) {

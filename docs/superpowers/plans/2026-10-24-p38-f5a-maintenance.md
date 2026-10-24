@@ -89,6 +89,14 @@ Items: `objects/incoming-*` directories; `refs/**/*.lock`, `packed-refs.lock`, `
 if gc failed (the failure may be caused by such a lock). Startup keeps removing all of them unconditionally
 (`orphans::sweep` after it kills orphans) and gains `objects/incoming-*`.
 
+### 4a. Additions after the diff review
+
+- Cleanup also needs the exclusive lifecycle lock (`Lifecycle::try_exclusive`, never waits, taken after the gate): default-branch
+  changes and branch deletes write refs under that lock without the gate.
+- `pulls::verify_roots` checks every pull request row against the refs after the reconcile (a sync logs and skips a PR it cannot
+  repair, so reconcile success alone proved nothing).
+- The cancel flag is checked after the gate is taken; the reconcile does not carry it (short commands, a slow delete answers 503).
+
 ### 5. Failure and recovery
 
 gc killed at any point: stage 1 leaves the old packs until the new one is complete; git's temp files

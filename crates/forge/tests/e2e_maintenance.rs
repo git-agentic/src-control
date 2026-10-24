@@ -193,10 +193,13 @@ fn aged_unreferenced_objects_go_young_and_reachable_ones_stay() {
     let w = world();
     let head = w.commit("f", "f.txt", "f\n", Some("main"));
     let old_loose = w.loose("old loose");
-    let old_packed = w.loose("old packed");
     age(&w.loose_path(&old_loose), 30);
-    // Pack the third into an old pack (kept unreachable), then drop its loose copy.
-    w.git(&["repack", "-a", "-d", "-l", "--keep-unreachable"]);
+    // An old unreferenced object inside a pack: reach it through a temporary ref while packing
+    // (git 2.40 only packs loose unreachable objects next to an existing pack), then drop the ref.
+    let old_packed = w.loose("old packed");
+    w.git(&["update-ref", "refs/tmp/keep", &old_packed]);
+    w.git(&["repack", "-a", "-d", "-l"]);
+    w.git(&["update-ref", "-d", "refs/tmp/keep"]);
     for e in std::fs::read_dir(w.repo().join("objects/pack"))
         .unwrap()
         .flatten()
@@ -464,9 +467,29 @@ fn the_cron_route_is_for_site_admins_with_the_admin_scope() {
         404
     );
     assert_eq!(w.s.send("POST", url, Some(&w.auth), None).status, 204);
-    // A second request while one is queued or running starts nothing more.
-    assert!(!w.s.app.maint.request() || w.s.app.maint.busy());
     wait_for("the queue to drain", || !w.s.app.maint.busy());
+}
+
+#[test]
+fn requests_during_a_running_pass_start_nothing_more() {
+    let wrap = Wrap::new("gc");
+    let w = world_with(cfg(), Some(wrap.bin()));
+    let before = w.s.app.maint.passes();
+    wrap.hold();
+    let url = "/api/v1/admin/cron/git_gc_repos";
+    assert_eq!(w.s.send("POST", url, Some(&w.auth), None).status, 204);
+    wrap.wait_started();
+    for _ in 0..3 {
+        assert_eq!(w.s.send("POST", url, Some(&w.auth), None).status, 204);
+    }
+    assert!(
+        !w.s.app.maint.request(),
+        "a running pass covers the request"
+    );
+    wrap.release();
+    wait_for("the pass", || w.s.app.maint.passes() > before);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(w.s.app.maint.passes(), before + 1, "exactly one pass ran");
 }
 
 #[test]
@@ -496,6 +519,19 @@ fn a_prune_window_shorter_than_the_safe_minimum_is_refused_at_startup() {
 fn passes_beside_writers_lose_nothing() {
     let w = world();
     w.commit("f", "f.txt", "f\n", Some("main"));
+    // Everything that exists is old, so the passes really prune and the writers reuse old objects.
+    let junk: Vec<String> = (0..20).map(|i| w.loose(&format!("junk {i}"))).collect();
+    let mut stack = vec![w.repo().join("objects")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if d.file_name().is_some_and(|n| n.len() == 2) {
+                age(&p, 30);
+            }
+        }
+    }
     let stop = AtomicBool::new(false);
     let acknowledged = std::sync::Mutex::new(Vec::<String>::new());
     std::thread::scope(|sc| {
@@ -532,9 +568,54 @@ fn passes_beside_writers_lose_nothing() {
         passes.join().unwrap();
     });
     assert!(!acknowledged.lock().unwrap().is_empty());
+    assert!(
+        junk.iter().all(|j| !w.exists(j)),
+        "the passes pruned the old junk"
+    );
     w.fsck();
     for file in acknowledged.lock().unwrap().iter() {
         let r = w.api("GET", &format!("/contents/{file}?ref=f"), None);
         assert_eq!(r.status, 200, "{file} was acknowledged and must read back");
     }
+}
+
+#[test]
+fn a_branch_or_default_branch_writer_defers_the_cleanup() {
+    let w = world();
+    let stale = w.repo().join("refs/heads/zz.lock");
+    std::fs::write(&stale, "x").unwrap();
+    age(&stale, 1);
+    {
+        // The exclusive lifecycle lock is what default-branch changes and branch deletes hold.
+        let lock = w.s.app.life.lock_for(w.id);
+        let _writer = lock.write().unwrap();
+        assert!(matches!(w.maintain(), Outcome::Done { .. }));
+        assert!(stale.exists(), "a lifecycle writer may own that lock");
+    }
+    assert!(matches!(w.maintain(), Outcome::Done { .. }));
+    assert!(!stale.exists());
+}
+
+#[test]
+fn an_open_pull_with_no_branch_and_no_retention_ref_stops_the_prune() {
+    let w = world();
+    w.commit("f", "f.txt", "f\n", Some("main"));
+    let r = w.api(
+        "POST",
+        "/pulls",
+        Some(json!({"title": "PR f", "head": "f", "base": "main"})),
+    );
+    let n = r.json()["number"].as_i64().unwrap();
+    // Lost branch and retention ref, and a fresh lock that keeps the repair from succeeding: the
+    // sync logs and skips this pull request, yet the prune must still refuse to run.
+    w.git(&["update-ref", "-d", "refs/heads/f"]);
+    w.git(&["update-ref", "-d", &format!("refs/forge/pull/{n}/head")]);
+    let lock = w.repo().join(format!("refs/forge/pull/{n}/head.lock"));
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, "x").unwrap();
+    let junk = w.loose("junk");
+    age(&w.loose_path(&junk), 30);
+    let o = w.maintain();
+    assert!(matches!(o, Outcome::Skipped(_)), "{o:?}");
+    assert!(w.exists(&junk));
 }

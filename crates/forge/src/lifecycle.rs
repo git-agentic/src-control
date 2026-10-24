@@ -204,6 +204,21 @@ impl Lifecycle {
         Some(f())
     }
 
+    /// Run `f` while holding the repository's exclusive lifecycle lock, if it is free right now
+    /// (never waits): default-branch changes and branch deletes write refs under that lock alone,
+    /// so a cleanup that unlinks lock files needs it too. Take the gate first (see the lock order).
+    pub fn try_exclusive<T>(&self, id: i64, f: impl FnOnce() -> T) -> Option<T> {
+        let lock = self.lock_for(id);
+        let held = match lock.try_write() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let r = f();
+        drop(held);
+        Some(r)
+    }
+
     /// `repos/<id>.git`: always built from the integer id.
     pub fn repo_dir(&self, id: i64) -> PathBuf {
         self.data_dir.join("repos").join(format!("{id}.git"))
