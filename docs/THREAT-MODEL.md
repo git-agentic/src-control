@@ -1045,7 +1045,7 @@ and the `pulls` unit tests.
   vanished head runs the sync before taking the lock (`reads_do_not_deadlock_against_exclusive_repository_operations`).
 - **Account objects.** A PR's `user` and `merged_by` carry the full account object (stored email, admin flag), as recorded
   from Gitea and as `GET /users/{u}` already shows to any signed-in caller; only the objects Gitea itself nests in statuses,
-  comments and review lists are masked (login-derived email, no admin flag). Anyone with read access to a repository can
+  comments are masked (login-derived email, no admin flag), and a review list shows the stored email, as recorded (F#33). Anyone with read access to a repository can
   therefore see the stored email of its PR authors. Accounts that must not be identifiable should use a placeholder email.
 - **Cost.** Mergeability and diff statistics run `git` per PR on a cache miss; a page lists at most 50 PRs. A repository with
   many open PRs and a huge history makes a list slow, not wrong; the runner's concurrency and timeouts bound it.

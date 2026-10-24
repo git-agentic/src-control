@@ -477,6 +477,49 @@ pub fn has_vanished_head(conn: &Connection, git: &Git, dir: &Path, repo_id: i64)
     }
 }
 
+/// [`sync_locked`] for one PR; `true` when it closed it.
+fn sync_one(
+    conn: &Connection,
+    git: &Git,
+    dir: &Path,
+    mut p: Pull,
+    kept: &HashMap<String, String>,
+    heads: &HashMap<String, String>,
+    now: i64,
+) -> Result<bool, ComputeError> {
+    let tip = head_tip(heads, &p.head_ref);
+    let have = kept.get(&retention_ref(p.number)).cloned();
+    match tip {
+        Some(t) => {
+            if have.as_deref() != Some(t.as_str()) {
+                retain_cas(git, dir, p.number, &t, have.as_deref())?;
+            }
+            if p.head_sha != t || p.head_gone {
+                p.head_sha = t;
+                p.head_gone = false;
+                save(conn, &p)?;
+            }
+            Ok(false)
+        }
+        // Reopened without its branch: stays open on the retained head.
+        None if p.head_gone => Ok(false),
+        None => {
+            // The branch is gone, so whoever deleted it has recorded its tip: read that now.
+            let head = refs_under(git, dir, &retention_ref(p.number))?
+                .remove(&retention_ref(p.number))
+                .unwrap_or_else(|| p.head_sha.clone());
+            retain(git, dir, p.number, &head)?;
+            p.head_sha = head.clone();
+            p.final_head = Some(head);
+            p.state = "closed".into();
+            p.closed = Some(now);
+            p.updated = now;
+            save(conn, &p)?;
+            Ok(true)
+        }
+    }
+}
+
 /// Bring refs and rows into agreement, with the write gate held: an open PR's retention ref
 /// follows its head branch; a PR whose head branch is gone keeps the retained head and is
 /// closed. Returns how many PRs it closed.
@@ -497,36 +540,12 @@ pub fn sync_locked(
     let kept = refs_under(git, dir, "refs/forge/pull")?;
     let heads = refs_under(git, dir, "refs/heads")?;
     let mut closed = 0;
-    for mut p in open {
-        let tip = head_tip(&heads, &p.head_ref);
-        let have = kept.get(&retention_ref(p.number)).cloned();
-        match tip {
-            Some(t) => {
-                if have.as_deref() != Some(t.as_str()) {
-                    retain_cas(git, dir, p.number, &t, have.as_deref())?;
-                }
-                if p.head_sha != t || p.head_gone {
-                    p.head_sha = t;
-                    p.head_gone = false;
-                    save(conn, &p)?;
-                }
-            }
-            // Reopened without its branch: stays open on the retained head.
-            None if p.head_gone => {}
-            None => {
-                // The branch is gone, so whoever deleted it has recorded its tip: read that now.
-                let head = refs_under(git, dir, &retention_ref(p.number))?
-                    .remove(&retention_ref(p.number))
-                    .unwrap_or_else(|| p.head_sha.clone());
-                retain(git, dir, p.number, &head)?;
-                p.head_sha = head.clone();
-                p.final_head = Some(head);
-                p.state = "closed".into();
-                p.closed = Some(now);
-                p.updated = now;
-                save(conn, &p)?;
-                closed += 1;
-            }
+    for p in open {
+        let number = p.number;
+        // One PR that cannot be synced (a git failure on its ref) must not keep the others from it.
+        match sync_one(conn, git, dir, p, &kept, &heads, now) {
+            Ok(c) => closed += usize::from(c),
+            Err(e) => eprintln!("sc-forge: could not sync pull request {number}: {e}"),
         }
     }
     Ok(closed)
@@ -551,6 +570,12 @@ pub fn reconcile_repo(
         .collect::<rusqlite::Result<_>>()?;
     let known: HashMap<i64, (String, Option<String>)> =
         rows.into_iter().map(|(n, s, h)| (n, (s, h))).collect();
+    for p in open_pulls(conn, repo_id)? {
+        // Reopened without its branch: the stored head is the only anchor left.
+        if p.head_gone && kept.get(&retention_ref(p.number)) != Some(&p.head_sha) {
+            retain(git, dir, p.number, &p.head_sha)?;
+        }
+    }
     for (n, (state, final_head)) in &known {
         if state != "open" {
             if let Some(h) = final_head {

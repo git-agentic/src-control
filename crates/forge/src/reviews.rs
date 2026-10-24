@@ -253,9 +253,14 @@ pub fn create_review(ctx: &mut Ctx) -> Resp {
         Ok(_) => {}
         Err(e) => return ctx.app.internal(&e),
     }
-    let commit_id = match crate::pulls_api::head_of(ctx, &a, &p) {
-        Ok(h) => h,
-        Err(r) => return r,
+    // Git runs under the shared lifecycle lock, so a delete in flight answers 404, not a git error.
+    let commit_id = match ctx.app.life.with_read(ctx.conn, a.repo.id, || {
+        crate::pulls_api::head_of(ctx, &a, &p)
+    }) {
+        Ok(Some(Ok(h))) => h,
+        Ok(Some(Err(r))) => return r,
+        Ok(None) => return missing(ctx),
+        Err(e) => return ctx.app.internal(&e),
     };
     let official = a.perm >= Perm::Write && decides(state);
     let t = now();

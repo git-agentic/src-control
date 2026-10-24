@@ -335,7 +335,9 @@ fn a_push_that_deletes_or_rewrites_the_head_keeps_it_reachable() {
         second.as_str()
     );
     assert_eq!(w.retained(1).as_deref(), Some(second.as_str()));
-    // a push that deletes the branch closes the PR on the last head
+    // a push that deletes the branch closes the PR on the last head: the hook records the tip itself
+    // (the ref is pointed elsewhere first, so only the hook can put it right)
+    w.git(&["update-ref", "refs/forge/pull/1/head", &first]);
     in_work(&["push", "-q", "origin", ":pb"]);
     let pr = w.api("GET", "/pulls/1", None).json();
     assert_eq!(pr["state"], "closed");
