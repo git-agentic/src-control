@@ -347,8 +347,9 @@ pub fn maintain_repo(app: &App, conn: &rusqlite::Connection, id: i64) -> Outcome
             return Outcome::Skipped("retention refs could not be reconciled");
         }
         // A merge intent still pending after the reconcile has a commit only the journal names.
-        if merges::has_pending(conn, id) {
-            return Outcome::Skipped("a merge is still pending");
+        // Fail closed: an unreadable journal is treated as a pending merge.
+        if !matches!(merges::pending_checked(conn, id), Ok(false)) {
+            return Outcome::Skipped("a merge is pending or the journal is unreadable");
         }
         // Saturating, and never a cutoff in the future: an absurd window must not prune everything.
         let window = i64::try_from(cfg.prune_expire.as_secs()).unwrap_or(i64::MAX);

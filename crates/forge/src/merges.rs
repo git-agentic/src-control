@@ -95,8 +95,14 @@ pub fn pending(conn: &Connection, repo_id: i64) -> rusqlite::Result<Vec<Intent>>
     rows
 }
 
-/// Is a merge of this repository unfinished?
+/// Is a merge of this repository unfinished? A database error reads as "no": callers that must
+/// fail closed use [`pending_checked`].
 pub fn has_pending(conn: &Connection, repo_id: i64) -> bool {
+    pending_checked(conn, repo_id).unwrap_or(false)
+}
+
+/// [`has_pending`] that reports a database error instead of answering "no".
+pub fn pending_checked(conn: &Connection, repo_id: i64) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT 1 FROM merge_intents WHERE repo_id = ?1 AND state = 'pending' LIMIT 1",
         [repo_id],
@@ -104,7 +110,6 @@ pub fn has_pending(conn: &Connection, repo_id: i64) -> bool {
     )
     .optional()
     .map(|r| r.is_some())
-    .unwrap_or(false)
 }
 
 fn insert(conn: &Connection, i: &Intent, now: i64) -> rusqlite::Result<i64> {
