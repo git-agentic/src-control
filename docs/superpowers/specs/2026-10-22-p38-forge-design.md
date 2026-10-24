@@ -355,17 +355,16 @@ Minimum `git` 2.40 in tests; the container pins a current release
   treated as literals with NUL-delimited output (`-z`). Output is size-capped.
 - **Reads:** `for-each-ref`, `rev-parse`, `log`/`rev-list` with a fixed `-z`
   format, `cat-file`, `ls-tree -r -z`, `diff-tree`, `archive --format=zip|tar.gz`.
-- **Contents write** (POST/PUT): with `new_branch`, the protection policy applies to the
+- **Contents write** (POST/PUT/DELETE): with `new_branch`, the protection policy applies to the
   **target** branch (a new branch has no rule), creating it from a protected base is
   allowed (recorded: 201 with `new_branch` where a write to the protected branch is
-  403), and the base ref is read once and used as the CAS old value. Validate the path (reject empty, `.`, `..`,
-  `.git` and its NTFS/HFS aliases, absolute paths; mode 100644 only), `hash-object
-  -w`, a temp `GIT_INDEX_FILE` (`read-tree`, `update-index --cacheinfo`,
-  `write-tree`), `commit-tree`, then `update-ref <ref> <new> <old>` (zero old id
-  for an unborn branch). The branch must pass the protection policy first. A
-  lost CAS rebuilds from the new tip, revalidates the supplied blob `sha`, and
-  retries up to 3 times, then answers 409. Server-made commits bypass
-  `receive.fsckObjects`, so the path rules above are the check.
+  403), and the base ref is read once and used as the CAS old value. As built (F3b, "F3b decisions"
+  below): path rules, then raw `ls-tree -z` and `mktree -z` along the path (no index file), `hash-object -w`,
+  `commit-tree`, then `update-ref <ref> <new> <old>` (zero old id to create). The branch must pass the
+  protection policy first and again immediately before the ref update. A lost CAS rebuilds from the new tip,
+  revalidates the supplied blob `sha`, and retries up to 3 times, then answers 409. Server-made commits bypass
+  `receive.fsckObjects`, so the path rules above are the check (plus a refusal of `.gitmodules` and over-long
+  `.gitattributes` lines, whose content `fsck` checks on pushes).
 - **Per-repo write lock** serializes the server's own ref writes (contents,
   merges, PR-ref updates). It does not exclude receive-pack; the guarantees below
   come from Git's atomic ref transaction, not the lock.
@@ -816,8 +815,7 @@ F2b is the git half of F2 (plan: `docs/superpowers/plans/2026-10-23-p38-f2b-git-
 ### F3a decisions (as built)
 
 F3a is the read half of the content API (plan: `docs/superpowers/plans/2026-10-23-p38-f3a-content-reads.md`). The
-write half (`POST`/`PUT` contents) is F3b; until then both answer 501 after the auth checks, so a read-only token still
-gets its recorded 403.
+write half (`POST`/`PUT`/`DELETE` contents) is F3b, below; F3a shipped them as 501 stubs behind the auth checks.
 
 - **Routes.** `git/refs`, `git/refs/{ref..}`, `tags`, `commits`, `git/commits/{sha}` (+ `.diff`/`.patch`),
   `git/trees/{sha..}`, `contents`, `contents/{path..}`, `archive/{name..}` under `/repos/{o}/{r}` (read scope, read
@@ -857,6 +855,50 @@ gets its recorded 403.
 - **Conformance gate.** `forge-check.sh` now replays `A B C D E J K L M N R V` (12 scenarios). `E` stops at its first
   contents write (`[42, KeyError: 'sha']`) with E#36 to #41 deferred to F3b; `D` defers its PR listing and `B` its status
   post (F4).
+
+### F3b decisions (as built)
+
+F3b is the write half of the content API (plan: `docs/superpowers/plans/2026-10-24-p38-f3b-contents-writes.md`, with its
+"Decisions after independent review"). `gate E` replays E#36 to #43 unchanged.
+
+- **Routes.** `POST`, `PUT` and `DELETE` `/repos/{o}/{r}/contents/{path..}` (write scope, write permission). `DELETE` is
+  unrecorded (the recordings only have POST and PUT); it follows the Gitea 1.22 API: `sha` required, `{content: null,
+  commit, verification}`.
+- **Request.** `content` base64 (required for POST/PUT, an empty string is an empty file), `message` (trailing
+  whitespace trimmed, one `\n` added, default `Add|Update|Delete <path>`, NUL refused), `branch` (base, default the
+  default branch from the row read under the lock), `new_branch` (empty or equal to `branch` is absent), `sha` (PUT and
+  DELETE). `author`, `committer`, `dates` and `signoff` are accepted and ignored (the authenticated user is author and
+  committer; departure from Gitea); `from_path` is 422 because ignoring a rename would leave a copy.
+- **Path rules** (`gitwrite::write_path_ok`): `valid_path`, no `\`, no trailing `/`, at most 64 components of at most 255
+  bytes, no `.git` alias (case, trailing dots and spaces, `:stream`, `git~1`, HFS-ignorable code points) and no
+  `.gitmodules` alias: **`.gitmodules` cannot be written through the API** (its URL/path/name checks run only in
+  `receive.fsckObjects`). A `.gitattributes` line over 2048 bytes is refused. Windows device names, `:` in a name and
+  case-fold sibling collisions are not prevented.
+- **Semantics.** New files are `100644`; PUT keeps `100755` (and normalises legacy modes such as `100664` in the directories
+  it rebuilds; untouched subtrees keep their ids); a symlink, gitlink or directory at the path is 422 for PUT/DELETE, and
+  POST on any existing entry or under a non-tree parent is 422. An unborn default branch (`empty: true`, whatever other
+  branches exist) takes a POST as its first, parentless commit; PUT/DELETE there and `new_branch` from an unborn base are
+  404. `new_branch` must not equal, contain or lie under an existing branch name (422, before any object is written).
+  A missing path on PUT/DELETE is 404 (unrecorded; Gitea may answer 500).
+- **Locks.** A per-repository write gate (`limits::Gate(1)`, 10 s, 503 when busy) is taken first, then the shared
+  lifecycle lock, each once (`Lifecycle::with_write_row`, which hands over the fresh row); documented in
+  `lifecycle.rs` as the order F4 must follow. The runner gate applies to every git command.
+- **Publication.** Objects first, the ref last by `update-ref` CAS. After any failure the ref is re-read and the outcome
+  decided by `gitwrite::classify` (landed, lost round, lock held with a 50 ms pause, branch gone 404, `new_branch` exists
+  422, ref D/F conflict 422, anything else 500, logged); three lost rounds is 409 `the branch was changed concurrently,
+  try again`. The response is built before the ref moves and nothing is read from git afterwards; the repository's
+  `updated_unix` stamp after a successful write is log-only on failure.
+- **Limits.** Body (`--max-body-bytes`, 1 MiB) bounds content; 64 levels, 16 MiB per raw listing and 64 MiB cumulative
+  listing per attempt, 60 s for the operation, free disk against `--min-free-bytes` through the same reservation pool as
+  pushes (content plus 8 MiB).
+- **Protection seam.** `policy::check_contents_write(target, creating)` is evaluated early (Gitea checks protection first)
+  and again immediately before the ref update on every attempt, including for `new_branch`; it permits everything until
+  F4 adds rules, in the same module as the pre-receive policy.
+- **Identity.** Author and committer are the authenticated user's login and stored email (else
+  `<login>@noreply.localhost`); both commit dates are one server timestamp (`GIT_*_DATE`) so the response matches the commit.
+- **Not built / not tested.** The 409 exhaustion path has a unit-tested classifier but no end-to-end test (it needs a
+  deterministic interfering writer); the F4 `refs/forge/pull/<n>/head` refresh for a contents write to a PR branch;
+  portable-name collision rules; a disk reservation sized to the exact rebuilt trees.
 
 ## Open questions
 

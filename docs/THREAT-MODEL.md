@@ -968,6 +968,30 @@ Threat-model pass #2 for the read endpoints. Tests are in `crates/forge/tests/e2
 - **Not covered.** Content is served as stored: a file in a repository is returned base64-encoded in JSON, and raw/web
   URLs are not served, so no response is rendered as HTML.
 
+### Content API writes (F3b)
+
+Threat-model pass #2, first half (server-side writes; merge races and the protection bypass tests come with F4).
+Tests are in `crates/forge/tests/e2e_write.rs` and the `gitwrite` unit tests.
+
+- **Server-made commits bypass `receive.fsckObjects`.** The API therefore refuses what fsck would refuse on a push:
+  `.git` aliases (including NTFS and HFS spellings), `.gitmodules` (any content: the URL/path/name checks are not
+  reproduced), a `.gitattributes` line over 2048 bytes, backslashes, and paths deeper than 64 or with a component over
+  255 bytes (`git_aliases_and_separators_are_refused`, `paths_that_a_checkout_could_misread_are_refused`). Names that only
+  a case-insensitive or Windows checkout would collide (device names, `a:b`, `Foo` beside `foo/`) are not prevented.
+- **A write cannot damage what it did not touch.** Trees are rewritten from raw bytes; the entries the request did not name
+  keep their names and ids (`a_rewrite_keeps_every_untouched_entry_byte_for_byte`, `untouched_siblings_keep_their_exact_names`).
+  Legacy modes in a rebuilt directory are normalised.
+- **Concurrent writes.** The ref moves only by compare-and-swap; a lost round rebuilds from the new tip and re-checks the
+  precondition (`concurrent_api_writers_and_an_independent_ref_writer_lose_nothing`: an independent real-git writer races
+  twelve API writers and loses no commit). A push is not excluded by the write gate, so a writer can get 409 under sustained
+  pushes.
+- **Resource use.** One write at a time per repository (503 after 10 s); at most 3 attempts, 64 levels, 64 MiB of listings and
+  60 s each; disk is reserved from the push pool. A write holds the shared lifecycle lock, so a delete waits for it
+  (`deleting_the_repository_while_writes_are_queued_does_not_hang`).
+- **Identity cannot be chosen.** `author`, `committer` and `dates` in a request are ignored; the commit is the
+  authenticated user's. A write collaborator can still push any identity over git, as in Gitea.
+- **Unreferenced objects.** A refused or lost write leaves blobs/trees/commits no ref reaches; automatic gc is off (F5 adds gc).
+
 ## Reporting
 
 Security reports go to **toni@git-agentic.com** or GitHub private vulnerability
