@@ -265,14 +265,8 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
     let Some(identity) = Identity::new(&user.login, &email).map(|i| i.at(when)) else {
         return ctx.app.internal(&"unusable commit identity");
     };
-    let _held = match ctx
-        .app
-        .transports
-        .reserve_disk(&ctx.app.data_dir, w.bytes.len() as u64 + RESERVE_SLACK)
-    {
-        Some(h) => h,
-        None => return error(&ctx.app.base, 507, "insufficient storage"),
-    };
+    // Disk is promised only once the request has passed its preconditions (a refused one is 422, not 507).
+    let mut held = None;
     // Written after the first successful precondition check, so a refused request stores nothing.
     let mut blob: Option<String> = None;
     let base_ref = refname::branch_ref(&base_name);
@@ -324,15 +318,25 @@ fn run(ctx: &Ctx, a: &Access, row: &Repo, w: &Write) -> Resp {
         if started.elapsed() > DEADLINE {
             return error(&ctx.app.base, 503, "the write took too long, try again");
         }
-        // The rewrite stores about as many bytes of trees as the walk read: promise them for this attempt.
+        let prev_mode = match gw::check(&op, &comps, &walk) {
+            Ok(m) => m,
+            Err(r) => return refuse(ctx, &w.path, r),
+        };
+        // The content and slack once, and for this attempt the tree bytes the walk read (the rewrite
+        // stores about as many).
+        if held.is_none() {
+            held = ctx
+                .app
+                .transports
+                .reserve_disk(&ctx.app.data_dir, w.bytes.len() as u64 + RESERVE_SLACK);
+            if held.is_none() {
+                return error(&ctx.app.base, 507, "insufficient storage");
+            }
+        }
         let trees = (gw::TOTAL_LISTING - budget.listing) as u64 + (1 << 20);
         let _trees_held = match ctx.app.transports.reserve_disk(&ctx.app.data_dir, trees) {
             Some(h) => h,
             None => return error(&ctx.app.base, 507, "insufficient storage"),
-        };
-        let prev_mode = match gw::check(&op, &comps, &walk) {
-            Ok(m) => m,
-            Err(r) => return refuse(ctx, &w.path, r),
         };
         if blob.is_none() && w.verb != Verb::Delete {
             match gw::hash_blob(git, &d, &w.bytes, started + DEADLINE) {
