@@ -65,6 +65,9 @@ impl Out {
 pub struct Identity {
     name: String,
     email: String,
+    /// Commit time (unix seconds), when the caller needs the commit to match a response it has
+    /// already built; otherwise git uses the clock.
+    date: Option<i64>,
 }
 
 impl Identity {
@@ -75,7 +78,14 @@ impl Identity {
         (safe(name) && safe(email)).then(|| Identity {
             name: name.into(),
             email: email.into(),
+            date: None,
         })
+    }
+
+    /// The same identity with both commit dates fixed to `secs` (UTC).
+    pub fn at(mut self, secs: i64) -> Identity {
+        self.date = Some(secs);
+        self
     }
 }
 
@@ -183,6 +193,9 @@ impl Git {
             for who in ["AUTHOR", "COMMITTER"] {
                 env.push((format!("GIT_{who}_NAME"), id.name.clone()));
                 env.push((format!("GIT_{who}_EMAIL"), id.email.clone()));
+                if let Some(t) = id.date {
+                    env.push((format!("GIT_{who}_DATE"), format!("{t} +0000")));
+                }
             }
         }
         env
