@@ -1058,8 +1058,9 @@ SIGKILL during merges, restarted and checked), and the `bypass_matrix_*` tests i
 - **The matrix.** Against a protected non-default branch, for `enable_push` off and on and for an administrator and a write
   collaborator: a fast-forward push and a contents write succeed only with pushes on; a forced push, a push deletion and the
   API branch delete never do; a new branch cut from the protected one is allowed; a pull request merge into it works under both
-  settings and is the only way in when pushes are off. Receive-pack, the contents API, the branch API and the merge all go
-  through the same `policy` functions on rules read from SQLite.
+  settings and is the only way in when pushes are off. Receive-pack, the contents API and the branch API go through the
+  same `policy` functions on rules read from SQLite; the merge deliberately does not (it ignores `enable_push`) and reads the same rules
+  only for the required status contexts.
 - **Required checks gate the merge, not a push** (recorded, W#8). They are read for the head commit under the write gate
   immediately before the intent is written; a status posted by a repository writer for that commit counts (statuses are not
   attestations). There is no administrator override. A rule that requires checks but lists none refuses every merge.

@@ -313,6 +313,9 @@ fn kill_nine_during_merges_leaves_a_consistent_forge() {
             "m{i}.txt is on main at the end"
         );
     }
+    drop(srv);
+    std::fs::remove_dir_all(&data).unwrap();
+    assert!(!data.exists());
 }
 
 fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {

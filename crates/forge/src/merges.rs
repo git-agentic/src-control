@@ -132,13 +132,14 @@ fn insert(conn: &Connection, i: &Intent, now: i64) -> rusqlite::Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
-/// A retry builds a new merge commit on the new base, with its own merge base, statistics and
-/// time: the journal says all of it before the ref moves, so recovery writes exactly what a
+/// A retry builds a new merge commit on the new base (and, when the client named no head, from
+/// whatever the head is by then), with its own merge base, statistics and time: the journal says
+/// all of it, the head included, before the ref moves, so recovery writes exactly what a
 /// normal completion would.
 fn retarget(conn: &Connection, i: &Intent) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE merge_intents SET base_oid = ?1, merge_oid = ?2, merge_base = ?3, changed_files = ?4, \
-         additions = ?5, deletions = ?6, merged_unix = ?7 WHERE id = ?8 AND state = 'pending'",
+         additions = ?5, deletions = ?6, merged_unix = ?7, head_oid = ?9 WHERE id = ?8 AND state = 'pending'",
         params![
             i.base_oid,
             i.merge_oid,
@@ -147,7 +148,8 @@ fn retarget(conn: &Connection, i: &Intent) -> rusqlite::Result<()> {
             i.additions,
             i.deletions,
             i.merged_unix,
-            i.id
+            i.id,
+            i.head_oid
         ],
     )?;
     Ok(())
@@ -783,6 +785,7 @@ mod tests {
         again.merge_base = "9".repeat(40);
         (again.changed_files, again.additions, again.deletions) = (5, 6, 7);
         again.merged_unix = 99;
+        again.head_oid = "8".repeat(40);
         retarget(&c, &again).unwrap();
         let p = pending(&c, repo).unwrap();
         assert_eq!(
@@ -803,11 +806,13 @@ mod tests {
             (5, 6, 7, 99),
             "a retry persists every fact it recomputed"
         );
+        assert_eq!(p[0].head_oid, "8".repeat(40), "and the head it built on");
         abort(&c, id).unwrap();
         assert!(
             insert(&c, &intent(repo, user, 1), 8).is_ok(),
             "an aborted intent frees the slot"
         );
         std::fs::remove_dir_all(&d).unwrap();
+        assert!(!d.exists());
     }
 }
