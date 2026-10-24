@@ -109,6 +109,14 @@ if gc failed (the failure may be caused by such a lock). Startup keeps removing 
   survives a concurrent `pack-refs`. The reconcile finishes its other repairs when the merge-ref repair fails.
 - Stage 2 is not purely file-system work: the reconcile can finalize or abort merge intents and close pull requests.
 
+### 4c. Additions after the second Opus review
+
+- `refs/forge/pull/<n>/base` keeps the stored base commit of unmerged PRs (a commit that is already gone is skipped, not an error).
+- The prune is skipped when stage 1 did not complete; duration flags are capped at ten years; the cutoff is checked in the pass too.
+- A quarantine is renamed under the registry lock and deleted after it; a gate timeout in the cleanup step no longer skips the repository.
+- The plan's `run_all`, per-repository `AtomicBool` and `with_idle` were not built: one runner thread serializes passes, and
+  `with_only` replaced `with_idle`.
+
 ### 5. Failure and recovery
 
 gc killed at any point: stage 1 leaves the old packs until the new one is complete; git's temp files

@@ -1119,19 +1119,23 @@ why each deletion is safe:
   startup unconditionally (after orphaned git processes are killed) and at run time only when the write gate is held, the
   exclusive lifecycle lock is free (default-branch changes and branch deletes write refs under that lock alone), the
   repository has no registered run that can write (`Registry::with_only` ignores read-only fetches and holds the registry lock so
-  no writer can register meanwhile)
+  no writer can register meanwhile; under that lock a quarantine is only renamed to `objects/dead-*` and deleted afterwards)
   and the item is older than 10 minutes. Age alone is never enough: a stepped clock or a suspended host can make a live owner's file
   look old.
 - **Delete.** A run registers like a transport and carries the registry's cancel flag into every git spawn, so a repository delete
-  cancels it (group kill) and waits for it before the rename. The run never takes the lifecycle lock; the gate wait is sliced so a
-  cancel is noticed. The reconcile between the two does not carry the cancel flag; it is a handful of short git commands, and a
+  cancels it (group kill) and waits for it before the rename. The run never waits for the lifecycle lock (`try_read`/`try_write`
+  only); the gate wait is sliced so a cancel is noticed. The reconcile between the two does not carry the cancel flag; it is a handful of short git commands, and a
   delete that outwaits it answers 503 and reopens the repository rather than renaming under it.
 - **Cruft packs are off on purpose.** Stage 1 pins `gc.cruftPacks=false`: with git's default, `gc --prune=never` writes unreachable
   objects into a cruft pack and `git prune` never touches packed objects, so nothing would be collected (a test packs an old
   object and fails if the pin goes). The cost: unreachable objects are stored loose, without deltas, for up to the window. Not
   measured on a realistic repository.
-- **Prune holds the gate** for at most 10 minutes (its own limit); without the bitmaps stage 1 writes it walks every object, so a
-  skipped or failed stage 1 on a large repository makes writers wait.
+- **Prune holds the gate** for at most 10 minutes (its own limit). It runs only after a complete stage 1 (git's own gc does not
+  prune after a failed repack either): without it reachable objects may still be loose and old, and the walk is slower. A repository
+  that is too full to repack therefore keeps its garbage until space is freed.
+- **Base commits.** An unmerged PR whose base branch is gone shows its stored `base_sha`; `refs/forge/pull/<n>/base` keeps that
+  commit (recreated by the reconciler while it exists). Duration flags above ten years are refused at startup (a cutoff that wrapped
+  would have meant "prune now"), and the pass also refuses a cutoff before the epoch.
 - **Remaining exposure.** A push built on an object older than the window while a concurrent force-push has just unreferenced it
   and stage 2 runs, is not excluded (receive-pack does not take the gate); its objects would have to be older than 14 days and
   unreachable in that instant. A pending merge intent whose merge commit stays unreferenced for the whole window reads as "not
