@@ -30,53 +30,51 @@ const SEP: char = '\u{1f}';
 /// and development hosts are the only users). The environment matters: the writer behind an HTTP
 /// push is `git receive-pack --stateless-rpc .` run in the repository's directory, named by nothing
 /// on its command line, but it inherited the `FORGE_DATA_DIR` the transport sets.
-fn processes() -> Vec<(i32, String, char)> {
+fn processes() -> Option<Vec<(i32, String, char)>> {
     if Path::new("/proc/self").exists() {
         let mut out = Vec::new();
-        if let Ok(rd) = std::fs::read_dir("/proc") {
-            for e in rd.flatten() {
-                let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
-                    continue;
-                };
-                let join = |raw: Vec<u8>| {
-                    raw.split(|b| *b == 0)
-                        .filter(|a| !a.is_empty())
-                        .map(|a| String::from_utf8_lossy(a).to_string())
-                        .collect::<Vec<_>>()
-                        .join(&SEP.to_string())
-                };
-                if let Ok(raw) = std::fs::read(e.path().join("cmdline")) {
-                    let mut cmd = join(raw);
-                    if let Ok(env) = std::fs::read(e.path().join("environ")) {
-                        cmd.push(SEP);
-                        cmd.push_str(&join(env));
-                    }
-                    out.push((pid, cmd, SEP));
+        let rd = std::fs::read_dir("/proc").ok()?;
+        for e in rd.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                continue;
+            };
+            let join = |raw: Vec<u8>| {
+                raw.split(|b| *b == 0)
+                    .filter(|a| !a.is_empty())
+                    .map(|a| String::from_utf8_lossy(a).to_string())
+                    .collect::<Vec<_>>()
+                    .join(&SEP.to_string())
+            };
+            if let Ok(raw) = std::fs::read(e.path().join("cmdline")) {
+                let mut cmd = join(raw);
+                if let Ok(env) = std::fs::read(e.path().join("environ")) {
+                    cmd.push(SEP);
+                    cmd.push_str(&join(env));
                 }
+                out.push((pid, cmd, SEP));
             }
         }
-        return out;
+        return Some(out);
     }
     let ps = ["/bin/ps", "/usr/bin/ps"]
         .into_iter()
         .find(|p| Path::new(p).exists());
-    let Some(ps) = ps else {
-        return Vec::new();
-    };
-    let Ok(o) = std::process::Command::new(ps)
+    let ps = ps?;
+    let o = std::process::Command::new(ps)
         .args(["-axEww", "-o", "pid=,command="])
         .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&o.stdout)
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim_start();
-            let (pid, cmd) = l.split_once(' ')?;
-            Some((pid.parse().ok()?, cmd.trim_start().to_string(), ' '))
-        })
-        .collect()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim_start();
+                let (pid, cmd) = l.split_once(' ')?;
+                Some((pid.parse().ok()?, cmd.trim_start().to_string(), ' '))
+            })
+            .collect(),
+    )
 }
 
 /// Is `cmd` a git invocation: the configured git executable (`SC_FORGE_GIT` may name it anything),
@@ -144,12 +142,13 @@ fn alive(pid: i32) -> bool {
 }
 
 /// Kill git processes that work on this data directory's repositories (not ours: `me`), then wait
-/// briefly for them to be gone. Returns `(killed, survivors)`. The match is on the command line
+/// briefly for them to be gone. Returns `(killed, survivors)`, or `None` when the process table
+/// could not be read at all. The match is on the command line
 /// (`--git-dir=<data>/repos/...` for our `update-ref`s, the repository path for `receive-pack` and
 /// `upload-pack`), or by the `FORGE_DATA_DIR` they inherited from the HTTP transport: the processes
 /// that can move a ref. Helpers that only read or write objects
 /// (`index-pack`, `unpack-objects`) are not named by path and are left to finish and exit.
-pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> (usize, usize) {
+pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> Option<(usize, usize)> {
     let needle = format!("{}/repos/", data_dir.display());
     let env_needle = format!("FORGE_DATA_DIR={}", data_dir.display());
     let mut killed = std::collections::BTreeSet::new();
@@ -157,7 +156,8 @@ pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> (usi
     // look finds nothing alive (at most a few seconds).
     let until = Instant::now() + Duration::from_secs(5);
     loop {
-        let found: Vec<i32> = processes()
+        // A look that could not be taken is not an empty look: nothing is concluded from it.
+        let found: Vec<i32> = processes()?
             .into_iter()
             .filter(|(pid, cmd, sep)| {
                 *pid != me
@@ -169,7 +169,7 @@ pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> (usi
             .map(|(pid, _, _)| pid)
             .collect();
         if found.is_empty() {
-            return (killed.len(), 0);
+            return Some((killed.len(), 0));
         }
         for pid in &found {
             killed.insert(*pid);
@@ -178,7 +178,7 @@ pub fn kill_orphan_git(data_dir: &Path, me: i32, git_bin: Option<&Path>) -> (usi
         }
         if Instant::now() >= until {
             let survivors = found.iter().filter(|p| alive(**p)).count();
-            return (killed.len(), survivors);
+            return Some((killed.len(), survivors));
         }
         std::thread::sleep(Duration::from_millis(30));
     }
@@ -235,7 +235,13 @@ pub fn remove_stale_locks(data_dir: &Path) -> usize {
 /// when no matching process is left alive: a lock of a writer that could not be killed is not ours
 /// to take.
 pub fn sweep(data_dir: &Path, git_bin: Option<&Path>) -> Swept {
-    let (killed, survivors) = kill_orphan_git(data_dir, std::process::id() as i32, git_bin);
+    let Some((killed, survivors)) = kill_orphan_git(data_dir, std::process::id() as i32, git_bin)
+    else {
+        eprintln!(
+            "sc-forge: could not read the process table; leaving any orphaned git writers and ref locks alone"
+        );
+        return Swept::default();
+    };
     let locks = if survivors == 0 {
         remove_stale_locks(data_dir)
     } else {
