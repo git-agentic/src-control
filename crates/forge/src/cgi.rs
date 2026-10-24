@@ -496,6 +496,7 @@ fn environment(l: &Launch, marker: &std::path::Path) -> Vec<(String, String)> {
     var("GIT_HTTP_MAX_REQUEST_BUFFER", cfg.max_request.to_string());
     var("FORGE_DATA_DIR", git.data_dir().display().to_string());
     var("FORGE_REPO_ID", id.to_string());
+    var("FORGE_GIT_BIN", git.bin().display().to_string());
     var("FORGE_USER_ID", l.plan.user.id.to_string());
     var("FORGE_ACCEPT_MARKER", marker.display().to_string());
     env

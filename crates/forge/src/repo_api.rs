@@ -30,6 +30,7 @@ fn life_err(app: &App, e: LifecycleError) -> Resp {
             "The repository with the same name already exists.",
         ),
         LifecycleError::BadBranch => error(&app.base, 422, "[DefaultBranch]: invalid branch name"),
+        LifecycleError::Protected(m) => error(&app.base, 403, &m),
         LifecycleError::Gone => not_found(&app.base, "The target couldn't be found.", None),
         LifecycleError::Git(crate::gitproc::GitError::Busy) => {
             error(&app.base, 503, "too many git operations in flight")
@@ -81,7 +82,12 @@ fn compute_empty(app: &App, conn: &rusqlite::Connection, r: &Repo) -> Result<boo
 }
 
 /// The repository object with a live read of `empty`.
-fn repo_json(app: &App, conn: &rusqlite::Connection, r: &Repo, perm: Perm) -> Result<Value, Resp> {
+pub(crate) fn repo_json(
+    app: &App,
+    conn: &rusqlite::Connection,
+    r: &Repo,
+    perm: Perm,
+) -> Result<Value, Resp> {
     let empty = compute_empty(app, conn, r)?;
     repo_json_known(app, conn, r, perm, empty)
 }
@@ -629,6 +635,8 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
     let (author_login, committer_login) = (login(&c.author)?, login(&c.committer)?);
     let who = |p: &gitread::Person, login: Option<String>| json!({"name": p.name, "email": p.email, "username": login.unwrap_or_default()});
     let full = format!("{}/{}", a.repo.owner, a.repo.name);
+    let rules = crate::protection::load(ctx.conn, a.repo.id).map_err(|e| ctx.app.internal(&e))?;
+    let rule = rules.for_branch(&br.name);
     Ok(json!({
         "name": br.name,
         "commit": {
@@ -643,13 +651,13 @@ fn branch_json(ctx: &Ctx, a: &Access, br: &gitread::Branch) -> Result<Value, Res
             "removed": null,
             "modified": null,
         },
-        "protected": false,
+        "protected": rule.is_some(),
         "required_approvals": 0,
-        "enable_status_check": false,
-        "status_check_contexts": [],
-        "user_can_push": a.perm >= Perm::Write,
+        "enable_status_check": rule.is_some_and(|r| r.enable_status_check),
+        "status_check_contexts": rule.map_or_else(|| json!([]), |r| json!(r.contexts)),
+        "user_can_push": a.perm >= Perm::Write && rule.is_none_or(|r| r.enable_push),
         "user_can_merge": a.perm >= Perm::Write,
-        "effective_branch_protection_name": "",
+        "effective_branch_protection_name": rule.map_or("", |r| r.branch.as_str()),
     }))
 }
 

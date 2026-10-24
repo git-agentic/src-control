@@ -8,9 +8,11 @@
 //! cannot be replaced by repository content (`core.hooksPath` is pinned per spawn and repositories
 //! are created without a hooks directory), and it trusts nothing from git but the three stdin fields.
 
-use crate::{db, policy, repos};
+use crate::gitproc::{Git, Spec};
+use crate::policy::Rules;
+use crate::{db, policy, protection, repos};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Read git's update lines from `r` as raw bytes. Any read error or any line that is not valid UTF-8
 /// refuses the whole push: stopping at the first bad line would leave the rest unchecked (fail open).
@@ -28,7 +30,15 @@ pub fn read_updates(mut r: impl Read) -> Result<Vec<String>, String> {
 }
 
 /// Decide a whole push. `lines` are git's `<old> <new> <ref>` records; returns every refusal text.
-pub fn decide(lines: &[String], default_branch: &str, live: bool) -> Vec<String> {
+/// `is_ff(old, new)` answers whether `new` descends from `old`; it is asked only for an update of
+/// an existing protected branch that allows pushes.
+pub fn decide(
+    lines: &[String],
+    default_branch: &str,
+    live: bool,
+    rules: &Rules,
+    is_ff: &dyn Fn(&str, &str) -> Result<bool, String>,
+) -> Vec<String> {
     if !live {
         return vec!["refusing the push: the repository is not available".to_string()];
     }
@@ -36,8 +46,18 @@ pub fn decide(lines: &[String], default_branch: &str, live: bool) -> Vec<String>
     for l in lines {
         let mut it = l.splitn(3, ' ');
         match (it.next(), it.next(), it.next()) {
-            (Some(_old), Some(new), Some(name)) if !name.is_empty() => {
-                if let Err(e) = policy::check_update(name, new, default_branch) {
+            (Some(old), Some(new), Some(name)) if !name.is_empty() => {
+                let verdict = policy::check_update(name, new, default_branch).and_then(|()| {
+                    match name.strip_prefix("refs/heads/") {
+                        Some(branch) => {
+                            policy::check_protected_push(rules, branch, old, new, || {
+                                is_ff(old, new)
+                            })
+                        }
+                        None => Ok(()),
+                    }
+                });
+                if let Err(e) = verdict {
                     out.push(e);
                 }
             }
@@ -47,12 +67,82 @@ pub fn decide(lines: &[String], default_branch: &str, live: bool) -> Vec<String>
     out
 }
 
-/// Look up the repository the hook runs for: `(default_branch, live)`.
-pub fn lookup(data_dir: &Path, repo_id: i64) -> Result<(String, bool), String> {
+/// What the hook needs to know about the repository.
+pub struct RepoInfo {
+    pub default_branch: String,
+    pub live: bool,
+    pub rules: Rules,
+}
+
+/// Look up the repository the hook runs for.
+pub fn lookup(data_dir: &Path, repo_id: i64) -> Result<RepoInfo, String> {
     let conn = db::open_readonly(data_dir).map_err(|e| e.to_string())?;
     match repos::find_by_id(&conn, repo_id).map_err(|e| e.to_string())? {
-        Some(r) => Ok((r.default_branch, r.state == "live")),
+        Some(r) => Ok(RepoInfo {
+            rules: protection::load(&conn, r.id).map_err(|e| e.to_string())?,
+            live: r.state == "live",
+            default_branch: r.default_branch,
+        }),
         None => Err(format!("repository {repo_id} does not exist")),
+    }
+}
+
+fn full_id(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// An object directory git handed the hook is acceptable only when it lies under the
+/// repository's own `objects/` (receive-pack's quarantine does).
+fn under(objects: &Path, p: &Path) -> bool {
+    p.is_absolute()
+        && !p.components().any(|c| matches!(c, Component::ParentDir))
+        && p.starts_with(objects)
+}
+
+/// Is `new` a descendant of `old`? Runs `git merge-base --is-ancestor` with the sanitized runner
+/// environment plus the quarantine's object directories (the pushed objects are only there until
+/// the push is accepted). Anything unexpected refuses the update.
+fn is_ff_in(
+    data_dir: &Path,
+    repo_id: i64,
+    git_bin: &Path,
+    old: &str,
+    new: &str,
+) -> Result<bool, String> {
+    if !full_id(old) || !full_id(new) {
+        return Err("malformed object id".into());
+    }
+    let git = Git::new(data_dir, git_bin.to_path_buf(), 1).map_err(|e| e.to_string())?;
+    let repo: PathBuf = git.data_dir().join("repos").join(format!("{repo_id}.git"));
+    let objects = repo.join("objects");
+    let incoming = std::env::var("GIT_OBJECT_DIRECTORY").ok();
+    let alternates = std::env::var("GIT_ALTERNATE_OBJECT_DIRECTORIES").ok();
+    let mut extra: Vec<(&str, &str)> = Vec::new();
+    if let Some(d) = incoming.as_deref() {
+        if !under(&objects, Path::new(d)) {
+            return Err("unexpected object directory".into());
+        }
+        extra.push(("GIT_OBJECT_DIRECTORY", d));
+    }
+    if let Some(a) = alternates.as_deref() {
+        // A colon-separated list; every entry must be one of the repository's own.
+        if !a.split(':').all(|d| under(&objects, Path::new(d))) {
+            return Err("unexpected alternate object directory".into());
+        }
+        extra.push(("GIT_ALTERNATE_OBJECT_DIRECTORIES", a));
+    }
+    let out = git
+        .run(&Spec {
+            repo: Some(&repo),
+            args: &["merge-base", "--is-ancestor", old, new],
+            extra_env: &extra,
+            ..Default::default()
+        })
+        .map_err(|e| e.to_string())?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
     }
 }
 
@@ -88,14 +178,19 @@ pub fn run() -> i32 {
             return 1;
         }
     };
-    let (default_branch, live) = match lookup(Path::new(&data), id) {
+    let info = match lookup(Path::new(&data), id) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("sc-forge pre-receive: refusing the push: {e}");
             return 1;
         }
     };
-    let refusals = decide(&lines, &default_branch, live);
+    let git_bin = std::env::var_os("FORGE_GIT_BIN").map(PathBuf::from);
+    let is_ff = |old: &str, new: &str| match &git_bin {
+        Some(b) => is_ff_in(Path::new(&data), id, b, old, new),
+        None => Err("FORGE_GIT_BIN is not set".into()),
+    };
+    let refusals = decide(&lines, &info.default_branch, info.live, &info.rules, &is_ff);
     for r in &refusals {
         eprintln!("{r}");
     }
@@ -120,12 +215,55 @@ mod tests {
         format!("{A} {new} {r}")
     }
 
+    fn ff(v: bool) -> impl Fn(&str, &str) -> Result<bool, String> {
+        move |_, _| Ok(v)
+    }
+
+    fn rules(push: bool) -> Rules {
+        Rules(vec![policy::Rule {
+            branch: "rel".into(),
+            enable_push: push,
+            enable_status_check: false,
+            contexts: None,
+        }])
+    }
+
+    #[test]
+    fn protection_rules_decide_pushes_and_the_default_branch_text_comes_first() {
+        let one =
+            |rules: &Rules, line: String, f: bool| decide(&[line], "main", true, rules, &ff(f));
+        assert_eq!(one(&rules(false), l(A, "refs/heads/rel"), true).len(), 1);
+        assert_eq!(one(&rules(true), l(A, "refs/heads/rel"), true).len(), 0);
+        assert_eq!(one(&rules(true), l(A, "refs/heads/rel"), false).len(), 1);
+        assert_eq!(one(&rules(true), l(Z, "refs/heads/rel"), true).len(), 1);
+        assert_eq!(one(&rules(true), l(A, "refs/heads/other"), false).len(), 0);
+        assert_eq!(one(&rules(true), l(A, "refs/tags/rel"), false).len(), 0);
+        let bad = decide(
+            &[l(A, "refs/heads/rel")],
+            "main",
+            true,
+            &rules(true),
+            &|_, _| Err("boom".into()),
+        );
+        assert_eq!(bad.len(), 1, "a failed ancestry check refuses");
+        let main = Rules(vec![policy::Rule {
+            branch: "main".into(),
+            enable_push: true,
+            enable_status_check: false,
+            contexts: None,
+        }]);
+        let out = one(&main, l(Z, "refs/heads/main"), true);
+        assert!(out[0].contains("default branch"), "{out:?}");
+    }
+
     #[test]
     fn a_clean_push_is_accepted() {
         assert!(decide(
             &[l(A, "refs/heads/feat"), l(A, "refs/tags/v1")],
             "main",
-            true
+            true,
+            &Rules::default(),
+            &ff(true)
         )
         .is_empty());
     }
@@ -141,6 +279,8 @@ mod tests {
             ],
             "main",
             true,
+            &Rules::default(),
+            &ff(true),
         );
         assert_eq!(out.len(), 3, "{out:?}");
         assert!(
@@ -152,13 +292,34 @@ mod tests {
 
     #[test]
     fn a_repository_that_is_not_live_refuses_everything() {
-        assert_eq!(decide(&[l(A, "refs/heads/x")], "main", false).len(), 1);
+        assert_eq!(
+            decide(
+                &[l(A, "refs/heads/x")],
+                "main",
+                false,
+                &Rules::default(),
+                &ff(true)
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]
     fn malformed_lines_fail_closed() {
         for bad in ["", "onlyone", "a b", "a b "] {
-            assert_eq!(decide(&[bad.to_string()], "main", true).len(), 1, "{bad:?}");
+            assert_eq!(
+                decide(
+                    &[bad.to_string()],
+                    "main",
+                    true,
+                    &Rules::default(),
+                    &ff(true)
+                )
+                .len(),
+                1,
+                "{bad:?}"
+            );
         }
     }
 
@@ -200,13 +361,16 @@ mod tests {
         )
         .unwrap();
         let r = repos::insert_creating(&conn, owner.id, "r", "trunk", "", "", 1).unwrap();
+        let i = lookup(&d, r.id).unwrap();
         assert_eq!(
-            lookup(&d, r.id).unwrap(),
-            ("trunk".to_string(), false),
+            (i.default_branch.as_str(), i.live),
+            ("trunk", false),
             "creating is not live"
         );
         repos::set_state(&conn, r.id, "creating", "live", 2).unwrap();
-        assert_eq!(lookup(&d, r.id).unwrap(), ("trunk".to_string(), true));
+        let i = lookup(&d, r.id).unwrap();
+        assert_eq!((i.default_branch.as_str(), i.live), ("trunk", true));
+        assert!(i.rules.0.is_empty());
         assert!(lookup(&d, 999).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }

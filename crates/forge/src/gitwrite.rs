@@ -176,6 +176,7 @@ fn run(
         identity: id,
         max_output: Some(cap),
         timeout: Some(left.min(Duration::from_secs(60))),
+        ..Default::default()
     })?;
     if out.ok() {
         Ok(out.stdout)

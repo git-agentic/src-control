@@ -72,6 +72,9 @@ pub enum LifecycleError {
     /// The default branch name is not a valid branch name.
     #[error("invalid branch name")]
     BadBranch,
+    /// A branch protection rule forbids the operation.
+    #[error("{0}")]
+    Protected(String),
     /// A git command that must succeed failed.
     #[error("git failed: {0}")]
     GitFailed(String),
@@ -467,7 +470,8 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// Delete a branch (the caller has refused the default branch). `NoSuchBranch` when absent.
+    /// Delete a branch (the caller has refused the default branch). `NoSuchBranch` when absent;
+    /// `Protected` when a protection rule covers it.
     pub fn delete_branch(
         &self,
         conn: &Connection,
@@ -485,13 +489,40 @@ impl Lifecycle {
                 "refusing to delete the default branch".into(),
             ));
         }
+        // The exclusive lock is held, so no gated writer (rule change, contents write) is running.
+        crate::policy::check_branch_delete(&crate::protection::load(conn, current.id)?, branch)
+            .map_err(LifecycleError::Protected)?;
         let dir = self.repo_dir(current.id);
         let full = refname::branch_ref(branch);
-        if !self.branch_exists(&dir, &full)? {
-            return Err(LifecycleError::NoSuchBranch);
+        // Compare-and-swap: receive-pack is not excluded by this lock, so a push that moves the
+        // branch between the read and the delete must not be deleted along with it.
+        for _ in 0..3 {
+            let out = self.git.run(&Spec {
+                repo: Some(&dir),
+                args: &["rev-parse", "--verify", "-q", "--end-of-options", &full],
+                ..Default::default()
+            })?;
+            let tip = match out.status.code() {
+                Some(0) => out.text(),
+                Some(1) => return Err(LifecycleError::NoSuchBranch),
+                _ => {
+                    return Err(LifecycleError::GitFailed(
+                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    ))
+                }
+            };
+            let out = self.git.run(&Spec {
+                repo: Some(&dir),
+                args: &["update-ref", "-d", &full, &tip],
+                ..Default::default()
+            })?;
+            if out.ok() {
+                return Ok(());
+            }
         }
-        self.run(&dir, &["update-ref", "-d", &full], None, None)?;
-        Ok(())
+        Err(LifecycleError::GitFailed(
+            "the branch kept changing while it was being deleted".into(),
+        ))
     }
 
     /// Move `p` out of the way into `orphans/` (never deleting it).

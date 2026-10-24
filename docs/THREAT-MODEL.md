@@ -992,6 +992,33 @@ Tests are in `crates/forge/tests/e2e_write.rs` and the `gitwrite` unit tests.
   authenticated user's. A write collaborator can still push any identity over git, as in Gitea.
 - **Unreferenced objects.** A refused or lost write leaves blobs/trees/commits no ref reaches; automatic gc is off (F5 adds gc).
 
+### Branch protection and commit statuses (F4a)
+
+Threat-model pass #2, second part (protection across write paths); the merge path and the bypass matrix come with F4c.
+Tests: `crates/forge/tests/e2e_protection.rs`, the `policy`, `hook`, `protection` and `statuses` unit tests.
+
+- **One policy for every ref move.** Push (`pre-receive`), contents API and branch DELETE call the same
+  `policy` functions on rules read from SQLite. Administrators are not exempt: `enable_push: false` refuses them too
+  (`pushes_under_a_rule`, `contents_writes_under_a_rule`). Tests use a non-default protected branch so the default-branch
+  rule cannot mask a missing check.
+- **Fail closed.** An unreadable database, a hook without `FORGE_GIT_BIN`, an unexpected object directory, a malformed object
+  id, or an ancestry check that errors refuses the update. The ancestry check runs `git merge-base --is-ancestor` with the
+  runner's pinned environment (no replace objects, no system or global config, hooks directory fixed) and only the
+  quarantine's object directories added, each required to be under the repository's `objects/`.
+- **Names.** Matching is exact and case-insensitive (a case alias of a protected name is protected); glob rule names, glob
+  context names and every unenforced protection setting are refused rather than stored, so a rule never looks stronger than it is.
+  A rule on a branch that does not exist yet reserves the name against push and contents creation.
+- **Ordering.** Rule create/PATCH/DELETE hold the repository's write gate, as do contents writes, which re-read the rules
+  immediately before `update-ref`: after a PATCH returns, no contents write lands under the old rule
+  (`a_rule_change_is_ordered_against_contents_writes`). `receive-pack` does not take the gate: a rule created while a push is
+  between `pre-receive` and its ref transaction does not stop that push. Rule changes answer 503 while a write holds the gate.
+- **Statuses are not attestations.** Any caller with write access may post any context for any commit of the repository
+  (Gitea's trust boundary). They gate merges only (F4c). Posting is bounded: 100 contexts per commit, 100 rows per context,
+  field length caps, `target_url` limited to plain `http(s)` so a status link cannot be a `javascript:` URL in a web client.
+  The author's stored email is not shown in the creator object.
+- **Branch delete.** The API refuses a protected branch and deletes with compare-and-swap on the observed tip, so a concurrent
+  push is not erased by a stale delete.
+
 ## Reporting
 
 Security reports go to **toni@git-agentic.com** or GitHub private vulnerability

@@ -9,7 +9,7 @@ use crate::lifecycle::Lifecycle;
 use crate::limits::{Backoff, Gate, Proxies};
 use crate::repos::{self, Access, Perm};
 use crate::scope::{self, Cat, Level, Need};
-use crate::{api, content_api, content_write, db, repo_api, store};
+use crate::{api, content_api, content_write, db, protection, repo_api, statuses, store};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -451,6 +451,78 @@ pub static ROUTES: &[Route] = &[
         n(Cat::Repository, Level::Read),
         Repo(Perm::Read),
         content_api::get_archive,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/branch_protections",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        protection::list_rules,
+    ),
+    r(
+        "POST",
+        "/repos/{o}/{r}/branch_protections",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Read),
+        protection::create_rule,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/branch_protections/{b..}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        protection::get_rule,
+    ),
+    r(
+        "PATCH",
+        "/repos/{o}/{r}/branch_protections/{b..}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Read),
+        protection::patch_rule,
+    ),
+    r(
+        "DELETE",
+        "/repos/{o}/{r}/branch_protections/{b..}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Read),
+        protection::delete_rule,
+    ),
+    r(
+        "POST",
+        "/repos/{o}/{r}/statuses/{sha..}",
+        Token,
+        n(Cat::Repository, Level::Write),
+        Repo(Perm::Read),
+        statuses::create_status,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/statuses/{sha..}",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        statuses::list_statuses,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/commits/{sha}/statuses",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        statuses::list_statuses,
+    ),
+    r(
+        "GET",
+        "/repos/{o}/{r}/commits/{sha}/status",
+        Token,
+        n(Cat::Repository, Level::Read),
+        Repo(Perm::Read),
+        statuses::combined_status,
     ),
 ];
 
