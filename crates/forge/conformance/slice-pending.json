@@ -15,38 +15,6 @@
    ]
   ]
  },
- "E": {
-  "stop": [
-   42,
-   "KeyError: 'sha'"
-  ],
-  "defer": [
-   [
-    36,
-    "POST /api/v1/repos/acme/hist/contents/new.txt"
-   ],
-   [
-    37,
-    "POST /api/v1/repos/acme/hist/contents/new.txt"
-   ],
-   [
-    38,
-    "PUT /api/v1/repos/acme/hist/contents/README.md"
-   ],
-   [
-    39,
-    "PUT /api/v1/repos/acme/hist/contents/README.md"
-   ],
-   [
-    40,
-    "PUT /api/v1/repos/acme/hist/contents/README.md"
-   ],
-   [
-    41,
-    "POST /api/v1/repos/acme/hist/contents/branch-file.txt"
-   ]
-  ]
- },
  "K": {
   "defer": [
    [

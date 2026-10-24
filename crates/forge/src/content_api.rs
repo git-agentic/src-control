@@ -18,12 +18,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-fn dir(ctx: &Ctx, a: &Access) -> PathBuf {
+pub(crate) fn dir(ctx: &Ctx, a: &Access) -> PathBuf {
     ctx.app.life.repo_dir(a.repo.id)
 }
 
 /// `{base}/api/v1/repos/{owner}/{repo}`.
-fn api_base(ctx: &Ctx, a: &Access) -> String {
+pub(crate) fn api_base(ctx: &Ctx, a: &Access) -> String {
     format!(
         "{}/api/v1/repos/{}/{}",
         ctx.app.base, a.repo.owner, a.repo.name
@@ -31,7 +31,7 @@ fn api_base(ctx: &Ctx, a: &Access) -> String {
 }
 
 /// `{base}/{owner}/{repo}`: the web URLs Gitea puts in `html_url`.
-fn web_base(ctx: &Ctx, a: &Access) -> String {
+pub(crate) fn web_base(ctx: &Ctx, a: &Access) -> String {
     format!("{}/{}/{}", ctx.app.base, a.repo.owner, a.repo.name)
 }
 
@@ -55,7 +55,7 @@ fn flag(ctx: &Ctx, k: &str, default: bool) -> bool {
 }
 
 /// A git failure that is the request's doing, as opposed to the repository's.
-fn read_err(ctx: &Ctx, a: &Access, e: GitError) -> Resp {
+pub(crate) fn read_err(ctx: &Ctx, a: &Access, e: GitError) -> Resp {
     match e {
         GitError::OutputTooLarge => error(&ctx.app.base, 413, "the result is too large to serve"),
         GitError::Timeout { .. } => error(&ctx.app.base, 504, "git timed out"),
@@ -123,7 +123,7 @@ impl<'a> Users<'a> {
     }
 }
 
-fn verification() -> Value {
+pub(crate) fn verification() -> Value {
     json!({"verified": false, "reason": "gpg.error.not_signed_commit", "signature": "", "signer": null, "payload": ""})
 }
 
@@ -588,6 +588,52 @@ fn content_json(
     exact_last: bool,
 ) -> Result<Value, Resp> {
     let (git, d) = (&ctx.app.life.git, dir(ctx, a));
+    let last = if exact_last {
+        git_err(ctx, a, gitobj::last_commit(git, &d, commit, &e.path))?.unwrap_or_default()
+    } else {
+        commit.to_string()
+    };
+    let ty = entry_type(e);
+    let size = e.size.unwrap_or(0);
+    let (mut encoding, mut content, mut target) = (Value::Null, Value::Null, Value::Null);
+    // A link target is a path (PATH_MAX); a bigger blob is not read, and a listing reads at most
+    // LAST_COMMIT_BUDGET of them, so one tree cannot make the server read thousands of blobs.
+    if ty == "symlink" && size <= 4096 && (with_content || exact_last) {
+        let b = git_err(ctx, a, gitobj::blob(git, &d, &e.oid))?;
+        target = Value::String(String::from_utf8_lossy(&b).to_string());
+    } else if ty == "file" && with_content && size <= gitobj::MAX_BLOB {
+        let b = git_err(ctx, a, gitobj::blob(git, &d, &e.oid))?;
+        encoding = json!("base64");
+        content = Value::String(b64::encode(&b));
+    }
+    Ok(content_value(
+        ctx, a, refname, kind, e, &last, encoding, content, target,
+    ))
+}
+
+/// The type string of a tree entry in a contents object.
+fn entry_type(e: &TreeEntry) -> &'static str {
+    match (e.kind.as_str(), e.mode.as_str()) {
+        ("tree", _) => "dir",
+        ("commit", _) => "submodule",
+        (_, "120000") => "symlink",
+        _ => "file",
+    }
+}
+
+/// The contents object of `e` as of ref `refname` (also what a contents write answers with).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn content_value(
+    ctx: &Ctx,
+    a: &Access,
+    refname: &str,
+    kind: RefKind,
+    e: &TreeEntry,
+    last: &str,
+    encoding: Value,
+    content: Value,
+    target: Value,
+) -> Value {
     let api = api_base(ctx, a);
     let web = web_base(ctx, a);
     let enc_path = e
@@ -602,36 +648,15 @@ fn content_json(
         .collect::<Vec<_>>()
         .join("/");
     let query_ref = pct_encode(refname);
-    let last = if exact_last {
-        git_err(ctx, a, gitobj::last_commit(git, &d, commit, &e.path))?.unwrap_or_default()
-    } else {
-        commit.to_string()
-    };
     let name = e.path.rsplit('/').next().unwrap_or(&e.path);
     let seg = kind.segment();
-    let ty = match (e.kind.as_str(), e.mode.as_str()) {
-        ("tree", _) => "dir",
-        ("commit", _) => "submodule",
-        (_, "120000") => "symlink",
-        _ => "file",
-    };
+    let ty = entry_type(e);
     let size = e.size.unwrap_or(0);
-    let (mut encoding, mut content, mut target) = (Value::Null, Value::Null, Value::Null);
-    // A link target is a path (PATH_MAX); a bigger blob is not read, and a listing reads at most
-    // LAST_COMMIT_BUDGET of them, so one tree cannot make the server read thousands of blobs.
-    if ty == "symlink" && size <= 4096 && (with_content || exact_last) {
-        let b = git_err(ctx, a, gitobj::blob(git, &d, &e.oid))?;
-        target = Value::String(String::from_utf8_lossy(&b).to_string());
-    } else if ty == "file" && with_content && size <= gitobj::MAX_BLOB {
-        let b = git_err(ctx, a, gitobj::blob(git, &d, &e.oid))?;
-        encoding = json!("base64");
-        content = Value::String(b64::encode(&b));
-    }
     let self_url = format!("{api}/contents/{enc_path}?ref={query_ref}");
     // Recorded: directories point at `git/blobs/<tree id>` too.
     let git_url = format!("{api}/git/blobs/{}", e.oid);
     let html = format!("{web}/src/{seg}/{enc_ref}/{enc_path}");
-    Ok(json!({
+    json!({
         "name": name,
         "path": e.path,
         "sha": e.oid,
@@ -647,7 +672,7 @@ fn content_json(
         "download_url": if ty == "file" { json!(format!("{web}/raw/{seg}/{enc_ref}/{enc_path}")) } else { Value::Null },
         "submodule_git_url": null,
         "_links": {"self": self_url, "git": git_url, "html": html},
-    }))
+    })
 }
 
 /// Entries of one listing whose `last_commit_sha` is computed exactly.

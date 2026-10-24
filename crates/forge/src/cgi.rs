@@ -105,6 +105,17 @@ impl Transports {
         }
     }
 
+    /// Reserve `need` bytes of disk for a server-made write against the same floor and pool as pushes
+    /// (`None`: the disk cannot promise it).
+    pub fn reserve_disk(
+        &self,
+        data_dir: &std::path::Path,
+        need: u64,
+    ) -> Option<crate::transport::Held> {
+        let free = crate::transport::free_bytes(data_dir).unwrap_or(0);
+        self.reserve.reserve(free, self.cfg.min_free, need)
+    }
+
     fn repo_slots(&self, repo: i64) -> Arc<Semaphore> {
         let mut m = self.per_repo.lock().unwrap_or_else(|e| e.into_inner());
         if m.len() > 256 {

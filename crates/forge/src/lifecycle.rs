@@ -9,6 +9,13 @@
 //!
 //! `serve` holds the [`DirLock`] for its lifetime, so no second process can reconcile or mutate
 //! the same directory, and a per-repository mutex serializes the server's own operations on one id.
+//!
+//! **Lock order** for a server-made ref write (contents writes now, merges and PR-ref updates in F4):
+//! the repository's write gate first ([`Lifecycle::with_write_row`]: timed, 503 when busy), then the
+//! shared lifecycle lock, each taken once. Nothing beneath that boundary may take the lifecycle lock
+//! again (no `with_read` helper): the lock is writer-preferring, so a queued delete between two
+//! shared acquisitions by one request deadlocks it. Never take the gate while holding the lifecycle
+//! lock.
 
 use crate::gitproc::{Git, GitError, Identity, Spec};
 use crate::refname;
@@ -85,6 +92,15 @@ pub struct Report {
     pub missing_dirs: usize,
 }
 
+/// How [`Lifecycle::with_write_row`] ended.
+pub enum WriteRun<T> {
+    /// The write gate stayed taken for the whole wait.
+    Busy,
+    /// The repository is deleted or being deleted.
+    Gone,
+    Ran(T),
+}
+
 /// Owns the on-disk layout and the per-repository serialization.
 pub struct Lifecycle {
     data_dir: PathBuf,
@@ -92,6 +108,8 @@ pub struct Lifecycle {
     /// Live git transports by repository, cancelled by `delete` and at shutdown.
     pub registry: Arc<crate::registry::Registry>,
     locks: Mutex<HashMap<i64, Arc<RwLock<()>>>>,
+    /// One writer per repository at a time; see the lock order above.
+    gates: Mutex<HashMap<i64, Arc<crate::limits::Gate>>>,
     #[cfg(test)]
     crash_at: Mutex<Option<&'static str>>,
 }
@@ -113,6 +131,7 @@ impl Lifecycle {
             git,
             registry: Arc::default(),
             locks: Mutex::default(),
+            gates: Mutex::default(),
             #[cfg(test)]
             crash_at: Mutex::default(),
         })
@@ -133,6 +152,34 @@ impl Lifecycle {
         Ok(match repos::find_by_id(conn, id)? {
             Some(r) if r.state == "live" => Some(f()),
             _ => None,
+        })
+    }
+
+    /// Run `f` (a server-made write to repository `id`) as its only writer, under the shared
+    /// lifecycle lock, with the repository's row as it is now (so the default branch is current).
+    /// `Busy`: another write held the gate for `wait`; `Gone`: the repository is not `live`.
+    pub fn with_write_row<T>(
+        &self,
+        conn: &Connection,
+        id: i64,
+        wait: Duration,
+        f: impl FnOnce(&Repo) -> T,
+    ) -> Result<WriteRun<T>, rusqlite::Error> {
+        let gate = self
+            .gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id)
+            .or_insert_with(|| Arc::new(crate::limits::Gate::new(1)))
+            .clone();
+        let Some(_writer) = gate.acquire_timeout(wait) else {
+            return Ok(WriteRun::Busy);
+        };
+        let lock = self.lock_for(id);
+        let _shared = lock.read().unwrap_or_else(|e| e.into_inner());
+        Ok(match repos::find_by_id(conn, id)? {
+            Some(r) if r.state == "live" => WriteRun::Ran(f(&r)),
+            _ => WriteRun::Gone,
         })
     }
 
@@ -359,6 +406,10 @@ impl Lifecycle {
         }
         self.registry.forget(repo.id);
         self.locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&repo.id);
+        self.gates
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&repo.id);

@@ -9,7 +9,7 @@ use crate::lifecycle::Lifecycle;
 use crate::limits::{Backoff, Gate, Proxies};
 use crate::repos::{self, Access, Perm};
 use crate::scope::{self, Cat, Level, Need};
-use crate::{api, content_api, db, repo_api, store};
+use crate::{api, content_api, content_write, db, repo_api, store};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -419,15 +419,14 @@ pub static ROUTES: &[Route] = &[
         Repo(Perm::Read),
         content_api::get_contents,
     ),
-    // F3b builds the writes; until then they answer 501 after the scope and permission checks, so
-    // a read-only token still gets its recorded 403.
+    // Contents writes (F3b): write scope and write permission, then a server-made commit.
     r(
         "POST",
         "/repos/{o}/{r}/contents/{p..}",
         Token,
         n(Cat::Repository, Level::Write),
         Repo(Perm::Write),
-        api::not_implemented,
+        content_write::write_contents,
     ),
     r(
         "PUT",
@@ -435,7 +434,7 @@ pub static ROUTES: &[Route] = &[
         Token,
         n(Cat::Repository, Level::Write),
         Repo(Perm::Write),
-        api::not_implemented,
+        content_write::write_contents,
     ),
     r(
         "DELETE",
@@ -443,7 +442,7 @@ pub static ROUTES: &[Route] = &[
         Token,
         n(Cat::Repository, Level::Write),
         Repo(Perm::Write),
-        api::not_implemented,
+        content_write::write_contents,
     ),
     r(
         "GET",

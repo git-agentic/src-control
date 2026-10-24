@@ -13,6 +13,7 @@ pub mod auth;
 pub mod b64;
 pub mod cgi;
 pub mod content_api;
+pub mod content_write;
 pub mod db;
 pub mod gitobj;
 pub mod gitproc;
