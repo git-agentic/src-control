@@ -374,4 +374,29 @@ mod tests {
         assert!(lookup(&d, 999).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    #[test]
+    fn object_directories_must_lie_under_the_repository_and_ids_must_be_full_hex() {
+        let objects = Path::new("/data/repos/7.git/objects");
+        for ok in [
+            "/data/repos/7.git/objects",
+            "/data/repos/7.git/objects/incoming-AbC123",
+        ] {
+            assert!(under(objects, Path::new(ok)), "{ok}");
+        }
+        for bad in [
+            "/data/repos/7.git/objects/../../8.git/objects",
+            "/data/repos/7.git/objects2",
+            "/data/repos/8.git/objects",
+            "/data/repos/7.git",
+            "objects/incoming",
+            "",
+        ] {
+            assert!(!under(objects, Path::new(bad)), "{bad:?}");
+        }
+        assert!(full_id(A) && full_id(&"a".repeat(64)));
+        for bad in ["", "abc", &"g".repeat(40), &"a".repeat(41), "-q"] {
+            assert!(!full_id(bad), "{bad:?}");
+        }
+    }
 }

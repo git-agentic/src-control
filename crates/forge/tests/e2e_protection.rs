@@ -471,6 +471,13 @@ fn a_rule_change_is_ordered_against_contents_writes() {
         );
         assert_eq!(p.status, 200, "{}", p.msg());
         let tip = w.git(&["rev-parse", "refs/heads/rel"]);
+        // a write attempted after the change returned is refused (and the writer keeps trying)
+        let after = w.api(
+            "POST",
+            "/contents/after.txt",
+            Some(json!({"content": b64s("x\n"), "message": "m", "branch": "rel"})),
+        );
+        assert_eq!(after.status, 403, "{}", after.msg());
         std::thread::sleep(std::time::Duration::from_millis(400));
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         (tip, writer.join().unwrap())
@@ -584,4 +591,44 @@ fn statuses_round_trip_and_their_limits() {
     );
     assert_eq!(r.status, 403);
     assert!(r.msg().contains("permission to write"), "{}", r.msg());
+}
+
+#[test]
+fn combined_status_does_not_deadlock_against_exclusive_repository_operations() {
+    // The combined status reads the repository twice (the revision, then the repository object);
+    // an exclusive operation (branch delete) queued between the two must not wedge either.
+    let w = world();
+    let sha = w.git(&["rev-parse", "refs/heads/main"]);
+    let r = w.api(
+        "POST",
+        &format!("/statuses/{sha}"),
+        Some(json!({"state": "success", "context": "c"})),
+    );
+    assert_eq!(r.status, 201);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|sc| {
+        for _ in 0..3 {
+            sc.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let r = w.api("GET", &format!("/commits/{sha}/status"), None);
+                    assert_eq!(r.status, 200, "{}", r.msg());
+                }
+            });
+        }
+        let (wr, shar, stopr) = (&w, &sha, &stop);
+        sc.spawn(move || {
+            for i in 0..40 {
+                wr.git(&["update-ref", &format!("refs/heads/t{i}"), shar]);
+                let r = wr.api("DELETE", &format!("/branches/t{i}"), None);
+                assert_eq!(r.status, 204, "{}", r.msg());
+            }
+            stopr.store(true, std::sync::atomic::Ordering::SeqCst);
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(60)).is_ok(),
+            "the deletes finished: no reader wedged the exclusive lock"
+        );
+    });
 }

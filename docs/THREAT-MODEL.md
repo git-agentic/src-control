@@ -1016,6 +1016,10 @@ Tests: `crates/forge/tests/e2e_protection.rs`, the `policy`, `hook`, `protection
   (Gitea's trust boundary). They gate merges only (F4c). Posting is bounded: 100 contexts per commit, 100 rows per context,
   field length caps, `target_url` limited to plain `http(s)` so a status link cannot be a `javascript:` URL in a web client.
   The author's stored email is not shown in the creator object.
+- **Operator note.** The hook accepts the quarantine's object directories only when they are plain absolute paths under the
+  repository's `objects/`. A data directory whose path contains `:` or starts with `"` makes git quote or split them, and every
+  fast-forward push to a protected branch that allows pushes is then refused (fail closed, but easy to miss): keep such
+  characters out of `--data-dir`.
 - **Branch delete.** The API refuses a protected branch and deletes with compare-and-swap on the observed tip, so a concurrent
   push is not erased by a stale delete.
 

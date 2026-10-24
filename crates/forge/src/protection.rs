@@ -378,6 +378,33 @@ pub fn patch_rule(ctx: &mut Ctx) -> Resp {
         Err(r) => return r,
     };
     let name = ctx.param("b").to_string();
+    // The rule's name does not change, but a name that is sent is validated like a create's.
+    let (bn, rn) = (str_field(&b, "branch_name"), str_field(&b, "rule_name"));
+    if let (Some(x), Some(y)) = (&bn, &rn) {
+        if x != y {
+            return error(
+                &ctx.app.base,
+                422,
+                "branch_name and rule_name must be the same",
+            );
+        }
+    }
+    for n in [&bn, &rn].into_iter().flatten() {
+        if has_glob(n) {
+            return error(
+                &ctx.app.base,
+                422,
+                "branch name patterns are not supported: name one branch",
+            );
+        }
+        if n.to_lowercase() != name.to_lowercase() {
+            return error(
+                &ctx.app.base,
+                422,
+                "a rule cannot be renamed: delete it and create another",
+            );
+        }
+    }
     gated(ctx, &a, || {
         let cur = match find(ctx.conn, a.repo.id, &name) {
             Ok(Some(s)) => s,

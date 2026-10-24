@@ -361,68 +361,76 @@ pub fn list_statuses(ctx: &mut Ctx) -> Resp {
 }
 
 /// `GET /repos/{o}/{r}/commits/{ref}/status`: the latest status per context, with the combined
-/// state over all of them; the listed statuses are paged.
+/// state over all of them; the listed statuses are paged. Only the resolution of the revision
+/// runs under the shared lifecycle lock: `repo_json` takes that lock itself, and a second shared
+/// acquisition behind a queued exclusive one would deadlock (see `lifecycle`'s lock order).
 pub fn combined_status(ctx: &mut Ctx) -> Resp {
     let a = match acc(ctx) {
         Ok(a) => a.clone(),
         Err(r) => return r,
     };
     let rev = ctx.param("sha").to_string();
-    read_locked(ctx, &a, |ctx| {
-        let sha = match commit_of(ctx, &a, &rev) {
-            Ok(s) => s,
-            Err(r) => return r,
-        };
-        let all = match latest(ctx.conn, a.repo.id, &sha) {
-            Ok(v) => v,
-            Err(e) => return ctx.app.internal(&e),
-        };
-        let (page, limit) = page_params(ctx);
-        let mut creators = HashMap::new();
-        let shown: Result<Vec<Value>, Resp> = all
-            .iter()
-            .skip(((page - 1) * limit) as usize)
-            .take(limit as usize)
-            .map(|s| status_json(ctx, &a, s, &mut creators))
-            .collect();
-        let shown = match shown {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        // Recorded: a commit with no statuses carries no repository object.
-        let repo = if all.is_empty() {
-            Value::Null
-        } else {
-            match repo_json(ctx.app, ctx.conn, &a.repo, a.perm) {
-                Ok(v) => v,
-                Err(r) => return r,
-            }
-        };
-        let total = all.len() as i64;
-        let body = json!({
-            "state": combined_state(&all),
-            "sha": sha,
-            "total_count": shown.len(),
-            "statuses": if shown.is_empty() { Value::Null } else { Value::Array(shown) },
-            "repository": repo,
-            "commit_url": "",
-            "url": "",
-        });
-        let mut r = Resp::json(200, &body);
-        if total > 0 {
-            r = r.with("x-total-count", total.to_string());
+    let mut resolved = None;
+    let early = read_locked(ctx, &a, |ctx| match commit_of(ctx, &a, &rev) {
+        Ok(s) => {
+            resolved = Some(s);
+            Resp::no_content()
         }
-        let path = format!(
-            "/repos/{}/{}/commits/{}/status",
-            a.repo.owner,
-            a.repo.name,
-            crate::api::pct_encode(&rev)
-        );
-        if let Some(l) = link_header(ctx, &path, total, page, limit, &[]) {
-            r = r.with("link", l);
+        Err(r) => r,
+    });
+    let Some(sha) = resolved else {
+        return early;
+    };
+    let ctx: &Ctx = ctx;
+    let all = match latest(ctx.conn, a.repo.id, &sha) {
+        Ok(v) => v,
+        Err(e) => return ctx.app.internal(&e),
+    };
+    let (page, limit) = page_params(ctx);
+    let mut creators = HashMap::new();
+    let shown: Result<Vec<Value>, Resp> = all
+        .iter()
+        .skip(((page - 1) * limit) as usize)
+        .take(limit as usize)
+        .map(|s| status_json(ctx, &a, s, &mut creators))
+        .collect();
+    let shown = match shown {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    // Recorded: a commit with no statuses carries no repository object.
+    let repo = if all.is_empty() {
+        Value::Null
+    } else {
+        match repo_json(ctx.app, ctx.conn, &a.repo, a.perm) {
+            Ok(v) => v,
+            Err(r) => return r,
         }
-        r
-    })
+    };
+    let total = all.len() as i64;
+    let body = json!({
+        "state": combined_state(&all),
+        "sha": sha,
+        "total_count": shown.len(),
+        "statuses": if shown.is_empty() { Value::Null } else { Value::Array(shown) },
+        "repository": repo,
+        "commit_url": "",
+        "url": "",
+    });
+    let mut r = Resp::json(200, &body);
+    if total > 0 {
+        r = r.with("x-total-count", total.to_string());
+    }
+    let path = format!(
+        "/repos/{}/{}/commits/{}/status",
+        a.repo.owner,
+        a.repo.name,
+        crate::api::pct_encode(&rev)
+    );
+    if let Some(l) = link_header(ctx, &path, total, page, limit, &[]) {
+        r = r.with("link", l);
+    }
+    r
 }
 
 #[cfg(test)]
