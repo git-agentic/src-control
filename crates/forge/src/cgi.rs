@@ -856,8 +856,9 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
         match tokio::task::spawn_blocking(move || transport::authorize(&app, &req, path)).await {
             Ok(Ok(p)) => p,
             Ok(Err(r)) => return buffered(r),
-            // A cancelled blocking task means the runtime is shutting down: not an internal error.
-            Err(_) => return buffered(shutting_down()),
+            // A cancelled blocking task means the runtime is shutting down; a panic is an internal error.
+            Err(e) if e.is_cancelled() => return buffered(shutting_down()),
+            Err(_) => return buffered(text(500, "internal server error\n")),
         }
     };
     let t = &app.transports;
@@ -958,7 +959,8 @@ pub async fn handle(app: Arc<App>, req: Req, body: Incoming, path: GitPath) -> R
             eprintln!("sc-forge: could not start git: {e}");
             return buffered(text(500, "internal server error\n"));
         }
-        Err(_) => return buffered(shutting_down()),
+        Err(e) if e.is_cancelled() => return buffered(shutting_down()),
+        Err(_) => return buffered(text(500, "internal server error\n")),
     };
     let Started {
         head,
