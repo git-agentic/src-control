@@ -614,3 +614,99 @@ fn startup_reconcile_restores_retention_refs_and_closes_vanished_heads() {
     );
     assert!(w.retained(2).is_some());
 }
+
+#[test]
+fn a_closed_pull_keeps_the_head_it_was_closed_with() {
+    let w = world();
+    let a = w.commit("k", "k1.txt", Some("main"));
+    w.open("k");
+    w.api("PATCH", "/pulls/1", Some(json!({"state": "closed"})));
+    let b = w.commit("k", "k2.txt", None);
+    assert_ne!(a, b);
+    let pr = w.api("GET", "/pulls/1", None).json();
+    assert_eq!(
+        pr["head"]["sha"],
+        a.as_str(),
+        "the branch moved, the closed PR did not"
+    );
+    assert_eq!(pr["head"]["ref"], "k");
+    assert_eq!(
+        w.api("GET", "/pulls/1/commits", None)
+            .json()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(w.retained(1).as_deref(), Some(a.as_str()));
+    // reopening follows the branch again
+    let re = w
+        .api("PATCH", "/pulls/1", Some(json!({"state": "open"})))
+        .json();
+    assert_eq!(re["head"]["sha"], b.as_str());
+    assert_eq!(
+        w.retained(1).as_deref(),
+        Some(b.as_str()),
+        "sync re-points the ref"
+    );
+}
+
+#[test]
+fn a_stale_sync_never_overwrites_a_newer_retained_head() {
+    let w = world();
+    let a = w.commit("cas", "c1.txt", Some("main"));
+    w.open("cas");
+    let git = &w.s.runner;
+    let dir = w.s.dir.join("repos").join(format!("{}.git", w.id));
+    // someone (the pre-receive hook) recorded a newer tip after the snapshot a sync took
+    let b = w.commit("other", "c2.txt", Some("main"));
+    assert!(
+        !scl_forge::pulls::retain_cas(git, &dir, 1, &b, Some(&"1".repeat(40))).unwrap(),
+        "wrong expectation: refused"
+    );
+    assert_eq!(w.retained(1).as_deref(), Some(a.as_str()), "untouched");
+    assert!(scl_forge::pulls::retain_cas(git, &dir, 1, &b, Some(&a)).unwrap());
+    assert_eq!(w.retained(1).as_deref(), Some(b.as_str()));
+    assert!(
+        !scl_forge::pulls::retain_cas(git, &dir, 1, &a, None).unwrap(),
+        "create-only refuses an existing ref"
+    );
+}
+
+#[test]
+fn page_links_select_the_rows_the_page_did() {
+    let w = world();
+    for i in 0..3 {
+        w.commit(&format!("p{i}"), &format!("p{i}.txt"), Some("main"));
+        w.open(&format!("p{i}"));
+    }
+    // an encoded name is not `limit` for the server, so it is not for the next page either
+    let r = w.api("GET", "/pulls?%6cimit=2&limit=1&sort=oldest", None);
+    assert_eq!(r.json().as_array().unwrap().len(), 1);
+    let link = r.header("link").unwrap();
+    assert!(
+        link.contains("limit=1&page=2") && !link.contains("limit=2"),
+        "{link}"
+    );
+    // a bare key is ignored by the server and not repeated
+    let r = w.api("GET", "/pulls?sort&sort=oldest&limit=1", None);
+    assert_eq!(r.json()[0]["number"], 1);
+    assert!(r.header("link").unwrap().contains("sort=oldest"));
+    // a hostile query cannot break out of the link target
+    let r = w.api("GET", "/pulls?limit=1&x=%3E%2C%3Chttp://evil%3E", None);
+    let link = r.header("link").unwrap();
+    assert!(
+        !link.contains("evil>") && link.matches('<').count() == link.matches("; rel=").count(),
+        "{link}"
+    );
+}
+
+#[test]
+fn startup_reconcile_covers_repositories_without_any_pull() {
+    let w = world();
+    let tip = w.git(&["rev-parse", "refs/heads/main"]);
+    w.git(&["update-ref", "refs/forge/pull/1/head", &tip]); // an orphan of a crashed first creation
+    let conn = scl_forge::db::connect(&w.s.dir).unwrap();
+    scl_forge::pulls::reconcile_all(&w.s.app.life, &conn, 100);
+    assert_eq!(w.retained(1), None);
+}

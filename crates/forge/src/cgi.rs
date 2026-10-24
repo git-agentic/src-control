@@ -811,6 +811,9 @@ impl Supervise {
         let status = child.wait();
         let ok = reason == "exited" && status.as_ref().is_ok_and(|s| s.success());
         let _ = verdict.send(ok);
+        // The child is gone: release the transport registration, so a repository delete waiting
+        // for it is not also waiting on the sync below (which takes the shared lifecycle lock).
+        drop(reg);
         let err = tail.and_then(|t| t.join().ok()).unwrap_or_default();
         if !ok {
             eprintln!(

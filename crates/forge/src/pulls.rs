@@ -348,8 +348,17 @@ pub fn compute(
             c.deletions
         ],
     )?;
+    // Bounded per repository: obsolete (base, head) pairs of branches that moved on go oldest first.
+    conn.execute(
+        "DELETE FROM mergeability_cache WHERE repo_id = ?1 AND rowid NOT IN \
+         (SELECT rowid FROM mergeability_cache WHERE repo_id = ?1 ORDER BY rowid DESC LIMIT ?2)",
+        params![repo_id, CACHE_PER_REPO],
+    )?;
     Ok(c)
 }
+
+/// Mergeability rows kept per repository.
+const CACHE_PER_REPO: i64 = 2_000;
 
 /// Why [`compute`] failed.
 #[derive(Debug, thiserror::Error)]
@@ -385,7 +394,8 @@ pub fn refs_under(
         .collect())
 }
 
-/// Point PR `n`'s retention ref at `oid` (a commit that exists).
+/// Point PR `n`'s retention ref at `oid` (a commit that exists), whatever it holds now. For the
+/// authoritative writers: PR creation, close, and the record of a head that is about to be deleted.
 pub fn retain(git: &Git, dir: &Path, n: i64, oid: &str) -> Result<(), GitError> {
     let r = retention_ref(n);
     let out = git.run(&Spec {
@@ -400,6 +410,27 @@ pub fn retain(git: &Git, dir: &Path, n: i64, oid: &str) -> Result<(), GitError> 
             String::from_utf8_lossy(&out.stderr).trim().to_string(),
         ))
     }
+}
+
+/// Move PR `n`'s retention ref from `expected` (`None` = it must not exist) to `oid`, and only
+/// then. `Ok(false)` means someone else changed it in the meantime (a push's hook records the tip
+/// of a deleted head without the write gate): the caller leaves it alone, because a newer value
+/// must never be overwritten by a stale snapshot.
+pub fn retain_cas(
+    git: &Git,
+    dir: &Path,
+    n: i64,
+    oid: &str,
+    expected: Option<&str>,
+) -> Result<bool, GitError> {
+    let r = retention_ref(n);
+    let zero = "0".repeat(oid.len());
+    let out = git.run(&Spec {
+        repo: Some(dir),
+        args: &["update-ref", &r, oid, expected.unwrap_or(&zero)],
+        ..Default::default()
+    })?;
+    Ok(out.ok())
 }
 
 /// Retain `oid` for every open PR whose head branch is `branch` (called with the exclusive
@@ -463,8 +494,11 @@ pub fn sync_locked(
     if open.is_empty() {
         return Ok(0);
     }
-    let heads = refs_under(git, dir, "refs/heads")?;
+    // The retention refs are read before the branches: a head deleted by a push in between has
+    // had its tip recorded by the hook already, and every write below is a compare-and-swap on
+    // what was read, so a stale snapshot can never overwrite a newer retained head.
     let kept = refs_under(git, dir, "refs/forge/pull")?;
+    let heads = refs_under(git, dir, "refs/heads")?;
     let mut closed = 0;
     for mut p in open {
         let tip = head_tip(&heads, &p.head_ref);
@@ -472,7 +506,7 @@ pub fn sync_locked(
         match tip {
             Some(t) => {
                 if have.as_deref() != Some(t.as_str()) {
-                    retain(git, dir, p.number, &t)?;
+                    retain_cas(git, dir, p.number, &t, have.as_deref())?;
                 }
                 if p.head_sha != t || p.head_gone {
                     p.head_sha = t;
@@ -483,7 +517,10 @@ pub fn sync_locked(
             // Reopened without its branch: stays open on the retained head.
             None if p.head_gone => {}
             None => {
-                let head = have.unwrap_or_else(|| p.head_sha.clone());
+                // The branch is gone, so whoever deleted it has recorded its tip: read that now.
+                let head = refs_under(git, dir, &retention_ref(p.number))?
+                    .remove(&retention_ref(p.number))
+                    .unwrap_or_else(|| p.head_sha.clone());
                 retain(git, dir, p.number, &head)?;
                 p.head_sha = head.clone();
                 p.final_head = Some(head);
@@ -564,23 +601,21 @@ pub fn sync(life: &Lifecycle, conn: &Connection, repo_id: i64, now: i64) {
 /// Startup: repair every live repository that has pull requests (before the listener is bound,
 /// so nothing else is running).
 pub fn reconcile_all(life: &Lifecycle, conn: &Connection, now: i64) {
-    let ids: Vec<i64> = match conn
-        .prepare("SELECT DISTINCT repo_id FROM pulls")
-        .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
-    {
+    // Every live repository, not only those with pull requests: an orphan ref from a crash during
+    // a repository's first PR creation has no row to find it by.
+    let repos = match crate::repos::list_in_state(conn, "live") {
         Ok(v) => v,
         Err(e) => {
             eprintln!("sc-forge: pull request reconcile could not list repositories: {e}");
             return;
         }
     };
-    for id in ids {
-        let live = matches!(crate::repos::find_by_id(conn, id), Ok(Some(r)) if r.state == "live");
-        if !live {
-            continue;
-        }
-        if let Err(e) = reconcile_repo(conn, &life.git, &life.repo_dir(id), id, now) {
-            eprintln!("sc-forge: pull request reconcile of repository {id} failed: {e}");
+    for r in repos {
+        if let Err(e) = reconcile_repo(conn, &life.git, &life.repo_dir(r.id), r.id, now) {
+            eprintln!(
+                "sc-forge: pull request reconcile of repository {} failed: {e}",
+                r.id
+            );
         }
     }
 }

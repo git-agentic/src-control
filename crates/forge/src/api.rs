@@ -193,16 +193,17 @@ fn links(
         .req
         .query
         .split('&')
-        .filter(|kv| !kv.is_empty())
-        .map(|kv| {
-            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            // Re-encoded strictly from the decoded text, never echoed raw: a `>` or `"` in the
-            // request must not close the link target or start another entry.
-            let enc = |t: &str| {
+        // Parsed exactly like `Req::param` (raw names, `name=value` pairs only, first value wins),
+        // so the next page selects the rows this one did.
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| {
+            // Re-encoded strictly, never echoed raw: a `>` or `"` in the request must not close the
+            // link target or start another entry. Names stay raw-equivalent (not decoded).
+            let dec = |t: &str| {
                 crate::routes::percent_decode(&t.replace('+', " "))
                     .map_or_else(|| pct_encode(t), |d| pct_encode(&d))
             };
-            (enc(k), enc(v))
+            (pct_encode(k), dec(v))
         })
         .rev() // the request parser reads the first value of a repeated parameter; the last insert wins
         .collect();

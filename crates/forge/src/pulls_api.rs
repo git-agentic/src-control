@@ -83,21 +83,30 @@ fn live(ctx: &Ctx, a: &Access, p: &Pull) -> Result<Live, Resp> {
         });
     }
     let base_sha = tip(ctx, a, &p.base_ref)?.unwrap_or_else(|| p.base_sha.clone());
-    let (head_sha, head_ref) = match tip(ctx, a, &p.head_ref)? {
-        Some(t) => (t, p.head_ref.clone()),
-        None => {
-            let kept = gw::read_ref(
-                &ctx.app.life.git,
-                &dir(ctx, a),
-                &pulls::retention_ref(p.number),
-            )
-            .map_err(|e| read_err(ctx, a, e))?;
-            (
-                kept.or_else(|| p.final_head.clone())
-                    .unwrap_or_else(|| p.head_sha.clone()),
-                format!("refs/pull/{}/head", p.number),
-            )
-        }
+    let kept = || -> Result<String, Resp> {
+        let kept = gw::read_ref(
+            &ctx.app.life.git,
+            &dir(ctx, a),
+            &pulls::retention_ref(p.number),
+        )
+        .map_err(|e| read_err(ctx, a, e))?;
+        Ok(kept
+            .or_else(|| p.final_head.clone())
+            .unwrap_or_else(|| p.head_sha.clone()))
+    };
+    let branch = tip(ctx, a, &p.head_ref)?;
+    let (head_sha, head_ref) = match (&p.state[..], branch) {
+        // A closed PR keeps the head it was closed with, however its branch moves afterwards.
+        ("closed", b) => (
+            p.final_head.clone().map_or_else(kept, Ok)?,
+            if b.is_some() {
+                p.head_ref.clone()
+            } else {
+                format!("refs/pull/{}/head", p.number)
+            },
+        ),
+        (_, Some(t)) => (t, p.head_ref.clone()),
+        (_, None) => (kept()?, format!("refs/pull/{}/head", p.number)),
     };
     let c = pulls::compute(
         ctx.conn,
@@ -609,6 +618,12 @@ pub fn patch_pull(ctx: &mut Ctx) -> Resp {
                 e => ctx.app.internal(&e),
             };
         }
+        // A reopened PR follows its branch again: bring its retention ref along (gate held).
+        sync_held(ctx, &a);
+        let p = match find(ctx, &a, n) {
+            Ok(p) => p,
+            Err(r) => return r,
+        };
         match render(ctx, &a, &p) {
             Ok(v) => Resp::json(201, &v),
             Err(r) => r,
