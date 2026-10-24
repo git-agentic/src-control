@@ -27,6 +27,14 @@ const MAX_BODY: usize = 65_536;
 /// Changed files one `files` page may carry.
 const MAX_FILES: usize = 3_000;
 
+/// A repository path for a URL: every segment percent-encoded, the separators kept.
+fn enc_path(p: &str) -> String {
+    p.split('/')
+        .map(crate::api::pct_encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn missing(ctx: &Ctx) -> Resp {
     not_found(&ctx.app.base, "The target couldn't be found.", None)
 }
@@ -760,9 +768,9 @@ pub fn pull_files(ctx: &mut Ctx) -> Resp {
                     "additions": f.additions,
                     "deletions": f.deletions,
                     "changes": f.additions + f.deletions,
-                    "html_url": format!("{web}/src/commit/{}/{}", l.head_sha, f.name),
-                    "contents_url": format!("{api}/contents/{}?ref={}", f.name, l.head_sha),
-                    "raw_url": format!("{web}/raw/commit/{}/{}", l.head_sha, f.name),
+                    "html_url": format!("{web}/src/commit/{}/{}", l.head_sha, enc_path(&f.name)),
+                    "contents_url": format!("{api}/contents/{}?ref={}", enc_path(&f.name), l.head_sha),
+                    "raw_url": format!("{web}/raw/commit/{}/{}", l.head_sha, enc_path(&f.name)),
                 })
             })
             .collect();

@@ -444,21 +444,18 @@ pub fn retain_for_branch(
     oid: &str,
 ) -> Result<(), ComputeError> {
     for p in open_pulls(conn, repo_id)? {
-        if crate::policy::same_branch_name(&p.head_ref, branch) {
+        if p.head_ref == branch {
             retain(git, dir, p.number, oid)?;
         }
     }
     Ok(())
 }
 
-/// The tip of branch `name` in a `refs/heads` listing (case-insensitive like every branch match).
+/// The tip of branch `name` in a `refs/heads` listing. Exact: on a case-sensitive filesystem
+/// `feature` and `Feature` are two branches. (On a case-insensitive development filesystem a PR
+/// opened with a differently cased name reads as vanished; production is Linux.)
 fn head_tip(heads: &HashMap<String, String>, name: &str) -> Option<String> {
-    heads
-        .iter()
-        .find(|(n, _)| {
-            crate::policy::same_branch_name(n.strip_prefix("refs/heads/").unwrap_or(n), name)
-        })
-        .map(|(_, o)| o.clone())
+    heads.get(&format!("refs/heads/{name}")).cloned()
 }
 
 /// Does an open PR of the repository have a head branch that is gone without the PR knowing

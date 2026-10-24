@@ -710,3 +710,50 @@ fn startup_reconcile_covers_repositories_without_any_pull() {
     scl_forge::pulls::reconcile_all(&w.s.app.life, &conn, 100);
     assert_eq!(w.retained(1), None);
 }
+
+#[test]
+fn branches_differing_only_in_case_are_two_heads_and_file_urls_are_encoded() {
+    let w = world();
+    let up = w.git(&["rev-parse", "refs/heads/main"]);
+    // two branches that a case-insensitive match would conflate (skipped where the filesystem folds case)
+    let lower = {
+        let r = w.api("POST", "/contents/a%23b.txt", Some(json!({"content": b64("x\n"), "message": "m", "branch": "main", "new_branch": "feature"})));
+        assert_eq!(r.status, 201, "{}", r.msg());
+        w.git(&["rev-parse", "refs/heads/feature"])
+    };
+    if w.s
+        .git_try(w.id, &["rev-parse", "--verify", "-q", "refs/heads/Feature"])
+        .is_some()
+    {
+        return; // case-folding filesystem
+    }
+    w.git(&["update-ref", "refs/heads/Feature", &up]);
+    let upper = {
+        w.api("POST", "/contents/other.txt", Some(json!({"content": b64("y\n"), "message": "m", "branch": "main", "new_branch": "Feature2"})));
+        w.git(&["rev-parse", "refs/heads/Feature2"])
+    };
+    w.git(&["update-ref", "refs/heads/Feature", &upper]);
+    w.open("feature");
+    assert_eq!(
+        w.retained(1).as_deref(),
+        Some(lower.as_str()),
+        "the PR follows `feature`, not `Feature`"
+    );
+    w.git(&["update-ref", "-d", "refs/heads/feature"]);
+    assert_eq!(
+        w.api("GET", "/pulls/1", None).json()["state"],
+        "closed",
+        "`Feature` does not keep it open"
+    );
+    assert_eq!(w.retained(1).as_deref(), Some(lower.as_str()));
+    // URLs name the file, not a fragment
+    w.commit("u", "a#b.txt", Some("main"));
+    w.open("u");
+    let f = w.api("GET", "/pulls/2/files", None).json();
+    assert_eq!(f[0]["filename"], "a#b.txt");
+    assert!(f[0]["contents_url"]
+        .as_str()
+        .unwrap()
+        .contains("/contents/a%23b.txt?ref="));
+    assert!(f[0]["raw_url"].as_str().unwrap().ends_with("/a%23b.txt"));
+}

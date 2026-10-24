@@ -187,10 +187,7 @@ fn retain_deleted_heads(
     let git = Git::new(data_dir, git_bin.to_path_buf(), 1).map_err(|e| e.to_string())?;
     let repo = git.data_dir().join("repos").join(format!("{repo_id}.git"));
     for (old, branch) in deletes {
-        for p in open
-            .iter()
-            .filter(|p| policy::same_branch_name(&p.head_ref, branch))
-        {
+        for p in open.iter().filter(|p| p.head_ref == branch) {
             if !full_id(old) {
                 return Err("malformed object id".into());
             }
