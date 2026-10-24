@@ -15,6 +15,7 @@ pub mod cgi;
 pub mod content_api;
 pub mod db;
 pub mod gitobj;
+pub mod gitwrite;
 pub mod gitproc;
 pub mod gitread;
 pub mod hook;
