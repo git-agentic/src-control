@@ -38,6 +38,14 @@ pub fn check_update(name: &str, new: &str, default_branch: &str) -> Result<(), R
     ))
 }
 
+/// May a contents write put a commit on branch `target`? `creating` is true when the write creates
+/// the branch (`new_branch`, or the first commit of an unborn default). Called before the objects
+/// are built and again immediately before the ref update, on every attempt, so a rule added in F4
+/// is evaluated at the moment the ref moves (the spec's linearization point).
+pub fn check_contents_write(_target: &str, _creating: bool) -> Result<(), Refusal> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -705,7 +705,7 @@ capture) through F6 (acceptance on the first deployment); F0, F1 (server
 skeleton, users, organizations, tokens, `admin` CLI), F2a (repositories API, lifecycle
 and reconciler, collaborators, branches) and F2b (smart-HTTP git transport via `git http-backend`,
 `pre-receive` ref policy, admission control, threat-model pass #1) and F3a (content reads: refs, tags, commits,
-trees, contents, archives; writes are F3b) are built. Hosted repos are
+trees, contents, archives) and F3b (contents writes: create, update, delete as server-made commits) are built. Hosted repos are
 bare Git and get none of the `.sc/` features.
 
 Other follow-up work is tracked as GitHub issues and listed under Deferred
