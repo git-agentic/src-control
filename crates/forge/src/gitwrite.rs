@@ -514,7 +514,19 @@ mod tests {
     use super::*;
     use crate::gitproc::find_git;
 
-    fn repo(tag: &str) -> (Git, std::path::PathBuf, std::path::PathBuf) {
+    /// Removes its directory when dropped, and checks it is gone (also when a test fails).
+    struct Tmp(std::path::PathBuf);
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+            if !std::thread::panicking() {
+                assert!(!self.0.exists(), "test dir must be gone after teardown");
+            }
+        }
+    }
+
+    fn repo(tag: &str) -> (Git, Tmp, std::path::PathBuf) {
         let d =
             std::env::temp_dir().join(format!("scl-forge-gitwrite-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -536,7 +548,7 @@ mod tests {
             })
             .unwrap()
             .ok());
-        (g, d, dir)
+        (g, Tmp(d), dir)
     }
 
     fn far() -> Instant {
@@ -851,7 +863,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(listed, b"a/b/c.txt\0");
-        let _ = std::fs::remove_dir_all(d);
+        drop(d);
     }
 
     #[test]
@@ -905,6 +917,6 @@ mod tests {
             String::from_utf8_lossy(&msg).trim(),
             "u|u@example.invalid|1700000000|u|1700000000|two"
         );
-        let _ = std::fs::remove_dir_all(d);
+        drop(d);
     }
 }
