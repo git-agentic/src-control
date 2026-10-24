@@ -1093,9 +1093,56 @@ SIGKILL during merges, restarted and checked), and the `bypass_matrix_*` tests i
   CI); a later change to it needs a new migration.
 - **Known windows.** A rule created while a push is between `pre-receive` and its ref update is not stopped (the push does not
   take the gate). A merge computes its tree before it takes the base lock in git, so a base that moves under it only costs a retry,
-  not a wrong merge (the compare-and-swap refuses). Objects of aborted or lost merges stay unreferenced until F5's gc.
+  not a wrong merge (the compare-and-swap refuses). Objects of aborted or lost merges stay unreferenced until the maintenance
+  pass collects them (F5a, below).
 - **Identity.** The merge commit is authored and committed by the authenticated user (name and stored email, or
   `<login>@noreply.localhost`), as for contents writes; a client cannot choose it.
+
+### Maintenance: garbage collection and leftover cleanup (F5a)
+
+`maintenance.rs` deletes data, so it is the part of the forge where a mistake loses an acknowledged write. What it deletes, and
+why each deletion is safe:
+
+- **Unreferenced objects, in two stages.** Stage 1 (`git gc --prune=never --force`, no gate, `gc.cruftPacks=false` pinned) packs
+  what refs reach and loosens unreachable packed objects with their old pack's mtime; it deletes nothing. Stage 2 runs under the
+  repository's write gate: it first confirms every retention ref (`pulls::reconcile_repo` recreates a missing head, final-head or
+  merge-commit ref from the database, and `pulls::verify_roots` then checks each pull request row independently, because a sync
+  logs and skips a PR it cannot repair; any error, or a merge intent still pending, skips the prune; the reconcile runs under the
+  shared lifecycle lock like every gated writer, taken with `try_read` so a queued delete cannot deadlock it), then `git prune --expire=<window>` removes loose unreachable
+  objects older than the window (`--gc-prune-expire`, default 14 days, refused below twice `--git-timeout` and an hour). Holding the
+  gate keeps the API writers away: a contents write or merge copies existing, possibly old, trees and blobs into new objects
+  (`mktree` does not touch the referenced objects), and without the gate prune could unlink one between that read and the
+  ref update. A first draft held no gate; Sol found this interleaving and the draft was dropped.
+- **Merge commits.** A finished merge used to keep only its head alive; rewriting the base afterwards orphaned the merge commit that
+  `merge_commit_sha` still names. `refs/forge/pull/<n>/merge` now holds it (written by `finish`, recreated by the reconciler).
+- **Leftover locks and quarantine directories.** `refs/**/*.lock`, `packed-refs.lock`, `HEAD.lock`, the commit-graph locks a killed gc leaves and receive-pack's `objects/tmp_objdir-incoming-*` quarantine directories go at
+  startup unconditionally (after orphaned git processes are killed) and at run time only when the write gate is held, the
+  exclusive lifecycle lock is free (default-branch changes and branch deletes write refs under that lock alone), the
+  repository has no registered run that can write (`Registry::with_only` ignores read-only fetches and holds the registry lock so
+  no writer can register meanwhile; under that lock a quarantine is only renamed to `objects/dead-*` and deleted afterwards)
+  and the item is older than 10 minutes. Age alone is never enough: a stepped clock or a suspended host can make a live owner's file
+  look old.
+- **Delete.** A run registers like a transport and carries the registry's cancel flag into every git spawn, so a repository delete
+  cancels it (group kill) and waits for it before the rename. The run never waits for the lifecycle lock (`try_read`/`try_write`
+  only); the gate wait is sliced so a cancel is noticed. The reconcile between the two does not carry the cancel flag; it is a handful of short git commands, and a
+  delete that outwaits it answers 503 and reopens the repository rather than renaming under it.
+- **Cruft packs are off on purpose.** Stage 1 pins `gc.cruftPacks=false`: with git's default, `gc --prune=never` writes unreachable
+  objects into a cruft pack and `git prune` never touches packed objects, so nothing would be collected (a test packs an old
+  object and fails if the pin goes). The cost: unreachable objects are stored loose, without deltas, for up to the window. Not
+  measured on a realistic repository.
+- **Prune holds the gate** for at most 10 minutes (its own limit). It runs only after a complete stage 1 (git's own gc does not
+  prune after a failed repack either): without it reachable objects may still be loose and old, and the walk is slower. A repository
+  that is too full to repack therefore keeps its garbage until space is freed.
+- **Base commits.** An unmerged PR whose base branch is gone shows its stored `base_sha`; `refs/forge/pull/<n>/base` keeps that
+  commit (recreated by the reconciler while it exists). Duration flags above ten years are refused at startup (a cutoff that wrapped
+  would have meant "prune now"), and the pass also refuses a cutoff before the epoch.
+- **Remaining exposure.** A push built on an object older than the window while a concurrent force-push has just unreferenced it
+  and stage 2 runs, is not excluded (receive-pack does not take the gate); its objects would have to be older than 14 days and
+  unreachable in that instant. A pending merge intent whose merge commit stays unreferenced for the whole window reads as "not
+  landed" and aborts (a landed merge is reachable from the base or its marker). `git gc` is bounded by `--gc-timeout` and the
+  cgroup, not by `RLIMIT`s; a repack needs roughly the repository's size in free disk (the pass skips the repack below
+  `--min-free-bytes` plus that size). Writers to a repository wait on the gate (10 s) while stage 2 runs and see 503 if it
+  outlasts that; stage 2 is a reachability walk and a scan of loose objects, not a repack.
 
 ## Reporting
 

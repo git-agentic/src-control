@@ -95,8 +95,14 @@ pub fn pending(conn: &Connection, repo_id: i64) -> rusqlite::Result<Vec<Intent>>
     rows
 }
 
-/// Is a merge of this repository unfinished?
+/// Is a merge of this repository unfinished? A database error reads as "no": callers that must
+/// fail closed use [`pending_checked`].
 pub fn has_pending(conn: &Connection, repo_id: i64) -> bool {
+    pending_checked(conn, repo_id).unwrap_or(false)
+}
+
+/// [`has_pending`] that reports a database error instead of answering "no".
+pub fn pending_checked(conn: &Connection, repo_id: i64) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT 1 FROM merge_intents WHERE repo_id = ?1 AND state = 'pending' LIMIT 1",
         [repo_id],
@@ -104,7 +110,6 @@ pub fn has_pending(conn: &Connection, repo_id: i64) -> bool {
     )
     .optional()
     .map(|r| r.is_some())
-    .unwrap_or(false)
 }
 
 fn insert(conn: &Connection, i: &Intent, now: i64) -> rusqlite::Result<i64> {
@@ -225,6 +230,14 @@ fn finish(
             i.pull_number
         );
     }
+    // The marker goes below; from here on this ref is what keeps the merge commit alive when the
+    // base is rewritten away from it.
+    if let Err(e) = pulls::retain_at(git, dir, &pulls::merge_ref(i.pull_number), &i.merge_oid) {
+        eprintln!(
+            "sc-forge: could not retain the merge commit of pull request {}: {e}",
+            i.pull_number
+        );
+    }
     let mut last = None;
     for k in 0..3 {
         match finalize_rows(conn, i, recovered) {
@@ -252,7 +265,7 @@ fn finish(
 }
 
 /// Does the commit exist in the repository?
-fn commit_exists(git: &Git, dir: &Path, oid: &str) -> Result<bool, GitError> {
+pub(crate) fn commit_exists(git: &Git, dir: &Path, oid: &str) -> Result<bool, GitError> {
     let out = git.run(&Spec {
         repo: Some(dir),
         args: &["cat-file", "-e", &format!("{oid}^{{commit}}")],
@@ -295,7 +308,8 @@ fn mark_landed(git: &Git, dir: &Path, i: &Intent) {
 
 /// Is a git writer holding the base ref right now (its lock file exists)? At run time that is a
 /// live writer (a push, or our own publish): the intent waits rather than being judged under it.
-/// The lock of a *dead* writer is cleared at startup (`orphans::sweep`), not guessed at here.
+/// The lock of a *dead* writer is cleared at startup (`orphans::sweep`) or by the maintenance pass
+/// once its writers are excluded (`orphans::clean_repo`), not guessed at here.
 fn base_is_locked(dir: &Path, base_ref: &str) -> bool {
     dir.join("refs")
         .join("heads")
@@ -448,8 +462,8 @@ fn publish(git: &Git, dir: &Path, i: &Intent) -> Result<bool, GitError> {
     }) {
         Ok(o) => Ok(o.ok()),
         // Killed by the runner's deadline. SIGKILL leaves the locks of the refs it had prepared; they
-        // stay until the next restart's cleanup, because a lock cannot be told from a live writer's
-        // at run time (the intent stays pending while the base is locked).
+        // stay until the next restart or maintenance pass cleans them, because a lock cannot be told
+        // from a live writer's here (the intent stays pending while the base is locked).
         Err(GitError::Timeout { .. }) => Ok(false),
         Err(e) => Err(e),
     }

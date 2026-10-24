@@ -7,6 +7,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// The largest duration flag accepted: ten years, far beyond any sensible window.
+const MAX_DURATION_SECS: u64 = 10 * 365 * 86_400;
+
 #[derive(Parser)]
 #[command(name = "sc-forge", version, about = "A Gitea-compatible Git forge")]
 struct Cli {
@@ -91,6 +94,16 @@ struct ServeArgs {
     /// Memory limit of each git transport child, bytes, Linux only (0 = none).
     #[arg(long, default_value_t = 8 << 30)]
     git_memory_limit: u64,
+    /// Seconds between garbage-collection passes over all repositories (0 = only on request through
+    /// `POST /api/v1/admin/cron/git_gc_repos`).
+    #[arg(long, default_value_t = 86_400)]
+    maintenance_interval: u64,
+    /// Seconds an unreachable object survives garbage collection (at least twice `--git-timeout` and an hour).
+    #[arg(long, default_value_t = 14 * 86_400)]
+    gc_prune_expire: u64,
+    /// Wall-clock limit of the garbage collection of one repository, seconds.
+    #[arg(long, default_value_t = 3_600)]
+    gc_timeout: u64,
     /// Concurrent password verifications (Argon2 is memory-hard).
     #[arg(long, default_value_t = 4)]
     argon2_concurrency: usize,
@@ -264,9 +277,28 @@ fn run_serve(a: ServeArgs) -> Result<()> {
         ("--git-idle-timeout", a.git_idle_timeout),
         ("--max-pack-size", a.max_pack_size),
         ("--max-request-bytes", a.max_request_bytes),
+        ("--gc-timeout", a.gc_timeout),
     ] {
         if v == 0 {
             bail!("{flag} must be at least 1");
+        }
+    }
+    let min_expire = scl_forge::maintenance::min_prune_expire(Duration::from_secs(a.git_timeout));
+    if Duration::from_secs(a.gc_prune_expire) < min_expire {
+        bail!(
+            "--gc-prune-expire must be at least {} seconds (twice --git-timeout, and an hour): a shorter window can delete objects an operation in flight still needs",
+            min_expire.as_secs()
+        );
+    }
+    // Durations are added to `Instant::now()` and subtracted from a unix time: an absurd value
+    // would panic the runner or, worse, turn a long prune window into "prune now".
+    for (flag, v) in [
+        ("--maintenance-interval", a.maintenance_interval),
+        ("--gc-prune-expire", a.gc_prune_expire),
+        ("--gc-timeout", a.gc_timeout),
+    ] {
+        if v > MAX_DURATION_SECS {
+            bail!("{flag} must be at most {MAX_DURATION_SECS} seconds (ten years)");
         }
     }
     bind_gate(&a.listen, a.behind_proxy, a.allow_plaintext).map_err(anyhow::Error::msg)?;
@@ -335,6 +367,16 @@ fn run_serve(a: ServeArgs) -> Result<()> {
     std::sync::Arc::get_mut(&mut app)
         .expect("the app has no other owner yet")
         .transports = scl_forge::cgi::Transports::new(tcfg);
+    std::sync::Arc::get_mut(&mut app)
+        .expect("the app has no other owner yet")
+        .maint = scl_forge::maintenance::Maintenance::new(scl_forge::maintenance::Cfg {
+        interval: Duration::from_secs(a.maintenance_interval),
+        prune_expire: Duration::from_secs(a.gc_prune_expire),
+        gc_timeout: Duration::from_secs(a.gc_timeout),
+        min_free: a.min_free_bytes,
+        ..Default::default()
+    });
+    let _maintenance = scl_forge::maintenance::spawn(app.clone());
     let limits = Limits {
         max_body: a.max_body_bytes,
         max_connections: a.max_connections,

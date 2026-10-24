@@ -189,6 +189,51 @@ impl Lifecycle {
         })
     }
 
+    /// Run `f` as the only server-side writer of repository `id`: the write gate only, not the
+    /// lifecycle lock, so a `delete` is never held up behind it (maintenance cancels itself through
+    /// the registry instead). `None`: the gate stayed taken for `wait`.
+    pub fn with_gate<T>(&self, id: i64, wait: Duration, f: impl FnOnce() -> T) -> Option<T> {
+        let gate = self
+            .gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id)
+            .or_insert_with(|| Arc::new(crate::limits::Gate::new(1)))
+            .clone();
+        let _writer = gate.acquire_timeout(wait)?;
+        Some(f())
+    }
+
+    /// Run `f` (a server-made write) under the shared lifecycle lock if it can be had right now,
+    /// never waiting: a delete queued for the exclusive lock would otherwise wait for a caller that
+    /// is itself waiting for the lock. Take the gate first. `None`: the lock was not free.
+    pub fn try_shared<T>(&self, id: i64, f: impl FnOnce() -> T) -> Option<T> {
+        let lock = self.lock_for(id);
+        let held = match lock.try_read() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let r = f();
+        drop(held);
+        Some(r)
+    }
+
+    /// Run `f` while holding the repository's exclusive lifecycle lock, if it is free right now
+    /// (never waits): default-branch changes and branch deletes write refs under that lock alone,
+    /// so a cleanup that unlinks lock files needs it too. Take the gate first (see the lock order).
+    pub fn try_exclusive<T>(&self, id: i64, f: impl FnOnce() -> T) -> Option<T> {
+        let lock = self.lock_for(id);
+        let held = match lock.try_write() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let r = f();
+        drop(held);
+        Some(r)
+    }
+
     /// `repos/<id>.git`: always built from the integer id.
     pub fn repo_dir(&self, id: i64) -> PathBuf {
         self.data_dir.join("repos").join(format!("{id}.git"))

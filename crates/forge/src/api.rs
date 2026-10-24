@@ -412,6 +412,16 @@ pub fn admin_list_users(ctx: &mut Ctx) -> Resp {
     }
 }
 
+/// `POST /admin/cron/{task}`: run a maintenance task now. Only `git_gc_repos` exists; it answers 204
+/// at once and the pass runs on the maintenance thread (a pass already queued or running covers it).
+pub fn admin_cron(ctx: &mut Ctx) -> Resp {
+    if ctx.param("task") != "git_gc_repos" {
+        return error(&ctx.app.base, 404, "unknown cron task");
+    }
+    ctx.app.maint.request();
+    Resp::no_content()
+}
+
 /// `POST /admin/users`: create a user; `must_change_password` defaults to true as in Gitea, and `admin` is ignored (set it with PATCH).
 pub fn admin_create_user(ctx: &mut Ctx) -> Resp {
     let b = match body(ctx) {

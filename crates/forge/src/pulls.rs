@@ -23,6 +23,18 @@ pub fn retention_ref(n: i64) -> String {
     format!("refs/forge/pull/{n}/head")
 }
 
+/// The ref that keeps the base commit a pull request was last opened or retargeted against, for
+/// when its base branch is gone and the stored commit is all that remains.
+pub fn base_ref(n: i64) -> String {
+    format!("refs/forge/pull/{n}/base")
+}
+
+/// The ref that keeps the merge commit of merged pull request `n` alive after the base moves on
+/// (the landing marker is retired once the merge is final).
+pub fn merge_ref(n: i64) -> String {
+    format!("refs/forge/pull/{n}/merge")
+}
+
 /// A stored pull request.
 #[derive(Clone, Debug)]
 pub struct Pull {
@@ -398,10 +410,14 @@ pub fn refs_under(
 /// Point PR `n`'s retention ref at `oid` (a commit that exists), whatever it holds now. For the
 /// authoritative writers: PR creation, close, and the record of a head that is about to be deleted.
 pub fn retain(git: &Git, dir: &Path, n: i64, oid: &str) -> Result<(), GitError> {
-    let r = retention_ref(n);
+    retain_at(git, dir, &retention_ref(n), oid)
+}
+
+/// Point `r` (one of the `refs/forge/pull/<n>/…` refs) at `oid`, whatever it holds now.
+pub fn retain_at(git: &Git, dir: &Path, r: &str, oid: &str) -> Result<(), GitError> {
     let out = git.run(&Spec {
         repo: Some(dir),
-        args: &["update-ref", &r, oid],
+        args: &["update-ref", r, oid],
         ..Default::default()
     })?;
     if out.ok() {
@@ -573,13 +589,47 @@ pub fn reconcile_repo(
     crate::merges::drop_stale_receipts(conn, git, dir, repo_id)?;
     sync_locked(conn, git, dir, repo_id, now)?;
     let kept = refs_under(git, dir, "refs/forge/pull")?;
-    let mut st =
-        conn.prepare("SELECT number, state, final_head_sha FROM pulls WHERE repo_id = ?1")?;
-    let rows: Vec<(i64, String, Option<String>)> = st
-        .query_map([repo_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let mut st = conn.prepare(
+        "SELECT number, state, final_head_sha, merge_commit_sha, base_sha FROM pulls WHERE repo_id = ?1",
+    )?;
+    // (number, state, final head, merge commit, base)
+    type Row = (i64, String, Option<String>, Option<String>, String);
+    let rows: Vec<Row> = st
+        .query_map([repo_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
-    let known: HashMap<i64, (String, Option<String>)> =
-        rows.into_iter().map(|(n, s, h)| (n, (s, h))).collect();
+    let known: HashMap<i64, (String, Option<String>)> = rows
+        .iter()
+        .map(|(n, s, h, _, _)| (*n, (s.clone(), h.clone())))
+        .collect();
+    // A merged pull request's merge commit stays reachable even after the base is rewritten. A
+    // repair that fails is remembered, not returned at once: the other repairs still run.
+    let mut failed = None;
+    for (n, state, _, merge, base) in &rows {
+        if let (true, Some(m)) = (state == "merged", merge) {
+            if kept.get(&merge_ref(*n)) != Some(m) {
+                if let Err(e) = retain_at(git, dir, &merge_ref(*n), m) {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        // The stored base is what an unmerged PR shows once its base branch is gone. A commit that
+        // no longer exists cannot be kept (and nothing is lost by not keeping it).
+        if state != "merged" && kept.get(&base_ref(*n)) != Some(base) {
+            match crate::merges::commit_exists(git, dir, base) {
+                Ok(true) => {
+                    if let Err(e) = retain_at(git, dir, &base_ref(*n), base) {
+                        failed.get_or_insert(e);
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+    }
     for p in open_pulls(conn, repo_id)? {
         // Reopened without its branch: the stored head is the only anchor left.
         if p.head_gone && kept.get(&retention_ref(p.number)) != Some(&p.head_sha) {
@@ -598,7 +648,11 @@ pub fn reconcile_repo(
     for name in kept.keys() {
         let n = name
             .strip_prefix("refs/forge/pull/")
-            .and_then(|r| r.strip_suffix("/head"))
+            .and_then(|r| {
+                r.strip_suffix("/head")
+                    .or_else(|| r.strip_suffix("/merge"))
+                    .or_else(|| r.strip_suffix("/base"))
+            })
             .and_then(|n| n.parse::<i64>().ok());
         if n.is_some_and(|n| !known.contains_key(&n)) {
             let _ = git.run(&Spec {
@@ -606,6 +660,55 @@ pub fn reconcile_repo(
                 args: &["update-ref", "-d", name],
                 ..Default::default()
             });
+        }
+    }
+    match failed {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
+}
+
+/// Does a ref still hold every commit a pull request row names? The check before anything is
+/// pruned, independent of how [`reconcile_repo`] went (a sync logs and skips a PR it cannot
+/// repair): an open PR needs its head branch or its retention ref at the stored head; a closed or
+/// merged one its retention ref at the final head; a merged one also its merge ref.
+pub fn verify_roots(conn: &Connection, git: &Git, dir: &Path, repo_id: i64) -> Result<(), String> {
+    let e = |e: &dyn std::fmt::Display| e.to_string();
+    let kept = refs_under(git, dir, "refs/forge/pull").map_err(|x| e(&x))?;
+    let heads = refs_under(git, dir, "refs/heads").map_err(|x| e(&x))?;
+    let mut st = conn
+        .prepare("SELECT number FROM pulls WHERE repo_id = ?1")
+        .map_err(|x| e(&x))?;
+    let numbers: Vec<i64> = st
+        .query_map([repo_id], |r| r.get(0))
+        .map_err(|x| e(&x))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|x| e(&x))?;
+    for n in numbers {
+        let Some(p) = find(conn, repo_id, n).map_err(|x| e(&x))? else {
+            continue;
+        };
+        let held = |r: String, want: &str| kept.get(&r).is_some_and(|have| have == want);
+        let ok = match p.state.as_str() {
+            "open" => {
+                (!p.head_gone && head_tip(&heads, &p.head_ref).is_some())
+                    || held(retention_ref(n), &p.head_sha)
+            }
+            _ => p
+                .final_head
+                .as_deref()
+                .is_none_or(|h| held(retention_ref(n), h)),
+        };
+        let merge_ok = p.state != "merged"
+            || p.merge_commit
+                .as_deref()
+                .is_none_or(|m| held(merge_ref(n), m));
+        // A base commit that exists must be held; one that is already gone cannot be.
+        let base_ok = p.state == "merged"
+            || held(base_ref(n), &p.base_sha)
+            || !crate::merges::commit_exists(git, dir, &p.base_sha).map_err(|x| e(&x))?;
+        if !ok || !merge_ok || !base_ok {
+            return Err(format!("pull request {n} is not held by a ref"));
         }
     }
     Ok(())
