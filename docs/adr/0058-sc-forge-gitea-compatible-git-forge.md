@@ -1,6 +1,6 @@
 # ADR-0058: sc-forge, a Gitea-compatible Git forge
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-10-25)
 - **Date:** 2026-10-22
 - **Phase:** 38
 - **Builds on:** ADR-0028 (hosted Git through system `git`), ADR-0040 (bearer
@@ -146,3 +146,25 @@ Whether `has_actions` PATCH is accepted or refused, the `/version` string, and
 an eventual TLS option are decided during F1 and F5. Foreign-token codes, merge
 message texts and the deliberate departures from Gitea are recorded in the spec
 ("Contract decisions from the recordings") and `crates/forge/conformance/`.
+
+## Acceptance outcome
+
+F0–F5 are implemented. F6 passed on 2026-10-25 against a disposable local
+consumer deployment using forge source `dd563f231092b4c9832f56475a597c7dddd8e825`
+(the runtime change merged in #319; its later commit changes only a maintenance
+test). All six default consumer scenarios passed together: topology, delivery
+including customer merge, request-to-agent-runtime, brownfield import,
+brownfield one-shot and Claim recovery. Customer source imports remained on
+Gitea. Recovery exercised an actual orchestrator with a controlled harness,
+lost-acknowledgement replay, an explicit Worker budget reset and browser
+readback without navigation. This is consumer integration evidence, not a
+qualification of a real coding model.
+
+The recorded 24-scenario conformance gate remains the reproducible regression
+suite in this repository. Consumer evidence is retained in the consumer's
+private workspace; it is not available from this repository's CI.
+
+Acceptance does not approve a production migration. The local fixture used
+the consumer's Redis-free middleware mode, so production rate limiting was
+not qualified. SSH, Actions and the other v1 exclusions above remain excluded;
+implementation follow-ons remain tracked in #316.
