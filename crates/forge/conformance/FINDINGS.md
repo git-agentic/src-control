@@ -149,8 +149,9 @@ every failure is a difference listed in the last table.
 ## Not recorded or partial
 
 - SSH, LFS, Actions, webhooks, releases, labels, milestones and issues other than comments.
-- `mergeable` is compared by type only, since it flips while a PR is checked; the conflict state is
-  kept as the note `conflicting_pr_mergeable_after_8s`.
+- `mergeable` can flip while Gitea checks a PR. The conflicting PRs in G and T settle before recording
+  and compare `false` by value. The sc-forge gate additionally pins the clean PR lifecycle in F and
+  the clean merge in G through departures, because its mergeability is computed synchronously.
 - A non-fast-forward push to a protected branch is refused by the git client before it reaches the
   server, so only the forced variants exercise the server.
 - Which of two same-second rows lists first (tokens, statuses, branches) is arbitrary on some versions;

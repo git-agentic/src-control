@@ -1582,5 +1582,188 @@
    ]
   },
   "reason": "sc-forge refuses a read-only collaborator's tag push at the advertisement with 403 Forbidden; Gitea advertises and then declines in pre-receive"
+ },
+ {
+  "scenario": "F",
+  "exchange": 0,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/prs/pulls",
+  "expect": {
+   "fields": {
+    "mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 2,
+  "kind": "http",
+  "match": "POST /api/v1/repos/acme/prs/pulls",
+  "expect": {
+   "fields": {
+    "mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 11,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/prs/pulls/<id:path:pulls#1>",
+  "expect": {
+   "fields": {
+    "mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 15,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/prs/pulls/<id:path:pulls#1>",
+  "expect": {
+   "fields": {
+    "mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 22,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/prs/pulls/<id:path:pulls#3>",
+  "expect": {
+   "fields": {
+    "mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 24,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/prs/pulls/<id:path:pulls#3>",
+  "expect": {
+   "fields": {
+    "mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 25,
+  "kind": "http",
+  "match": "PATCH /api/v1/repos/acme/prs/pulls/<id:path:pulls#3>",
+  "expect": {
+   "fields": {
+    "mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 7,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/prs/pulls?state=all&head=acme%3Af2&limit=50",
+  "expect": {
+   "fields": {
+    "0.mergeable": true,
+    "1.mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 9,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/prs/pulls?state=open&limit=50",
+  "expect": {
+   "fields": {
+    "0.mergeable": true,
+    "1.mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 17,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/prs/pulls?state=open&limit=50",
+  "expect": {
+   "fields": {
+    "0.mergeable": true,
+    "1.mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "F",
+  "exchange": 23,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/prs/pulls?state=closed&limit=50",
+  "expect": {
+   "fields": {
+    "0.mergeable": true
+   }
+  },
+  "reason": "Clean independent branches remain mergeable across create, list, head update, close, reopen and edit; sc-forge computes this synchronously."
+ },
+ {
+  "scenario": "G",
+  "exchange": 1,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#1>",
+  "expect": {
+   "fields": {
+    "mergeable": true
+   }
+  },
+  "reason": "The clean PR is mergeable immediately; Gitea recorded its asynchronous check before completion."
+ },
+ {
+  "scenario": "G",
+  "exchange": 6,
+  "kind": "http",
+  "match": "GET /api/v1/repos/acme/merges/pulls/<id:path:pulls#1>",
+  "expect": {
+   "fields": {
+    "mergeable": false
+   }
+  },
+  "reason": "A merged PR is frozen and no longer mergeable; sc-forge reports this synchronously."
+ },
+ {
+  "scenario": "K",
+  "exchange": 55,
+  "kind": "http",
+  "match": "GET /api/v1/orgs/acme/repos",
+  "expect": {
+   "ignore_headers": [
+    "x-total-count"
+   ]
+  },
+  "reason": "Gitea leaks all 11 organization repositories in X-Total-Count even when the body is access-filtered. The complete body stays compared; e2e_repos::listings_are_filtered_by_access_with_visible_counts checks visible-count filtering for a read collaborator and an outsider."
+ },
+ {
+  "scenario": "K",
+  "exchange": 56,
+  "kind": "http",
+  "match": "GET /api/v1/orgs/acme/repos?limit=50",
+  "expect": {
+   "ignore_headers": [
+    "x-total-count"
+   ]
+  },
+  "reason": "Gitea leaks all 11 organization repositories in X-Total-Count even when the body is access-filtered. The complete body stays compared; e2e_repos::listings_are_filtered_by_access_with_visible_counts checks visible-count filtering for a read collaborator and an outsider."
  }
 ]

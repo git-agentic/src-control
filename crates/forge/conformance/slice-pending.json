@@ -1,14 +1,1 @@
-{
- "K": {
-  "defer": [
-   [
-    55,
-    "GET /api/v1/orgs/acme/repos"
-   ],
-   [
-    56,
-    "GET /api/v1/orgs/acme/repos?limit=50"
-   ]
-  ]
- }
-}
+{}

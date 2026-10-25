@@ -848,6 +848,10 @@ smaller ones (protected-cache hygiene, theirs-side resolve carry, sparse and
 P28 review follow-ons, the port de-flake, the clippy allow-list) are recorded in
 `CLAUDE.md`, `ARCHITECTURE.md` and the ADRs.
 
+- **Forge lifecycle and resource follow-ups (#316):** default-branch PATCH versus receive-pack
+  deletion, cancellation and shutdown evidence with real Git transfers, Linux memory-limit
+  execution, authentication-budget limits, scope recordings and quota budgets. These remain
+  separate from the F0 conformance checklist (#297) and F6 deployment acceptance.
 - **Remaining history-editing depth:** operation objects in the CAS
   (Jujutsu-deep upgrade to the file oplog), oplog entries for
   remote-tracking refs.

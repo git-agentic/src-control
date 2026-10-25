@@ -1194,6 +1194,17 @@ def cmd_selftest(a):
     assert not cmp_exchange(step, dict(step), Bij()), "an identical git step matches"
     other = dict(step, cmd="git clone --depth=1 http://<creds>@<host>/acme/a.git <tmp>/w")
     assert any("git command" in t for _, t in cmp_exchange(step, other, Bij())), "changed arguments must fail"
+    # The real gate must reject a wrong mergeability value and a URL naming another repository.
+    here = os.path.dirname(os.path.abspath(__file__))
+    pr = J.load(open(os.path.join(here, "fixtures", "1.22.6", "F-pulls.json")))["exchanges"][0]
+    deps = load_departures(os.path.join(here, "departures.json"), {s[0] for s in SCENARIOS})
+    dep = next((d for d in deps if d["scenario"] == "F" and 0 in dep_indexes(d["exchange"], [pr])), None)
+    def compare_pr(act):
+        return apply_override(pr, act, dep, Bij()) if dep else cmp_exchange(pr, act, Bij())
+    assert not any(lv == "fail" for lv, _ in compare_pr(pr)), "the recorded clean PR matches"
+    for key, value in (("mergeable", False), ("html_url", "<base>/acme/wrong/pulls/1")):
+        wrong = dict(pr, body=dict(pr["body"], **{key: value}))
+        assert any(lv == "fail" and key in text for lv, text in compare_pr(wrong)), f"wrong {key} must fail"
     bad = []
     for d in sorted(os.listdir(a.fixtures_root)):
         full = os.path.join(a.fixtures_root, d)
