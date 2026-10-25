@@ -935,7 +935,7 @@ tests, the image and the operations guide are F5b.
   held, no other registered run on the repository and an age over 10 minutes. This closes the "lock left by a git writer killed at
   run time" gap.
 - **Not built.** Per-owner byte quotas and per-user transport limits (they need a budget decision first; Engine's clones come from
-  one service account; #297). No last-gc state: an idle repository is collected every interval. `Git::run` gained `Spec::cancel`
+  one service account; #316). No last-gc state: an idle repository is collected every interval. `Git::run` gained `Spec::cancel`
   but still sets no `RLIMIT`s (only transports do).
 
 ### F4c decisions (as built)
@@ -1061,6 +1061,19 @@ exchanges of Q.
 - **Refusal texts.** Pushes are refused with `refusing to update protected branch <b>: direct pushes are not allowed`,
   `refusing to force-push protected branch <b>` and `refusing to delete protected branch <b>` (departure entries for
   I#7, I#8 and I#10; the default branch keeps F2b's wording and is checked first).
+
+### Post-F5 conformance follow-ups (#297)
+
+All 24 recorded scenarios are in the gate and `slice-pending.json` is empty. K#55-56 now compare
+the complete org repository lists; only `X-Total-Count` differs deliberately: Gitea counts invisible
+repositories, while sc-forge counts only visible ones (the API's access-filtered-count test pins this).
+F's clean PR lifecycle pins `mergeable: true` on create, lists, head changes, close/reopen and edit;
+G pins the clean PR to `true` before merge and `false` after merge. G/T retain their strict settled
+conflict checks. URLs already compare by value, including repository identity. The offline selftest
+now requires wrong mergeability and wrong-repository URL mutations to fail the actual gate.
+Refusal texts were fixed in #315; combined-status decisions are recorded under "Statuses" above.
+Remaining lifecycle, resource and authentication limits from the implementation comments are tracked
+in #316; F6 remains acceptance on the first consumer deployment.
 
 ## Open questions
 

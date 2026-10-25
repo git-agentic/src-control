@@ -7,8 +7,8 @@ serves, **recorded from real Gitea** rather than written by hand. A scenario run
 - `check` runs the same scenarios against any server and compares the result with the fixtures.
 - `diff` compares two fixture directories offline, for example `1.22.6` against `1.26.2`.
 
-`show` prints a readable digest of a fixture directory. `selftest` (offline, run by `forge-check.sh`) checks that the compact fixture writer round-trips and that
-every stored fixture is exactly what it would write. Everything is Python 3 standard library plus
+`show` prints a readable digest of a fixture directory. `selftest` (offline, run by `forge-check.sh`) checks the comparator's negative controls,
+that the compact fixture writer round-trips and that every stored fixture is exactly what it would write. Everything is Python 3 standard library plus
 `git` and (for recording) Docker. Always run Python as `python3 -I`.
 
 ## Record against real Gitea
@@ -46,9 +46,12 @@ python3 -I run.py diff fixtures/1.22.6 fixtures/1.26.2   # offline version diff
 python3 -I run.py show fixtures/1.26.2 --only G --body    # what was recorded
 ```
 
-Against the in-tree server use `./forge-check.sh` (it replays scenarios `A,B,C,L,N,R`; the others wait for their routes, see `slice-pending.json` and the spec's "F2a decisions"; it bootstraps an empty data directory with the `admin` CLI,
+Against the in-tree server use `./forge-check.sh` (it replays all 24 scenarios; it bootstraps an empty data directory with the `admin` CLI,
 starts `sc-forge serve` on a free loopback port, runs `check` with the departures and `slice-pending.json`, and
-stops the server; CI runs it). `check --pending FILE` takes a JSON map `{scenario: [N, "METHOD /path"]}` (a bare `N` is also accepted): the
+stops the server; CI runs it). `slice-pending.json` is empty. K#55-56 compare their complete access-filtered
+bodies; departures exclude Gitea's `X-Total-Count`, which leaks invisible repositories. sc-forge's visible
+counts are pinned by `e2e_repos::listings_are_filtered_by_access_with_visible_counts`.
+`check --pending FILE` takes a JSON map `{scenario: [N, "METHOD /path"]}` (a bare `N` is also accepted): the
 server is expected to answer the first N exchanges of that scenario, the scenario must then stop at the named setup
 call (a route from a later slice), and the rest are reported as pending. A server that answers more than N, or a scenario that
 completes, fails the run, so the file shrinks as slices land and is empty when the contract is whole. It is for the
@@ -82,9 +85,14 @@ observations called notes). Exchange N of the run is compared with exchange N of
   normalized to placeholders, and the SSH authority a server derives from its own config
   (`ssh://git@localhost:2222/acme/alpha.git`, `git@host:acme/alpha.git`) becomes `<ssh-authority>`, so
   `ssh_url` is compared by repo path only.
-- The one place `mergeable` is compared by value: the conflicting PR in scenarios G and T. The call polls
+- The conflicting PR in scenarios G and T compares `mergeable` by value. The call polls
   until 8 consecutive reads agree (`settle_keys`), the settled value must be `false` when recording, and
   the exchange lists `strict_keys: ["mergeable"]` so `check` compares that value too.
+  For sc-forge, departure `fields` also pin every PR response in F to `mergeable: true` (independent,
+  conflict-free branches, including close/reopen and lists), G#1 to `true` before the clean merge and
+  G#6 to `false` after it. This checks synchronous answers without freezing Gitea's transient values.
+  `html_url` is always compared by value after URL normalization. `selftest` mutates a recorded PR's
+  boolean and repository URL and requires the real gate to reject both.
 - Error text: for every recorded exchange with status >= 400 whose body has `message` (or a non-empty
   `errors`), the actual text must equal the recorded text after normalization: lower case, and only
   id-shaped trailing details dropped (`[uid: 0, name: ]`, `[id: x, rel_path: ]`, numeric `id:`/`issue_id:`
@@ -176,14 +184,15 @@ success, ...), as well as every deliberate sc-forge difference.
 - Teams (scenario B: create team, add member, carol's org permission) are tagged `team` and covered by
   departures because sc-forge has no teams. Basic-**password** auth on an ordinary API route (scenarios B,
   R, X) is covered by departures too: sc-forge accepts a password only on `/users/{u}/tokens*`.
-- The `message_contains` words for sc-forge's own error texts (merge style, state, rename, branch) are
-  placeholders: reword them when sc-forge's messages are fixed.
+- The `message_contains` words pin sc-forge's own refusal texts, including merge style, state,
+  rename, branch and ref-namespace refusals (#315).
 
 Not covered by a departure: the merge of a PR whose head is already in base. sc-forge reproduces Gitea's
-`405 "Please try again later"` with `changed_files: 0`, so the recorded exchanges apply unchanged. The
-combined status for a sha with no statuses (1.22.6 `state:""`, 1.26.2 `pending`) and for an unknown sha
-(1.22.6 `200` with empty fields, 1.26.2 `404`) are not 500/empty-message/malformed cases, so the rule gives
-no departure; add one when sc-forge's answer is decided.
+`405 "Please try again later"` with `changed_files: 0`, so the recorded exchanges apply unchanged.
+The combined status for a commit with no statuses is `pending` with the real sha (H#0), and an
+unknown sha is 404 (H#48). These follow 1.26.2 because 1.22.6's bodies contain empty answers.
+After a refused `bogus` status, the existing commit still has no statuses (H#49: `pending`, count 0).
+The departures and spec's "Statuses" section record these decisions.
 
 ### Normalization
 
