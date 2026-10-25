@@ -85,16 +85,24 @@ fn push_then_clone_round_trips() {
     c.ok(&work, None, &["add", "."]);
     c.ok(&work, None, &["commit", "-q", "-m", "one"]);
     c.ok(&work, Some(&auth), &["push", &url, "main"]);
-    let clone = c.dir.join("clone");
-    c.ok(
-        &c.dir,
-        Some(&auth),
-        &["clone", "-q", &url, clone.to_str().unwrap()],
-    );
-    assert_eq!(
-        std::fs::read_to_string(clone.join("a.txt")).unwrap(),
-        "hello\n"
-    );
+    let plain = url.strip_suffix(".git").unwrap();
+    for (label, remote) in [("suffix", url.as_str()), ("plain", plain)] {
+        let clone = c.dir.join(format!("clone-{label}"));
+        c.ok(
+            &c.dir,
+            Some(&auth),
+            &["clone", "-q", remote, clone.to_str().unwrap()],
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.txt")).unwrap(),
+            "hello\n"
+        );
+        c.ok(
+            &clone,
+            Some(&auth),
+            &["push", "-q", remote, &format!("main:refs/heads/{label}")],
+        );
+    }
 }
 
 // ---- helpers ----
@@ -202,18 +210,20 @@ fn missing_and_invisible_repositories_answer_identically() {
     );
     assert_eq!(r.status, 201);
     for repo in ["secret", "nothere"] {
-        for q in [UP, RP] {
-            let r = s.send(
-                "GET",
-                &format!("/siteadmin/{repo}.git{q}"),
-                Some(&bob),
-                None,
-            );
-            assert_eq!(
-                (r.status, body_text(&r).as_str()),
-                (404, "Repository not found"),
-                "{repo}{q}"
-            );
+        for suffix in [".git", ""] {
+            for q in [UP, RP] {
+                let r = s.send(
+                    "GET",
+                    &format!("/siteadmin/{repo}{suffix}{q}"),
+                    Some(&bob),
+                    None,
+                );
+                assert_eq!(
+                    (r.status, body_text(&r).as_str()),
+                    (404, "Repository not found"),
+                    "{repo}{suffix}{q}"
+                );
+            }
         }
     }
 }

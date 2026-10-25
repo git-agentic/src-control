@@ -768,7 +768,8 @@ F2b is the git half of F2 (plan: `docs/superpowers/plans/2026-10-23-p38-f2b-git-
   objects/pack/pack-<hex>.{pack,idx}}` only, served by `git http-backend` run as a CGI; everything else under `.git/` is
   404, a wrong method 405, a dumb `info/refs` (no `service=`) 404 (git's dumb listing ignores `hideRefs`). The transport
   has its own whitelist (`transport::parse`) beside `routes::ROUTES`: an explicit, recorded exception to "every route is in
-  the table". Gitea also serves the path without `.git`; sc-forge does not.
+  the table". The `.git` suffix is optional, as in Gitea: both forms resolve to the same repository
+  and pass through the same authorization and CGI path construction. REST paths remain on the API router.
 - **Order of checks** on a git request: credentials (401), method (405), scope (403), repository and existence (404),
   permission (403), then encoding (415), declared body size (413), admission (503), gzip inflation (400/413), disk
   reservation (507), process start.
