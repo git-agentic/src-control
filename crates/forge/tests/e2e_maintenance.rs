@@ -561,11 +561,12 @@ fn passes_beside_writers_lose_nothing() {
                 })
             })
             .collect();
-        for h in writers {
-            h.join().unwrap();
-        }
+        let results: Vec<_> = writers.into_iter().map(|h| h.join()).collect();
         stop.store(true, Ordering::SeqCst);
         passes.join().unwrap();
+        for result in results {
+            result.unwrap();
+        }
     });
     assert!(!acknowledged.lock().unwrap().is_empty());
     assert!(
