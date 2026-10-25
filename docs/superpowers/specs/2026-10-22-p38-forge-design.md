@@ -1,9 +1,8 @@
 # Design: sc-forge, a Gitea-compatible Git forge (P38)
 
 - **Date:** 2026-10-22 (revision 2, after independent design review)
-- **Status:** Draft, pre-implementation (ADR-0058 is Proposed)
-- **ADR:** ADR-0058 is firmed from Proposed to Accepted when the phase is built
-  (ROADMAP "How a phase gets built")
+- **Status:** Accepted (2026-10-25); implementation complete
+- **ADR:** [ADR-0058](../../adr/0058-sc-forge-gitea-compatible-git-forge.md) is Accepted (2026-10-25).
 - **Contract source:** `crates/forge/conformance/` (recorded from real Gitea
   1.22.6 and 1.26.2; see "Conformance") plus the client survey summarized below
 
