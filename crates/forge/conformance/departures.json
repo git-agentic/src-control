@@ -7,7 +7,7 @@
   "expect": {
    "status": 409,
    "message_contains": [
-    "conflict"
+    "merge conflict"
    ]
   },
   "reason": "sc-forge answers a conflicting merge with 409 and a conflict message; Gitea answers 405 'Please try again later'"
@@ -20,7 +20,7 @@
   "expect": {
    "status": 409,
    "message_contains": [
-    "conflict"
+    "merge conflict"
    ]
   },
   "reason": "sc-forge answers a conflicting merge with 409 and a conflict message; Gitea answers 405 'Please try again later'"
@@ -33,7 +33,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "merge"
+    "only do=merge is supported"
    ],
    "ignore_body": true
   },
@@ -91,7 +91,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "merge"
+    "only do=merge is supported"
    ],
    "ignore_body": true
   },
@@ -149,7 +149,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "merge"
+    "only do=merge is supported"
    ],
    "ignore_body": true
   },
@@ -193,7 +193,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "merge"
+    "only do=merge is supported"
    ],
    "ignore_body": true
   },
@@ -251,7 +251,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "merge"
+    "only do=merge is supported"
    ]
   },
   "reason": "sc-forge supports only Do=merge, not fast-forward-only (reword message_contains once sc-forge's text is fixed)"
@@ -334,8 +334,8 @@
   "expect": {
    "status": 409,
    "message_contains": [
-    "conflict",
-    "unrelated"
+    "merge conflict",
+    "unrelated histories"
    ],
    "ignore_body": true
   },
@@ -349,7 +349,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "couldn't be found"
+    "the target couldn't be found"
    ]
   },
   "reason": "Gitea answers 500 for an unknown sha; sc-forge answers 404"
@@ -362,7 +362,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "couldn't be found"
+    "the target couldn't be found"
    ]
   },
   "reason": "Gitea answers 500 for an unknown sha; sc-forge answers 404"
@@ -521,7 +521,7 @@
     403
    ],
    "message_contains": [
-    "password"
+    "invalid username or password"
    ]
   },
   "reason": "token routes take the user's password only; a token sent as the Basic password fails password verification, so sc-forge answers with a password-class refusal instead of Gitea's scope error"
@@ -537,7 +537,7 @@
     403
    ],
    "message_contains": [
-    "password"
+    "invalid username or password"
    ]
   },
   "reason": "token routes take the user's password only; a token sent as the Basic password fails password verification, so sc-forge answers with a password-class refusal instead of Gitea's scope error"
@@ -553,7 +553,7 @@
     403
    ],
    "message_contains": [
-    "password"
+    "basic authentication with the user's password is required"
    ]
   },
   "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
@@ -569,7 +569,7 @@
     403
    ],
    "message_contains": [
-    "password"
+    "basic authentication with the user's password is required"
    ]
   },
   "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
@@ -585,7 +585,7 @@
     403
    ],
    "message_contains": [
-    "password"
+    "basic authentication with the user's password is required"
    ]
   },
   "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
@@ -601,7 +601,7 @@
     403
    ],
    "message_contains": [
-    "password"
+    "invalid username or password"
    ],
    "ignore_body": true
   },
@@ -618,7 +618,7 @@
     403
    ],
    "message_contains": [
-    "password"
+    "invalid username or password"
    ],
    "ignore_body": true,
    "ignore_headers": [
@@ -639,7 +639,7 @@
     403
    ],
    "message_contains": [
-    "password"
+    "basic authentication with the user's password is required"
    ]
   },
   "reason": "sc-forge requires the user's password on /users/{u}/tokens routes; a token is refused"
@@ -652,7 +652,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "ref not found"
    ]
   },
   "reason": "1.22.6 answers 500; version rule follows 1.26.2 (404)"
@@ -665,7 +665,7 @@
   "expect": {
    "status": 405,
    "message_contains": [
-    "already merged"
+    "the pr is already merged"
    ]
   },
   "reason": "1.22.6 answers an empty message; version rule follows 1.26.2 'The PR is already merged'"
@@ -678,7 +678,7 @@
   "expect": {
    "status": 405,
    "message_contains": [
-    "already merged"
+    "the pr is already merged"
    ]
   },
   "reason": "1.22.6 answers an empty message; version rule follows 1.26.2 'The PR is already merged'"
@@ -742,7 +742,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "state"
+    "must be one of pending, success, error, failure"
    ],
    "ignore_body": true
   },
@@ -756,7 +756,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "state"
+    "must be one of pending, success, error, failure"
    ],
    "ignore_body": true
   },
@@ -770,7 +770,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "state"
+    "must be one of pending, success, error, failure"
    ],
    "ignore_body": true
   },
@@ -858,7 +858,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "rename"
+    "repository rename is not supported"
    ],
    "ignore_body": true
   },
@@ -890,7 +890,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "couldn't be found"
+    "the target couldn't be found"
    ],
    "ignore_body": true
   },
@@ -904,7 +904,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "couldn't be found"
+    "the target couldn't be found"
    ],
    "ignore_body": true,
    "ignore_headers": [
@@ -937,7 +937,7 @@
   "expect": {
    "ok": false,
    "message_contains": [
-    "not found"
+    "repository not found"
    ]
   },
   "reason": "the new name does not exist"
@@ -950,7 +950,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "couldn't be found"
+    "the target couldn't be found"
    ]
   },
   "reason": "the new name does not exist"
@@ -963,7 +963,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "couldn't be found"
+    "the target couldn't be found"
    ],
    "ignore_body": true
   },
@@ -977,7 +977,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "couldn't be found"
+    "the target couldn't be found"
    ],
    "ignore_body": true
   },
@@ -991,7 +991,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "branch"
+    "branch does not exist"
    ],
    "ignore_body": true
   },
@@ -1039,7 +1039,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "repository not found"
    ]
   },
   "reason": "sc-forge answers 404, not Gitea's 403 'Push to create is not enabled'"
@@ -1052,7 +1052,7 @@
   "expect": {
    "status": 404,
    "message_contains": [
-    "not found"
+    "repository not found"
    ]
   },
   "reason": "sc-forge answers 404, not Gitea's 403 'Push to create is not enabled'"
@@ -1158,11 +1158,11 @@
     501
    ],
    "message_contains": [
-    "not"
+    "no such api route"
    ],
    "ignore_body": true
   },
-  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text) [ignore_body: the recorded 201 body has another shape than the departed answer]"
+  "reason": "teams are a non-goal in sc-forge [ignore_body: the recorded 201 body has another shape than the departed answer]"
  },
  {
   "scenario": "B",
@@ -1176,11 +1176,11 @@
     501
    ],
    "message_contains": [
-    "not"
+    "no such api route"
    ],
    "ignore_body": true
   },
-  "reason": "teams are a non-goal in sc-forge (words in message_contains are placeholders for its text) [ignore_body: the recorded 204 body has another shape than the departed answer]"
+  "reason": "teams are a non-goal in sc-forge [ignore_body: the recorded 204 body has another shape than the departed answer]"
  },
  {
   "scenario": "B",
@@ -1200,7 +1200,7 @@
    },
    "ignore_body": true
   },
-  "reason": "carol is not a team member without teams: no read permission via the org (200 all false or 404). teams are a non-goal in sc-forge (words in message_contains are placeholders for its text) [ignore_body: the recorded 200 body has another shape than the departed answer]"
+  "reason": "carol is not a team member without teams: no read permission via the org (200 all false or 404). teams are a non-goal in sc-forge [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "X",
@@ -1210,11 +1210,11 @@
   "expect": {
    "status": 401,
    "message_contains": [
-    "auth"
+    "this route accepts access tokens only"
    ],
    "ignore_body": true
   },
-  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one) [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "X",
@@ -1224,11 +1224,11 @@
   "expect": {
    "status": 401,
    "message_contains": [
-    "auth"
+    "this route accepts access tokens only"
    ],
    "ignore_body": true
   },
-  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one) [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "X",
@@ -1238,11 +1238,11 @@
   "expect": {
    "status": 401,
    "message_contains": [
-    "auth"
+    "this route accepts access tokens only"
    ],
    "ignore_body": true
   },
-  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 201 body has another shape than the departed answer]"
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one) [ignore_body: the recorded 201 body has another shape than the departed answer]"
  },
  {
   "scenario": "X",
@@ -1252,11 +1252,11 @@
   "expect": {
    "status": 401,
    "message_contains": [
-    "auth"
+    "this route accepts access tokens only"
    ],
    "ignore_body": true
   },
-  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one); 'auth' is a placeholder for its 401 text [ignore_body: the recorded 200 body has another shape than the departed answer]"
+  "reason": "sc-forge never tries a Basic password on an ordinary API route (only /users/{u}/tokens* accept one) [ignore_body: the recorded 200 body has another shape than the departed answer]"
  },
  {
   "scenario": "H",
@@ -1287,14 +1287,14 @@
    "status": 404,
    "ignore_body": true,
    "message_contains": [
-    "couldn't be found"
+    "the target couldn't be found"
    ],
    "ignore_headers": [
     "link",
     "x-total-count"
    ]
   },
-  "reason": "combined status of an unknown sha: 404 (1.26.2); 1.22.6's 200 with empty fields is an empty answer, so the version rule picks 1.26.2. 'not found' is a placeholder word for sc-forge's text"
+  "reason": "combined status of an unknown sha: 404 (1.26.2); 1.22.6's 200 with empty fields is an empty answer, so the version rule picks 1.26.2."
  },
  {
   "scenario": "H",
@@ -1452,7 +1452,7 @@
   "expect": {
    "status": 422,
    "message_contains": [
-    "state"
+    "must be one of pending, success, error, failure"
    ],
    "ignore_body": true
   },
@@ -1569,5 +1569,18 @@
    ]
   },
   "reason": "sc-forge's hook words the refusal 'refusing to delete the default branch'; Gitea says 'gitea: branch main is the default branch and cannot be deleted'. Both end in 'pre-receive hook declined'"
+ },
+ {
+  "scenario": "S",
+  "exchange": 13,
+  "kind": "git",
+  "match": "read-collab-push-tag",
+  "expect": {
+   "ok": false,
+   "message_contains": [
+    "forbidden"
+   ]
+  },
+  "reason": "sc-forge refuses a read-only collaborator's tag push at the advertisement with 403 Forbidden; Gitea advertises and then declines in pre-receive"
  }
 ]
