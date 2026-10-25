@@ -803,11 +803,8 @@ F2b is the git half of F2 (plan: `docs/superpowers/plans/2026-10-23-p38-f2b-git-
   (C#30, K#34; Gitea declines in pre-receive), the default-branch delete message (J#62), protocol v2 advertisements have no
   `# service=` preamble (V#5), the unborn-default behaviour above (N). Gitea's behaviour that the tests cannot reproduce
   and sc-forge does not copy: moving HEAD to the first pushed branch.
-- **Conformance gate.** `forge-check.sh` replays `A B C J K L M N R V` (10 scenarios). `slice-pending.json` now has
-  `{"stop": [N, text], "defer": [[index, "METHOD /path"], ...]}` entries: a deferred exchange still runs and must be the
-  recorded call, but its mismatch waits for a later slice, and it fails the run when it starts passing. `B` stops at its
-  first contents call; J's `/tags` and `/git/refs/tags`, K's and N's `/contents`, and K's org listing counts (which depend
-  on scenarios that need F3/F4 routes) are deferred. `S` needs a PR (F4); `X`, `D`, `E`-`I`, `O`-`Q`, `T`, `U`, `W` stay out.
+- **Conformance gate (current).** `forge-check.sh` replays all 24 scenarios (`A` through `X`).
+  `slice-pending.json` is empty; no exchanges are deferred. See "Post-F5 conformance follow-ups" below.
   A departed git step still has its command line compared; credentialed URLs compare equal under `http` and `https`.
 - **Differences from the plan.** Admission takes the per-repository slot first (the plan said global first, which lets a
   flood on one repository hold global slots while waiting); the realm and RPC cache policy are Gitea's (the plan departed
@@ -856,9 +853,9 @@ write half (`POST`/`PUT`/`DELETE` contents) is F3b, below; F3a shipped them as 5
   repository has no branch or tag at all.
 - **Not served.** `git/blobs`, `git/tags` and web `raw` URLs appear in response bodies as Gitea writes them but are not
   routes.
-- **Conformance gate.** `forge-check.sh` now replays `A B C D E J K L M N R V` (12 scenarios). `E` stops at its first
-  contents write (`[42, KeyError: 'sha']`) with E#36 to #41 deferred to F3b; `D` defers its PR listing and `B` its status
-  post (F4).
+- **Conformance gate at F3a (historical).** `forge-check.sh` replayed `A B C D E J K L M N R V` (12 scenarios).
+  `E` stopped at its first contents write, E#36 to #41 waited for F3b, and D's PR listing and B's status post waited
+  for F4. The current gate runs all 24 scenarios without pending exchanges; see "Post-F5 conformance follow-ups".
 
 ### F3b decisions (as built)
 
@@ -940,8 +937,8 @@ tests, the image and the operations guide are F5b.
 
 ### F4c decisions (as built)
 
-F4c adds migration 5 (`merge_intents`) and `POST /pulls/{n}/merge`; the gate now replays G, T, U, O and Q completely (the F4
-slices together leave only K's two deferred org-listing exchanges pending). The merge below replaces the corresponding
+F4c adds migration 5 (`merge_intents`) and `POST /pulls/{n}/merge`. At that slice, G, T, U, O and Q joined the gate completely;
+K's last two org-listing exchanges were enabled in the Post-F5 follow-ups below. The merge below replaces the corresponding
 steps of "Merge" and "Crash recovery" above where they differ (plan decisions R1-R5 after the Opus and Sol review).
 
 - **Order, all under the repository's write gate.** Settle any pending intent; re-read the PR (merged: 405 `The PR is
@@ -986,8 +983,8 @@ steps of "Merge" and "Crash recovery" above where they differ (plan decisions R1
 
 ### F4b decisions (as built)
 
-F4b adds migration 4 (`pulls`, `mergeability_cache`, `reviews`, `issue_comments`) and gates F, O (the merge-dependent exchanges
-stay `defer`red until F4c), P and D#13.
+F4b added migration 4 (`pulls`, `mergeability_cache`, `reviews`, `issue_comments`) and gated F, O, P and D#13;
+its merge-dependent exchanges waited for F4c and are now in the gate.
 
 - **PR object.** The recorded 1.22.6 shape (`id` is the row id, `number` the per-repository index; `user` is the creator's full
   account object; `base.repo`/`head.repo` are the repository object). Open PRs show the live tips; `mergeable`, `merge_base`,

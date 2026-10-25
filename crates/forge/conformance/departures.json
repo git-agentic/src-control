@@ -1752,7 +1752,7 @@
     "x-total-count"
    ]
   },
-  "reason": "Gitea leaks all 11 organization repositories in X-Total-Count even when the body is access-filtered; sc-forge reports only visible repositories (0 for Dave, 9 for Carol). The complete body stays compared; e2e_repos::listings_are_filtered_by_access_with_visible_counts independently pins filtered counts."
+  "reason": "Gitea leaks all 11 organization repositories in X-Total-Count even when the body is access-filtered. The complete body stays compared; e2e_repos::listings_are_filtered_by_access_with_visible_counts checks visible-count filtering for a read collaborator and an outsider."
  },
  {
   "scenario": "K",
@@ -1764,6 +1764,6 @@
     "x-total-count"
    ]
   },
-  "reason": "Gitea leaks all 11 organization repositories in X-Total-Count even when the body is access-filtered; sc-forge reports only visible repositories (0 for Dave, 9 for Carol). The complete body stays compared; e2e_repos::listings_are_filtered_by_access_with_visible_counts independently pins filtered counts."
+  "reason": "Gitea leaks all 11 organization repositories in X-Total-Count even when the body is access-filtered. The complete body stays compared; e2e_repos::listings_are_filtered_by_access_with_visible_counts checks visible-count filtering for a read collaborator and an outsider."
  }
 ]
