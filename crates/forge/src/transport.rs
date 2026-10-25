@@ -1,4 +1,4 @@
-//! Smart-HTTP git transport: `/{owner}/{repo}.git/...` served by `git http-backend` as a CGI.
+//! Smart-HTTP git transport with an optional `.git` suffix, served by `git http-backend` as a CGI.
 //!
 //! This module holds the parts that decide *what may be asked of git* and *how git's answer is
 //! read*, as plain functions with tests: the path whitelist, the git-specific credential and
@@ -50,7 +50,7 @@ impl Sub {
     }
 }
 
-/// A parsed `/{owner}/{repo}.git/{sub}` request path.
+/// A parsed Git request path, with or without the repository's `.git` suffix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitPath {
     pub owner: String,
@@ -63,7 +63,7 @@ pub struct GitPath {
 pub enum Route {
     /// Not a git path at all (the ordinary router handles it).
     NotGit,
-    /// A `/{o}/{r}.git/...` path that is not on the whitelist: 404.
+    /// A Git path that is not on the whitelist: 404.
     Unknown,
     Git(GitPath),
 }
@@ -110,6 +110,9 @@ fn sub_of(rest: &str) -> Option<Sub> {
 /// plain name characters (so no `/`, `..` or control character can come out of a decode); the
 /// rest must match the whitelist exactly, byte for byte, with no escapes.
 pub fn parse(path: &str) -> Route {
+    if path.starts_with("/api/") {
+        return Route::NotGit;
+    }
     let Some(p) = path.strip_prefix('/') else {
         return Route::NotGit;
     };
@@ -117,10 +120,13 @@ pub fn parse(path: &str) -> Route {
     let (Some(owner), Some(repo_git)) = (it.next(), it.next()) else {
         return Route::NotGit;
     };
-    let Some(repo_enc) = repo_git.strip_suffix(".git") else {
-        return Route::NotGit;
-    };
     let rest = it.next().unwrap_or("");
+    let sub = sub_of(rest);
+    let repo_enc = match repo_git.strip_suffix(".git") {
+        Some(repo) => repo,
+        None if sub.is_some() => repo_git,
+        None => return Route::NotGit,
+    };
     let (Some(owner), Some(repo)) = (
         crate::routes::percent_decode(owner),
         crate::routes::percent_decode(repo_enc),
@@ -133,7 +139,7 @@ pub fn parse(path: &str) -> Route {
     {
         return Route::Unknown;
     }
-    match sub_of(rest) {
+    match sub {
         Some(sub) => Route::Git(GitPath { owner, repo, sub }),
         None => Route::Unknown,
     }
@@ -565,9 +571,10 @@ mod tests {
         for p in [
             "/",
             "/api/v1/user",
+            "/api/v1/HEAD",
+            "/api/v1/git-upload-pack",
             "/acme/alpha",
             "/acme",
-            "/acme/alpha/info/refs",
             "healthz",
             "/api/healthz",
         ] {
