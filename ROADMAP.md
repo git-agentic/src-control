@@ -696,27 +696,13 @@ across every phase.
 
 ## Active
 
-**P38 — sc-forge** (Proposed, [ADR-0058](docs/adr/0058-sc-forge-gitea-compatible-git-forge.md)):
-a Gitea-compatible Git forge (bare repos over smart HTTP, a recorded subset of
-`/api/v1`, SQLite metadata) so a platform can swap its project Git host by
-config. Design:
-`docs/superpowers/specs/2026-10-22-p38-forge-design.md`. Slices F0 (contract
-capture) through F6 (acceptance on the first deployment); F0, F1 (server
-skeleton, users, organizations, tokens, `admin` CLI), F2a (repositories API, lifecycle
-and reconciler, collaborators, branches) and F2b (smart-HTTP git transport via `git http-backend`,
-`pre-receive` ref policy, admission control, threat-model pass #1) and F3a (content reads: refs, tags, commits,
-trees, contents, archives) and F3b (contents writes: create, update, delete as server-made commits) and F4a (branch protection
-enforced on push, contents API and branch delete; commit statuses) and F4b (pull requests, reviews, comments, retention
-refs) and F4c (merge with a crash-safe journal, required-check gating, kill -9 and protection-matrix tests) and F5a (two-stage gc, merge-commit retention, runtime cleanup of stale locks and quarantine directories) and F5b (structured logs, graceful SIGTERM drain, bind-gate tests, container image, operations guide) are built. Hosted repos are
-bare Git and get none of the `.sc/` features.
-
-Other follow-up work is tracked as GitHub issues and listed under Deferred
-below.
+No phase is currently active. Follow-up work is tracked under Deferred below.
 
 ## Completed phases (usability-first ordering)
 
 | Phase | Goal | Demoable outcome | ADR |
 |-------|------|------------------|-----|
+| **P38 — sc-forge** | Configurable project Git host | Bare Git over smart HTTP, recorded Gitea API subset, protected merges and operations tooling; all 24 recorded scenarios and all six first-consumer acceptance scenarios pass. Local acceptance only; production migration is separate. | [0058](docs/adr/0058-sc-forge-gitea-compatible-git-forge.md) |
 | **P4 — Merge & conflict resolution** | Combine work from two branches | `sc merge <branch>` creates a merge snapshot; clean merges auto-resolve, conflicts are detected and reported | [0012](docs/adr/0012-three-way-merge.md) |
 | **P5 — Secret scanner (accidental-plaintext guard)** | Stop plaintext secrets being committed | pattern + entropy scan hard-rejects plaintext secrets, with `sc scan` and a hash-scoped allowlist | [0017](docs/adr/0017-secret-scanner.md) |
 | **P6 — Remotes: clone / push / fetch** | Sync a repo between locations | `sc clone <src> <dst>`, `sc push`, `sc fetch` transfer objects + refs; `fetch` then `merge` integrates remote work | [0013](docs/adr/0013-remote-sync-model.md) |

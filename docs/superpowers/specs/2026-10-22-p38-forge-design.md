@@ -1,9 +1,8 @@
 # Design: sc-forge, a Gitea-compatible Git forge (P38)
 
 - **Date:** 2026-10-22 (revision 2, after independent design review)
-- **Status:** Draft, pre-implementation (ADR-0058 is Proposed)
-- **ADR:** ADR-0058 is firmed from Proposed to Accepted when the phase is built
-  (ROADMAP "How a phase gets built")
+- **Status:** Accepted (2026-10-25); implementation complete
+- **ADR:** [ADR-0058](../../adr/0058-sc-forge-gitea-compatible-git-forge.md) is Accepted (2026-10-25).
 - **Contract source:** `crates/forge/conformance/` (recorded from real Gitea
   1.22.6 and 1.26.2; see "Conformance") plus the client survey summarized below
 
@@ -1071,7 +1070,28 @@ conflict checks. URLs already compare by value, including repository identity. T
 now requires wrong mergeability and wrong-repository URL mutations to fail the actual gate.
 Refusal texts were fixed in #315; combined-status decisions are recorded under "Statuses" above.
 Remaining lifecycle, resource and authentication limits from the implementation comments are tracked
-in #316; F6 remains acceptance on the first consumer deployment.
+in #316. F6 passed on the first consumer deployment; see below.
+
+## F6 acceptance outcome
+
+Completed on 2026-10-25 using a disposable local consumer deployment and forge
+source `dd563f231092b4c9832f56475a597c7dddd8e825` (#319's runtime change).
+One complete default sweep passed topology, delivery with customer merge,
+request-to-agent-runtime, brownfield import, brownfield one-shot and Claim
+recovery. Only the target Git host was selected as sc-forge; customer source
+imports stayed on Gitea. The consumer's configuration and fixture repairs
+were delivered through its own repositories.
+
+Claim recovery used the real orchestrator with a controlled harness. It
+verified failure acknowledgement replay, persistence of the stopped Claim
+across restart, explicit budget reset, a second Worker, unchanged Claim
+ownership, unique failure/recovery comments and browser-visible recovery
+without navigation. It does not qualify a real coding model.
+
+The consumer's private evidence is separate from this repository's reproducible
+24-scenario conformance gate. The local run used Redis-free consumer middleware
+and did not qualify production rate limiting or authorize QA/production
+cutover. Existing v1 exclusions and #316 follow-ons remain in force.
 
 ## Open questions
 
