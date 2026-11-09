@@ -2,7 +2,8 @@
 //! generation and hashing, constant-time comparison. Lives here because
 //! RustCrypto (argon2, blake3) and the RNG stay quarantined in this crate.
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use std::sync::OnceLock;
 
@@ -11,11 +12,10 @@ pub fn hash_password(password: &str) -> String {
     use rand_core::{OsRng, RngCore};
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
-    let salt = SaltString::encode_b64(&salt).expect("16 bytes is a valid salt length");
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .expect("argon2 hashing with default parameters cannot fail")
-        .to_string()
+    let hash: PasswordHash = Argon2::default()
+        .hash_password_with_salt(password.as_bytes(), &salt)
+        .expect("argon2 hashing with default parameters cannot fail");
+    hash.to_string()
 }
 
 static DUMMY: OnceLock<String> = OnceLock::new();
@@ -100,6 +100,18 @@ mod tests {
             !verify_password(&right[..0], Some(&h)),
             "empty is not the password"
         );
+    }
+
+    #[test]
+    fn hash_from_argon2_0_5_still_verifies() {
+        // Made by argon2 0.5.3 (the version before 0.6): rows stored by older
+        // sc-forge builds must keep verifying after the upgrade.
+        let legacy = concat!(
+            "$argon2id$v=19$m=19456,t=2,p=1$12Jq/QaZmfBGlN6TfZu3Rg",
+            "$nVEPZmM6n6sSG8yZfXvFF5E00aLDJTCVu7bpGnEhDyU"
+        );
+        assert!(verify_password("legacy-0.5-fixture-pw", Some(legacy)));
+        assert!(!verify_password("legacy-0.5-fixture-px", Some(legacy)));
     }
 
     #[test]
