@@ -700,7 +700,7 @@ fn quarantined(repo_dir: &Path) -> bool {
 }
 
 #[test]
-fn a_cancelled_push_leaves_no_ref_lock_or_quarantine() {
+fn a_push_cancelled_mid_pack_moves_no_ref_and_its_quarantine_is_reclaimed() {
     use std::io::Write;
     // The server does not always see a client that leaves mid-body (the body read can miss the
     // EOF, #316); the idle timeout then ends the transport. A short one bounds the test either way.
@@ -761,10 +761,11 @@ fn a_cancelled_push_leaves_no_ref_lock_or_quarantine() {
         tip.starts_with(&old),
         "the cancelled push moved main: {tip}"
     );
+    // git takes its ref locks only after the whole pack has arrived, so none is held here.
     let left = leftovers(&repo_dir);
     assert!(
         left.iter().all(|p| !p.to_string_lossy().ends_with(".lock")),
-        "no ref lock survives the cancel: {left:?}"
+        "no lock survives the cancel: {left:?}"
     );
     // git does not always get to remove its quarantine before the group is killed (seen with
     // Apple git 2.54); maintenance reclaims what is left once it is old enough to have no owner.
@@ -809,7 +810,12 @@ fn slow_fetch(
 fn ends_cleanly(mut sock: std::net::TcpStream) -> (bool, usize) {
     use std::io::Read;
     let mut buf = Vec::new();
-    let _ = sock.read_to_end(&mut buf);
+    match sock.read_to_end(&mut buf) {
+        Ok(_) => {}
+        // A cut connection may end in a reset; a timeout means the server left it hanging.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("the response neither ended nor broke: {e}"),
+    }
     (buf.ends_with(b"\r\n0\r\n\r\n"), buf.len())
 }
 

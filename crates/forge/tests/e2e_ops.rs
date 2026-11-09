@@ -333,7 +333,12 @@ fn group_alive(pgid: &str) -> bool {
 /// `(ended with the terminating chunk, bytes)` for the rest of a held response.
 fn rest_of(mut s: TcpStream) -> (bool, usize) {
     let mut buf = Vec::new();
-    let _ = s.read_to_end(&mut buf);
+    match s.read_to_end(&mut buf) {
+        Ok(_) => {}
+        // A cut connection may end in a reset; a timeout means the server left it hanging.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("the response neither ended nor broke: {e}"),
+    }
     (buf.ends_with(b"\r\n0\r\n\r\n"), buf.len())
 }
 
@@ -346,6 +351,10 @@ fn sigterm_lets_a_clone_in_flight_finish_within_the_drain() {
     let held = held_fetch(&p, &token, "drained", &want);
     p.sigterm();
     std::thread::sleep(Duration::from_millis(300)); // the drain has begun
+    assert!(
+        p.child.try_wait().unwrap().is_none(),
+        "the server waits for the transfer"
+    );
     let (clean, got) = rest_of(held);
     assert!(clean && got > 16 << 20, "{got} bytes, clean: {clean}");
     let st = p.wait(Duration::from_secs(20)).expect("exits after it");
@@ -365,7 +374,12 @@ fn sigterm_cancels_a_clone_still_running_at_the_drain_deadline() {
     p.sigterm();
     let st = p.wait(Duration::from_secs(15)).expect("exits");
     assert!(st.success(), "{st:?}");
-    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    // It waited out the two-second drain for the transfer, then cut it.
+    let took = t0.elapsed();
+    assert!(
+        took >= Duration::from_millis(1900) && took < Duration::from_secs(10),
+        "{took:?}"
+    );
     // Read only now: the transfer was cut, so the response has no terminating chunk (a client
     // sees an error, not a clean but truncated pack), and no git outlives the server.
     let (clean, got) = rest_of(held);
