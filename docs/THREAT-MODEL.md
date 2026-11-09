@@ -926,8 +926,10 @@ unless said otherwise).
   2.54); maintenance removes it once it is old enough to have no owner, as it does for a server killed outright
   (`a_push_cancelled_mid_pack_moves_no_ref_and_its_quarantine_is_reclaimed`). A push cancelled while it holds its ref
   lock (held in git's `reference-transaction prepared` hook) releases the lock and moves no ref
-  (`a_push_cancelled_while_holding_its_ref_lock_releases_it`). A client that leaves mid-body is sometimes
-  noticed only at `--git-idle-timeout` (the body read can miss the EOF, about 1 run in 8 locally, #316).
+  (`a_push_cancelled_while_holding_its_ref_lock_releases_it`). A client whose close the server never receives (seen on macOS loopback in about 1 run in 8;
+  a dead host or a dropped NAT entry does the same) is found by TCP keepalive, whose probes start after 15 s of
+  silence (`Limits::tcp_keepalive`), instead of only at `--git-idle-timeout`; a paused but live client answers them
+  (`keepalive_probes_leave_a_paused_live_client_alone`, #316).
 - **Process control.** One supervisor thread owns each child and its process group and signals the group while the
   leader is still an unreaped zombie (so a reused group id cannot be hit); the registry holds a cancel flag, never a
   group id. A client that hangs up ends the child (`a_large_push_and_clone_stream_and_a_vanished_client_ends_the_child`);

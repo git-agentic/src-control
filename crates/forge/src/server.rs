@@ -31,6 +31,10 @@ pub struct Limits {
     pub header_timeout: Duration,
     /// Time allowed to receive a request body once its headers arrived.
     pub body_timeout: Duration,
+    /// Idle time before TCP keepalive probes a connection's peer. A client that vanished without
+    /// a close the server received (a dead host, a dropped NAT entry, and on macOS loopback in
+    /// tests, #316) is then noticed by the probes instead of only at the transport idle timeout.
+    pub tcp_keepalive: Duration,
 }
 
 impl Default for Limits {
@@ -40,6 +44,7 @@ impl Default for Limits {
             max_connections: 512,
             header_timeout: Duration::from_secs(10),
             body_timeout: Duration::from_secs(30),
+            tcp_keepalive: Duration::from_secs(15),
         }
     }
 }
@@ -314,6 +319,11 @@ pub async fn serve(
                     continue;
                 };
                 let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
+                // Best effort: without probes a vanished peer still ends at the idle timeout.
+                let keepalive = socket2::TcpKeepalive::new().with_time(limits.tcp_keepalive);
+                if let Err(e) = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+                    crate::log::warning!("could not enable TCP keepalive: {e}");
+                }
                 let (app, limits) = (app.clone(), limits.clone());
                 let header_timeout = limits.header_timeout;
                 let mut stop = stop_rx.clone();
