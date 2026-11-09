@@ -909,7 +909,8 @@ unless said otherwise).
   The child runs with `RLIMIT_CPU` (900 s), `RLIMIT_FSIZE`, `RLIMIT_CORE=0` and, on Linux, `RLIMIT_DATA`
   (`--git-memory-limit`, 8 GiB per child, so the host-wide bound is `--max-transports` times that; anonymous memory,
   which stops a pack declaring a huge compressed object from growing one child without limit;
-  not enforced on macOS and untested in CI: a cgroup limit on the service is the real bound), a wall-clock limit
+  not enforced on macOS; on Linux a push whose object needs more fails with git's out-of-memory error and moves nothing,
+  `the_git_memory_limit_stops_a_push_whose_object_needs_more`, and a cgroup limit on the service is the host-wide bound), a wall-clock limit
   (`--git-timeout`) and directional stall deadlines (`--git-idle-timeout`: no request bytes while git waits for them, or
   no room in the response because the client does not read), all of which end the transport
   (`slots_are_bounded_then_released_when_the_client_disconnects`, `a_stalled_upload_is_cut_off_by_the_idle_deadline`,
