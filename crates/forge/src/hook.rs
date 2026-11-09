@@ -197,6 +197,19 @@ fn retain_deleted_heads(
     Ok(())
 }
 
+/// Test-only knob (`SC_FORGE_HOOK_HOLD` on the server): create `marker` once the row has been
+/// read, then wait (at most 30 s) until the test removes it, so a test can act between this
+/// push's read of the default branch and its ref update.
+fn hold(marker: &Path) {
+    if std::fs::write(marker, b"").is_err() {
+        return;
+    }
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while marker.exists() && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Entry point: returns the process exit code.
 pub fn run() -> i32 {
     let (Some(data), Some(id)) = (
@@ -224,6 +237,9 @@ pub fn run() -> i32 {
             return 1;
         }
     };
+    if let Some(p) = std::env::var_os("FORGE_TEST_HOOK_HOLD") {
+        hold(Path::new(&p));
+    }
     let git_bin = std::env::var_os("FORGE_GIT_BIN").map(PathBuf::from);
     let is_ff = |old: &str, new: &str| match &git_bin {
         Some(b) => is_ff_in(Path::new(&data), id, b, old, new),

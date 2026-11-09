@@ -28,6 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+/// How long a default-branch change waits for the repository's pushes to finish.
+const PUSH_WAIT: Duration = Duration::from_secs(10);
+
 /// Exclusive hold on the data directory for the life of the process.
 pub struct DirLock(#[allow(dead_code)] File);
 
@@ -75,6 +78,9 @@ pub enum LifecycleError {
     /// A branch protection rule forbids the operation.
     #[error("{0}")]
     Protected(String),
+    /// A push or maintenance pass is writing the repository; the caller may retry.
+    #[error("busy")]
+    Busy,
     /// A concurrent change kept winning; the caller may retry.
     #[error("{0}")]
     Conflict(String),
@@ -486,6 +492,11 @@ impl Lifecycle {
     }
 
     /// Make `branch` the default: it must exist; bare `HEAD` is written first, then the row.
+    ///
+    /// The `pre-receive` hook reads the default branch when a push starts, so a push already in
+    /// flight could delete the new default after it is set. The row is therefore committed only if
+    /// no push (or maintenance pass) has registered since the branch was checked; otherwise `HEAD`
+    /// is put back and the answer is `Busy`. A push that registers later reads the new row.
     pub fn set_default_branch(
         &self,
         conn: &Connection,
@@ -493,6 +504,11 @@ impl Lifecycle {
         branch: &str,
         now: i64,
     ) -> Result<(), LifecycleError> {
+        // Before the lock: waiting for a push must not hold up the repository's readers.
+        let since = self
+            .registry
+            .writers_idle(repo.id, PUSH_WAIT)
+            .ok_or(LifecycleError::Busy)?;
         let lock = self.lock_for(repo.id);
         let _held = lock.write().unwrap_or_else(|e| e.into_inner());
         let current = repos::find_by_id(conn, repo.id)?
@@ -512,10 +528,21 @@ impl Lifecycle {
             default_branch: Some(branch.to_string()),
             ..Default::default()
         };
-        if !repos::update_live(conn, current.id, &patch, now)? {
-            return Err(LifecycleError::Gone);
+        let committed = self.registry.if_no_writer_since(current.id, since, || {
+            repos::update_live(conn, current.id, &patch, now)
+        });
+        match committed {
+            Some(Ok(true)) => Ok(()),
+            Some(Ok(false)) => Err(LifecycleError::Gone),
+            Some(Err(e)) => Err(e.into()),
+            None => {
+                // The row still names the old default; a failed restore is what the reconciler's
+                // HEAD repair fixes, as after a crash at `head-written`.
+                let old = refname::branch_ref(&current.default_branch);
+                self.run(&dir, &["symbolic-ref", "HEAD", &old], None, None)?;
+                Err(LifecycleError::Busy)
+            }
         }
-        Ok(())
     }
 
     /// Delete a branch (the caller has refused the default branch). `NoSuchBranch` when absent;

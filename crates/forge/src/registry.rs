@@ -64,6 +64,8 @@ struct Slot {
     closed: bool,
     /// Cancel handle and whether the run may write (a push, a maintenance pass).
     live: HashMap<u64, (Cancel, bool)>,
+    /// Writers registered so far: lets [`Registry::if_no_writer_since`] see one that came and went.
+    writers: u64,
 }
 
 /// Live transports by repository id.
@@ -107,11 +109,9 @@ impl Registry {
         }
         let key = self.next.fetch_add(1, Ordering::SeqCst);
         let cancel = Cancel::default();
-        slots
-            .entry(repo)
-            .or_default()
-            .live
-            .insert(key, (cancel.clone(), writes));
+        let slot = slots.entry(repo).or_default();
+        slot.writers += u64::from(writes);
+        slot.live.insert(key, (cancel.clone(), writes));
         Some(Registration {
             reg: self.clone(),
             repo,
@@ -133,9 +133,6 @@ impl Registry {
         let mut slots = self.lock();
         if let Some(s) = slots.get_mut(&repo) {
             s.closed = false;
-            if s.live.is_empty() {
-                slots.remove(&repo);
-            }
         }
     }
 
@@ -172,6 +169,33 @@ impl Registry {
             }
             _ => None,
         }
+    }
+
+    /// Wait up to `limit` until no writer (a push, a maintenance pass) is registered on `repo`, and
+    /// return the writer count to hand to [`Registry::if_no_writer_since`]. `None` on timeout.
+    pub fn writers_idle(&self, repo: i64, limit: Duration) -> Option<u64> {
+        let end = Instant::now() + limit;
+        let mut slots = self.lock();
+        loop {
+            match slots.get(&repo) {
+                Some(s) if s.live.values().any(|(_, w)| *w) => {}
+                s => return Some(s.map_or(0, |s| s.writers)),
+            }
+            let left = end.checked_duration_since(Instant::now())?;
+            slots = self
+                .idle
+                .wait_timeout(slots, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// Run `f` only if no writer has registered on `repo` since [`Registry::writers_idle`] returned
+    /// `since`, holding the registry lock so none can register meanwhile: a push that starts after
+    /// `f` sees what `f` committed. `f` must be short and must not call back into the registry.
+    pub fn if_no_writer_since<T>(&self, repo: i64, since: u64, f: impl FnOnce() -> T) -> Option<T> {
+        let slots = self.lock();
+        (slots.get(&repo).map_or(0, |s| s.writers) == since).then(f)
     }
 
     /// Drop the (closed) slot of a repository that no longer exists.
@@ -222,10 +246,8 @@ impl Drop for Registration {
     fn drop(&mut self) {
         let mut slots = self.reg.lock();
         if let Some(s) = slots.get_mut(&self.repo) {
+            // The slot stays (it keeps the writer count); `forget` drops it with the repository.
             s.live.remove(&self.key);
-            if s.live.is_empty() && !s.closed {
-                slots.remove(&self.repo);
-            }
         }
         self.reg.idle.notify_all();
     }
@@ -255,6 +277,25 @@ mod tests {
         assert!(r.wait_idle(1, Duration::from_millis(20)));
         r.reopen(1);
         assert!(r.register(1, true, || true).is_some());
+    }
+
+    #[test]
+    fn a_writer_that_came_and_went_still_counts() {
+        let r = Arc::new(Registry::default());
+        let fetch = r.register(3, false, || true).unwrap();
+        let since = r
+            .writers_idle(3, Duration::ZERO)
+            .expect("a fetch is not a writer");
+        assert_eq!(r.if_no_writer_since(3, since, || 1), Some(1));
+        drop(r.register(3, true, || true).unwrap()); // a push starts and ends
+        assert_eq!(r.if_no_writer_since(3, since, || 1), None);
+        let push = r.register(3, true, || true).unwrap();
+        assert!(
+            r.writers_idle(3, Duration::from_millis(20)).is_none(),
+            "a live push"
+        );
+        drop((push, fetch));
+        assert!(r.writers_idle(3, Duration::ZERO).is_some());
     }
 
     #[test]
