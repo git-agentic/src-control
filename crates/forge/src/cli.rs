@@ -192,6 +192,9 @@ enum OrgCmd {
         name: String,
         #[arg(long)]
         owner: String,
+        /// `public`, `limited` or `private`, as in Gitea.
+        #[arg(long, default_value = "public")]
+        visibility: String,
         #[arg(long)]
         data_dir: PathBuf,
     },
@@ -272,10 +275,11 @@ fn run_admin(cmd: AdminCmd) -> Result<()> {
                 OrgCmd::Create {
                     name,
                     owner,
+                    visibility,
                     data_dir,
                 },
         } => {
-            admin::org_create(&data_dir, &name, &owner)?;
+            admin::org_create(&data_dir, &name, &owner, &visibility)?;
             println!("Organization '{name}' has been successfully created!");
         }
         AdminCmd::Repo {

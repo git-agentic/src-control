@@ -103,10 +103,13 @@ pub fn repo_set_pull_floor(data_dir: &Path, owner: &str, name: &str, floor: i64)
     Ok(())
 }
 
-/// `admin org create`.
-pub fn org_create(data_dir: &Path, name: &str, owner: &str) -> Result<()> {
+/// `admin org create`, with Gitea's visibility values (`public`, `limited`, `private`).
+pub fn org_create(data_dir: &Path, name: &str, owner: &str, visibility: &str) -> Result<()> {
     if names::check(name).is_err() {
         bail!("invalid or reserved organization name {name:?}");
+    }
+    if !crate::api::valid_visibility(visibility) {
+        bail!("invalid visibility {visibility:?}: use public, limited or private");
     }
     let mut conn = db::open_for_admin(data_dir)?;
     let owner = store::find_by_login(&conn, owner)?
@@ -115,7 +118,7 @@ pub fn org_create(data_dir: &Path, name: &str, owner: &str) -> Result<()> {
     let acct = NewAccount {
         login: name.into(),
         is_org: true,
-        visibility: "public".into(),
+        visibility: visibility.into(),
         ..Default::default()
     };
     match store::create_org(&mut conn, &acct, owner.id, now()) {

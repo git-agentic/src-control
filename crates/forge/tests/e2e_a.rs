@@ -650,8 +650,12 @@ fn admin_cli_changes_are_visible_to_the_running_server() {
         .status,
         201
     );
-    scl_forge::admin::org_create(&s.dir, "cliorg", "carol").unwrap();
+    scl_forge::admin::org_create(&s.dir, "cliorg", "carol", "public").unwrap();
     assert_eq!(s.get("/api/v1/orgs/cliorg", &token(&s.admin)).status, 200);
+    scl_forge::admin::org_create(&s.dir, "hidden", "carol", "private").unwrap();
+    let r = s.get("/api/v1/orgs/hidden", &token(&s.admin));
+    assert_eq!(r.json()["visibility"], "private");
+    assert!(scl_forge::admin::org_create(&s.dir, "odd", "carol", "secret").is_err());
     assert!(scl_forge::admin::user_create(
         &s.dir,
         "carol",

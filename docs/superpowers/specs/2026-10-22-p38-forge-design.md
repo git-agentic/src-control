@@ -510,7 +510,7 @@ sc-forge serve --data-dir DIR --listen ADDR --public-url URL [--behind-proxy|--a
 sc-forge admin user create --username U --password P --email E [--admin] [--must-change-password=false]
 sc-forge admin user change-password --username U --password P [--must-change-password=false]
 sc-forge admin user generate-access-token --username U [--token-name N] [--scopes S,…] [--raw]
-sc-forge admin org create --name O --owner U
+sc-forge admin org create --name O --owner U [--visibility public|limited|private]
 sc-forge hook pre-receive|post-receive      # internal
 ```
 
