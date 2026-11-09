@@ -85,6 +85,24 @@ pub fn generate_access_token(
     }
 }
 
+/// `admin repo set-pull-floor`: new pull requests of `owner/name` are numbered above `floor`, so
+/// the numbers a repository had on the forge it was migrated from are never given out again. The
+/// floor only rises: a lower value leaves it as it is.
+pub fn repo_set_pull_floor(data_dir: &Path, owner: &str, name: &str, floor: i64) -> Result<()> {
+    if floor < 0 {
+        bail!("pull floor must not be negative");
+    }
+    let conn = db::open_for_admin(data_dir)?;
+    let repo = crate::repos::find_row(&conn, owner, name)?
+        .filter(|r| r.state == "live")
+        .ok_or_else(|| anyhow!("repository does not exist [{owner}/{name}]"))?;
+    conn.execute(
+        "UPDATE repos SET pull_floor = MAX(pull_floor, ?2) WHERE id = ?1",
+        rusqlite::params![repo.id, floor],
+    )?;
+    Ok(())
+}
+
 /// `admin org create`.
 pub fn org_create(data_dir: &Path, name: &str, owner: &str) -> Result<()> {
     if names::check(name).is_err() {

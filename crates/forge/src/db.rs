@@ -190,6 +190,9 @@ const MIGRATIONS: &[&str] = &[
         created_unix INTEGER NOT NULL
     );
     CREATE UNIQUE INDEX merge_intents_one_pending ON merge_intents (repo_id, pull_number) WHERE state = 'pending';",
+    // 6: a repository migrated from another forge keeps its old pull request numbers retired: new
+    // ones start above `pull_floor` (set by `sc-forge admin repo set-pull-floor`).
+    "ALTER TABLE repos ADD COLUMN pull_floor INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// Every table the current schema creates; `/healthz` probes each, so a missing or unreadable one

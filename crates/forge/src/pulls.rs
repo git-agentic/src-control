@@ -175,13 +175,14 @@ pub fn list(
     Ok((rows, total))
 }
 
+/// One above both the repository's highest PR number and its pull-number floor.
+const NEXT_NUMBER: &str =
+    "SELECT MAX(COALESCE((SELECT MAX(number) FROM pulls WHERE repo_id = ?1), 0), \
+     COALESCE((SELECT pull_floor FROM repos WHERE id = ?1), 0)) + 1";
+
 /// The number the next PR of the repository gets.
 pub fn next_number(conn: &Connection, repo_id: i64) -> rusqlite::Result<i64> {
-    conn.query_row(
-        "SELECT COALESCE(MAX(number), 0) + 1 FROM pulls WHERE repo_id = ?1",
-        [repo_id],
-        |r| r.get(0),
-    )
+    conn.query_row(NEXT_NUMBER, [repo_id], |r| r.get(0))
 }
 
 /// Insert a PR with the next number of the repository (PRs and, one day, issues share it).
@@ -198,11 +199,7 @@ pub fn insert(
     now: i64,
 ) -> rusqlite::Result<Pull> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let number: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(number), 0) + 1 FROM pulls WHERE repo_id = ?1",
-        [repo_id],
-        |r| r.get(0),
-    )?;
+    let number: i64 = tx.query_row(NEXT_NUMBER, [repo_id], |r| r.get(0))?;
     tx.execute(
         "INSERT INTO pulls (repo_id, number, head_ref, base_ref, base_sha, head_sha, title, body, \
          state, creator_id, created_unix, updated_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9, ?10, ?10)",
@@ -757,10 +754,11 @@ mod tests {
     use super::*;
 
     fn conn() -> (Connection, std::path::PathBuf, i64, i64) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
             "scl-forge-pulls-{}-{}",
             std::process::id(),
-            crate::timefmt::now()
+            N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         let _ = std::fs::remove_dir_all(&d);
         let conn = crate::db::open_for_admin(&d).unwrap();
@@ -776,6 +774,25 @@ mod tests {
         .unwrap();
         let repo = crate::repos::insert_creating(&conn, owner.id, "r", "main", "", "", 1).unwrap();
         (conn, d, repo.id, owner.id)
+    }
+
+    #[test]
+    fn a_pull_floor_retires_every_number_up_to_it() {
+        let (c, d, repo, user) = conn();
+        c.execute("UPDATE repos SET pull_floor = 41 WHERE id = ?1", [repo])
+            .unwrap();
+        assert_eq!(next_number(&c, repo).unwrap(), 42);
+        let a = insert(&c, repo, "f", "main", "b1", "h1", "t", "", user, 5).unwrap();
+        assert_eq!(a.number, 42);
+        c.execute("UPDATE repos SET pull_floor = 10 WHERE id = ?1", [repo])
+            .unwrap();
+        let b = insert(&c, repo, "g", "main", "b1", "h2", "t", "", user, 6).unwrap();
+        assert_eq!(
+            b.number, 43,
+            "a floor below the highest number changes nothing"
+        );
+        assert_eq!(next_number(&c, repo).unwrap(), 44);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

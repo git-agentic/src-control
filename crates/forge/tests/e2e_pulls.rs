@@ -159,6 +159,26 @@ fn create_validates_and_the_object_has_the_recorded_shape() {
 }
 
 #[test]
+fn a_pull_floor_set_on_a_running_server_retires_the_old_numbers() {
+    let w = world();
+    w.commit("f1", "f1.txt", Some("main"));
+    scl_forge::admin::repo_set_pull_floor(&w.s.dir, "siteadmin", "w", 41).unwrap();
+    scl_forge::admin::repo_set_pull_floor(&w.s.dir, "siteadmin", "w", 10).unwrap();
+    assert_eq!(
+        w.open("f1")["number"],
+        42,
+        "a lower floor does not reopen retired numbers"
+    );
+    assert_eq!(
+        w.api("GET", "/pulls/1", None).status,
+        404,
+        "an old number names nothing"
+    );
+    assert!(scl_forge::admin::repo_set_pull_floor(&w.s.dir, "siteadmin", "nope", 1).is_err());
+    assert!(scl_forge::admin::repo_set_pull_floor(&w.s.dir, "siteadmin", "w", -1).is_err());
+}
+
+#[test]
 fn the_head_follows_the_branch_and_lists_are_ordered_and_paged() {
     let w = world();
     w.commit("f1", "a.txt", Some("main"));
