@@ -159,8 +159,9 @@ fn is_default(v: &Value) -> bool {
     }
 }
 
+/// Does `s` use Gitea's glob syntax (its compiler gives `* ? [ { \\` a meaning)?
 fn has_glob(s: &str) -> bool {
-    s.contains(['*', '?', '['])
+    s.contains(['*', '?', '[', '{', '\\'])
 }
 
 fn contexts_of(v: &Value) -> Result<Option<Vec<String>>, String> {

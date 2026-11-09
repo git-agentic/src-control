@@ -164,6 +164,12 @@ fn rule_crud_validation_and_the_branch_object() {
             "patterns are not supported",
         ),
         (
+            "brace glob",
+            json!({"branch_name": "{main,release}"}),
+            422,
+            "patterns are not supported",
+        ),
+        (
             "approvals",
             json!({"branch_name": "x", "required_approvals": 2}),
             422,
