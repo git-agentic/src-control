@@ -570,6 +570,25 @@ fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
 }
 
 #[test]
+fn keepalive_probes_leave_a_paused_live_client_alone() {
+    let s = Srv::start_with(scl_forge::server::Limits {
+        tcp_keepalive: std::time::Duration::from_secs(1),
+        ..Default::default()
+    });
+    let auth = token(&s.admin);
+    repo(&s, "smart");
+    let held = stalled_push(&s, &auth, "smart");
+    wait_for("the transport to register", || {
+        s.app.life.registry.live() == 1
+    });
+    // The client sends nothing for several probe periods; its TCP stack still answers them.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert_eq!(s.app.life.registry.live(), 1, "a live client is kept");
+    drop(held);
+    wait_for("the transport to end", || s.app.life.registry.live() == 0);
+}
+
+#[test]
 fn slots_are_bounded_then_released_when_the_client_disconnects() {
     let s = Srv::start_transport(scl_forge::cgi::Cfg {
         max_transports: 1,
@@ -702,10 +721,11 @@ fn quarantined(repo_dir: &Path) -> bool {
 #[test]
 fn a_push_cancelled_mid_pack_moves_no_ref_and_its_quarantine_is_reclaimed() {
     use std::io::Write;
-    // The server does not always see a client that leaves mid-body (the body read can miss the
-    // EOF, #316); the idle timeout then ends the transport. A short one bounds the test either way.
-    let s = Srv::start_transport(scl_forge::cgi::Cfg {
-        idle: std::time::Duration::from_secs(5),
+    // The server does not always receive the close of a client that leaves mid-body (#316, seen
+    // on macOS loopback); TCP keepalive probes then find it gone, well before the 120 s idle
+    // timeout. A one-second probe delay keeps the test inside `wait_for`'s ten seconds.
+    let s = Srv::start_with(scl_forge::server::Limits {
+        tcp_keepalive: std::time::Duration::from_secs(1),
         ..Default::default()
     });
     let c = Client::new("cancel-push");
@@ -750,8 +770,7 @@ fn a_push_cancelled_mid_pack_moves_no_ref_and_its_quarantine_is_reclaimed() {
     wait_for("the push to be receiving into its quarantine", || {
         s.app.life.registry.live() == 1 && quarantined(&repo_dir)
     });
-    // The client goes away mid-pack: the server cancels the transport (on the broken body, or
-    // at the idle timeout).
+    // The client goes away mid-pack: the server cancels the transport.
     drop(sock);
     wait_for("the transport to unregister", || {
         s.app.life.registry.live() == 0
