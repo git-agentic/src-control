@@ -922,8 +922,9 @@ unless said otherwise).
   from its signal handlers; we wait up to one second for the leader to exit and stderr to close) and then SIGKILL. A push
   cancelled mid-pack moves no ref, but its `objects/tmp_objdir-incoming-*` quarantine can survive (seen with Apple git
   2.54); maintenance removes it once it is old enough to have no owner, as it does for a server killed outright
-  (`a_push_cancelled_mid_pack_moves_no_ref_and_its_quarantine_is_reclaimed`). git holds ref locks only inside its ref
-  transaction after the pack has arrived; a cancel inside that window is not tested (maintenance covers stale locks). A client that leaves mid-body is sometimes
+  (`a_push_cancelled_mid_pack_moves_no_ref_and_its_quarantine_is_reclaimed`). A push cancelled while it holds its ref
+  lock (held in git's `reference-transaction prepared` hook) releases the lock and moves no ref
+  (`a_push_cancelled_while_holding_its_ref_lock_releases_it`). A client that leaves mid-body is sometimes
   noticed only at `--git-idle-timeout` (the body read can miss the EOF, about 1 run in 8 locally, #316).
 - **Process control.** One supervisor thread owns each child and its process group and signals the group while the
   leader is still an unreaped zombie (so a reused group id cannot be hit); the registry holds a cancel flag, never a

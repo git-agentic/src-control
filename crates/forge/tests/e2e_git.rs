@@ -761,7 +761,7 @@ fn a_push_cancelled_mid_pack_moves_no_ref_and_its_quarantine_is_reclaimed() {
         tip.starts_with(&old),
         "the cancelled push moved main: {tip}"
     );
-    // git takes its ref locks only after the whole pack has arrived, so none is held here.
+    // git takes its ref locks only after the whole pack has arrived (see the next test).
     let left = leftovers(&repo_dir);
     assert!(
         left.iter().all(|p| !p.to_string_lossy().ends_with(".lock")),
@@ -778,6 +778,64 @@ fn a_push_cancelled_mid_pack_moves_no_ref_and_its_quarantine_is_reclaimed() {
     let conn = scl_forge::db::connect(&s.app.data_dir).unwrap();
     let _ = scl_forge::maintenance::maintain_repo(&s.app, &conn, 1);
     assert_eq!(leftovers(&repo_dir), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn a_push_cancelled_while_holding_its_ref_lock_releases_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Srv::start();
+    let c = Client::new("cancel-lock");
+    let url = repo(&s, "cancel-lock");
+    let auth = token(&s.admin);
+    let work = seeded(&c, &url, &auth);
+    let old = c.ok(&work, None, &["rev-parse", "HEAD"]).trim().to_string();
+    put_commit(&c, &work, "b.txt", "two\n");
+    // git runs `reference-transaction prepared` with the ref locks taken: hold the push there.
+    let marker = c.dir.join("locked");
+    let hook = s.dir.join("hooks/reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n/bin/cat >/dev/null\n[ \"$1\" = prepared ] || exit 0\n: > '{m}'\nwhile [ -e '{m}' ]; do /bin/sleep 0.05; done\n",
+            m = marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let push = std::thread::spawn({
+        let (dir, work, auth, url) = (c.dir.clone(), work.clone(), auth.clone(), url.clone());
+        move || {
+            Command::new("git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+                .env("HOME", &dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .current_dir(&work)
+                .arg("-c")
+                .arg(format!("http.extraHeader=Authorization: {auth}"))
+                .args(["push", "-q", &url, "main"])
+                .output()
+                .unwrap()
+        }
+    });
+    let lock = s.dir.join("repos/1.git/refs/heads/main.lock");
+    wait_for("the push to hold its ref lock", || {
+        marker.exists() && lock.exists()
+    });
+    // Cancel the transport the way a delete or shutdown does, keeping the repository.
+    s.app.life.registry.close(1);
+    wait_for("the transport to end", || s.app.life.registry.live() == 0);
+    s.app.life.registry.reopen(1);
+    let _ = std::fs::remove_file(&marker);
+    std::fs::remove_file(&hook).unwrap();
+    assert!(!push.join().unwrap().status.success(), "the push was cut");
+    assert!(!lock.exists(), "git released the ref lock on SIGTERM");
+    let tip = c.ok(&work, Some(&auth), &["ls-remote", &url, "refs/heads/main"]);
+    assert!(
+        tip.starts_with(&old),
+        "the cancelled push moved main: {tip}"
+    );
 }
 
 /// Ask for `want`'s full pack over a raw socket and read only the response head, so the
